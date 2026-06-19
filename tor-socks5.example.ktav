@@ -1,0 +1,39 @@
+## tor-socks5 configuration template.
+## Copy this file to tor-socks5.ktav and edit.
+## Real bridges, a custom listen address, and runtime state belong in
+## tor-socks5.ktav which is gitignored.
+##
+## Ktav 0.6 syntax: only ## at the start of a line is a comment.
+## A single # is content. No inline or trailing comments.
+## Everything after the colon is value verbatim until end of line.
+
+listen: 127.0.0.1:1080
+
+log.default: info
+log.output: stderr
+log.ansi: true
+
+bridges.lines: [
+    obfs4 198.51.100.7:9001 0000000000000000000000000000000000AAAAAA cert=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA iat-mode=0
+    webtunnel [2001:db8::1]:443 0000000000000000000000000000000000BBBBBB url=https://example.com/path ver=0.0.3
+]
+
+bridges.sources: [
+    {
+        label: scriptzteam-obfs4
+        url: https://raw.githubusercontent.com/scriptzteam/Tor-Bridges-Collector/main/bridges-obfs4
+    }
+    {
+        label: scriptzteam-webtunnel
+        url: https://raw.githubusercontent.com/scriptzteam/Tor-Bridges-Collector/main/bridges-webtunnel
+    }
+    {
+        label: tor-browser-obfs4
+        url: https://gitlab.torproject.org/tpo/applications/tor-browser/-/raw/main/projects/common/bridges_list.obfs4.txt
+    }
+]
+
+upstream.enabled: false
+upstream.address: 127.0.0.1:9050
+upstream.username:
+upstream.password:

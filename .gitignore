@@ -1,0 +1,27 @@
+/target
+**/*.rs.bk
+.idea/
+.vscode/
+*.log
+
+# Local crush state and run artefacts (DB, prompts, captured outputs).
+/.crush/
+/.crush-runs/
+/.cache/
+
+# Claude Code tooling (not part of the public project).
+/.claude/
+/CLAUDE.md
+
+# Main config (contains real bridges / personal listen address).
+/tor-socks5.ktav
+# Runtime state files written next to the config.
+/tor-socks5.users.ktav
+/tor-socks5.alive-bridges.log
+# Unverified bridge candidate pool (scratch staging, never committed).
+*.candidates.log
+# Optional seed bridges (real bridge lines are not committed).
+*.seeds
+
+# Arti state dir (created at first bootstrap).
+/arti-data/

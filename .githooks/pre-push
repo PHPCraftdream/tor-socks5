@@ -1,0 +1,21 @@
+#!/bin/sh
+# Pre-push gate: formatting, lints, and tests must all pass before a push.
+#
+# Enable once per clone:
+#     git config core.hooksPath .githooks
+#
+# Bypass in an emergency with `git push --no-verify`.
+set -e
+
+echo "pre-push: cargo fmt --all --check"
+cargo fmt --all -- --check
+
+echo "pre-push: cargo clippy --workspace --all-targets -- -D warnings"
+cargo clippy --workspace --all-targets -- -D warnings
+
+echo "pre-push: cargo test --workspace"
+cargo test --workspace
+
+echo "pre-push: OK"
+
+cargo sweep --time 7 2>/dev/null || true

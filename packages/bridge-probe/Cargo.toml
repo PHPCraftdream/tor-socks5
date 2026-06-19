@@ -1,0 +1,28 @@
+[package]
+name = "bridge-probe"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Parallel TCP reachability probing and latency sort for Tor bridge lines."
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bridge-line.workspace = true
+
+tokio = { workspace = true, features = ["net", "time", "macros", "rt"] }
+futures.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "probe_bench"
+harness = false

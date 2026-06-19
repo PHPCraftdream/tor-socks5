@@ -1,0 +1,57 @@
+[package]
+name = "socks5-proxy"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Local SOCKS5 proxy with embedded Tor (arti) and self-managed obfs4/webtunnel bridges."
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+arti-wrapper = { path = "../../packages/arti-wrapper" }
+auth = { path = "../../packages/auth" }
+bridge-line.workspace = true
+bridge-fetcher = { path = "../../packages/bridge-fetcher" }
+bridge-probe = { path = "../../packages/bridge-probe" }
+lyrebird.workspace = true
+
+ktav.workspace = true
+service-manager.workspace = true
+serde.workspace = true
+indexmap.workspace = true
+time.workspace = true
+clap.workspace = true
+rpassword.workspace = true
+
+rustls.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+
+anyhow.workspace = true
+thiserror.workspace = true
+getrandom.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+criterion.workspace = true
+
+[[bench]]
+name = "socks5_bench"
+harness = false
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
