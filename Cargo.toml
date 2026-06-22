@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "packages/*",
     "apps/*",
+    "vendor/saturating-time",
 ]
 
 # bridge-fetcher is in packages/* via glob
@@ -72,6 +73,12 @@ codegen-units = 1
 tor-dirclient = { path = "vendor/tor-dirclient" }
 ## DEBUG: tor-dirmgr with a hard timeout on the bridge-descriptor fetch.
 tor-dirmgr = { path = "vendor/tor-dirmgr" }
+## FIX: saturating-time 0.3.0 `saturating_add`/`saturating_sub` eagerly force a
+## non-terminating min/max search on Windows SystemTime — the root cause of an
+## infinite loop in `tor_netdoc::RouterDesc::parse` (used only for bridge
+## descriptors), which left every bridge "unsuitable to purpose" so no circuit
+## could be built. Vendored with a lazy unwrap + a find_limit termination guard.
+saturating-time = { path = "vendor/saturating-time" }
 ptrs-gesher-bridge-line = { path = "../ptrs-gesher/crates/bridge-line" }
 ptrs-gesher-lyrebird    = { path = "../ptrs-gesher/crates/lyrebird" }
 ptrs-gesher-core        = { path = "../ptrs-gesher/crates/core" }

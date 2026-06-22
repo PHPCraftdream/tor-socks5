@@ -316,10 +316,6 @@ where
     // sees a clean EOF after exactly that many bytes — instead of blocking
     // until a stream-level RELAY_END that may never arrive over a slow
     // obfs4 circuit (the cause of spurious "Partial response" / DirTimeout).
-    eprintln!(
-        "[DBG-DIRCLIENT] response Content-Length = {:?}, encoding = {:?}",
-        header.length, header.encoding
-    );
     let mut decoder = match header.length {
         Some(clen) => {
             use futures::io::AsyncReadExt as _;
@@ -484,7 +480,6 @@ where
         let status = futures::select! {
             status = stream.read(buf).fuse() => status,
             _ = timer => {
-                eprintln!("[DBG-DIRCLIENT] IDLE TIMEOUT (stall) after {written_total} bytes");
                 result.resize(written_total, 0); // truncate as needed
                 return Err(RequestError::DirTimeout);
             }
@@ -492,14 +487,12 @@ where
         let written_in_this_loop = match status {
             Ok(n) => n,
             Err(other) => {
-                eprintln!("[DBG-DIRCLIENT] READ ERROR after {written_total} bytes: {other:?}");
                 result.resize(written_total, 0); // truncate as needed
                 return Err(other.into());
             }
         };
 
         written_total += written_in_this_loop;
-        eprintln!("[DBG-DIRCLIENT] read {written_in_this_loop} bytes, total {written_total}");
 
         // exit conditions below
 

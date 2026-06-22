@@ -3344,6 +3344,7 @@ dependencies = [
  "ptrs-gesher-obfs4",
  "ptrs-gesher-webtunnel",
  "safelog 0.4.8",
+ "socket2",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -3952,8 +3953,6 @@ dependencies = [
 [[package]]
 name = "saturating-time"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b63583a1dd0647d1484228529ab4ecaa874048d2956f117362aa5f5826456230"
 
 [[package]]
 name = "schemars"

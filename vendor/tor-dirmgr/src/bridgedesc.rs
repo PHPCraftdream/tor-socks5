@@ -140,7 +140,7 @@ impl Default for BridgeDescDownloadConfig {
     fn default() -> Self {
         let secs = Duration::from_secs;
         BridgeDescDownloadConfig {
-            parallelism: 2.try_into().expect("parallelism is zero"),
+            parallelism: 12.try_into().expect("parallelism is zero"),
             // tor-socks5 local patch: the upstream 30s initial retry is too
             // slow to recover a one-hop bridge-descriptor fetch that failed on
             // a transient connection reset, leaving bridges "unsuitable to
@@ -232,19 +232,13 @@ impl<R: Runtime> mockable::MockableAPI<R> for () {
             let request = tor_dirclient::request::RoutersOwnDescRequest::new();
             let response = tor_dirclient::send_request(runtime, &request, &mut stream, None)
                 .await
-                .map_err(|dce| {
-                    eprintln!("[DBG-BRIDGEDESC] send_request error (full): {dce:?}");
-                    match dce {
-                    tor_dirclient::Error::RequestFailed(re) => {
-                        eprintln!("[DBG-BRIDGEDESC] RequestFailed inner: {re:?}");
-                        Error::RequestFailed(re)
-                    }
+                .map_err(|dce| match dce {
+                    tor_dirclient::Error::RequestFailed(re) => Error::RequestFailed(re),
                     _ => internal!(
                         "tor_dirclient::send_request gave non-RequestFailed {:?}",
                         dce
                     )
                     .into(),
-                    }
                 })?;
             let output = response.into_output_string()?;
             Ok::<Option<String>, Error>(Some(output))
