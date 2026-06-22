@@ -122,22 +122,23 @@ fn build_config(settings: &Settings) -> Result<TorClientConfig> {
     // the consensus / certificates / microdescriptors arrive slowly and the
     // last few objects keep getting dropped, so the bootstrap never reaches a
     // usable directory (bridges stay `dir_info_missing` → "unsuitable to
-    // purpose" → no Data guard). C-tor tolerates slow bridges; we make arti do
-    // the same by raising the retry budgets and widening per-object
-    // parallelism so a stalled fetch is retried (and raced) instead of
-    // abandoned. These are upper bounds on *attempts*, not busy-loops — each
-    // attempt still waits on its own timeout.
+    // purpose" → no Data guard).
+    //
+    // GENTLE, not aggressive. An earlier revision widened per-object
+    // parallelism (consensus x10, microdesc x12) to "race many bridges at
+    // once". That backfired: it opens a burst of simultaneous obfs4 channels
+    // to the small bridge pool, and the bridges' flood/abuse protection
+    // forcibly resets the connections (os error 10054) — exactly the network
+    // flood we must avoid. C-tor is stable on these same bridges precisely
+    // because it is conservative: few concurrent connections, patient retries.
+    // We mirror that — keep a generous *attempts* budget (retries spread over
+    // time are fine) but low concurrency so we never hammer a bridge.
     {
         let sched = builder.download_schedule();
         sched.retry_bootstrap().attempts(64);
-        // High parallelism so the consensus / microdescriptors are fetched
-        // from MANY bridges at once and the first one that actually delivers
-        // the whole document wins — a bridge that truncates mid-transfer is
-        // raced past instead of blocking the bootstrap. This is what lets a
-        // pool of marginal bridges bootstrap as fast as its best member.
-        sched.retry_consensus().attempts(32).parallelism(10);
-        sched.retry_certs().attempts(32).parallelism(6);
-        sched.retry_microdescs().attempts(64).parallelism(12);
+        sched.retry_consensus().attempts(32).parallelism(2);
+        sched.retry_certs().attempts(32).parallelism(2);
+        sched.retry_microdescs().attempts(64).parallelism(3);
     }
 
     // Pin arti's state + cache under an app-local directory when asked, so
