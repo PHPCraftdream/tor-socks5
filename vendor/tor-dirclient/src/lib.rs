@@ -472,7 +472,7 @@ where
     // "Partial response". Switched to an IDLE (inter-read) timeout: the
     // timer is rebuilt every iteration, so it only fires when no byte has
     // arrived for `idle_timeout` — a true stall, not merely a slow stream.
-    let idle_timeout = Duration::from_secs(15);
+    let idle_timeout = Duration::from_secs(90);
 
     loop {
         // allocate buffer for next read
