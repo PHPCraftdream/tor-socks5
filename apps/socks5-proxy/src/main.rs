@@ -38,6 +38,15 @@ fn main() -> Result<()> {
     }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
+        // Pin a generous worker-thread count. arti's circuit manager can churn
+        // hard (many concurrent failed circuit-build attempts over flaky
+        // bridges); if the default pool (= CPU count) is small, those tasks can
+        // monopolise every worker and starve other arti tasks — notably the
+        // bridge-descriptor fetch, which was observed to hang for minutes with
+        // its own 30s timeout never even firing (a tell-tale sign the future
+        // was never being polled). A larger pool keeps workers available so
+        // those tasks make progress and their timeouts actually arm.
+        .worker_threads(16)
         .enable_all()
         .build()
         .context("building Tokio runtime")?;

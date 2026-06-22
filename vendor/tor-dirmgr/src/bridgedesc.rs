@@ -149,7 +149,7 @@ impl Default for BridgeDescDownloadConfig {
             // many simultaneous obfs4 channels to the small bridge pool trips
             // the bridges' flood protection (forced reset, os 10054). Gentle
             // and patient mirrors C-tor, which stays connected to these bridges.
-            retry: secs(10),
+            retry: secs(5),
             prefetch: secs(1000),
             min_refetch: secs(3600),
             max_refetch: secs(3600 * 3), // matches C Tor behaviour
@@ -249,7 +249,13 @@ impl<R: Runtime> mockable::MockableAPI<R> for () {
             let output = response.into_output_string()?;
             Ok::<Option<String>, Error>(Some(output))
         };
-        match runtime.timeout(Duration::from_secs(30), fetch).await {
+        // Short per-attempt timeout: get_or_launch_dir_specific can hang for
+        // the whole budget waiting on an obfs4 channel that the bridge keeps
+        // resetting (os 10054/10053). A big consensus succeeds on roughly one
+        // attempt in N once a channel happens to hold; the tiny descriptor
+        // fetch needs the same luck, so we abandon a stuck attempt quickly and
+        // try again rather than burning 30s per attempt.
+        match runtime.timeout(Duration::from_secs(10), fetch).await {
             Ok(r) => r,
             Err(_) => {
                 Err(internal!("bridge descriptor fetch timed out (tor-socks5 patch)").into())
