@@ -1,0 +1,6 @@
+{
+  "git": {
+    "sha1": "d93b5bed3a99a085a15e681633ef47a4e53098ea"
+  },
+  "path_in_vcs": "crates/tor-dirclient"
+}

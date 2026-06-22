@@ -15,6 +15,9 @@
 
 # Main config (contains real bridges / personal listen address).
 /tor-socks5.ktav
+# Extra config variants used while debugging (also contain real bridges).
+/tor-socks5-trace.ktav
+/tor-socks5-webtunnel.ktav
 # Runtime state files written next to the config.
 /tor-socks5.users.ktav
 /tor-socks5.alive-bridges.log
@@ -25,3 +28,8 @@
 
 # Arti state dir (created at first bootstrap).
 /arti-data/
+# Local backup of a known-good warm arti cache (large binary, never committed).
+/arti-data.bak/
+
+# Session checkpoints: personal working state, reference bridge IPs in prose.
+/docs/checkpoints/

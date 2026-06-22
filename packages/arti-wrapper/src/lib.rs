@@ -117,6 +117,29 @@ impl TorTunnel {
 fn build_config(settings: &Settings) -> Result<TorClientConfig> {
     let mut builder: TorClientConfigBuilder = TorClientConfig::builder();
 
+    // Patience for slow bridges. arti's default download schedules are tuned
+    // for fast public relays; over a slow/marginal obfs4 or webtunnel bridge
+    // the consensus / certificates / microdescriptors arrive slowly and the
+    // last few objects keep getting dropped, so the bootstrap never reaches a
+    // usable directory (bridges stay `dir_info_missing` → "unsuitable to
+    // purpose" → no Data guard). C-tor tolerates slow bridges; we make arti do
+    // the same by raising the retry budgets and widening per-object
+    // parallelism so a stalled fetch is retried (and raced) instead of
+    // abandoned. These are upper bounds on *attempts*, not busy-loops — each
+    // attempt still waits on its own timeout.
+    {
+        let sched = builder.download_schedule();
+        sched.retry_bootstrap().attempts(64);
+        // High parallelism so the consensus / microdescriptors are fetched
+        // from MANY bridges at once and the first one that actually delivers
+        // the whole document wins — a bridge that truncates mid-transfer is
+        // raced past instead of blocking the bootstrap. This is what lets a
+        // pool of marginal bridges bootstrap as fast as its best member.
+        sched.retry_consensus().attempts(32).parallelism(10);
+        sched.retry_certs().attempts(32).parallelism(6);
+        sched.retry_microdescs().attempts(64).parallelism(12);
+    }
+
     // Pin arti's state + cache under an app-local directory when asked, so
     // they are predictable, wipeable, and never shared with another arti
     // instance. A shared OS-default state dir can carry a stale guard

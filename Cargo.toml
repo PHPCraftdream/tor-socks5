@@ -68,6 +68,10 @@ codegen-units = 1
 ## builds today. Remove this block before publishing tor-socks5 (after
 ## ptrs-gesher 0.5.0 is on crates.io).
 [patch.crates-io]
+## DEBUG: instrumented tor-dirclient to log bytes received in dir reads.
+tor-dirclient = { path = "vendor/tor-dirclient" }
+## DEBUG: tor-dirmgr with a hard timeout on the bridge-descriptor fetch.
+tor-dirmgr = { path = "vendor/tor-dirmgr" }
 ptrs-gesher-bridge-line = { path = "../ptrs-gesher/crates/bridge-line" }
 ptrs-gesher-lyrebird    = { path = "../ptrs-gesher/crates/lyrebird" }
 ptrs-gesher-core        = { path = "../ptrs-gesher/crates/core" }
