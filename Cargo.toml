@@ -16,11 +16,11 @@ readme = "README.md"
 authors = ["PHPCraftdream <noreply@users.noreply.github.com>"]
 keywords = ["tor", "socks5", "proxy", "bridges", "anonymity"]
 categories = ["network-programming", "command-line-utilities"]
-rust-version = "1.75"
+rust-version = "1.89"
 
 [workspace.dependencies]
-arti-client = { version = "0.42", default-features = false, features = ["tokio", "rustls", "onion-service-client", "static-sqlite", "bridge-client", "pt-client"] }
-tor-rtcompat = { version = "0.42", default-features = false, features = ["tokio", "rustls"] }
+arti-client = { version = "0.43", default-features = false, features = ["tokio", "rustls", "onion-service-client", "static-sqlite", "bridge-client", "pt-client"] }
+tor-rtcompat = { version = "0.43", default-features = false, features = ["tokio", "rustls"] }
 
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 
@@ -54,11 +54,22 @@ httparse = "1"
 base64 = "0.22"
 getrandom = "0.2"
 url = "2"
-bridge-line = { version = "0.4", package = "ptrs-gesher-bridge-line" }
-lyrebird = { version = "0.4", package = "ptrs-gesher-lyrebird" }
+bridge-line = { version = "0.5", package = "ptrs-gesher-bridge-line" }
+lyrebird = { version = "0.5", package = "ptrs-gesher-lyrebird" }
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 proptest = "1"
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+## TEMPORARY: ptrs-gesher 0.5.0 is not yet on crates.io. Patch the five
+## ptrs-gesher crates at the local sibling checkout so the workspace
+## builds today. Remove this block before publishing tor-socks5 (after
+## ptrs-gesher 0.5.0 is on crates.io).
+[patch.crates-io]
+ptrs-gesher-bridge-line = { path = "../ptrs-gesher/crates/bridge-line" }
+ptrs-gesher-lyrebird    = { path = "../ptrs-gesher/crates/lyrebird" }
+ptrs-gesher-core        = { path = "../ptrs-gesher/crates/core" }
+ptrs-gesher-obfs4       = { path = "../ptrs-gesher/crates/obfs4" }
+ptrs-gesher-webtunnel   = { path = "../ptrs-gesher/crates/webtunnel" }

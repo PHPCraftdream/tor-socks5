@@ -61,9 +61,13 @@ Probe outcomes are recorded next to the config in
 `<stem>.alive-bridges.log`. Per bridge:
 
 ```text
-# fails=0 seen=12 attempt=<iso> ok=<iso|-> latency=NNms
+# fails=0 seen=12 attempt=<iso> ok=<iso|-> latency=NNms cfails=0 cobs=<iso>
 obfs4 198.51.100.7:9001 FINGERPRINT cert=... iat-mode=0
 ```
+
+Two independent signal layers drive the bridge lifecycle:
+
+**TCP-layer (probes we run ourselves):**
 
 - a **successful** probe resets `fails` to 0, stamps `ok`, and bumps
   `seen` (the stability signal);
@@ -72,7 +76,68 @@ obfs4 198.51.100.7:9001 FINGERPRINT cert=... iat-mode=0
 - once `fails` reaches **`max_fails`** the bridge is **pruned** from both
   the store and the config.
 
+**Circuit-layer (active health observation, see below):**
+
+- a per-guard "usable" event from arti resets `cfails` to 0 and stamps
+  `cobs`;
+- a per-guard "unusable" event bumps `cfails` — at most **once per
+  `circuit_observation_window_mins`** (arti retries quickly; rate
+  limiting prevents the same failure from being counted many times);
+- once `cfails` reaches **`max_circuit_fails`** the bridge is also
+  pruned — even if its TCP-probe `fails` is still 0.
+
 This is deliberately gentle — no network flood.
+
+## Active health observation (`circuit_fails`)
+
+A TCP-reachable bridge is not always usable for multi-hop Tor traffic.
+A bridge whose **descriptor** in arti's directory cache disagrees with
+the **fingerprint** in our bridge line — common with crowd-sourced
+lists after the bridge operator rotates keys — accepts TCP/TLS but
+quietly refuses to be promoted to a usable guard. Naive reachability
+probing has no way to tell these apart from truly working bridges.
+
+To catch this without paying for a dedicated arti instance per bridge
+(empirically ~45 s of wall time per check, prohibitive for a pool),
+the proxy installs a passive `tracing_subscriber::Layer` on top of
+arti's own log stream. arti emits **two** structured TRACE events the
+layer listens for:
+
+```text
+tor_guardmgr: Known usability status guard_id=… usable=true|false
+tor_guardmgr: Guard status changed.   guard_id=… old=… new=Reachable|Unreachable|Untried
+```
+
+`Known usability status` carries an explicit `usable: bool` and fires
+only on arti's `GuardStatus::Success` path. `Guard status changed.`
+fires symmetrically on every `Reachable`-enum transition (including the
+failure direction, where the first event has no counterpart) — the
+layer maps `new=Reachable → usable=true`, `new=Unreachable →
+usable=false`, and ignores `new=Untried` (initial state). Together they
+cover both success and failure observations.
+
+The layer extracts the guard's RSA identity (which equals our bridge
+line's fingerprint) from the event's structured fields and pushes a
+`(fingerprint, usable)` observation into a shared sink. The
+maintenance loop drains the sink into the health store on every tick,
+where the rules above turn observations into `cfails` and, eventually,
+prunes. arti itself remains unmodified.
+
+This layer runs on its own filter (`tor_guardmgr=trace`) independent
+of the user's main log configuration, so raising or lowering
+`log.targets.tor_*` does not blind active observation. It emits no
+log output of its own.
+
+**Known limitation — purpose-filter rejection is invisible.** arti
+0.43 rejects guards that don't match the requested purpose at the
+`select_guard` filter stage, before any reachability attempt, and the
+matching log message (`"Couldn't select guard … N/M as unsuitable to
+purpose"`) is **aggregate** — it has no structured per-guard identity
+to attach a `cfails` bump to. This typically affects configured bridges
+whose directory descriptor disagrees with the configured fingerprint
+in a way arti detects at consensus time. The TCP-probe failure counter
+(`fails`) is the only signal that catches these; the active layer is
+complementary, not a replacement.
 
 ## Fetching fresh bridges: the candidate pool
 
@@ -148,11 +213,13 @@ the pool from the sources, then lazily probes and promotes up to `--count`.
 | `sources` | 3 built-in | HTTPS collectors to fetch from (see above). |
 | `use_seeds` | `true` | Fall back to bundled seed bridges (`*.seeds`) when no configured bridge is reachable at startup. |
 | `auto_fetch` | `true` | Refresh + drain in the background to keep the working list healthy. |
-| `min_alive` | `2` | Target number of healthy working bridges; top up below this. |
+| `min_alive` | `8` | Target number of healthy working bridges; top up below this. A generous buffer lets arti's guard manager settle on a working subset on its own, even when some bridges turn out to be bootstrap-only or have stale fingerprints. |
 | `max_body_mib` | `64` | Max size of a single fetched source response. |
-| `max_fails` | `24` | Prune a bridge after this many failed probes. |
-| `fail_window_mins` | `60` | A bridge's failure counter bumps at most once per this window. |
+| `max_fails` | `24` | Prune a bridge after this many failed **TCP** probes. |
+| `fail_window_mins` | `60` | A bridge's TCP failure counter bumps at most once per this window. |
 | `recheck_interval_mins` | `60` | How often the maintenance loop re-probes, refreshes, and drains. `0` disables it. |
+| `max_circuit_fails` | `5` | Prune a bridge after this many consecutive **circuit-layer** failures observed from arti's per-guard usability events — catches descriptor / fingerprint mismatch on TCP-reachable bridges. |
+| `circuit_observation_window_mins` | `30` | A bridge's circuit-failure counter bumps at most once per this window. Finer-grained than TCP because circuit events arrive more frequently than TCP probes. |
 
 ## State files (next to the config, all gitignored)
 

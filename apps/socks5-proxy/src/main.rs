@@ -1,3 +1,4 @@
+mod arti_observability;
 mod bridge_store;
 mod bridges_cmd;
 mod candidate_pool;

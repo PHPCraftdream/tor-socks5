@@ -112,7 +112,13 @@ pub struct BridgesConfig {
     /// live ones into the config for the next start. Default `true`.
     pub auto_fetch: bool,
     /// Threshold for `auto_fetch`: enrich the config when the number of
-    /// reachable bridges at startup is below this. Default `2`.
+    /// reachable bridges at startup is below this. Default `8`.
+    ///
+    /// A generous default is the cheap baseline of "active health
+    /// observation": arti's guard manager itself drops guards it can't
+    /// use, so keeping a healthy buffer of TCP-reachable bridges in the
+    /// config lets arti settle on a working subset on its own, even when
+    /// some of those bridges are bootstrap-only or have stale fingerprints.
     pub min_alive: usize,
     /// Maximum size, in MiB, of a single bridge-list response downloaded
     /// from a `sources` URL. A response larger than this is rejected (the
@@ -129,6 +135,20 @@ pub struct BridgesConfig {
     /// if we are short on healthy ones, fetches more. `0` disables the
     /// periodic task. Default `60`. Kept generous to avoid network flood.
     pub recheck_interval_mins: u64,
+    /// **Circuit-layer pruning threshold.** A bridge that passes TCP
+    /// reachability probes but accumulates this many consecutive
+    /// circuit-layer failures (per arti's per-guard usability events) is
+    /// removed from the config and the health store. Default `5` —
+    /// roughly the number of independent failure observations needed to
+    /// trust that a bridge is structurally unusable (descriptor stale,
+    /// fingerprint mismatch) rather than victim of a transient outage.
+    pub max_circuit_fails: u32,
+    /// The circuit-failure counter for a bridge is bumped at most once
+    /// per this many minutes — arti retries quickly, and without rate
+    /// limiting every retry would be counted as a fresh failure. Default
+    /// `30`, half of `fail_window_mins` because circuit signals arrive
+    /// more frequently than TCP probes.
+    pub circuit_observation_window_mins: u64,
 }
 
 /// An HTTPS endpoint to fetch a bridge list from. The minimal form is just
@@ -177,11 +197,13 @@ impl Default for BridgesConfig {
             ],
             use_seeds: true,
             auto_fetch: true,
-            min_alive: 2,
+            min_alive: 8,
             max_body_mib: 64,
             max_fails: 24,
             fail_window_mins: 60,
             recheck_interval_mins: 60,
+            max_circuit_fails: 5,
+            circuit_observation_window_mins: 30,
         }
     }
 }
@@ -544,6 +566,37 @@ bridges.lines: [
     }
 
     // -- Config extension tests ---
+
+    #[test]
+    fn default_circuit_pruning_knobs_are_sensible() {
+        let cfg = BridgesConfig::default();
+        assert_eq!(cfg.max_circuit_fails, 5);
+        assert_eq!(cfg.circuit_observation_window_mins, 30);
+        // Sanity: the circuit window is finer-grained than the TCP one,
+        // matching the relative arrival rates of the two signal classes.
+        assert!(cfg.circuit_observation_window_mins < cfg.fail_window_mins);
+    }
+
+    #[test]
+    fn circuit_pruning_knobs_are_overridable_in_ktav() {
+        let src = "\
+listen: 127.0.0.1:1080
+bridges.max_circuit_fails: 12
+bridges.circuit_observation_window_mins: 10
+";
+        let cfg: Config = ktav::from_str(src).expect("ktav parses circuit knobs");
+        assert_eq!(cfg.bridges.max_circuit_fails, 12);
+        assert_eq!(cfg.bridges.circuit_observation_window_mins, 10);
+    }
+
+    #[test]
+    fn circuit_pruning_knobs_fall_back_to_defaults_when_absent() {
+        // A minimal config touches none of the new knobs — defaults stick.
+        let src = "listen: 127.0.0.1:1080\n";
+        let cfg: Config = ktav::from_str(src).expect("ktav parses without circuit knobs");
+        assert_eq!(cfg.bridges.max_circuit_fails, 5);
+        assert_eq!(cfg.bridges.circuit_observation_window_mins, 30);
+    }
 
     #[test]
     fn default_bridge_sources_are_populated() {

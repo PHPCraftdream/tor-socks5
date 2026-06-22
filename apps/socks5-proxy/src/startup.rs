@@ -3,6 +3,7 @@
 
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 
+use crate::arti_observability::{GuardObservabilityLayer, ObservationSink};
 use crate::config::{Config, LogConfig, LogOutput};
 
 /// `rustls` 0.23 requires picking a process-wide crypto provider explicitly.
@@ -13,7 +14,9 @@ pub(crate) fn install_crypto_provider() {
 }
 
 /// Initialise the global tracing subscriber from the config's log
-/// settings and return the non-blocking writer's [`WorkerGuard`].
+/// settings and return the non-blocking writer's [`WorkerGuard`] plus
+/// the [`ObservationSink`] that captures per-guard usability events
+/// from arti.
 ///
 /// Logging is **non-blocking**: records are handed to a dedicated writer
 /// thread, so a slow or full sink (a file on a busy disk, a piped
@@ -22,22 +25,46 @@ pub(crate) fn install_crypto_provider() {
 /// flushes and stops the writer thread, so bind it to a variable that
 /// lives until shutdown.
 ///
-/// `RUST_LOG` overrides the config file's level/target settings when set.
-pub(crate) fn init_tracing(cfg: &Config) -> WorkerGuard {
-    use tracing_subscriber::EnvFilter;
+/// Active health observation: a second tracing layer
+/// ([`GuardObservabilityLayer`]) listens on `tor_guardmgr=trace`
+/// regardless of the user's main log filter. It pushes guard-usability
+/// observations into the returned [`ObservationSink`] without producing
+/// any log output of its own. The proxy's maintenance loop drains the
+/// sink into the bridge health store; see
+/// [`crate::tor_setup::update_health_and_prune`].
+///
+/// `RUST_LOG` overrides the config file's level/target settings for the
+/// fmt layer only; the observability layer's filter is fixed.
+pub(crate) fn init_tracing(cfg: &Config) -> (WorkerGuard, ObservationSink) {
+    use tracing_subscriber::filter::EnvFilter;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
 
-    let filter =
+    let user_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(cfg.log.to_filter()));
 
     let (writer, guard, ansi) = make_writer(&cfg.log);
 
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
+    let fmt_layer = tracing_subscriber::fmt::layer()
         .with_ansi(ansi)
         .with_writer(writer)
+        .with_filter(user_filter);
+
+    // Active health observation: a per-layer filter on `tor_guardmgr=trace`
+    // (independent of the user's fmt filter) feeds the observability layer
+    // the structured events it needs without dragging arti traffic noise
+    // into the user-visible log.
+    let sink = ObservationSink::new();
+    let observability_layer = GuardObservabilityLayer::new(sink.clone())
+        .with_filter(EnvFilter::new("tor_guardmgr=trace"));
+
+    tracing_subscriber::registry()
+        .with(fmt_layer)
+        .with(observability_layer)
         .init();
 
-    guard
+    (guard, sink)
 }
 
 /// Build the non-blocking writer for the configured sink. Returns the

@@ -92,9 +92,7 @@ impl TorTunnel {
             .await
             .map_err(TorError::Bootstrap)?;
         tracing::info!("Tor is ready");
-        Ok(Self {
-            inner: Arc::new(client),
-        })
+        Ok(Self { inner: client })
     }
 
     /// Open a stream through Tor to the given address.

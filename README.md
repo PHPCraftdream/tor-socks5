@@ -17,7 +17,10 @@ SOCKS5 proxy instead of Tor, and install itself as an OS service.
   - configured bridges are **probed** for reachability at startup — dead ones are skipped,
     live ones are sorted fastest-first and cached to `tor-socks5.alive-bridges.log`;
   - `tor-socks5 bridges fetch` **pulls fresh bridges** from public collectors *over Tor* and
-    merges the working ones into the config.
+    merges the working ones into the config;
+  - **active health observation** — a tracing layer on top of arti catches per-guard usability
+    events and prunes bridges that pass TCP but fail at the circuit layer (descriptor or
+    fingerprint mismatch). See [`docs/bridges.md`](docs/bridges.md).
 - **obfs4 + webtunnel** pluggable transports, run in-process (the binary re-execs itself as the
   PT — no second executable to ship).
 - **User authentication** (RFC 1929 username/password), Argon2id-hashed, with an HMAC success

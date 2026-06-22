@@ -55,8 +55,10 @@ pub(crate) async fn run_server(
     let cfg = loaded.into_config();
 
     // Held until the server shuts down so the non-blocking log writer
-    // keeps flushing for the whole run.
-    let _log_guard = init_tracing(&cfg);
+    // keeps flushing for the whole run. The observation sink captures
+    // per-guard usability events from arti's tracing layer for the
+    // bridge maintenance loop to drain into the health store.
+    let (_log_guard, obs_sink) = init_tracing(&cfg);
     install_crypto_provider();
     shutdown::bind_child_processes_to_self();
 
@@ -126,11 +128,15 @@ pub(crate) async fn run_server(
                 spawn_auto_fetch(tor.clone(), cfg.clone(), config_path.clone(), deficit);
             }
 
-            // Periodic upkeep: re-probe, prune dead bridges, top up when short.
+            // Periodic upkeep: re-probe, prune dead bridges, top up when short,
+            // drain circuit-layer observations from arti's tracing into the
+            // health store so descriptor-mismatch / unsuitable bridges are
+            // pruned alongside the TCP-dead ones.
             spawn_bridge_maintenance(
                 tor.clone(),
                 config_path.clone(),
                 cfg.bridges.recheck_interval_mins,
+                obs_sink.clone(),
             );
 
             Egress::Tor(tor)
@@ -354,6 +360,7 @@ fn spawn_bridge_maintenance(
     tor: TorTunnel,
     config_path: Option<std::path::PathBuf>,
     interval_mins: u64,
+    obs_sink: crate::arti_observability::ObservationSink,
 ) {
     if interval_mins == 0 {
         info!("bridge maintenance disabled (recheck_interval_mins = 0)");
@@ -400,6 +407,7 @@ fn spawn_bridge_maintenance(
                 &parsed,
                 &alive,
                 &cfg,
+                Some(&obs_sink),
             );
 
             if cfg.bridges.auto_fetch && !cfg.bridges.sources.is_empty() {

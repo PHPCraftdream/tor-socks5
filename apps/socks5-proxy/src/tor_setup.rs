@@ -79,7 +79,9 @@ pub(crate) async fn build_tor_settings(
     // Update bridge health (success resets, failure bumps once per window)
     // and prune any bridge that reached `max_fails` — from both the store
     // and the config. Best-effort: never fails the bootstrap.
-    let store = update_health_and_prune(config_path, &probed, &alive, cfg);
+    // Bootstrap path: no observation sink yet — arti hasn't started
+    // emitting per-guard usability events when build_tor_settings runs.
+    let store = update_health_and_prune(config_path, &probed, &alive, cfg, None);
 
     // Order the reachable bridges — obfs4 and webtunnel together — by
     // stability then ping: most-proven first (`ok_count`), ties broken by
@@ -146,6 +148,7 @@ pub(crate) fn update_health_and_prune(
     probed: &[BridgeLine],
     alive: &[(BridgeLine, Duration)],
     cfg: &Config,
+    observation_sink: Option<&crate::arti_observability::ObservationSink>,
 ) -> Option<BridgeStore> {
     let store_path = BridgeStore::resolve_path(config_path);
     let mut store = match BridgeStore::load(store_path.clone()) {
@@ -158,7 +161,40 @@ pub(crate) fn update_health_and_prune(
 
     let now = OffsetDateTime::now_utc();
     let window = Duration::from_secs(cfg.bridges.fail_window_mins.saturating_mul(60));
-    let pruned = store.note_probe_round(probed, alive, now, window, cfg.bridges.max_fails);
+    let circuit_window = Duration::from_secs(
+        cfg.bridges
+            .circuit_observation_window_mins
+            .saturating_mul(60),
+    );
+
+    // Phase 1: TCP-layer health (probe round). Bumps `fails` once per
+    // `fail_window`, resets on TCP success. Also handles circuit-layer
+    // pruning via `cfg.bridges.max_circuit_fails`.
+    let pruned = store.note_probe_round(
+        probed,
+        alive,
+        now,
+        window,
+        cfg.bridges.max_fails,
+        cfg.bridges.max_circuit_fails,
+    );
+
+    // Phase 2: circuit-layer observations from arti's tracing. Drain the
+    // sink into the store so accumulated per-guard usability events bump
+    // `circuit_fails` (rate-limited by `circuit_observation_window`) or
+    // reset it. The sink is best-effort: a maintenance loop without one
+    // (e.g. unit tests, the `bridges fetch` command) simply skips this
+    // step.
+    if let Some(sink) = observation_sink {
+        let (failures, successes, unmatched) =
+            sink.drain_into_store(&mut store, probed, now, circuit_window);
+        if failures + successes + unmatched > 0 {
+            info!(
+                failures,
+                successes, unmatched, "drained circuit-layer guard observations"
+            );
+        }
+    }
 
     match store.save() {
         Ok(()) => info!(

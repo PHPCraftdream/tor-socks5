@@ -51,13 +51,24 @@ struct Entry {
     last_attempt: OffsetDateTime,
     /// Latency of the last successful probe.
     last_latency: Duration,
-    /// Consecutive failure count (reset to 0 on any success).
+    /// Consecutive TCP-probe failure count (reset to 0 on any TCP success).
     fails: u32,
     /// Cumulative count of successful probes over the bridge's lifetime.
     /// Never reset — a long-lived, frequently-reachable bridge accrues a
     /// high count, so this is our persistent **stability** signal (used to
     /// order bridges for arti: more-proven first, then by latency).
     ok_count: u32,
+    /// Consecutive **circuit-layer** failure count, observed from arti's
+    /// own tracing events (per-guard usability reports). Distinct from
+    /// `fails` (TCP-probe layer): a bridge whose TCP/TLS works but whose
+    /// descriptor or fingerprint is stale answers reachability probes yet
+    /// can't carry multi-hop circuits. Resets to 0 on a circuit success.
+    circuit_fails: u32,
+    /// Last time the circuit-failure counter was touched (bumped or reset).
+    /// Used to rate-limit `circuit_fails` to once per
+    /// `circuit_observation_window` (arti retries quickly; we mustn't
+    /// count each retry as a fresh failure).
+    last_circuit_observation: OffsetDateTime,
 }
 
 impl Entry {
@@ -134,6 +145,8 @@ impl BridgeStore {
                     last_latency: meta.last_latency,
                     fails: meta.fails,
                     ok_count: meta.ok_count,
+                    circuit_fails: meta.circuit_fails,
+                    last_circuit_observation: meta.last_circuit_observation,
                 };
                 entries.insert(entry.key(), entry);
             } else {
@@ -161,6 +174,8 @@ impl BridgeStore {
             last_latency: latency,
             fails: 0,
             ok_count: 0,
+            circuit_fails: 0,
+            last_circuit_observation: now,
         });
         e.bridge = bridge;
         e.last_ok = Some(now);
@@ -175,9 +190,10 @@ impl BridgeStore {
     /// `probed` is every bridge that was attempted; `alive` is the subset
     /// that responded (with latency). A reachable bridge resets to
     /// healthy; an unreachable one bumps its `fails` counter at most once
-    /// per `fail_window`. Any bridge whose `fails` reaches `max_fails` is
-    /// removed from the store and returned, so the caller can also drop it
-    /// from the config.
+    /// per `fail_window`. Any bridge whose `fails` reaches `max_fails`
+    /// **or** whose `circuit_fails` reaches `max_circuit_fails` is removed
+    /// from the store and returned, so the caller can also drop it from
+    /// the config.
     ///
     /// Pure w.r.t. `now` so it is unit-testable.
     pub fn note_probe_round(
@@ -187,6 +203,7 @@ impl BridgeStore {
         now: OffsetDateTime,
         fail_window: Duration,
         max_fails: u32,
+        max_circuit_fails: u32,
     ) -> Vec<BridgeLine> {
         use std::collections::HashSet;
         let alive_keys: HashSet<Key> = alive.iter().map(|(b, _)| key_of(b)).collect();
@@ -201,7 +218,60 @@ impl BridgeStore {
             self.note_failure_at(bridge, now, fail_window);
         }
 
-        self.prune(max_fails)
+        self.prune(max_fails, max_circuit_fails)
+    }
+
+    /// Record a circuit-layer failure observed from arti's tracing events.
+    /// Rate-limited: at most one bump per `window`. Returns true if the
+    /// counter was incremented this call. If the bridge is unknown to the
+    /// store, it is inserted with `circuit_fails = 1`.
+    ///
+    /// Pure w.r.t. `now` for unit testing.
+    pub fn note_circuit_failure_at(
+        &mut self,
+        bridge: &BridgeLine,
+        now: OffsetDateTime,
+        window: Duration,
+    ) -> bool {
+        let key = key_of(bridge);
+        match self.entries.get_mut(&key) {
+            Some(e) => {
+                if now - e.last_circuit_observation >= window {
+                    e.circuit_fails = e.circuit_fails.saturating_add(1);
+                    e.last_circuit_observation = now;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => {
+                self.entries.insert(
+                    key,
+                    Entry {
+                        bridge: bridge.clone(),
+                        last_ok: None,
+                        last_attempt: now,
+                        last_latency: Duration::ZERO,
+                        fails: 0,
+                        ok_count: 0,
+                        circuit_fails: 1,
+                        last_circuit_observation: now,
+                    },
+                );
+                true
+            }
+        }
+    }
+
+    /// Record a circuit-layer success observed from arti's tracing events:
+    /// resets `circuit_fails` to 0 and stamps `last_circuit_observation`.
+    /// No-op for an unknown bridge — circuit successes only matter for
+    /// bridges we are tracking via TCP probes too.
+    pub fn note_circuit_success_at(&mut self, bridge: &BridgeLine, now: OffsetDateTime) {
+        if let Some(e) = self.entries.get_mut(&key_of(bridge)) {
+            e.circuit_fails = 0;
+            e.last_circuit_observation = now;
+        }
     }
 
     /// Bump the failure counter for one bridge, respecting the rate limit.
@@ -235,6 +305,8 @@ impl BridgeStore {
                         last_latency: Duration::ZERO,
                         fails: 1,
                         ok_count: 0,
+                        circuit_fails: 0,
+                        last_circuit_observation: now,
                     },
                 );
                 true
@@ -242,13 +314,13 @@ impl BridgeStore {
         }
     }
 
-    /// Remove and return every bridge whose failure count reached
-    /// `max_fails`.
-    fn prune(&mut self, max_fails: u32) -> Vec<BridgeLine> {
+    /// Remove and return every bridge whose `fails` reached `max_fails`
+    /// or whose `circuit_fails` reached `max_circuit_fails`.
+    fn prune(&mut self, max_fails: u32, max_circuit_fails: u32) -> Vec<BridgeLine> {
         let dead: Vec<Key> = self
             .entries
             .iter()
-            .filter(|(_, e)| e.fails >= max_fails)
+            .filter(|(_, e)| e.fails >= max_fails || e.circuit_fails >= max_circuit_fails)
             .map(|(k, _)| k.clone())
             .collect();
         dead.into_iter()
@@ -291,7 +363,11 @@ impl BridgeStore {
             out.push_str(&e.last_ok.map(format_iso).unwrap_or_else(|| "-".to_string()));
             out.push_str(" latency=");
             out.push_str(&e.last_latency.as_millis().to_string());
-            out.push_str("ms\n");
+            out.push_str("ms cfails=");
+            out.push_str(&e.circuit_fails.to_string());
+            out.push_str(" cobs=");
+            out.push_str(&format_iso(e.last_circuit_observation));
+            out.push('\n');
             out.push_str(&e.bridge.to_string());
             out.push('\n');
             out.push('\n');
@@ -332,6 +408,21 @@ impl BridgeStore {
         self.entries.get(&key_of(bridge)).map_or(0, |e| e.ok_count)
     }
 
+    /// Circuit-layer consecutive failure count for a bridge (0 if unknown).
+    /// Surfaced by arti's tracing events; used to prune bridges that pass
+    /// TCP probes but can't carry multi-hop traffic.
+    ///
+    /// Exposed for diagnostics and the upcoming circuit-aware pruning flow
+    /// (config knob `max_circuit_fails`, see issue #115); allow(dead_code)
+    /// keeps clippy quiet while only tests exercise it.
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn circuit_fails(&self, bridge: &BridgeLine) -> u32 {
+        self.entries
+            .get(&key_of(bridge))
+            .map_or(0, |e| e.circuit_fails)
+    }
+
     /// Failure count for a bridge (0 if unknown). Test/diagnostic helper.
     #[cfg(test)]
     fn fails_of(&self, bridge: &BridgeLine) -> u32 {
@@ -347,6 +438,8 @@ struct Meta {
     last_latency: Duration,
     fails: u32,
     ok_count: u32,
+    circuit_fails: u32,
+    last_circuit_observation: OffsetDateTime,
 }
 
 impl Default for Meta {
@@ -358,12 +451,16 @@ impl Default for Meta {
             last_latency: Duration::ZERO,
             fails: 0,
             ok_count: 0,
+            circuit_fails: 0,
+            last_circuit_observation: epoch,
         }
     }
 }
 
 fn parse_meta_comment(s: &str) -> Option<Meta> {
-    // New format: `fails=N attempt=<iso> ok=<iso|-> latency=NNms`.
+    // New format: `fails=N seen=M attempt=<iso> ok=<iso|-> latency=NNms`
+    // plus optional `cfails=N cobs=<iso>` (active health observation).
+    // Unknown tokens are ignored — forward-compatible.
     if s.starts_with("fails=") {
         let mut meta = Meta::default();
         for tok in s.split_whitespace() {
@@ -382,6 +479,10 @@ fn parse_meta_comment(s: &str) -> Option<Meta> {
             } else if let Some(v) = tok.strip_prefix("latency=") {
                 let ms = v.strip_suffix("ms")?.parse::<u64>().ok()?;
                 meta.last_latency = Duration::from_millis(ms);
+            } else if let Some(v) = tok.strip_prefix("cfails=") {
+                meta.circuit_fails = v.parse().ok()?;
+            } else if let Some(v) = tok.strip_prefix("cobs=") {
+                meta.last_circuit_observation = OffsetDateTime::parse(v, &Iso8601::DEFAULT).ok()?;
             }
         }
         return Some(meta);
@@ -402,6 +503,8 @@ fn parse_meta_comment(s: &str) -> Option<Meta> {
         last_latency: Duration::from_millis(lat_ms),
         fails: 0,
         ok_count: 1,
+        circuit_fails: 0,
+        last_circuit_observation: when,
     })
 }
 
@@ -547,13 +650,13 @@ mod tests {
 
         // 23 failed rounds, one per window+ → fails climbs to 23, no prune.
         for _ in 0..(MAX_FAILS - 1) {
-            let pruned = s.note_probe_round(&probed, &alive, now, HOUR, MAX_FAILS);
+            let pruned = s.note_probe_round(&probed, &alive, now, HOUR, MAX_FAILS, u32::MAX);
             assert!(pruned.is_empty());
             now += HOUR + Duration::from_secs(1);
         }
         assert_eq!(s.fails_of(&b), MAX_FAILS - 1);
         // The 24th failure → prune.
-        let pruned = s.note_probe_round(&probed, &alive, now, HOUR, MAX_FAILS);
+        let pruned = s.note_probe_round(&probed, &alive, now, HOUR, MAX_FAILS, u32::MAX);
         assert_eq!(pruned.len(), 1, "bridge removed at max_fails");
         assert_eq!(s.len(), 0);
     }
@@ -566,7 +669,7 @@ mod tests {
         let now = OffsetDateTime::from_unix_timestamp(3_000_000).unwrap();
         let probed = vec![a.clone(), d.clone()];
         let alive = vec![(a.clone(), Duration::from_millis(50))];
-        let pruned = s.note_probe_round(&probed, &alive, now, HOUR, MAX_FAILS);
+        let pruned = s.note_probe_round(&probed, &alive, now, HOUR, MAX_FAILS, u32::MAX);
         assert!(pruned.is_empty());
         assert_eq!(s.fails_of(&a), 0, "alive stays healthy");
         assert_eq!(s.fails_of(&d), 1, "dead bumped");
@@ -599,6 +702,117 @@ mod tests {
         s.save().unwrap();
         let loaded = BridgeStore::load(path).unwrap();
         assert_eq!(loaded.fails_of(&b), 2, "fails persisted across save/load");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- Circuit-layer observation tests -------------------------------------
+
+    const HALF_HOUR: Duration = Duration::from_secs(30 * 60);
+    const MAX_CIRCUIT_FAILS: u32 = 5;
+
+    #[test]
+    fn circuit_failure_bumps_outside_window_rate_limits_inside() {
+        let mut s = empty();
+        let b = bridge(OBFS4_A);
+        let t0 = OffsetDateTime::from_unix_timestamp(2_500_000).unwrap();
+
+        // First observation creates the entry with circuit_fails=1.
+        assert!(s.note_circuit_failure_at(&b, t0, HALF_HOUR));
+        assert_eq!(s.circuit_fails(&b), 1);
+        // Within the rate-limit window — no increment.
+        assert!(!s.note_circuit_failure_at(&b, t0 + Duration::from_secs(60), HALF_HOUR));
+        assert_eq!(s.circuit_fails(&b), 1);
+        // Past the window — increments.
+        assert!(s.note_circuit_failure_at(&b, t0 + HALF_HOUR + Duration::from_secs(1), HALF_HOUR));
+        assert_eq!(s.circuit_fails(&b), 2);
+    }
+
+    #[test]
+    fn circuit_success_resets_circuit_fails() {
+        let mut s = empty();
+        let b = bridge(OBFS4_A);
+        let t0 = OffsetDateTime::from_unix_timestamp(2_500_000).unwrap();
+        s.note_circuit_failure_at(&b, t0, HALF_HOUR);
+        s.note_circuit_failure_at(&b, t0 + HALF_HOUR + Duration::from_secs(1), HALF_HOUR);
+        assert_eq!(s.circuit_fails(&b), 2);
+        s.note_circuit_success_at(&b, t0 + 2 * HALF_HOUR);
+        assert_eq!(s.circuit_fails(&b), 0, "success clears circuit_fails");
+    }
+
+    #[test]
+    fn circuit_success_is_noop_for_unknown_bridge() {
+        let mut s = empty();
+        let b = bridge(OBFS4_A);
+        let now = OffsetDateTime::from_unix_timestamp(2_500_000).unwrap();
+        s.note_circuit_success_at(&b, now);
+        assert_eq!(s.len(), 0, "no entry created from a success-only signal");
+        assert_eq!(s.circuit_fails(&b), 0);
+    }
+
+    #[test]
+    fn note_probe_round_prunes_after_max_circuit_fails() {
+        let mut s = empty();
+        let b = bridge(OBFS4_A);
+        let probed = vec![b.clone()];
+        // TCP probe says alive — so `fails` stays 0 throughout.
+        let alive = vec![(b.clone(), Duration::from_millis(50))];
+        let mut now = OffsetDateTime::from_unix_timestamp(2_600_000).unwrap();
+
+        // Drive circuit_fails up to (MAX_CIRCUIT_FAILS - 1).
+        for _ in 0..(MAX_CIRCUIT_FAILS - 1) {
+            s.note_circuit_failure_at(&b, now, HALF_HOUR);
+            now += HALF_HOUR + Duration::from_secs(1);
+        }
+        // probe round with full health on TCP side, but circuit_fails close
+        // to the threshold — still no prune yet.
+        let pruned = s.note_probe_round(&probed, &alive, now, HOUR, MAX_FAILS, MAX_CIRCUIT_FAILS);
+        assert!(pruned.is_empty());
+        // ...but wait — note_probe_round resets `fails` and records success
+        // on TCP. It does NOT touch circuit_fails (TCP and circuit layers are
+        // independent). So circuit_fails is still MAX-1 here.
+        assert_eq!(s.circuit_fails(&b), MAX_CIRCUIT_FAILS - 1);
+
+        // One more circuit failure → reaches MAX_CIRCUIT_FAILS.
+        s.note_circuit_failure_at(&b, now + HALF_HOUR + Duration::from_secs(1), HALF_HOUR);
+        assert_eq!(s.circuit_fails(&b), MAX_CIRCUIT_FAILS);
+        // Next probe round prunes despite TCP-healthy state.
+        let pruned = s.note_probe_round(
+            &probed,
+            &alive,
+            now + 2 * HOUR,
+            HOUR,
+            MAX_FAILS,
+            MAX_CIRCUIT_FAILS,
+        );
+        assert_eq!(pruned.len(), 1, "TCP-alive bridge pruned on circuit_fails");
+        assert_eq!(s.len(), 0);
+    }
+
+    #[test]
+    fn circuit_metadata_persists_across_save_load() {
+        let dir = tmp_dir();
+        let path = dir.join("c.log");
+        let mut s = BridgeStore::load(path.clone()).unwrap();
+        let b = bridge(OBFS4_A);
+        let t0 = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        // Make a TCP-healthy entry first so the bridge survives without
+        // also crossing `fails` thresholds. Use `record_at` (not `record`)
+        // so the entry's `last_circuit_observation` is in the same time
+        // frame as the failures below — otherwise the rate-limit window
+        // (last_circuit_observation = now_utc()) eats every bump that
+        // happens "in the past" relative to wall time.
+        s.record_at(b.clone(), Duration::from_millis(10), t0);
+        s.note_circuit_failure_at(&b, t0 + HALF_HOUR + Duration::from_secs(1), HALF_HOUR);
+        s.note_circuit_failure_at(&b, t0 + 2 * HALF_HOUR + Duration::from_secs(2), HALF_HOUR);
+        assert_eq!(s.circuit_fails(&b), 2);
+        s.save().unwrap();
+
+        let loaded = BridgeStore::load(path).unwrap();
+        assert_eq!(
+            loaded.circuit_fails(&b),
+            2,
+            "cfails= persisted across save/load"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
