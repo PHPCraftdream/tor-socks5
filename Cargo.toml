@@ -69,9 +69,16 @@ codegen-units = 1
 ## builds today. Remove this block before publishing tor-socks5 (after
 ## ptrs-gesher 0.5.0 is on crates.io).
 [patch.crates-io]
-## DEBUG: instrumented tor-dirclient to log bytes received in dir reads.
+## Vendored, locally-fixed forks of three upstream crates. We keep the full
+## source in `vendor/` (see vendor/README.md) and override the crates.io
+## versions here, so the build is self-contained and does NOT depend on these
+## fixes being accepted upstream. Same-version overrides of the exact crates.io
+## releases we depend on — bump alongside any arti upgrade.
+##
+## tor-dirclient 0.43.0: idle (not total) read timeout for slow obfs4 bridges.
 tor-dirclient = { path = "vendor/tor-dirclient" }
-## DEBUG: tor-dirmgr with a hard timeout on the bridge-descriptor fetch.
+## tor-dirmgr 0.43.0: hard timeout on the bridge-descriptor fetch (it used to
+## hang forever) + patient, gentle retry/parallelism for the bridge pool.
 tor-dirmgr = { path = "vendor/tor-dirmgr" }
 ## FIX: saturating-time 0.3.0 `saturating_add`/`saturating_sub` eagerly force a
 ## non-terminating min/max search on Windows SystemTime — the root cause of an
