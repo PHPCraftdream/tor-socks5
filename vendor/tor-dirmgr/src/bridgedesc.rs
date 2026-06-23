@@ -140,15 +140,17 @@ impl Default for BridgeDescDownloadConfig {
     fn default() -> Self {
         let secs = Duration::from_secs;
         BridgeDescDownloadConfig {
+            // tor-socks5 local patch: fetch all configured bridges' descriptors
+            // concurrently. These are cheap one-hop fetches; letting them race
+            // means a reachable bridge gets its descriptor (→ becomes a usable
+            // Data guard) without waiting behind dead/slow bridges in the pool.
+            // (Bulk consensus/microdesc downloads are kept gentle separately,
+            // via the client's download_schedule, to avoid flooding bridges.)
             parallelism: 12.try_into().expect("parallelism is zero"),
-            // tor-socks5 local patch: the upstream 30s initial retry is too
-            // slow to recover a one-hop bridge-descriptor fetch that failed on
-            // a transient connection reset, leaving bridges "unsuitable to
-            // purpose" (dir_info_missing) for a long time. A 10s base retry is
-            // more responsive. Concurrency is kept LOW (2) on purpose: opening
-            // many simultaneous obfs4 channels to the small bridge pool trips
-            // the bridges' flood protection (forced reset, os 10054). Gentle
-            // and patient mirrors C-tor, which stays connected to these bridges.
+            // The upstream 30s initial retry is too slow to recover a one-hop
+            // fetch that failed on a transient reset, leaving a bridge
+            // "unsuitable to purpose" (dir_info_missing) for a long time; a 5s
+            // base retry is far more responsive.
             retry: secs(5),
             prefetch: secs(1000),
             min_refetch: secs(3600),
