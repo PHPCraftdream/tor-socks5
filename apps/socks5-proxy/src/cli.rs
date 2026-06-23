@@ -36,6 +36,7 @@ tor-socks5 users allow-onion alice      # grant .onion access to an existing use
 tor-socks5 bridges fetch                # fetch & merge fresh bridges over Tor\n  \
 tor-socks5 --upstream 127.0.0.1:9050    # egress via an upstream SOCKS5 instead of Tor\n  \
 tor-socks5 service install              # install as a system service\n  \
+tor-socks5 --daemon --pid-file /run/tor-socks5.pid   # run in the background (Unix only)\n  \
 tor-socks5 help --all                   # print the full bundled documentation\n\n\
 Run `tor-socks5 <command> --help` for command-specific options, or \
 `tor-socks5 help` to browse the bundled manuals."
@@ -62,6 +63,16 @@ pub(crate) struct Cli {
     /// (falls back to the Tor egress).
     #[arg(long)]
     pub(crate) no_upstream: bool,
+
+    /// Run in the background as a daemon (Unix only): detach from the
+    /// controlling terminal, redirect stdio to /dev/null. On Windows,
+    /// install as a service instead (`tor-socks5 service install`).
+    #[arg(long, short = 'd')]
+    pub(crate) daemon: bool,
+
+    /// Path to write the daemon's PID file (Unix only; used with --daemon).
+    #[arg(long, value_name = "PATH")]
+    pub(crate) pid_file: Option<PathBuf>,
 
     #[command(subcommand)]
     pub(crate) command: Option<Command>,

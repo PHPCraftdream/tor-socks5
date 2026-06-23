@@ -56,3 +56,40 @@ log.file: /var/log/tor-socks5.log
 ```
 
 See [logging](logging.md).
+
+## Daemon mode (Unix only)
+
+`--daemon` (short form `-d`) is an alternative to `service install` for running the proxy in the
+background **without** a supervisor. It is **Unix-only**: on Windows, `--daemon` errors out —
+install a service instead (`tor-socks5 service install`).
+
+```bash
+tor-socks5 --daemon
+tor-socks5 --daemon --pid-file /run/tor-socks5.pid
+```
+
+`--daemon` detaches from the controlling terminal (double-fork + `setsid`), redirects stdin,
+stdout, and stderr to `/dev/null`, and `chdir`s to `/`. `--pid-file <PATH>` writes the daemon's
+PID to a file, useful for `kill` or an init script. Because stdio is sent to `/dev/null`, set a
+file log sink in the config so daemon logs are captured — otherwise the proxy prints a warning on
+the original stderr before detaching and the records are lost:
+
+```ktav
+log.output: file
+log.file: /var/log/tor-socks5.log
+```
+
+### `--daemon` vs `service install`
+
+| | `--daemon` | `service install` |
+|---|---|---|
+| Backgrounds itself | yes | runs foreground under a supervisor |
+| Restart on crash | no | yes (supervisor policy) |
+| Start on boot | no | yes |
+| Windows | not supported | yes (SCM) |
+
+`service install` registers with systemd / launchd / `rc.d` / the Windows SCM, which handles
+supervision, automatic restart, and start-on-boot. For most servers, prefer `service install`.
+Reach for `--daemon` for quick background runs on a host where you do not want (or cannot) install
+a full service unit — e.g. an ad-hoc run from a shell, a container entrypoint without an init
+system, or a one-off behind a process supervisor that only needs a PID file.
