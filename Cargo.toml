@@ -43,6 +43,10 @@ rpassword = "7"
 clap = { version = "4.5", features = ["derive"] }
 service-manager = "0.11"
 
+# Unix-only: used by the socks5-proxy `--daemon` mode (fork/setsid/stdio
+# redirection via the `daemonize` crate). Pulled in only on `cfg(unix)`.
+daemonize = "0.5"
+
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
@@ -64,10 +68,6 @@ proptest = "1"
 lto = "thin"
 codegen-units = 1
 
-## TEMPORARY: ptrs-gesher 0.5.0 is not yet on crates.io. Patch the five
-## ptrs-gesher crates at the local sibling checkout so the workspace
-## builds today. Remove this block before publishing tor-socks5 (after
-## ptrs-gesher 0.5.0 is on crates.io).
 [patch.crates-io]
 ## Vendored, locally-fixed forks of three upstream crates. We keep the full
 ## source in `vendor/` (see vendor/README.md) and override the crates.io
@@ -86,8 +86,7 @@ tor-dirmgr = { path = "vendor/tor-dirmgr" }
 ## descriptors), which left every bridge "unsuitable to purpose" so no circuit
 ## could be built. Vendored with a lazy unwrap + a find_limit termination guard.
 saturating-time = { path = "vendor/saturating-time" }
-ptrs-gesher-bridge-line = { path = "../ptrs-gesher/crates/bridge-line" }
-ptrs-gesher-lyrebird    = { path = "../ptrs-gesher/crates/lyrebird" }
-ptrs-gesher-core        = { path = "../ptrs-gesher/crates/core" }
-ptrs-gesher-obfs4       = { path = "../ptrs-gesher/crates/obfs4" }
-ptrs-gesher-webtunnel   = { path = "../ptrs-gesher/crates/webtunnel" }
+## NOTE: ptrs-gesher 0.5.0 is published on crates.io and consumed directly
+## from there (see [workspace.dependencies] above) — no path override needed.
+## Our obfs4 fixes (handshake-residual, decode_eof, TCP keepalive) are part of
+## the published 0.5.0 release.
