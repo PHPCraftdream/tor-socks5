@@ -1,0 +1,99 @@
+# Release — build native socks5-proxy binaries on tag push and publish a GitHub Release.
+# Complements ci.yml (fmt/clippy/test on branch push & PR); this one fires only on `v*` tags.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release -p socks5-proxy --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: matrix.archive != 'zip'
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="target/${{ matrix.target }}/release/socks5-proxy"
+          archive="tor-socks5-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
+          # Rename to product name inside the archive.
+          tmp="$(mktemp -d)"
+          cp "$src" "$tmp/tor-socks5"
+          tar czf "$archive" -C "$tmp" tor-socks5
+          shasum -a 256 "$archive" > "$archive.sha256"
+
+      - name: Package (windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $src = "target/${{ matrix.target }}/release/socks5-proxy.exe"
+          $archive = "tor-socks5-${{ github.ref_name }}-${{ matrix.target }}.zip"
+          $tmp = New-Item -ItemType Directory -Path ([System.IO.Path]::GetTempPath() + [System.Guid]::NewGuid().ToString())
+          Copy-Item $src "$tmp/tor-socks5.exe"
+          Compress-Archive -Path "$tmp/tor-socks5.exe" -DestinationPath $archive
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
+          "$hash *$archive" | Out-File -NoNewline -Encoding ascii "$archive.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tor-socks5-${{ matrix.target }}
+          path: |
+            tor-socks5-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+            tor-socks5-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
+            tor-socks5-${{ github.ref_name }}-${{ matrix.target }}.zip
+            tor-socks5-${{ github.ref_name }}-${{ matrix.target }}.zip.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*/tor-socks5-*.tar.gz
+            artifacts/*/tor-socks5-*.tar.gz.sha256
+            artifacts/*/tor-socks5-*.zip
+            artifacts/*/tor-socks5-*.zip.sha256
+          fail_on_unmatched_files: true
