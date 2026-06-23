@@ -115,6 +115,9 @@ fn install(mgr: &dyn ServiceManager, config_override: Option<&Path>) -> Result<(
         println!("created default config at {}", config_path.display());
     }
 
+    // `args` is only mutated on Windows (the SCM marker push below); on other
+    // platforms that branch is compiled out, leaving the binding unmutated.
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut args: Vec<OsString> = vec!["--config".into(), config_path.clone().into_os_string()];
 
     // On Windows the service process must enter the SCM dispatcher; the
