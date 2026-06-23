@@ -1,6 +1,10 @@
 # tor-socks5
 
 [![CI](https://github.com/PHPCraftdream/tor-socks5/actions/workflows/ci.yml/badge.svg)](https://github.com/PHPCraftdream/tor-socks5/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/PHPCraftdream/tor-socks5/blob/main/LICENSE-MIT)
+[![MSRV](https://img.shields.io/badge/MSRV-1.89%2B-blue.svg)](https://www.rust-lang.org)
+![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-informational.svg)
+[![Release](https://img.shields.io/github/v/release/PHPCraftdream/tor-socks5?sort=semver&display_name=tag)](https://github.com/PHPCraftdream/tor-socks5/releases)
 
 A local **SOCKS5 proxy that tunnels TCP through Tor** — and **fetches and probes its own
 bridges** so it keeps working on censored networks without manual bridge wrangling.
