@@ -86,6 +86,6 @@ stay on the latest release.
 
 ## Credit
 
-We are happy to credit reporters in the CHANGELOG and release notes
-for responsibly disclosed vulnerabilities. If you prefer to remain
-anonymous, let us know in your report and we will respect that.
+We are happy to credit reporters in the release notes for responsibly
+disclosed vulnerabilities. If you prefer to remain anonymous, let us
+know in your report and we will respect that.
