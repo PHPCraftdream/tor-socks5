@@ -62,6 +62,15 @@ pub(crate) async fn run_server(
     install_crypto_provider();
     shutdown::bind_child_processes_to_self();
 
+    // The PT child (busybox dispatch, re-exec of this same binary) inherits
+    // our environment and sets up its own tracing subscriber independently
+    // of `cfg.log`. Propagate our own ansi choice via the NO_COLOR
+    // convention (https://no-color.org) so a `log.ansi: false` config also
+    // silences the child's colored output, not just ours.
+    if !cfg.log.ansi {
+        std::env::set_var("NO_COLOR", "1");
+    }
+
     info!(%source, "loaded configuration");
 
     // Load the users registry (sits next to the main config). The file

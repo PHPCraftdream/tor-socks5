@@ -1235,7 +1235,7 @@ checksum = "bd5850ec9ad2d9ba0aa33fb22c0b0ef4d91e524566be497ac2a6e40b847e67bb"
 dependencies = [
  "heck",
  "indexmap 2.14.0",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro-crate",
  "proc-macro2",
  "quote",
@@ -3322,18 +3322,18 @@ dependencies = [
 
 [[package]]
 name = "ptrs-gesher-bridge-line"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a36c1426bd38f2c7c455c3d930ad0c079b433d943dfc45e8517eb4e7f3171102"
+checksum = "fc7416a540556e40e3f80675a26d96aec0af2debde9b90c7c615e8f5d2bef209"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "ptrs-gesher-core"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20c844260c9d781c8db9e80da12e2062a8bd4ce3e1087a3ee985efa3ec3087f4"
+checksum = "1b6d9237164b21d2beaf74b23de67cf8ed382fd0f82e46a66d7709071a16f725"
 dependencies = [
  "futures",
  "itertools 0.14.0",
@@ -3346,9 +3346,9 @@ dependencies = [
 
 [[package]]
 name = "ptrs-gesher-lyrebird"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aafe69e6e9344fdcb681d1e5b0d15cd74cb50a62e8f9fa39312e256b1c2ec3ae"
+checksum = "f66756f2a338cb670181c420bc56bd1d449b175d46ff109016acc81c55ec4fb9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3370,9 +3370,9 @@ dependencies = [
 
 [[package]]
 name = "ptrs-gesher-obfs4"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b31861d7e5c12ce27088caf0c331c003c1a892bc0d807c9dd36bb702bb331cc"
+checksum = "8feb05dc766ab73b4b38fabf794f50a5ce8866cb2623567b300625fc39892712"
 dependencies = [
  "base64",
  "bytes",
@@ -3409,9 +3409,9 @@ dependencies = [
 
 [[package]]
 name = "ptrs-gesher-webtunnel"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "497cba8ae74ad47b6709de31aa5134981f258d32ed372d74ecf4a35146ccfa8d"
+checksum = "4659f4a12c1e031ae9cdfea02f62404b93793ba6afa56fbf6236165dd0b547e1"
 dependencies = [
  "base64",
  "getrandom 0.2.17",
@@ -4211,7 +4211,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32824fab5e16e6c4d86dc1ba84489390419a39f97699852b66480bb87d297ed8"
 dependencies = [
  "bstr",
- "dirs 6.0.0",
+ "dirs 4.0.0",
  "os_str_bytes",
 ]
 

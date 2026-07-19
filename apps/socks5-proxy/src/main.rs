@@ -25,6 +25,18 @@ use crate::cli::{Cli, Command};
 use crate::users_cli::RpasswordPrompt;
 
 fn main() -> Result<()> {
+    // Ask the console host to interpret ANSI/VT escape sequences. Windows
+    // Terminal already does this on its own pty layer, but classic conhost
+    // (still what plain `cmd.exe` attaches to on many setups) only does it
+    // if an application explicitly turns the flag on — nothing in our
+    // logging stack (tracing-subscriber / nu-ansi-term) does this for us,
+    // so colored log lines rendered as raw `\x1b[...m` bytes without it.
+    // This sets a property of the console *object*, not just our handle, so
+    // it also fixes the PT child's (lyrebird's) colored output, since that
+    // child inherits and writes to the same console.
+    #[cfg(windows)]
+    enable_windows_ansi_support();
+
     // Windows-service dispatch: when the Service Control Manager starts
     // us, the installed image path carries a marker argument. We must
     // hand control to the SCM dispatcher *before* building a Tokio
@@ -48,7 +60,13 @@ fn main() -> Result<()> {
     // entirely, and returns directly.
     if std::env::var_os("TOR_PT_MANAGED_TRANSPORT_VER").is_some() {
         let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(16)
+            // See the matching comment on the proxy-mode runtime below: a
+            // bursty client (e.g. Telegram opening dozens of simultaneous
+            // connections) drives just as many concurrent obfs4/webtunnel
+            // handshake attempts here, in the PT child. A small pool risks
+            // the same worker-starvation pattern that once stalled the
+            // bridge-descriptor fetch task.
+            .worker_threads(32)
             .enable_all()
             .build()
             .context("building Tokio runtime for pluggable-transport mode")?;
@@ -91,11 +109,41 @@ fn main() -> Result<()> {
         // its own 30s timeout never even firing (a tell-tale sign the future
         // was never being polled). A larger pool keeps workers available so
         // those tasks make progress and their timeouts actually arm.
-        .worker_threads(16)
+        //
+        // Raised 16 -> 32, confirmed by A/B burst-testing (a synthetic
+        // Telegram-style flood of dozens of simultaneous SOCKS5 connects):
+        // at 16 workers every guard was repeatedly driven to "unsuitable to
+        // purpose" (dir_info_missing) — 61 occurrences in one burst, even
+        // with a 22-bridge pool — reproducing the original bootstrap-time
+        // starvation bug at a larger, sustained scale. At 32 workers, the
+        // identical burst produced zero such occurrences.
+        .worker_threads(32)
         .enable_all()
         .build()
         .context("building Tokio runtime")?;
     rt.block_on(async_main(cli))
+}
+
+/// Turn on `ENABLE_VIRTUAL_TERMINAL_PROCESSING` on the process's console, if
+/// it has one, so ANSI escape sequences render as color instead of raw
+/// bytes. A no-op (not an error) when stderr is redirected to a file/pipe —
+/// `GetConsoleMode` simply fails for a non-console handle, which we ignore.
+#[cfg(windows)]
+fn enable_windows_ansi_support() {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        STD_ERROR_HANDLE,
+    };
+    // SAFETY: GetStdHandle/GetConsoleMode/SetConsoleMode are plain FFI calls
+    // on a well-known standard-handle constant; every return value is
+    // checked before use and nothing here dereferences a pointer.
+    unsafe {
+        let handle = GetStdHandle(STD_ERROR_HANDLE);
+        let mut mode = 0u32;
+        if GetConsoleMode(handle, &mut mode) != 0 {
+            SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        }
+    }
 }
 
 /// If `log.output` is `stdout` or `stderr`, print a warning to the *original*
