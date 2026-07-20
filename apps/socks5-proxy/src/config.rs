@@ -28,6 +28,8 @@ pub struct Config {
     pub log: LogConfig,
     /// Bridges configuration.
     pub bridges: BridgesConfig,
+    /// Stale-channel watchdog configuration.
+    pub watchdog: WatchdogConfig,
     /// Optional upstream SOCKS5 proxy used as the egress instead of Tor.
     pub upstream: UpstreamConfig,
 }
@@ -60,6 +62,43 @@ impl std::fmt::Debug for UpstreamConfig {
             .field("username", &self.username)
             .field("password", &"<redacted>")
             .finish()
+    }
+}
+
+/// Stale-channel watchdog: detects Tor channels left half-open by a
+/// silent network change (no carrier/IEEE event reaches arti, so
+/// `tor-chanmgr` never expires the channel and `TorClient::connect`
+/// keeps failing against a dead guard) and rebuilds the `TorClient`
+/// without restarting the process. See `tor_watchdog.rs`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WatchdogConfig {
+    /// Master switch. Default `true`.
+    pub enabled: bool,
+    /// Seconds between watchdog checks. Default `45` (every check reads
+    /// a few atomics and the bridge store — cheap enough to run this
+    /// often).
+    pub check_interval_secs: u64,
+    /// Seconds without a successful Tor `connect` (while attempts are
+    /// still being made) before the watchdog rebuilds the `TorClient`.
+    /// Default `180` (3 min): long enough to ride out a slow circuit
+    /// build, short enough that a user does not sit on dead channels
+    /// for many minutes.
+    pub stale_after_secs: u64,
+    /// Minimum seconds between two `TorClient` rebuilds. Default `300`
+    /// (5 min): if a rebuild did not help (a real network block, not a
+    /// stale channel), this prevents a rebuild storm.
+    pub rebuild_cooldown_secs: u64,
+}
+
+impl Default for WatchdogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            check_interval_secs: 45,
+            stale_after_secs: 180,
+            rebuild_cooldown_secs: 300,
+        }
     }
 }
 
@@ -251,6 +290,7 @@ impl Default for Config {
             listen: "127.0.0.1:1080".to_string(),
             log: LogConfig::default(),
             bridges: BridgesConfig::default(),
+            watchdog: WatchdogConfig::default(),
             upstream: UpstreamConfig::default(),
         }
     }

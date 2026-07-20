@@ -27,13 +27,43 @@
 //! - `"Guard status changed."`  → `usable = (new == "Reachable")`; events
 //!   with `new = "Untried"` (initial state) are ignored.
 //!
-//! **Known limitation.** arti 0.43 does NOT emit any per-guard event when
-//! a configured bridge is rejected at the **purpose-filter** stage of
-//! `select_guard` (the aggregate `"Couldn't select guard ... N/M as
-//! unsuitable to purpose"` is not per-guard structured). That class of
-//! rejection — typically a descriptor/fingerprint mismatch — is invisible
-//! to this layer; the TCP-probe failure counter remains the only signal
-//! for it. See `docs/bridges.md`.
+//! **Known limitation — purpose-filter rejection.** arti 0.43 does NOT
+//! emit any per-guard event when a configured bridge is rejected at the
+//! **purpose-filter** stage of `select_guard` (the aggregate `"Couldn't
+//! select guard ... N/M as unsuitable to purpose"` is not per-guard
+//! structured). That class of rejection — typically a descriptor/
+//! fingerprint mismatch — is invisible to this layer; the TCP-probe
+//! failure counter remains the only signal for it. See `docs/bridges.md`.
+//!
+//! **Known limitation — channel & PT-handshake timeouts.** A bridge whose
+//! TCP works but whose obfs4/webtunnel handshake times out (the live
+//! signature: `lyrebird: handshake failed: HandshakeTimeout` plus
+//! `tor_chanmgr`'s `Channel for [scrubbed] timed out`) is **not** linkable
+//! to a specific bridge through this layer. Verified against arti 0.43:
+//!
+//! * `tor-chanmgr`/`tor-circmgr` wrap the failing peer in
+//!   `LoggedChanTarget`, which is `safelog::BoxSensitive<OwnedChanTarget>`
+//!   (`tor-linkspec-0.43/src/owned.rs`): its Display/Debug render as
+//!   `[scrubbed]`, so neither the address nor the fingerprint is
+//!   recoverable from the error — by design.
+//! * every `tor-chanmgr` `#[instrument]` uses `skip_all`, so the channel
+//!   target never appears as a typed field either, only in the scrubbed
+//!   Display message.
+//! * `tor-ptmgr` re-emits the PT child's own log lines as free-form
+//!   messages (`"[pt {}] {}", pt_name, message`, `tor-ptmgr-0.43/src/
+//!   ipc.rs`) carrying only the PT *name* as structure — the `address=`
+//!   substring is unstructured text controlled by the child binary, not a
+//!   typed field and not a fingerprint.
+//!
+//! A `handshake_fails` counter fed from these events is therefore not
+//! buildable without either disabling arti's safe-logging (a security
+//! regression) or free-text-scraping the PT child's message (brittle,
+//! child-controlled and unversioned). The only fingerprint-linked failure
+//! signal remains the guardmgr reachability transition captured here into
+//! `circuit_fails` — which is why a TCP-alive / handshake-dead bridge is
+//! pruned slowly (rate-limited: one bump per
+//! `circuit_observation_window`, threshold `max_circuit_fails`), not
+//! instantly.
 //!
 //! We install a [`tracing_subscriber::Layer`] that listens for these
 //! events (and only these), extracts the RSA identity fingerprint from

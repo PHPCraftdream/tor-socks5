@@ -14,6 +14,7 @@ mod shutdown;
 mod socks5;
 mod startup;
 mod tor_setup;
+mod tor_watchdog;
 mod upstream;
 mod users_cli;
 

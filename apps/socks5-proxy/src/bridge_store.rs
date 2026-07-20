@@ -400,6 +400,16 @@ impl BridgeStore {
         self.entries.len()
     }
 
+    /// Number of bridges currently in a healthy TCP state (`fails == 0`)
+    /// per the last probe round. Surfaced for the stale-channel watchdog,
+    /// which must distinguish "all circuits fail but bridges are
+    /// reachable" (stale channels → rebuild the client) from "bridges are
+    /// genuinely unreachable" (the bridge maintenance loop's own job).
+    #[must_use]
+    pub fn alive_count(&self) -> usize {
+        self.entries.values().filter(|e| e.fails == 0).count()
+    }
+
     /// Cumulative successful-probe count for a bridge (0 if unknown). This
     /// is the persistent stability signal used to order bridges for arti:
     /// a higher count means the bridge has proven reachable more often.

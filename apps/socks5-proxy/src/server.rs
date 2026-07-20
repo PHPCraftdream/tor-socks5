@@ -15,6 +15,7 @@ use crate::config::{Config, Loaded, UpstreamConfig};
 use crate::socks5::{self, Reply};
 use crate::startup::{init_tracing, install_crypto_provider};
 use crate::tor_setup::build_tor_settings;
+use crate::tor_watchdog::{spawn_tor_watchdog, TorHandle};
 use crate::{shutdown, upstream};
 
 /// Maximum concurrent SOCKS5 connections. Each may run an Argon2id verify
@@ -26,7 +27,7 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 /// replaces Tor entirely.
 #[derive(Clone)]
 enum Egress {
-    Tor(TorTunnel),
+    Tor(TorHandle),
     Upstream(Arc<upstream::Upstream>),
 }
 
@@ -132,23 +133,38 @@ pub(crate) async fn run_server(
             // (or fell back to seeds), top up the working list in the
             // background — drain the candidate pool first, fetching fresh
             // candidates over the now-live Tor only if the pool is short.
+            // One-shot: takes a direct `TorTunnel` clone and runs to
+            // completion long before the watchdog could ever fire.
             let deficit = cfg.bridges.min_alive.saturating_sub(alive);
             if cfg.bridges.auto_fetch && deficit > 0 {
                 spawn_auto_fetch(tor.clone(), cfg.clone(), config_path.clone(), deficit);
             }
 
+            // Single indirection point for the live `TorClient`: the accept
+            // loop and the maintenance loop read the *current* tunnel
+            // through this handle, so a watchdog rebuild becomes visible to
+            // both without re-distribution. Cheap to clone (one
+            // `Arc<RwLock<_>>` + two atomics).
+            let handle = TorHandle::new(tor);
+
             // Periodic upkeep: re-probe, prune dead bridges, top up when short,
             // drain circuit-layer observations from arti's tracing into the
             // health store so descriptor-mismatch / unsuitable bridges are
-            // pruned alongside the TCP-dead ones.
+            // pruned alongside the TCP-dead ones. Reads the tunnel through
+            // the handle so pool refreshes follow a watchdog rebuild.
             spawn_bridge_maintenance(
-                tor.clone(),
+                handle.clone(),
                 config_path.clone(),
                 cfg.bridges.recheck_interval_mins,
                 obs_sink.clone(),
             );
 
-            Egress::Tor(tor)
+            // Stale-channel watchdog: rebuilds the `TorClient` when circuits
+            // keep failing against TCP-reachable bridges (the half-open
+            // channel scenario). Detached; disabled by config when unwanted.
+            spawn_tor_watchdog(handle.clone(), config_path.clone(), cfg.watchdog);
+
+            Egress::Tor(handle)
         }
     };
 
@@ -167,14 +183,14 @@ pub(crate) async fn run_server(
         }
     }
 
-    // For the Tor egress, dropping the tunnel triggers `tor-ptmgr` to
-    // terminate PT subprocesses and releases arti's exclusive lock on its
-    // state directory. The Job Object installed at startup kills anything
-    // that leaks past this point. The upstream egress holds no such
-    // resources.
-    if let Egress::Tor(tor) = egress {
+    // For the Tor egress, draining the handle takes the tunnel out of the
+    // shared slot; dropping it triggers `tor-ptmgr` to terminate PT
+    // subprocesses and releases arti's exclusive lock on its state
+    // directory. The Job Object installed at startup kills anything that
+    // leaks past this point. The upstream egress holds no such resources.
+    if let Egress::Tor(handle) = egress {
         info!("stopping Tor client and pluggable transports");
-        drop(tor);
+        drop(handle.drain().await);
         // Give arti's reactor a brief moment to flush the shutdown.
         // Empirically this is enough for the state-dir lock to be released
         // before the next run starts.
@@ -279,10 +295,29 @@ async fn handle_client(
     }
 
     match egress {
-        Egress::Tor(tor) => {
+        Egress::Tor(handle) => {
             info!(host = ?req.host, port = req.port, "tunneling through Tor");
+            // Read the *current* tunnel through the handle: a watchdog
+            // rebuild swaps the slot, and new connections must pick up the
+            // replacement. Returns None only while the server is draining
+            // the slot at shutdown.
+            let tor = match handle.tunnel().await {
+                Some(t) => t,
+                None => {
+                    socks5::reply(&mut client, Reply::GeneralFailure).await.ok();
+                    bail!("tor tunnel unavailable (shutting down?)");
+                }
+            };
+            // Feed the watchdog: every attempt bumps the counter (so it can
+            // tell "no traffic" from "circuits failing"), a success stamps
+            // the last-good time it compares against.
+            handle.health().record_attempt();
             let tor_stream = match tor.connect(&req.host, req.port).await {
-                Ok(s) => s,
+                Ok(s) => {
+                    handle.health().record_success();
+                    info!(host = ?req.host, port = req.port, "tor connection established");
+                    s
+                }
                 Err(e) => {
                     // We don't try to map the underlying cause to a specific
                     // SOCKS5 code; GeneralFailure is enough to tell the client
@@ -366,7 +401,7 @@ fn spawn_auto_fetch(
 /// interval, bounded-concurrency probing, the once-per-window failure
 /// counter, and a top-up fetch only when actually short.
 fn spawn_bridge_maintenance(
-    tor: TorTunnel,
+    handle: TorHandle,
     config_path: Option<std::path::PathBuf>,
     interval_mins: u64,
     obs_sink: crate::arti_observability::ObservationSink,
@@ -422,16 +457,20 @@ fn spawn_bridge_maintenance(
             if cfg.bridges.auto_fetch && !cfg.bridges.sources.is_empty() {
                 // Periodically refresh the candidate pool from the sources
                 // (over Tor) — keeps it fresh and drops anything that has
-                // since become a working bridge.
-                if let Err(e) = crate::fetch_merge::refresh_candidate_pool(
-                    &tor,
-                    &cfg,
-                    config_path.as_deref(),
-                    Duration::from_secs(30),
-                )
-                .await
-                {
-                    warn!(error = %e, "maintenance: pool refresh failed");
+                // since become a working bridge. Snapshot the *current*
+                // tunnel through the handle so a refresh follows a watchdog
+                // rebuild rather than pinning the dying original.
+                if let Some(tor) = handle.tunnel().await {
+                    if let Err(e) = crate::fetch_merge::refresh_candidate_pool(
+                        &tor,
+                        &cfg,
+                        config_path.as_deref(),
+                        Duration::from_secs(30),
+                    )
+                    .await
+                    {
+                        warn!(error = %e, "maintenance: pool refresh failed");
+                    }
                 }
             }
 
