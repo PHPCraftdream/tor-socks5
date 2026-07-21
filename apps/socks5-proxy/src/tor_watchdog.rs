@@ -133,14 +133,17 @@ impl TorHandle {
     }
 }
 
-/// Hard cap on a single rebuild attempt. On a fully-blocked network a
-/// fresh `dirmgr` bootstrap never completes, and a bare `.await` would
-/// leave the half-built second `TorClient` (and its PT children) racing
-/// the old one for the same tokio runtime and busybox PT — observed in
-/// production as three `tor-socks5.exe` processes instead of two.
-/// Timing out drops the in-flight future, cancelling arti's half-built
-/// bootstrap; PT subprocess cleanup itself is not instantaneous (see the
-/// note at the `timeout(...)` call site below).
+/// Hard cap on how long a single rebuild attempt waits for the network
+/// bootstrap to finish. On a fully-blocked network a fresh `dirmgr`
+/// bootstrap never completes. Unlike a bare `.await` around the whole
+/// rebuild (which would lose the only reference to an already-constructed
+/// `TorClient`, orphaning its detached background tasks and any spawned PT
+/// child), this timeout wraps only the network-wait phase (see
+/// [`rebuild`]): the `TorTunnel` itself is constructed synchronously first
+/// and stays fully owned by the caller even when the wait times out, so it
+/// can be explicitly dropped instead of leaked. PT subprocess cleanup on
+/// that drop is still not instantaneous (see the note at the `rebuild(...)`
+/// call site below).
 const REBUILD_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Once this many rebuilds fail in a row (timeout or error), the watchdog
@@ -205,6 +208,13 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
         // [`EXTENDED_REBUILD_COOLDOWN`] so a fully-blocked network is not
         // hammered. Reset to 0 on the first successful rebuild.
         let mut consecutive_failures: u32 = 0;
+        // Which rebuild slot is currently live, if any rebuild has ever
+        // succeeded. `None` means the original (primary state-dir) client
+        // from startup is still live. Only updated on a *successful*
+        // rebuild — a failed attempt leaves whatever is actually live
+        // unchanged, so the next attempt still computes the correct (free)
+        // target instead of retrying the same collision.
+        let mut live_slot: Option<RebuildSlot> = None;
 
         loop {
             ticker.tick().await;
@@ -273,12 +283,20 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
                  channels from a network change"
             );
 
-            // Bound the rebuild: a bootstrap that can't finish within this
-            // window is on a fully-blocked network and will never return; a
-            // bare `.await` would leave a second TorClient (and its PT
-            // children) racing the old one for the same runtime resources.
-            // Timing out drops the in-flight future, cancelling the
-            // half-built bootstrap. Note this is not an *immediate* PT
+            // Always target the slot that is NOT currently live, so this
+            // rebuild can never collide with the state-dir lock of whatever
+            // client is presently serving connections (see `RebuildSlot`).
+            let target_slot = match live_slot {
+                None => RebuildSlot::A,
+                Some(live) => live.other(),
+            };
+
+            // `rebuild` itself bounds only the network-wait phase with
+            // REBUILD_TIMEOUT (see its doc comment and body): construction
+            // of the `TorTunnel` is synchronous and always fully succeeds or
+            // fails outright, so a timeout here can never strand an unowned
+            // half-built client. On `TimedOut` we still hold the `TorTunnel`
+            // and explicitly drop it below — not an *immediate* PT
             // subprocess reap: tor-ptmgr's cleanup only fires the next time
             // the child writes another stdout line and its forwarding thread
             // notices the receiver is gone (ipc.rs in tor-ptmgr — no
@@ -286,10 +304,11 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
             // retries/timeouts), so this tends to happen soon, but it is not
             // guaranteed instantly; any process that outlives this is still
             // bounded by the startup Job Object on process exit.
-            match tokio::time::timeout(REBUILD_TIMEOUT, rebuild(config_path.as_deref())).await {
-                Ok(Ok(new_tor)) => {
+            match rebuild(config_path.as_deref(), target_slot).await {
+                Ok(RebuildOutcome::Ready(new_tor)) => {
                     handle.swap(new_tor).await;
                     last_rebuild = Some(Instant::now());
+                    live_slot = Some(target_slot);
                     if consecutive_failures > 0 {
                         info!(
                             prior_consecutive_failures = consecutive_failures,
@@ -299,24 +318,14 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
                     consecutive_failures = 0;
                     info!("tor stale-channel watchdog: TorClient rebuilt and swapped in");
                 }
-                Ok(Err(e)) => {
-                    // Count the failure and set the cooldown either way so a
-                    // persistently unreachable network does not trigger a
-                    // rebuild storm. `next_cooldown` reports what will gate
-                    // the *next* attempt after this bump.
-                    consecutive_failures = consecutive_failures.saturating_add(1);
-                    last_rebuild = Some(Instant::now());
-                    warn!(
-                        error = %e,
-                        consecutive_failures,
-                        threshold = CONSECUTIVE_FAILURES_BEFORE_BACKOFF,
-                        next_cooldown_secs = next_cooldown(consecutive_failures, cooldown).as_secs(),
-                        "tor stale-channel watchdog: rebuild failed — will retry after cooldown"
-                    );
-                }
-                Err(_elapsed) => {
-                    // Timeout: the rebuild future has been dropped, cancelling
-                    // the half-built bootstrap. Same treatment as an error.
+                Ok(RebuildOutcome::TimedOut(tor)) => {
+                    // Controlled drop of a fully-owned value — not an
+                    // orphaning cancellation. `tor` was never lost to an
+                    // external future-cancellation, so this relies on
+                    // arti's normal, already-working Drop-based cleanup
+                    // (the same mechanism the graceful-shutdown path in
+                    // `server.rs` already uses successfully).
+                    drop(tor);
                     consecutive_failures = consecutive_failures.saturating_add(1);
                     last_rebuild = Some(Instant::now());
                     warn!(
@@ -326,12 +335,78 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
                         next_cooldown_secs =
                             next_cooldown(consecutive_failures, cooldown).as_secs(),
                         "tor stale-channel watchdog: rebuild timed out — dropped the \
-                         half-built bootstrap to avoid a second live TorClient"
+                         fully-owned half-bootstrapped client"
+                    );
+                }
+                Err(e) => {
+                    // Count the failure and set the cooldown either way so a
+                    // persistently unreachable network does not trigger a
+                    // rebuild storm. `next_cooldown` reports what will gate
+                    // the *next* attempt after this bump.
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    last_rebuild = Some(Instant::now());
+                    warn!(
+                        // `{:#}` (not `%e`/Display) walks anyhow's full
+                        // `.context()` chain — the top-level message alone
+                        // ("re-bootstrapping Tor client") hid the actual
+                        // cause in production and made a state-dir lock
+                        // collision indistinguishable from a real bootstrap
+                        // failure.
+                        error = format!("{:#}", e),
+                        consecutive_failures,
+                        threshold = CONSECUTIVE_FAILURES_BEFORE_BACKOFF,
+                        next_cooldown_secs =
+                            next_cooldown(consecutive_failures, cooldown).as_secs(),
+                        "tor stale-channel watchdog: rebuild failed — will retry after cooldown"
                     );
                 }
             }
         }
     });
+}
+
+/// One of two dedicated rebuild state-dirs the watchdog ping-pongs between.
+///
+/// A single fixed sibling dir was tried first and failed in production: the
+/// *first* rebuild moved the live client off the primary dir and into that
+/// sibling, but every rebuild *after* that targeted the same sibling — which
+/// was by then the live, in-use directory — and collided with its own
+/// exclusive lock, failing in ~5s every time (not the 90s timeout; an
+/// outright lock error). Two slots, always targeting whichever one is *not*
+/// currently live, avoids that self-collision indefinitely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RebuildSlot {
+    A,
+    B,
+}
+
+impl RebuildSlot {
+    fn dir_name(self) -> &'static str {
+        match self {
+            RebuildSlot::A => "watchdog-rebuild-a",
+            RebuildSlot::B => "watchdog-rebuild-b",
+        }
+    }
+
+    fn other(self) -> Self {
+        match self {
+            RebuildSlot::A => RebuildSlot::B,
+            RebuildSlot::B => RebuildSlot::A,
+        }
+    }
+}
+
+/// Outcome of one rebuild attempt.
+enum RebuildOutcome {
+    /// Bootstrap finished; here is the ready tunnel.
+    Ready(TorTunnel),
+    /// Bootstrap did not finish within [`REBUILD_TIMEOUT`], but — unlike the
+    /// old single-phase design — we still fully own the client (it was never
+    /// lost to an external future-cancellation); the caller decides what to
+    /// do with it (currently: drop it explicitly, which is a safe,
+    /// controlled drop of a fully-owned value, not an orphaning
+    /// cancellation).
+    TimedOut(TorTunnel),
 }
 
 /// Re-run the startup bootstrap path against the current config and return
@@ -340,26 +415,38 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
 /// bridges — exactly the reset arti has no public API for.
 ///
 /// **State dir.** arti holds an *exclusive* lock on its state directory. The
-/// dying client we are replacing still holds the primary `arti-data` lock
-/// (its clones drain only as in-flight connections finish, which on
-/// half-open channels is not prompt). Bootstrapping the replacement against
-/// the same dir would therefore deadlock on that lock. We point the
-/// replacement at a sibling subdir (`arti-data/watchdog-rebuild`) instead:
-/// distinct lock file, no contention, and reused across rebuilds — by the
-/// time the cooldown permits the next rebuild, the previous replacement's
-/// in-flight connections have failed on dead circuits and released its lock.
-async fn rebuild(config_path: Option<&Path>) -> anyhow::Result<TorTunnel> {
+/// dying client we are replacing still holds its own lock (its clones drain
+/// only as in-flight connections finish, which on half-open channels is not
+/// prompt). Bootstrapping the replacement into the *same* dir would
+/// therefore deadlock (or, in practice, fail fast on the lock). The caller
+/// passes the [`RebuildSlot`] that is *not* currently live, so this always
+/// targets a free directory regardless of how many rebuilds have happened.
+///
+/// **Two-phase construction.** `TorTunnel::create_unbootstrapped_with` is
+/// synchronous — it either returns a fully owned client or fails outright,
+/// with no `.await` in between to be cancelled mid-way. Only the subsequent
+/// network wait (`tor.wait_bootstrapped()`) is wrapped in
+/// [`REBUILD_TIMEOUT`]; if that times out, the caller still gets the fully
+/// owned `TorTunnel` back via [`RebuildOutcome::TimedOut`] instead of losing
+/// it to a cancelled future, which used to orphan its detached background
+/// tasks (and any already-spawned PT child process).
+async fn rebuild(
+    config_path: Option<&Path>,
+    target: RebuildSlot,
+) -> anyhow::Result<RebuildOutcome> {
     let cfg = crate::config::Config::load_with_override(config_path)?.into_config();
     let mut settings = build_tor_settings(&cfg, config_path)
         .await
         .context("rebuilding tor settings")?;
     if let Some(primary) = settings.state_dir.as_ref() {
-        settings.state_dir = Some(primary.join("watchdog-rebuild"));
+        settings.state_dir = Some(primary.join(target.dir_name()));
     }
-    let tor = TorTunnel::bootstrap_with(settings)
-        .await
-        .context("re-bootstrapping Tor client")?;
-    Ok(tor)
+    let tor = TorTunnel::create_unbootstrapped_with(settings).context("constructing Tor client")?;
+    match tokio::time::timeout(REBUILD_TIMEOUT, tor.wait_bootstrapped()).await {
+        Ok(Ok(())) => Ok(RebuildOutcome::Ready(tor)),
+        Ok(Err(e)) => Err(e).context("re-bootstrapping Tor client"),
+        Err(_elapsed) => Ok(RebuildOutcome::TimedOut(tor)),
+    }
 }
 
 /// Number of bridges in a healthy TCP state (`fails == 0`) per the last

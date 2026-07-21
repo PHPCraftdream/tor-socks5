@@ -112,6 +112,51 @@ impl TorTunnel {
     pub fn raw(&self) -> &TorClient<PreferredRuntime> {
         &self.inner
     }
+
+    /// Construct a `TorClient` without waiting for network bootstrap.
+    ///
+    /// Synchronous — no `.await` inside, so nothing external can cancel it
+    /// mid-construction; it either returns a fully owned client or an error,
+    /// atomically. Pair with [`wait_bootstrapped`](Self::wait_bootstrapped)
+    /// to actually reach a usable directory; unlike
+    /// [`bootstrap_raw`](Self::bootstrap_raw), the two steps are separate
+    /// `await` points, so a timeout wrapped around only the second one can
+    /// never strand an unowned, half-built client with detached background
+    /// tasks (chanmgr/circmgr/dirmgr/ptmgr) — the caller always keeps the
+    /// `TorTunnel` value and can explicitly `drop` it.
+    pub fn create_unbootstrapped(config: TorClientConfig) -> Result<Self> {
+        // Mirrors `TorClient::create_bootstrapped`'s own runtime lookup,
+        // including its panic-on-no-runtime `.expect(...)` semantics — this
+        // app always runs inside a tokio runtime, so that's consistent, not
+        // a new risk.
+        let runtime = PreferredRuntime::current().expect(
+            "TorClient could not get an asynchronous runtime; are you running in the right context?",
+        );
+        let client = TorClient::with_runtime(runtime)
+            .config(config)
+            .create_unbootstrapped()
+            .map_err(TorError::Bootstrap)?;
+        Ok(Self { inner: client })
+    }
+
+    /// Settings-based convenience mirror of `bootstrap_with`, but synchronous
+    /// and without waiting for the network — parallels
+    /// [`create_unbootstrapped`](Self::create_unbootstrapped) the way
+    /// `bootstrap_with` parallels `bootstrap_raw`.
+    pub fn create_unbootstrapped_with(settings: Settings) -> Result<Self> {
+        let config = build_config(&settings)?;
+        Self::create_unbootstrapped(config)
+    }
+
+    /// Wait for the client to reach a usable directory.
+    ///
+    /// Safe to wrap in an external timeout: cancelling this future only
+    /// abandons the *wait* — the `TorTunnel` itself (owned separately by the
+    /// caller, outside this future) is untouched and can be retried or
+    /// dropped explicitly afterward.
+    pub async fn wait_bootstrapped(&self) -> Result<()> {
+        self.inner.bootstrap().await.map_err(TorError::Bootstrap)
+    }
 }
 
 fn build_config(settings: &Settings) -> Result<TorClientConfig> {
