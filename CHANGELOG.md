@@ -53,6 +53,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both the main proxy runtime and the pluggable-transport child runtime;
   confirmed via A/B burst-testing (61 guard-exhaustion occurrences at 16
   workers vs. 0 at 32, identical bridge pool).
+- The watchdog's rebuild always targeted the same fixed sibling state
+  directory (`arti-data/watchdog-rebuild`). This worked for exactly one
+  rebuild — after the first success moved the live client into that
+  directory, every subsequent rebuild collided with its exclusive lock and
+  failed fast (~5s) instead of actually retrying, observed live as 9
+  consecutive `rebuild failed` events with a climbing
+  `consecutive_failures` count. Fixed by alternating between two sibling
+  directories (`watchdog-rebuild-a`/`-b`), always targeting whichever one
+  is not currently live.
+- The rebuild's 90s timeout wrapped the entire bootstrap call
+  (`TorClient::create_bootstrapped`), a single `async` function that
+  synchronously spawns several detached background tasks (channel/circuit/
+  directory/PT managers) before it can return a value. Cancelling that
+  future on timeout dropped the only reference to the half-constructed
+  client, but the detached tasks — and any already-spawned PT child
+  process — kept running ownerless for the life of the process, observed
+  live as extra near-zero-memory `tor-socks5.exe` processes accumulating
+  after repeated watchdog timeouts. Fixed by switching to the two-phase
+  bootstrap API `arti-client` already exposes
+  (`create_unbootstrapped()` — synchronous, cannot be cancelled mid-way —
+  followed by a separately-timed `.bootstrap()`): a timeout now only
+  abandons the network-wait, never ownership, so a timed-out client is
+  explicitly and safely dropped instead of leaked.
 
 ### Known limitations
 
