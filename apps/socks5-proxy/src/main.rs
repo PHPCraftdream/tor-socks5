@@ -60,6 +60,45 @@ fn main() -> Result<()> {
     // must NEVER daemonise, so it is handled here, out of the clap path
     // entirely, and returns directly.
     if std::env::var_os("TOR_PT_MANAGED_TRANSPORT_VER").is_some() {
+        // arti (tor-ptmgr) sets TOR_PT_EXIT_ON_STDIN_CLOSE=1 on managed PT
+        // children and, per the pluggable-transport spec, signals shutdown by
+        // closing the child's stdin: the child is required to exit on EOF.
+        // `ptrs-gesher-lyrebird` 0.5.1 does not honour this (the detection
+        // helper exists in ptrs-gesher-core but nothing calls it — unlike
+        // Go's lyrebird, which does implement it), so `lyrebird::run()` below
+        // just blocks forever once launched. Every watchdog-triggered rebuild
+        // that drops the parent's `TorClient` therefore leaks a permanent
+        // zombie PT child (16 of them were found accumulated in production).
+        // Work around it here with our own blocking stdin-EOF watcher, on a
+        // plain OS thread (not a Tokio task) so it keeps running and can
+        // still call `process::exit` even if the PT runtime below wedges.
+        if std::env::var("TOR_PT_EXIT_ON_STDIN_CLOSE").as_deref() == Ok("1") {
+            std::thread::spawn(|| {
+                use std::io::Read;
+
+                let mut buf = [0u8; 64];
+                loop {
+                    match std::io::stdin().read(&mut buf) {
+                        Ok(0) | Err(_) => {
+                            // Tracing is not guaranteed to be initialised in PT-child
+                            // mode (the subscriber is set up later, in the proxy-mode
+                            // startup path, which this branch never reaches), so use
+                            // eprintln! here rather than `tracing::info!` to make sure
+                            // the message isn't silently dropped.
+                            eprintln!(
+                                "stdin closed by parent — exiting per TOR_PT_EXIT_ON_STDIN_CLOSE"
+                            );
+                            std::process::exit(0);
+                        }
+                        Ok(_) => {
+                            // PT stdin isn't used for data per the spec; keep draining
+                            // it so we still notice the eventual EOF.
+                        }
+                    }
+                }
+            });
+        }
+
         let rt = tokio::runtime::Builder::new_multi_thread()
             // See the matching comment on the proxy-mode runtime below: a
             // bursty client (e.g. Telegram opening dozens of simultaneous

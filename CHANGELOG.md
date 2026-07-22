@@ -76,6 +76,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   followed by a separately-timed `.bootstrap()`): a timeout now only
   abandons the network-wait, never ownership, so a timed-out client is
   explicitly and safely dropped instead of leaked.
+- Even with the two-phase bootstrap fix above, dropping a `TorClient` still
+  left its pluggable-transport child process running forever: arti sets
+  `TOR_PT_EXIT_ON_STDIN_CLOSE=1` and closes the child's stdin as its
+  shutdown signal, but our PT child (`ptrs-gesher-lyrebird` 0.5.1, run via
+  busybox dispatch of our own binary) never reads stdin at all — the
+  detection helper exists in `ptrs-gesher-core` but nothing calls it,
+  unlike upstream Go lyrebird. Every watchdog-triggered rebuild therefore
+  leaked one more permanent zombie process; 16 were found accumulated on
+  one production deployment. Fixed with a small dedicated OS thread in the
+  PT-child branch that blocks on `stdin` and calls `process::exit(0)` on
+  EOF, restoring the contract our own binary is supposed to honor as a PT
+  child regardless of what the pluggable-transport crate does.
 
 ### Known limitations
 
