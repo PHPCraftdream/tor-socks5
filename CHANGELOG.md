@@ -104,6 +104,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tor-persist` itself locks with) so a rebuild always lands on a slot
   that is genuinely free right now, tolerating however many prior
   generations are still draining, up to the size of the pool.
+- The watchdog could rebuild into a self-inflicted outage: a rebuilt
+  `TorClient` lands in a cold rebuild-slot directory whose bridge-descriptor
+  cache starts empty, so its guards report "unsuitable to purpose" for
+  several minutes while it re-fetches descriptors over the network — but
+  arti's readiness signal only covers directory bootstrap, not bridge
+  descriptors, so the watchdog swapped this in immediately, replacing a
+  live (if degraded) client with one guaranteed unable to carry traffic.
+  One production incident saw a 12-minute outage this way, and the
+  watchdog's own periodic re-triggering (since the swapped-in client also
+  couldn't recover) made it worse rather than better. Fixed on four fronts:
+  a canary check retries the most recent successful `(host, port)` through
+  the rebuilt client before trusting it enough to swap in (a failed canary
+  now keeps the old client running instead); every failed `TorTunnel::
+  connect` is classified by `tor_error::ErrorKind` into three buckets
+  (exit-side timeout, guard/descriptor exhaustion, genuine circuit-build
+  timeout), and the watchdog now declines to rebuild when the window is
+  dominated by the first two — a rebuild cannot fix either, and for
+  guard exhaustion it actively reproduces it; the rebuild's target slot has
+  its bridge-descriptor cache warmed from the primary directory before
+  construction, so it starts with the same advantage a cold process
+  restart already got for free; and the "attempts this tick" trigger
+  condition now requires at least 3 attempts instead of 1, so a single
+  stray retry cannot arm a rebuild decision.
 
 ### Known limitations
 
