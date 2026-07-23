@@ -22,6 +22,7 @@ rust-version = "1.89"
 [workspace.dependencies]
 arti-client = { version = "0.43", default-features = false, features = ["tokio", "rustls", "onion-service-client", "static-sqlite", "bridge-client", "pt-client"] }
 tor-rtcompat = { version = "0.43", default-features = false, features = ["tokio", "rustls"] }
+tor-error = "0.43"
 
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 

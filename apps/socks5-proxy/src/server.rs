@@ -320,6 +320,10 @@ async fn handle_client(
                     s
                 }
                 Err(e) => {
+                    // Classify the failure into the three `ErrorKind`s the
+                    // watchdog cares about (see `classify_and_record`'s doc
+                    // comment) — data collection only, no gating here.
+                    crate::tor_watchdog::classify_and_record(&e, handle.health());
                     // We don't try to map the underlying cause to a specific
                     // SOCKS5 code; GeneralFailure is enough to tell the client
                     // we refused.

@@ -62,6 +62,24 @@ pub struct TorHealth {
     /// once per check interval), so contention with the hot-path writer is
     /// a non-issue.
     last_success_target: Arc<Mutex<Option<(String, u16)>>>,
+    /// Monotonic count of `TorTunnel::connect` failures classified as
+    /// `tor_error::ErrorKind::RemoteNetworkTimeout` — the circuit reached
+    /// the exit but the exit went silent. The Tor stack itself is working;
+    /// rebuilding the client would not help this class of failure. Like
+    /// `attempts`, the watchdog reads the *delta* between ticks rather than
+    /// a value reset in place — see `spawn_tor_watchdog`'s loop.
+    remote_timeout_count: Arc<AtomicU64>,
+    /// Monotonic count of `TorTunnel::connect` failures classified as
+    /// `tor_error::ErrorKind::TorAccessFailed` — guards are down or
+    /// unsuitable (e.g. missing bridge descriptors). A rebuild would land
+    /// in the same state, so this class does not indicate a stale-channel
+    /// condition the watchdog can fix.
+    access_failed_count: Arc<AtomicU64>,
+    /// Monotonic count of `TorTunnel::connect` failures classified as
+    /// `tor_error::ErrorKind::TorNetworkTimeout` — genuine circuit-build
+    /// timeouts. Unlike the other two classes, a rebuild (fresh channels)
+    /// can plausibly fix this one.
+    net_timeout_count: Arc<AtomicU64>,
 }
 
 impl TorHealth {
@@ -103,6 +121,81 @@ impl TorHealth {
 
     fn attempt_count(&self) -> u64 {
         self.attempts.load(Ordering::Relaxed)
+    }
+
+    /// Bump the `RemoteNetworkTimeout` class counter. See
+    /// [`classify_and_record`] for where this is called from the hot path.
+    pub fn record_remote_timeout(&self) {
+        self.remote_timeout_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump the `TorAccessFailed` class counter.
+    pub fn record_access_failed(&self) {
+        self.access_failed_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump the `TorNetworkTimeout` class counter.
+    pub fn record_net_timeout(&self) {
+        self.net_timeout_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cumulative `RemoteNetworkTimeout` count. The watchdog loop is
+    /// expected to compare this against the previous tick's value (the same
+    /// delta pattern as `attempt_count`) rather than treat it as a
+    /// per-interval value — there is no reset method by design.
+    ///
+    /// Not yet read outside tests: the watchdog-loop gating logic that
+    /// consumes this (and its two siblings below) alongside the trigger
+    /// conditions in `spawn_tor_watchdog` is a separate, following change.
+    /// `#[allow(dead_code)]` documents that this is deliberately-prepared
+    /// API, not an oversight.
+    #[allow(dead_code)]
+    pub fn remote_timeout_count(&self) -> u64 {
+        self.remote_timeout_count.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative `TorAccessFailed` count. See `remote_timeout_count` for
+    /// the delta-reading convention and the dead-code note.
+    #[allow(dead_code)]
+    pub fn access_failed_count(&self) -> u64 {
+        self.access_failed_count.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative `TorNetworkTimeout` count. See `remote_timeout_count` for
+    /// the delta-reading convention and the dead-code note.
+    #[allow(dead_code)]
+    pub fn net_timeout_count(&self) -> u64 {
+        self.net_timeout_count.load(Ordering::Relaxed)
+    }
+}
+
+/// Classify a failed `TorTunnel::connect` and bump the matching counter on
+/// `health`, if the error falls into one of the three classes the watchdog
+/// cares about (see the module-level doc comment on [`TorHealth`]'s
+/// `*_count` fields). Any other `TorError` variant, or any other
+/// `tor_error::ErrorKind`, is left uncounted — this classification is
+/// deliberately narrow, not exhaustive.
+///
+/// Pulled out as a free function (rather than inlined at the `server.rs`
+/// call site) so it can be unit-tested without a live Tor connection: the
+/// three `ErrorKind`s below can only be produced by real network activity
+/// deep inside arti, so the classification match itself is what gets
+/// exercised here, gated on a hand-built `arti_client::Error`/`ErrorKind`.
+///
+/// | `ErrorKind`            | meaning                                             |
+/// |------------------------|------------------------------------------------------|
+/// | `RemoteNetworkTimeout` | circuit built, exit went silent — rebuild won't help |
+/// | `TorAccessFailed`      | guards down/unsuitable — rebuild reproduces the same |
+/// | `TorNetworkTimeout`    | genuine circuit-build timeout — rebuild can help     |
+pub fn classify_and_record(err: &arti_wrapper::TorError, health: &TorHealth) {
+    let arti_wrapper::TorError::Connect { source, .. } = err else {
+        return;
+    };
+    match tor_error::HasKind::kind(source) {
+        tor_error::ErrorKind::RemoteNetworkTimeout => health.record_remote_timeout(),
+        tor_error::ErrorKind::TorAccessFailed => health.record_access_failed(),
+        tor_error::ErrorKind::TorNetworkTimeout => health.record_net_timeout(),
+        _ => {}
     }
 }
 
@@ -755,5 +848,74 @@ mod tests {
         assert_eq!(picked_no_avoid, Some(2));
 
         drop(guards);
+    }
+
+    #[test]
+    fn error_class_counters_roundtrip_independently() {
+        // Each of the three class counters starts at 0 and accumulates
+        // independently of the others — the same "record N times, read N"
+        // shape as `attempt_count`, but exercised three times over so a
+        // copy-paste mistake wiring one counter to the wrong field would
+        // fail this test.
+        let h = TorHealth::default();
+        assert_eq!(h.remote_timeout_count(), 0);
+        assert_eq!(h.access_failed_count(), 0);
+        assert_eq!(h.net_timeout_count(), 0);
+
+        h.record_remote_timeout();
+        h.record_remote_timeout();
+        h.record_remote_timeout();
+        assert_eq!(h.remote_timeout_count(), 3);
+        assert_eq!(
+            h.access_failed_count(),
+            0,
+            "recording remote_timeout must not bump access_failed"
+        );
+        assert_eq!(
+            h.net_timeout_count(),
+            0,
+            "recording remote_timeout must not bump net_timeout"
+        );
+
+        h.record_access_failed();
+        h.record_access_failed();
+        assert_eq!(h.access_failed_count(), 2);
+        assert_eq!(
+            h.remote_timeout_count(),
+            3,
+            "recording access_failed must not touch remote_timeout"
+        );
+        assert_eq!(
+            h.net_timeout_count(),
+            0,
+            "recording access_failed must not bump net_timeout"
+        );
+
+        h.record_net_timeout();
+        assert_eq!(h.net_timeout_count(), 1);
+        assert_eq!(
+            h.remote_timeout_count(),
+            3,
+            "recording net_timeout must not touch remote_timeout"
+        );
+        assert_eq!(
+            h.access_failed_count(),
+            2,
+            "recording net_timeout must not touch access_failed"
+        );
+    }
+
+    #[test]
+    fn classify_and_record_ignores_non_connect_variants() {
+        // `TorError` variants other than `Connect` (e.g. a config error
+        // raised before any network activity) carry no `arti_client::Error`
+        // to classify — `classify_and_record` must leave all three counters
+        // untouched rather than guess.
+        let h = TorHealth::default();
+        let err = arti_wrapper::TorError::InvalidBridge("not a real bridge line".to_string());
+        classify_and_record(&err, &h);
+        assert_eq!(h.remote_timeout_count(), 0);
+        assert_eq!(h.access_failed_count(), 0);
+        assert_eq!(h.net_timeout_count(), 0);
     }
 }

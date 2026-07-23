@@ -4342,6 +4342,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-util",
+ "tor-error",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
