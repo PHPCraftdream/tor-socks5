@@ -208,13 +208,19 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
         // [`EXTENDED_REBUILD_COOLDOWN`] so a fully-blocked network is not
         // hammered. Reset to 0 on the first successful rebuild.
         let mut consecutive_failures: u32 = 0;
-        // Which rebuild slot is currently live, if any rebuild has ever
-        // succeeded. `None` means the original (primary state-dir) client
-        // from startup is still live. Only updated on a *successful*
-        // rebuild — a failed attempt leaves whatever is actually live
-        // unchanged, so the next attempt still computes the correct (free)
-        // target instead of retrying the same collision.
-        let mut live_slot: Option<RebuildSlot> = None;
+        // Which rebuild slot (index into the [`REBUILD_SLOT_COUNT`]-sized
+        // pool) is currently live, if any rebuild has ever succeeded. `None`
+        // means either the original (primary state-dir) client from startup
+        // is still live, or the config has no persistent state dir at all.
+        // Only updated on a *successful* rebuild — a failed attempt leaves
+        // whatever is actually live unchanged. The slot for the *next*
+        // rebuild is no longer precomputed here: `rebuild()` probes each
+        // pool slot's on-disk locks itself (via `pick_free_slot`) once it
+        // knows the state dir, and picks whichever one is actually free —
+        // tolerating however many prior generations are still draining
+        // (see the doc comment on `rebuild` for why a fixed A/B pair isn't
+        // enough).
+        let mut live_slot: Option<u8> = None;
 
         loop {
             ticker.tick().await;
@@ -283,14 +289,6 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
                  channels from a network change"
             );
 
-            // Always target the slot that is NOT currently live, so this
-            // rebuild can never collide with the state-dir lock of whatever
-            // client is presently serving connections (see `RebuildSlot`).
-            let target_slot = match live_slot {
-                None => RebuildSlot::A,
-                Some(live) => live.other(),
-            };
-
             // `rebuild` itself bounds only the network-wait phase with
             // REBUILD_TIMEOUT (see its doc comment and body): construction
             // of the `TorTunnel` is synchronous and always fully succeeds or
@@ -304,11 +302,11 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
             // retries/timeouts), so this tends to happen soon, but it is not
             // guaranteed instantly; any process that outlives this is still
             // bounded by the startup Job Object on process exit.
-            match rebuild(config_path.as_deref(), target_slot).await {
-                Ok(RebuildOutcome::Ready(new_tor)) => {
+            match rebuild(config_path.as_deref(), live_slot).await {
+                Ok(RebuildOutcome::Ready { tor: new_tor, slot }) => {
                     handle.swap(new_tor).await;
                     last_rebuild = Some(Instant::now());
-                    live_slot = Some(target_slot);
+                    live_slot = slot;
                     if consecutive_failures > 0 {
                         info!(
                             prior_consecutive_failures = consecutive_failures,
@@ -365,41 +363,56 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
     });
 }
 
-/// One of two dedicated rebuild state-dirs the watchdog ping-pongs between.
-///
-/// A single fixed sibling dir was tried first and failed in production: the
-/// *first* rebuild moved the live client off the primary dir and into that
-/// sibling, but every rebuild *after* that targeted the same sibling — which
-/// was by then the live, in-use directory — and collided with its own
-/// exclusive lock, failing in ~5s every time (not the 90s timeout; an
-/// outright lock error). Two slots, always targeting whichever one is *not*
-/// currently live, avoids that self-collision indefinitely.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RebuildSlot {
-    A,
-    B,
+/// Number of parallel rebuild-slot state directories the watchdog cycles
+/// through. A single fixed pair (the previous design) assumed the slot
+/// that is not currently "live" is always free to reuse — but `TorHandle`
+/// only drops its OWN reference on swap; the underlying `Arc<TorClient>`
+/// (and arti's exclusive state-dir lock) survives until the last in-flight
+/// connection that cloned the old `TorTunnel` finishes, which for a
+/// long-lived connection (e.g. a persistent Telegram session) can be
+/// hours. With only two slots, a rebuild a few cycles later can collide
+/// with a still-draining earlier generation. A small pool, probed for an
+/// actually-free slot before use, tolerates however many generations are
+/// simultaneously draining, up to REBUILD_SLOT_COUNT of them.
+const REBUILD_SLOT_COUNT: u8 = 6;
+
+fn rebuild_slot_dir_name(slot: u8) -> String {
+    format!("watchdog-rebuild-{slot}")
 }
 
-impl RebuildSlot {
-    fn dir_name(self) -> &'static str {
-        match self {
-            RebuildSlot::A => "watchdog-rebuild-a",
-            RebuildSlot::B => "watchdog-rebuild-b",
-        }
-    }
+/// Probe whether a slot directory's persistent-state locks are free right
+/// now, without holding them ourselves (open-then-immediately-drop). A
+/// missing lock file (slot never used) counts as free — `LockFileGuard::
+/// try_lock` creates it as a side effect, same as arti's own code does.
+///
+/// Hardcodes `arti-client` 0.43.0's on-disk layout (`cache/dir.lock`,
+/// `state/state/state.lock`) — an internal implementation detail that
+/// could shift on an arti upgrade. If either probe errors for any other
+/// reason (permissions, unexpected layout), this reports "free" rather
+/// than blocking rebuilds outright — worst case we're back to the old
+/// blind-retry behavior for that one slot, not stuck forever.
+fn slot_is_free(dir: &Path) -> bool {
+    let probe = |rel: &str| -> std::io::Result<bool> {
+        Ok(fslock_guard::LockFileGuard::try_lock(dir.join(rel))?.is_some())
+    };
+    probe("cache/dir.lock").unwrap_or(true) && probe("state/state/state.lock").unwrap_or(true)
+}
 
-    fn other(self) -> Self {
-        match self {
-            RebuildSlot::A => RebuildSlot::B,
-            RebuildSlot::B => RebuildSlot::A,
-        }
-    }
+/// Find the first slot (skipping `avoid`, the currently-live one if any)
+/// whose locks are currently free. `None` means every slot in the pool is
+/// still draining a previous generation — the caller should back off and
+/// retry later rather than colliding.
+fn pick_free_slot(base: &Path, avoid: Option<u8>) -> Option<u8> {
+    (0..REBUILD_SLOT_COUNT)
+        .filter(|&s| Some(s) != avoid)
+        .find(|&s| slot_is_free(&base.join(rebuild_slot_dir_name(s))))
 }
 
 /// Outcome of one rebuild attempt.
 enum RebuildOutcome {
-    /// Bootstrap finished; here is the ready tunnel.
-    Ready(TorTunnel),
+    /// Bootstrap finished; here is the ready tunnel and the slot it landed
+    /// in (`None` only if the config has no persistent state dir at all).
+    Ready { tor: TorTunnel, slot: Option<u8> },
     /// Bootstrap did not finish within [`REBUILD_TIMEOUT`], but — unlike the
     /// old single-phase design — we still fully own the client (it was never
     /// lost to an external future-cancellation); the caller decides what to
@@ -415,12 +428,18 @@ enum RebuildOutcome {
 /// bridges — exactly the reset arti has no public API for.
 ///
 /// **State dir.** arti holds an *exclusive* lock on its state directory. The
-/// dying client we are replacing still holds its own lock (its clones drain
-/// only as in-flight connections finish, which on half-open channels is not
-/// prompt). Bootstrapping the replacement into the *same* dir would
-/// therefore deadlock (or, in practice, fail fast on the lock). The caller
-/// passes the [`RebuildSlot`] that is *not* currently live, so this always
-/// targets a free directory regardless of how many rebuilds have happened.
+/// dying client we are replacing still holds its own lock — and, critically,
+/// so can any *older* generation whose `TorTunnel` clone is still held open
+/// by a long-lived connection (`TorHandle::swap` only drops the slot's own
+/// reference; the underlying `Arc<TorClient>` and its state-dir lock survive
+/// until the last such clone is dropped, which for a persistent connection
+/// can be hours — see `TorHandle::swap`'s doc comment). A single fixed pair
+/// of directories assumes the "not currently live" slot is always free,
+/// which breaks once a stale generation is still draining when its turn in
+/// the pair comes back around. Instead, this probes a small pool of
+/// [`REBUILD_SLOT_COUNT`] slots (see [`pick_free_slot`]) for one whose
+/// on-disk locks are actually free right now, tolerating however many
+/// generations are simultaneously draining, up to the size of the pool.
 ///
 /// **Two-phase construction.** `TorTunnel::create_unbootstrapped_with` is
 /// synchronous — it either returns a fully owned client or fails outright,
@@ -432,18 +451,31 @@ enum RebuildOutcome {
 /// tasks (and any already-spawned PT child process).
 async fn rebuild(
     config_path: Option<&Path>,
-    target: RebuildSlot,
+    avoid_slot: Option<u8>,
 ) -> anyhow::Result<RebuildOutcome> {
     let cfg = crate::config::Config::load_with_override(config_path)?.into_config();
     let mut settings = build_tor_settings(&cfg, config_path)
         .await
         .context("rebuilding tor settings")?;
-    if let Some(primary) = settings.state_dir.as_ref() {
-        settings.state_dir = Some(primary.join(target.dir_name()));
-    }
+    let picked_slot = if let Some(base) = settings.state_dir.clone() {
+        let slot = pick_free_slot(&base, avoid_slot).with_context(|| {
+            format!(
+                "all {REBUILD_SLOT_COUNT} rebuild slots are currently busy — a prior \
+                 generation is still draining (long-lived connection holding an old \
+                 TorTunnel clone open)"
+            )
+        })?;
+        settings.state_dir = Some(base.join(rebuild_slot_dir_name(slot)));
+        Some(slot)
+    } else {
+        None
+    };
     let tor = TorTunnel::create_unbootstrapped_with(settings).context("constructing Tor client")?;
     match tokio::time::timeout(REBUILD_TIMEOUT, tor.wait_bootstrapped()).await {
-        Ok(Ok(())) => Ok(RebuildOutcome::Ready(tor)),
+        Ok(Ok(())) => Ok(RebuildOutcome::Ready {
+            tor,
+            slot: picked_slot,
+        }),
         Ok(Err(e)) => Err(e).context("re-bootstrapping Tor client"),
         Err(_elapsed) => Ok(RebuildOutcome::TimedOut(tor)),
     }
@@ -530,5 +562,64 @@ mod tests {
         let s = unix_secs();
         // After 2024-01-01 and before year ~2100 — sanity, not exactness.
         assert!(s > 1_704_067_200, "unix_secs should be past 2024");
+    }
+
+    #[test]
+    fn slot_is_free_for_empty_or_missing_dir() {
+        let base = tempfile::tempdir().expect("tempdir");
+        // Directory exists but has never been used by arti — no lock files.
+        assert!(slot_is_free(base.path()));
+
+        // Directory doesn't even exist yet.
+        let missing = base.path().join("never-created");
+        assert!(slot_is_free(&missing));
+    }
+
+    #[test]
+    fn slot_is_free_reports_false_while_locked_then_true_after_drop() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let cache_lock = base.path().join("cache").join("dir.lock");
+        std::fs::create_dir_all(cache_lock.parent().unwrap()).expect("mkdir cache");
+
+        {
+            // Blocking lock — guaranteed to be held for as long as `guard`
+            // is alive, unlike `try_lock` which could race in a test.
+            let _guard =
+                fslock_guard::LockFileGuard::lock(&cache_lock).expect("acquire cache lock");
+            assert!(
+                !slot_is_free(base.path()),
+                "slot must report busy while cache/dir.lock is held"
+            );
+        }
+        // Guard dropped — the lock is released.
+        assert!(
+            slot_is_free(base.path()),
+            "slot must report free once the lock is released"
+        );
+    }
+
+    #[test]
+    fn pick_free_slot_skips_busy_and_avoided_slots() {
+        let base = tempfile::tempdir().expect("tempdir");
+
+        // Lock slots 0 and 1; leave slot 2 (and beyond) free.
+        let mut guards = Vec::new();
+        for busy in [0u8, 1u8] {
+            let dir = base.path().join(rebuild_slot_dir_name(busy));
+            let lock_path = dir.join("cache").join("dir.lock");
+            std::fs::create_dir_all(lock_path.parent().unwrap()).expect("mkdir cache");
+            guards.push(fslock_guard::LockFileGuard::lock(&lock_path).expect("acquire slot lock"));
+        }
+
+        // Slot 2 would be the first free one, but we also ask to avoid it
+        // (as if it were the currently-live slot) — expect slot 3 instead.
+        let picked = pick_free_slot(base.path(), Some(2));
+        assert_eq!(picked, Some(3));
+
+        // Without an avoid constraint, the first free slot (2) wins.
+        let picked_no_avoid = pick_free_slot(base.path(), None);
+        assert_eq!(picked_no_avoid, Some(2));
+
+        drop(guards);
     }
 }

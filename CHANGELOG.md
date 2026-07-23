@@ -88,6 +88,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   PT-child branch that blocks on `stdin` and calls `process::exit(0)` on
   EOF, restoring the contract our own binary is supposed to honor as a PT
   child regardless of what the pluggable-transport crate does.
+- The two-slot `watchdog-rebuild-a`/`-b` ping-pong (see above) assumed the
+  slot that is not currently live is always free to reuse. It is not:
+  `TorHandle::swap` only drops its own reference to the outgoing
+  `TorTunnel`, while the underlying `Arc<TorClient>` — and arti's exclusive
+  state-dir lock — survives until the last in-flight connection that had
+  already cloned it finishes, which for a long-lived connection (e.g. a
+  persistent Telegram session) can be hours. After 7 successful rebuilds
+  over 16 hours on one deployment, the 8th collided with a still-draining
+  generation from several cycles earlier and failed with `"another
+  instance of Arti has the lock"` on every retry, permanently — the
+  watchdog could never recover on its own. Fixed by replacing the fixed
+  pair with a pool of 6 candidate directories, each probed with a
+  non-blocking `fslock-guard` lock check before use (the same crate
+  `tor-persist` itself locks with) so a rebuild always lands on a slot
+  that is genuinely free right now, tolerating however many prior
+  generations are still draining, up to the size of the pool.
 
 ### Known limitations
 

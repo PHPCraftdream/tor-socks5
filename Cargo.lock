@@ -4326,6 +4326,7 @@ dependencies = [
  "clap",
  "criterion",
  "daemonize",
+ "fslock-guard",
  "futures",
  "getrandom 0.2.17",
  "indexmap 2.14.0",

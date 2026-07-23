@@ -18,6 +18,7 @@ auth = { path = "../../packages/auth" }
 bridge-line.workspace = true
 bridge-fetcher = { path = "../../packages/bridge-fetcher" }
 bridge-probe = { path = "../../packages/bridge-probe" }
+fslock-guard = "0.7"
 lyrebird.workspace = true
 
 ktav.workspace = true
