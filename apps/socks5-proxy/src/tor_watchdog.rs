@@ -27,6 +27,24 @@
 //! it rebuilds the `TorClient` via the same bootstrap path used at startup
 //! and atomically swaps it in for new connections. A cooldown prevents a
 //! rebuild storm when the rebuild does not help (a genuine network block).
+//!
+//! ## Why "attempts are failing" isn't enough on its own
+//!
+//! A rebuild only replaces channels — it does nothing for a healthy Tor
+//! stack whose *exits* went quiet, or whose guards are temporarily
+//! unsuitable. Worse, a rebuild lands in a cold rebuild-slot state
+//! directory (see [`REBUILD_SLOT_COUNT`]) whose bridge-descriptor cache
+//! starts empty, so its guards are themselves "unsuitable to purpose" for
+//! several minutes — trading a live, merely degraded client for one that is
+//! *guaranteed* unable to serve traffic. This is the mechanism analyzed in
+//! docs/upstream/guard-exhaustion-watchdog-spiral.md: a rebuild triggered by
+//! exit-side timeouts, not a stale channel, made an outage worse rather than
+//! fixing it. `classify_and_record` (fed from `server.rs` on every failed
+//! `TorTunnel::connect`) and [`should_decline_rebuild`] add a fourth trigger
+//! condition — a signature gate — that declines to rebuild when the
+//! window's failures are dominated by `RemoteNetworkTimeout` or
+//! `TorAccessFailed` rather than `TorNetworkTimeout`, since only the latter
+//! is the "zombie channel" signature a rebuild can actually fix.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -144,26 +162,20 @@ impl TorHealth {
     /// delta pattern as `attempt_count`) rather than treat it as a
     /// per-interval value — there is no reset method by design.
     ///
-    /// Not yet read outside tests: the watchdog-loop gating logic that
-    /// consumes this (and its two siblings below) alongside the trigger
-    /// conditions in `spawn_tor_watchdog` is a separate, following change.
-    /// `#[allow(dead_code)]` documents that this is deliberately-prepared
-    /// API, not an oversight.
-    #[allow(dead_code)]
+    /// Read by `spawn_tor_watchdog`'s loop to feed [`should_decline_rebuild`]
+    /// — see that function's doc comment for how the delta is used.
     pub fn remote_timeout_count(&self) -> u64 {
         self.remote_timeout_count.load(Ordering::Relaxed)
     }
 
     /// Cumulative `TorAccessFailed` count. See `remote_timeout_count` for
-    /// the delta-reading convention and the dead-code note.
-    #[allow(dead_code)]
+    /// the delta-reading convention and its use in the watchdog loop.
     pub fn access_failed_count(&self) -> u64 {
         self.access_failed_count.load(Ordering::Relaxed)
     }
 
     /// Cumulative `TorNetworkTimeout` count. See `remote_timeout_count` for
-    /// the delta-reading convention and the dead-code note.
-    #[allow(dead_code)]
+    /// the delta-reading convention and its use in the watchdog loop.
     pub fn net_timeout_count(&self) -> u64 {
         self.net_timeout_count.load(Ordering::Relaxed)
     }
@@ -289,11 +301,57 @@ fn next_cooldown(consecutive_failures: u32, normal: Duration) -> Duration {
     }
 }
 
+/// Signature gate on top of the three existing trigger conditions (stale
+/// success, fresh attempts, alive bridges) — see
+/// docs/upstream/guard-exhaustion-watchdog-spiral.md §3.A/§4.2 for the full
+/// analysis this implements.
+///
+/// A rebuild only replaces *channels*; it cannot fix a class of failure that
+/// has nothing to do with stale channels. Two of the three classified
+/// `TorTunnel::connect` failure kinds are exactly that:
+/// - `RemoteNetworkTimeout`: the circuit reached the exit and the exit went
+///   silent. The Tor stack (guards, circuits, channels) is healthy — this is
+///   the far side's problem, and a rebuild changes nothing about it.
+/// - `TorAccessFailed`: guards are down or unsuitable (e.g. bridge
+///   descriptors missing). A rebuild lands in a *cold* slot whose guard
+///   state starts from scratch — it reproduces this exact condition rather
+///   than curing it (this is the mechanism behind the 12-minute outage
+///   analyzed in the spiral doc: rebuild swapped a live, merely degraded
+///   client for one that was guaranteed-broken for minutes).
+///
+/// Only `TorNetworkTimeout` (genuine circuit-build timeouts) is the
+/// "zombie channel after a network change" signature the watchdog exists to
+/// fix — fresh channels from a rebuild can plausibly resolve it.
+///
+/// Decision rule: decline (return `true`) when `net_timeout` is not the
+/// strict maximum of the three deltas *and* at least one of the other two
+/// is non-zero. This lets a `net_timeout`-dominated window (or a tie broken
+/// in its favor) through unconditionally, while a window dominated by
+/// `remote_timeout`/`access_failed` — including the incident's 8-for-8
+/// `RemoteNetworkTimeout` case — is declined. When all three deltas are
+/// zero (the failures came from some other, unclassified path, or there
+/// were no `TorTunnel::connect` failures at all this tick) the function
+/// returns `false`: no data means "behave as before", not "assume the
+/// worst".
+fn should_decline_rebuild(
+    new_remote_timeout: u64,
+    new_access_failed: u64,
+    new_net_timeout: u64,
+) -> bool {
+    if new_remote_timeout == 0 && new_access_failed == 0 && new_net_timeout == 0 {
+        return false;
+    }
+    let net_is_strict_max =
+        new_net_timeout > new_remote_timeout && new_net_timeout > new_access_failed;
+    !net_is_strict_max && (new_remote_timeout > 0 || new_access_failed > 0)
+}
+
 /// Spawn the stale-channel watchdog as a detached tokio task.
 ///
-/// Every `check_interval` the task evaluates the three trigger conditions
-/// (stale success, fresh attempts, alive bridges) and, if all hold and the
-/// cooldown has elapsed, rebuilds the `TorClient` and swaps it in. A
+/// Every `check_interval` the task evaluates four trigger conditions (stale
+/// success, fresh attempts, alive bridges, and a failure-signature gate —
+/// see [`should_decline_rebuild`]) and, if all hold and the cooldown has
+/// elapsed, rebuilds the `TorClient` and swaps it in. A
 /// `check_interval_secs == 0` (or `enabled == false`) config disables it.
 ///
 /// Mirrors the shape of `spawn_bridge_maintenance` so the two background
@@ -323,6 +381,12 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
         ticker.tick().await; // consume the immediate first tick
 
         let mut prev_attempts = handle.health().attempt_count();
+        // Baselines for the signature gate (see `should_decline_rebuild`):
+        // same delta-between-ticks convention as `prev_attempts` above, one
+        // per classified failure kind.
+        let mut prev_remote_timeout = handle.health().remote_timeout_count();
+        let mut prev_access_failed = handle.health().access_failed_count();
+        let mut prev_net_timeout = handle.health().net_timeout_count();
         let mut last_rebuild: Option<Instant> = None;
         // Consecutive failed rebuilds (timeout or error). Once it crosses
         // [`CONSECUTIVE_FAILURES_BEFORE_BACKOFF`] the cooldown stretches to
@@ -353,6 +417,18 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
             let new_attempts = attempts.saturating_sub(prev_attempts);
             prev_attempts = attempts;
 
+            let remote_timeout = health.remote_timeout_count();
+            let new_remote_timeout = remote_timeout.saturating_sub(prev_remote_timeout);
+            prev_remote_timeout = remote_timeout;
+
+            let access_failed = health.access_failed_count();
+            let new_access_failed = access_failed.saturating_sub(prev_access_failed);
+            prev_access_failed = access_failed;
+
+            let net_timeout = health.net_timeout_count();
+            let new_net_timeout = net_timeout.saturating_sub(prev_net_timeout);
+            prev_net_timeout = net_timeout;
+
             // Anchor the stale window on the last success, or — before the
             // first one — on the watchdog start. This both gives the freshly
             // bootstrapped client a warm-up grace period and covers the
@@ -379,6 +455,40 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
             // bridge-maintenance loop's "bridges are genuinely down" case.
             let alive = live_bridge_count(config_path.as_deref());
             if alive == 0 {
+                continue;
+            }
+            // Condition 4 (signature gate): the first three conditions only
+            // tell us "circuits are failing while attempts and bridges are
+            // both fine" — they cannot tell a stale channel from a healthy
+            // stack whose exits or guards are simply having a bad time. A
+            // rebuild only replaces channels; if the failures this window
+            // are dominated by `RemoteNetworkTimeout` (exit went silent,
+            // Tor stack is fine) or `TorAccessFailed` (guards down/
+            // unsuitable — a rebuild starts in a *cold* slot and reproduces
+            // this exact state, worse yet: the spiral analyzed in
+            // docs/upstream/guard-exhaustion-watchdog-spiral.md happens
+            // precisely because a cold rebuild slot's guards are unsuitable
+            // for several minutes), rebuilding cannot fix what's wrong and
+            // trades a live, merely degraded client for a guaranteed-broken
+            // one. See `should_decline_rebuild`'s doc comment for the exact
+            // rule and docs/upstream/guard-exhaustion-watchdog-spiral.md
+            // §3.A/§4.2 for the incident this closes (8 attempts in 218 s,
+            // all RemoteNetworkTimeout/ExitTimeout to one Telegram DC).
+            //
+            // Declining here is a deliberate non-attempt, not a failed one:
+            // `last_rebuild`/`consecutive_failures` are left untouched so
+            // the cooldown timer does not arm and a legitimate rebuild is
+            // not deferred if the signature flips to net-timeout-dominated
+            // on a later tick.
+            if should_decline_rebuild(new_remote_timeout, new_access_failed, new_net_timeout) {
+                warn!(
+                    new_remote_timeout,
+                    new_access_failed,
+                    new_net_timeout,
+                    "declining rebuild: failures in this window are \
+                     RemoteNetworkTimeout/TorAccessFailed, not TorNetworkTimeout \
+                     — a fresh client would reproduce the same state, not fix it"
+                );
                 continue;
             }
             // Cooldown: never rebuild more often than configured, even when
@@ -917,5 +1027,54 @@ mod tests {
         assert_eq!(h.remote_timeout_count(), 0);
         assert_eq!(h.access_failed_count(), 0);
         assert_eq!(h.net_timeout_count(), 0);
+    }
+
+    #[test]
+    fn should_decline_rebuild_no_data_does_not_block() {
+        // No classified failures this window at all — either nothing failed
+        // through TorTunnel::connect, or the failures came through some
+        // other, unclassified path. Either way, "no data" must mean "behave
+        // as before" (don't rebuild-gate on an absence of signal), not
+        // "assume the worst and decline".
+        assert!(!should_decline_rebuild(0, 0, 0));
+    }
+
+    #[test]
+    fn should_decline_rebuild_pure_net_timeout_allows_rebuild() {
+        // Only TorNetworkTimeout this window — the exact "zombie channel"
+        // signature the watchdog exists to fix. Must proceed to rebuild.
+        assert!(!should_decline_rebuild(0, 0, 5));
+    }
+
+    #[test]
+    fn should_decline_rebuild_pure_remote_timeout_declines() {
+        // Only RemoteNetworkTimeout — exit went silent, Tor stack is
+        // healthy. A rebuild cannot help; must decline.
+        assert!(should_decline_rebuild(5, 0, 0));
+    }
+
+    #[test]
+    fn should_decline_rebuild_pure_access_failed_declines() {
+        // Only TorAccessFailed — guards down/unsuitable. A rebuild starts in
+        // a cold slot and reproduces the same condition; must decline.
+        assert!(should_decline_rebuild(0, 5, 0));
+    }
+
+    #[test]
+    fn should_decline_rebuild_net_timeout_dominant_mix_allows_rebuild() {
+        // Mixed window where net_timeout strictly dominates the sum of the
+        // other two classes — the zombie-channel signature is still the
+        // main story here, so the rebuild should proceed.
+        assert!(!should_decline_rebuild(2, 1, 10));
+    }
+
+    #[test]
+    fn should_decline_rebuild_incident_signature_declines() {
+        // The actual incident this gate closes: 8 attempts in 218 s, all
+        // RemoteNetworkTimeout/ExitTimeout to a single Telegram DC, zero
+        // TorAccessFailed and zero TorNetworkTimeout. The old trigger would
+        // have rebuilt into a cold, guard-unsuitable slot and made the
+        // outage worse; the gate must decline.
+        assert!(should_decline_rebuild(8, 0, 0));
     }
 }
