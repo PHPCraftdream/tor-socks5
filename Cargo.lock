@@ -4334,6 +4334,7 @@ dependencies = [
  "ptrs-gesher-bridge-line",
  "ptrs-gesher-lyrebird",
  "rpassword",
+ "rusqlite",
  "rustls",
  "serde",
  "service-manager",

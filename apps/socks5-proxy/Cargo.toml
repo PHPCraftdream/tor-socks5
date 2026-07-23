@@ -19,6 +19,7 @@ bridge-line.workspace = true
 bridge-fetcher = { path = "../../packages/bridge-fetcher" }
 bridge-probe = { path = "../../packages/bridge-probe" }
 tor-error.workspace = true
+rusqlite.workspace = true
 fslock-guard = "0.7"
 lyrebird.workspace = true
 

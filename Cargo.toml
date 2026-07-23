@@ -23,6 +23,12 @@ rust-version = "1.89"
 arti-client = { version = "0.43", default-features = false, features = ["tokio", "rustls", "onion-service-client", "static-sqlite", "bridge-client", "pt-client"] }
 tor-rtcompat = { version = "0.43", default-features = false, features = ["tokio", "rustls"] }
 tor-error = "0.43"
+# Same rusqlite version arti-client/tor-dirmgr already resolve to via their
+# own "bundled" feature (see vendor/tor-dirmgr/Cargo.toml) — pinning the same
+# range here reuses that single resolved version rather than adding a new one
+# to Cargo.lock. `bundled` again so this crate does not additionally require a
+# system libsqlite3 on top of what arti already statically links in.
+rusqlite = { version = ">=0.36.0, <0.40.0", features = ["bundled"] }
 
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 

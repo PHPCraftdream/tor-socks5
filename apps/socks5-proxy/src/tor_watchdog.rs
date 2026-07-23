@@ -279,6 +279,18 @@ impl TorHandle {
 /// call site below).
 const REBUILD_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// Minimum number of `TorTunnel::connect` attempts observed within a single
+/// tick before "attempts are still coming" (trigger condition 2) is treated
+/// as a real signal rather than noise. The incident analyzed in
+/// docs/upstream/guard-exhaustion-watchdog-spiral.md fired a rebuild on just
+/// 8 attempts over 218 s — already a weak sample to decide "this looks like
+/// a stale-channel problem" from. `1` (the previous implicit threshold, since
+/// the old check was only `== 0`) lets a single stray retry arm the rebuild
+/// decision; this raises the bar slightly without meaningfully delaying a
+/// real, live-traffic-driven trigger — a genuinely stale channel under
+/// actual use produces many attempts per tick, not one or two.
+const MIN_ATTEMPTS_TO_TRIGGER: u64 = 3;
+
 /// Once this many rebuilds fail in a row (timeout or error), the watchdog
 /// backs off to [`EXTENDED_REBUILD_COOLDOWN`] instead of the configured
 /// `rebuild_cooldown_secs`: a persistently blocked network does not merit
@@ -446,8 +458,12 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
                 continue;
             }
             // Condition 2: attempts were made in this tick — silence here
-            // means "no traffic", not "circuits failing".
-            if new_attempts == 0 {
+            // means "no traffic", not "circuits failing". Requires at least
+            // MIN_ATTEMPTS_TO_TRIGGER rather than just "> 0": a rebuild lands
+            // in a slot the canary/warm-up path treats specially, so it
+            // should not fire on a single stray attempt — see that
+            // constant's doc comment for why 3 and not 0/1.
+            if new_attempts < MIN_ATTEMPTS_TO_TRIGGER {
                 continue;
             }
             // Condition 3: at least one bridge is TCP-reachable per the last
@@ -620,6 +636,166 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
     });
 }
 
+/// Relative path (from a state dir root) to arti's persistent net-document
+/// cache database — hardcodes `tor-dirmgr` 0.43.0's on-disk layout (see
+/// `vendor/tor-dirmgr/src/storage/sqlite.rs`'s `from_path_and_mistrust`,
+/// which opens exactly this file under the configured cache dir).
+const DIR_SQLITE_REL_PATH: &str = "cache/dir.sqlite3";
+
+/// Best-effort: copy fresh `BridgeDescs` rows from the primary cache into a
+/// rebuild slot's cache *before* `TorTunnel::create_unbootstrapped_with`
+/// constructs the slot's client, so the rebuilt client starts with a warm
+/// bridge-descriptor cache instead of an empty one — the same advantage a
+/// cold process restart gets from the primary directory being continuously
+/// refreshed by the live client. See
+/// docs/upstream/guard-exhaustion-watchdog-spiral.md §2.3 ("Bridge-дескрипторы
+/// персистентно кэшируются — и в этом вся разница"), §3.B3 and §4.3.
+///
+/// Without this, a rebuild lands in a slot whose `BridgeDescs` cache is empty
+/// or stale, and arti's `dirmgr` has to fetch bridge descriptors over the
+/// network from scratch — guardmgr only requests descriptors for its first
+/// two preferred guards at a time (`data_parallelism: 1` by default), so this
+/// can take minutes under retry/backoff, during which every guard is
+/// `dir_info_missing` = "unsuitable to purpose" and the canary
+/// ([`verify_usable`]) keeps failing. Copying the primary's already-fetched
+/// rows in gives the slot the same warm start a cold process restart gets
+/// "for free" from the primary directory.
+///
+/// This hardcodes arti's private on-disk schema (the `BridgeDescs` table in
+/// `cache/dir.sqlite3`: `bridge_line TEXT PRIMARY KEY, fetched, until,
+/// contents BLOB` — see `vendor/tor-dirmgr/src/storage/sqlite.rs`'s
+/// `UPDATE_SCHEMA`/`FIND_BRIDGEDESC`/`INSERT_BRIDGEDESC`) — an internal
+/// implementation detail that could shift on an arti upgrade. **Fail-open**:
+/// any error (missing primary file, missing/uninitialized slot database,
+/// schema mismatch, lock contention with a still-live client reading/writing
+/// the same file) is caught and logged at `debug`/`warn`, never propagated —
+/// a failed warm-up just means the slot starts cold, exactly like before
+/// this change, not a blocked or failed rebuild.
+///
+/// `primary_base` is the state dir root as configured (i.e. `settings
+/// .state_dir` *before* `rebuild()` redirects it into a
+/// `watchdog-rebuild-N` slot); `slot_dir` is that slot's directory.
+fn warm_slot_bridge_desc_cache(primary_base: &Path, slot_dir: &Path) {
+    match try_warm_slot_bridge_desc_cache(primary_base, slot_dir) {
+        Ok(copied) if copied > 0 => {
+            info!(
+                rows = copied,
+                "tor stale-channel watchdog: warmed rebuild slot's BridgeDescs cache from \
+                 the primary directory before construction"
+            );
+        }
+        Ok(_) => {
+            // Nothing to copy (primary cache empty, or nothing newer than
+            // what the slot already has) — not worth logging at info level.
+        }
+        Err(e) => {
+            warn!(
+                error = format!("{e:#}"),
+                "tor stale-channel watchdog: could not warm rebuild slot's BridgeDescs cache \
+                 — proceeding with a cold slot, same as before this optimization"
+            );
+        }
+    }
+}
+
+/// Fallible inner half of [`warm_slot_bridge_desc_cache`], split out so the
+/// caller can funnel every error path through one `warn!` without repeating
+/// the fail-open wrapping at every `?`.
+///
+/// Returns the number of `BridgeDescs` rows copied (0 is not an error — it
+/// just means the primary had nothing to offer).
+fn try_warm_slot_bridge_desc_cache(primary_base: &Path, slot_dir: &Path) -> anyhow::Result<usize> {
+    let primary_db = primary_base.join(DIR_SQLITE_REL_PATH);
+    if !primary_db.is_file() {
+        // Nothing to warm from — e.g. this process has never bootstrapped
+        // against a persistent state dir. Not an error, just nothing to do.
+        return Ok(0);
+    }
+
+    let slot_db = slot_dir.join(DIR_SQLITE_REL_PATH);
+    if !slot_db.is_file() {
+        // The slot's own cache database does not exist yet — it is created
+        // by arti itself as part of `TorClient::create_unbootstrapped`,
+        // which runs strictly after this function (see `rebuild`'s call
+        // site). Hand-rolling arti's versioned schema
+        // (`TorSchemaMeta`/`UPDATE_SCHEMA` in
+        // vendor/tor-dirmgr/src/storage/sqlite.rs) here to create an empty
+        // database upfront would duplicate and risk drifting from an
+        // internal detail we do not own; simplest and safest is to skip the
+        // warm-up for a slot's first-ever use and let it populate its cache
+        // the normal (network) way once, same as before this change. Later
+        // rebuilds reusing this same slot directory will find the database
+        // already created and get warmed normally.
+        return Ok(0);
+    }
+
+    // Open the primary read-only: a live client may still be reading and
+    // periodically writing this same file. `SQLITE_OPEN_READ_ONLY` avoids
+    // taking any write lock on it and lets sqlite's own MVCC-ish concurrent
+    // reader support do its job; if the primary is momentarily locked in a
+    // way that conflicts even with a reader, the error simply propagates up
+    // through `?` and the whole warm-up is skipped for this rebuild (fail-open).
+    let primary_flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let primary = rusqlite::Connection::open_with_flags(&primary_db, primary_flags)
+        .context("opening primary BridgeDescs cache read-only")?;
+
+    // The slot database is brand-new or from a previous generation in this
+    // same slot directory — open it normally (read-write, no create: we
+    // already checked it exists above).
+    let slot_flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let mut slot = rusqlite::Connection::open_with_flags(&slot_db, slot_flags)
+        .context("opening slot BridgeDescs cache read-write")?;
+
+    let mut rows: Vec<(
+        String,
+        rusqlite::types::Value,
+        rusqlite::types::Value,
+        Vec<u8>,
+    )> = Vec::new();
+    {
+        let mut stmt = primary
+            .prepare("SELECT bridge_line, fetched, until, contents FROM BridgeDescs")
+            .context("preparing BridgeDescs read from primary cache")?;
+        let mapped = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, rusqlite::types::Value>(1)?,
+                    row.get::<_, rusqlite::types::Value>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            })
+            .context("reading BridgeDescs rows from primary cache")?;
+        for row in mapped {
+            rows.push(row.context("decoding a BridgeDescs row from primary cache")?);
+        }
+    }
+
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    let tx = slot
+        .transaction()
+        .context("opening a transaction on the slot BridgeDescs cache")?;
+    {
+        let mut insert = tx
+            .prepare("INSERT OR REPLACE INTO BridgeDescs (bridge_line, fetched, until, contents) VALUES (?1, ?2, ?3, ?4)")
+            .context("preparing BridgeDescs write into slot cache")?;
+        for (bridge_line, fetched, until, contents) in &rows {
+            insert
+                .execute(rusqlite::params![bridge_line, fetched, until, contents])
+                .context("writing a BridgeDescs row into slot cache")?;
+        }
+    }
+    tx.commit()
+        .context("committing warmed BridgeDescs rows into slot cache")?;
+
+    Ok(rows.len())
+}
+
 /// Number of parallel rebuild-slot state directories the watchdog cycles
 /// through. A single fixed pair (the previous design) assumed the slot
 /// that is not currently "live" is always free to reuse — but `TorHandle`
@@ -753,7 +929,13 @@ async fn rebuild(
                  TorTunnel clone open)"
             )
         })?;
-        settings.state_dir = Some(base.join(rebuild_slot_dir_name(slot)));
+        let slot_dir = base.join(rebuild_slot_dir_name(slot));
+        // Best-effort warm-up of the slot's bridge-descriptor cache from the
+        // primary directory, before the slot's own client (and its
+        // database) exists — see `warm_slot_bridge_desc_cache`'s doc comment
+        // for why this matters and why it is fail-open.
+        warm_slot_bridge_desc_cache(&base, &slot_dir);
+        settings.state_dir = Some(slot_dir);
         Some(slot)
     } else {
         None
@@ -1066,6 +1248,119 @@ mod tests {
         // other two classes — the zombie-channel signature is still the
         // main story here, so the rebuild should proceed.
         assert!(!should_decline_rebuild(2, 1, 10));
+    }
+
+    /// Create a primitive `BridgeDescs`-only sqlite database at `path`,
+    /// mirroring just enough of arti's real schema (see
+    /// `vendor/tor-dirmgr/src/storage/sqlite.rs`'s `UPDATE_SCHEMA`) for the
+    /// warm-up code path to exercise real `SELECT`/`INSERT OR REPLACE`
+    /// round-trips, without pulling in arti's full versioned-schema machinery.
+    fn make_bridge_descs_db(path: &Path, rows: &[(&str, i64, i64, &[u8])]) {
+        std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir for test db");
+        let conn = rusqlite::Connection::open(path).expect("create test db");
+        conn.execute_batch(
+            "CREATE TABLE BridgeDescs (
+                bridge_line TEXT PRIMARY KEY NOT NULL,
+                fetched DATE NOT NULL,
+                until DATE NOT NULL,
+                contents BLOB NOT NULL
+            );",
+        )
+        .expect("create BridgeDescs table");
+        for (bridge_line, fetched, until, contents) in rows {
+            conn.execute(
+                "INSERT INTO BridgeDescs (bridge_line, fetched, until, contents) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![bridge_line, fetched, until, contents],
+            )
+            .expect("insert test row");
+        }
+    }
+
+    #[test]
+    fn warm_slot_copies_rows_from_primary_into_empty_slot() {
+        let primary = tempfile::tempdir().expect("primary tempdir");
+        let slot = tempfile::tempdir().expect("slot tempdir");
+
+        make_bridge_descs_db(
+            &primary.path().join(DIR_SQLITE_REL_PATH),
+            &[
+                ("bridge one line", 1_000, 2_000, b"contents-one"),
+                ("bridge two line", 1_500, 2_500, b"contents-two"),
+            ],
+        );
+        // Slot's database already exists (as it would after arti has used
+        // this slot at least once before) but starts empty.
+        make_bridge_descs_db(&slot.path().join(DIR_SQLITE_REL_PATH), &[]);
+
+        let copied = try_warm_slot_bridge_desc_cache(primary.path(), slot.path())
+            .expect("warm-up must succeed when both databases are well-formed");
+        assert_eq!(copied, 2);
+
+        let conn = rusqlite::Connection::open(slot.path().join(DIR_SQLITE_REL_PATH))
+            .expect("reopen slot db");
+        let mut stmt = conn
+            .prepare("SELECT bridge_line, fetched, until, contents FROM BridgeDescs ORDER BY bridge_line")
+            .unwrap();
+        let got: Vec<(String, i64, i64, Vec<u8>)> = stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "bridge one line".to_string(),
+                    1_000,
+                    2_000,
+                    b"contents-one".to_vec()
+                ),
+                (
+                    "bridge two line".to_string(),
+                    1_500,
+                    2_500,
+                    b"contents-two".to_vec()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn warm_slot_is_fail_open_when_primary_db_missing() {
+        let primary = tempfile::tempdir().expect("primary tempdir");
+        let slot = tempfile::tempdir().expect("slot tempdir");
+        make_bridge_descs_db(&slot.path().join(DIR_SQLITE_REL_PATH), &[]);
+
+        // No primary database was ever created at `primary.path()`.
+        let copied = try_warm_slot_bridge_desc_cache(primary.path(), slot.path()).expect(
+            "a missing primary database must be treated as \"nothing to copy\", not an error",
+        );
+        assert_eq!(copied, 0);
+
+        // The public, non-fallible wrapper must also not panic in this case.
+        warm_slot_bridge_desc_cache(primary.path(), slot.path());
+    }
+
+    #[test]
+    fn warm_slot_is_fail_open_when_slot_cache_dir_missing() {
+        let primary = tempfile::tempdir().expect("primary tempdir");
+        let slot = tempfile::tempdir().expect("slot tempdir");
+        make_bridge_descs_db(
+            &primary.path().join(DIR_SQLITE_REL_PATH),
+            &[("some bridge", 1, 2, b"x")],
+        );
+        // Slot directory exists (tempdir) but its `cache/` subdirectory —
+        // and therefore `cache/dir.sqlite3` — was never created, as would be
+        // the case for a slot that has never been used by arti before.
+
+        let copied = try_warm_slot_bridge_desc_cache(primary.path(), slot.path())
+            .expect("a missing slot database must be treated as \"skip, arti will create it\"");
+        assert_eq!(copied, 0);
+
+        // The public, non-fallible wrapper must also not panic in this case.
+        warm_slot_bridge_desc_cache(primary.path(), slot.path());
     }
 
     #[test]
