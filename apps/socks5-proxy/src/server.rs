@@ -315,6 +315,7 @@ async fn handle_client(
             let tor_stream = match tor.connect(&req.host, req.port).await {
                 Ok(s) => {
                     handle.health().record_success();
+                    handle.health().record_success_target(&req.host, req.port);
                     info!(host = ?req.host, port = req.port, "tor connection established");
                     s
                 }

@@ -30,7 +30,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -56,6 +56,12 @@ pub struct TorHealth {
     /// still being made" — the difference between *no traffic* and
     /// *circuits failing*.
     attempts: Arc<AtomicU64>,
+    /// `(host, port)` of the most recent successful `TorTunnel::connect`.
+    /// A plain `Mutex` rather than atomics: the value is a `String`, so it
+    /// cannot live in a lock-free cell. Read only by the watchdog (at most
+    /// once per check interval), so contention with the hot-path writer is
+    /// a non-issue.
+    last_success_target: Arc<Mutex<Option<(String, u16)>>>,
 }
 
 impl TorHealth {
@@ -67,6 +73,28 @@ impl TorHealth {
     /// Stamp "now" as the last successful connect. Called only on success.
     pub fn record_success(&self) {
         self.last_success.store(unix_secs(), Ordering::Relaxed);
+    }
+
+    /// Remember the `(host, port)` of the most recent successful
+    /// `TorTunnel::connect`, so the watchdog can later re-try the exact
+    /// same target as a post-rebuild usability canary (see
+    /// [`verify_usable`]). Last-write-wins — we only need *some* recently
+    /// good target, not a history of them.
+    pub fn record_success_target(&self, host: &str, port: u16) {
+        *self
+            .last_success_target
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some((host.to_string(), port));
+    }
+
+    /// The most recently recorded successful target, if any. `None` before
+    /// the first success ever recorded on this handle (e.g. process just
+    /// started).
+    fn last_success_target(&self) -> Option<(String, u16)> {
+        self.last_success_target
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn last_success_secs(&self) -> u64 {
@@ -302,7 +330,8 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
             // retries/timeouts), so this tends to happen soon, but it is not
             // guaranteed instantly; any process that outlives this is still
             // bounded by the startup Job Object on process exit.
-            match rebuild(config_path.as_deref(), live_slot).await {
+            let canary_target = handle.health().last_success_target();
+            match rebuild(config_path.as_deref(), live_slot, canary_target).await {
                 Ok(RebuildOutcome::Ready { tor: new_tor, slot }) => {
                     handle.swap(new_tor).await;
                     last_rebuild = Some(Instant::now());
@@ -334,6 +363,31 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
                             next_cooldown(consecutive_failures, cooldown).as_secs(),
                         "tor stale-channel watchdog: rebuild timed out — dropped the \
                          fully-owned half-bootstrapped client"
+                    );
+                }
+                Ok(RebuildOutcome::NotUsable(tor)) => {
+                    // Same controlled-drop reasoning as the TimedOut arm: we
+                    // fully own `tor`, so this is a normal, safe drop. The
+                    // old client stays live in `live_slot` — we deliberately
+                    // do not swap, because the freshly bootstrapped client
+                    // reported directory-ready but failed to actually carry
+                    // traffic within VERIFY_TIMEOUT (see verify_usable's
+                    // doc comment and RebuildOutcome::NotUsable): swapping
+                    // it in would replace a live, if degraded, client with
+                    // one that silently cannot serve traffic for minutes
+                    // while it catches up on bridge descriptors.
+                    drop(tor);
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    last_rebuild = Some(Instant::now());
+                    warn!(
+                        verify_timeout_secs = VERIFY_TIMEOUT.as_secs(),
+                        consecutive_failures,
+                        threshold = CONSECUTIVE_FAILURES_BEFORE_BACKOFF,
+                        next_cooldown_secs =
+                            next_cooldown(consecutive_failures, cooldown).as_secs(),
+                        "tor stale-channel watchdog: rebuild bootstrapped but failed the \
+                         usability check — a fresh client would have been unable to serve \
+                         traffic; keeping the current one"
                     );
                 }
                 Err(e) => {
@@ -420,6 +474,36 @@ enum RebuildOutcome {
     /// controlled drop of a fully-owned value, not an orphaning
     /// cancellation).
     TimedOut(TorTunnel),
+    /// Bootstrap finished and reported ready, but the client could not
+    /// actually establish a connection within the verify budget — arti's
+    /// readiness signal only covers directory bootstrap, not bridge
+    /// descriptors (see docs/upstream/guard-exhaustion-watchdog-spiral.md
+    /// §2.2). Swapping this in would replace a live client with one that
+    /// silently can't serve traffic for minutes. Caller drops it, same as
+    /// TimedOut.
+    NotUsable(TorTunnel),
+}
+
+/// Budget for the post-bootstrap usability check (separate from
+/// REBUILD_TIMEOUT, which only bounds directory bootstrap).
+const VERIFY_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Try to actually establish a connection through a freshly-bootstrapped
+/// client before trusting it enough to swap in. `target` is a recently
+/// successful (host, port) pair to retry against; if none is available
+/// (process just started, nothing has ever succeeded), skip verification
+/// entirely — treat the client as usable (nothing better to compare
+/// against, and gating everything on this would block first-ever startup
+/// too — though note: rebuild() only runs after startup already succeeded
+/// once, so in practice `target` should be Some by then).
+async fn verify_usable(tor: &TorTunnel, target: Option<(String, u16)>) -> bool {
+    let Some((host, port)) = target else {
+        return true;
+    };
+    tokio::time::timeout(VERIFY_TIMEOUT, tor.connect(&host, port))
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false)
 }
 
 /// Re-run the startup bootstrap path against the current config and return
@@ -452,6 +536,7 @@ enum RebuildOutcome {
 async fn rebuild(
     config_path: Option<&Path>,
     avoid_slot: Option<u8>,
+    canary_target: Option<(String, u16)>,
 ) -> anyhow::Result<RebuildOutcome> {
     let cfg = crate::config::Config::load_with_override(config_path)?.into_config();
     let mut settings = build_tor_settings(&cfg, config_path)
@@ -472,10 +557,16 @@ async fn rebuild(
     };
     let tor = TorTunnel::create_unbootstrapped_with(settings).context("constructing Tor client")?;
     match tokio::time::timeout(REBUILD_TIMEOUT, tor.wait_bootstrapped()).await {
-        Ok(Ok(())) => Ok(RebuildOutcome::Ready {
-            tor,
-            slot: picked_slot,
-        }),
+        Ok(Ok(())) => {
+            if verify_usable(&tor, canary_target).await {
+                Ok(RebuildOutcome::Ready {
+                    tor,
+                    slot: picked_slot,
+                })
+            } else {
+                Ok(RebuildOutcome::NotUsable(tor))
+            }
+        }
         Ok(Err(e)) => Err(e).context("re-bootstrapping Tor client"),
         Err(_elapsed) => Ok(RebuildOutcome::TimedOut(tor)),
     }
@@ -525,6 +616,29 @@ mod tests {
         h.record_success();
         let s = h.last_success_secs();
         assert!(s > 0, "record_success must stamp a real unix time");
+    }
+
+    #[test]
+    fn success_target_roundtrips_and_starts_empty() {
+        let h = TorHealth::default();
+        assert_eq!(h.last_success_target(), None);
+        h.record_success_target("example.com", 443);
+        assert_eq!(
+            h.last_success_target(),
+            Some(("example.com".to_string(), 443))
+        );
+    }
+
+    #[test]
+    fn success_target_last_write_wins() {
+        let h = TorHealth::default();
+        h.record_success_target("first.example", 80);
+        h.record_success_target("second.example", 8080);
+        assert_eq!(
+            h.last_success_target(),
+            Some(("second.example".to_string(), 8080)),
+            "a newer record_success_target call must overwrite the previous one"
+        );
     }
 
     #[test]
@@ -595,6 +709,26 @@ mod tests {
         assert!(
             slot_is_free(base.path()),
             "slot must report free once the lock is released"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_usable_skips_network_when_no_target() {
+        // `target: None` must short-circuit to `true` without ever touching
+        // the network — this is the "nothing to compare against yet" case
+        // (process just started, no success recorded on this handle). We
+        // can't cheaply fake a *bootstrapped* TorTunnel in a unit test, but
+        // `create_unbootstrapped_with` is synchronous and does no I/O, so it
+        // is safe to use here purely to get a real `&TorTunnel` reference —
+        // if `verify_usable` ever tried to use it (it must not, for
+        // `target: None`), the call would hang/fail and the test would
+        // never reach the assertion below within the runtime's default
+        // behavior, since nothing here awaits a bootstrap.
+        let tor = arti_wrapper::TorTunnel::create_unbootstrapped_with(Default::default())
+            .expect("synchronous, no-I/O construction must succeed");
+        assert!(
+            verify_usable(&tor, None).await,
+            "target: None must be treated as usable without a network round-trip"
         );
     }
 
