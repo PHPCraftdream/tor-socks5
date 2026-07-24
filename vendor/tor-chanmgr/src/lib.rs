@@ -366,6 +366,30 @@ impl<R: Runtime> ChanMgr<R> {
         self.mgr.expire_channels()
     }
 
+    // tor-socks5 local patch: expose `AbstractChanMgr::terminate_all_channels()`
+    // (mgr.rs) as a public API. See `vendor/README.md`'s `tor-chanmgr` section
+    // for the full rationale: this is the primitive that lets a caller force
+    // every tracked channel closed after detecting a stale post-network-change
+    // condition, instead of waiting for `expire_channels()`'s idle-duration
+    // check (which never fires while a stuck circuit keeps retrying against a
+    // dead channel).
+    /// Unconditionally terminate every channel currently tracked by this
+    /// manager, regardless of whether it is in use, and remove them from the
+    /// internal map.
+    ///
+    /// Existing references to a terminated channel (e.g. held by an in-flight
+    /// circuit builder) will observe it fail the same way they would after a
+    /// real network-level disconnection; [`ChanMgr::get_or_launch`] will
+    /// transparently build a fresh channel the next time one is requested.
+    ///
+    /// Unlike [`expire_channels`](Self::expire_channels), this does not wait
+    /// for channels to become idle: it is meant to be called explicitly by a
+    /// caller that has already detected that its channels are stale (for
+    /// example, after a host network change), not on a periodic schedule.
+    pub fn terminate_all_channels(&self) {
+        self.mgr.terminate_all_channels();
+    }
+
     /// Notifies the chanmgr to be dormant like dormancy
     pub fn set_dormancy(
         &self,

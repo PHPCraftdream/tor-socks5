@@ -680,6 +680,31 @@ impl<C: AbstractChannelFactory> MgrState<C> {
         ret
     }
 
+    // tor-socks5 local patch: unconditional counterpart to
+    // `expire_channels()` above. Reuses the exact same
+    // `self.inner.lock()...channels.retain(...)` iteration pattern, but
+    // instead of consulting `ready_to_expire` (idle-duration based), it
+    // force-closes every open channel via `AbstractChannel::terminate()`
+    // and then drops it from the map unconditionally. `Building` (pending)
+    // entries are left alone: there is no live `Channel` there yet to
+    // terminate, and dropping a pending entry out from under
+    // `PendingChannelHandle`'s bookkeeping would trip its `Drop` assertions.
+    /// Unconditionally terminate every open channel, regardless of whether it
+    /// is in use, and remove it from the map.
+    pub(crate) fn terminate_all_channels(&self) {
+        self.inner
+            .lock()
+            .expect("Poisoned lock")
+            .channels
+            .retain(|chan| match chan {
+                ChannelState::Open(ent) => {
+                    ent.channel.terminate();
+                    false
+                }
+                ChannelState::Building(_) => true,
+            });
+    }
+
     /// Helper: Return the default max unused duration for a channel.
     fn random_max_unused_duration() -> Duration {
         Duration::from_secs(
@@ -1008,6 +1033,11 @@ mod test {
             Ok(())
         }
         fn engage_padding_activities(&self) {}
+        fn terminate(&self) {
+            // Not exercised by this module's tests (see `terminate_all_channels`
+            // tests below, which use a dedicated `TerminateFakeChannel` with
+            // interior mutability to observe the call).
+        }
     }
     impl tor_linkspec::HasRelayIds for FakeChannel {
         fn identity(
@@ -1203,6 +1233,142 @@ mod test {
             assert_eq!(map.by_ed25519(&str_to_ed("h")).len(), 1);
             assert_eq!(map.by_ed25519(&str_to_ed("g")).len(), 0);
         })?;
+        Ok(())
+    }
+
+    // tor-socks5 local patch: coverage for `MgrState::terminate_all_channels`.
+
+    /// A `FakeChannel` variant with interior mutability, so tests can observe
+    /// whether `AbstractChannel::terminate()` was actually invoked (unlike the
+    /// plain `FakeChannel` above, whose `usable: bool` field isn't mutable
+    /// through `&self`).
+    #[derive(Clone, Debug)]
+    struct TerminateFakeChannel {
+        ed_ident: Ed25519Identity,
+        terminated: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl AbstractChannel for TerminateFakeChannel {
+        fn is_canonical(&self) -> bool {
+            unimplemented!()
+        }
+        fn is_canonical_to_peer(&self) -> bool {
+            unimplemented!()
+        }
+        fn is_usable(&self) -> bool {
+            !self.terminated.load(Ordering::SeqCst)
+        }
+        fn duration_unused(&self) -> Option<Duration> {
+            None
+        }
+        fn reparameterize(
+            &self,
+            _updates: Arc<ChannelPaddingInstructionsUpdates>,
+        ) -> tor_proto::Result<()> {
+            Ok(())
+        }
+        fn reparameterize_kist(&self, _kist_params: KistParams) -> tor_proto::Result<()> {
+            Ok(())
+        }
+        fn engage_padding_activities(&self) {}
+        fn terminate(&self) {
+            self.terminated.store(true, Ordering::SeqCst);
+        }
+    }
+    impl tor_linkspec::HasRelayIds for TerminateFakeChannel {
+        fn identity(
+            &self,
+            key_type: tor_linkspec::RelayIdType,
+        ) -> Option<tor_linkspec::RelayIdRef<'_>> {
+            match key_type {
+                tor_linkspec::RelayIdType::Ed25519 => Some((&self.ed_ident).into()),
+                _ => None,
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct TerminateFakeChannelFactory {}
+
+    #[allow(clippy::diverging_sub_expression)] // for unimplemented!() + async_trait
+    #[async_trait]
+    impl AbstractChannelFactory for TerminateFakeChannelFactory {
+        type Channel = TerminateFakeChannel;
+        type BuildSpec = tor_linkspec::OwnedChanTarget;
+        type Stream = ();
+
+        async fn build_channel(
+            &self,
+            _target: &Self::BuildSpec,
+            _reporter: BootstrapReporter,
+            _memquota: ChannelAccount,
+        ) -> Result<Arc<TerminateFakeChannel>> {
+            unimplemented!()
+        }
+
+        #[cfg(feature = "relay")]
+        async fn build_channel_using_incoming(
+            &self,
+            _peer: Sensitive<std::net::SocketAddr>,
+            _stream: Self::Stream,
+            _memquota: ChannelAccount,
+        ) -> Result<Arc<Self::Channel>> {
+            unimplemented!()
+        }
+    }
+
+    fn terminate_ch(
+        ident: &'static str,
+        terminated: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> ChannelState<TerminateFakeChannel> {
+        let channel = TerminateFakeChannel {
+            ed_ident: str_to_ed(ident),
+            terminated: Arc::clone(terminated),
+        };
+        ChannelState::Open(OpenEntry {
+            channel: Arc::new(channel),
+            max_unused_duration: Duration::from_secs(180),
+        })
+    }
+
+    #[test]
+    fn terminate_all_channels() -> Result<()> {
+        let map = MgrState::<TerminateFakeChannelFactory>::new(
+            TerminateFakeChannelFactory::default(),
+            ChannelConfig::default(),
+            Default::default(),
+            &Default::default(),
+        );
+
+        let flag_a = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag_b = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // A pending ("Building") entry should survive untouched: there is no
+        // live channel there yet to terminate.
+        let pending_ids = RelayIds::from_relay_ids(&TerminateFakeChannel {
+            ed_ident: str_to_ed("pending"),
+            terminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        let (pending_entry, _send, _unique_id) = setup_launch(pending_ids);
+
+        map.with_channels(|map| {
+            map.insert(terminate_ch("wello", &flag_a));
+            map.insert(terminate_ch("yello", &flag_b));
+            map.insert(ChannelState::Building(pending_entry));
+        })?;
+
+        map.terminate_all_channels();
+
+        assert!(flag_a.load(Ordering::SeqCst), "channel should be terminated");
+        assert!(flag_b.load(Ordering::SeqCst), "channel should be terminated");
+
+        map.with_channels(|map| {
+            // Open channels were terminated and removed from the map.
+            assert_eq!(map.by_ed25519(&str_to_ed("w")).len(), 0);
+            assert_eq!(map.by_ed25519(&str_to_ed("y")).len(), 0);
+            // The pending ("Building") entry was left untouched.
+            assert_eq!(map.by_ed25519(&str_to_ed("p")).len(), 1);
+        })?;
+
         Ok(())
     }
 }

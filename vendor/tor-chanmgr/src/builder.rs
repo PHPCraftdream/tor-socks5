@@ -713,6 +713,12 @@ impl crate::mgr::AbstractChannel for tor_proto::channel::Channel {
     fn engage_padding_activities(&self) {
         tor_proto::channel::Channel::engage_padding_activities(self);
     }
+    // tor-socks5 local patch: delegate to the already-public
+    // `Channel::terminate()` so `ChanMgr::terminate_all_channels()` can reach
+    // it through the generic `AbstractChannel` machinery.
+    fn terminate(&self) {
+        tor_proto::channel::Channel::terminate(self);
+    }
 }
 
 #[cfg(test)]

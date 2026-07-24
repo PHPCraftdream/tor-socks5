@@ -286,6 +286,7 @@ mod test {
             Ok(())
         }
         fn engage_padding_activities(&self) {}
+        fn terminate(&self) {}
     }
 
     impl HasRelayIds for FakeChannel {

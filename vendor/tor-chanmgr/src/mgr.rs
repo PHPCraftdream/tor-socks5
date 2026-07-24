@@ -63,6 +63,26 @@ pub(crate) trait AbstractChannel: HasRelayIds {
     ///
     /// [`Channel::engage_padding_activities`]: tor_proto::channel::Channel::engage_padding_activities
     fn engage_padding_activities(&self);
+
+    // tor-socks5 local patch: force-invalidate a channel from outside the
+    // manager. `expire_channels()` only ever retires a channel once it has
+    // been idle past its randomized `max_unused_duration`; a channel that a
+    // stuck circuit is still (hopelessly) attempting to use is never "idle"
+    // and so is never expired, even after the underlying network path is
+    // dead (e.g. after a host network change leaves a half-open TCP/TLS
+    // socket). The concrete `tor_proto::channel::Channel` already has a
+    // public `terminate()` that shuts the channel (and its circuits) down
+    // immediately, but nothing above it in this crate could reach it. This
+    // method plumbs that primitive through the generic `AbstractChannel`
+    // machinery so `ChanMgr::terminate_all_channels()` (see `lib.rs`) can
+    // call it on every tracked channel.
+    /// Force this channel to shut down immediately, regardless of whether it
+    /// is currently in use.
+    ///
+    /// See [`Channel::terminate`].
+    ///
+    /// [`Channel::terminate`]: tor_proto::channel::Channel::terminate
+    fn terminate(&self);
 }
 
 /// Trait to describe how channels-like objects are created.
@@ -512,6 +532,28 @@ impl<CF: AbstractChannelFactory + Clone> AbstractChanMgr<CF> {
         self.channels.expire_channels()
     }
 
+    // tor-socks5 local patch: unconditionally terminate every tracked
+    // channel, regardless of usage/idle state. Reuses the same
+    // `self.channels`-level iteration as `expire_channels()`
+    // (see `state::MgrState::terminate_all_channels`), but skips the
+    // `ready_to_expire` check entirely: every channel is force-closed via
+    // `AbstractChannel::terminate()` and then dropped from the map. Intended
+    // to be called explicitly by a caller that has already detected a stale
+    // network condition (e.g. a post-network-change watchdog), not on a
+    // periodic schedule.
+    /// Unconditionally terminate every channel currently tracked by this
+    /// manager, and remove them from the map.
+    ///
+    /// Unlike [`expire_channels`](Self::expire_channels), this does not check
+    /// whether a channel is idle: every channel is force-closed via
+    /// [`AbstractChannel::terminate`], including ones with circuits actively
+    /// (if hopelessly) attached. Callers that hold a reference to a channel
+    /// that gets terminated here will observe it fail the same way they would
+    /// after a real network-level disconnection.
+    pub(crate) fn terminate_all_channels(&self) {
+        self.channels.terminate_all_channels();
+    }
+
     /// Test only: return the open usable channels with a given `ident`.
     #[cfg(test)]
     pub(crate) fn get_nowait<'a, T>(&self, ident: T) -> Vec<Arc<CF::Channel>>
@@ -633,6 +675,9 @@ mod test {
             Ok(())
         }
         fn engage_padding_activities(&self) {}
+        fn terminate(&self) {
+            self.start_closing();
+        }
     }
 
     impl HasRelayIds for FakeChannel {
@@ -953,6 +998,54 @@ mod test {
             assert!(!mgr.get_nowait(&u32_to_ed(3)).is_empty());
             assert!(!mgr.get_nowait(&u32_to_ed(4)).is_empty());
             assert!(mgr.get_nowait(&u32_to_ed(5)).is_empty());
+        });
+    }
+
+    // tor-socks5 local patch: coverage for `AbstractChanMgr::terminate_all_channels`.
+    #[test]
+    fn terminate_all_channels() {
+        test_with_one_runtime!(|runtime| async {
+            let mgr = new_test_abstract_chanmgr(runtime);
+
+            let (ch7, ch8) = join!(
+                mgr.get_or_launch(FakeBuildSpec(7, 'a', u32_to_ed(7), ADDR_A), CU::UserTraffic),
+                mgr.get_or_launch(FakeBuildSpec(8, 'a', u32_to_ed(8), ADDR_A), CU::UserTraffic),
+            );
+            let ch7 = ch7.unwrap().0;
+            let ch8 = ch8.unwrap().0;
+
+            // Neither channel is "unusable" yet: unlike `expire_channels`, which
+            // requires channels to be idle past their `max_unused_duration`,
+            // `terminate_all_channels` closes them unconditionally.
+            assert!(ch7.is_usable());
+            assert!(ch8.is_usable());
+
+            mgr.terminate_all_channels();
+
+            // Both channels were force-closed...
+            assert!(ch7.closing.load(Ordering::SeqCst));
+            assert!(ch8.closing.load(Ordering::SeqCst));
+            // ...and removed from the manager's map.
+            assert!(mgr.get_nowait(&u32_to_ed(7)).is_empty());
+            assert!(mgr.get_nowait(&u32_to_ed(8)).is_empty());
+        });
+    }
+
+    #[test]
+    fn terminate_all_channels_leaves_pending_alone() {
+        test_with_one_runtime!(|runtime| async {
+            let mgr = new_test_abstract_chanmgr(runtime);
+
+            // '💤' never completes within this test, so the entry stays
+            // `Building` in the map throughout.
+            let target = FakeBuildSpec(9, '💤', u32_to_ed(9), ADDR_A);
+            let mut pending = Box::pin(mgr.get_or_launch(target, CU::UserTraffic));
+            assert!(poll!(&mut pending).is_pending());
+
+            // Should not panic or otherwise disturb the still-building entry.
+            mgr.terminate_all_channels();
+
+            assert!(poll!(&mut pending).is_pending());
         });
     }
 }
