@@ -36,6 +36,9 @@ pub enum TorError {
 
     #[error("failed to build Tor client config: {0}")]
     BuildConfig(String),
+
+    #[error("could not access Tor client's channel manager: {0}")]
+    ChanMgrUnavailable(#[source] arti_client::Error),
 }
 
 pub type Result<T, E = TorError> = std::result::Result<T, E>;
@@ -111,6 +114,31 @@ impl TorTunnel {
     /// Access the inner `TorClient` for features not exposed by the wrapper.
     pub fn raw(&self) -> &TorClient<PreferredRuntime> {
         &self.inner
+    }
+
+    /// Unconditionally close every channel this client's `ChanMgr` currently
+    /// tracks, in place, without constructing a new `TorClient`.
+    ///
+    /// Requires the vendored `tor-chanmgr` patch (see
+    /// `vendor/tor-chanmgr/src/lib.rs`'s `ChanMgr::terminate_all_channels`)
+    /// and `arti-client`'s `experimental-api` feature, which is what gates
+    /// `TorClient::chanmgr()`. Any circuit builder holding a reference to a
+    /// terminated channel observes it fail exactly as it would after a real
+    /// network-level disconnection; `ChanMgr::get_or_launch` transparently
+    /// builds a fresh channel (over the same already-warm guard/bridge-
+    /// descriptor state) the next time one is requested. See
+    /// `tor_watchdog.rs`'s module doc comment for why this replaced building
+    /// a whole second `TorClient` in a cold rebuild-slot directory.
+    ///
+    /// `TorClient::chanmgr()` itself returns a `Result` — it fails only when
+    /// the client is not in a "running" state (e.g. fully dormant); that
+    /// failure is surfaced here rather than swallowed so the watchdog can
+    /// tell "termination requested, arti will reconnect" from "could not
+    /// even reach the channel manager".
+    pub fn terminate_all_channels(&self) -> Result<()> {
+        let chanmgr = self.inner.chanmgr().map_err(TorError::ChanMgrUnavailable)?;
+        chanmgr.terminate_all_channels();
+        Ok(())
     }
 
     /// Construct a `TorClient` without waiting for network bootstrap.

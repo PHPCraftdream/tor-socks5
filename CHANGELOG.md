@@ -127,6 +127,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restart already got for free; and the "attempts this tick" trigger
   condition now requires at least 3 attempts instead of 1, so a single
   stray retry cannot arm a rebuild decision.
+- The watchdog's rebuild-slot pool (see the entries above) existed to work
+  around one thing: there was no public API to force-invalidate a stale Tor
+  channel, so the only known reset was building a second, whole `TorClient`
+  in a sibling state directory and swapping it in once it proved usable.
+  Everything else about that design was compensating for the side effects
+  of that workaround — a rebuilt client landed in a *cold* state directory
+  with an empty bridge-descriptor cache, so a hand-written warm-up step
+  (`warm_slot_bridge_desc_cache`) copied `BridgeDescs` rows out of
+  `tor-dirmgr`'s *private*, version-specific sqlite schema, something its
+  own doc comment already flagged as "an internal implementation detail
+  that could shift on an arti upgrade"; and because `TorHandle::swap` only
+  drops its own reference while the outgoing client's state-dir lock can
+  survive for hours (a long-lived connection still holding a clone open),
+  a single sibling directory was not enough, requiring a pool of 6
+  candidate directories each probed with a non-blocking `fslock-guard` lock
+  check before use — and still capable of exhausting the whole pool if
+  enough generations were draining at once. Replaced by vendoring
+  `tor-chanmgr` 0.43.0 and adding `ChanMgr::terminate_all_channels()` to it
+  (force-closes every channel the *live* client's channel manager tracks,
+  reusing the same iteration `expire_channels()` already does, without
+  touching guard/circuit state), exposed through `arti-client`'s
+  `TorClient::chanmgr()` (gated behind the `experimental-api` cargo
+  feature, now enabled) and a new `TorTunnel::terminate_all_channels()` on
+  the wrapper. The watchdog now reacts to the exact same trigger
+  conditions (stale window, attempt/failure-kind counters, the
+  `should_decline_rebuild` signature gate, `MIN_ATTEMPTS_TO_TRIGGER`) by
+  terminating the live client's channels in place — same client, same state
+  directory, same already-warm guard/bridge-descriptor cache, no second
+  `TorClient` to construct, canary-test, or dispose of — and lets arti's
+  `ChanMgr::get_or_launch` build fresh channels the next time one is
+  requested. The canary (`verify_usable`, unchanged) still runs after
+  termination to judge whether the reconnect actually worked, feeding the
+  same `consecutive_failures`/cooldown backoff as before; there is simply
+  no longer a second client for it to gate a swap on. This removes the
+  cold-cache trade-off entirely (no cold rebuild-slot state directory ever
+  exists, so there is nothing for it to be cold), along with the
+  `fslock-guard` and `rusqlite` direct dependencies of `socks5-proxy`
+  (both remain in the dependency tree transitively via `tor-dirmgr`/
+  `tor-persist`, just no longer used by this crate's own code).
 
 ### Known limitations
 

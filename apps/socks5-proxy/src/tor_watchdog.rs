@@ -1,6 +1,6 @@
 //! Stale-channel watchdog: detects Tor channels left half-open by a
-//! silent network change and rebuilds the `TorClient` without restarting
-//! the process.
+//! silent network change and terminates them in place, letting arti
+//! reconnect over the same already-bootstrapped `TorClient`.
 //!
 //! ## The problem this solves
 //!
@@ -14,8 +14,7 @@
 //! The dead-channel signal in arti is an OS-level TCP error (RST/EOF/write
 //! failure). On a quiet Wi-Fi handoff the socket stays half-open and the
 //! default Windows TCP keepalive is measured in hours, so that signal may
-//! never arrive. There is no public API to force-invalidate a channel; the
-//! only reliable reset is to drop the `TorClient` and build a fresh one.
+//! never arrive.
 //!
 //! ## How it heals
 //!
@@ -23,42 +22,96 @@
 //! one stamps `last_success`. A background task (see [`spawn_tor_watchdog`])
 //! periodically checks: if no circuit succeeded within the stale window
 //! **while attempts keep coming** and at least one bridge is still
-//! TCP-reachable (so this is not the bridge-maintenance loop's problem),
-//! it rebuilds the `TorClient` via the same bootstrap path used at startup
-//! and atomically swaps it in for new connections. A cooldown prevents a
-//! rebuild storm when the rebuild does not help (a genuine network block).
+//! TCP-reachable (so this is not the bridge-maintenance loop's problem), it
+//! calls [`arti_wrapper::TorTunnel::terminate_all_channels`] on the *live*
+//! `TorTunnel` — the same client, in the same state directory, with the
+//! same already-warm guard/bridge-descriptor cache — and lets arti's own
+//! `ChanMgr::get_or_launch` build fresh channels the next time one is
+//! requested. A cooldown prevents a rebuild storm when this does not help
+//! (a genuine network block).
+//!
+//! ## Why this replaced the old rebuild-slot-pool design
+//!
+//! An earlier version of this watchdog reacted to the same trigger
+//! conditions by constructing a brand-new `TorTunnel` in one of a small pool
+//! of sibling "rebuild slot" state directories, warming its bridge-
+//! descriptor sqlite cache from the primary directory by hand, canary-
+//! testing it, and only then swapping it in for the old client. That design
+//! existed to work around exactly one problem: there was no public API to
+//! force-invalidate a channel, so the only known reset was "build a whole
+//! new `TorClient`". Everything else about it was compensating for the
+//! side effects of that workaround —
+//!
+//! - A rebuilt client landed in a *cold* state directory, so guards started
+//!   "unsuitable to purpose" until bridge descriptors were re-fetched over
+//!   the network, which could take minutes — the sqlite-warm-up step
+//!   (`warm_slot_bridge_desc_cache`, since removed) tried to paper over this
+//!   by hand-copying `BridgeDescs` rows out of `tor-dirmgr`'s *private*,
+//!   version-specific on-disk schema — the code's own doc comments already
+//!   flagged this as "an internal implementation detail that could shift on
+//!   an arti upgrade".
+//! - A single fixed sibling directory assumed the outgoing client's state-
+//!   dir lock was always free to reuse; it is not — `TorHandle::swap` only
+//!   drops its own reference, and the underlying `Arc<TorClient>` (and
+//!   arti's exclusive lock) survives until the last long-lived connection
+//!   that had cloned it finishes, which can be hours. This required a pool
+//!   of `REBUILD_SLOT_COUNT` candidate directories, each probed with a
+//!   non-blocking `fslock-guard` lock check (`slot_is_free`/`pick_free_slot`,
+//!   since removed) before use — fragile in its own right (hardcoded
+//!   `cache/dir.lock` / `state/state/state.lock` paths) and still capable of
+//!   exhausting the whole pool if enough generations were draining at once.
+//!
+//! [`tor_chanmgr::ChanMgr::terminate_all_channels`] (vendored — see
+//! `vendor/tor-chanmgr/src/lib.rs` and `vendor/README.md`) removes the
+//! premise these workarounds existed for: it force-closes every channel the
+//! *live* client's channel manager tracks without building anything new, so
+//! there is no cold cache, no second state-dir lock to juggle, and no slot
+//! pool to exhaust. `TorClient::chanmgr()` is behind `arti-client`'s
+//! `experimental-api` feature cargo flag, which this workspace now enables.
+//!
+//! ## Judging success without a second client to canary
+//!
+//! The old design canary-tested the *new* client (via [`verify_usable`])
+//! before trusting it enough to swap in, because there were two clients in
+//! play and only one of them should survive. Here there is only ever one
+//! client — the same one, with its channels reset — so "swap in on success"
+//! has no meaning any more. What still needs answering is the same question
+//! the old canary answered: did this actually help? We reuse the identical
+//! mechanism ([`verify_usable`], unchanged: retry the most recent
+//! successful `(host, port)` under a timeout) *after* calling
+//! `terminate_all_channels`, and feed its answer into the exact same
+//! `consecutive_failures`/cooldown machinery the rebuild path used — a
+//! successful reconnect resets the counter, a failure extends the cooldown.
+//! This keeps the operational behavior (backoff under a genuinely blocked
+//! network, quick recovery otherwise) identical to before, without a
+//! parallel client to construct or dispose of.
 //!
 //! ## Why "attempts are failing" isn't enough on its own
 //!
-//! A rebuild only replaces channels — it does nothing for a healthy Tor
-//! stack whose *exits* went quiet, or whose guards are temporarily
-//! unsuitable. Worse, a rebuild lands in a cold rebuild-slot state
-//! directory (see [`REBUILD_SLOT_COUNT`]) whose bridge-descriptor cache
-//! starts empty, so its guards are themselves "unsuitable to purpose" for
-//! several minutes — trading a live, merely degraded client for one that is
-//! *guaranteed* unable to serve traffic. This is the mechanism analyzed in
+//! Terminating channels only forces a reconnect — it does nothing for a
+//! healthy Tor stack whose *exits* went quiet, or whose guards are
+//! temporarily unsuitable; retrying those the exact same way changes
+//! nothing. This is the mechanism analyzed in
 //! docs/upstream/guard-exhaustion-watchdog-spiral.md: a rebuild triggered by
 //! exit-side timeouts, not a stale channel, made an outage worse rather than
 //! fixing it. `classify_and_record` (fed from `server.rs` on every failed
 //! `TorTunnel::connect`) and [`should_decline_rebuild`] add a fourth trigger
-//! condition — a signature gate — that declines to rebuild when the
-//! window's failures are dominated by `RemoteNetworkTimeout` or
-//! `TorAccessFailed` rather than `TorNetworkTimeout`, since only the latter
-//! is the "zombie channel" signature a rebuild can actually fix.
+//! condition — a signature gate — that declines to act when the window's
+//! failures are dominated by `RemoteNetworkTimeout` or `TorAccessFailed`
+//! rather than `TorNetworkTimeout`, since only the latter is the "zombie
+//! channel" signature a channel reset can actually fix.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::Context;
 use arti_wrapper::TorTunnel;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::bridge_store::BridgeStore;
 use crate::config::WatchdogConfig;
-use crate::tor_setup::build_tor_settings;
 
 /// Shared, lock-free circuit-level health signal, updated from the SOCKS5
 /// hot path on every Tor `connect`. Cheap to clone (two atomics behind an
@@ -215,7 +268,11 @@ pub fn classify_and_record(err: &arti_wrapper::TorError, health: &TorHealth) {
 /// loop (reads the current tunnel for each new connection), the watchdog
 /// (replaces it after a rebuild) and the bridge-maintenance loop (reads it
 /// for over-Tor candidate-pool refreshes). All clones share one slot, so a
-/// rebuild becomes visible to every consumer without re-distribution.
+/// terminate-and-reconnect becomes visible to every consumer without
+/// re-distribution — even though the watchdog no longer replaces the
+/// tunnel value itself, the slot indirection is still what lets the accept
+/// loop and the bridge-maintenance loop read "the current tunnel" without
+/// each holding a fixed clone.
 #[derive(Clone)]
 pub struct TorHandle {
     /// `Option` so the slot can be drained at shutdown, dropping the last
@@ -237,9 +294,7 @@ impl TorHandle {
     /// Snapshot the current tunnel for a new connection. Returns `None`
     /// only while the server is shutting down (the slot has been drained);
     /// callers should treat that as a transient "unavailable" error. A
-    /// `TorTunnel` is an `Arc<TorClient>` internally, so the clone is cheap
-    /// and the connection runs against a fixed client even if the watchdog
-    /// swaps the slot right after.
+    /// `TorTunnel` is an `Arc<TorClient>` internally, so the clone is cheap.
     pub async fn tunnel(&self) -> Option<TorTunnel> {
         self.slot.read().await.clone()
     }
@@ -247,15 +302,6 @@ impl TorHandle {
     /// Circuit-level health counters shared with the watchdog.
     pub fn health(&self) -> &TorHealth {
         &self.health
-    }
-
-    /// Atomically replace the live tunnel. The previously slotted
-    /// `TorTunnel` is dropped (releasing the slot's `Arc<TorClient>` ref);
-    /// it fully goes away once the in-flight connections that cloned it
-    /// finish, because the other consumers read through the slot rather
-    /// than holding a fixed clone.
-    pub async fn swap(&self, new: TorTunnel) {
-        let _ = self.slot.write().await.insert(new);
     }
 
     /// Take the tunnel out of the slot (graceful shutdown). The returned
@@ -266,18 +312,11 @@ impl TorHandle {
     }
 }
 
-/// Hard cap on how long a single rebuild attempt waits for the network
-/// bootstrap to finish. On a fully-blocked network a fresh `dirmgr`
-/// bootstrap never completes. Unlike a bare `.await` around the whole
-/// rebuild (which would lose the only reference to an already-constructed
-/// `TorClient`, orphaning its detached background tasks and any spawned PT
-/// child), this timeout wraps only the network-wait phase (see
-/// [`rebuild`]): the `TorTunnel` itself is constructed synchronously first
-/// and stays fully owned by the caller even when the wait times out, so it
-/// can be explicitly dropped instead of leaked. PT subprocess cleanup on
-/// that drop is still not instantaneous (see the note at the `rebuild(...)`
-/// call site below).
-const REBUILD_TIMEOUT: Duration = Duration::from_secs(90);
+/// Budget for the post-termination usability check: how long [`heal`] waits
+/// for the live client to actually carry traffic again after
+/// `terminate_all_channels`, before giving up on this tick and letting the
+/// cooldown/backoff machinery gate the next attempt.
+const VERIFY_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Minimum number of `TorTunnel::connect` attempts observed within a single
 /// tick before "attempts are still coming" (trigger condition 2) is treated
@@ -291,10 +330,15 @@ const REBUILD_TIMEOUT: Duration = Duration::from_secs(90);
 /// actual use produces many attempts per tick, not one or two.
 const MIN_ATTEMPTS_TO_TRIGGER: u64 = 3;
 
-/// Once this many rebuilds fail in a row (timeout or error), the watchdog
-/// backs off to [`EXTENDED_REBUILD_COOLDOWN`] instead of the configured
+/// Once this many heal attempts (terminate-then-reconnect) fail in a row
+/// (terminate error, or the client still doesn't reconnect within
+/// [`VERIFY_TIMEOUT`]), the watchdog backs off to
+/// [`EXTENDED_REBUILD_COOLDOWN`] instead of the configured
 /// `rebuild_cooldown_secs`: a persistently blocked network does not merit
-/// a rebuild every few minutes.
+/// retrying every few minutes. Field/constant names still say "rebuild" —
+/// that's the configured `[watchdog]` key (`rebuild_cooldown_secs`) this
+/// mirrors, kept stable across the rebuild-slot → in-place-heal switch so
+/// existing config files do not need to change.
 const CONSECUTIVE_FAILURES_BEFORE_BACKOFF: u32 = 3;
 
 /// Fixed cooldown applied once [`CONSECUTIVE_FAILURES_BEFORE_BACKOFF`] is
@@ -302,7 +346,7 @@ const CONSECUTIVE_FAILURES_BEFORE_BACKOFF: u32 = 3;
 /// alone for a while", independent of how aggressive the normal cooldown is.
 const EXTENDED_REBUILD_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 
-/// Cooldown that will gate the *next* rebuild after `consecutive_failures`
+/// Cooldown that will gate the *next* heal attempt after `consecutive_failures`
 /// failed attempts. Pure helper so the loop's failure branches log the
 /// cooldown that will actually apply, without duplicating the threshold.
 fn next_cooldown(consecutive_failures: u32, normal: Duration) -> Duration {
@@ -363,8 +407,9 @@ fn should_decline_rebuild(
 /// Every `check_interval` the task evaluates four trigger conditions (stale
 /// success, fresh attempts, alive bridges, and a failure-signature gate —
 /// see [`should_decline_rebuild`]) and, if all hold and the cooldown has
-/// elapsed, rebuilds the `TorClient` and swaps it in. A
-/// `check_interval_secs == 0` (or `enabled == false`) config disables it.
+/// elapsed, calls [`heal`] to terminate the live client's channels in place
+/// and verify it reconnects. A `check_interval_secs == 0` (or
+/// `enabled == false`) config disables it.
 ///
 /// Mirrors the shape of `spawn_bridge_maintenance` so the two background
 /// loops share a house style (detached, gentle, interval-based, logs-only
@@ -400,24 +445,12 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
         let mut prev_access_failed = handle.health().access_failed_count();
         let mut prev_net_timeout = handle.health().net_timeout_count();
         let mut last_rebuild: Option<Instant> = None;
-        // Consecutive failed rebuilds (timeout or error). Once it crosses
+        // Consecutive failed heal attempts (post-termination reconnect
+        // verification timed out or never succeeded). Once it crosses
         // [`CONSECUTIVE_FAILURES_BEFORE_BACKOFF`] the cooldown stretches to
         // [`EXTENDED_REBUILD_COOLDOWN`] so a fully-blocked network is not
-        // hammered. Reset to 0 on the first successful rebuild.
+        // hammered. Reset to 0 on the first successful heal.
         let mut consecutive_failures: u32 = 0;
-        // Which rebuild slot (index into the [`REBUILD_SLOT_COUNT`]-sized
-        // pool) is currently live, if any rebuild has ever succeeded. `None`
-        // means either the original (primary state-dir) client from startup
-        // is still live, or the config has no persistent state dir at all.
-        // Only updated on a *successful* rebuild — a failed attempt leaves
-        // whatever is actually live unchanged. The slot for the *next*
-        // rebuild is no longer precomputed here: `rebuild()` probes each
-        // pool slot's on-disk locks itself (via `pick_free_slot`) once it
-        // knows the state dir, and picks whichever one is actually free —
-        // tolerating however many prior generations are still draining
-        // (see the doc comment on `rebuild` for why a fixed A/B pair isn't
-        // enough).
-        let mut live_slot: Option<u8> = None;
 
         loop {
             ticker.tick().await;
@@ -459,9 +492,7 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
             }
             // Condition 2: attempts were made in this tick — silence here
             // means "no traffic", not "circuits failing". Requires at least
-            // MIN_ATTEMPTS_TO_TRIGGER rather than just "> 0": a rebuild lands
-            // in a slot the canary/warm-up path treats specially, so it
-            // should not fire on a single stray attempt — see that
+            // MIN_ATTEMPTS_TO_TRIGGER rather than just "> 0" — see that
             // constant's doc comment for why 3 and not 0/1.
             if new_attempts < MIN_ATTEMPTS_TO_TRIGGER {
                 continue;
@@ -476,42 +507,38 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
             // Condition 4 (signature gate): the first three conditions only
             // tell us "circuits are failing while attempts and bridges are
             // both fine" — they cannot tell a stale channel from a healthy
-            // stack whose exits or guards are simply having a bad time. A
-            // rebuild only replaces channels; if the failures this window
-            // are dominated by `RemoteNetworkTimeout` (exit went silent,
-            // Tor stack is fine) or `TorAccessFailed` (guards down/
-            // unsuitable — a rebuild starts in a *cold* slot and reproduces
-            // this exact state, worse yet: the spiral analyzed in
-            // docs/upstream/guard-exhaustion-watchdog-spiral.md happens
-            // precisely because a cold rebuild slot's guards are unsuitable
-            // for several minutes), rebuilding cannot fix what's wrong and
-            // trades a live, merely degraded client for a guaranteed-broken
-            // one. See `should_decline_rebuild`'s doc comment for the exact
-            // rule and docs/upstream/guard-exhaustion-watchdog-spiral.md
-            // §3.A/§4.2 for the incident this closes (8 attempts in 218 s,
-            // all RemoteNetworkTimeout/ExitTimeout to one Telegram DC).
+            // stack whose exits or guards are simply having a bad time.
+            // Terminating channels only forces a reconnect; if the failures
+            // this window are dominated by `RemoteNetworkTimeout` (exit went
+            // silent, Tor stack is fine) or `TorAccessFailed` (guards down/
+            // unsuitable), a reconnect over the same guards changes nothing.
+            // See `should_decline_rebuild`'s doc comment for the exact rule
+            // and docs/upstream/guard-exhaustion-watchdog-spiral.md §3.A/§4.2
+            // for the incident this closes (8 attempts in 218 s, all
+            // RemoteNetworkTimeout/ExitTimeout to one Telegram DC).
             //
             // Declining here is a deliberate non-attempt, not a failed one:
             // `last_rebuild`/`consecutive_failures` are left untouched so
-            // the cooldown timer does not arm and a legitimate rebuild is
-            // not deferred if the signature flips to net-timeout-dominated
-            // on a later tick.
+            // the cooldown timer does not arm and a legitimate heal is not
+            // deferred if the signature flips to net-timeout-dominated on a
+            // later tick.
             if should_decline_rebuild(new_remote_timeout, new_access_failed, new_net_timeout) {
                 warn!(
                     new_remote_timeout,
                     new_access_failed,
                     new_net_timeout,
-                    "declining rebuild: failures in this window are \
+                    "declining channel termination: failures in this window are \
                      RemoteNetworkTimeout/TorAccessFailed, not TorNetworkTimeout \
-                     — a fresh client would reproduce the same state, not fix it"
+                     — reconnecting over the same guards would reproduce the same \
+                     state, not fix it"
                 );
                 continue;
             }
-            // Cooldown: never rebuild more often than configured, even when
-            // the rebuild cannot help (a real network block). After a run of
-            // consecutive failures we stretch it further (see
-            // [`EXTENDED_REBUILD_COOLDOWN`]) so a fully-blocked network is
-            // not hammered every `rebuild_cooldown_secs`.
+            // Cooldown: never act more often than configured, even when it
+            // cannot help (a real network block). After a run of consecutive
+            // failures we stretch it further (see [`EXTENDED_REBUILD_COOLDOWN`])
+            // so a fully-blocked network is not hammered every
+            // `rebuild_cooldown_secs`.
             let effective_cooldown = if consecutive_failures >= CONSECUTIVE_FAILURES_BEFORE_BACKOFF
             {
                 EXTENDED_REBUILD_COOLDOWN
@@ -532,70 +559,34 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
                 consecutive_failures,
                 effective_cooldown_secs = effective_cooldown.as_secs(),
                 "no successful Tor circuit in the stale window despite attempts \
-                 and alive bridges — rebuilding TorClient, possibly stale \
-                 channels from a network change"
+                 and alive bridges — terminating all live channels in place, \
+                 possibly stale channels from a network change"
             );
 
-            // `rebuild` itself bounds only the network-wait phase with
-            // REBUILD_TIMEOUT (see its doc comment and body): construction
-            // of the `TorTunnel` is synchronous and always fully succeeds or
-            // fails outright, so a timeout here can never strand an unowned
-            // half-built client. On `TimedOut` we still hold the `TorTunnel`
-            // and explicitly drop it below — not an *immediate* PT
-            // subprocess reap: tor-ptmgr's cleanup only fires the next time
-            // the child writes another stdout line and its forwarding thread
-            // notices the receiver is gone (ipc.rs in tor-ptmgr — no
-            // kill_on_drop). In practice a stuck PT keeps logging (handshake
-            // retries/timeouts), so this tends to happen soon, but it is not
-            // guaranteed instantly; any process that outlives this is still
-            // bounded by the startup Job Object on process exit.
             let canary_target = handle.health().last_success_target();
-            match rebuild(config_path.as_deref(), live_slot, canary_target).await {
-                Ok(RebuildOutcome::Ready { tor: new_tor, slot }) => {
-                    handle.swap(new_tor).await;
+            let Some(tor) = handle.tunnel().await else {
+                // Slot already drained (shutdown in progress) — nothing to
+                // heal. Leave the cooldown/failure counters untouched, same
+                // as the signature-gate decline above: this is not a failed
+                // attempt, just nothing to do.
+                continue;
+            };
+            match heal(&tor, canary_target).await {
+                HealResult::Healed => {
                     last_rebuild = Some(Instant::now());
-                    live_slot = slot;
                     if consecutive_failures > 0 {
                         info!(
                             prior_consecutive_failures = consecutive_failures,
-                            "tor stale-channel watchdog: rebuild succeeded — backoff counter reset"
+                            "tor stale-channel watchdog: heal succeeded — backoff counter reset"
                         );
                     }
                     consecutive_failures = 0;
-                    info!("tor stale-channel watchdog: TorClient rebuilt and swapped in");
-                }
-                Ok(RebuildOutcome::TimedOut(tor)) => {
-                    // Controlled drop of a fully-owned value — not an
-                    // orphaning cancellation. `tor` was never lost to an
-                    // external future-cancellation, so this relies on
-                    // arti's normal, already-working Drop-based cleanup
-                    // (the same mechanism the graceful-shutdown path in
-                    // `server.rs` already uses successfully).
-                    drop(tor);
-                    consecutive_failures = consecutive_failures.saturating_add(1);
-                    last_rebuild = Some(Instant::now());
-                    warn!(
-                        timeout_secs = REBUILD_TIMEOUT.as_secs(),
-                        consecutive_failures,
-                        threshold = CONSECUTIVE_FAILURES_BEFORE_BACKOFF,
-                        next_cooldown_secs =
-                            next_cooldown(consecutive_failures, cooldown).as_secs(),
-                        "tor stale-channel watchdog: rebuild timed out — dropped the \
-                         fully-owned half-bootstrapped client"
+                    info!(
+                        "tor stale-channel watchdog: channels terminated and client \
+                         reconnected successfully"
                     );
                 }
-                Ok(RebuildOutcome::NotUsable(tor)) => {
-                    // Same controlled-drop reasoning as the TimedOut arm: we
-                    // fully own `tor`, so this is a normal, safe drop. The
-                    // old client stays live in `live_slot` — we deliberately
-                    // do not swap, because the freshly bootstrapped client
-                    // reported directory-ready but failed to actually carry
-                    // traffic within VERIFY_TIMEOUT (see verify_usable's
-                    // doc comment and RebuildOutcome::NotUsable): swapping
-                    // it in would replace a live, if degraded, client with
-                    // one that silently cannot serve traffic for minutes
-                    // while it catches up on bridge descriptors.
-                    drop(tor);
+                HealResult::StillUnhealthy => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
                     last_rebuild = Some(Instant::now());
                     warn!(
@@ -604,31 +595,26 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
                         threshold = CONSECUTIVE_FAILURES_BEFORE_BACKOFF,
                         next_cooldown_secs =
                             next_cooldown(consecutive_failures, cooldown).as_secs(),
-                        "tor stale-channel watchdog: rebuild bootstrapped but failed the \
-                         usability check — a fresh client would have been unable to serve \
-                         traffic; keeping the current one"
+                        "tor stale-channel watchdog: channels terminated but the client \
+                         did not reconnect within the verify budget — will retry after \
+                         cooldown"
                     );
                 }
-                Err(e) => {
+                HealResult::TerminateFailed(e) => {
                     // Count the failure and set the cooldown either way so a
-                    // persistently unreachable network does not trigger a
-                    // rebuild storm. `next_cooldown` reports what will gate
-                    // the *next* attempt after this bump.
+                    // persistently unreachable channel manager does not
+                    // trigger a retry storm. `next_cooldown` reports what
+                    // will gate the *next* attempt after this bump.
                     consecutive_failures = consecutive_failures.saturating_add(1);
                     last_rebuild = Some(Instant::now());
                     warn!(
-                        // `{:#}` (not `%e`/Display) walks anyhow's full
-                        // `.context()` chain — the top-level message alone
-                        // ("re-bootstrapping Tor client") hid the actual
-                        // cause in production and made a state-dir lock
-                        // collision indistinguishable from a real bootstrap
-                        // failure.
-                        error = format!("{:#}", e),
+                        error = format!("{e:#}"),
                         consecutive_failures,
                         threshold = CONSECUTIVE_FAILURES_BEFORE_BACKOFF,
                         next_cooldown_secs =
                             next_cooldown(consecutive_failures, cooldown).as_secs(),
-                        "tor stale-channel watchdog: rebuild failed — will retry after cooldown"
+                        "tor stale-channel watchdog: could not terminate channels — \
+                         will retry after cooldown"
                     );
                 }
             }
@@ -636,245 +622,61 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
     });
 }
 
-/// Relative path (from a state dir root) to arti's persistent net-document
-/// cache database — hardcodes `tor-dirmgr` 0.43.0's on-disk layout (see
-/// `vendor/tor-dirmgr/src/storage/sqlite.rs`'s `from_path_and_mistrust`,
-/// which opens exactly this file under the configured cache dir).
-const DIR_SQLITE_REL_PATH: &str = "cache/dir.sqlite3";
+/// Outcome of one [`heal`] attempt.
+enum HealResult {
+    /// Channels were terminated and the client reconnected successfully
+    /// (verified via [`verify_usable`]) within [`VERIFY_TIMEOUT`].
+    Healed,
+    /// Channels were terminated, but the client did not carry traffic again
+    /// within [`VERIFY_TIMEOUT`] — arti did not (yet) reconnect, or the
+    /// underlying network problem is not actually channel-related. The old
+    /// client is still live (there was never a second one to fall back to);
+    /// the caller backs off via the cooldown/consecutive-failures machinery.
+    StillUnhealthy,
+    /// `TorTunnel::terminate_all_channels` itself failed — e.g. the client
+    /// is not in a "running" state (see `arti_wrapper::TorTunnel::
+    /// terminate_all_channels`'s doc comment). No channels were touched.
+    TerminateFailed(anyhow::Error),
+}
 
-/// Best-effort: copy fresh `BridgeDescs` rows from the primary cache into a
-/// rebuild slot's cache *before* `TorTunnel::create_unbootstrapped_with`
-/// constructs the slot's client, so the rebuilt client starts with a warm
-/// bridge-descriptor cache instead of an empty one — the same advantage a
-/// cold process restart gets from the primary directory being continuously
-/// refreshed by the live client. See
-/// docs/upstream/guard-exhaustion-watchdog-spiral.md §2.3 ("Bridge-дескрипторы
-/// персистентно кэшируются — и в этом вся разница"), §3.B3 and §4.3.
+/// Terminate every channel the live `tor` client's `ChanMgr` currently
+/// tracks, then judge whether the client actually recovers.
 ///
-/// Without this, a rebuild lands in a slot whose `BridgeDescs` cache is empty
-/// or stale, and arti's `dirmgr` has to fetch bridge descriptors over the
-/// network from scratch — guardmgr only requests descriptors for its first
-/// two preferred guards at a time (`data_parallelism: 1` by default), so this
-/// can take minutes under retry/backoff, during which every guard is
-/// `dir_info_missing` = "unsuitable to purpose" and the canary
-/// ([`verify_usable`]) keeps failing. Copying the primary's already-fetched
-/// rows in gives the slot the same warm start a cold process restart gets
-/// "for free" from the primary directory.
+/// ## Why there is still a canary here
 ///
-/// This hardcodes arti's private on-disk schema (the `BridgeDescs` table in
-/// `cache/dir.sqlite3`: `bridge_line TEXT PRIMARY KEY, fetched, until,
-/// contents BLOB` — see `vendor/tor-dirmgr/src/storage/sqlite.rs`'s
-/// `UPDATE_SCHEMA`/`FIND_BRIDGEDESC`/`INSERT_BRIDGEDESC`) — an internal
-/// implementation detail that could shift on an arti upgrade. **Fail-open**:
-/// any error (missing primary file, missing/uninitialized slot database,
-/// schema mismatch, lock contention with a still-live client reading/writing
-/// the same file) is caught and logged at `debug`/`warn`, never propagated —
-/// a failed warm-up just means the slot starts cold, exactly like before
-/// this change, not a blocked or failed rebuild.
-///
-/// `primary_base` is the state dir root as configured (i.e. `settings
-/// .state_dir` *before* `rebuild()` redirects it into a
-/// `watchdog-rebuild-N` slot); `slot_dir` is that slot's directory.
-fn warm_slot_bridge_desc_cache(primary_base: &Path, slot_dir: &Path) {
-    match try_warm_slot_bridge_desc_cache(primary_base, slot_dir) {
-        Ok(copied) if copied > 0 => {
-            info!(
-                rows = copied,
-                "tor stale-channel watchdog: warmed rebuild slot's BridgeDescs cache from \
-                 the primary directory before construction"
-            );
-        }
-        Ok(_) => {
-            // Nothing to copy (primary cache empty, or nothing newer than
-            // what the slot already has) — not worth logging at info level.
-        }
-        Err(e) => {
-            warn!(
-                error = format!("{e:#}"),
-                "tor stale-channel watchdog: could not warm rebuild slot's BridgeDescs cache \
-                 — proceeding with a cold slot, same as before this optimization"
-            );
-        }
+/// The rebuild-slot design canary-tested a *second*, freshly bootstrapped
+/// client before trusting it enough to replace the first — the two-client
+/// setup was the whole point of the canary (never trust the newcomer
+/// blindly). Here there is exactly one client, and terminating its channels
+/// cannot itself be undone or second-guessed — there is no alternative to
+/// swap to. So the canary's role changes from "gatekeeper before a swap" to
+/// "signal for the backoff/cooldown machinery": did terminating the
+/// channels actually let the client reconnect, or is whatever was wrong
+/// with the network still wrong? Reusing [`verify_usable`] unchanged (retry
+/// the most recent successful `(host, port)` under [`VERIFY_TIMEOUT`]) for
+/// this keeps that judgment identical to the old design's, so a genuinely
+/// blocked network still triggers [`CONSECUTIVE_FAILURES_BEFORE_BACKOFF`]-
+/// driven backoff exactly as before, just without a client to construct and
+/// dispose of on every tick.
+async fn heal(tor: &TorTunnel, canary_target: Option<(String, u16)>) -> HealResult {
+    if let Err(e) = tor.terminate_all_channels() {
+        return HealResult::TerminateFailed(anyhow::Error::new(e));
+    }
+    if verify_usable(tor, canary_target).await {
+        HealResult::Healed
+    } else {
+        HealResult::StillUnhealthy
     }
 }
 
-/// Fallible inner half of [`warm_slot_bridge_desc_cache`], split out so the
-/// caller can funnel every error path through one `warn!` without repeating
-/// the fail-open wrapping at every `?`.
-///
-/// Returns the number of `BridgeDescs` rows copied (0 is not an error — it
-/// just means the primary had nothing to offer).
-fn try_warm_slot_bridge_desc_cache(primary_base: &Path, slot_dir: &Path) -> anyhow::Result<usize> {
-    let primary_db = primary_base.join(DIR_SQLITE_REL_PATH);
-    if !primary_db.is_file() {
-        // Nothing to warm from — e.g. this process has never bootstrapped
-        // against a persistent state dir. Not an error, just nothing to do.
-        return Ok(0);
-    }
-
-    let slot_db = slot_dir.join(DIR_SQLITE_REL_PATH);
-    if !slot_db.is_file() {
-        // The slot's own cache database does not exist yet — it is created
-        // by arti itself as part of `TorClient::create_unbootstrapped`,
-        // which runs strictly after this function (see `rebuild`'s call
-        // site). Hand-rolling arti's versioned schema
-        // (`TorSchemaMeta`/`UPDATE_SCHEMA` in
-        // vendor/tor-dirmgr/src/storage/sqlite.rs) here to create an empty
-        // database upfront would duplicate and risk drifting from an
-        // internal detail we do not own; simplest and safest is to skip the
-        // warm-up for a slot's first-ever use and let it populate its cache
-        // the normal (network) way once, same as before this change. Later
-        // rebuilds reusing this same slot directory will find the database
-        // already created and get warmed normally.
-        return Ok(0);
-    }
-
-    // Open the primary read-only: a live client may still be reading and
-    // periodically writing this same file. `SQLITE_OPEN_READ_ONLY` avoids
-    // taking any write lock on it and lets sqlite's own MVCC-ish concurrent
-    // reader support do its job; if the primary is momentarily locked in a
-    // way that conflicts even with a reader, the error simply propagates up
-    // through `?` and the whole warm-up is skipped for this rebuild (fail-open).
-    let primary_flags =
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let primary = rusqlite::Connection::open_with_flags(&primary_db, primary_flags)
-        .context("opening primary BridgeDescs cache read-only")?;
-
-    // The slot database is brand-new or from a previous generation in this
-    // same slot directory — open it normally (read-write, no create: we
-    // already checked it exists above).
-    let slot_flags =
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let mut slot = rusqlite::Connection::open_with_flags(&slot_db, slot_flags)
-        .context("opening slot BridgeDescs cache read-write")?;
-
-    let mut rows: Vec<(
-        String,
-        rusqlite::types::Value,
-        rusqlite::types::Value,
-        Vec<u8>,
-    )> = Vec::new();
-    {
-        let mut stmt = primary
-            .prepare("SELECT bridge_line, fetched, until, contents FROM BridgeDescs")
-            .context("preparing BridgeDescs read from primary cache")?;
-        let mapped = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, rusqlite::types::Value>(1)?,
-                    row.get::<_, rusqlite::types::Value>(2)?,
-                    row.get::<_, Vec<u8>>(3)?,
-                ))
-            })
-            .context("reading BridgeDescs rows from primary cache")?;
-        for row in mapped {
-            rows.push(row.context("decoding a BridgeDescs row from primary cache")?);
-        }
-    }
-
-    if rows.is_empty() {
-        return Ok(0);
-    }
-
-    let tx = slot
-        .transaction()
-        .context("opening a transaction on the slot BridgeDescs cache")?;
-    {
-        let mut insert = tx
-            .prepare("INSERT OR REPLACE INTO BridgeDescs (bridge_line, fetched, until, contents) VALUES (?1, ?2, ?3, ?4)")
-            .context("preparing BridgeDescs write into slot cache")?;
-        for (bridge_line, fetched, until, contents) in &rows {
-            insert
-                .execute(rusqlite::params![bridge_line, fetched, until, contents])
-                .context("writing a BridgeDescs row into slot cache")?;
-        }
-    }
-    tx.commit()
-        .context("committing warmed BridgeDescs rows into slot cache")?;
-
-    Ok(rows.len())
-}
-
-/// Number of parallel rebuild-slot state directories the watchdog cycles
-/// through. A single fixed pair (the previous design) assumed the slot
-/// that is not currently "live" is always free to reuse — but `TorHandle`
-/// only drops its OWN reference on swap; the underlying `Arc<TorClient>`
-/// (and arti's exclusive state-dir lock) survives until the last in-flight
-/// connection that cloned the old `TorTunnel` finishes, which for a
-/// long-lived connection (e.g. a persistent Telegram session) can be
-/// hours. With only two slots, a rebuild a few cycles later can collide
-/// with a still-draining earlier generation. A small pool, probed for an
-/// actually-free slot before use, tolerates however many generations are
-/// simultaneously draining, up to REBUILD_SLOT_COUNT of them.
-const REBUILD_SLOT_COUNT: u8 = 6;
-
-fn rebuild_slot_dir_name(slot: u8) -> String {
-    format!("watchdog-rebuild-{slot}")
-}
-
-/// Probe whether a slot directory's persistent-state locks are free right
-/// now, without holding them ourselves (open-then-immediately-drop). A
-/// missing lock file (slot never used) counts as free — `LockFileGuard::
-/// try_lock` creates it as a side effect, same as arti's own code does.
-///
-/// Hardcodes `arti-client` 0.43.0's on-disk layout (`cache/dir.lock`,
-/// `state/state/state.lock`) — an internal implementation detail that
-/// could shift on an arti upgrade. If either probe errors for any other
-/// reason (permissions, unexpected layout), this reports "free" rather
-/// than blocking rebuilds outright — worst case we're back to the old
-/// blind-retry behavior for that one slot, not stuck forever.
-fn slot_is_free(dir: &Path) -> bool {
-    let probe = |rel: &str| -> std::io::Result<bool> {
-        Ok(fslock_guard::LockFileGuard::try_lock(dir.join(rel))?.is_some())
-    };
-    probe("cache/dir.lock").unwrap_or(true) && probe("state/state/state.lock").unwrap_or(true)
-}
-
-/// Find the first slot (skipping `avoid`, the currently-live one if any)
-/// whose locks are currently free. `None` means every slot in the pool is
-/// still draining a previous generation — the caller should back off and
-/// retry later rather than colliding.
-fn pick_free_slot(base: &Path, avoid: Option<u8>) -> Option<u8> {
-    (0..REBUILD_SLOT_COUNT)
-        .filter(|&s| Some(s) != avoid)
-        .find(|&s| slot_is_free(&base.join(rebuild_slot_dir_name(s))))
-}
-
-/// Outcome of one rebuild attempt.
-enum RebuildOutcome {
-    /// Bootstrap finished; here is the ready tunnel and the slot it landed
-    /// in (`None` only if the config has no persistent state dir at all).
-    Ready { tor: TorTunnel, slot: Option<u8> },
-    /// Bootstrap did not finish within [`REBUILD_TIMEOUT`], but — unlike the
-    /// old single-phase design — we still fully own the client (it was never
-    /// lost to an external future-cancellation); the caller decides what to
-    /// do with it (currently: drop it explicitly, which is a safe,
-    /// controlled drop of a fully-owned value, not an orphaning
-    /// cancellation).
-    TimedOut(TorTunnel),
-    /// Bootstrap finished and reported ready, but the client could not
-    /// actually establish a connection within the verify budget — arti's
-    /// readiness signal only covers directory bootstrap, not bridge
-    /// descriptors (see docs/upstream/guard-exhaustion-watchdog-spiral.md
-    /// §2.2). Swapping this in would replace a live client with one that
-    /// silently can't serve traffic for minutes. Caller drops it, same as
-    /// TimedOut.
-    NotUsable(TorTunnel),
-}
-
-/// Budget for the post-bootstrap usability check (separate from
-/// REBUILD_TIMEOUT, which only bounds directory bootstrap).
-const VERIFY_TIMEOUT: Duration = Duration::from_secs(90);
-
-/// Try to actually establish a connection through a freshly-bootstrapped
-/// client before trusting it enough to swap in. `target` is a recently
-/// successful (host, port) pair to retry against; if none is available
-/// (process just started, nothing has ever succeeded), skip verification
-/// entirely — treat the client as usable (nothing better to compare
-/// against, and gating everything on this would block first-ever startup
-/// too — though note: rebuild() only runs after startup already succeeded
-/// once, so in practice `target` should be Some by then).
+/// Try to actually establish a connection through the client before
+/// declaring a heal attempt successful. `target` is a recently successful
+/// (host, port) pair to retry against; if none is available (process just
+/// started, nothing has ever succeeded), skip verification entirely — treat
+/// the client as usable (nothing better to compare against, and gating
+/// everything on this would block first-ever startup too — though note:
+/// `heal()` only runs after startup already succeeded once, so in practice
+/// `target` should be Some by then).
 async fn verify_usable(tor: &TorTunnel, target: Option<(String, u16)>) -> bool {
     let Some((host, port)) = target else {
         return true;
@@ -883,78 +685,6 @@ async fn verify_usable(tor: &TorTunnel, target: Option<(String, u16)>) -> bool {
         .await
         .map(|r| r.is_ok())
         .unwrap_or(false)
-}
-
-/// Re-run the startup bootstrap path against the current config and return
-/// a fresh `TorTunnel`. Re-probes bridges (so a freshly-dead one is dropped)
-/// and re-bootstraps, establishing brand-new channels to the reachable
-/// bridges — exactly the reset arti has no public API for.
-///
-/// **State dir.** arti holds an *exclusive* lock on its state directory. The
-/// dying client we are replacing still holds its own lock — and, critically,
-/// so can any *older* generation whose `TorTunnel` clone is still held open
-/// by a long-lived connection (`TorHandle::swap` only drops the slot's own
-/// reference; the underlying `Arc<TorClient>` and its state-dir lock survive
-/// until the last such clone is dropped, which for a persistent connection
-/// can be hours — see `TorHandle::swap`'s doc comment). A single fixed pair
-/// of directories assumes the "not currently live" slot is always free,
-/// which breaks once a stale generation is still draining when its turn in
-/// the pair comes back around. Instead, this probes a small pool of
-/// [`REBUILD_SLOT_COUNT`] slots (see [`pick_free_slot`]) for one whose
-/// on-disk locks are actually free right now, tolerating however many
-/// generations are simultaneously draining, up to the size of the pool.
-///
-/// **Two-phase construction.** `TorTunnel::create_unbootstrapped_with` is
-/// synchronous — it either returns a fully owned client or fails outright,
-/// with no `.await` in between to be cancelled mid-way. Only the subsequent
-/// network wait (`tor.wait_bootstrapped()`) is wrapped in
-/// [`REBUILD_TIMEOUT`]; if that times out, the caller still gets the fully
-/// owned `TorTunnel` back via [`RebuildOutcome::TimedOut`] instead of losing
-/// it to a cancelled future, which used to orphan its detached background
-/// tasks (and any already-spawned PT child process).
-async fn rebuild(
-    config_path: Option<&Path>,
-    avoid_slot: Option<u8>,
-    canary_target: Option<(String, u16)>,
-) -> anyhow::Result<RebuildOutcome> {
-    let cfg = crate::config::Config::load_with_override(config_path)?.into_config();
-    let mut settings = build_tor_settings(&cfg, config_path)
-        .await
-        .context("rebuilding tor settings")?;
-    let picked_slot = if let Some(base) = settings.state_dir.clone() {
-        let slot = pick_free_slot(&base, avoid_slot).with_context(|| {
-            format!(
-                "all {REBUILD_SLOT_COUNT} rebuild slots are currently busy — a prior \
-                 generation is still draining (long-lived connection holding an old \
-                 TorTunnel clone open)"
-            )
-        })?;
-        let slot_dir = base.join(rebuild_slot_dir_name(slot));
-        // Best-effort warm-up of the slot's bridge-descriptor cache from the
-        // primary directory, before the slot's own client (and its
-        // database) exists — see `warm_slot_bridge_desc_cache`'s doc comment
-        // for why this matters and why it is fail-open.
-        warm_slot_bridge_desc_cache(&base, &slot_dir);
-        settings.state_dir = Some(slot_dir);
-        Some(slot)
-    } else {
-        None
-    };
-    let tor = TorTunnel::create_unbootstrapped_with(settings).context("constructing Tor client")?;
-    match tokio::time::timeout(REBUILD_TIMEOUT, tor.wait_bootstrapped()).await {
-        Ok(Ok(())) => {
-            if verify_usable(&tor, canary_target).await {
-                Ok(RebuildOutcome::Ready {
-                    tor,
-                    slot: picked_slot,
-                })
-            } else {
-                Ok(RebuildOutcome::NotUsable(tor))
-            }
-        }
-        Ok(Err(e)) => Err(e).context("re-bootstrapping Tor client"),
-        Err(_elapsed) => Ok(RebuildOutcome::TimedOut(tor)),
-    }
 }
 
 /// Number of bridges in a healthy TCP state (`fails == 0`) per the last
@@ -1038,21 +768,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn swap_and_drain_release_tunnel() {
+    async fn drain_releases_tunnel() {
         // We can't build a real TorTunnel in a unit test, but the slot only
         // stores Option<TorTunnel> and we never read it here — so a stub
         // via the type system isn't possible without a live tunnel. Instead
-        // exercise the Option mechanics indirectly: a freshly-built handle
-        // (via new) needs a TorTunnel. Cover drain-on-None instead by
-        // constructing the slot directly.
+        // exercise the Option mechanics indirectly by constructing the slot
+        // directly.
         let slot: Arc<RwLock<Option<u32>>> = Arc::new(RwLock::new(Some(42)));
         assert_eq!(slot.read().await.clone(), Some(42));
-        // "swap"
-        *slot.write().await = Some(7);
-        assert_eq!(slot.read().await.clone(), Some(7));
         // "drain"
         let taken = slot.write().await.take();
-        assert_eq!(taken, Some(7));
+        assert_eq!(taken, Some(42));
         assert!(slot.read().await.is_none());
     }
 
@@ -1061,40 +787,6 @@ mod tests {
         let s = unix_secs();
         // After 2024-01-01 and before year ~2100 — sanity, not exactness.
         assert!(s > 1_704_067_200, "unix_secs should be past 2024");
-    }
-
-    #[test]
-    fn slot_is_free_for_empty_or_missing_dir() {
-        let base = tempfile::tempdir().expect("tempdir");
-        // Directory exists but has never been used by arti — no lock files.
-        assert!(slot_is_free(base.path()));
-
-        // Directory doesn't even exist yet.
-        let missing = base.path().join("never-created");
-        assert!(slot_is_free(&missing));
-    }
-
-    #[test]
-    fn slot_is_free_reports_false_while_locked_then_true_after_drop() {
-        let base = tempfile::tempdir().expect("tempdir");
-        let cache_lock = base.path().join("cache").join("dir.lock");
-        std::fs::create_dir_all(cache_lock.parent().unwrap()).expect("mkdir cache");
-
-        {
-            // Blocking lock — guaranteed to be held for as long as `guard`
-            // is alive, unlike `try_lock` which could race in a test.
-            let _guard =
-                fslock_guard::LockFileGuard::lock(&cache_lock).expect("acquire cache lock");
-            assert!(
-                !slot_is_free(base.path()),
-                "slot must report busy while cache/dir.lock is held"
-            );
-        }
-        // Guard dropped — the lock is released.
-        assert!(
-            slot_is_free(base.path()),
-            "slot must report free once the lock is released"
-        );
     }
 
     #[tokio::test]
@@ -1117,29 +809,27 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pick_free_slot_skips_busy_and_avoided_slots() {
-        let base = tempfile::tempdir().expect("tempdir");
-
-        // Lock slots 0 and 1; leave slot 2 (and beyond) free.
-        let mut guards = Vec::new();
-        for busy in [0u8, 1u8] {
-            let dir = base.path().join(rebuild_slot_dir_name(busy));
-            let lock_path = dir.join("cache").join("dir.lock");
-            std::fs::create_dir_all(lock_path.parent().unwrap()).expect("mkdir cache");
-            guards.push(fslock_guard::LockFileGuard::lock(&lock_path).expect("acquire slot lock"));
+    #[tokio::test]
+    async fn heal_reports_terminate_failed_on_a_client_that_is_not_running() {
+        // A `TorTunnel` built via `create_unbootstrapped_with` is
+        // synchronous, does no I/O, and never reaches arti's "running"
+        // state — so `TorClient::chanmgr()` (and therefore
+        // `TorTunnel::terminate_all_channels`) must fail on it, exactly the
+        // same way it would on a fully dormant client. `heal` must surface
+        // this as `TerminateFailed` rather than panicking or silently
+        // treating it as `StillUnhealthy` — the two mean different things to
+        // the watchdog loop's logging (dead channel manager vs. a live one
+        // that just isn't reconnecting).
+        let tor = arti_wrapper::TorTunnel::create_unbootstrapped_with(Default::default())
+            .expect("synchronous, no-I/O construction must succeed");
+        match heal(&tor, None).await {
+            HealResult::TerminateFailed(_) => {}
+            HealResult::Healed => panic!("an unbootstrapped client cannot have healed"),
+            HealResult::StillUnhealthy => panic!(
+                "chanmgr() must fail outright on a client that never bootstrapped, not just \
+                 fail the canary"
+            ),
         }
-
-        // Slot 2 would be the first free one, but we also ask to avoid it
-        // (as if it were the currently-live slot) — expect slot 3 instead.
-        let picked = pick_free_slot(base.path(), Some(2));
-        assert_eq!(picked, Some(3));
-
-        // Without an avoid constraint, the first free slot (2) wins.
-        let picked_no_avoid = pick_free_slot(base.path(), None);
-        assert_eq!(picked_no_avoid, Some(2));
-
-        drop(guards);
     }
 
     #[test]
@@ -1248,119 +938,6 @@ mod tests {
         // other two classes — the zombie-channel signature is still the
         // main story here, so the rebuild should proceed.
         assert!(!should_decline_rebuild(2, 1, 10));
-    }
-
-    /// Create a primitive `BridgeDescs`-only sqlite database at `path`,
-    /// mirroring just enough of arti's real schema (see
-    /// `vendor/tor-dirmgr/src/storage/sqlite.rs`'s `UPDATE_SCHEMA`) for the
-    /// warm-up code path to exercise real `SELECT`/`INSERT OR REPLACE`
-    /// round-trips, without pulling in arti's full versioned-schema machinery.
-    fn make_bridge_descs_db(path: &Path, rows: &[(&str, i64, i64, &[u8])]) {
-        std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir for test db");
-        let conn = rusqlite::Connection::open(path).expect("create test db");
-        conn.execute_batch(
-            "CREATE TABLE BridgeDescs (
-                bridge_line TEXT PRIMARY KEY NOT NULL,
-                fetched DATE NOT NULL,
-                until DATE NOT NULL,
-                contents BLOB NOT NULL
-            );",
-        )
-        .expect("create BridgeDescs table");
-        for (bridge_line, fetched, until, contents) in rows {
-            conn.execute(
-                "INSERT INTO BridgeDescs (bridge_line, fetched, until, contents) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![bridge_line, fetched, until, contents],
-            )
-            .expect("insert test row");
-        }
-    }
-
-    #[test]
-    fn warm_slot_copies_rows_from_primary_into_empty_slot() {
-        let primary = tempfile::tempdir().expect("primary tempdir");
-        let slot = tempfile::tempdir().expect("slot tempdir");
-
-        make_bridge_descs_db(
-            &primary.path().join(DIR_SQLITE_REL_PATH),
-            &[
-                ("bridge one line", 1_000, 2_000, b"contents-one"),
-                ("bridge two line", 1_500, 2_500, b"contents-two"),
-            ],
-        );
-        // Slot's database already exists (as it would after arti has used
-        // this slot at least once before) but starts empty.
-        make_bridge_descs_db(&slot.path().join(DIR_SQLITE_REL_PATH), &[]);
-
-        let copied = try_warm_slot_bridge_desc_cache(primary.path(), slot.path())
-            .expect("warm-up must succeed when both databases are well-formed");
-        assert_eq!(copied, 2);
-
-        let conn = rusqlite::Connection::open(slot.path().join(DIR_SQLITE_REL_PATH))
-            .expect("reopen slot db");
-        let mut stmt = conn
-            .prepare("SELECT bridge_line, fetched, until, contents FROM BridgeDescs ORDER BY bridge_line")
-            .unwrap();
-        let got: Vec<(String, i64, i64, Vec<u8>)> = stmt
-            .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
-        assert_eq!(
-            got,
-            vec![
-                (
-                    "bridge one line".to_string(),
-                    1_000,
-                    2_000,
-                    b"contents-one".to_vec()
-                ),
-                (
-                    "bridge two line".to_string(),
-                    1_500,
-                    2_500,
-                    b"contents-two".to_vec()
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn warm_slot_is_fail_open_when_primary_db_missing() {
-        let primary = tempfile::tempdir().expect("primary tempdir");
-        let slot = tempfile::tempdir().expect("slot tempdir");
-        make_bridge_descs_db(&slot.path().join(DIR_SQLITE_REL_PATH), &[]);
-
-        // No primary database was ever created at `primary.path()`.
-        let copied = try_warm_slot_bridge_desc_cache(primary.path(), slot.path()).expect(
-            "a missing primary database must be treated as \"nothing to copy\", not an error",
-        );
-        assert_eq!(copied, 0);
-
-        // The public, non-fallible wrapper must also not panic in this case.
-        warm_slot_bridge_desc_cache(primary.path(), slot.path());
-    }
-
-    #[test]
-    fn warm_slot_is_fail_open_when_slot_cache_dir_missing() {
-        let primary = tempfile::tempdir().expect("primary tempdir");
-        let slot = tempfile::tempdir().expect("slot tempdir");
-        make_bridge_descs_db(
-            &primary.path().join(DIR_SQLITE_REL_PATH),
-            &[("some bridge", 1, 2, b"x")],
-        );
-        // Slot directory exists (tempdir) but its `cache/` subdirectory —
-        // and therefore `cache/dir.sqlite3` — was never created, as would be
-        // the case for a slot that has never been used by arti before.
-
-        let copied = try_warm_slot_bridge_desc_cache(primary.path(), slot.path())
-            .expect("a missing slot database must be treated as \"skip, arti will create it\"");
-        assert_eq!(copied, 0);
-
-        // The public, non-fallible wrapper must also not panic in this case.
-        warm_slot_bridge_desc_cache(primary.path(), slot.path());
     }
 
     #[test]
