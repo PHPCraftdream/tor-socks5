@@ -187,6 +187,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports in. The watchdog's `verify_usable` canary is left in place for
   now — it may become partly redundant once this is observed live, but that
   retirement is a separate, later decision pending field data.
+- The stdin-EOF workaround thread added earlier for the zombie PT-child
+  problem (see the `ptrs-gesher-lyrebird` 0.5.1 entry above) masked a bug
+  in our own `ptrs-gesher` project rather than fixing it — `ptrs-gesher`
+  is our sibling repository, not a true third-party upstream, so the
+  right place for the fix was there. `ptrs-gesher-lyrebird` 0.5.2 (bumped
+  from `"0.5"`, no `Cargo.toml` change needed) now honors
+  `TOR_PT_EXIT_ON_STDIN_CLOSE` itself via a proper `CancellationToken`
+  wired into its own graceful-shutdown `select!` loop, verified by a
+  process-level integration test that launches the real binary and
+  asserts it exits on stdin close. The now-redundant workaround thread in
+  `main.rs`'s PT-child branch is removed.
 
 ### Known limitations
 

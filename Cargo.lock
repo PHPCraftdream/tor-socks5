@@ -3320,18 +3320,18 @@ dependencies = [
 
 [[package]]
 name = "ptrs-gesher-bridge-line"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc7416a540556e40e3f80675a26d96aec0af2debde9b90c7c615e8f5d2bef209"
+checksum = "a3831a7f47cede698e2dd6fc95efb15e8ba38502da922b2b544f8e748c48285e"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "ptrs-gesher-core"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b6d9237164b21d2beaf74b23de67cf8ed382fd0f82e46a66d7709071a16f725"
+checksum = "6b4964e94a68a171d8922023afd54a0d3f266b4af61aea48897dce1e6a8f73d2"
 dependencies = [
  "futures",
  "itertools 0.14.0",
@@ -3344,9 +3344,9 @@ dependencies = [
 
 [[package]]
 name = "ptrs-gesher-lyrebird"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f66756f2a338cb670181c420bc56bd1d449b175d46ff109016acc81c55ec4fb9"
+checksum = "93160817acfe1266d44fdbfa1b03564029316e3792c2a195880f87065d78180a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3368,9 +3368,9 @@ dependencies = [
 
 [[package]]
 name = "ptrs-gesher-obfs4"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8feb05dc766ab73b4b38fabf794f50a5ce8866cb2623567b300625fc39892712"
+checksum = "945b4ea1a68083a9f3f1b3d5b144e07bfbcd792d211adcca1dae411abbd0dd68"
 dependencies = [
  "base64",
  "bytes",
@@ -3407,9 +3407,9 @@ dependencies = [
 
 [[package]]
 name = "ptrs-gesher-webtunnel"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4659f4a12c1e031ae9cdfea02f62404b93793ba6afa56fbf6236165dd0b547e1"
+checksum = "537affb84ff63edd4a57af7ec635cfd4bf08e91a6202d59e40fbf627f005038a"
 dependencies = [
  "base64",
  "getrandom 0.2.17",
