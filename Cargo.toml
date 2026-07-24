@@ -76,7 +76,7 @@ lto = "thin"
 codegen-units = 1
 
 [patch.crates-io]
-## Vendored, locally-fixed forks of three upstream crates. We keep the full
+## Vendored, locally-fixed forks of upstream crates. We keep the full
 ## source in `vendor/` (see vendor/README.md) and override the crates.io
 ## versions here, so the build is self-contained and does NOT depend on these
 ## fixes being accepted upstream. Same-version overrides of the exact crates.io
@@ -93,6 +93,10 @@ tor-dirmgr = { path = "vendor/tor-dirmgr" }
 ## descriptors), which left every bridge "unsuitable to purpose" so no circuit
 ## could be built. Vendored with a lazy unwrap + a find_limit termination guard.
 saturating-time = { path = "vendor/saturating-time" }
+## tor-chanmgr 0.43.0: vendored as a baseline ahead of an upcoming
+## terminate_all_channels() patch (to let the watchdog force-drop stale
+## channels after a network change) — no behavior change yet.
+tor-chanmgr = { path = "vendor/tor-chanmgr" }
 ## NOTE: ptrs-gesher 0.5.0 is published on crates.io and consumed directly
 ## from there (see [workspace.dependencies] above) — no path override needed.
 ## Our obfs4 fixes (handshake-residual, decode_eof, TCP keepalive) are part of

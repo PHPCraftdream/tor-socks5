@@ -1,8 +1,8 @@
 # vendor/ — locally-maintained forks of upstream crates
 
-These are **full source copies** of three upstream crates, with local fixes
-applied, committed into this repository and wired in via `[patch.crates-io]`
-in the workspace `Cargo.toml`.
+These are **full source copies** of upstream crates, with local fixes applied
+(or, for `tor-chanmgr`, about to be applied), committed into this repository
+and wired in via `[patch.crates-io]` in the workspace `Cargo.toml`.
 
 Why they live here: the build must be self-contained and must NOT depend on
 our fixes being accepted upstream. Everything needed to build is in git.
@@ -33,6 +33,13 @@ consensus over an obfs4 bridge. Switched to an **idle** (inter-read) timeout
 The bridge-descriptor fetch (`bridgedesc.rs`) had **no timeout** and could hang
 forever. Added a hard per-attempt timeout, faster retry, and gentle
 (non-flooding) parallelism for the bridge pool.
+
+### `tor-chanmgr` (0.43.0) — baseline, no changes yet
+Vendored as-is from crates.io ahead of an upcoming `terminate_all_channels()`
+patch: the stale-channel watchdog (see `tor_watchdog.rs`) needs a way to force
+every tracked channel closed after a network change is detected, and
+`ChanMgr` doesn't expose that today. This commit is a pure copy with **no
+behavior change** — the patch itself is a separate, follow-up change.
 
 ## Maintenance
 
