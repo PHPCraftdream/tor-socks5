@@ -72,6 +72,28 @@ directly, not a long-lived cache that a `terminate_all_channels()` call
 would strand (confirmed in
 `docs/upstream/arti-vendor-integration-plan.md` §1.3).
 
+### `tor-guardmgr` (0.43.0)
+Vendored as a **baseline** ahead of an aggregated guard-usable signal patch —
+no behavior change yet. The planned fix adds a new
+`usable_guard_events()` stream to `GuardMgr` (mirroring the existing
+`skew_events()` / `postage::watch` plumbing already in this crate), published
+whenever a primary/preferred guard's `dir_info_missing` flag flips, plus the
+matching `arti-client` change that wires it into `BootstrapStatus`. This
+commit only adds the unmodified 0.43.0 source so the path override compiles
+identically; the actual fix lands in the next commit.
+
+### `arti-client` (0.43.0)
+Vendored as a **baseline** ahead of the guard-usable signal patch — no
+behavior change yet. Vendored as a **mandatory pair** with `tor-guardmgr`:
+neither crate's half is useful on its own (`tor-guardmgr`'s new stream has no
+consumer; `arti-client`'s `BootstrapStatus` change has no stream to consume —
+see `docs/upstream/arti-vendor-integration-plan.md` §2). Only this crate is
+overridden here; its internal `tor-*` dependencies keep resolving from
+crates.io / already-patched sources as before (the published manifest carries
+version-only deps, no `path`). This commit only adds the unmodified 0.43.0
+source so the path override compiles identically; the actual fix lands in the
+next commit.
+
 ## Maintenance
 
 - Versions match the exact crates.io releases the dependency graph resolves

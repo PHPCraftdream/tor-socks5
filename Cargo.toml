@@ -91,6 +91,17 @@ saturating-time = { path = "vendor/saturating-time" }
 ## terminate_all_channels() patch (to let the watchdog force-drop stale
 ## channels after a network change) — no behavior change yet.
 tor-chanmgr = { path = "vendor/tor-chanmgr" }
+## tor-guardmgr 0.43.0: vendored as a baseline ahead of a guard-usable signal
+## patch (an aggregated "guards ready" event stream feeding BootstrapStatus) —
+## no behavior change yet.
+tor-guardmgr = { path = "vendor/tor-guardmgr" }
+## arti-client 0.43.0: vendored as a baseline ahead of the guard-usable signal
+## patch (wiring the new GuardMgr stream into BootstrapStatus::ready_for_traffic)
+## — no behavior change yet. Vendored together with tor-guardmgr: the two
+## patches are a mandatory pair (see docs/upstream/arti-vendor-integration-plan.md
+## §2). Only this crate is overridden; its internal tor-* deps keep resolving
+## from crates.io / already-patched sources as before.
+arti-client = { path = "vendor/arti-client" }
 ## NOTE: ptrs-gesher 0.5.0 is published on crates.io and consumed directly
 ## from there (see [workspace.dependencies] above) — no path override needed.
 ## Our obfs4 fixes (handshake-residual, decode_eof, TCP keepalive) are part of
