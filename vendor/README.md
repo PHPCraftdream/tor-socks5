@@ -73,26 +73,33 @@ would strand (confirmed in
 `docs/upstream/arti-vendor-integration-plan.md` §1.3).
 
 ### `tor-guardmgr` (0.43.0)
-Vendored as a **baseline** ahead of an aggregated guard-usable signal patch —
-no behavior change yet. The planned fix adds a new
-`usable_guard_events()` stream to `GuardMgr` (mirroring the existing
-`skew_events()` / `postage::watch` plumbing already in this crate), published
-whenever a primary/preferred guard's `dir_info_missing` flag flips, plus the
-matching `arti-client` change that wires it into `BootstrapStatus`. This
-commit only adds the unmodified 0.43.0 source so the path override compiles
-identically; the actual fix lands in the next commit.
+A guard is only eligible for a data circuit once it has complete directory
+information (`dir_info_missing == false`), but `GuardMgr` never aggregated
+this into a system-wide "do we have any usable guard at all" signal — so
+nothing downstream could tell "directory bootstrapped" apart from "directory
+bootstrapped, but every guard is still descriptor-naked". Added
+`GuardSet::any_guard_usable_for_traffic()` (true iff at least one guard in the
+active sample is `usable()` and has complete directory information) and
+`GuardMgr::usable_guard_events()`, a `postage::watch`-backed stream
+(mirroring the existing `skew_events()` plumbing) that republishes this
+aggregate every time the guard sample is refreshed. Consumed by the matching
+`arti-client` change below. Vendored and patched together with `arti-client`
+as a **mandatory pair** — see
+`docs/upstream/arti-vendor-integration-plan.md` §1.4/§2.
 
 ### `arti-client` (0.43.0)
-Vendored as a **baseline** ahead of the guard-usable signal patch — no
-behavior change yet. Vendored as a **mandatory pair** with `tor-guardmgr`:
-neither crate's half is useful on its own (`tor-guardmgr`'s new stream has no
-consumer; `arti-client`'s `BootstrapStatus` change has no stream to consume —
-see `docs/upstream/arti-vendor-integration-plan.md` §2). Only this crate is
-overridden here; its internal `tor-*` dependencies keep resolving from
-crates.io / already-patched sources as before (the published manifest carries
-version-only deps, no `path`). This commit only adds the unmodified 0.43.0
-source so the path override compiles identically; the actual fix lands in the
-next commit.
+`BootstrapStatus::ready_for_traffic()` used to report "ready" once directory
+bootstrap completed, without regard to whether any guard actually had usable
+descriptors — the root cause of a guard-exhaustion spiral where a client
+looked "ready" while still unable to build a single data circuit for
+minutes. `ready_for_traffic()` now ANDs in a third signal,
+`tor-guardmgr`'s new `usable_guard_events()` stream (wired into
+`RunningInner::new`/`report_status` as a fourth event source alongside
+`conn_status`/`dir_status`/`skew_status`), defaulting to `false` so a freshly
+constructed client is never considered ready before the first guard-sample
+refresh reports in. Only this crate is overridden here; its internal `tor-*`
+dependencies keep resolving from crates.io / already-patched sources as
+before (the published manifest carries version-only deps, no `path`).
 
 ## Maintenance
 

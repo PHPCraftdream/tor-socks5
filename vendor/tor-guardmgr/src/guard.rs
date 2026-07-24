@@ -367,6 +367,24 @@ impl Guard {
         self.unlisted_since.is_none() && self.disabled.is_none()
     }
 
+    /// tor-socks5 local patch: return true if we have complete directory
+    /// information (a microdescriptor) for this guard — i.e. its
+    /// `dir_info_missing` flag is false, so it is eligible for multi-hop data
+    /// circuits. Exposed crate-visible so the aggregated guard-usable signal
+    /// (`GuardSet::any_guard_usable_for_traffic`) can inspect it directly
+    /// instead of synthesizing a `GuardUsage`.
+    pub(crate) fn has_complete_dir_info(&self) -> bool {
+        !self.dir_info_missing
+    }
+
+    /// tor-socks5 local patch: test-only setter to drive the aggregated
+    /// guard-usable signal in unit tests without standing up a full NetDir that
+    /// omits microdescriptors.
+    #[cfg(test)]
+    pub(crate) fn set_dir_info_missing_for_test(&mut self, missing: bool) {
+        self.dir_info_missing = missing;
+    }
+
     /// Return true if this guard is ready (with respect to any timeouts) for
     /// the given `usage` at `now`.
     pub(crate) fn ready_for_usage(&self, usage: &GuardUsage, now: Instant) -> bool {
@@ -968,6 +986,22 @@ mod test {
         let ports = vec!["127.0.0.7:7777".parse().unwrap()];
         let added = SystemTime::get();
         Guard::new(id, ports, None, added)
+    }
+
+    // tor-socks5 local patch: verify the directory-info accessor that backs the
+    // aggregated guard-usable signal (GuardSet::any_guard_usable_for_traffic).
+    #[test]
+    fn has_complete_dir_info_accessor() {
+        let mut g = basic_guard();
+        assert!(g.usable());
+        // A freshly-created guard has no missing directory information.
+        assert!(g.has_complete_dir_info());
+        // Simulate the guard-exhaustion case: the guard is listed, but we lack
+        // its microdescriptor.
+        g.dir_info_missing = true;
+        assert!(!g.has_complete_dir_info());
+        g.dir_info_missing = false;
+        assert!(g.has_complete_dir_info());
     }
 
     #[test]

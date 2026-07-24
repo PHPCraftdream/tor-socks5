@@ -111,6 +111,9 @@ use oneshot_fused_workaround as oneshot;
 pub use config::GuardMgrConfig;
 pub use err::{GuardMgrConfigError, GuardMgrError, PickGuardError};
 pub use events::ClockSkewEvents;
+// tor-socks5 local patch: re-export the aggregated guard-usable event stream
+// type (see `GuardMgr::usable_guard_events`).
+pub use events::GuardUsableEvents;
 pub use filter::GuardFilter;
 pub use ids::FirstHopId;
 pub use pending::{GuardMonitor, GuardStatus, GuardUsable};
@@ -212,6 +215,15 @@ struct GuardMgrInner {
     /// A receiver object to hand out to observers who want to know about
     /// changes in our estimated clock skew.
     recv_skew: events::ClockSkewEvents,
+
+    /// tor-socks5 local patch: a sender to publish changes in the aggregated
+    /// "guards usable" signal (true iff at least one usable guard in the
+    /// active sample has complete directory information).
+    send_usable: postage::watch::Sender<bool>,
+
+    /// tor-socks5 local patch: a receiver to hand out to observers who want to
+    /// know about the aggregated "guards usable" signal.
+    recv_usable: events::GuardUsableEvents,
 
     /// A netdir provider that we can use for adding new guards when
     /// insufficient guards are available.
@@ -346,6 +358,13 @@ impl<R: Runtime> GuardMgr<R> {
         let (send_skew, recv_skew) = postage::watch::channel();
         let recv_skew = ClockSkewEvents { inner: recv_skew };
 
+        // tor-socks5 local patch: channel for the aggregated "guards usable"
+        // signal. Initialized to `false` (conservative: the client is not
+        // ready until a positive signal arrives after the first guard-sample
+        // refresh).
+        let (send_usable, recv_usable) = postage::watch::channel();
+        let recv_usable = GuardUsableEvents { inner: recv_usable };
+
         let inner = Arc::new(Mutex::new(GuardMgrInner {
             guards: state,
             filter: GuardFilter::unfiltered(),
@@ -358,6 +377,8 @@ impl<R: Runtime> GuardMgr<R> {
             storage,
             send_skew,
             recv_skew,
+            send_usable,
+            recv_usable,
             netdir_provider: None,
             #[cfg(feature = "bridge-client")]
             bridge_desc_provider: None,
@@ -710,6 +731,18 @@ impl<R: Runtime> GuardMgr<R> {
         inner.recv_skew.clone()
     }
 
+    /// tor-socks5 local patch: return a stream of events describing whether the
+    /// active guard sample is usable for traffic — `true` iff at least one
+    /// usable guard currently has complete directory information. arti-client
+    /// consumes this to gate `BootstrapStatus::ready_for_traffic()`.
+    ///
+    /// Like [`skew_events`](Self::skew_events), this stream can be lossy: if the
+    /// state changes more than once before you read, you only get the latest.
+    pub fn usable_guard_events(&self) -> GuardUsableEvents {
+        let inner = self.inner.lock().expect("Poisoned lock");
+        inner.recv_usable.clone()
+    }
+
     /// Ensure that the message queue is flushed before proceeding to
     /// the next step.  Used for testing.
     #[cfg(test)]
@@ -901,6 +934,14 @@ impl GuardMgrInner {
             #[cfg(not(feature = "bridge-client"))]
             let _ = now;
         });
+
+        // tor-socks5 local patch: recompute and publish the aggregated
+        // "guards usable" signal after every guard-status refresh. Guard
+        // directory information (`dir_info_missing`) is mutated inside
+        // `update_status_from_dir` in the call above, so this is the point at
+        // which the signal can change. arti-client gates
+        // `BootstrapStatus::ready_for_traffic()` on it.
+        self.update_guard_usability();
     }
 
     /// Replace our bridge configuration with the one from `new_config`.
@@ -1333,6 +1374,18 @@ impl GuardMgrInner {
         // TODO: we might want to do this only conditionally, when the skew
         // estimate changes.
         *self.send_skew.borrow_mut() = estimate;
+    }
+
+    /// tor-socks5 local patch: recompute whether the active guard sample is
+    /// usable for traffic (at least one usable guard has complete directory
+    /// information) and publish the result. Called at the end of [`update`] so
+    /// the signal tracks every refresh of guard directory information.
+    fn update_guard_usability(&mut self) {
+        let usable = self
+            .guards
+            .active_guards()
+            .any_guard_usable_for_traffic();
+        *self.send_usable.borrow_mut() = usable;
     }
 
     /// If the circuit built because of a given [`PendingRequest`] may

@@ -509,6 +509,37 @@ impl GuardSet {
         self.fix_consistency();
     }
 
+    /// tor-socks5 local patch: return true iff at least one guard in this set is
+    /// `usable()` (listed and not disabled) and has complete directory
+    /// information (`has_complete_dir_info`) — i.e. we have at least one guard
+    /// through which we can actually build multi-hop data circuits right now.
+    ///
+    /// This is the aggregate published via `GuardMgr::usable_guard_events` and
+    /// required by arti-client's `BootstrapStatus::ready_for_traffic()`, so that
+    /// the client no longer reports "ready for traffic" once the directory is
+    /// bootstrapped while every guard still lacks a usable descriptor.
+    pub(crate) fn any_guard_usable_for_traffic(&self) -> bool {
+        self.preference_order()
+            .any(|(_, g)| g.usable() && g.has_complete_dir_info())
+    }
+
+    /// tor-socks5 local patch: test-only helper that sets `dir_info_missing` on
+    /// every guard in the set, to drive the aggregated guard-usable signal
+    /// (`any_guard_usable_for_traffic`) without standing up a NetDir that omits
+    /// microdescriptors. Mirrors the `mem::take`/`into_values`/`collect` pattern
+    /// used by `update_status_from_dir`.
+    #[cfg(test)]
+    pub(crate) fn set_all_guards_dir_info_missing_for_test(&mut self, missing: bool) {
+        let old = std::mem::take(&mut self.guards);
+        self.guards = old
+            .into_values()
+            .map(|mut g| {
+                g.set_dir_info_missing_for_test(missing);
+                g
+            })
+            .collect();
+    }
+
     /// Re-build the list of primary guards.
     ///
     /// Primary guards are chosen according to preference order over all
@@ -1246,6 +1277,38 @@ mod test {
 
         guards.expire_old_guards(&params, t1 + one_day * 200);
         assert_eq!(guards.sample.len(), 0);
+    }
+
+    // tor-socks5 local patch: verify the aggregated "guards usable" signal that
+    // gates arti-client's BootstrapStatus::ready_for_traffic(). This is the core
+    // of the guard-exhaustion-spiral fix: when every sampled guard lacks a
+    // microdescriptor the aggregate must be false, even though the guards are
+    // still listed (usable()).
+    #[test]
+    fn any_guard_usable_for_traffic_aggregation() {
+        let netdir = netdir();
+        let params = GuardParams {
+            n_primary: 4,
+            ..GuardParams::default()
+        };
+        let mut guards = GuardSet::default();
+        guards.extend_sample_as_needed(SystemTime::get(), &params, &netdir);
+        guards.select_primary_guards(&params);
+
+        // Normal case: sampled guards carry complete directory information, so
+        // the active sample is usable for traffic.
+        assert!(guards.any_guard_usable_for_traffic());
+
+        // Guard-exhaustion spiral: every guard lacks a microdescriptor. The
+        // guards are still listed (usable()), but none can build data circuits,
+        // so the aggregate must be false — the exact condition that must keep
+        // BootstrapStatus::ready_for_traffic() reporting "not ready".
+        guards.set_all_guards_dir_info_missing_for_test(true);
+        assert!(!guards.any_guard_usable_for_traffic());
+
+        // Once guards regain their descriptors, the sample becomes usable again.
+        guards.set_all_guards_dir_info_missing_for_test(false);
+        assert!(guards.any_guard_usable_for_traffic());
     }
 
     #[test]

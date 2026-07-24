@@ -166,6 +166,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `fslock-guard` and `rusqlite` direct dependencies of `socks5-proxy`
   (both remain in the dependency tree transitively via `tor-dirmgr`/
   `tor-persist`, just no longer used by this crate's own code).
+- Even with the rebuild-slot pool gone (see above), the underlying reason
+  arti itself could report "ready for traffic" while still unable to build a
+  single data circuit remained: `BootstrapStatus::ready_for_traffic()`
+  considered only directory-bootstrap completeness, with no notion of
+  whether any guard actually had a usable descriptor
+  (`dir_info_missing`) — the root cause analyzed in
+  `docs/upstream/guard-exhaustion-watchdog-spiral.md`. Fixed by vendoring
+  `tor-guardmgr` 0.43.0 and `arti-client` 0.43.0 as a mandatory pair (neither
+  half is useful alone). `tor-guardmgr` gains
+  `GuardSet::any_guard_usable_for_traffic()` (true iff at least one guard in
+  the active sample is usable and has complete directory information) and
+  `GuardMgr::usable_guard_events()`, a `postage::watch`-backed stream
+  (mirroring the crate's existing `skew_events()` plumbing) republishing this
+  aggregate on every guard-sample refresh. `arti-client` wires this in as a
+  fourth event source in `RunningInner::new`/`report_status` (alongside
+  `conn_status`/`dir_status`/`skew_status`) and `ready_for_traffic()` now
+  requires it as a third conjunct, defaulting to `false` so a freshly
+  constructed client is never "ready" before the first guard-sample refresh
+  reports in. The watchdog's `verify_usable` canary is left in place for
+  now — it may become partly redundant once this is observed live, but that
+  retirement is a separate, later decision pending field data.
 
 ### Known limitations
 

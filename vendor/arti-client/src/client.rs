@@ -1199,6 +1199,11 @@ impl<R: Runtime> RunningInner<R> {
         let conn_status = chanmgr.bootstrap_events();
         let dir_status = dirmgr.bootstrap_events();
         let skew_status = circmgr.skew_events();
+        // tor-socks5 local patch: aggregated "guards usable" signal from
+        // tor-guardmgr (true iff at least one usable guard has complete
+        // directory information), used to gate
+        // `BootstrapStatus::ready_for_traffic()`.
+        let guard_status = guardmgr.usable_guard_events();
 
         let rtclone = runtime.clone();
 
@@ -1237,6 +1242,7 @@ impl<R: Runtime> RunningInner<R> {
                 conn_status,
                 dir_status,
                 skew_status,
+                guard_status,
             ))
             .map_err(|e| ErrorDetail::from_spawn("top-level status reporter", e))?;
 

@@ -32,6 +32,12 @@ pub struct BootstrapStatus {
     dir_status: DirBootstrapStatus,
     /// Current estimate of our clock skew.
     skew: Option<SkewEstimate>,
+    /// tor-socks5 local patch: whether at least one usable guard currently has
+    /// complete directory information (i.e. we have a guard through which we
+    /// can actually build data circuits). Required by `ready_for_traffic()`
+    /// so the client no longer reports "ready" while every guard still lacks
+    /// a usable descriptor (guard-exhaustion spiral). Defaults to `false`.
+    guards_usable: bool,
 }
 
 impl BootstrapStatus {
@@ -51,7 +57,10 @@ impl BootstrapStatus {
     /// as far as we know, we can start acting on a new client request immediately.
     pub fn ready_for_traffic(&self) -> bool {
         let now = SystemTime::get();
-        self.conn_status.usable() && self.dir_status.usable_at(now)
+        // tor-socks5 local patch: also require the aggregated "guards usable"
+        // signal, so we don't report "ready" while no guard has the descriptor
+        // information needed to build circuits (guard-exhaustion spiral).
+        self.conn_status.usable() && self.dir_status.usable_at(now) && self.guards_usable
     }
 
     /// If the client is unable to make forward progress for some reason, return
@@ -107,6 +116,13 @@ impl BootstrapStatus {
     /// Adjust this status based on new estimated clock skew information.
     fn apply_skew_estimate(&mut self, status: Option<SkewEstimate>) {
         self.skew = status;
+    }
+
+    /// tor-socks5 local patch: adjust this status based on a new aggregated
+    /// "guards usable" value (true iff at least one usable guard has complete
+    /// directory information).
+    fn apply_guards_usable(&mut self, usable: bool) {
+        self.guards_usable = usable;
     }
 
     /// Return true if our current clock skew estimate is considered noteworthy.
@@ -220,6 +236,9 @@ pub(crate) async fn report_status(
     conn_status: ConnStatusEvents,
     dir_status: impl Stream<Item = DirBootstrapStatus> + Send + Unpin,
     skew_status: ClockSkewEvents,
+    // tor-socks5 local patch: fourth stream — the aggregated "guards usable"
+    // signal from tor-guardmgr.
+    guards_usable: impl Stream<Item = bool> + Send + Unpin,
 ) {
     /// Internal enumeration to combine incoming status changes.
     #[allow(clippy::large_enum_variant)]
@@ -230,11 +249,14 @@ pub(crate) async fn report_status(
         Dir(DirBootstrapStatus),
         /// A clock skew change
         Skew(Option<SkewEstimate>),
+        /// tor-socks5 local patch: a guards-usable change
+        Guard(bool),
     }
     let mut stream = futures::stream::select_all(vec![
         conn_status.map(Event::Conn).boxed(),
         dir_status.map(Event::Dir).boxed(),
         skew_status.map(Event::Skew).boxed(),
+        guards_usable.map(Event::Guard).boxed(),
     ]);
 
     while let Some(event) = stream.next().await {
@@ -243,6 +265,7 @@ pub(crate) async fn report_status(
             Event::Conn(e) => b.apply_conn_status(e),
             Event::Dir(e) => b.apply_dir_status(e),
             Event::Skew(e) => b.apply_skew_estimate(e),
+            Event::Guard(e) => b.apply_guards_usable(e),
         }
         debug!("{}", *b);
     }
@@ -274,5 +297,45 @@ impl Stream for BootstrapEvents {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         self.inner.poll_next_unpin(cx)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    // tor-socks5 local patch: contract tests for the `guards_usable` field that
+    // gates `ready_for_traffic()`. A behavioral test that fully isolates the
+    // third conjunct would require constructing "usable" ConnStatus /
+    // DirBootstrapStatus values, whose internals are private to tor-chanmgr /
+    // tor-dirmgr and therefore not constructable from this crate; the
+    // aggregation logic itself is unit-tested in tor-guardmgr
+    // (`any_guard_usable_for_traffic_aggregation`), and the end-to-end wiring is
+    // exercised by the workspace `cargo build`/`cargo test`.
+
+    #[test]
+    fn guards_usable_defaults_false() {
+        // The field MUST default to false: until the first aggregated guard
+        // signal arrives, the client must not be considered ready for traffic.
+        // (Defaulting it to true would silently reintroduce the
+        // guard-exhaustion spiral this patch fixes.)
+        let s = BootstrapStatus::default();
+        assert!(!s.guards_usable);
+        // Consequently a freshly-constructed status is never ready for traffic.
+        assert!(!s.ready_for_traffic());
+    }
+
+    #[test]
+    fn apply_guards_usable_sets_field() {
+        let mut s = BootstrapStatus::default();
+        assert!(!s.guards_usable);
+        s.apply_guards_usable(true);
+        assert!(s.guards_usable);
+        s.apply_guards_usable(false);
+        assert!(!s.guards_usable);
+        // With conn/dir still at their (non-usable) defaults, flipping
+        // guards_usable alone must NOT make the client ready: it is a required
+        // conjunct of `ready_for_traffic()`, not a sufficient condition.
+        assert!(!s.ready_for_traffic());
     }
 }
