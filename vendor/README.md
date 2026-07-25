@@ -58,6 +58,31 @@ full `catch_unwind` rollback was deliberately left out as the larger, optional
 second step). Regression test added: a panicking closure no longer poisons the
 next `get()`/`mutate()`.
 
+Third fix — `sqlite_error_kind()` (`err.rs`) mapped `SQLITE_BUSY` /
+`SQLITE_LOCKED` (`rusqlite::ErrorCode::DatabaseBusy`/`DatabaseLocked`) into
+`ErrorKind::Internal`, so `impl From<rusqlite::Error> for Error` wrapped them
+as `tor_error::Bug::from_error(..., "sqlite detected bug")` and
+`bootstrap_action()` then returned `BootstrapAction::Fatal`. On a long-lived
+Windows desktop process the directory cache db is routinely locked for a few
+milliseconds by antivirus real-time scanning, Windows Search indexing, or
+OneDrive/backup sync over the cache directory — exactly the transient,
+fully-recoverable contention that `SQLITE_BUSY`/`SQLITE_LOCKED` semantically
+mean ("try again later"). A transient file lock was thus mislabeled and
+mis-handled as a programming bug, fatally aborting the bootstrap. Fix: moved
+`DatabaseBusy`/`DatabaseLocked` out of the `EK::Internal` match arm and into
+`EK::CacheAccessFailed` — the same bucket already used for the analogous
+environmental cache-access IO failures (`FileLockingProtocolFailed`,
+`SystemIoFailure`, `CannotOpen`, `PermissionDenied`, ...) — so they become a
+plain `Error::SqliteError` instead of an `Error::Bug`. Note: both `Bug` and
+`SqliteError` map to `BootstrapAction::Fatal`, so this is primarily an
+honest-classification fix (a transient lock is no longer reported as a
+"detected bug") that also sets up correct semantics for a future retry-with-
+backoff on `CacheAccessFailed`, deliberately left as the larger, optional
+second step. `OperationInterrupted`/`OperationAborted` were deliberately left
+in `Internal` (explicit cancel/abort signals, not file-lock contention).
+Regression tests added covering both the direct `sqlite_error_kind()`
+classification and the end-to-end `From<rusqlite::Error>` path.
+
 ### `tor-chanmgr` (0.43.0)
 `ChanMgr` tracks open channels but only ever retires one automatically via
 `expire_channels()`, which requires the channel to have been *idle* past a

@@ -406,12 +406,27 @@ fn sqlite_error_kind(e: &rusqlite::Error) -> ErrorKind {
             | RE::OperationInterrupted
             | RE::ReadOnly
             | RE::OperationAborted
-            | RE::DatabaseBusy
-            | RE::DatabaseLocked
             | RE::OutOfMemory
             | RE::InternalMalfunction => EK::Internal,
 
-            RE::FileLockingProtocolFailed
+            // tor-socks5 local patch: SQLITE_BUSY / SQLITE_LOCKED are transient
+            // file-lock contention on the cache database, not a programming
+            // bug. On a long-lived Windows desktop process the cache db is
+            // routinely locked for a few ms by antivirus real-time scanning,
+            // Windows Search indexing, or OneDrive/backup sync over the cache
+            // directory; SQLITE_BUSY/LOCKED literally mean "try again later".
+            // Move them out of the EK::Internal arm so From<rusqlite::Error>
+            // below no longer wraps them as tor_error::Bug("sqlite detected
+            // bug") and instead classifies them as CacheAccessFailed, alongside
+            // the other environmental cache-access IO failures
+            // (FileLockingProtocolFailed, SystemIoFailure, CannotOpen, ...).
+            // OperationInterrupted/OperationAborted are deliberately left in
+            // EK::Internal: they are explicit cancel/abort signals, not
+            // transient file-lock contention, so reclassifying them would be
+            // unjustified scope creep.
+            RE::DatabaseBusy
+            | RE::DatabaseLocked
+            | RE::FileLockingProtocolFailed
             | RE::AuthorizationForStatementDenied
             | RE::NotFound
             | RE::DiskFull
@@ -445,4 +460,80 @@ pub enum ReadOnlyStorageError {
         /// The schema that we actually support.
         supported: u32,
     },
+}
+
+// tor-socks5 local patch: regression tests for the SQLITE_BUSY/LOCKED
+// reclassification above. Without the patch, DatabaseBusy/DatabaseLocked map
+// to EK::Internal and From<rusqlite::Error> wraps them as Error::Bug; with the
+// patch they map to EK::CacheAccessFailed and become a plain Error::SqliteError.
+#[cfg(test)]
+mod test {
+    // @@ begin test lint list maintained by maint/add_warning @@
+    #![allow(clippy::bool_assert_comparison)]
+    #![allow(clippy::clone_on_copy)]
+    #![allow(clippy::dbg_macro)]
+    #![allow(clippy::mixed_attributes_style)]
+    #![allow(clippy::print_stderr)]
+    #![allow(clippy::print_stdout)]
+    #![allow(clippy::single_char_pattern)]
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unchecked_time_subtraction)]
+    #![allow(clippy::useless_vec)]
+    #![allow(clippy::needless_pass_by_value)]
+    //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
+    use super::*;
+    use tor_error::ErrorKind as EK;
+
+    /// Build a `rusqlite::Error::SqliteFailure` carrying the given primary
+    /// `ErrorCode`, with a neutral `extended_code` of 0.
+    fn sqlite_failure(code: rusqlite::ErrorCode) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(rusqlite::ffi::Error { code, extended_code: 0 }, None)
+    }
+
+    #[test]
+    fn sqlite_busy_locked_are_transient_cache_access() {
+        // Direct classification: BUSY/LOCKED must map to CacheAccessFailed,
+        // not Internal.
+        assert_eq!(
+            sqlite_error_kind(&sqlite_failure(rusqlite::ErrorCode::DatabaseBusy)),
+            EK::CacheAccessFailed
+        );
+        assert_eq!(
+            sqlite_error_kind(&sqlite_failure(rusqlite::ErrorCode::DatabaseLocked)),
+            EK::CacheAccessFailed
+        );
+
+        // End-to-end through From<rusqlite::Error>: a transient file lock must
+        // become a plain Error::SqliteError (retriable cache-access failure),
+        // NOT an Error::Bug carrying "sqlite detected bug".
+        let busy: Error = sqlite_failure(rusqlite::ErrorCode::DatabaseBusy).into();
+        assert!(
+            matches!(busy, Error::SqliteError(_)),
+            "SQLITE_BUSY must not be wrapped as Error::Bug"
+        );
+        assert_eq!(busy.kind(), EK::CacheAccessFailed);
+    }
+
+    #[test]
+    fn sqlite_classification_unchanged_around_the_patch() {
+        // Environmental IO failures keep their existing CacheAccessFailed home.
+        assert_eq!(
+            sqlite_error_kind(&sqlite_failure(rusqlite::ErrorCode::SystemIoFailure)),
+            EK::CacheAccessFailed
+        );
+        assert_eq!(
+            sqlite_error_kind(&sqlite_failure(rusqlite::ErrorCode::FileLockingProtocolFailed)),
+            EK::CacheAccessFailed
+        );
+        // Genuine "shouldn't happen" codes stay Internal — the patch does not
+        // broaden the reclassification to explicit cancel/abort signals.
+        assert_eq!(
+            sqlite_error_kind(&sqlite_failure(rusqlite::ErrorCode::OperationInterrupted)),
+            EK::Internal
+        );
+        assert_eq!(
+            sqlite_error_kind(&sqlite_failure(rusqlite::ErrorCode::InternalMalfunction)),
+            EK::Internal
+        );
+    }
 }

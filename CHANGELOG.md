@@ -270,6 +270,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   back a partial mutation made before the panic (a full `catch_unwind` rollback
   was deliberately left as the larger, optional second step). Regression test
   added: a panicking closure no longer poisons the next `get()`/`mutate()`.
+- `tor-dirmgr`'s `sqlite_error_kind()` (`err.rs`) classified `SQLITE_BUSY` /
+  `SQLITE_LOCKED` (`rusqlite::ErrorCode::DatabaseBusy`/`DatabaseLocked`) as
+  `ErrorKind::Internal`, so `impl From<rusqlite::Error> for Error` wrapped them
+  as `tor_error::Bug` ("sqlite detected bug") and `bootstrap_action()` then
+  treated them as `Fatal`. On a long-lived Windows desktop process the
+  directory cache db is routinely locked for a few milliseconds by antivirus
+  real-time scanning, Windows Search indexing, or OneDrive/backup sync over
+  the cache directory — exactly the transient, fully-recoverable contention
+  that `SQLITE_BUSY`/`SQLITE_LOCKED` semantically mean ("try again later"). A
+  transient file lock was thus mislabeled and mis-handled as a programming
+  bug, fatally aborting bootstrap. Fixed by reclassifying `DatabaseBusy` /
+  `DatabaseLocked` into `ErrorKind::CacheAccessFailed` — the same bucket
+  already used for the analogous environmental cache-access failures
+  (`FileLockingProtocolFailed`, `SystemIoFailure`, `CannotOpen`, ...) — so
+  they become a plain `Error::SqliteError` instead of `Error::Bug`. (Both
+  variants still map to `BootstrapAction::Fatal`, so this is primarily an
+  honest-classification fix that stops a transient lock from being reported
+  as a "detected bug" and sets up correct semantics for a future retry-with-
+  backoff, deliberately left as the larger, optional second step.)
+  `OperationInterrupted` / `OperationAborted` were deliberately left in
+  `Internal`: they are explicit cancel/abort signals, not file-lock
+  contention. Regression tests added covering both the direct classification
+  and the end-to-end `From<rusqlite::Error>` path.
 
 ### Known limitations
 
