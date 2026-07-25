@@ -717,6 +717,29 @@ impl GuardSet {
             .collect();
     }
 
+    /// tor-socks5 local patch: re-enable every guard that is currently
+    /// `disabled` (clearing its `disabled` state and resetting the
+    /// indeterminate-failure history that led to the disable), returning the
+    /// number of guards that were re-enabled.
+    ///
+    /// Guards that are not disabled are left untouched (their observed history
+    /// is never wiped). See `Guard::reset_disabled` for the per-guard semantics
+    /// and rationale.
+    pub(crate) fn reset_disabled_guards(&mut self) -> usize {
+        let old_guards = std::mem::take(&mut self.guards);
+        let mut n_reset = 0usize;
+        self.guards = old_guards
+            .into_values()
+            .map(|mut guard| {
+                if guard.reset_disabled() {
+                    n_reset += 1;
+                }
+                guard
+            })
+            .collect();
+        n_reset
+    }
+
     /// Record that an attempt has begun to use the guard with
     /// `guard_id`.
     pub(crate) fn record_attempt(&mut self, guard_id: &GuardId, now: Instant) {

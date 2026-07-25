@@ -542,6 +542,28 @@ impl<R: Runtime> GuardMgr<R> {
         inner.guards.active_guards_mut().mark_all_guards_retriable();
     }
 
+    /// tor-socks5 local patch: re-enable every guard that is currently disabled
+    /// by `TooManyIndeterminateFailures` (clearing its `disabled` state and
+    /// resetting the indeterminate-failure history that led to the disable),
+    /// and return the number of guards that were re-enabled.
+    ///
+    /// `tor-guardmgr` permanently disables a guard once its lifetime
+    /// indeterminate-failure ratio exceeds `0.7`, and persists that `disabled`
+    /// state across restarts; nothing else in the crate ever clears it. In a
+    /// bridge-only deployment with only a handful of configured bridges, a
+    /// single transient second-hop/exit failure storm can therefore take a
+    /// bridge out of rotation for good. This hook lets an application-level
+    /// watchdog (which knows how small the bridge pool is) deliberately
+    /// re-enable disabled bridges on its own policy — for example when too few
+    /// usable bridges remain.
+    ///
+    /// Returns the number of guards that were disabled and are now
+    /// re-enabled. Guards that were already usable are left untouched.
+    pub fn reset_disabled_guards(&self) -> usize {
+        let mut inner = self.inner.lock().expect("Poisoned lock");
+        inner.guards.active_guards_mut().reset_disabled_guards()
+    }
+
     /// Configure this guardmgr to use a fixed [`NetDir`] instead of a provider.
     ///
     /// This function is for testing only, and is exclusive with

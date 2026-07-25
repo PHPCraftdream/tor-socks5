@@ -224,6 +224,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timer reset there would degenerate to a per-phase total. A genuine
   idle/total fix for the PT handshake belongs one layer down, in the PT
   transport (`tor-ptmgr` / the PT child) emitting progress ticks.
+- `tor-guardmgr` could permanently (and persistently, across restarts)
+  disable one of the few hand-configured bridges with no automatic recovery
+  path. `record_indeterminate_result()` sets `Guard::disabled` once a guard's
+  *lifetime* indeterminate-failure ratio (`n_indeterminate / (n_successes +
+  n_indeterminate)`, sampled past 15 observations) crosses `0.7`. That
+  `disabled` field is serialized to the state file and nothing in the crate
+  ever clears it — its own TODO concedes "we'll need a way to make ancient
+  history expire" but no such mechanism exists. `GuardStatus::Indeterminate`
+  is exactly the "circuit failed beyond the guard" class (second-hop/exit
+  timeouts) that the guard-exhaustion incident logged by the hundred per
+  minute; in bridge-only operation, where traffic splits across 2-6 bridges
+  instead of thousands of sampled relays, one such storm can push a bridge
+  over the threshold and take it out of rotation *for good*. The detection
+  logic and its threshold are left untouched (they are an upstream-tuned
+  path-bias defense); instead a manual override hook is added so an
+  application-level watchdog can deliberately re-enable disabled bridges on
+  its own policy ("too few usable bridges remain"). `Guard::reset_disabled()`
+  clears `disabled` **and** resets `CircHistory`/`suspicious_behavior_warned`
+  (otherwise the next indeterminate result would immediately re-trip the
+  threshold on the stale numerator), surfaced as
+  `GuardSet::reset_disabled_guards()` (counting re-enabled guards, leaving
+  healthy guards' history untouched), `GuardMgr::reset_disabled_guards()`,
+  and a `TorClient::reset_disabled_guards()` passthrough (gated
+  `experimental-api`, mirroring the existing `dirmgr()`/`circmgr()`/
+  `chanmgr()` accessors). Parallels `tor-chanmgr`'s
+  `terminate_all_channels()` as a second application-reachable escape hatch
+  for an upstream mechanism that, in a small bridge-only pool, can strand a
+  resource with no auto-recovery.
 
 ### Known limitations
 

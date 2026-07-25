@@ -802,6 +802,43 @@ impl Guard {
         }
     }
 
+    /// tor-socks5 local patch: clear this guard's `disabled` state and give it
+    /// a fresh start, also resetting the circuit-failure history that produced
+    /// the disable.
+    ///
+    /// Returns `true` if the guard was disabled (and is now re-enabled), `false`
+    /// if it was already usable — in which case nothing is touched: we never
+    /// wipe the observed history of a healthy guard.
+    ///
+    /// # Why this exists
+    ///
+    /// [`record_indeterminate_result`](Self::record_indeterminate_result)
+    /// permanently sets `disabled` once the lifetime indeterminate-failure
+    /// ratio crosses `0.7`. The `disabled` field is persisted (serialized to
+    /// the state file) and nothing else in this crate ever clears it, so once a
+    /// guard is disabled it stays disabled until it drops out of the sample for
+    /// an unrelated reason. In a bridge-only deployment with only a handful of
+    /// configured bridges, a single transient second-hop/exit failure storm
+    /// (which is exactly what `GuardStatus::Indeterminate` counts) can take a
+    /// bridge out of rotation for good, with no automatic recovery path.
+    ///
+    /// This is the manual escape hatch an application-level watchdog can invoke
+    /// on its own policy — e.g. "too few usable bridges remain, do not let this
+    /// one stay permanently disabled". The history is reset rather than only
+    /// `disabled`, because the accumulated `n_indeterminate` would otherwise
+    /// immediately re-trip the disable threshold on the very next
+    /// indeterminate result.
+    pub(crate) fn reset_disabled(&mut self) -> bool {
+        if self.disabled.take().is_some() {
+            self.circ_history = CircHistory::default();
+            self.suspicious_behavior_warned = false;
+            info!(guard=?self.id, "Re-enabling previously disabled guard (manual reset of indeterminate-failure history).");
+            true
+        } else {
+            false
+        }
+    }
+
     /// Return a [`FirstHop`](crate::FirstHop) object to represent this guard.
     pub(crate) fn get_external_rep(&self, selection: GuardSetSelector) -> crate::FirstHop {
         crate::FirstHop {
@@ -1382,6 +1419,48 @@ mod test {
                 panic!("Wrong variant: {:?}", other);
             }
         }
+    }
+
+    // tor-socks5 local patch: verify the reset-disabled primitive that an
+    // application-level watchdog uses to recover a permanently-disabled guard.
+    #[test]
+    fn reset_disabled() {
+        let mut g = basic_guard();
+        let params = GuardParams::default();
+        let now = SystemTime::get();
+
+        // A fresh, healthy guard is not disabled; resetting it is a no-op that
+        // returns false and must not touch anything.
+        assert!(!g.reset_disabled());
+        assert!(g.disabled.is_none());
+
+        // Drive the guard into the disabled state (mirror `disable_on_failure`):
+        // 1 success + 14 indeterminate => 15 observations, ratio 14/15 ~= 0.93.
+        let _ignore = g.record_success(now, &params);
+        for _ in 0..14 {
+            g.record_indeterminate_result();
+        }
+        assert!(g.disabled.is_some());
+        assert_eq!(g.circ_history.n_successes, 1);
+        assert_eq!(g.circ_history.n_indeterminate, 14);
+
+        // Reset: disabled clears, history clears, suspicious-warn flag clears,
+        // and the call reports that a guard was re-enabled.
+        assert!(g.reset_disabled());
+        assert!(g.disabled.is_none());
+        assert_eq!(g.circ_history.n_successes, 0);
+        assert_eq!(g.circ_history.n_indeterminate, 0);
+
+        // After reset we are back below MIN_OBSERVATIONS, so a single new
+        // indeterminate result must NOT re-disable the guard: it gets a genuine
+        // fresh start rather than being immediately re-tripped by the old
+        // accumulated numerator. (This is exactly why the history is reset and
+        // not just `disabled`.)
+        g.record_indeterminate_result();
+        assert!(g.disabled.is_none());
+
+        // A healthy guard with no disable stays a no-op even after activity.
+        assert!(!g.reset_disabled());
     }
 
     #[test]

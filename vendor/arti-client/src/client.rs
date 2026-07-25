@@ -1717,6 +1717,33 @@ impl<R: Runtime> TorClient<R> {
             .clone())
     }
 
+    /// tor-socks5 local patch: re-enable every guard that the guard manager has
+    /// permanently disabled via its indeterminate-failure path-bias detection,
+    /// returning the number of guards that were re-enabled.
+    ///
+    /// `tor-guardmgr` disables a guard once its lifetime indeterminate-failure
+    /// ratio exceeds 0.7, persists that `disabled` state across restarts, and
+    /// never clears it. In a bridge-only deployment with only a handful of
+    /// configured bridges, a single transient second-hop/exit failure storm can
+    /// therefore take a bridge out of rotation for good, with no automatic
+    /// recovery path. This hook lets an application-level watchdog (which knows
+    /// how small the bridge pool is) deliberately re-enable disabled bridges on
+    /// its own policy — for example when too few usable bridges remain.
+    ///
+    /// Returns an error if the client is not yet running (dormant / under
+    /// construction); otherwise the count of guards that were disabled and are
+    /// now re-enabled. Guards that were already usable are left untouched.
+    ///
+    /// This function is unstable. It is only enabled if the crate was
+    /// built with the `experimental-api` feature.
+    #[cfg(feature = "experimental-api")]
+    pub fn reset_disabled_guards(&self) -> crate::Result<usize> {
+        let inner = self
+            .client
+            .running_inner("reset disabled guards")?;
+        Ok(inner.guardmgr.reset_disabled_guards())
+    }
+
     /// Return a reference to this client's circuit pool.
     ///
     /// This function is unstable. It is only enabled if the crate was

@@ -109,6 +109,31 @@ aggregate every time the guard sample is refreshed. Consumed by the matching
 as a **mandatory pair** — see
 `docs/upstream/arti-vendor-integration-plan.md` §1.4/§2.
 
+Second fix — the indeterminate-failure **permanent disable** with no recovery
+path. `record_indeterminate_result()` sets `Guard::disabled` once the guard's
+*lifetime* indeterminate-failure ratio (`n_indeterminate / (n_successes +
+n_indeterminate)`) crosses `0.7`. That `disabled` field is **persisted**
+(serialized to the state file) and nothing in the crate ever clears it — its
+own TODO admits "we'll need a way to make ancient history expire" but no such
+mechanism exists. `GuardStatus::Indeterminate` is exactly the "circuit failed
+beyond the guard" class (second-hop/exit timeouts) that the
+guard-exhaustion-watchdog-spiral incident logged by the hundred-per-minute;
+in bridge-only operation, where traffic is split across 2-6 hand-configured
+bridges instead of thousands of sampled relays, one such storm can drive a
+bridge's ratio over the threshold and disable it *for good* (surviving
+restarts), with no automatic re-enable. Added a manual escape hatch the
+application watchdog can invoke on its own policy ("too few usable bridges
+remain, don't let this one stay dead"): `Guard::reset_disabled()` clears
+`disabled` **and** resets `CircHistory`/`suspicious_behavior_warned` (so the
+next indeterminate result doesn't immediately re-trip the threshold on the
+stale numerator), surfaced as `GuardSet::reset_disabled_guards()` (counting
+re-enabled guards, leaving healthy guards' history untouched),
+`GuardMgr::reset_disabled_guards()`, and a `TorClient::reset_disabled_guards()`
+passthrough (gated `experimental-api`, mirroring the existing
+`dirmgr()`/`circmgr()`/`chanmgr()` accessors). The detection logic and its
+security threshold are left untouched — this is purely an additive override
+hook, exactly paralleling `tor-chanmgr`'s `terminate_all_channels()`.
+
 ### `arti-client` (0.43.0)
 `BootstrapStatus::ready_for_traffic()` used to report "ready" once directory
 bootstrap completed, without regard to whether any guard actually had usable
