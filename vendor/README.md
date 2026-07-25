@@ -72,6 +72,28 @@ directly, not a long-lived cache that a `terminate_all_channels()` call
 would strand (confirmed in
 `docs/upstream/arti-vendor-integration-plan.md` §1.3).
 
+Second fix — the channel-build **connect timeout**. `connect_via_transport`
+armed a single TOTAL timeout (5s for `is_direct()`, 10s for everything
+else) around the whole of `connect_no_timeout`. `is_direct()` is false for
+*every* pluggable-transport channel, so in this client's bridge-only
+operation 100% of channel builds were bounded by that 10s ceiling — for the
+full PT handshake (bridge TCP connect + obfs4/webtunnel client handshake +
+Tor TLS + Tor link handshake, ~10+ round trips). That is too tight for a
+healthy-but-slow / high-latency bridge path, and because `Error::ChanTimeout`
+maps to `RetryTime::Immediate` (`err.rs`), the guard manager retried at once
+and just hit the same 10s ceiling again. The PT total was raised 10s → 45s
+(extracted as the unit-tested `connect_build_timeout(is_direct)` helper).
+This is a single generous **total**, not the idle/total split applied in
+`tor-dirclient`'s `read_and_decompress`: that split relies on a read loop
+with per-byte progress, whereas here the slow phase (the PT handshake) lives
+entirely inside the opaque `TransportImplHelper::connect` call with no
+progress callback, and the only progress boundaries visible at this level
+(phase completions reported via the `BootstrapReporter`) bracket the PT
+handshake rather than sample within it — so an idle timer reset there would
+degenerate to a per-phase total. A genuine idle/total fix for the PT
+handshake belongs one layer down, in the PT transport (`tor-ptmgr` / the PT
+child), which is out of scope for this crate.
+
 ### `tor-guardmgr` (0.43.0)
 A guard is only eligible for a data circuit once it has complete directory
 information (`dir_info_missing == false`), but `GuardMgr` never aggregated

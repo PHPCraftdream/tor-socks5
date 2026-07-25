@@ -180,6 +180,31 @@ where
     }
 }
 
+/// Total timeout for a single outbound channel-build attempt, by transport kind.
+///
+/// Direct (relay) builds get a tight budget: a direct TCP+TLS+Tor-link
+/// handshake to a live relay is fast, and a longer bound only masks a dead
+/// relay. Pluggable-transport (non-direct) builds get a generous total — see
+/// the call site in `connect_via_transport` for why this remains a single
+/// total rather than an idle/total split, and why 45s was chosen.
+//
+// tor-socks5 local patch: extracted as a function so the per-transport budget
+// is unit-testable (upstream hard-coded 10s for every non-direct channel).
+fn connect_build_timeout(is_direct: bool) -> Duration {
+    if is_direct {
+        // Direct relay path — unchanged from upstream.
+        Duration::from_secs(5)
+    } else {
+        // Pluggable-transport path: was 10s, now 45s. The full handshake
+        // chain (bridge TCP connect + obfs4/webtunnel handshake + Tor TLS +
+        // Tor link handshake) over a high-latency / congested-but-healthy
+        // bridge needs well over 10s; 45s gives that headroom while still
+        // bounding a dead bridge per attempt. (Cf. tor-dirclient's 90s *idle*
+        // download timeout; this is a *total*, so shorter.)
+        Duration::from_secs(45)
+    }
+}
+
 #[async_trait]
 impl<R: Runtime, H: TransportImplHelper> ChannelFactory for ChanBuilder<R, H>
 where
@@ -195,12 +220,39 @@ where
     ) -> crate::Result<Arc<tor_proto::channel::Channel>> {
         use tor_rtcompat::SleepProviderExt;
 
-        // TODO: make this an option.  And make a better value.
-        let delay = if target.chan_method().is_direct() {
-            std::time::Duration::new(5, 0)
-        } else {
-            std::time::Duration::new(10, 0)
-        };
+        // tor-socks5 local patch: give pluggable-transport (non-direct)
+        // channel builds a far more generous total than upstream's flat 10s.
+        //
+        // Upstream arms a single TOTAL timeout (5s direct, 10s everything
+        // else) around the whole of `connect_no_timeout`. `is_direct()` is
+        // false for *every* pluggable-transport channel, so in bridge-only
+        // operation 100% of channel builds are bounded by that 10s ceiling
+        // — for the full PT handshake (TCP connect to the bridge +
+        // obfs4/webtunnel client handshake + Tor TLS + Tor link handshake,
+        // ~10+ round trips). That is too tight for a healthy-but-slow /
+        // high-latency bridge path, and because `Error::ChanTimeout` maps to
+        // `RetryTime::Immediate` (err.rs), the guard manager retries at once
+        // and just hits the same 10s ceiling again instead of giving the
+        // slow path longer.
+        //
+        // This is NOT split into idle/total like the tor-dirclient patch
+        // (`read_and_decompress` in vendor/tor-dirclient). That split works
+        // there because the download is a read loop with per-byte progress,
+        // so the idle timer is rebuilt on every read. Here
+        // `connect_no_timeout` is a single opaque future, and its slow phase
+        // — the PT handshake — lives entirely inside
+        // `TransportImplHelper::connect`, which returns `(PeerAddr, Stream)`
+        // with no progress callback. The only progress boundaries visible at
+        // this level are phase completions (record_tcp_success /
+        // record_tls_finished / record_handshake_done), which *bracket* the
+        // PT handshake rather than sample within it, so an idle timer reset
+        // there would degenerate to a per-phase total and not help the actual
+        // failure mode. A genuine idle/total fix for the PT handshake would
+        // have to live one layer down, in the PT transport (tor-ptmgr / the
+        // PT child) emitting progress ticks — out of scope for this crate.
+        // Until then, a generous total is the honest bound available here.
+        // See `connect_build_timeout` for the value choice.
+        let delay = connect_build_timeout(target.chan_method().is_direct());
 
         self.runtime
             .timeout(delay, self.connect_no_timeout(target, reporter.0, memquota))
@@ -847,6 +899,23 @@ mod test {
             r2.unwrap();
             Ok(())
         })
+    }
+
+    // tor-socks5 local patch: pin the per-transport connect-build budget so
+    // the PT (non-direct) total cannot silently regress to upstream's 10s.
+    // These fail against the pre-patch value (10s) and pass with the fix.
+    #[test]
+    fn connect_build_timeout_direct() {
+        // Direct (relay) channel build: tight total, unchanged from upstream.
+        assert_eq!(connect_build_timeout(true), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn connect_build_timeout_pluggable_transport() {
+        // Non-direct (PT) channel build: generous total. Upstream used a flat
+        // 10s, too tight for the full PT handshake over a high-latency bridge.
+        // See `connect_build_timeout` for why this is a total, not idle/total.
+        assert_eq!(connect_build_timeout(false), Duration::from_secs(45));
     }
 
     // TODO: Write tests for timeout logic, once there is smarter logic.

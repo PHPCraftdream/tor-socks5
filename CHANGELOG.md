@@ -198,6 +198,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process-level integration test that launches the real binary and
   asserts it exits on stdin close. The now-redundant workaround thread in
   `main.rs`'s PT-child branch is removed.
+- The PT channel-build timeout was too tight for a healthy-but-slow
+  bridge. `tor-chanmgr`'s `connect_via_transport` armed a single TOTAL
+  timeout around the whole channel build — 5s for a `is_direct()`
+  channel, 10s for everything else — and `is_direct()` is false for
+  *every* pluggable-transport channel, so in this client's bridge-only
+  operation 100% of channel builds were bounded by that 10s ceiling.
+  That ceiling has to cover the entire PT handshake (TCP connect to the
+  bridge + obfs4/webtunnel client handshake + Tor TLS + Tor link
+  handshake, ~10+ round trips), which a high-latency or
+  congested-but-healthy bridge path cannot fit — and because
+  `Error::ChanTimeout` maps to `RetryTime::Immediate`, the guard manager
+  retried at once and hit the same 10s ceiling again, looping instead of
+  giving the slow path the longer single wait it needed. Fixed by
+  vendoring `tor-chanmgr` 0.43.0's connect path and raising the PT
+  (non-direct) total 10s → 45s (the direct-relay total stays at 5s),
+  extracted as a unit-tested `connect_build_timeout(is_direct)` helper.
+  This is a single generous **total**, deliberately not the idle/total
+  split applied earlier to `tor-dirclient`'s directory download: that
+  split works only because the download is a read loop with per-byte
+  progress, whereas here the slow phase (the PT handshake) is entirely
+  inside the opaque `TransportImplHelper::connect` call with no progress
+  callback — the phase-completion boundaries visible at this level
+  bracket the PT handshake rather than sample within it, so an idle
+  timer reset there would degenerate to a per-phase total. A genuine
+  idle/total fix for the PT handshake belongs one layer down, in the PT
+  transport (`tor-ptmgr` / the PT child) emitting progress ticks.
 
 ### Known limitations
 
