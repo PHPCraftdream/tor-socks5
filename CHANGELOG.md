@@ -252,6 +252,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `terminate_all_channels()` as a second application-reachable escape hatch
   for an upstream mechanism that, in a small bridge-only pool, can strand a
   resource with no auto-recovery.
+- A panic inside `tor-dirmgr`'s `SharedMutArc::mutate()` (e.g. an edge-case
+  microdescriptor parse in `DirMgr`'s `add_microdesc` loop, which runs roughly
+  hourly) permanently bricked the shared netdir handle. All four lock sites in
+  `shared_ref.rs` (`replace`/`clear`/`get`/`mutate`) used
+  `.write()/.read().expect("Poisoned lock for directory reference")` on a plain
+  `std::sync::RwLock`; a panic inside `mutate()`'s closure poisons that lock
+  forever, and `.expect()` then re-panics on every subsequent access. The
+  process stays alive (a panic in a spawned tokio task doesn't tear down the
+  runtime) but every later directory read panics in its own task — silent
+  permanent degradation until a manual restart, exactly what this long-lived
+  headless deployment tries to avoid. Fixed by vendoring `tor-dirmgr` 0.43.0's
+  `shared_ref.rs` and replacing the four `.expect(...)` sites with
+  `.unwrap_or_else(|e| e.into_inner())` — the same recover-from-poisoned-lock
+  pattern already used in this repo's `tor_watchdog.rs`. `into_inner()` hands
+  back the guard over whatever data survived the panic; it does **not** roll
+  back a partial mutation made before the panic (a full `catch_unwind` rollback
+  was deliberately left as the larger, optional second step). Regression test
+  added: a panicking closure no longer poisons the next `get()`/`mutate()`.
 
 ### Known limitations
 

@@ -34,6 +34,30 @@ The bridge-descriptor fetch (`bridgedesc.rs`) had **no timeout** and could hang
 forever. Added a hard per-attempt timeout, faster retry, and gentle
 (non-flooding) parallelism for the bridge pool.
 
+Second fix — the `SharedMutArc` netdir handle (`shared_ref.rs`) was permanently
+bricked by **any** panic inside `mutate()`'s closure. `replace()`/`clear()`/
+`get()`/`mutate()` all used `.write()/.read().expect("Poisoned lock for
+directory reference")` on a plain `std::sync::RwLock`. A panic inside the
+closure (e.g. an edge-case microdescriptor parse inside `DirMgr`'s
+`add_microdesc` loop, which runs roughly hourly for the lifetime of the
+process) poisons that `RwLock` forever — standard `std::sync::RwLock`
+semantics — and the `.expect()` then re-panics on **every** subsequent
+`get()`/`replace()`/`mutate()`. The process stays alive (a panic in a spawned
+tokio task doesn't tear down the runtime by default) but the netdir becomes
+unreadable for all later operations, with no external signal beyond a stream
+of panics in the log. For a long-lived headless process with no supervisor to
+restart it, that converts one non-fatal panic into permanent degradation until
+a manual restart. `mutate()`'s own doc comment already flagged this (`# No
+panic-safety ... TODO: Fix this.`). Fix: replaced the four `.expect(...)` sites
+with `.unwrap_or_else(|e| e.into_inner())` — exactly the pattern already in use
+in this repo's `apps/socks5-proxy/src/tor_watchdog.rs` for the same class of
+problem. `into_inner()` hands back the guard over whatever data survived the
+panic; it does **not** roll back a partial mutation performed before the panic
+(recover-with-possible-staleness beats permanent panic-on-every-access — a
+full `catch_unwind` rollback was deliberately left out as the larger, optional
+second step). Regression test added: a panicking closure no longer poisons the
+next `get()`/`mutate()`.
+
 ### `tor-chanmgr` (0.43.0)
 `ChanMgr` tracks open channels but only ever retires one automatically via
 `expire_channels()`, which requires the channel to have been *idle* past a
