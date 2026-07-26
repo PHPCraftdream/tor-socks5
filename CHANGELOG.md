@@ -306,6 +306,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the hook on every `TorClient` construction path, so the event now lands in
   this project's normal logging pipeline instead of being silent.
 
+- The bridge-descriptor fetch in `tor-guardmgr` was throttled to the top
+  `maximum = max(data_parallelism, 2)` guards even during a total
+  guard-exhaustion state, where that conservative cap is itself the
+  bottleneck. When every guard is descriptor-naked, the eligible guards are
+  still listed, reachable, and not in backoff (a failed descriptor fetch is
+  invisible to the guard layer), so they all pass `descriptors_to_request`'s
+  filter and are then truncated by `take(maximum)` — leaving a client
+  requesting descriptors for only its top 2 bridges while 20+ others that
+  could recover it are never asked. This is the exact mechanism behind the
+  12-minute outage in `docs/upstream/guard-exhaustion-watchdog-spiral.md`
+  §2.4, and it also starved the `tor-dirmgr` parallelism raise to 12
+  (separate fix above): the manager can only fetch bridges the guard layer
+  hands it via `set_bridges`, so a 12-wide ceiling was never reached while
+  only 2 were ever requested. Fixed by widening the cap to the whole eligible
+  sample only while `GuardSet::any_guard_usable_for_traffic()` is false (the
+  exhaustion emergency), then snapping back to the conservative top-N the
+  moment the first guard's descriptor arrives and it becomes usable. Safe
+  against flooding because the lower layer (`tor-dirmgr`'s `BridgeDescMgr`)
+  independently caps concurrent fetches and backs off per-bridge retries, so
+  requesting more candidates here cannot exceed that budget — it only stops
+  starving it. Additive: one conditional inside `descriptors_to_request`, no
+  signature change.
+
 ### Known limitations
 
 - Bridges whose TCP reachability probe passes but whose obfs4/webtunnel

@@ -1010,6 +1010,39 @@ impl GuardSet {
         let maximum = std::cmp::max(params.data_parallelism, MINIMUM);
         let data_usage = GuardUsage::default();
 
+        // tor-socks5 local patch: adaptive parallelism for guard-descriptor
+        // fetch.  Normally we request descriptors for only the top `maximum`
+        // guards in preference order.  But when *no* guard is currently usable
+        // for traffic (`any_guard_usable_for_traffic`), every guard in the
+        // sample is descriptor-naked — and in exactly that state this
+        // conservative top-N cap is itself the bottleneck: the eligible guards
+        // are still listed, reachable and not in backoff (a failed descriptor
+        // fetch is invisible to this layer — it never trips
+        // `record_failure`/`retry_at`), so they all pass the filter below and
+        // are then truncated by `take(maximum)`.  In bridge-only operation that
+        // left a client requesting descriptors for only its top 2 bridges
+        // while 20+ others that could have recovered it were never asked — the
+        // mechanism behind the 12-minute guard-exhaustion outage analyzed in
+        // docs/upstream/guard-exhaustion-watchdog-spiral.md §2.4.
+        //
+        // Widening to the whole eligible sample in that emergency lets a
+        // reachable bridge surface its descriptor (and become a usable Data
+        // guard) without waiting behind dead/slow bridges earlier in the
+        // preference order, then snaps back to the conservative cap the moment
+        // the first guard becomes usable.  This is safe against flooding
+        // because the lower layer (`tor-dirmgr`'s `BridgeDescMgr`)
+        // independently caps concurrent descriptor fetches
+        // (`BridgeDescDownloadConfig::parallelism`) and backs off per-bridge
+        // retries, so requesting more candidates here cannot exceed that
+        // budget — it only stops starving the manager's existing parallelism
+        // (which a separate `tor-dirmgr` patch raised to 12 but which was
+        // never reached while only 2 bridges were ever handed down here).
+        let take_n = if self.any_guard_usable_for_traffic() {
+            maximum
+        } else {
+            usize::MAX
+        };
+
         // Here we duplicate some but not all of the restrictions above in
         // pick_guard_id.  We skip those restrictions that are specific to only
         // certain kinds of circuits, and those that are temporary restrictions
@@ -1026,7 +1059,7 @@ impl GuardSet {
                     && g.ready_for_usage(&data_usage, now)
                     && self.active_filter.permits(*g)
             })
-            .take(maximum)
+            .take(take_n)
             .map(|(_, g)| g)
             .collect()
     }
@@ -1332,6 +1365,65 @@ mod test {
         // Once guards regain their descriptors, the sample becomes usable again.
         guards.set_all_guards_dir_info_missing_for_test(false);
         assert!(guards.any_guard_usable_for_traffic());
+    }
+
+    // tor-socks5 local patch: verify the adaptive widening of the
+    // descriptor-request parallelism when the guard sample is exhausted. With
+    // a usable guard present, `descriptors_to_request` must honor the
+    // conservative top-N cap; with none usable, it must request the whole
+    // eligible sample so a reachable bridge is not starved behind dead/slow
+    // bridges earlier in preference order.
+    #[cfg(feature = "bridge-client")]
+    #[test]
+    fn descriptors_to_request_adaptive_parallelism() {
+        let netdir = netdir();
+        let params = GuardParams {
+            min_filtered_sample_size: 5,
+            // keep `data_parallelism` at its default of 1 so `maximum` is the
+            // MINIMUM floor of 2 — small enough to be observably narrower than
+            // the 5-guard sample.
+            ..GuardParams::default()
+        };
+        let now = Instant::get();
+        let mut guards = GuardSet::default();
+        guards.extend_sample_as_needed(SystemTime::get(), &params, &netdir);
+        guards.select_primary_guards(&params);
+
+        // `data_parallelism=1` ⇒ maximum = max(1, 2) = 2, well below the
+        // 5-guard sample, so the cap is observable.
+        let maximum = std::cmp::max(params.data_parallelism, 2);
+        assert_eq!(maximum, 2);
+        assert!(guards.guards.len() > maximum);
+
+        // Normal case: sampled guards carry complete directory information, so
+        // at least one is usable for traffic — the conservative cap applies.
+        assert!(guards.any_guard_usable_for_traffic());
+        assert_eq!(
+            guards.descriptors_to_request(now, &params).len(),
+            maximum,
+            "conservative cap must bind when a usable guard exists"
+        );
+
+        // Guard-exhaustion spiral: every guard lacks a descriptor, so none is
+        // usable for traffic. The adaptive path must widen past the cap so the
+        // bridges beyond the top-2 also get descriptor requests.
+        guards.set_all_guards_dir_info_missing_for_test(true);
+        assert!(!guards.any_guard_usable_for_traffic());
+        let n_exhausted = guards.descriptors_to_request(now, &params).len();
+        assert!(
+            n_exhausted > maximum,
+            "exhaustion must widen parallelism beyond the {maximum}-guard cap, got {n_exhausted}"
+        );
+
+        // Recovery: once a guard regains its descriptor, the conservative cap
+        // snaps back.
+        guards.set_all_guards_dir_info_missing_for_test(false);
+        assert!(guards.any_guard_usable_for_traffic());
+        assert_eq!(
+            guards.descriptors_to_request(now, &params).len(),
+            maximum,
+            "conservative cap must return once a guard becomes usable"
+        );
     }
 
     #[test]

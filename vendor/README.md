@@ -183,6 +183,33 @@ passthrough (gated `experimental-api`, mirroring the existing
 security threshold are left untouched — this is purely an additive override
 hook, exactly paralleling `tor-chanmgr`'s `terminate_all_channels()`.
 
+Third fix — adaptive parallelism for the bridge-descriptor fetch.
+`GuardSet::descriptors_to_request()` caps the guards it hands to the
+descriptor manager at `maximum = max(params.data_parallelism, 2)`. That
+conservative cap is correct in normal operation, but during a total
+guard-exhaustion state (every guard `dir_info_missing`, i.e. no usable guard
+for traffic — exactly the condition surfaced by the first fix's
+`any_guard_usable_for_traffic`) it becomes the bottleneck: the eligible
+guards are still listed, reachable, and not in backoff (a failed descriptor
+fetch is invisible to the guard layer — it never trips
+`record_failure`/`retry_at`), so they all pass the filter and are then
+truncated by `take(maximum)`, leaving a client requesting descriptors for
+only its top 2 bridges while the rest of the sample that could recover it is
+never asked. This is the mechanism behind the 12-minute outage analyzed in
+`docs/upstream/guard-exhaustion-watchdog-spiral.md` §2.4, and it also starved
+the `tor-dirmgr` parallelism raise (the `BridgeDescMgr` can only fetch
+bridges the guard layer hands it via `set_bridges`, so a 12-wide ceiling was
+never reached while only 2 were ever requested). Fix: while
+`any_guard_usable_for_traffic()` is false, widen `take_n` to the whole
+eligible sample (`usize::MAX`, naturally bounded by the sample size); snap
+back to the conservative `maximum` the moment the first guard becomes usable.
+No flood risk: the lower layer independently caps concurrent fetches
+(`BridgeDescDownloadConfig::parallelism`) and backs off per-bridge retries,
+so requesting more candidates here cannot exceed that budget — it only stops
+starving it. One-line conditional inside `descriptors_to_request`, no
+signature change; unit test added mirroring
+`any_guard_usable_for_traffic_aggregation`.
+
 ### `arti-client` (0.43.0)
 `BootstrapStatus::ready_for_traffic()` used to report "ready" once directory
 bootstrap completed, without regard to whether any guard actually had usable
