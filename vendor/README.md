@@ -197,6 +197,26 @@ refresh reports in. Only this crate is overridden here; its internal `tor-*`
 dependencies keep resolving from crates.io / already-patched sources as
 before (the published manifest carries version-only deps, no `path`).
 
+Second fix — observability for the intentional protocol-mismatch shutdown.
+Arti's ["fast zombies"][fz] defense (Tor proposal 266) calls
+`std::process::exit(1)` when the live consensus marks a subprotocol our
+build lacks as required — deliberate, not a bug, and **not** weakened here
+(same reasoning as the `safelog` item in `CHANGELOG.md`'s Known
+limitations). The problem was purely observability: the shutdown wrote only
+an `eprintln!` to stderr, invisible in a deploy model with no
+supervisor/systemd/Docker to notice the process died. Added
+`FatalProtocolErrorHandler` (a `Fn(&Error) + Send + Sync` trait with a
+blanket impl for closures) and `TorClientBuilder::fatal_protocol_error_handler()`
+to install it; `RunningInner::new`'s `on_fatal` closure now invokes the hook
+(via the unit-tested seam `notify_fatal_protocol_error`) immediately before
+its existing `eprintln!`/`sleep`/`process::exit(1)` sequence, which is
+otherwise unchanged. `packages/arti-wrapper` wires every `TorClient`
+construction path through a `tor_builder()` helper that installs a
+`tracing::error!` marker as the hook, so the event now lands in this
+project's normal logging pipeline instead of being silent.
+
+[fz]: https://spec.torproject.org/proposals/266-removing-current-obsolete-clients.html
+
 ## Maintenance
 
 - Versions match the exact crates.io releases the dependency graph resolves

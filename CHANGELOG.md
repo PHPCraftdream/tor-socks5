@@ -293,6 +293,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Internal`: they are explicit cancel/abort signals, not file-lock
   contention. Regression tests added covering both the direct classification
   and the end-to-end `From<rusqlite::Error>` path.
+- `arti-client`'s intentional ["fast zombies"](https://spec.torproject.org/proposals/266-removing-current-obsolete-clients.html)
+  shutdown (Tor proposal 266: exit if the live consensus marks a subprotocol
+  our build lacks as required) called `std::process::exit(1)` after only an
+  `eprintln!` to stderr — invisible in this project's deploy model, which has
+  no supervisor/systemd/Docker to notice the process died. Not weakening the
+  shutdown itself (deliberate, same reasoning as the `safelog` item below);
+  added a `FatalProtocolErrorHandler` hook (`TorClientBuilder::
+  fatal_protocol_error_handler()`) invoked immediately before the existing
+  `eprintln!`/`sleep`/`process::exit(1)` sequence, which is otherwise
+  unchanged. `packages/arti-wrapper` installs a `tracing::error!` marker as
+  the hook on every `TorClient` construction path, so the event now lands in
+  this project's normal logging pipeline instead of being silent.
 
 ### Known limitations
 

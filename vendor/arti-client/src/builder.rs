@@ -28,6 +28,55 @@ pub trait DirProviderBuilder<R: Runtime>: Send + Sync {
     ) -> Result<Arc<dyn tor_dirmgr::DirProvider + 'static>>;
 }
 
+// tor-socks5 local patch: observability hook for arti's intentional
+// protocol-mismatch shutdown (Tor proposal 266). See the matching change in
+// `RunningInner::new`'s `on_fatal` closure (`client.rs`) and the application
+// wiring in `packages/arti-wrapper`.
+
+/// A hook invoked immediately before Arti performs a fatal shutdown because
+/// the running software version is missing a subprotocol that the live Tor
+/// network consensus marks as **required** for clients.
+///
+/// This is the ["fast zombies"][fz] defense (Tor proposal 266): an obsolete
+/// client is intentionally shut down rather than allowed to keep querying the
+/// network for functionality that no longer exists. The shutdown itself
+/// (`std::process::exit`) is **not** optional and is **not** disabled by this
+/// hook — it is a deliberate safety measure. This hook exists purely for
+/// **observability**: it lets an embedding application emit a structured
+/// `tracing::error!` marker (or fire an alert) *before* the process dies, so
+/// that in deployment models with no external supervisor to notice the exit
+/// (e.g. a manually-replaced binary on a desktop) the event is not silent.
+///
+/// The hook is invoked exactly once, synchronously inside the fatal-shutdown
+/// task, before Arti flushes its logs and calls `std::process::exit(1)`. It is
+/// therefore guaranteed to run before the process exits, regardless of whether
+/// any other task happens to be scheduled.
+///
+/// Any `Fn(&Error) + Send + Sync` closure implements this trait, so you can
+/// pass a closure directly to
+/// [`TorClientBuilder::fatal_protocol_error_handler`].
+///
+/// [fz]: https://spec.torproject.org/proposals/266-removing-current-obsolete-clients.html
+pub trait FatalProtocolErrorHandler: Send + Sync {
+    /// Invoked once, immediately before Arti begins its fatal shutdown.
+    ///
+    /// `error` describes why the shutdown is happening; its
+    /// [`kind`](tor_error::HasKind::kind) is typically
+    /// [`ErrorKind::SoftwareDeprecated`](tor_error::ErrorKind::SoftwareDeprecated)
+    /// (a missing required protocol).
+    fn on_fatal_protocol_error(&self, error: &crate::Error);
+}
+
+// tor-socks5 local patch: blanket impl so plain closures can be used as hooks.
+impl<F> FatalProtocolErrorHandler for F
+where
+    F: Fn(&crate::Error) + Send + Sync,
+{
+    fn on_fatal_protocol_error(&self, error: &crate::Error) {
+        self(error)
+    }
+}
+
 /// A DirProviderBuilder that constructs a regular DirMgr.
 #[derive(Clone, Debug)]
 struct DirMgrBuilder {}
@@ -67,6 +116,9 @@ pub struct TorClientBuilder<R: Runtime> {
     /// If present, an amount of time to wait when trying to acquire the filesystem locks for our
     /// storage.
     local_resource_timeout: Option<Duration>,
+    /// tor-socks5 local patch: optional observability hook invoked
+    /// immediately before Arti's intentional protocol-mismatch shutdown.
+    fatal_protocol_error_handler: Option<Arc<dyn crate::FatalProtocolErrorHandler>>,
     /// Optional directory filter to install for testing purposes.
     ///
     /// Only available when `arti-client` is built with the `dirfilter` and `experimental-api` features.
@@ -94,6 +146,7 @@ impl<R: Runtime> TorClientBuilder<R> {
             bootstrap_behavior: BootstrapBehavior::default(),
             dirmgr_builder: Arc::new(DirMgrBuilder {}),
             local_resource_timeout: None,
+            fatal_protocol_error_handler: None,
             #[cfg(feature = "dirfilter")]
             dirfilter: None,
         }
@@ -113,6 +166,25 @@ impl<R: Runtime> TorClientBuilder<R> {
     /// be used.
     pub fn bootstrap_behavior(mut self, bootstrap_behavior: BootstrapBehavior) -> Self {
         self.bootstrap_behavior = bootstrap_behavior;
+        self
+    }
+
+    /// Install a hook invoked immediately before Arti performs its intentional
+    /// fatal shutdown (see [`FatalProtocolErrorHandler`]).
+    ///
+    /// The shutdown is deliberate — a required Tor subprotocol is missing (Tor
+    /// proposal 266) — and is **not** disabled by installing a hook; this only
+    /// adds an observability seam that fires *before* the process exits. If no
+    /// hook is installed, Arti's default `eprintln!`-to-stderr behaviour is
+    /// unchanged.
+    ///
+    /// tor-socks5 local patch.
+    pub fn fatal_protocol_error_handler<H>(mut self, hook: H) -> Self
+    where
+        H: FatalProtocolErrorHandler + 'static,
+    {
+        let arc: Arc<dyn FatalProtocolErrorHandler> = Arc::new(hook);
+        self.fatal_protocol_error_handler = Some(arc);
         self
     }
 
@@ -251,6 +323,8 @@ impl<R: Runtime> TorClientBuilder<R> {
             self.bootstrap_behavior,
             Arc::clone(&self.dirmgr_builder),
             dirmgr_extensions,
+            // tor-socks5 local patch: forward the observability hook.
+            self.fatal_protocol_error_handler.clone(),
         )
         .map_err(ErrorDetail::into);
 

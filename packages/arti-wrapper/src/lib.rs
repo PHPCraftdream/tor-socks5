@@ -91,7 +91,8 @@ impl TorTunnel {
     /// Bootstrap using a pre-built `arti-client` config (escape hatch).
     pub async fn bootstrap_raw(config: TorClientConfig) -> Result<Self> {
         tracing::info!("bootstrapping Tor client...");
-        let client = TorClient::create_bootstrapped(config)
+        let client = tor_builder(config)
+            .create_bootstrapped()
             .await
             .map_err(TorError::Bootstrap)?;
         tracing::info!("Tor is ready");
@@ -153,15 +154,12 @@ impl TorTunnel {
     /// tasks (chanmgr/circmgr/dirmgr/ptmgr) — the caller always keeps the
     /// `TorTunnel` value and can explicitly `drop` it.
     pub fn create_unbootstrapped(config: TorClientConfig) -> Result<Self> {
-        // Mirrors `TorClient::create_bootstrapped`'s own runtime lookup,
-        // including its panic-on-no-runtime `.expect(...)` semantics — this
-        // app always runs inside a tokio runtime, so that's consistent, not
-        // a new risk.
-        let runtime = PreferredRuntime::current().expect(
-            "TorClient could not get an asynchronous runtime; are you running in the right context?",
-        );
-        let client = TorClient::with_runtime(runtime)
-            .config(config)
+        // `tor_builder` mirrors `TorClient::create_bootstrapped`'s own runtime
+        // lookup, including its panic-on-no-runtime `.expect(...)` semantics
+        // — this app always runs inside a tokio runtime, so that's consistent,
+        // not a new risk — and additionally installs the fatal-shutdown
+        // observability hook (see `fatal_protocol_error_hook`).
+        let client = tor_builder(config)
             .create_unbootstrapped()
             .map_err(TorError::Bootstrap)?;
         Ok(Self { inner: client })
@@ -185,6 +183,38 @@ impl TorTunnel {
     pub async fn wait_bootstrapped(&self) -> Result<()> {
         self.inner.bootstrap().await.map_err(TorError::Bootstrap)
     }
+}
+
+// tor-socks5 local patch: build every `TorClient` through this helper so the
+// intentional protocol-mismatch shutdown (Tor proposal 266) is observable.
+fn tor_builder(config: TorClientConfig) -> arti_client::TorClientBuilder<PreferredRuntime> {
+    let runtime = PreferredRuntime::current().expect(
+        "TorClient could not get an asynchronous runtime; are you running in the right context?",
+    );
+    TorClient::with_runtime(runtime)
+        .config(config)
+        // Surface the otherwise-silent intentional shutdown as a structured
+        // log line before arti calls `std::process::exit(1)`. The shutdown
+        // itself is deliberately NOT disabled — it is a security measure.
+        .fatal_protocol_error_handler(fatal_protocol_error_hook)
+}
+
+// tor-socks5 local patch: structured marker emitted immediately before arti's
+// fatal protocol-mismatch shutdown. This process has no external supervisor to
+// notice the exit, so without this the event is silent until a human wonders
+// why the proxy stopped responding. `target = "arti_wrapper"` is already in
+// the app's tracing directive set (see `config.rs`), so this is captured by
+// the normal logging pipeline.
+fn fatal_protocol_error_hook(error: &arti_client::Error) {
+    use arti_client::HasKind as _;
+    tracing::error!(
+        target: "arti_wrapper",
+        error_kind = %error.kind(),
+        error = %error,
+        "arti is performing an intentional fatal shutdown: this build is missing a Tor \
+         subprotocol the live network consensus marks as required for clients (proposal 266). \
+         The process will exit shortly. Upgrade arti and restart the proxy to recover.",
+    );
 }
 
 fn build_config(settings: &Settings) -> Result<TorClientConfig> {

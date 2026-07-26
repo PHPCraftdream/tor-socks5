@@ -225,6 +225,11 @@ struct NotConstructedInner<R: Runtime> {
 
     /// A (possibly user-provided) set of in-process extensions for our NetDirProvider.
     dirmgr_extensions: tor_dirmgr::config::DirMgrExtensions,
+
+    /// tor-socks5 local patch: optional observability hook invoked
+    /// immediately before Arti's intentional protocol-mismatch shutdown.
+    fatal_protocol_error_handler:
+        Option<Arc<dyn crate::builder::FatalProtocolErrorHandler>>,
 }
 
 /// Data structures for a "running" client.
@@ -935,6 +940,8 @@ impl<R: Runtime> TorClient<R> {
         autobootstrap: BootstrapBehavior,
         dirmgr_builder: Arc<dyn crate::builder::DirProviderBuilder<R>>,
         dirmgr_extensions: tor_dirmgr::config::DirMgrExtensions,
+        // tor-socks5 local patch: observability hook for the fatal shutdown.
+        fatal_protocol_error_handler: Option<Arc<dyn crate::builder::FatalProtocolErrorHandler>>,
     ) -> StdResult<Arc<Self>, ErrorDetail> {
         if crate::util::running_as_setuid() {
             return Err(tor_error::bad_api_usage!(
@@ -983,6 +990,8 @@ impl<R: Runtime> TorClient<R> {
             status_sender,
             dirmgr_builder,
             dirmgr_extensions,
+            // tor-socks5 local patch: forward the observability hook.
+            fatal_protocol_error_handler,
         });
 
         let inner = Mutex::new(Inner::NotConstructed(inner));
@@ -1079,6 +1088,19 @@ impl<R: Runtime> NotConstructedInner<R> {
     }
 }
 
+// tor-socks5 local patch: invoke the (optional) fatal-protocol-error hook with
+// the public [`Error`] view of the fatal shutdown cause. Separated from the
+// inline `on_fatal` closure above so the hook-firing logic can be unit-tested
+// without dragging in `std::process::exit`.
+pub(crate) fn notify_fatal_protocol_error(
+    hook: &Option<Arc<dyn crate::builder::FatalProtocolErrorHandler>>,
+    error: &crate::Error,
+) {
+    if let Some(hook) = hook {
+        hook.on_fatal_protocol_error(error);
+    }
+}
+
 impl<R: Runtime> RunningInner<R> {
     /// Construct a new [`RunningInner`] and launch its associated tasks.
     fn new(
@@ -1091,6 +1113,8 @@ impl<R: Runtime> RunningInner<R> {
             status_sender,
             dirmgr_builder,
             dirmgr_extensions,
+            // tor-socks5 local patch: observability hook for the fatal shutdown.
+            fatal_protocol_error_handler,
         } = pending;
 
         let runtime = client.runtime.clone();
@@ -1221,12 +1245,19 @@ impl<R: Runtime> RunningInner<R> {
             // but that will take some work.
             |fatal| async move {
                 use tor_error::ErrorReport as _;
+                // tor-socks5 local patch: give the embedding application a
+                // chance to emit a structured marker (tracing::error!, an
+                // alert, ...) before the intentional, non-negotiable fatal
+                // shutdown, so the event is observable without an external
+                // supervisor. The shutdown itself is NOT altered.
+                let fatal_err = crate::err::Error::from(fatal.clone());
+                notify_fatal_protocol_error(&fatal_protocol_error_handler, &fatal_err);
                 // We already logged this error, but let's tell stderr too.
                 eprintln!(
                     "Shutting down because of unsupported software version.\nError was:\n{}",
                     fatal.report(),
                 );
-                if let Some(hint) = crate::err::Error::from(fatal).hint() {
+                if let Some(hint) = fatal_err.hint() {
                     eprintln!("{}", hint);
                 }
                 // Give the tracing module a while to flush everything, since it has no built-in
@@ -2522,6 +2553,44 @@ mod test {
     use super::*;
     use crate::config::TorClientConfigBuilder;
     use crate::{ErrorKind, HasKind};
+
+    // tor-socks5 local patch: contract tests for the fatal-protocol-error
+    // observability hook. A behavioral test that drives the full
+    // `on_fatal` closure would invoke `std::process::exit(1)` and is therefore
+    // impossible to run in-process; instead we unit-test the extracted seam
+    // (`notify_fatal_protocol_error`) that the closure calls immediately before
+    // exiting. The end-to-end wiring (builder -> NotConstructedInner ->
+    // RunningInner::new -> closure) is exercised by the workspace
+    // `cargo build`.
+
+    #[test]
+    fn fatal_protocol_error_hook_none_is_noop() {
+        // With no hook installed, firing the seam must simply do nothing
+        // (Arti's default `eprintln!`-only behaviour is unchanged).
+        let hook: Option<Arc<dyn crate::FatalProtocolErrorHandler>> = None;
+        let err = crate::Error::from(crate::err::ErrorDetail::ExitTimeout);
+        notify_fatal_protocol_error(&hook, &err);
+    }
+
+    #[test]
+    fn fatal_protocol_error_hook_is_invoked_with_error() {
+        // With a hook installed, firing the seam must invoke it exactly once
+        // with the public `Error` view of the fatal cause, *before* the
+        // process would exit. (This is the whole point of the patch: an
+        // embedding application gets a structured marker it can log/alert on.)
+        let recorded = Arc::new(Mutex::new(None::<ErrorKind>));
+        let recorded_inner = Arc::clone(&recorded);
+        let hook: Arc<dyn crate::FatalProtocolErrorHandler> =
+            Arc::new(move |error: &crate::Error| {
+                *recorded_inner.lock().unwrap() = Some(error.kind());
+            });
+        let err = crate::Error::from(crate::err::ErrorDetail::ExitTimeout);
+        notify_fatal_protocol_error(&Some(hook), &err);
+        assert_eq!(
+            *recorded.lock().unwrap(),
+            Some(ErrorKind::RemoteNetworkTimeout)
+        );
+    }
 
     #[test]
     fn create_unbootstrapped() {
