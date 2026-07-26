@@ -343,3 +343,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `circuit_fails` (guard-reachability) counters remain the only pruning
   signals for such bridges, which is why a TCP-alive/handshake-dead bridge
   is pruned more slowly than a fully dead one.
+
+### Considered and declined
+
+- **Reactor-task leak after `ChanMgr::terminate_all_channels()`**: investigated
+  whether the detached tokio task spawned per channel in `tor-chanmgr`'s
+  `builder.rs` (`rt.spawn(async { let _ = reactor.run().await; })` — the
+  returned `JoinHandle` is dropped, so the task is "ownerless") could accumulate
+  across the watchdog's repeated heal-cycle calls over a long process uptime,
+  prompted by `tor-chanmgr`'s own TODO next to `expire_channels()` ("I don't
+  think dropping the `ChannelState<>` from the channel list actually closes a
+  channel reactor…", GitLab work item
+  [#1600](https://gitlab.torproject.org/tpo/core/arti/-/work_items/1600)).
+  **No leak found; no code change made.** That TODO's worry is specific to
+  `expire_channels()`, which drops a `ChannelState` from the map relying solely
+  on the `Arc<Channel>` refcount reaching zero — so if a circuit elsewhere
+  (`tor-circmgr`) still holds a clone, the channel and its reactor survive.
+  Our `terminate_all_channels()` does **not** rely on refcount: it calls
+  `tor_proto::channel::Channel::terminate()` on each open channel *before*
+  dropping it. That `terminate()` (`tor-proto` 0.43.0, `src/channel.rs:951`) is
+  `let _ = self.send_control(CtrlMsg::Shutdown)` over an **unbounded** mpsc
+  (`unbounded_send`), so the message is always buffered and never blocks. The
+  channel reactor's `run()` loop (`src/channel/reactor.rs:251`) `select!`s
+  `self.control.next()` as one of its racing branches; on
+  `Some(CtrlMsg::Shutdown)` `run_once` returns `Err(ReactorError::Shutdown)`
+  (`reactor.rs:340`) and the loop does `break Ok(())`, so the reactor future
+  completes and tokio reaps the spawned task — dropping a `JoinHandle` does not
+  keep an already-completed task alive. `run()` takes `mut self`, so the
+  reactor's `CircMap` and all circuit entries are dropped with it. Because the
+  `select!` races the control channel against the socket read, Shutdown is
+  received promptly even when the underlying transport is dead/half-open (the
+  watchdog scenario): the socket-read branch simply stays pending while the
+  control branch wins. This is independently guaranteed by `tor-proto`'s own
+  `shutdown` / `shutdown2` unit tests (`src/channel/reactor.rs:966` / `:978`),
+  which assert `terminate()` makes `run_once` return `ReactorError::Shutdown`
+  and resolves a running `run()` future. No regression test was added: the
+  `tor-chanmgr` test fakes (`FakeChannel` / `TerminateFakeChannel`) do not spawn
+  a real reactor, so reactor-task accumulation is not observable from that
+  crate's test API, and exercising a real `Channel` reactor would require
+  vendoring the large `tor-proto` crate with its `testing` feature — out of
+  scope for this task. Work item #1600 is still an open TODO in 0.43.0 (the
+  comment is verbatim in `vendor/tor-chanmgr/src/mgr/state.rs:672`); upstream's
+  planned fix is to move expiry *into* the reactor itself, which would also
+  subsume our `terminate_all_channels()` — no action for us until we re-vendor
+  past that change.
