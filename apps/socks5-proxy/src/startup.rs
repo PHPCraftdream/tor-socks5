@@ -1,6 +1,8 @@
 //! Process-wide startup helpers shared by the server and the
 //! `bridges fetch` command: logging setup and the rustls crypto provider.
 
+use std::io::IsTerminal;
+
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 
 use crate::arti_observability::{GuardObservabilityLayer, ObservationSink};
@@ -68,25 +70,38 @@ pub(crate) fn init_tracing(cfg: &Config) -> (WorkerGuard, ObservationSink) {
 }
 
 /// Build the non-blocking writer for the configured sink. Returns the
-/// writer, its flush guard, and whether ANSI colour should be enabled
-/// (always off for a file sink). Any failure to open a file degrades to
+/// writer, its flush guard, and whether ANSI colour should be enabled —
+/// resolved by [`resolve_ansi`] from the configured flag and the *actual*
+/// destination's TTY status. Any failure to open a file degrades to
 /// stderr with a message on the original stderr (the subscriber is not
 /// up yet, so `tracing` is not available here).
 fn make_writer(log: &LogConfig) -> (NonBlocking, WorkerGuard, bool) {
+    // Probe the real TTY status of each standard stream once. A static
+    // config flag cannot tell whether stdout/stderr is an actual terminal
+    // or has been redirected to a file/pipe (e.g. `> log.err` or a
+    // `Start-Process -RedirectStandardError` launch); `is_terminal()`
+    // reflects the live handle, so colour is only enabled when the bytes
+    // truly go to a console.
+    let stdout_tty = std::io::stdout().is_terminal();
+    let stderr_tty = std::io::stderr().is_terminal();
     match log.output {
         LogOutput::Stdout => {
             let (nb, guard) = tracing_appender::non_blocking(std::io::stdout());
-            (nb, guard, log.ansi)
+            let ansi = resolve_ansi(log.ansi, LogOutput::Stdout, stdout_tty, stderr_tty);
+            (nb, guard, ansi)
         }
         LogOutput::Stderr => {
             let (nb, guard) = tracing_appender::non_blocking(std::io::stderr());
-            (nb, guard, log.ansi)
+            let ansi = resolve_ansi(log.ansi, LogOutput::Stderr, stdout_tty, stderr_tty);
+            (nb, guard, ansi)
         }
         LogOutput::File => {
             if log.file.trim().is_empty() {
                 eprintln!("log.output = file but log.file is empty — falling back to stderr");
                 let (nb, guard) = tracing_appender::non_blocking(std::io::stderr());
-                return (nb, guard, log.ansi);
+                // Bytes now land on stderr, so the stderr TTY rule applies.
+                let ansi = resolve_ansi(log.ansi, LogOutput::Stderr, stdout_tty, stderr_tty);
+                return (nb, guard, ansi);
             }
             match std::fs::OpenOptions::new()
                 .create(true)
@@ -94,19 +109,100 @@ fn make_writer(log: &LogConfig) -> (NonBlocking, WorkerGuard, bool) {
                 .open(&log.file)
             {
                 Ok(file) => {
-                    // No ANSI escapes in a file — they would be literal noise.
                     let (nb, guard) = tracing_appender::non_blocking(file);
-                    (nb, guard, false)
+                    // Real file output: colour is always off.
+                    let ansi = resolve_ansi(log.ansi, LogOutput::File, stdout_tty, stderr_tty);
+                    (nb, guard, ansi)
                 }
                 Err(e) => {
                     eprintln!(
                         "could not open log file {:?}: {e} — falling back to stderr",
                         log.file
                     );
+                    // Bytes now land on stderr, so the stderr TTY rule applies.
                     let (nb, guard) = tracing_appender::non_blocking(std::io::stderr());
-                    (nb, guard, log.ansi)
+                    let ansi = resolve_ansi(log.ansi, LogOutput::Stderr, stdout_tty, stderr_tty);
+                    (nb, guard, ansi)
                 }
             }
         }
+    }
+}
+
+/// Decide whether ANSI colour escapes should be emitted, given the user's
+/// configured `ansi` flag, the *actual* destination of the log bytes, and
+/// the TTY status of stdout/stderr.
+///
+/// `ansi` is an opt-in that only takes effect when the bytes really go to a
+/// terminal:
+/// - `File` → always `false`; raw escapes in a file are literal noise and
+///   [`LogConfig::ansi`] documents they are forced off.
+/// - `Stdout` → `configured && is_stdout_tty`.
+/// - `Stderr` → `configured && is_stderr_tty`.
+///
+/// This is split out purely so the TTY booleans are injectable in tests —
+/// `std::io::stdout().is_terminal()` cannot be mocked directly.
+fn resolve_ansi(
+    configured: bool,
+    destination: LogOutput,
+    is_stdout_tty: bool,
+    is_stderr_tty: bool,
+) -> bool {
+    match destination {
+        LogOutput::File => false,
+        LogOutput::Stdout => configured && is_stdout_tty,
+        LogOutput::Stderr => configured && is_stderr_tty,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // (а) configured on + real terminal → colours on.
+    #[test]
+    fn ansi_on_when_configured_and_stdout_is_terminal() {
+        assert!(resolve_ansi(true, LogOutput::Stdout, true, false));
+    }
+
+    #[test]
+    fn ansi_on_when_configured_and_stderr_is_terminal() {
+        assert!(resolve_ansi(true, LogOutput::Stderr, false, true));
+    }
+
+    // (б) configured on but redirected (not a terminal) → colours off, so
+    // raw escape bytes never land in a redirected file/pipe.
+    #[test]
+    fn ansi_off_when_stdout_redirected() {
+        assert!(!resolve_ansi(true, LogOutput::Stdout, false, true));
+    }
+
+    #[test]
+    fn ansi_off_when_stderr_redirected() {
+        assert!(!resolve_ansi(true, LogOutput::Stderr, true, false));
+    }
+
+    // (в) explicitly disabled by the user → off even on a real terminal.
+    #[test]
+    fn ansi_off_when_configured_off_even_on_terminal() {
+        assert!(!resolve_ansi(false, LogOutput::Stdout, true, true));
+        assert!(!resolve_ansi(false, LogOutput::Stderr, true, true));
+    }
+
+    // (г) file destination → always off, regardless of flag or TTY status.
+    #[test]
+    fn ansi_always_off_for_file_output() {
+        assert!(!resolve_ansi(true, LogOutput::File, true, true));
+        assert!(!resolve_ansi(false, LogOutput::File, false, false));
+    }
+
+    // A stream's decision depends only on its own TTY status: the stdout
+    // rule never consults stderr's TTY bit, and vice versa.
+    #[test]
+    fn each_stream_uses_only_own_tty_status() {
+        assert!(resolve_ansi(true, LogOutput::Stdout, true, false));
+        assert!(!resolve_ansi(true, LogOutput::Stdout, false, true));
+        assert!(resolve_ansi(true, LogOutput::Stderr, false, true));
+        assert!(!resolve_ansi(true, LogOutput::Stderr, true, false));
     }
 }

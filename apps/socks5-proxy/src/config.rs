@@ -128,8 +128,12 @@ pub struct LogConfig {
     pub output: LogOutput,
     /// Path used when `output: file`. Empty falls back to stderr.
     pub file: String,
-    /// Colorize output with ANSI escapes. Ignored (forced off) for file
-    /// output. Default `true`.
+    /// Colorize output with ANSI escapes when writing to a real terminal.
+    /// Set to `false` to force plain text even on a terminal. Has no effect
+    /// when the actual output is not a terminal (redirected to a file/pipe):
+    /// colors are then always disabled regardless of this setting, so raw
+    /// `\x1b[...m` bytes never pollute redirected log files. Ignored (forced
+    /// off) for `file` output. Default `true`.
     pub ansi: bool,
 }
 

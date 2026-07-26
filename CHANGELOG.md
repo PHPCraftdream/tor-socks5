@@ -46,6 +46,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it explicitly at startup via `SetConsoleMode`, which also fixes the
   pluggable-transport child's (lyrebird's) colored output since it
   inherits the same console.
+- Raw ANSI color escape sequences (`\x1b[...m`) were being written into
+  redirected log files as literal garbage bytes. The `log.ansi` config
+  flag (default `true`) was passed straight through to the tracing fmt
+  layer for both `stdout` and `stderr` sinks regardless of whether those
+  streams were actual terminals, and a static config flag cannot tell
+  that stderr has been redirected to a file — which is exactly what the
+  `start.bat`/`restart.bat` launcher scripts do via PowerShell
+  `Start-Process -RedirectStandardError`, and what any plain `> log.err`
+  redirection does. The `LogConfig::ansi` docstring already promised ANSI
+  was "ignored (forced off) for file output", but `make_writer` honoured
+  that only on the file-opened path, not on the stdout/stderr paths nor
+  on the file→stderr fallback paths. ANSI is now resolved from the *live*
+  TTY status of the actual destination (`std::io::IsTerminal`, stable
+  since Rust 1.70, no new dependency): enabled only when `ansi: true`
+  *and* the target stream really is a terminal, and unconditionally off
+  for file output. The decision lives in a pure `resolve_ansi` helper so
+  the TTY booleans are injectable, and all flag×destination×TTY
+  combinations are covered by unit tests. This is the complement of the
+  `SetConsoleMode`/`ENABLE_VIRTUAL_TERMINAL_PROCESSING` fix above — that
+  one makes colors render when output *is* a console; this one stops
+  emitting them when it isn't.
 - Telegram-style connection bursts (dozens of simultaneous SOCKS5
   connects) could drive every configured guard to "unsuitable to purpose"
   under a small Tokio worker pool, reproducing the original bootstrap-time
