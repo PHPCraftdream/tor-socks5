@@ -133,7 +133,11 @@ pub struct LogConfig {
     /// when the actual output is not a terminal (redirected to a file/pipe):
     /// colors are then always disabled regardless of this setting, so raw
     /// `\x1b[...m` bytes never pollute redirected log files. Ignored (forced
-    /// off) for `file` output. Default `true`.
+    /// off) for `file` output. Default `true`. The same stderr-based
+    /// decision is propagated to the pluggable-transport child process via
+    /// the `NO_COLOR` env var, so its independent logging layer (which
+    /// always writes to the inherited stderr) stays plain under the same
+    /// conditions.
     pub ansi: bool,
 }
 

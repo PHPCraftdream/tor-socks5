@@ -67,6 +67,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SetConsoleMode`/`ENABLE_VIRTUAL_TERMINAL_PROCESSING` fix above — that
   one makes colors render when output *is* a console; this one stops
   emitting them when it isn't.
+- Raw ANSI color escapes (`\x1b[...m`) were *still* leaking into redirected
+  log files from the **pluggable-transport child process** even after the
+  own-process fix above (commit `a9f9849`). `resolve_ansi` correctly strips
+  color from our own tracing layer when stderr is not a terminal, but the PT
+  child (`ptrs-gesher-lyrebird` 0.5, run via the busybox dispatch of our own
+  binary in `main.rs`) sets up its **own independent** `tracing_subscriber`
+  that always writes straight to its *inherited* stderr handle — the same OS
+  handle as ours whenever stderr has been redirected — and that crate's
+  `init_logging_recvr` defaults to ANSI-on unless the `NO_COLOR` env var is
+  set (a https://no-color.org convention it already implements; its own doc
+  comment explicitly expects the parent to set `NO_COLOR` before spawning).
+  `init_tracing` runs only in the parent process (the PT-child branch returns
+  to `lyrebird::run()` before reaching it), so nothing was setting
+  `NO_COLOR`: the child inherited an ANSI-always-on subscriber and its
+  `\x1b[2m`/`\x1b[33m` bytes landed in the very log file our own layer had
+  gone plain for — observed live as `lyrebird`-target lines full of raw
+  escapes in `start-3.err`. Fixed by having `init_tracing` propagate our own
+  stderr colour decision to the PT child: when ANSI should be off for an
+  inherited-stderr destination (the rule is always `Stderr`, regardless of
+  our own `LogConfig::output`, because the PT child's writer target is
+  fixed), the parent sets `NO_COLOR=1` in its own environment once at
+  startup, well before arti/tor-ptmgr later spawns the PT child (which
+  inherits the environment as usual). No change to the external crate, no
+  vendoring; the user's own `NO_COLOR` is honoured as-is when colour should
+  stay on (never cleared). The pure decision lives in a unit-tested
+  `should_set_no_color` helper; the side-effecting wrapper is left thin.
 - Telegram-style connection bursts (dozens of simultaneous SOCKS5
   connects) could drive every configured guard to "unsuitable to purpose"
   under a small Tokio worker pool, reproducing the original bootstrap-time

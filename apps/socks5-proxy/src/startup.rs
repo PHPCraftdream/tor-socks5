@@ -48,6 +48,13 @@ pub(crate) fn init_tracing(cfg: &Config) -> (WorkerGuard, ObservationSink) {
 
     let (writer, guard, ansi) = make_writer(&cfg.log);
 
+    // Propagate the same stderr colour decision to the pluggable-transport
+    // child process (run later via the busybox dispatch in `main.rs`): its
+    // own independent tracing layer always writes to the inherited stderr,
+    // so without this it would emit raw ANSI escapes into a redirected log
+    // file even though our own layer has already gone plain.
+    propagate_color_preference_to_pt_child(&cfg.log);
+
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_ansi(ansi)
         .with_writer(writer)
@@ -155,6 +162,44 @@ fn resolve_ansi(
     }
 }
 
+/// Pure decision extracted from [`propagate_color_preference_to_pt_child`]:
+/// should the `NO_COLOR` env var be set for the pluggable-transport child?
+/// The PT child always writes to its *inherited* stderr (regardless of our
+/// own `LogConfig::output`), so this follows the `Stderr` rule of
+/// [`resolve_ansi`] and negates it: `NO_COLOR` is wanted precisely when ANSI
+/// should *not* be on for an inherited-stderr destination.
+///
+/// Split out so the logic is unit-testable without probing the real
+/// `std::io::stderr().is_terminal()` or mutating the process-wide `NO_COLOR`
+/// env var (shared state that parallel tests in one process must not touch).
+fn should_set_no_color(configured: bool, is_stderr_tty: bool) -> bool {
+    !resolve_ansi(configured, LogOutput::Stderr, is_stderr_tty, is_stderr_tty)
+}
+
+/// Propagate our own stderr colour decision to the pluggable-transport child
+/// process (`ptrs-gesher-lyrebird`, spawned later via the busybox dispatch
+/// in `main.rs`). That crate sets up its own independent
+/// `tracing_subscriber`, always writing straight to its *inherited* stderr
+/// handle — the same OS handle as ours whenever stderr has been redirected —
+/// and defaults to ANSI-on unless the `NO_COLOR` env var is set (a
+/// https://no-color.org convention it already implements; its own doc
+/// comment explicitly expects the parent to do exactly this). Without this,
+/// a redirected/non-terminal stderr still gets raw ANSI escapes from the PT
+/// child even after our own log output is already correctly plain.
+///
+/// Keyed on `LogOutput::Stderr`'s rule regardless of our OWN
+/// `LogConfig::output` target, because the PT child's writer target is fixed
+/// (always stderr) and does not follow our own config. When colour should
+/// stay on, the env var is left untouched — a user who already set
+/// `NO_COLOR` themselves is honoured as-is (never cleared). Called once from
+/// [`init_tracing`], before arti/tor-ptmgr later spawns the PT child.
+fn propagate_color_preference_to_pt_child(log: &LogConfig) {
+    let stderr_tty = std::io::stderr().is_terminal();
+    if should_set_no_color(log.ansi, stderr_tty) {
+        std::env::set_var("NO_COLOR", "1");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,5 +249,38 @@ mod tests {
         assert!(!resolve_ansi(true, LogOutput::Stdout, false, true));
         assert!(resolve_ansi(true, LogOutput::Stderr, false, true));
         assert!(!resolve_ansi(true, LogOutput::Stderr, true, false));
+    }
+
+    // --- should_set_no_color (the PT-child colour-propagation decision) ---
+    //
+    // The PT child always writes to its inherited stderr, so NO_COLOR is
+    // set iff ANSI would be off for a stderr destination — i.e. the exact
+    // negation of `resolve_ansi(..., LogOutput::Stderr, t, t)`.
+
+    // configured on + stderr is a real terminal → colour on → NO_COLOR NOT
+    // set, so a terminal PT child still gets colours.
+    #[test]
+    fn no_color_not_set_when_configured_and_stderr_is_terminal() {
+        assert!(!should_set_no_color(true, true));
+    }
+
+    // configured on but stderr redirected (not a terminal) → colour off →
+    // NO_COLOR set, so the PT child's inherited-stderr bytes stay plain.
+    #[test]
+    fn no_color_set_when_stderr_redirected_even_if_configured() {
+        assert!(should_set_no_color(true, false));
+    }
+
+    // explicitly disabled by the user → colour off even on a terminal →
+    // NO_COLOR set, propagating the user's opt-out to the PT child too.
+    #[test]
+    fn no_color_set_when_configured_off_even_on_terminal() {
+        assert!(should_set_no_color(false, true));
+    }
+
+    // both off: configured off and no terminal → NO_COLOR set.
+    #[test]
+    fn no_color_set_when_configured_off_and_redirected() {
+        assert!(should_set_no_color(false, false));
     }
 }
