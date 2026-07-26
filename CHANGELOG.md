@@ -387,3 +387,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   planned fix is to move expiry *into* the reactor itself, which would also
   subsume our `terminate_all_channels()` — no action for us until we re-vendor
   past that change.
+
+- **Vendoring `tor-ptmgr` 0.43.0 for `kill_on_drop` / `Drop` hardening of the
+  PT-child**: investigated whether to vendor the one remaining un-vendored
+  crate in our arti 0.43 dependency graph to add `kill_on_drop(true)` (or a
+  `Drop` impl that calls `child.kill()`) to the pluggable-transport child
+  spawn, as defense-in-depth against third-party PT binaries that ignore
+  stdin EOF and could orphan. **Declined; no vendoring, no `Cargo.toml` /
+  `vendor/` change.** Confirmed on the live 0.43.0 source
+  (`tor-ptmgr-0.43.0/src/ipc.rs`): the spawn (`ipc.rs:572`, `Command::new(
+  binary_path).stdin(Stdio::piped()).spawn()`) uses **`std::process::Command`**
+  (`ipc.rs:19` `use std::process::{Child, Command, Stdio};`), not
+  `tokio::process::Command` — so `.kill_on_drop(true)` is not even available;
+  it would require a `Drop` wrapper struct around `Child`, not a one-line
+  method call. More importantly, the patch would not achieve its goal: there
+  is no `impl Drop` for `AsyncPtChild` (only `stdout`/`identifier` fields;
+  `ipc.rs:370-375`) and the `Child` handle is `move`d into a **detached**
+  worker OS thread (`thread::spawn`, `ipc.rs:393`), never joined. That worker
+  **already kills** non-cooperative children in the graceful path — when
+  `AsyncPtChild` is dropped the receiver is dropped, the thread sees
+  `is_disconnected()` (`ipc.rs:405-408`), breaks, drops stdin (which a
+  stdin-ignoring child simply won't notice), sleeps `GRACEFUL_EXIT_TIME` = 5s
+  (`ipc.rs:32`), then `try_wait()` → `Ok(None)` → `child.kill()`
+  (`ipc.rs:441-447`). The only residual orphan risk is **abrupt parent
+  exit** (`std::process::exit`/abort/SIGKILL), which discards the detached
+  worker mid-`sleep` without running its destructors — and **neither** a
+  `std::process::Child` `Drop` wrapper **nor** `tokio`'s `kill_on_drop` can
+  help there, since both fire only on a normal Rust drop, not on abrupt
+  termination. Closing that gap needs OS-level process groups
+  (`setsid`/`PR_SET_PDEATHSIG` on Unix, Job Objects on Windows) — a
+  substantially larger, runtime/OS-specific change that is out of scope and
+  is not what `kill_on_drop` provides. The sole marginal gain of a `Drop`
+  wrapper (the worker-thread closure panicking before it reaches `kill()`) is
+  too narrow to justify introducing a new vendored crate, especially given the
+  root cause is already fixed for the only PT we ship — `ptrs-gesher-lyrebird`
+  reads stdin to EOF since 0.5.2 (`37a87f5`, pulled in at `97b4775`) — and no
+  third-party PT is configured in this project.
