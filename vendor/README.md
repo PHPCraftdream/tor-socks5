@@ -244,6 +244,23 @@ project's normal logging pipeline instead of being silent.
 
 [fz]: https://spec.torproject.org/proposals/266-removing-current-obsolete-clients.html
 
+Third fix — expose `tor-guardmgr`'s `GuardMgr::note_external_failure()`
+through `TorClient`. `tor-guardmgr` already has a public, battle-tested entry
+point for reporting that some activity *outside* of `tor-guardmgr`'s own
+circuit-build bookkeeping failed against a given guard (feeding directly into
+the same primary/confirmed/sample guard-state machine, prop271, that circuit
+failures use) — but nothing on `arti-client`'s public surface reached it.
+Added `TorClient::note_external_guard_failure(&self, identity, activity)`
+(gated `experimental-api`, mirroring the existing
+`dirmgr()`/`circmgr()`/`chanmgr()`/`reset_disabled_guards()` accessors), a
+thin delegate to `GuardMgr::note_external_failure()` with no `tor-guardmgr`
+changes at all. Also re-exports `tor_guardmgr::ExternalActivity` and
+`tor_linkspec::HasRelayIds` from the crate root so callers don't need a direct
+dependency on either crate just to name the types at the call site. This is
+purely the API entry point — no policy for *when* to call it (e.g. detecting
+an unhealthy pluggable-transport bridge whose circuits build but whose
+traffic stalls) is included here.
+
 ## Maintenance
 
 - Versions match the exact crates.io releases the dependency graph resolves

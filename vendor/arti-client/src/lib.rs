@@ -92,6 +92,15 @@ pub use {
 #[cfg(feature = "geoip")]
 pub use tor_geoip::CountryCode;
 
+// tor-socks5 local patch: re-export the types needed to call
+// `TorClient::note_external_guard_failure()` so that callers don't have to
+// add a direct `tor-guardmgr`/`tor-linkspec` dependency of their own just to
+// name `ExternalActivity` and `HasRelayIds` at the call site.
+#[cfg(feature = "experimental-api")]
+pub use tor_guardmgr::ExternalActivity;
+#[cfg(feature = "experimental-api")]
+pub use tor_linkspec::HasRelayIds;
+
 /// Return a list of the protocols [supported](tor_protover::doc_supported) by this crate.
 ///
 /// (This is a crate-private method so as not to expose tor_protover in our public API.)

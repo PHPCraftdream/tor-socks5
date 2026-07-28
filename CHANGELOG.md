@@ -44,6 +44,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   successful Tor `connect`, alongside the existing per-attempt and
   per-error logging — makes it possible to tell "working" from "hung" by
   grepping logs, rather than inferring it from the absence of errors.
+- **`TorClient::note_external_guard_failure()`** (vendored `arti-client`,
+  `experimental-api`): a thin passthrough to `tor-guardmgr`'s already-public
+  `GuardMgr::note_external_failure()`, which feeds directly into the existing
+  primary/confirmed/sample guard-state machine (prop271) that circuit-build
+  failures already use. No changes to `tor-guardmgr` itself. This is only the
+  API entry point — prep work for a future soft switch-over to a healthier
+  bridge on degradation of the current one; the decision logic for *when* to
+  call it is a separate, not-yet-built feature. Also re-exports
+  `tor_guardmgr::ExternalActivity` and `tor_linkspec::HasRelayIds` from
+  `arti-client`'s crate root for caller convenience.
 
 ### Fixed
 

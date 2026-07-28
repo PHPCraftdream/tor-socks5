@@ -73,7 +73,7 @@ where
     F: Fn(&crate::Error) + Send + Sync,
 {
     fn on_fatal_protocol_error(&self, error: &crate::Error) {
-        self(error)
+        self(error);
     }
 }
 
