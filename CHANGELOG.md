@@ -54,6 +54,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   call it is a separate, not-yet-built feature. Also re-exports
   `tor_guardmgr::ExternalActivity` and `tor_linkspec::HasRelayIds` from
   `arti-client`'s crate root for caller convenience.
+- **Soft-failover: watchdog signals guard failure to arti when a healthier
+  bridge is available.** Completes the warm-pool/soft-switchover feature:
+  a new background task (`spawn_bridge_failover_watchdog` in
+  `tor_watchdog.rs`) periodically re-reads the configured bridges' health
+  from `bridge_store.rs` (the same circuit-layer observation pipeline
+  `bridge_warmer.rs` already ranks candidates with) and, when a bridge's
+  `circuit_fails` crosses a configurable threshold *and* a meaningfully
+  healthier alternative exists among the other configured bridges (per
+  `should_signal_failover`'s two-part gate — an absolute degradation
+  threshold, plus a minimum health margin over the best alternative, to
+  avoid flapping between two mediocre bridges), calls the new
+  `arti_wrapper::TorTunnel::signal_bridge_failure()` for the degraded
+  bridge. That method wraps the previously-added
+  `TorClient::note_external_guard_failure()` with the same `BridgeLine` →
+  `BridgeConfigBuilder` → `BridgeConfig` conversion `warm_bridge` already
+  uses, and re-exports `tor_guardmgr::ExternalActivity` from
+  `arti_wrapper`'s own crate root so callers in `apps/socks5-proxy` need no
+  direct `tor-guardmgr` dependency. arti's own guard manager decides what
+  to do next (prop271 primary/confirmed/sample fallback) — this task never
+  picks or configures a replacement bridge itself, since there is no public
+  API to learn which bridge arti currently considers primary (a confirmed
+  architectural limitation of `arti-client`/`tor-guardmgr` 0.43). A
+  per-bridge cooldown (`failover_signal_cooldown_secs`) prevents
+  re-signalling the same bridge every watchdog tick. New `[watchdog]`
+  config knobs: `failover_min_circuit_fails` (default `3`),
+  `failover_min_margin` (default `2`), `failover_signal_cooldown_secs`
+  (default `600`) — existing config files pick up the new defaults
+  automatically.
 
 ### Fixed
 

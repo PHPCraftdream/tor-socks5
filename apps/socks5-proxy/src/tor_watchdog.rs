@@ -101,17 +101,20 @@
 //! rather than `TorNetworkTimeout`, since only the latter is the "zombie
 //! channel" signature a channel reset can actually fix.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arti_wrapper::TorTunnel;
+use bridge_line::BridgeLine;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::bridge_store::BridgeStore;
-use crate::config::WatchdogConfig;
+use crate::bridge_warmer::{candidates_with_health, Health};
+use crate::config::{Config, WatchdogConfig};
 
 /// Shared, lock-free circuit-level health signal, updated from the SOCKS5
 /// hot path on every Tor `connect`. Cheap to clone (two atomics behind an
@@ -400,6 +403,202 @@ fn should_decline_rebuild(
     let net_is_strict_max =
         new_net_timeout > new_remote_timeout && new_net_timeout > new_access_failed;
     !net_is_strict_max && (new_remote_timeout > 0 || new_access_failed > 0)
+}
+
+/// Decide whether the current bridge's circuit-layer health has degraded
+/// enough — relative to the healthiest configured alternative — that arti's
+/// guard manager should be nudged away from it.
+///
+/// This is the predicate behind the soft-failover watchdog (see
+/// [`spawn_bridge_failover_watchdog`]): unlike [`should_decline_rebuild`],
+/// which gates a channel *reset* against the same guards, this gates a
+/// signal that actively pushes arti toward a *different* bridge — a much
+/// more consequential action, so the bar is deliberately two-part:
+///
+/// 1. `current_circuit_fails >= threshold` — the current bridge must have
+///    crossed an absolute degradation threshold on its own. A single stray
+///    failure (or even two) must not arm this; `threshold` is the same
+///    "how many consecutive circuit-layer failures constitute real
+///    degradation" judgment `bridges.max_circuit_fails` already makes for
+///    outright pruning, just set lower (see `WatchdogConfig::
+///    failover_min_circuit_fails`'s doc comment for why a lower bar is
+///    appropriate here).
+/// 2. `current_circuit_fails - best_alternative_circuit_fails >= min_margin`
+///    — the *best available alternative* must be meaningfully healthier,
+///    not just "not worse". Without this, two bridges with near-identical,
+///    both-mediocre health would ping-pong a signal back and forth every
+///    tick as their counters see-saw by one.
+///
+/// Both conditions must hold; either one failing declines to signal.
+/// Saturating subtraction: if the alternative is not actually healthier
+/// (`best_alternative_circuit_fails >= current_circuit_fails`), the
+/// subtraction saturates to `0`, which is `< min_margin` for any
+/// `min_margin > 0` — so "alternative is not better than current" always
+/// declines, without a separate comparison needed.
+fn should_signal_failover(
+    current_circuit_fails: u32,
+    best_alternative_circuit_fails: u32,
+    threshold: u32,
+    min_margin: u32,
+) -> bool {
+    if current_circuit_fails < threshold {
+        return false;
+    }
+    let margin = current_circuit_fails.saturating_sub(best_alternative_circuit_fails);
+    margin >= min_margin
+}
+
+/// Spawn the soft-failover watchdog as a detached tokio task.
+///
+/// There is no public arti API to ask "which bridge is currently the
+/// primary guard" (an architectural limitation of `arti-client`/
+/// `tor-guardmgr` 0.43, not something this task works around) — so instead
+/// this treats **every configured bridge's own circuit-layer health**
+/// (already tracked in [`BridgeStore`] via the same observation pipeline
+/// `bridge_warmer.rs` ranks candidates with) as the proxy signal: a bridge
+/// that is actually carrying — and failing — traffic accumulates
+/// `circuit_fails` through the existing `GuardObservabilityLayer` pipeline
+/// (see `arti_observability.rs`), rate-limited to one bump per
+/// `bridges.circuit_observation_window_mins` the same way pruning already
+/// is.
+///
+/// Every `check_interval` the task re-reads the configured bridges and
+/// their health, and for each bridge whose `circuit_fails` has crossed
+/// [`WatchdogConfig::failover_min_circuit_fails`] checks
+/// [`should_signal_failover`] against the healthiest remaining alternative
+/// (via [`crate::bridge_warmer::select_top_n`]'s ranking, excluding the
+/// degraded bridge itself). When it returns `true`, calls
+/// [`arti_wrapper::TorTunnel::signal_bridge_failure`] for the degraded
+/// bridge — arti's own prop271 guard-state machine decides what to do next
+/// (there is no swap performed here). A per-bridge cooldown
+/// (`failover_signal_cooldown_secs`) prevents re-signalling the same bridge
+/// every tick while it hovers at/above the threshold.
+///
+/// A `check_interval_secs == 0` (or `enabled == false`) config disables
+/// this the same way it disables [`spawn_tor_watchdog`] — the two share one
+/// `[watchdog]` config section and one interval, since both read the same
+/// health data on the same cadence.
+pub fn spawn_bridge_failover_watchdog(
+    handle: TorHandle,
+    config_path: Option<PathBuf>,
+    cfg: WatchdogConfig,
+) {
+    if !cfg.enabled || cfg.check_interval_secs == 0 {
+        info!("bridge soft-failover watchdog disabled");
+        return;
+    }
+
+    let interval = Duration::from_secs(cfg.check_interval_secs);
+    let signal_cooldown = Duration::from_secs(cfg.failover_signal_cooldown_secs);
+
+    info!(
+        check_secs = cfg.check_interval_secs,
+        min_circuit_fails = cfg.failover_min_circuit_fails,
+        min_margin = cfg.failover_min_margin,
+        signal_cooldown_secs = cfg.failover_signal_cooldown_secs,
+        "bridge soft-failover watchdog armed"
+    );
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await; // consume the immediate first tick
+
+        // Per-bridge last-signalled time, keyed by the bridge's canonical
+        // string form (`BridgeLine` has no `Eq`/`Hash` impl of its own).
+        // Rate-limits re-signalling the same degraded bridge every tick —
+        // mirrors `rebuild_cooldown_secs`'s role for channel termination.
+        let mut last_signalled: HashMap<String, Instant> = HashMap::new();
+
+        loop {
+            ticker.tick().await;
+
+            let Some(tor) = handle.tunnel().await else {
+                // Slot drained (shutdown in progress) — nothing to signal.
+                continue;
+            };
+
+            let cfg = match Config::load_with_override(config_path.as_deref()) {
+                Ok(loaded) => loaded.into_config(),
+                Err(e) => {
+                    warn!(error = %e, "soft-failover: could not reload config");
+                    continue;
+                }
+            };
+
+            let candidates = candidates_with_health(&cfg, config_path.as_deref());
+            if candidates.len() < 2 {
+                // Need at least one degraded bridge and one alternative.
+                continue;
+            }
+
+            for (idx, (bridge, health)) in candidates.iter().enumerate() {
+                if health.circuit_fails < cfg.watchdog.failover_min_circuit_fails {
+                    continue;
+                }
+
+                let alternatives: Vec<(BridgeLine, Health)> = candidates
+                    .iter()
+                    .enumerate()
+                    .filter(|(other_idx, _)| *other_idx != idx)
+                    .map(|(_, c)| c.clone())
+                    .collect();
+                let Some(best) = healthiest(&alternatives) else {
+                    continue;
+                };
+
+                if !should_signal_failover(
+                    health.circuit_fails,
+                    best.circuit_fails,
+                    cfg.watchdog.failover_min_circuit_fails,
+                    cfg.watchdog.failover_min_margin,
+                ) {
+                    continue;
+                }
+
+                let key = bridge.to_string();
+                if let Some(last) = last_signalled.get(&key) {
+                    if last.elapsed() < signal_cooldown {
+                        continue;
+                    }
+                }
+
+                warn!(
+                    bridge = %bridge,
+                    circuit_fails = health.circuit_fails,
+                    best_alternative_circuit_fails = best.circuit_fails,
+                    "bridge health degraded relative to a healthier alternative — \
+                     signalling guard failure to arti"
+                );
+                match tor.signal_bridge_failure(bridge, arti_wrapper::ExternalActivity::DirCache) {
+                    Ok(()) => {
+                        last_signalled.insert(key, Instant::now());
+                    }
+                    Err(e) => {
+                        warn!(bridge = %bridge, error = %e, "soft-failover: failed to signal guard failure");
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// The healthiest single candidate among `candidates`, per the same
+/// ranking [`crate::bridge_warmer::select_top_n`] uses (TCP-unreachable
+/// bridges excluded, then ascending `circuit_fails`, ties broken by
+/// descending `ok_count`). Returns the winning [`Health`] only — the
+/// soft-failover check only needs the alternative's health, not its
+/// identity.
+fn healthiest(candidates: &[(BridgeLine, Health)]) -> Option<Health> {
+    crate::bridge_warmer::select_top_n(candidates, 1)
+        .into_iter()
+        .next()
+        .and_then(|winner| {
+            candidates
+                .iter()
+                .find(|(b, _)| b.to_string() == winner.to_string())
+                .map(|(_, h)| *h)
+        })
 }
 
 /// Spawn the stale-channel watchdog as a detached tokio task.
@@ -948,5 +1147,102 @@ mod tests {
         // have rebuilt into a cold, guard-unsuitable slot and made the
         // outage worse; the gate must decline.
         assert!(should_decline_rebuild(8, 0, 0));
+    }
+
+    // -- should_signal_failover ----------------------------------------------
+
+    #[test]
+    fn should_signal_failover_below_threshold_never_fires() {
+        // Current bridge hasn't even crossed the absolute degradation
+        // threshold yet — must decline regardless of how healthy the
+        // alternative is.
+        assert!(!should_signal_failover(2, 0, 3, 2));
+    }
+
+    #[test]
+    fn should_signal_failover_at_threshold_with_sufficient_margin_fires() {
+        // Current bridge is exactly at the threshold, and the alternative
+        // is clearly healthier (margin 5 >= min_margin 2) — must fire.
+        assert!(should_signal_failover(3, 0, 3, 2));
+    }
+
+    #[test]
+    fn should_signal_failover_above_threshold_but_insufficient_margin_declines() {
+        // Both bridges are degraded (threshold crossed), but the
+        // alternative isn't meaningfully better — margin of 1 is below
+        // min_margin of 2. Must decline: this is the "don't ping-pong
+        // between two mediocre bridges" case.
+        assert!(!should_signal_failover(4, 3, 3, 2));
+    }
+
+    #[test]
+    fn should_signal_failover_alternative_not_better_declines() {
+        // The "alternative" is tied with (or worse than) the current
+        // bridge — saturating_sub floors the margin at 0, which is below
+        // any positive min_margin, so this must decline without a separate
+        // "is it actually better" check.
+        assert!(!should_signal_failover(5, 5, 3, 1));
+        assert!(!should_signal_failover(5, 8, 3, 1));
+    }
+
+    #[test]
+    fn should_signal_failover_zero_margin_configured_fires_on_any_nonneg_gap() {
+        // A degenerate but valid configuration (`min_margin == 0`): once the
+        // threshold is crossed, any alternative that is not strictly worse
+        // is enough to fire — including a tie (margin == 0 >= min_margin
+        // 0).
+        assert!(should_signal_failover(3, 3, 3, 0));
+    }
+
+    #[test]
+    fn should_signal_failover_large_margin_exact_boundary_fires() {
+        // Margin exactly equal to min_margin must fire (>=, not >).
+        assert!(should_signal_failover(10, 5, 3, 5));
+        // One below the boundary must decline.
+        assert!(!should_signal_failover(10, 6, 3, 5));
+    }
+
+    // -- healthiest -----------------------------------------------------------
+
+    fn bridge(line: &str) -> BridgeLine {
+        line.parse().expect("test bridge line parses")
+    }
+
+    fn health(tcp_fails: u32, circuit_fails: u32, ok_count: u32) -> Health {
+        Health {
+            tcp_fails,
+            circuit_fails,
+            ok_count,
+        }
+    }
+
+    const OBFS4_A: &str =
+        "obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=ZZZ iat-mode=0";
+    const OBFS4_B: &str =
+        "obfs4 5.6.7.8:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=WWW iat-mode=0";
+
+    #[test]
+    fn healthiest_picks_lowest_circuit_fails() {
+        let candidates = vec![
+            (bridge(OBFS4_A), health(0, 5, 1)),
+            (bridge(OBFS4_B), health(0, 1, 1)),
+        ];
+        let best = healthiest(&candidates).expect("non-empty candidates yield a winner");
+        assert_eq!(best.circuit_fails, 1);
+    }
+
+    #[test]
+    fn healthiest_empty_candidates_yields_none() {
+        assert_eq!(healthiest(&[]), None);
+    }
+
+    #[test]
+    fn healthiest_excludes_tcp_unhealthy_bridges() {
+        // Only a TCP-unhealthy alternative is available — `select_top_n`
+        // excludes it outright, so `healthiest` must report no winner
+        // rather than surfacing an unreachable bridge as "the best
+        // alternative".
+        let candidates = vec![(bridge(OBFS4_A), health(1, 0, 100))];
+        assert_eq!(healthiest(&candidates), None);
     }
 }

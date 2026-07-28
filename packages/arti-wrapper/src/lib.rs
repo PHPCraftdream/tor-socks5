@@ -46,7 +46,20 @@ pub enum TorError {
         #[source]
         source: Box<tor_chanmgr::Error>,
     },
+
+    #[error("failed to signal guard failure for bridge {bridge}: {source}")]
+    SignalFailure {
+        bridge: String,
+        #[source]
+        source: arti_client::Error,
+    },
 }
+
+/// Re-exported so callers (e.g. `apps/socks5-proxy/src/tor_watchdog.rs`) do
+/// not need a direct dependency on `tor-guardmgr` just to call
+/// [`TorTunnel::signal_bridge_failure`]. Mirrors `arti_client`'s own
+/// re-export of the same type from its crate root.
+pub use tor_guardmgr::ExternalActivity;
 
 pub type Result<T, E = TorError> = std::result::Result<T, E>;
 
@@ -192,6 +205,55 @@ impl TorTunnel {
                 source: Box::new(source),
             })?;
         Ok(())
+    }
+
+    /// Tell arti's guard manager that `bridge` has been observed (by this
+    /// application, outside of arti's own circuit-build accounting) to be
+    /// degrading, so it can factor that into its own primary/confirmed/
+    /// sample guard-state machine (prop271) the next time it picks a guard.
+    ///
+    /// This is the soft-failover primitive behind the stale-channel
+    /// watchdog's bridge-degradation check (`tor_watchdog.rs` in
+    /// `apps/socks5-proxy`): unlike [`terminate_all_channels`]
+    /// (Self::terminate_all_channels), which forces a reconnect over the
+    /// same guards, this actively nudges arti away from a specific
+    /// degrading bridge toward a healthier one, without this crate having
+    /// to pick or configure the replacement itself — arti already owns that
+    /// decision.
+    ///
+    /// Symmetric with [`warm_bridge`](Self::warm_bridge): the same
+    /// `BridgeLine` → `BridgeConfigBuilder` → `BridgeConfig` conversion is
+    /// reused here to obtain a `HasRelayIds` identity, since `BridgeLine`
+    /// itself does not implement that trait.
+    ///
+    /// Requires `TorClient::note_external_guard_failure` (the
+    /// `experimental-api` feature, already enabled workspace-wide) — see
+    /// `vendor/arti-client/src/client.rs`. That call only fails when the
+    /// client is not in a "running" state (e.g. fully dormant or not yet
+    /// bootstrapped); that failure is surfaced here rather than swallowed,
+    /// mirroring [`terminate_all_channels`](Self::terminate_all_channels)'s
+    /// and [`warm_bridge`](Self::warm_bridge)'s error handling.
+    pub fn signal_bridge_failure(
+        &self,
+        bridge: &BridgeLine,
+        activity: tor_guardmgr::ExternalActivity,
+    ) -> Result<()> {
+        let serialized = bridge.to_string();
+        let builder: BridgeConfigBuilder =
+            serialized
+                .parse()
+                .map_err(|e: arti_client::config::BridgeParseError| {
+                    TorError::InvalidBridge(format!("{serialized:?}: {e}"))
+                })?;
+        let target = builder
+            .build()
+            .map_err(|e| TorError::InvalidBridge(format!("{serialized:?}: {e}")))?;
+        self.inner
+            .note_external_guard_failure(&target, activity)
+            .map_err(|source| TorError::SignalFailure {
+                bridge: serialized,
+                source,
+            })
     }
 
     /// Construct a `TorClient` without waiting for network bootstrap.
@@ -499,5 +561,54 @@ mod tests {
             cfg.is_ok(),
             "mixed transports should work with a valid pt_binary"
         );
+    }
+
+    #[tokio::test]
+    async fn signal_bridge_failure_requires_running_client() {
+        // `create_unbootstrapped_with` is synchronous and does no I/O, so the
+        // resulting client never reaches arti's "running" state — the same
+        // property `tor_watchdog.rs`'s
+        // `heal_reports_terminate_failed_on_a_client_that_is_not_running`
+        // test relies on for `terminate_all_channels`. This exercises the
+        // BridgeLine → BridgeConfigBuilder → BridgeConfig conversion path
+        // (shared with `warm_bridge`) end to end without any network access,
+        // and confirms the "not running" failure surfaces as
+        // `TorError::SignalFailure` rather than panicking or being silently
+        // swallowed.
+        //
+        // `#[tokio::test]`, not `#[test]`: `create_unbootstrapped_with` looks
+        // up the current tokio runtime via `PreferredRuntime::current()` (see
+        // `tor_builder`), which panics outside of an async context.
+        let tor = TorTunnel::create_unbootstrapped_with(Settings::default())
+            .expect("synchronous, no-I/O construction must succeed");
+        let bridge: BridgeLine =
+            "obfs4 192.0.2.1:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA iat-mode=0"
+                .parse()
+                .unwrap();
+        let err = tor
+            .signal_bridge_failure(&bridge, tor_guardmgr::ExternalActivity::DirCache)
+            .unwrap_err();
+        assert!(
+            matches!(err, TorError::SignalFailure { .. }),
+            "expected SignalFailure, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_bridge_failure_conversion_succeeds_for_plain_bridge_without_transport() {
+        // Same "not running" contract as the obfs4 case above, but with a
+        // plain bridge line (no transport) — confirms the BridgeLine →
+        // BridgeConfigBuilder → BridgeConfig conversion path used by
+        // `signal_bridge_failure` handles both bridge shapes, same as
+        // `warm_bridge`'s conversion.
+        let tor = TorTunnel::create_unbootstrapped_with(Settings::default())
+            .expect("synchronous, no-I/O construction must succeed");
+        let bridge: BridgeLine = "192.0.2.1:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01"
+            .parse()
+            .unwrap();
+        let err = tor
+            .signal_bridge_failure(&bridge, tor_guardmgr::ExternalActivity::DirCache)
+            .unwrap_err();
+        assert!(matches!(err, TorError::SignalFailure { .. }));
     }
 }

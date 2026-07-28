@@ -15,7 +15,7 @@ use crate::config::{Config, Loaded, UpstreamConfig};
 use crate::socks5::{self, Reply};
 use crate::startup::{init_tracing, install_crypto_provider};
 use crate::tor_setup::build_tor_settings;
-use crate::tor_watchdog::{spawn_tor_watchdog, TorHandle};
+use crate::tor_watchdog::{spawn_bridge_failover_watchdog, spawn_tor_watchdog, TorHandle};
 use crate::{shutdown, upstream};
 
 /// Maximum concurrent SOCKS5 connections. Each may run an Argon2id verify
@@ -163,6 +163,14 @@ pub(crate) async fn run_server(
             // keep failing against TCP-reachable bridges (the half-open
             // channel scenario). Detached; disabled by config when unwanted.
             spawn_tor_watchdog(handle.clone(), config_path.clone(), cfg.watchdog);
+
+            // Soft-failover watchdog: nudges arti's guard manager away from
+            // a specific bridge whose own circuit-layer health has degraded
+            // past a threshold, when a meaningfully healthier configured
+            // alternative exists. Shares the `[watchdog]` config section and
+            // check cadence with the stale-channel watchdog above; disabled
+            // by the same `enabled`/`check_interval_secs` switches.
+            spawn_bridge_failover_watchdog(handle.clone(), config_path.clone(), cfg.watchdog);
 
             // Bridge-channel warm-pool: keeps channels to the healthiest
             // candidate bridges open in the background, so a future

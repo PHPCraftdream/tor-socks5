@@ -91,6 +91,29 @@ pub struct WatchdogConfig {
     /// (5 min): if a rebuild did not help (a real network block, not a
     /// stale channel), this prevents a rebuild storm.
     pub rebuild_cooldown_secs: u64,
+    /// **Soft-failover degradation threshold.** A configured bridge whose
+    /// `circuit_fails` (per `bridge_store.rs`'s already-existing circuit-
+    /// layer observation, itself rate-limited by
+    /// `bridges.circuit_observation_window_mins`) reaches this many
+    /// consecutive failures is considered "degraded enough to consider
+    /// switching away from". Default `3` — deliberately lower than
+    /// `bridges.max_circuit_fails`'s default of `5` (which prunes the
+    /// bridge outright): failing over is a much cheaper, fully reversible
+    /// action than pruning, so it can fire on a smaller sample. See
+    /// `tor_watchdog.rs`'s `should_signal_failover`.
+    pub failover_min_circuit_fails: u32,
+    /// **Soft-failover health margin.** A healthier alternative must have
+    /// at least this many *fewer* `circuit_fails` than the degraded bridge
+    /// before the watchdog signals arti's guard manager away from it —
+    /// prevents flapping between two bridges whose health is roughly tied.
+    /// Default `2`.
+    pub failover_min_margin: u32,
+    /// Minimum seconds between two soft-failover signals for the **same**
+    /// bridge — rate-limits `TorTunnel::signal_bridge_failure` the same
+    /// way `rebuild_cooldown_secs` rate-limits channel termination, so a
+    /// bridge hovering right at the threshold does not get signalled every
+    /// watchdog tick. Default `600` (10 min).
+    pub failover_signal_cooldown_secs: u64,
 }
 
 impl Default for WatchdogConfig {
@@ -100,6 +123,9 @@ impl Default for WatchdogConfig {
             check_interval_secs: 45,
             stale_after_secs: 180,
             rebuild_cooldown_secs: 300,
+            failover_min_circuit_fails: 3,
+            failover_min_margin: 2,
+            failover_signal_cooldown_secs: 600,
         }
     }
 }

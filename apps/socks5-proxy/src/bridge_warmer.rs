@@ -89,7 +89,12 @@ pub(crate) fn select_top_n(candidates: &[(BridgeLine, Health)], n: usize) -> Vec
 /// treated as maximally healthy (all-zero counters) rather than excluded —
 /// mirrors `BridgeStore`'s own `map_or(0, ..)` convention for unknown
 /// bridges.
-fn candidates_with_health(
+///
+/// `pub(crate)` so the soft-failover watchdog (`tor_watchdog.rs`) can reuse
+/// the exact same candidate-gathering logic this module's own warming loop
+/// uses, rather than re-reading `BridgeStore` a second, subtly different
+/// way.
+pub(crate) fn candidates_with_health(
     cfg: &Config,
     config_path: Option<&std::path::Path>,
 ) -> Vec<(BridgeLine, Health)> {
