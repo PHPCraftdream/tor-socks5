@@ -911,6 +911,23 @@ fn unix_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Once;
+
+    /// Install rustls's process-wide `CryptoProvider` exactly once for this
+    /// test binary, mirroring `install_crypto_provider()` in
+    /// `apps/socks5-proxy/src/startup.rs` (which real app startup always
+    /// runs before constructing any `TorTunnel`). A genuinely fresh, empty
+    /// `state_dir` (see the tempdir-based tests below) reaches further into
+    /// arti's directory-manager setup than a dir with pre-existing state
+    /// would, and that path expects a crypto provider to already be
+    /// installed. `install_default()` errors if called twice in the same
+    /// process, so the error is intentionally discarded.
+    fn ensure_crypto_provider() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+    }
 
     #[test]
     fn health_starts_unstamped_and_counts_attempts() {
@@ -1000,7 +1017,23 @@ mod tests {
         // `target: None`), the call would hang/fail and the test would
         // never reach the assertion below within the runtime's default
         // behavior, since nothing here awaits a bootstrap.
-        let tor = arti_wrapper::TorTunnel::create_unbootstrapped_with(Default::default())
+        //
+        // `state_dir` must point at a fresh tempdir, not `Default::default()`'s
+        // `None` (which falls back to arti's shared per-user OS-default
+        // state/cache location): constructing even an "unbootstrapped"
+        // client eagerly opens that directory's storage, which is flaky on
+        // CI (`DirMgrSetup(ReadOnlyStorage(NoDatabase))` on a fresh runner
+        // with no prior arti state, or a real `SqliteError` when concurrent
+        // tests in this same binary race on the same shared path) — this is
+        // exactly the fragility `packages/arti-wrapper/src/lib.rs`'s
+        // `signal_bridge_failure_*` tests hit and fixed the same way.
+        let dir = tempfile::tempdir().unwrap();
+        let settings = arti_wrapper::Settings {
+            state_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        ensure_crypto_provider();
+        let tor = arti_wrapper::TorTunnel::create_unbootstrapped_with(settings)
             .expect("synchronous, no-I/O construction must succeed");
         assert!(
             verify_usable(&tor, None).await,
@@ -1019,7 +1052,16 @@ mod tests {
         // treating it as `StillUnhealthy` — the two mean different things to
         // the watchdog loop's logging (dead channel manager vs. a live one
         // that just isn't reconnecting).
-        let tor = arti_wrapper::TorTunnel::create_unbootstrapped_with(Default::default())
+        //
+        // Same tempdir `state_dir` rationale as the test above — do not
+        // revert to `Default::default()`.
+        let dir = tempfile::tempdir().unwrap();
+        let settings = arti_wrapper::Settings {
+            state_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        ensure_crypto_provider();
+        let tor = arti_wrapper::TorTunnel::create_unbootstrapped_with(settings)
             .expect("synchronous, no-I/O construction must succeed");
         match heal(&tor, None).await {
             HealResult::TerminateFailed(_) => {}
