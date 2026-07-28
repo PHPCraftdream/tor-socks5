@@ -436,6 +436,25 @@ fn build_config(settings: &Settings) -> Result<TorClientConfig> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::Once;
+
+    /// Install rustls's process-wide `CryptoProvider` exactly once for this
+    /// test binary, mirroring `install_crypto_provider()` in
+    /// `apps/socks5-proxy/src/startup.rs` (which real app startup always
+    /// runs before constructing any `TorTunnel`). Only needed by tests that
+    /// build a real `TorClientConfig` with a *fresh* (empty) state/cache dir:
+    /// with no cached consensus to read, `TorClientConfig::builder().build()`
+    /// reaches further into arti's directory-manager setup than a dir with
+    /// pre-existing state would, and that path expects a crypto provider to
+    /// already be installed. `install_default()` errors if called twice in
+    /// the same process (e.g. across multiple `#[tokio::test]`s here), so
+    /// the error is intentionally discarded.
+    fn ensure_crypto_provider() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+    }
 
     #[test]
     fn settings_default_is_default() {
@@ -579,7 +598,23 @@ mod tests {
         // `#[tokio::test]`, not `#[test]`: `create_unbootstrapped_with` looks
         // up the current tokio runtime via `PreferredRuntime::current()` (see
         // `tor_builder`), which panics outside of an async context.
-        let tor = TorTunnel::create_unbootstrapped_with(Settings::default())
+        //
+        // `state_dir` must point at a fresh tempdir rather than
+        // `Settings::default()`'s `None`: with `None`, arti falls back to
+        // its per-user OS-default state/cache location, and constructing
+        // even an "unbootstrapped" client eagerly opens that directory's
+        // storage — which fails with `DirMgrSetup(ReadOnlyStorage(NoDatabase))`
+        // on a fresh CI runner with no pre-existing arti state (the same
+        // real-shared-OS-path fragility `tor_setup.rs` already avoids for
+        // the live proxy, and that `verify_usable_skips_network_when_no_target`
+        // hit for the same reason in an earlier session).
+        ensure_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            state_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let tor = TorTunnel::create_unbootstrapped_with(settings)
             .expect("synchronous, no-I/O construction must succeed");
         let bridge: BridgeLine =
             "obfs4 192.0.2.1:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA iat-mode=0"
@@ -600,8 +635,15 @@ mod tests {
         // plain bridge line (no transport) — confirms the BridgeLine →
         // BridgeConfigBuilder → BridgeConfig conversion path used by
         // `signal_bridge_failure` handles both bridge shapes, same as
-        // `warm_bridge`'s conversion.
-        let tor = TorTunnel::create_unbootstrapped_with(Settings::default())
+        // `warm_bridge`'s conversion. Same tempdir `state_dir` rationale as
+        // the obfs4 case above — do not revert to `Settings::default()`.
+        ensure_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            state_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let tor = TorTunnel::create_unbootstrapped_with(settings)
             .expect("synchronous, no-I/O construction must succeed");
         let bridge: BridgeLine = "192.0.2.1:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01"
             .parse()

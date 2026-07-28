@@ -259,6 +259,7 @@ dependencies = [
  "anyhow",
  "arti-client",
  "ptrs-gesher-bridge-line",
+ "rustls",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
