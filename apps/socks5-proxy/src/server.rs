@@ -469,7 +469,7 @@ fn spawn_bridge_maintenance(
                 crate::tor_setup::BRIDGE_PROBE_TIMEOUT,
             )
             .await;
-            let _ = crate::tor_setup::update_health_and_prune(
+            let store = crate::tor_setup::update_health_and_prune(
                 config_path.as_deref(),
                 &parsed,
                 &alive,
@@ -497,14 +497,41 @@ fn spawn_bridge_maintenance(
                 }
             }
 
+            // A bridge counts toward the healthy working set only if it is
+            // reachable at BOTH layers: TCP-alive (already filtered by
+            // `alive`) AND not saturated with circuit-layer failures. TCP
+            // probes stay green while the obfs4/circuit layer is degraded
+            // (e.g. DPI interference on the transport handshake), so
+            // counting only TCP-alive bridges here would mask a total
+            // outage and never trigger a pool top-up.
+            let circuit_healthy = match &store {
+                Some(s) => alive
+                    .iter()
+                    .filter(|(b, _)| s.circuit_fails(b) < cfg.bridges.max_circuit_fails)
+                    .count(),
+                // No store → no circuit signal; fall back to the TCP-only
+                // behaviour so a missing store never blocks a top-up the
+                // TCP layer alone would have requested.
+                None => alive.len(),
+            };
+
+            info!(
+                tcp_alive = alive.len(),
+                circuit_healthy,
+                min = cfg.bridges.min_alive,
+                "maintenance: bridge health snapshot"
+            );
+
             // Top up the working list from the pool when we are short on
-            // healthy bridges (lazy probe, no fetch — the refresh above
-            // already filled the pool).
-            let deficit = cfg.bridges.min_alive.saturating_sub(alive.len());
+            // genuinely healthy bridges (lazy probe, no fetch — the refresh
+            // above already filled the pool).
+            let deficit = compute_deficit(cfg.bridges.min_alive, alive.len(), circuit_healthy);
             if deficit > 0 {
                 info!(
-                    alive = alive.len(),
+                    tcp_alive = alive.len(),
+                    circuit_healthy,
                     min = cfg.bridges.min_alive,
+                    want = deficit,
                     "maintenance: short on healthy bridges — draining candidate pool"
                 );
                 match crate::fetch_merge::drain_pool(config_path.as_deref(), deficit).await {
@@ -515,6 +542,24 @@ fn spawn_bridge_maintenance(
             }
         }
     });
+}
+
+/// How many working bridges we are short of, accounting for *both* layers
+/// of bridge health: TCP reachability and circuit-layer usability.
+///
+/// `tcp_alive` is the count of bridges that answered a TCP probe;
+/// `circuit_healthy` is the subset of those whose accumulated circuit-
+/// layer failures are still below the pruning threshold. Only a bridge
+/// healthy at *both* layers can actually carry traffic, so the deficit is
+/// driven by the smaller (circuit-aware) count. Used by
+/// [`spawn_bridge_maintenance`] to decide whether to promote fresh
+/// candidates from the pool into the working set.
+fn compute_deficit(min_alive: usize, tcp_alive: usize, circuit_healthy: usize) -> usize {
+    // `circuit_healthy` is by construction a subset of `tcp_alive`, but
+    // take the min defensively: a caller passing independent counts must
+    // never over-report healthy bridges.
+    let effective_healthy = tcp_alive.min(circuit_healthy);
+    min_alive.saturating_sub(effective_healthy)
 }
 
 #[cfg(test)]
@@ -691,5 +736,49 @@ mod tests {
             permits.try_acquire_owned().is_ok(),
             "releasing a permit must free a slot"
         );
+    }
+
+    #[test]
+    fn compute_deficit_zero_when_both_layers_healthy() {
+        // 31 TCP-alive, all circuit-healthy, min 8 → no deficit.
+        assert_eq!(compute_deficit(8, 31, 31), 0);
+    }
+
+    #[test]
+    fn compute_deficit_triggers_on_circuit_degradation_with_full_tcp() {
+        // Reproduces the production incident: every bridge TCP-alive but
+        // most saturated with circuit-layer failures — deficit must follow
+        // the circuit-healthy count, not the TCP count.
+        assert_eq!(compute_deficit(8, 31, 2), 6);
+    }
+
+    #[test]
+    fn compute_deficit_uses_lower_count_when_both_layers_low() {
+        // TCP itself is scarce; circuit-healthy is the binding constraint.
+        assert_eq!(compute_deficit(8, 3, 2), 6);
+    }
+
+    #[test]
+    fn compute_deficit_boundary_exactly_at_min() {
+        // circuit_healthy == min_alive → exactly enough, no deficit.
+        assert_eq!(compute_deficit(8, 31, 8), 0);
+    }
+
+    #[test]
+    fn compute_deficit_boundary_one_below_min() {
+        // circuit_healthy one short of min_alive → deficit of exactly 1.
+        assert_eq!(compute_deficit(8, 31, 7), 1);
+    }
+
+    #[test]
+    fn compute_deficit_zero_circuit_healthy_is_full_deficit() {
+        // Every bridge circuit-degraded → full deficit regardless of TCP.
+        assert_eq!(compute_deficit(8, 31, 0), 8);
+    }
+
+    #[test]
+    fn compute_deficit_saturates_at_zero_when_overhealthy() {
+        // More healthy than required → never goes negative.
+        assert_eq!(compute_deficit(8, 40, 40), 0);
     }
 }

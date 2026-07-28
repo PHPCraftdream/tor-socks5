@@ -85,6 +85,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The candidate-pool top-up trigger was blind to circuit-layer
+  degradation. `spawn_bridge_maintenance` (`server.rs`) computed the
+  healthy-bridge deficit purely from `alive.len()` — the count of bridges
+  that answered a TCP reachability probe — ignoring the circuit-layer
+  health `bridge_store.rs` already tracks (`circuit_fails`). When all 31
+  configured bridges simultaneously degraded at the obfs4-transport
+  handshake (mass `ConnectionReset`/`Invalid payload length` in
+  `lyrebird`, consistent with DPI interference on the transport layer
+  rather than port-level blocking), every TCP probe still succeeded
+  (`alive=31 dead=0`) for ~5 hours while zero circuits established — so
+  `deficit` stayed `0` against `min_alive: 8` and the maintenance loop
+  never promoted the fresh replacement candidates
+  `refresh_candidate_pool` had already discovered and cached. The deficit
+  now counts only bridges healthy at *both* layers: TCP-alive *and*
+  `circuit_fails < max_circuit_fails` (the same threshold already used
+  for circuit-layer pruning), via a pure `compute_deficit(min_alive,
+  tcp_alive, circuit_healthy)` helper covered by unit tests — reproducing
+  the incident (31 TCP-alive, 2 circuit-healthy → deficit 6). Each tick
+  now also logs both counters (`tcp_alive=N circuit_healthy=M min=K`) so
+  a TCP-green/circuit-dead split is visible in logs without guessing.
 - The stale-channel watchdog's rebuild had no timeout: on a fully-blocked
   network the fresh bootstrap could hang indefinitely while the old
   (also-failing) `TorClient` stayed alive, resulting in two concurrent
