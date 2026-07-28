@@ -4,6 +4,7 @@ members = [
     "packages/*",
     "apps/*",
     "vendor/saturating-time",
+    "vendor/arti-client",
 ]
 
 # bridge-fetcher is in packages/* via glob
@@ -23,6 +24,8 @@ rust-version = "1.89"
 arti-client = { version = "0.43", default-features = false, features = ["tokio", "rustls", "onion-service-client", "static-sqlite", "bridge-client", "pt-client", "experimental-api"] }
 tor-rtcompat = { version = "0.43", default-features = false, features = ["tokio", "rustls"] }
 tor-error = "0.43"
+tor-chanmgr = { version = "0.43", default-features = false, features = ["pt-client"] }
+tor-guardmgr = { version = "0.43", default-features = false, features = ["bridge-client", "pt-client"] }
 
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 

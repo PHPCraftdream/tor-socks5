@@ -420,17 +420,25 @@ impl BridgeStore {
 
     /// Circuit-layer consecutive failure count for a bridge (0 if unknown).
     /// Surfaced by arti's tracing events; used to prune bridges that pass
-    /// TCP probes but can't carry multi-hop traffic.
-    ///
-    /// Exposed for diagnostics and the upcoming circuit-aware pruning flow
-    /// (config knob `max_circuit_fails`, see issue #115); allow(dead_code)
-    /// keeps clippy quiet while only tests exercise it.
+    /// TCP probes but can't carry multi-hop traffic. Also used by the
+    /// bridge-warmer (`bridge_warmer.rs`) to rank candidates for channel
+    /// warming — a bridge accumulating circuit failures is deprioritized
+    /// even if its TCP probes still succeed.
     #[must_use]
-    #[allow(dead_code)]
     pub fn circuit_fails(&self, bridge: &BridgeLine) -> u32 {
         self.entries
             .get(&key_of(bridge))
             .map_or(0, |e| e.circuit_fails)
+    }
+
+    /// Consecutive TCP-probe failure count for a bridge (0 if unknown, which
+    /// also covers "never probed"). `0` means the last probe round saw this
+    /// bridge as reachable — the same condition [`Self::alive_count`] counts
+    /// bridges by. Used by the bridge-warmer to exclude TCP-unreachable
+    /// bridges from the warming pool.
+    #[must_use]
+    pub fn tcp_fails(&self, bridge: &BridgeLine) -> u32 {
+        self.entries.get(&key_of(bridge)).map_or(0, |e| e.fails)
     }
 
     /// Failure count for a bridge (0 if unknown). Test/diagnostic helper.
@@ -619,6 +627,18 @@ mod tests {
         s.record(bridge(OBFS4_A), Duration::from_millis(100));
         s.record(bridge(OBFS4_A_NEW_PARAMS), Duration::from_millis(50));
         assert_eq!(s.len(), 1, "same key upserts");
+    }
+
+    #[test]
+    fn tcp_fails_mirrors_fails_of_and_defaults_to_zero() {
+        let mut s = empty();
+        let b = bridge(OBFS4_A);
+        assert_eq!(s.tcp_fails(&b), 0, "unknown bridge reports 0");
+        let t0 = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        s.note_failure_at(&b, t0, HOUR);
+        assert_eq!(s.tcp_fails(&b), 1);
+        s.record_at(b.clone(), Duration::from_millis(5), t0 + HOUR);
+        assert_eq!(s.tcp_fails(&b), 0, "a TCP success resets it");
     }
 
     #[test]

@@ -37,3 +37,10 @@ upstream.enabled: false
 upstream.address: 127.0.0.1:9050
 upstream.username:
 upstream.password:
+
+## Background bridge-channel warm-pool (opt-in). Keeps channels to the
+## healthiest candidate bridges open ahead of time; does not change which
+## bridge carries traffic (that is a separate, not-yet-built feature).
+warm_pool.enabled: false
+warm_pool.pool_size: 3
+warm_pool.refresh_interval_secs: 60

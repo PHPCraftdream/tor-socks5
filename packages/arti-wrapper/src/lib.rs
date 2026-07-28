@@ -39,6 +39,13 @@ pub enum TorError {
 
     #[error("could not access Tor client's channel manager: {0}")]
     ChanMgrUnavailable(#[source] arti_client::Error),
+
+    #[error("failed to warm a channel to bridge {bridge}: {source}")]
+    Warm {
+        bridge: String,
+        #[source]
+        source: Box<tor_chanmgr::Error>,
+    },
 }
 
 pub type Result<T, E = TorError> = std::result::Result<T, E>;
@@ -139,6 +146,51 @@ impl TorTunnel {
     pub fn terminate_all_channels(&self) -> Result<()> {
         let chanmgr = self.inner.chanmgr().map_err(TorError::ChanMgrUnavailable)?;
         chanmgr.terminate_all_channels();
+        Ok(())
+    }
+
+    /// Open (or reuse) a channel to `bridge`, without building a circuit or
+    /// carrying any traffic over it yet.
+    ///
+    /// This is the primitive behind the background bridge-warming pool
+    /// (`bridge_warmer.rs` in `apps/socks5-proxy`): calling
+    /// `ChanMgr::get_or_launch` for a bridge populates `tor-chanmgr`'s own
+    /// identity-keyed channel cache (see `vendor/tor-chanmgr/src/mgr/
+    /// state.rs`), so when arti's guard manager later wants to build a
+    /// circuit through the same bridge it transparently reuses the
+    /// already-open (and already-warm) channel instead of paying for a
+    /// fresh obfs4/webtunnel handshake on the hot path. The routing to a
+    /// bridge's pluggable transport (if any) happens automatically inside
+    /// `ChanMgr` (`vendor/tor-chanmgr/src/factory.rs`'s `CompoundFactory`)
+    /// — callers do not need to special-case PT bridges.
+    ///
+    /// `usage: ChannelUsage::UserTraffic` is deliberate — it matches what a
+    /// real circuit build for user traffic would request, so the resulting
+    /// channel is not treated as disposable by any usage-based bookkeeping
+    /// `ChanMgr` may apply.
+    ///
+    /// Requires `TorClient::chanmgr()` (the `experimental-api` feature,
+    /// already enabled workspace-wide), same as
+    /// [`terminate_all_channels`](Self::terminate_all_channels).
+    pub async fn warm_bridge(&self, bridge: &BridgeLine) -> Result<()> {
+        let chanmgr = self.inner.chanmgr().map_err(TorError::ChanMgrUnavailable)?;
+        let serialized = bridge.to_string();
+        let builder: BridgeConfigBuilder =
+            serialized
+                .parse()
+                .map_err(|e: arti_client::config::BridgeParseError| {
+                    TorError::InvalidBridge(format!("{serialized:?}: {e}"))
+                })?;
+        let target = builder
+            .build()
+            .map_err(|e| TorError::InvalidBridge(format!("{serialized:?}: {e}")))?;
+        chanmgr
+            .get_or_launch(&target, tor_chanmgr::ChannelUsage::UserTraffic)
+            .await
+            .map_err(|source| TorError::Warm {
+                bridge: serialized,
+                source: Box::new(source),
+            })?;
         Ok(())
     }
 

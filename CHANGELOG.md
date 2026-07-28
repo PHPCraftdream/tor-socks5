@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Bridge channel warm-pool** (opt-in, prep work for background egress
+  switch-over): a new background task (`bridge_warmer.rs`) periodically
+  opens (or reuses) Tor channels to the healthiest `pool_size` candidate
+  bridges via `ChanMgr::get_or_launch`, ahead of any circuit actually
+  needing them. `tor-chanmgr` keys its channel cache by relay identity, so
+  a bridge warmed this way is transparently reused by arti's own guard
+  manager instead of paying for a fresh obfs4/webtunnel handshake on the
+  hot path — pluggable-transport routing for warmed bridges is handled
+  automatically inside `ChanMgr`, with no special-casing needed here.
+  Candidates are ranked using the health signals `bridge_store.rs` already
+  tracks (TCP-unreachable bridges excluded outright, then lowest
+  `circuit_fails` first, ties broken by highest `ok_count`). This task
+  only warms channels — it does not change which bridge carries traffic;
+  switch-over is a separate, not-yet-built feature. Configurable via a new
+  `[warm_pool]` config section (`enabled`, default `false`; `pool_size`,
+  default `3`; `refresh_interval_secs`, default `60`) — disabled by
+  default, so existing deployments are unaffected until explicitly opted
+  in.
 - **Stale-channel watchdog**: `arti-client` 0.43 has no hook on network-
   change events and `TorClient::reconfigure()` does not reset already-open
   channels, so a Tor client left running across a Wi-Fi/network switch can

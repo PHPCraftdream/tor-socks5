@@ -164,6 +164,16 @@ pub(crate) async fn run_server(
             // channel scenario). Detached; disabled by config when unwanted.
             spawn_tor_watchdog(handle.clone(), config_path.clone(), cfg.watchdog);
 
+            // Bridge-channel warm-pool: keeps channels to the healthiest
+            // candidate bridges open in the background, so a future
+            // switch-over (not built here) does not pay for a cold
+            // obfs4/webtunnel handshake. Opt-in; disabled by default.
+            crate::bridge_warmer::spawn_bridge_warmer(
+                handle.clone(),
+                config_path.clone(),
+                cfg.warm_pool,
+            );
+
             Egress::Tor(handle)
         }
     };

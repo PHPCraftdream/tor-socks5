@@ -30,6 +30,8 @@ pub struct Config {
     pub bridges: BridgesConfig,
     /// Stale-channel watchdog configuration.
     pub watchdog: WatchdogConfig,
+    /// Background bridge-channel warming pool configuration.
+    pub warm_pool: WarmPoolConfig,
     /// Optional upstream SOCKS5 proxy used as the egress instead of Tor.
     pub upstream: UpstreamConfig,
 }
@@ -98,6 +100,41 @@ impl Default for WatchdogConfig {
             check_interval_secs: 45,
             stale_after_secs: 180,
             rebuild_cooldown_secs: 300,
+        }
+    }
+}
+
+/// Background bridge-channel warming pool: periodically opens (or reuses)
+/// channels to the top-N healthiest candidate bridges, ahead of any circuit
+/// actually needing them. See `bridge_warmer.rs`.
+///
+/// This is prep work only — it does not switch egress between bridges (that
+/// is a separate, not-yet-built feature). Warming a channel just seeds
+/// `tor-chanmgr`'s own identity-keyed channel cache (see
+/// `vendor/tor-chanmgr/src/mgr/state.rs`) so that if arti's guard manager
+/// later builds a circuit through the same bridge, it reuses the
+/// already-open channel instead of paying for a fresh handshake on the hot
+/// path.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WarmPoolConfig {
+    /// Master switch. Default `false` — opt-in: this feature changes
+    /// nothing about which bridge carries traffic, but it does open extra
+    /// background channels, so it stays off until explicitly enabled.
+    pub enabled: bool,
+    /// How many of the healthiest candidate bridges to keep warm. Default
+    /// `3`.
+    pub pool_size: usize,
+    /// Seconds between warming passes. Default `60`.
+    pub refresh_interval_secs: u64,
+}
+
+impl Default for WarmPoolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            pool_size: 3,
+            refresh_interval_secs: 60,
         }
     }
 }
@@ -299,6 +336,7 @@ impl Default for Config {
             log: LogConfig::default(),
             bridges: BridgesConfig::default(),
             watchdog: WatchdogConfig::default(),
+            warm_pool: WarmPoolConfig::default(),
             upstream: UpstreamConfig::default(),
         }
     }
@@ -716,5 +754,52 @@ upstream.password: s3cret
             deserialized.bridges.sources[0].label,
             cfg.bridges.sources[0].label
         );
+    }
+
+    // -- warm_pool config --------------------------------------------------
+
+    #[test]
+    fn warm_pool_defaults_to_disabled_with_sensible_knobs() {
+        let cfg = Config::default();
+        assert!(!cfg.warm_pool.enabled);
+        assert_eq!(cfg.warm_pool.pool_size, 3);
+        assert_eq!(cfg.warm_pool.refresh_interval_secs, 60);
+    }
+
+    #[test]
+    fn parses_warm_pool_section() {
+        let src = r#"
+listen: 127.0.0.1:1080
+
+warm_pool.enabled: true
+warm_pool.pool_size: 5
+warm_pool.refresh_interval_secs: 30
+"#;
+        let cfg: Config = ktav::from_str(src).expect("ktav parses");
+        assert!(cfg.warm_pool.enabled);
+        assert_eq!(cfg.warm_pool.pool_size, 5);
+        assert_eq!(cfg.warm_pool.refresh_interval_secs, 30);
+    }
+
+    #[test]
+    fn warm_pool_falls_back_to_defaults_when_absent() {
+        let src = "listen: 127.0.0.1:1080\n";
+        let cfg: Config = ktav::from_str(src).expect("ktav parses without warm_pool");
+        assert!(!cfg.warm_pool.enabled);
+        assert_eq!(cfg.warm_pool.pool_size, 3);
+        assert_eq!(cfg.warm_pool.refresh_interval_secs, 60);
+    }
+
+    #[test]
+    fn warm_pool_roundtrip_preserves_fields() {
+        let mut cfg = Config::default();
+        cfg.warm_pool.enabled = true;
+        cfg.warm_pool.pool_size = 7;
+        cfg.warm_pool.refresh_interval_secs = 120;
+        let serialized = ktav::to_string(&cfg).expect("serialize");
+        let deserialized: Config = ktav::from_str(&serialized).expect("deserialize");
+        assert!(deserialized.warm_pool.enabled);
+        assert_eq!(deserialized.warm_pool.pool_size, 7);
+        assert_eq!(deserialized.warm_pool.refresh_interval_secs, 120);
     }
 }
