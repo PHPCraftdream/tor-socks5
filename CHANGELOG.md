@@ -504,6 +504,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requesting more candidates here cannot exceed that budget — it only stops
   starving it. Additive: one conditional inside `descriptors_to_request`, no
   signature change.
+- The accept loop's `warn!("connection finished with error")` log
+  (`server.rs`) logged the failure from `handle_client` via anyhow's plain
+  `Display` (`error = %e`), which prints only the outermost context tag —
+  e.g. literally `"SOCKS5 handshake"` — and silently drops the actual root
+  cause (a client-side TCP reset, EOF, an invalid SOCKS5 byte, etc.) that
+  is present deeper in the error's cause chain but never rendered. This
+  made the 240+/10min error bursts investigated in this session hard to
+  triage further, since the one line meant to explain *why* a connection
+  failed carried no more information than the fixed classification label
+  already did. Fixed by switching that field to anyhow's alternate
+  `Display` (`format!("{:#}", e)`), which renders the full "top: cause1:
+  cause2: ..." chain instead of just the top frame. Log-only change: no
+  signature or classification logic touched, `classify_conn_error` is
+  unaffected.
 
 ### Known limitations
 

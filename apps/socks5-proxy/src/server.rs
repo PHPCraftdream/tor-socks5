@@ -294,7 +294,11 @@ async fn accept_loop(
             if let Err(e) = handle_client(client, egress, auth, conn_health.clone()).await {
                 let kind = classify_conn_error(&e);
                 conn_health.record_error(kind);
-                warn!(%peer, error = %e, kind = ?kind, "connection finished with error");
+                // `{:#}` (anyhow's alternate Display) prints the full cause
+                // chain ("top: cause1: cause2: ..."); plain `%e` would only
+                // print the outermost context tag (e.g. "SOCKS5 handshake")
+                // and silently swallow the real root cause.
+                warn!(%peer, error = format!("{:#}", e), kind = ?kind, "connection finished with error");
             }
             drop(permit);
         });
