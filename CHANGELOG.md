@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Periodic connection-health summary log** (`conn_health.rs`): a new
+  background task drains a rolling window of accept-loop counters — new
+  connections, successful `tor connection established` events, and errors
+  by `ConnErrorKind` (client/Tor/other, via the existing `classify_conn_error`)
+  — into a single structured `info!("conn health")` line once per configured
+  interval, then resets the counters to zero for the next window (so the
+  rate reflects the last window, not a lifetime total that would flatten out
+  degradation over a long-running process). The line carries `attempted`,
+  `established`, `client_errors`, `tor_errors`, `other_errors`, and a derived
+  `success_rate_pct` (integer 0-100); a window with zero attempts is skipped
+  entirely rather than logging a placeholder rate. Counters are plain
+  `AtomicU64`s behind an `Arc` — no lock needed, since the accept loop only
+  ever increments and the summary task only ever reads-and-resets via
+  `swap`. Configurable via a new `[conn_health]` section (`enabled`, default
+  `true` — pure observation, safe by default unlike `warm_pool`;
+  `interval_secs`, default `60`).
 - **Structural classification of connection errors** (client vs Tor vs
   other) in the accept loop's failure log (`server.rs`): a new
   `classify_conn_error` walks an `anyhow::Error`'s cause chain by *type*

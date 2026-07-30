@@ -32,6 +32,8 @@ pub struct Config {
     pub watchdog: WatchdogConfig,
     /// Background bridge-channel warming pool configuration.
     pub warm_pool: WarmPoolConfig,
+    /// Periodic connection-health summary logging configuration.
+    pub conn_health: ConnHealthConfig,
     /// Optional upstream SOCKS5 proxy used as the egress instead of Tor.
     pub upstream: UpstreamConfig,
 }
@@ -161,6 +163,33 @@ impl Default for WarmPoolConfig {
             enabled: false,
             pool_size: 3,
             refresh_interval_secs: 60,
+        }
+    }
+}
+
+/// Periodic connection-health summary: once per `interval_secs`, drains a
+/// rolling window of accept-loop counters (new connections, successful Tor
+/// establishments, and errors by [`crate::server::ConnErrorKind`]) into one
+/// structured `info!("conn health")` line and resets them for the next
+/// window. See `conn_health.rs`.
+///
+/// Unlike [`WarmPoolConfig`], this is pure observation — it reads counters
+/// already bumped on the hot path and never touches the network or the Tor
+/// client, so it is safe to enable by default.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConnHealthConfig {
+    /// Master switch. Default `true` — pure observation, safe by default.
+    pub enabled: bool,
+    /// Seconds between summary logs. Default `60`.
+    pub interval_secs: u64,
+}
+
+impl Default for ConnHealthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: 60,
         }
     }
 }
@@ -363,6 +392,7 @@ impl Default for Config {
             bridges: BridgesConfig::default(),
             watchdog: WatchdogConfig::default(),
             warm_pool: WarmPoolConfig::default(),
+            conn_health: ConnHealthConfig::default(),
             upstream: UpstreamConfig::default(),
         }
     }
@@ -827,5 +857,46 @@ warm_pool.refresh_interval_secs: 30
         assert!(deserialized.warm_pool.enabled);
         assert_eq!(deserialized.warm_pool.pool_size, 7);
         assert_eq!(deserialized.warm_pool.refresh_interval_secs, 120);
+    }
+
+    // -- conn_health config -------------------------------------------------
+
+    #[test]
+    fn conn_health_defaults_to_enabled_with_sensible_interval() {
+        let cfg = Config::default();
+        assert!(cfg.conn_health.enabled);
+        assert_eq!(cfg.conn_health.interval_secs, 60);
+    }
+
+    #[test]
+    fn parses_conn_health_section() {
+        let src = r#"
+listen: 127.0.0.1:1080
+
+conn_health.enabled: false
+conn_health.interval_secs: 120
+"#;
+        let cfg: Config = ktav::from_str(src).expect("ktav parses");
+        assert!(!cfg.conn_health.enabled);
+        assert_eq!(cfg.conn_health.interval_secs, 120);
+    }
+
+    #[test]
+    fn conn_health_falls_back_to_defaults_when_absent() {
+        let src = "listen: 127.0.0.1:1080\n";
+        let cfg: Config = ktav::from_str(src).expect("ktav parses without conn_health");
+        assert!(cfg.conn_health.enabled);
+        assert_eq!(cfg.conn_health.interval_secs, 60);
+    }
+
+    #[test]
+    fn conn_health_roundtrip_preserves_fields() {
+        let mut cfg = Config::default();
+        cfg.conn_health.enabled = false;
+        cfg.conn_health.interval_secs = 90;
+        let serialized = ktav::to_string(&cfg).expect("serialize");
+        let deserialized: Config = ktav::from_str(&serialized).expect("deserialize");
+        assert!(!deserialized.conn_health.enabled);
+        assert_eq!(deserialized.conn_health.interval_secs, 90);
     }
 }

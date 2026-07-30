@@ -12,6 +12,7 @@ use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, Loaded, UpstreamConfig};
+use crate::conn_health::{spawn_conn_health_logger, ConnHealthCounters};
 use crate::socks5::{self, Reply};
 use crate::startup::{init_tracing, install_crypto_provider};
 use crate::tor_setup::build_tor_settings;
@@ -186,6 +187,14 @@ pub(crate) async fn run_server(
         }
     };
 
+    // Periodic connection-health summary: drains a rolling window of
+    // accept-loop counters (attempts, established, errors by kind) into one
+    // structured log line per interval. Pure observation — wired for both
+    // the Tor and upstream egress paths alike. Enabled by default (unlike
+    // `warm_pool`), since it changes nothing about live traffic.
+    let conn_health = ConnHealthCounters::default();
+    spawn_conn_health_logger(conn_health.clone(), cfg.conn_health);
+
     let listener = TcpListener::bind(&cfg.listen)
         .await
         .with_context(|| format!("failed to bind {}", cfg.listen))?;
@@ -194,7 +203,7 @@ pub(crate) async fn run_server(
     tokio::select! {
         biased;
         () = shutdown => {}
-        _ = accept_loop(listener, egress.clone(), auth_state.clone(), Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS))) => {
+        _ = accept_loop(listener, egress.clone(), auth_state.clone(), Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS)), conn_health.clone()) => {
             // The accept loop is unbounded: this branch means the listener
             // died (probably an OS error we already logged).
             warn!("accept loop exited unexpectedly");
@@ -261,6 +270,7 @@ async fn accept_loop(
     egress: Egress,
     auth: Option<Arc<AuthState>>,
     permits: Arc<tokio::sync::Semaphore>,
+    conn_health: ConnHealthCounters,
 ) {
     loop {
         let (client, peer) = match listener.accept().await {
@@ -272,6 +282,7 @@ async fn accept_loop(
         };
         let egress = egress.clone();
         let auth = auth.clone();
+        let conn_health = conn_health.clone();
         let permit = permits
             .clone()
             .acquire_owned()
@@ -279,8 +290,10 @@ async fn accept_loop(
             .expect("semaphore not closed");
         tokio::spawn(async move {
             debug!(%peer, "new connection");
-            if let Err(e) = handle_client(client, egress, auth).await {
+            conn_health.record_attempt();
+            if let Err(e) = handle_client(client, egress, auth, conn_health.clone()).await {
                 let kind = classify_conn_error(&e);
+                conn_health.record_error(kind);
                 warn!(%peer, error = %e, kind = ?kind, "connection finished with error");
             }
             drop(permit);
@@ -361,6 +374,7 @@ async fn handle_client(
     mut client: TcpStream,
     egress: Egress,
     auth: Option<Arc<AuthState>>,
+    conn_health: ConnHealthCounters,
 ) -> Result<()> {
     let req = socks5::handshake(&mut client, auth.clone())
         .await
@@ -404,6 +418,7 @@ async fn handle_client(
                 Ok(s) => {
                     handle.health().record_success();
                     handle.health().record_success_target(&req.host, req.port);
+                    conn_health.record_established();
                     info!(host = ?req.host, port = req.port, "tor connection established");
                     s
                 }

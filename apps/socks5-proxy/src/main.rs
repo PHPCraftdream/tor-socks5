@@ -5,6 +5,7 @@ mod bridges_cmd;
 mod candidate_pool;
 mod cli;
 mod config;
+mod conn_health;
 mod daemon;
 mod fetch_merge;
 mod help_cmd;
