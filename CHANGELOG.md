@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Structural classification of connection errors** (client vs Tor vs
+  other) in the accept loop's failure log (`server.rs`): a new
+  `classify_conn_error` walks an `anyhow::Error`'s cause chain by *type*
+  (`.downcast_ref::<arti_wrapper::TorError>()`, `.downcast_ref::<std::io::
+  Error>()`) rather than string-matching the rendered message, and tags
+  the existing `warn!("connection finished with error")` log line with a
+  structured `kind` field (`Tor`, `Client`, or `Other`) so operators can
+  reliably filter "the client dropped the SOCKS5 handshake" (routine —
+  clients like Telegram churn through many parallel connections) from
+  "Tor actually failed to build a circuit" (an `arti_wrapper::TorError::
+  Connect` anywhere in the chain) without guessing from free-text grep.
+  Complements the existing `classify_and_record` in `tor_watchdog.rs`,
+  which already does typed classification for the watchdog's own health
+  counters but only runs where the error is already known to be a
+  `TorError` — this new classifier handles the general `anyhow::Error`
+  the accept loop actually logs, which may be either kind.
 - **Bridge channel warm-pool** (opt-in, prep work for background egress
   switch-over): a new background task (`bridge_warmer.rs`) periodically
   opens (or reuses) Tor channels to the healthiest `pool_size` candidate

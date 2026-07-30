@@ -280,11 +280,81 @@ async fn accept_loop(
         tokio::spawn(async move {
             debug!(%peer, "new connection");
             if let Err(e) = handle_client(client, egress, auth).await {
-                warn!(%peer, error = %e, "connection finished with error");
+                let kind = classify_conn_error(&e);
+                warn!(%peer, error = %e, kind = ?kind, "connection finished with error");
             }
             drop(permit);
         });
     }
+}
+
+/// Coarse classification of a [`handle_client`] failure, so operators can
+/// tell "the client misbehaved" from "Tor is having a bad time" from
+/// "something else" without grepping the error text — see [`ConnErrorKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnErrorKind {
+    /// The client side of the SOCKS5 session misbehaved or disconnected —
+    /// e.g. it dropped the TCP connection mid-handshake. Not a proxy or Tor
+    /// problem; normal for clients that churn through many parallel
+    /// connections (Telegram and similar).
+    Client,
+    /// A Tor-side failure building a circuit/stream — an
+    /// `arti_wrapper::TorError::Connect` anywhere in the error's cause
+    /// chain. Finer-grained classification (which `tor_error::ErrorKind`)
+    /// already happens in [`crate::tor_watchdog::classify_and_record`]; this
+    /// variant only answers "is this Tor's problem at all".
+    Tor,
+    /// Anything else: I/O errors unrelated to the SOCKS5 handshake, bugs,
+    /// or failures that don't fit either bucket above.
+    Other,
+}
+
+/// Classify a [`handle_client`] failure by the *type* of its root cause,
+/// never by string-matching the rendered error message (message text is
+/// not a stable classification key — see the module-level rationale for
+/// why this exists).
+///
+/// Order of checks:
+/// 1. Any `arti_wrapper::TorError::Connect` in the chain → [`ConnErrorKind::Tor`].
+///    Checked first because a Tor connect failure is unambiguous and takes
+///    priority over any incidental I/O wrapping.
+/// 2. A `std::io::Error` in the chain whose kind indicates the client
+///    dropped/reset the connection (`ConnectionReset`, `ConnectionAborted`,
+///    `BrokenPipe`, `UnexpectedEof`), *or* any error in the chain carrying
+///    the `"SOCKS5 handshake"` context tag `handle_client` attaches to the
+///    handshake step → [`ConnErrorKind::Client`].
+/// 3. Otherwise → [`ConnErrorKind::Other`].
+pub(crate) fn classify_conn_error(err: &anyhow::Error) -> ConnErrorKind {
+    for cause in err.chain() {
+        if let Some(tor_err) = cause.downcast_ref::<arti_wrapper::TorError>() {
+            if matches!(tor_err, arti_wrapper::TorError::Connect { .. }) {
+                return ConnErrorKind::Tor;
+            }
+        }
+    }
+
+    for cause in err.chain() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io_err.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            ) {
+                return ConnErrorKind::Client;
+            }
+        }
+    }
+
+    if err
+        .chain()
+        .any(|cause| cause.to_string() == "SOCKS5 handshake")
+    {
+        return ConnErrorKind::Client;
+    }
+
+    ConnErrorKind::Other
 }
 
 async fn handle_client(
@@ -780,5 +850,103 @@ mod tests {
     fn compute_deficit_saturates_at_zero_when_overhealthy() {
         // More healthy than required → never goes negative.
         assert_eq!(compute_deficit(8, 40, 40), 0);
+    }
+
+    // -- classify_conn_error --------------------------------------------------
+
+    /// Install rustls's process-wide `CryptoProvider` exactly once for this
+    /// test binary — mirrors the same helper in `tor_watchdog.rs` /
+    /// `arti-wrapper`'s own tests. Needed because
+    /// `real_tor_connect_error_downcasts_as_tor` below builds a real,
+    /// unbootstrapped `TorTunnel` against a fresh tempdir state dir, which
+    /// reaches far enough into arti's directory-manager setup to expect a
+    /// crypto provider already installed. `install_default()` errors if
+    /// called twice in the same process, so the error is intentionally
+    /// discarded.
+    fn ensure_crypto_provider() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+    }
+
+    /// A real `arti_wrapper::TorError::Connect` wrapping a real
+    /// `arti_client::Error`, without any network activity: an unbootstrapped
+    /// `TorTunnel`'s `connect()` parses its target address (`IntoTorAddr`)
+    /// before ever touching the bootstrap state, and an invalid hostname
+    /// (embedded space — not a valid IP, `.onion`, or DNS hostname) fails
+    /// that parse synchronously, surfacing as `arti_client::Error`
+    /// (`TorAddrError::InvalidHostname` via its public `From` impl) wrapped
+    /// in `TorError::Connect` by `TorTunnel::connect`. This is a genuine
+    /// instance of the error type this classifier cares about, not a mock.
+    async fn real_tor_connect_error() -> arti_wrapper::TorError {
+        ensure_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let settings = arti_wrapper::Settings {
+            state_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let tor = arti_wrapper::TorTunnel::create_unbootstrapped_with(settings)
+            .expect("synchronous, no-I/O construction must succeed");
+        tor.connect("not a valid host", 443)
+            .await
+            .expect_err("an invalid hostname must fail address parsing before any network I/O")
+    }
+
+    #[tokio::test]
+    async fn classify_conn_error_tor_connect_is_tor() {
+        let tor_err = real_tor_connect_error().await;
+        assert!(matches!(tor_err, arti_wrapper::TorError::Connect { .. }));
+        let err = anyhow::Error::new(tor_err);
+        assert_eq!(classify_conn_error(&err), ConnErrorKind::Tor);
+    }
+
+    #[tokio::test]
+    async fn classify_conn_error_tor_connect_wrapped_in_context_is_still_tor() {
+        // A `.context(...)` call anywhere above the real cause must not
+        // shadow the underlying Tor error — `classify_conn_error` walks the
+        // whole chain, not just the top frame.
+        let tor_err = real_tor_connect_error().await;
+        let err = anyhow::Error::new(tor_err).context("tunneling through Tor");
+        assert_eq!(classify_conn_error(&err), ConnErrorKind::Tor);
+    }
+
+    #[test]
+    fn classify_conn_error_io_reset_during_handshake_is_client() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "peer reset");
+        let err = anyhow::Error::new(io_err).context("SOCKS5 handshake");
+        assert_eq!(classify_conn_error(&err), ConnErrorKind::Client);
+    }
+
+    #[test]
+    fn classify_conn_error_unexpected_eof_during_handshake_is_client() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof");
+        let err = anyhow::Error::new(io_err).context("SOCKS5 handshake");
+        assert_eq!(classify_conn_error(&err), ConnErrorKind::Client);
+    }
+
+    #[test]
+    fn classify_conn_error_broken_pipe_without_handshake_context_is_still_client() {
+        // The io::ErrorKind alone is enough — the "SOCKS5 handshake" context
+        // string is a secondary signal, not required.
+        let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe closed");
+        let err = anyhow::Error::new(io_err);
+        assert_eq!(classify_conn_error(&err), ConnErrorKind::Client);
+    }
+
+    #[test]
+    fn classify_conn_error_other_io_kind_is_other() {
+        // An I/O error whose kind is unrelated to a client disconnect (and
+        // with no "SOCKS5 handshake" context) must not be misclassified as
+        // Client.
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let err = anyhow::Error::new(io_err);
+        assert_eq!(classify_conn_error(&err), ConnErrorKind::Other);
+    }
+
+    #[test]
+    fn classify_conn_error_arbitrary_other_is_other() {
+        let err = anyhow::anyhow!("some unrelated failure");
+        assert_eq!(classify_conn_error(&err), ConnErrorKind::Other);
     }
 }
