@@ -210,6 +210,38 @@ starving it. One-line conditional inside `descriptors_to_request`, no
 signature change; unit test added mirroring
 `any_guard_usable_for_traffic_aggregation`.
 
+Fourth fix — a descriptor-less bridge guard hard-erroring an entire circuit
+attempt instead of being retried. `select_guard_once()` picks a guard from
+the sample, then (for `UniverseType::BridgeSet`) tries to attach circuit-
+target info from the latest bridge set; if the picked guard's `BridgeDesc`
+hasn't been fetched yet (an ordinary, expected-to-happen-sometimes race —
+descriptor fetch is async, independent of guard sampling) and the usage is
+`GuardUsageKind::Data`, it returned `PickGuardError::Internal` — a variant
+whose `retry_time()` is `RetryTime::Never`, so `tor-circmgr`'s outer retry
+loop (confirmed by reading its `mgr.rs`: `Internal`'s `AbsRetryTime::Never`
+triggers an immediate `break`) aborted the *entire* circuit-build request
+after this single guard pick, rather than trying a different guard or
+waiting the ~100ms a descriptor fetch typically takes. Observed live in
+production as `Tried to return a non-circtarget guard with Data usage!`
+warnings bursting to ~17/hour (historical baseline ~2/day) and contributing
+to real circuit-build timeouts. Two-part fix: (1) `select_guard_with_expand`
+now retries `select_guard_once` unconditionally after
+`update_guardset_internal()` refreshes each guard's `dir_info_missing` /
+`conforms_to_usage`, instead of only when the sample was actually *extended*
+(`ExtendedStatus::Yes`) — the old gate discarded the freshly-recomputed
+"this guard isn't suitable yet" state even when it correctly filters the
+descriptor-less guard out in favor of the next preferred candidate; (2) the
+residual failure (no valid candidate at all) now returns
+`PickGuardError::AllGuardsDown` instead of `Internal`, which *is* retriable
+(`RetryTime::AfterWaiting`), so the outer loop gets another chance instead of
+aborting outright. `GuardUsable` (in `pending.rs`) gained `#[derive(Debug)]`,
+needed only to satisfy the new regression test's assertion formatting — no
+functional change. New test `bridge_descriptorless_guard_is_retriable_not_internal`
+injects the exact stale state (a sampled bridge with `dir_info_missing`
+artificially cleared while its descriptor is genuinely absent) and asserts
+`AllGuardsDown`, not `Internal`. `tor-circmgr` itself is not vendored and was
+not touched — the whole fix lives inside this already-patched crate.
+
 ### `arti-client` (0.43.0)
 `BootstrapStatus::ready_for_traffic()` used to report "ready" once directory
 bootstrap completed, without regard to whether any guard actually had usable

@@ -540,6 +540,14 @@ impl GuardSet {
             .collect();
     }
 
+    /// tor-socks5 local patch: test-only accessor returning the number of
+    /// guards currently in the sample, used by regression tests to confirm a
+    /// guard was actually sampled before asserting on error variants.
+    #[cfg(test)]
+    pub(crate) fn n_sampled_for_test(&self) -> usize {
+        self.guards.len()
+    }
+
     /// Re-build the list of primary guards.
     ///
     /// Primary guards are chosen according to preference order over all

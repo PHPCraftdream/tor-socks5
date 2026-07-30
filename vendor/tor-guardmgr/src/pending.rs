@@ -42,6 +42,7 @@ use tor_basic_utils::skip_fmt;
 /// ignored because of a restriction, then we might use a guard that we
 /// otherwise wouldn't.
 #[pin_project]
+#[derive(Debug)]
 pub struct GuardUsable {
     /// If present, then this is a future to wait on to see whether the
     /// guard is usable.

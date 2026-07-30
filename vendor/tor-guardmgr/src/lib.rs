@@ -63,6 +63,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, Weak};
 #[cfg(feature = "bridge-client")]
+use tor_basic_utils::iter::FilterCount;
 use tor_error::internal;
 use tor_linkspec::{OwnedChanTarget, OwnedCircTarget, RelayId, RelayIdSet};
 use tor_netdir::NetDirProvider;
@@ -1554,19 +1555,23 @@ impl GuardMgrInner {
             // need to call update() or update_active_set_and_filter(). This
             // call is sufficient to  extend the sample and recompute primary
             // guards.
-            let extended = Self::update_guardset_internal(
+            let _extended = Self::update_guardset_internal(
                 &this.params,
                 wallclock,
                 this.guards.active_set.universe_type(),
                 this.guards.active_guards_mut(),
                 Some(univ),
             );
-            if extended == ExtendedStatus::Yes {
-                match this.select_guard_once(usage, now) {
-                    Ok(res) => return Some(res),
-                    Err(e) => {
-                        trace!("Couldn't select guard after update: {}", e);
-                    }
+            // Retry unconditionally: update_guardset_internal recomputes each
+            // guard's dir_info_missing / conforms_to_usage via
+            // update_from_universe, which can flip a descriptor-less bridge
+            // to "unsuitable for Data" even when the sample size is unchanged
+            // (ExtendedStatus::No). Gating the retry on sample growth (the
+            // old `== Yes` check) discarded that freshly-computed state.
+            match this.select_guard_once(usage, now) {
+                Ok(res) => return Some(res),
+                Err(e) => {
+                    trace!("Couldn't select guard after update: {}", e);
                 }
             }
             None
@@ -1611,9 +1616,22 @@ impl GuardMgrInner {
             first_hop.lookup_bridge_circ_target(&bridges);
 
             if usage.kind == GuardUsageKind::Data && !first_hop.contains_circ_target() {
-                return Err(PickGuardError::Internal(internal!(
-                    "Tried to return a non-circtarget guard with Data usage!"
-                )));
+                // tor-socks5 local patch: a missing bridge descriptor is a
+                // transient, recoverable condition (the descriptor is fetched
+                // asynchronously by BridgeDescProvider), not a programming
+                // bug. Return AllGuardsDown so HasRetryTime yields
+                // RetryTime::AfterWaiting and the caller retries instead of
+                // aborting the whole request after one attempt. The precise
+                // per-reason rejection counts are computed inside
+                // pick_guard_id and aren't available here, so report zeroed
+                // FilterCounts — the retry_at: None semantics are what matter.
+                return Err(PickGuardError::AllGuardsDown {
+                    retry_at: None,
+                    running: FilterCount::default(),
+                    pending: FilterCount::default(),
+                    suitable: FilterCount::default(),
+                    filtered: FilterCount::default(),
+                });
             }
         }
         Ok((list_kind, first_hop))
@@ -2230,6 +2248,71 @@ mod test {
             // Now that the guard is working as a cache, asking for it should get us the same guard.
             let (g4, _mon, _usable) = guardmgr.select_guard(dir_usage).unwrap();
             assert_eq!(g4.ed_identity(), guard.ed_identity());
+        });
+    }
+
+    #[cfg(feature = "bridge-client")]
+    #[test]
+    fn bridge_descriptorless_guard_is_retriable_not_internal() {
+        // Regression test for the vendor patch: when a bridge guard is picked
+        // for Data usage but has no descriptor (circ-target), the error must be
+        // AllGuardsDown (→ RetryTime::AfterWaiting) not Internal (→
+        // RetryTime::Never). Additionally, select_guard_with_expand must retry
+        // unconditionally after update_guardset_internal recomputes the guard's
+        // dir_info_missing, not only when the sample grew (ExtendedStatus::Yes).
+        test_with_all_runtimes!(|rt| async move {
+            let statemgr = TestingStateMgr::new();
+            let have_lock = statemgr.try_lock().unwrap();
+            assert!(have_lock.held());
+
+            // A single configured bridge with NO descriptor fetched yet.
+            // A direct (non-PT) bridge line so pt-client isn't required.
+            let bridge: crate::bridge::BridgeConfig =
+                "38.229.33.83:80 0BAC39417268B96B9F514E7F63FA6FBA1A788955"
+                    .parse()
+                    .unwrap();
+            let config = TestConfig {
+                bridges: vec![bridge],
+                ..TestConfig::default()
+            };
+
+            let guardmgr = GuardMgr::new(rt, statemgr, &config).unwrap();
+
+            // The bridge must have been sampled during GuardMgr::new.
+            {
+                let inner = guardmgr.inner.lock().expect("Poisoned lock");
+                assert!(
+                    inner.guards.bridges.n_sampled_for_test() > 0,
+                    "bridge was not sampled; test setup needs fixing"
+                );
+            }
+
+            // Inject the production stale state that triggers the bug: a guard
+            // whose cached dir_info_missing is false (so pick_guard selects it)
+            // while the live descriptor is absent (so lookup_bridge_circ_target
+            // finds no circ-target). Without this injection, the freshly-
+            // sampled descriptor-less bridge is already filtered out by
+            // pick_guard (dir_info_missing=true from update_from_universe).
+            {
+                let mut inner = guardmgr.inner.lock().expect("Poisoned lock");
+                inner
+                    .guards
+                    .bridges
+                    .set_all_guards_dir_info_missing_for_test(false);
+            }
+
+            // GuardUsage::default() is GuardUsageKind::Data.
+            let res = guardmgr.select_guard(GuardUsage::default());
+
+            // Pre-fix: PickGuardError::Internal → RetryTime::Never (abort).
+            // Post-fix: PickGuardError::AllGuardsDown → RetryTime::AfterWaiting.
+            assert!(
+                matches!(res, Err(PickGuardError::AllGuardsDown { .. })),
+                "expected AllGuardsDown (retriable), got {:?}",
+                res
+            );
+
+            drop(have_lock);
         });
     }
 

@@ -85,6 +85,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A descriptor-less bridge guard aborted an entire circuit-build attempt
+  instead of being retried. `tor-guardmgr`'s `select_guard_once()` returned
+  `PickGuardError::Internal` (`RetryTime::Never`) whenever the guard it
+  picked had a bridge config entry but no fetched descriptor yet — an
+  ordinary, expected-to-happen-sometimes race (descriptor fetch is async,
+  independent of guard sampling), not a true internal invariant violation.
+  Because `Internal` isn't retriable, `tor-circmgr`'s outer retry loop
+  aborted the whole request after this single guard pick rather than trying
+  a different guard or waiting out the fetch. Observed live in production:
+  `Tried to return a non-circtarget guard with Data usage!` warnings
+  bursting to ~17/hour (historical baseline ~2/day), contributing to real
+  circuit-build timeouts. Fixed in two parts: `select_guard_with_expand` now
+  retries `select_guard_once` unconditionally after the guard sample's
+  `dir_info_missing`/`conforms_to_usage` state is refreshed (previously
+  gated on the sample having grown, which discarded the freshly-recomputed
+  "this guard isn't ready" state even when it correctly ruled the
+  descriptor-less guard out); the residual failure now maps to the already-
+  retriable `PickGuardError::AllGuardsDown` instead of `Internal`. New
+  regression test `bridge_descriptorless_guard_is_retriable_not_internal`
+  reproduces the exact stale state and asserts the new (retriable) error
+  variant. `tor-circmgr` is not vendored and was not touched.
 - The candidate-pool top-up trigger was blind to circuit-layer
   degradation. `spawn_bridge_maintenance` (`server.rs`) computed the
   healthy-bridge deficit purely from `alive.len()` — the count of bridges
