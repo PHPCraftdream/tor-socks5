@@ -10,7 +10,7 @@
 use std::net::SocketAddr;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::callback::JavaCallback;
@@ -293,6 +293,7 @@ async fn engine_async(
 
     // Set status to On
     set_final_status(EngineStatus::On(actual_addr));
+    set_current_tunnel(Some(tunnel.clone()));
 
     // Create semaphore for concurrency limiting
     let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
@@ -317,7 +318,11 @@ async fn engine_async(
         }
     };
 
-    // Teardown: drop tunnel, then sleep 500ms to release state-dir lock
+    // Teardown: drop tunnel, then sleep 500ms to release state-dir lock.
+    // Clearing the shared handle *before* dropping the local one matters: a
+    // clone left behind in CURRENT_TUNNEL would keep the tunnel alive and
+    // could let a concurrent nativeRefreshBridges call reach it mid-teardown.
+    set_current_tunnel(None);
     info!("shutting down Tor client");
     drop(tunnel);
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -434,6 +439,34 @@ async fn handle_connection(
 fn set_final_status(status: EngineStatus) {
     use crate::get_status;
     *get_status().lock().unwrap_or_else(|p| p.into_inner()) = status;
+}
+
+/// The running engine's `TorTunnel`, shared with `nativeRefreshBridges`
+/// (`lib.rs`) so it can fetch fresh bridge lists over the already-live
+/// circuit -- `bridge_fetcher::fetch_all` requires an established
+/// `TorTunnel` and has no direct (non-Tor) fetch path, so this can only
+/// ever do anything while the engine is `On`. `None` whenever the engine
+/// isn't in that state (not started yet, still bootstrapping, or tearing
+/// down -- see the `set_current_tunnel(None)` call just before teardown in
+/// `engine_async`).
+static CURRENT_TUNNEL: OnceLock<Mutex<Option<TorTunnel>>> = OnceLock::new();
+
+fn set_current_tunnel(tunnel: Option<TorTunnel>) {
+    *CURRENT_TUNNEL
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = tunnel;
+}
+
+/// Cheap `TorTunnel` clone (see [`TorTunnel::clone`]'s use in `accept_loop`)
+/// of the currently running engine's tunnel, or `None` if the engine isn't
+/// `On` right now.
+pub(crate) fn get_current_tunnel() -> Option<TorTunnel> {
+    CURRENT_TUNNEL
+        .get()?
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
 }
 
 #[cfg(test)]

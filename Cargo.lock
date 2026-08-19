@@ -93,6 +93,7 @@ dependencies = [
  "anyhow",
  "arti-wrapper",
  "auth",
+ "bridge-fetcher",
  "bridge-probe",
  "jni 0.21.1",
  "libc",

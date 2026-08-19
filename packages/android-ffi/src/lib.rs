@@ -558,6 +558,139 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
     }
 }
 
+/// JNI entry point: `nativeRefreshBridges(String configPath)`
+///
+/// Fetches fresh bridge lines from `configPath`'s `bridges.sources` over the
+/// **currently running** engine's live `TorTunnel` (see
+/// [`engine::get_current_tunnel`]) and returns them newline-joined, one
+/// `BridgeLine` per line, ready to append to `bridges.lines` on the Kotlin
+/// side. Returns an empty string (not an error) if no sources are configured
+/// or none of them yielded anything usable.
+///
+/// This is a one-shot refresh, not a background/keep-alive task: it must be
+/// called again by Kotlin whenever a fresh list is wanted. It intentionally
+/// does *not* touch the running engine's own bridge set or config file --
+/// `bridge_fetcher::fetch_all` has no path that doesn't require an
+/// already-live Tor circuit, so this can only ever help populate bridges for
+/// the *next* start (or a future retry), never the current bootstrap.
+///
+/// - **Threading:** Blocks the calling thread for up to the fetch timeout
+///   (30s) -- call off the Android main thread.
+/// - **Error Signaling:** Throws `java.lang.IllegalStateException` if the
+///   engine isn't currently `On` (no live tunnel to fetch through), or
+///   `java.lang.RuntimeException` if `configPath` can't be read/parsed.
+#[no_mangle]
+pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativeRefreshBridges(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+) -> jstring {
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        let config_path_str: String = env
+            .get_string(&config_path)
+            .inspect_err(|_| {
+                env.throw_new(
+                    "java/lang/IllegalArgumentException",
+                    "configPath is null or invalid",
+                )
+                .ok();
+            })?
+            .into();
+
+        let Some(tunnel) = engine::get_current_tunnel() else {
+            let _ = env.throw_new(
+                "java/lang/IllegalStateException",
+                "engine is not running; bridges can only be refreshed over a live Tor circuit",
+            );
+            return Err(anyhow::anyhow!("engine not running"));
+        };
+
+        let loaded = Config::load_with_override(Some(std::path::Path::new(&config_path_str)))
+            .with_context(|| format!("loading config from {}", config_path_str))
+            .map_err(|e| {
+                let msg = format!("{:#}", e);
+                let _ = env.throw_new("java/lang/RuntimeException", &msg);
+                e
+            })?;
+        let cfg = match &loaded {
+            Loaded::FromFile { config, .. } => config,
+            Loaded::Defaults(config) => config,
+        };
+
+        let sources: Vec<bridge_fetcher::Source> = cfg
+            .bridges
+            .sources
+            .iter()
+            .map(|s| bridge_fetcher::Source {
+                label: s.label.clone(),
+                url: s.url.clone(),
+                headers: s.headers.clone(),
+                cookies: s.cookies.clone(),
+            })
+            .collect();
+
+        if sources.is_empty() {
+            return env.new_string("").map(|s| s.into_raw()).map_err(|e| {
+                error!("failed to create Java string for empty bridge refresh: {e}");
+                anyhow::anyhow!(e)
+            });
+        }
+
+        let max_body_bytes = cfg.bridges.max_body_mib.saturating_mul(1024 * 1024);
+
+        // A fresh, minimal runtime for this one-shot blocking call -- the
+        // engine's own multi-worker runtime lives on the engine thread's
+        // stack and isn't reachable from here (this JNI call runs on
+        // whatever thread Kotlin invoked it from).
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                let msg = format!("failed to create refresh runtime: {e}");
+                let _ = env.throw_new("java/lang/RuntimeException", &msg);
+                anyhow::anyhow!(msg)
+            })?;
+
+        let (fetched, outcomes) = rt.block_on(bridge_fetcher::fetch_all(
+            &tunnel,
+            &sources,
+            Duration::from_secs(30),
+            max_body_bytes,
+        ));
+
+        for outcome in &outcomes {
+            if let Some(err) = &outcome.error {
+                tracing::warn!(label = %outcome.label, error = %err, "bridge source failed");
+            } else {
+                info!(
+                    label = %outcome.label,
+                    bridges = outcome.bridges_extracted,
+                    "bridge source OK"
+                );
+            }
+        }
+
+        let (unique, duplicates) = bridge_fetcher::dedup_bridges(fetched);
+        info!(unique = unique.len(), duplicates, "bridge refresh complete");
+
+        let joined = unique
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        env.new_string(joined).map(|s| s.into_raw()).map_err(|e| {
+            error!("failed to create Java string for refreshed bridges: {e}");
+            anyhow::anyhow!(e)
+        })
+    }));
+
+    match result {
+        Ok(Ok(jstr)) => jstr,
+        Ok(Err(_)) | Err(_) => std::ptr::null_mut(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
