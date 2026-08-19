@@ -279,6 +279,17 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
             }
         };
 
+        // 3a. One-time process init. Must run before any `tracing::info!`/
+        // `warn!`/`error!` call below (step 7a's auth-decision logging in
+        // particular): with no global `tracing` subscriber installed yet,
+        // `tracing` macros are silent no-ops (nothing buffered, nothing
+        // deferred — the event is simply dropped at the callsite), so on
+        // the very first `nativeStart` in a process, logging anything
+        // before this point would vanish even though the code "runs
+        // unconditionally and synchronously".
+        ensure_crypto_provider();
+        ensure_tracing_subscriber(cfg);
+
         // 4. Parse bridges
         let parsed_bridges = cfg
             .bridges
@@ -401,18 +412,14 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
         // 10. Create Arc<JavaCallback>
         let java_callback = callback::JavaCallback::new(vm, global).into_arc();
 
-        // 11. One-time process init
-        ensure_crypto_provider();
-        ensure_tracing_subscriber(cfg);
-
-        // 12. Create channels for engine thread communication
+        // 11. Create channels for engine thread communication
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
 
-        // 13. Set status to Starting
+        // 12. Set status to Starting
         set_status(EngineStatus::Starting(0));
 
-        // 14. Spawn engine thread
+        // 13. Spawn engine thread
         let thread = match std::thread::Builder::new()
             .name("torsocks5-engine".into())
             .spawn(move || {
@@ -438,7 +445,7 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
             }
         };
 
-        // 15. Store handle
+        // 14. Store handle
         *engine_guard = Some(EngineHandle {
             stop_tx,
             done_rx,
