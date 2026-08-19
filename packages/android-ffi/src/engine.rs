@@ -12,10 +12,10 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::callback::JavaCallback;
 use anyhow::{Context, Result};
 use arti_wrapper::{BootstrapEvent, BootstrapEventCallback, TorTunnel};
 use auth::AuthState;
-use crate::callback::JavaCallback;
 use socks5_proto::{self, Reply};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -103,9 +103,7 @@ pub(crate) fn engine_main(
         Ok(guard) => guard,
         Err(e) => {
             error!(error = %e, "failed to attach engine thread to JVM");
-            set_final_status(EngineStatus::Error(format!(
-                "failed to attach to JVM: {e}"
-            )));
+            set_final_status(EngineStatus::Error(format!("failed to attach to JVM: {e}")));
             let _ = done_tx.send(());
             return;
         }
@@ -195,11 +193,8 @@ async fn engine_async(
         count = settings.bridges.len(),
         "probing bridges for reachability"
     );
-    let alive = bridge_probe::probe_and_sort(
-        settings.bridges.clone(),
-        Duration::from_secs(5),
-    )
-    .await;
+    let alive =
+        bridge_probe::probe_and_sort(settings.bridges.clone(), Duration::from_secs(5)).await;
 
     if alive.is_empty() {
         return Err(anyhow::anyhow!(
@@ -315,7 +310,10 @@ async fn accept_loop(
                 Err(e) => {
                     // Classify and log at appropriate level
                     let error_str = format!("{:#}", e);
-                    if error_str.contains("handshake") || error_str.contains("reset") || error_str.contains("broken pipe") {
+                    if error_str.contains("handshake")
+                        || error_str.contains("reset")
+                        || error_str.contains("broken pipe")
+                    {
                         debug!(%peer, error = %error_str, "connection error (client-side)");
                     } else {
                         warn!(%peer, error = %error_str, "connection error");
@@ -498,7 +496,10 @@ mod auth_wiring_tests {
         })
         .await;
 
-        assert!(result.is_err(), "handshake must fail when only NO_AUTH is offered");
+        assert!(
+            result.is_err(),
+            "handshake must fail when only NO_AUTH is offered"
+        );
     }
 
     #[tokio::test]
@@ -517,7 +518,10 @@ mod auth_wiring_tests {
                     .unwrap();
                 let mut auth_reply = [0u8; 2];
                 client.read_exact(&mut auth_reply).await.unwrap();
-                assert_eq!(auth_reply[1], 0x00, "server must accept correct credentials");
+                assert_eq!(
+                    auth_reply[1], 0x00,
+                    "server must accept correct credentials"
+                );
 
                 // CONNECT to 1.2.3.4:80 so the handshake can complete and
                 // return a `ConnectRequest` (handle_connection would now

@@ -120,7 +120,9 @@ mod android {
 
     impl AndroidLogWriter {
         fn new() -> Self {
-            Self { buf: Vec::with_capacity(256) }
+            Self {
+                buf: Vec::with_capacity(256),
+            }
         }
 
         /// Send one already-newline-stripped line to `logcat`.
@@ -135,8 +137,12 @@ mod android {
                 return;
             }
             let sanitized: Vec<u8> = line.iter().copied().filter(|&b| b != 0).collect();
-            let Ok(text) = CString::new(sanitized) else { return };
-            let Ok(tag) = CString::new(LOG_TAG) else { return };
+            let Ok(text) = CString::new(sanitized) else {
+                return;
+            };
+            let Ok(tag) = CString::new(LOG_TAG) else {
+                return;
+            };
             // SAFETY: `text` and `tag` are valid, NUL-terminated C strings
             // owned by this function for the duration of the call;
             // `__android_log_write` does not retain either pointer past

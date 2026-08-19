@@ -160,9 +160,9 @@ use engine::{EngineHandle, EngineStatus};
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::jstring;
 use jni::JNIEnv;
+use proxy_config::{Config, Loaded};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use proxy_config::{Config, Loaded};
 use tracing::{error, info};
 
 /// Global engine handle. Accessed via `OnceLock::get_or_init` for lazy initialization.
@@ -231,8 +231,11 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
         let config_path_str: String = env
             .get_string(&config_path)
             .inspect_err(|_| {
-                env.throw_new("java/lang/IllegalArgumentException", "configPath is null or invalid")
-                    .ok();
+                env.throw_new(
+                    "java/lang/IllegalArgumentException",
+                    "configPath is null or invalid",
+                )
+                .ok();
             })?
             .into();
 
@@ -270,7 +273,9 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
                     "java/lang/IllegalStateException",
                     "config file not found; must load from an explicit path on Android",
                 );
-                return Err(anyhow::anyhow!("config must be loaded from file on Android"));
+                return Err(anyhow::anyhow!(
+                    "config must be loaded from file on Android"
+                ));
             }
         };
 
@@ -297,10 +302,7 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
             })?;
 
         // 6. Pre-validate PT binary requirement
-        let needs_pt = parsed_bridges
-            .bridges
-            .iter()
-            .any(|b| b.transport.is_some());
+        let needs_pt = parsed_bridges.bridges.iter().any(|b| b.transport.is_some());
         let pt_binary = if needs_pt {
             if let Some(path) = std::env::var_os("TOR_PT_BINARY") {
                 if !path.is_empty() {
@@ -427,7 +429,9 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
             Err(e) => {
                 // Roll the status back: the engine never started, so the
                 // Starting(0) set above must not linger forever.
-                set_status(EngineStatus::Error(format!("failed to spawn engine thread: {e}")));
+                set_status(EngineStatus::Error(format!(
+                    "failed to spawn engine thread: {e}"
+                )));
                 let msg = format!("failed to spawn engine thread: {e}");
                 let _ = env.throw_new("java/lang/RuntimeException", &msg);
                 return Err(anyhow::anyhow!(msg));
@@ -446,14 +450,19 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
 
     if let Err(e) = result {
         let panic_msg = if e.is::<String>() {
-            e.downcast_ref::<String>().map(|s| s.as_str()).unwrap_or("unknown panic")
+            e.downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .unwrap_or("unknown panic")
         } else if e.is::<&str>() {
             e.downcast_ref::<&str>().copied().unwrap_or("unknown panic")
         } else {
             "unknown panic"
         };
         error!("nativeStart panic: {}", panic_msg);
-        set_status(EngineStatus::Error(format!("nativeStart panicked: {}", panic_msg)));
+        set_status(EngineStatus::Error(format!(
+            "nativeStart panicked: {}",
+            panic_msg
+        )));
     }
 }
 
@@ -488,10 +497,7 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
         let _ = handle.stop_tx.send(true);
 
         // Wait for the engine thread to finish (with timeout)
-        match handle
-            .done_rx
-            .recv_timeout(Duration::from_secs(10))
-        {
+        match handle.done_rx.recv_timeout(Duration::from_secs(10)) {
             Ok(()) => {
                 // Thread exited normally
                 let _ = handle.thread.join();
@@ -535,12 +541,10 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
         };
 
         let text = status.to_string();
-        env.new_string(text)
-            .map(|s| s.into_raw())
-            .map_err(|e| {
-                error!("failed to create Java string for status: {e}");
-                e
-            })
+        env.new_string(text).map(|s| s.into_raw()).map_err(|e| {
+            error!("failed to create Java string for status: {e}");
+            e
+        })
     })) {
         Ok(Ok(jstr)) => jstr,
         Ok(Err(_)) | Err(_) => std::ptr::null_mut(),

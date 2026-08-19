@@ -123,7 +123,10 @@ pub struct TorTunnel {
 /// Map one `BootstrapStatus` to callback event(s). Returns `true` when
 /// the status is ready for traffic (the subscriber's terminal success —
 /// the forwarding task exits after emitting `Ready`).
-fn emit_bootstrap_event(status: &arti_client::status::BootstrapStatus, on_event: &BootstrapEventCallback) -> bool {
+fn emit_bootstrap_event(
+    status: &arti_client::status::BootstrapStatus,
+    on_event: &BootstrapEventCallback,
+) -> bool {
     if status.ready_for_traffic() {
         on_event(BootstrapEvent::Ready);
         true
@@ -814,13 +817,10 @@ mod tests {
             }
         });
         tor.forward_bootstrap_events(callback);
-        let event = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            rx.recv(),
-        )
-        .await
-        .expect("timeout waiting for initial event")
-        .expect("channel should not close");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timeout waiting for initial event")
+            .expect("channel should not close");
         assert!(
             matches!(event, BootstrapEvent::Progress(_)),
             "first event should be Progress, got: {:?}",

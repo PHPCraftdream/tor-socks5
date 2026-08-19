@@ -32,5 +32,7 @@ fn main() -> anyhow::Result<()> {
         return rt.block_on(lyrebird::run());
     }
 
-    anyhow::bail!("this is a pluggable-transport helper exec'd by arti, not meant to be run directly");
+    anyhow::bail!(
+        "this is a pluggable-transport helper exec'd by arti, not meant to be run directly"
+    );
 }
