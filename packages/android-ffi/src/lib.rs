@@ -146,6 +146,7 @@
 //! `engine::engine_main` → `engine_async` → `accept_loop`, cloned once per accepted connection,
 //! and handed to `socks5_proto::handshake` exactly as the CLI does in `server.rs`.
 
+mod android_log;
 mod callback;
 mod engine;
 
@@ -199,15 +200,17 @@ fn ensure_crypto_provider() {
 }
 
 /// Helper: initialize the tracing subscriber (idempotent, uses config log settings).
+///
+/// `nativeStart` may be called many times over the life of an Android
+/// process (start/stop cycles), but `tracing::subscriber::set_global_default`
+/// (which `tracing_subscriber::fmt()...try_init()` calls under the hood)
+/// panics on a second call — the `OnceLock` below ensures the subscriber
+/// is installed exactly once per process, regardless of how many times
+/// `nativeStart` runs. See [`android_log`] for where the records actually
+/// go (`logcat` on Android, `stderr` on host builds).
 fn ensure_tracing_subscriber(cfg: &Config) {
     let _ = TRACING_SUBSCRIBER_INITED.get_or_init(|| {
-        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(cfg.log.to_filter()));
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(std::io::stderr)
-            .try_init()
-            .ok(); // Ignore "already registered" error on second start
+        android_log::init(cfg);
     });
 }
 

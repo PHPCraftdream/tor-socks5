@@ -29,3 +29,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 rustls = { workspace = true }
 jni = "0.21"
+
+# Android-only: backs the logcat sink in `android_log.rs`, which declares
+# `__android_log_write` (from `liblog.so`, always present on-device)
+# using libc's C type aliases. Not linked into host builds.
+[target.'cfg(target_os = "android")'.dependencies]
+libc = "0.2"

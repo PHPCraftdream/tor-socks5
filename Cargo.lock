@@ -95,6 +95,7 @@ dependencies = [
  "auth",
  "bridge-probe",
  "jni 0.21.1",
+ "libc",
  "proxy-config",
  "rustls",
  "socks5-proto",
