@@ -1,0 +1,21 @@
+[package]
+name = "socks5-proto"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Minimal SOCKS5 server-side protocol implementation (RFC 1928 CONNECT + RFC 1929 auth), shared by the CLI app and the Android FFI crate."
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+auth = { path = "../auth" }
+tokio.workspace = true
+
+[dev-dependencies]
+futures.workspace = true

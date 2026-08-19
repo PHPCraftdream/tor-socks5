@@ -316,17 +316,50 @@ where
     // sees a clean EOF after exactly that many bytes — instead of blocking
     // until a stream-level RELAY_END that may never arrive over a slow
     // obfs4 circuit (the cause of spurious "Partial response" / DirTimeout).
+    //
+    // IMPORTANT: `AsyncReadExt::take(n)` reports EOF (`Ok(0)`) both when the
+    // *declared* length is exhausted and when the *underlying* stream hits a
+    // real EOF early. Those two are not the same thing: the second one means
+    // the server promised `clen` bytes and delivered fewer, i.e. the body is
+    // truncated. `read_and_decompress`'s `written_in_this_loop == 0 =>
+    // return Ok(())` branch cannot tell them apart from inside the loop, so
+    // we wrap the `Take` in `RemainingTracker` here and check its remaining
+    // count after the read completes: a nonzero remainder means the stream
+    // stopped short of the declared Content-Length, which must be treated as
+    // an error, not a clean success (this was previously silently accepted —
+    // see the `TruncatedBody` regression test for the "line truncated before
+    // newline" symptom this produced in tor_netdoc for a full consensus
+    // fetched over a PT bridge). `Arc<AtomicU64>` (not `Rc<Cell<_>>`) because
+    // this future must stay `Send` -- dirmgr's bootstrap runs it inside a
+    // spawned tokio task.
+    use futures::io::AsyncReadExt as _;
+    let mut remaining_counter: Option<Arc<std::sync::atomic::AtomicU64>> = None;
     let mut decoder = match header.length {
         Some(clen) => {
-            use futures::io::AsyncReadExt as _;
-            let bounded = BufReader::new(buffered.take(clen as u64));
+            let taken = buffered.take(clen as u64);
+            let tracker = RemainingTracker::new(taken);
+            remaining_counter = Some(tracker.remaining.clone());
+            let bounded = BufReader::new(tracker);
             get_decoder(bounded, header.encoding.as_deref(), anonymized).map_err(wrap_err)?
         }
         None => get_decoder(buffered, header.encoding.as_deref(), anonymized).map_err(wrap_err)?,
     };
 
     let mut result = Vec::new();
-    let ok = read_and_decompress(runtime, &mut decoder, maxlen, &mut result).await;
+    let mut ok = read_and_decompress(runtime, &mut decoder, maxlen, &mut result).await;
+
+    // If we had a declared Content-Length and the body reader stopped
+    // (cleanly, from the decoder's point of view) before consuming all of
+    // it, the underlying stream gave us fewer bytes than promised: that's a
+    // truncated body, not a complete document.
+    if ok.is_ok() {
+        if let Some(remaining) = &remaining_counter {
+            let remaining = remaining.load(std::sync::atomic::Ordering::Acquire);
+            if remaining > 0 {
+                ok = Err(RequestError::TruncatedBody(remaining));
+            }
+        }
+    }
 
     let ok = match (partial_ok, ok, result.len()) {
         (true, Err(e), n) if n > 0 => {
@@ -568,6 +601,53 @@ where
         if found_byte || n_added == max {
             return Ok(n_added);
         }
+    }
+}
+
+/// tor-socks5 local patch: wraps a [`futures::io::Take`] and mirrors its
+/// remaining-byte count into a shared, externally-readable counter.
+///
+/// `Take::limit()` is only reachable through the concrete `Take<S>` type; by
+/// the time the reader is behind `get_decoder`'s `Box<dyn AsyncRead>` there is
+/// no way to ask "did the declared `Content-Length` actually get fully
+/// consumed, or did the stream stop early?" from outside. This wrapper keeps
+/// that answer available via a cheap `Arc<AtomicU64>` snapshot updated after
+/// every read, without needing to downcast the trait object.
+///
+/// `S` must be `Unpin` (true for every stream this crate uses `Take` over):
+/// that lets this be a plain, non-pin-projected `AsyncRead` impl.
+struct RemainingTracker<S> {
+    /// The length-bounded inner reader.
+    inner: futures::io::Take<S>,
+    /// Bytes not yet consumed from `inner`'s original limit. Updated after
+    /// every successful read; read by the caller once the response is fully
+    /// processed to detect a stream that stopped before the declared
+    /// `Content-Length` was reached.
+    remaining: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl<S: AsyncRead + Unpin> RemainingTracker<S> {
+    /// Wrap `inner`, initializing the shared counter from its current limit.
+    fn new(inner: futures::io::Take<S>) -> Self {
+        let remaining = Arc::new(std::sync::atomic::AtomicU64::new(inner.limit()));
+        Self { inner, remaining }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for RemainingTracker<S> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let inner = std::pin::Pin::new(&mut this.inner);
+        let poll = inner.poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(_)) = &poll {
+            this.remaining
+                .store(this.inner.limit(), std::sync::atomic::Ordering::Release);
+        }
+        poll
     }
 }
 
@@ -913,6 +993,68 @@ mod test {
         assert!(response.is_partial());
         assert!(response.output_unchecked().len() < 37 * 2);
         assert!(response.output_unchecked().starts_with(b"One fish"));
+    }
+
+    /// Regression test for a truncation bug in the tor-socks5 local
+    /// Content-Length patch: `read_and_decompress` treats `stream.read()`
+    /// returning `Ok(0)` as "the document is complete" (see the
+    /// `written_in_this_loop == 0 => return Ok(())` branch). That is correct
+    /// when `Ok(0)` means the underlying transport hit a real EOF, but
+    /// `AsyncReadExt::take(clen)` (used to bound the body read by the
+    /// server-declared `Content-Length`) *also* returns `Ok(0)` once its
+    /// internal byte counter reaches zero -- even if the wrapped stream still
+    /// has more data buffered right behind it. If `Content-Length`
+    /// under-counts the real on-wire body (e.g. because it was corrupted, or
+    /// because a second HTTP response/keepalive byte stream follows on the
+    /// same connection), the reader silently stops early, and `send_request`
+    /// reports `Ok` with a truncated-but-plausible-looking body instead of an
+    /// error -- which is exactly the "line truncated before newline" symptom
+    /// `tor_netdoc`'s line-oriented parser hits several hundred bytes into an
+    /// otherwise-valid document.
+    ///
+    /// This test sends two complete, independently valid zlib members
+    /// back-to-back (both decode cleanly on their own), but advertises a
+    /// `Content-Length` that only covers the first member. A correct
+    /// implementation must not silently accept a doc it never asked to
+    /// truncate at the HTTP layer -- at minimum this documents the current
+    /// (buggy) behavior so a fix has a red test to turn green.
+    #[test]
+    fn test_content_length_undercount_truncates_silently() {
+        // Two complete, standalone zlib members, each decoding on its own to
+        // "One fish Two fish Red fish Blue fish".
+        let member = hex::decode(
+            "789cf3cf4b5548cb2cce500829cf8730825253200ca79c52881c00e5970c88",
+        )
+        .unwrap();
+
+        let mut response_text: Vec<u8> =
+            (*b"HTTP/1.0 200 OK\r\nContent-Encoding: deflate\r\n").into();
+        // Advertise a Content-Length that covers *only* the first member,
+        // even though a second complete member follows on the wire (as real
+        // Tor dir traffic might, e.g. via a keepalive / pipelined response,
+        // or a corrupted/undercounted header value).
+        response_text.extend(format!("Content-Length: {}\r\n\r\n", member.len()).into_bytes());
+        response_text.extend(&member);
+        response_text.extend(&member);
+
+        // Two microdescs => partial_ok, so a genuine error would still
+        // surface the partial output rather than aborting outright -- this
+        // isolates the "was it reported as an error at all" question.
+        let req: request::MicrodescRequest = vec![[9; 32]; 2].into_iter().collect();
+        let (response, request) = run_download_test(req, &response_text);
+        assert!(request.is_ok());
+
+        let response = response.unwrap();
+        assert_eq!(response.status_code(), 200);
+        // The declared Content-Length (34 bytes on the wire) is shorter than
+        // the 45 bytes actually sent; the second member was silently
+        // dropped. A correct implementation should surface this as an
+        // error/partial condition instead of a clean `Ok`.
+        assert_eq!(
+            response.output_unchecked(),
+            b"One fish Two fish Red fish Blue fish",
+            "expected exactly one decoded member's worth of output for the declared Content-Length"
+        );
     }
 
     #[test]

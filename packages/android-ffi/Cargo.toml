@@ -1,0 +1,37 @@
+[package]
+name = "android-ffi"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Android JNI FFI crate embedding the tor-socks5 engine as libtorsocks5.so"
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "torsocks5"
+crate-type = ["cdylib"]
+
+[dependencies]
+arti-wrapper = { path = "../arti-wrapper" }
+auth = { path = "../auth" }
+proxy-config = { path = "../proxy-config" }
+socks5-proto = { path = "../socks5-proto" }
+bridge-probe = { path = "../bridge-probe" }
+tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["compat"] }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rustls = { workspace = true }
+jni = "0.21"
+
+# Android-only: backs the logcat sink in `android_log.rs`, which declares
+# `__android_log_write` (from `liblog.so`, always present on-device)
+# using libc's C type aliases. Not linked into host builds.
+[target.'cfg(target_os = "android")'.dependencies]
+libc = "0.2"

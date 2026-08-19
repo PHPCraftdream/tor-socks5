@@ -18,6 +18,8 @@ auth = { path = "../../packages/auth" }
 bridge-line.workspace = true
 bridge-fetcher = { path = "../../packages/bridge-fetcher" }
 bridge-probe = { path = "../../packages/bridge-probe" }
+proxy-config = { path = "../../packages/proxy-config" }
+socks5-proto = { path = "../../packages/socks5-proto" }
 tor-error.workspace = true
 lyrebird.workspace = true
 
@@ -58,5 +60,5 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
 ] }
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(all(unix, not(target_os = "android")))'.dependencies]
 daemonize = { workspace = true }

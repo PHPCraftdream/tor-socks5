@@ -63,6 +63,30 @@ pub use tor_guardmgr::ExternalActivity;
 
 pub type Result<T, E = TorError> = std::result::Result<T, E>;
 
+/// A bootstrap-progress event, flattened from arti's `BootstrapStatus`
+/// for embedders (CLI logging, the future JNI FFI crate). Treat
+/// `Progress` values as idempotent state updates, not a counter: arti's
+/// underlying watch stream coalesces and may repeat values.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BootstrapEvent {
+    /// Rough progress estimate, `0.0..=1.0` (arti's `as_frac()`).
+    Progress(f32),
+    /// The client is ready to carry traffic (`ready_for_traffic()`).
+    Ready,
+    /// arti currently reports it cannot make forward progress
+    /// (a human-readable blockage reason). Not necessarily fatal —
+    /// bootstrap status is non-monotonic.
+    Blocked(String),
+    /// The bootstrap attempt failed (the `wait_bootstrapped` error,
+    /// with its cause chain rendered into the string).
+    Failed(String),
+}
+
+/// Callback invoked for every [`BootstrapEvent`]. Shared via `Arc` (not
+/// `Box`) so the same callback can be held by both the event-forwarding
+/// task and the code awaiting bootstrap completion.
+pub type BootstrapEventCallback = Arc<dyn Fn(BootstrapEvent) + Send + Sync>;
+
 /// Bootstrap-time settings for [`TorTunnel`].
 #[derive(Debug, Default, Clone)]
 pub struct Settings {
@@ -96,6 +120,36 @@ pub struct TorTunnel {
     inner: Arc<TorClient<PreferredRuntime>>,
 }
 
+/// Map one `BootstrapStatus` to callback event(s). Returns `true` when
+/// the status is ready for traffic (the subscriber's terminal success —
+/// the forwarding task exits after emitting `Ready`).
+fn emit_bootstrap_event(status: &arti_client::status::BootstrapStatus, on_event: &BootstrapEventCallback) -> bool {
+    if status.ready_for_traffic() {
+        on_event(BootstrapEvent::Ready);
+        true
+    } else {
+        on_event(BootstrapEvent::Progress(status.as_frac()));
+        if let Some(blockage) = status.blocked() {
+            on_event(BootstrapEvent::Blocked(blockage.to_string()));
+        }
+        false
+    }
+}
+
+/// Render an error plus its whole `source()` chain into one line
+/// ("msg: cause: cause") — thiserror's `Display` stops at the top layer,
+/// and the FFI consumer only gets the string.
+fn error_chain_string(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(err) = source {
+        text.push_str(": ");
+        text.push_str(&err.to_string());
+        source = err.source();
+    }
+    text
+}
+
 impl TorTunnel {
     /// Bootstrap a Tor client with default configuration.
     pub async fn bootstrap() -> Result<Self> {
@@ -117,6 +171,65 @@ impl TorTunnel {
             .map_err(TorError::Bootstrap)?;
         tracing::info!("Tor is ready");
         Ok(Self { inner: client })
+    }
+
+    /// Forward this client's bootstrap events to `on_event` from a background
+    /// Tokio task: the current status is emitted synchronously first (a
+    /// subscriber always sees at least one `Progress` immediately), then one
+    /// `Progress` (+ `Blocked` when arti reports a blockage) per observed
+    /// status change, and a final `Ready` once the client can carry traffic —
+    /// after which the task exits. This is a *bootstrap* channel, not an
+    /// ongoing health monitor: post-ready status changes (e.g. losing the
+    /// network later) are not delivered; use the watchdog for that.
+    ///
+    /// Never fails bootstrap and never blocks. The spawned task deliberately
+    /// holds only the event stream and the callback — NOT a client clone —
+    /// so it cannot keep the `TorClient` (and its runtime tasks) alive
+    /// forever after the tunnel is dropped.
+    pub fn forward_bootstrap_events(&self, on_event: BootstrapEventCallback) {
+        use futures::StreamExt as _;
+        let mut events = self.inner.bootstrap_events();
+        if emit_bootstrap_event(&self.inner.bootstrap_status(), &on_event) {
+            return;
+        }
+        tokio::spawn(async move {
+            while let Some(status) = events.next().await {
+                if emit_bootstrap_event(&status, &on_event) {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// [`bootstrap_with`](Self::bootstrap_with) plus an optional
+    /// bootstrap-event subscription — the entry point the future JNI FFI
+    /// crate will use. Uses the timeout-safe two-step path
+    /// ([`create_unbootstrapped`](Self::create_unbootstrapped) →
+    /// [`wait_bootstrapped`](Self::wait_bootstrapped)) rather than the
+    /// one-shot `create_bootstrapped`, so see the former's docs for why the
+    /// `TorTunnel` stays owned by the caller on a failed/cancelled wait.
+    /// `None` behaves like `bootstrap_with` minus the event forwarding.
+    /// On bootstrap failure the callback receives
+    /// [`BootstrapEvent::Failed`] (error + cause chain) and the error is
+    /// still returned.
+    pub async fn bootstrap_with_notify(
+        settings: Settings,
+        on_event: Option<BootstrapEventCallback>,
+    ) -> Result<Self> {
+        let config = build_config(&settings)?;
+        let tunnel = Self::create_unbootstrapped(config)?;
+        if let Some(on_event) = &on_event {
+            tunnel.forward_bootstrap_events(on_event.clone());
+        }
+        match tunnel.wait_bootstrapped().await {
+            Ok(()) => Ok(tunnel),
+            Err(error) => {
+                if let Some(on_event) = &on_event {
+                    on_event(BootstrapEvent::Failed(error_chain_string(&error)));
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Open a stream through Tor to the given address.
@@ -652,5 +765,66 @@ mod tests {
             .signal_bridge_failure(&bridge, tor_guardmgr::ExternalActivity::DirCache)
             .unwrap_err();
         assert!(matches!(err, TorError::SignalFailure { .. }));
+    }
+
+    #[test]
+    fn emit_bootstrap_event_maps_default_status_to_progress() {
+        // `BootstrapStatus::default()` is documented by the vendored crate's
+        // own tests to never be ready for traffic, so `emit_bootstrap_event`
+        // must emit a `Progress` event and return `false`.
+        use std::sync::Mutex;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let callback: BootstrapEventCallback = Arc::new({
+            let events = events.clone();
+            move |event| events.lock().unwrap().push(event)
+        });
+        let status = arti_client::status::BootstrapStatus::default();
+        let ready = emit_bootstrap_event(&status, &callback);
+        assert!(!ready, "default status is not ready for traffic");
+        let collected = events.lock().unwrap();
+        assert_eq!(collected.len(), 1, "should emit exactly one event");
+        assert!(
+            matches!(collected[0], BootstrapEvent::Progress(0.0)),
+            "default status should emit Progress(0.0), got: {:?}",
+            collected[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_bootstrap_events_emits_initial_progress() {
+        // `forward_bootstrap_events` synchronously emits the current status
+        // before spawning the background task, so the callback receives a
+        // `Progress` event immediately without any network activity.
+        // The event arrives because the client's default bootstrap status
+        // (not yet bootstrapped, no network) is emitted on the first call.
+        ensure_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            state_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let tor = TorTunnel::create_unbootstrapped_with(settings)
+            .expect("synchronous, no-I/O construction must succeed");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let tx = Arc::new(tx);
+        let callback: BootstrapEventCallback = Arc::new({
+            let tx = tx.clone();
+            move |event| {
+                let _ = tx.try_send(event);
+            }
+        });
+        tor.forward_bootstrap_events(callback);
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            rx.recv(),
+        )
+        .await
+        .expect("timeout waiting for initial event")
+        .expect("channel should not close");
+        assert!(
+            matches!(event, BootstrapEvent::Progress(_)),
+            "first event should be Progress, got: {:?}",
+            event
+        );
     }
 }

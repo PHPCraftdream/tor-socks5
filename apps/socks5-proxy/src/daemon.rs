@@ -1,13 +1,14 @@
-//! Daemon-mode support (Unix only).
+//! Daemon-mode support (Unix, not Android).
 //!
-//! Gates entirely behind `#[cfg(unix)]`; on Windows this module is empty
-//! and `--daemon` is rejected at runtime in [`crate::main`] with a pointer
-//! at `service install`.
+//! Gates entirely behind `#[cfg(all(unix, not(target_os = "android")))]`; on Windows
+//! and Android this module is empty and `--daemon` is rejected at runtime in
+//! [`crate::main`] with a pointer at `service install` (Android: JNI-embedded builds
+//! must not daemonize).
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "android")))]
 use std::path::Path;
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "android")))]
 use anyhow::Context;
 
 /// Detach the process from the controlling terminal and run in the
@@ -36,7 +37,7 @@ use anyhow::Context;
 /// written there holding the daemon's PID.
 ///
 /// `start()` returns to the *child* process only; the parent exits.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "android")))]
 pub fn daemonize(pid_file: Option<&Path>) -> anyhow::Result<()> {
     let mut daemonize = daemonize::Daemonize::new()
         .working_directory("/")
