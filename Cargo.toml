@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "packages/android-ffi",
     "packages/*",
+    "apps/pt-helper",
     "apps/*",
     "vendor/saturating-time",
     "vendor/arti-client",
