@@ -9,6 +9,7 @@
 
 use std::net::SocketAddr;
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -109,6 +110,20 @@ pub(crate) fn engine_main(
         }
     };
 
+    // Tracks whether a `BootstrapEvent::Failed` was already relayed to Java
+    // from inside `engine_async` (`bootstrap_with_notify` emits it itself
+    // on a bootstrap-specific failure — see its doc comment). The catch-all
+    // below only emits `Failed` when this is still false, so a bootstrap
+    // failure doesn't fire `onFailed` twice with slightly different text.
+    let failed_already_emitted = Arc::new(AtomicBool::new(false));
+    // Cloned out before `java_callback` moves into the async block below —
+    // needed here, after `catch_unwind` returns, for the catch-all `emit`
+    // calls. Both clones drop before `_attach` regardless (it is the first
+    // local declared above), so this doesn't disturb the attach/detach
+    // ordering invariant described in the comment on `_attach`.
+    let java_callback_outer = Arc::clone(&java_callback);
+    let failed_flag_outer = Arc::clone(&failed_already_emitted);
+
     // Wrap everything in catch_unwind to prevent panic unwinding.
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
         // Build Tokio runtime (4 workers for mobile budget)
@@ -127,16 +142,33 @@ pub(crate) fn engine_main(
         };
 
         rt.block_on(async move {
-            engine_async(settings, listen_addr, auth_state, stop_rx, java_callback).await
+            engine_async(
+                settings,
+                listen_addr,
+                auth_state,
+                stop_rx,
+                java_callback,
+                failed_already_emitted,
+            )
+            .await
         })
     }));
 
-    // Set final status based on result
+    // Set final status based on result. Any error that reaches here without
+    // having already gone through the bootstrap-event `Failed` path (e.g.
+    // the bridge-probe-empty error, a listener bind failure, or a panic)
+    // still needs to reach the Java `BootstrapCallback` -- without this,
+    // `onFailed` is simply never called for those paths and the Kotlin side
+    // has no way to learn the engine died.
     let final_status = match result {
         Ok(Ok(())) => EngineStatus::Off,
         Ok(Err(e)) => {
-            error!("engine error: {:#}", e);
-            EngineStatus::Error(format!("{:#}", e))
+            let msg = format!("{:#}", e);
+            error!("engine error: {}", msg);
+            if !failed_flag_outer.load(Ordering::SeqCst) {
+                java_callback_outer.emit(BootstrapEvent::Failed(msg.clone()));
+            }
+            EngineStatus::Error(msg)
         }
         Err(panic_info) => {
             let panic_msg = panic_info
@@ -145,7 +177,9 @@ pub(crate) fn engine_main(
                 .or_else(|| panic_info.downcast_ref::<&str>().copied())
                 .unwrap_or("unknown panic");
             error!("engine panic: {}", panic_msg);
-            EngineStatus::Error(format!("engine panicked: {}", panic_msg))
+            let msg = format!("engine panicked: {}", panic_msg);
+            java_callback_outer.emit(BootstrapEvent::Failed(msg.clone()));
+            EngineStatus::Error(msg)
         }
     };
 
@@ -162,10 +196,12 @@ async fn engine_async(
     auth_state: Option<Arc<AuthState>>,
     mut stop_rx: tokio::sync::watch::Receiver<bool>,
     java_callback: Arc<JavaCallback>,
+    failed_already_emitted: Arc<AtomicBool>,
 ) -> Result<()> {
     // Create a shared callback that updates status AND emits to Java
     let callback: BootstrapEventCallback = Arc::new({
         let cb = Arc::clone(&java_callback);
+        let failed_flag = Arc::clone(&failed_already_emitted);
         move |event| {
             // Update status based on event
             match &event {
@@ -180,7 +216,10 @@ async fn engine_async(
                     // Blocked is non-fatal, don't change status
                 }
                 BootstrapEvent::Failed(_) => {
-                    // Failed is handled separately; bootstrap_with_notify also emits this
+                    // bootstrap_with_notify already relayed this; tell
+                    // engine_main's catch-all not to emit a second onFailed
+                    // for the same error.
+                    failed_flag.store(true, Ordering::SeqCst);
                 }
             }
             // Emit to Java
@@ -188,13 +227,24 @@ async fn engine_async(
         }
     });
 
-    // Probe bridges for reachability (5s timeout per bridge)
+    // Probe bridges for reachability (5s timeout per bridge). Cancellable:
+    // without this select!, a stop signal received while probing (which can
+    // itself take up to 5s per bridge) is not observed until the accept-loop
+    // select! further down, which is never reached if bridges never come up
+    // -- nativeStop would then block for its full 10s timeout instead of
+    // returning immediately.
     info!(
         count = settings.bridges.len(),
         "probing bridges for reachability"
     );
-    let alive =
-        bridge_probe::probe_and_sort(settings.bridges.clone(), Duration::from_secs(5)).await;
+    let alive = tokio::select! {
+        biased;
+        _ = stop_rx.changed() => {
+            info!("received stop signal while probing bridges");
+            return Ok(());
+        }
+        alive = bridge_probe::probe_and_sort(settings.bridges.clone(), Duration::from_secs(5)) => alive,
+    };
 
     if alive.is_empty() {
         return Err(anyhow::anyhow!(
@@ -212,11 +262,22 @@ async fn engine_async(
     let mut settings = settings;
     settings.bridges = alive.into_iter().map(|(bridge, _)| bridge).collect();
 
-    // Bootstrap Tor with event notifications
+    // Bootstrap Tor with event notifications. Cancellable for the same
+    // reason as the bridge probe above -- bootstrap can run for tens of
+    // seconds, and a stop signal received mid-bootstrap must tear the
+    // half-built `TorTunnel` down immediately rather than being ignored
+    // until bootstrap finishes or times out on its own.
     info!("bootstrapping Tor client...");
-    let tunnel = TorTunnel::bootstrap_with_notify(settings, Some(callback.clone()))
-        .await
-        .context("failed to bootstrap Tor")?;
+    let tunnel = tokio::select! {
+        biased;
+        _ = stop_rx.changed() => {
+            info!("received stop signal while bootstrapping");
+            return Ok(());
+        }
+        result = TorTunnel::bootstrap_with_notify(settings, Some(callback.clone())) => {
+            result.context("failed to bootstrap Tor")?
+        }
+    };
     info!("Tor is ready");
 
     // Bind SOCKS5 listener
