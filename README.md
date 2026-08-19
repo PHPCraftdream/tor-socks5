@@ -107,6 +107,13 @@ upstream.enabled: false
 upstream.address: 127.0.0.1:9050
 upstream.username:
 upstream.password:
+
+## Local SOCKS5 (RFC 1929) authentication. The CLI needs neither field set —
+## it auto-detects `tor-socks5.users.ktav` next to this config. Both exist
+## mainly for the Android JNI FFI crate, which is handed an explicit config
+## path with no implicit CWD/env-var fallback. See docs/auth.md.
+auth.enabled: true
+auth.users_file:
 ```
 
 > **Ktav comments are `##` at the start of a line** (a single `#` is content, and there are no

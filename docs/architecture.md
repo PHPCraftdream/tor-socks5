@@ -15,10 +15,13 @@ tor-socks5/
 ├── tor-socks5.example.ktav     # committed template
 ├── docs/
 ├── packages/                   # in-house libraries
+│   ├── android-ffi/            # Android JNI cdylib crate (libtorsocks5.so)
 │   ├── arti-wrapper/           # bootstrap & connect facade over arti-client
 │   ├── auth/                   # SOCKS5 user accounts + Argon2id authenticator
 │   ├── bridge-fetcher/         # HTTPS-over-Tor bridge list fetching
-│   └── bridge-probe/           # parallel TCP reachability probe + latency sort
+│   ├── bridge-probe/           # parallel TCP reachability probe + latency sort
+│   ├── proxy-config/           # Ktav Config schema, shared by the CLI and android-ffi
+│   └── socks5-proto/           # RFC 1928/1929 SOCKS5 server, shared by the CLI and android-ffi
 ├── apps/
 │   └── socks5-proxy/           # the binary (SOCKS5 proxy + busybox PT dispatch)
 └── vendor/                     # locally-patched forks of 3 upstream crates
@@ -72,6 +75,53 @@ listener (RFC 1929 USERNAME/PASSWORD). Mirrors the `resocks5` design:
   the real hash is written back to disk.
 * Per-account `.onion` gating: a user without `allowed_onion` is refused
   a circuit to a `.onion` destination.
+
+Consumed by both `apps/socks5-proxy` (directly) and `packages/android-ffi` (via
+`packages/socks5-proto`, which depends on `auth` and calls `AuthState::verify`
+during the RFC 1928 handshake). See `docs/auth.md` for the full picture,
+including the Android-specific `Config.auth` section.
+
+### `packages/proxy-config`
+
+The Ktav `Config` schema (`listen` / `log` / `bridges` / `watchdog` /
+`warm_pool` / `conn_health` / `upstream` / `auth`), shared verbatim by
+`apps/socks5-proxy` (via the `crate::config` re-export shim) and
+`packages/android-ffi` (loaded directly from the `configPath` argument to
+`nativeStart`). Depends only on `ktav`/`serde`/`indexmap`/`bridge-line` — no
+crypto or filesystem-registry logic lives here, that's `packages/auth`.
+
+### `packages/socks5-proto`
+
+The RFC 1928 SOCKS5 server implementation (CONNECT only) plus RFC 1929
+USERNAME/PASSWORD sub-negotiation, factored out of `apps/socks5-proxy` so
+`packages/android-ffi` can share the exact same wire-protocol and
+authentication code path instead of re-implementing it. `handshake(stream,
+auth: Option<Arc<AuthState>>)` is the single entry point both callers use;
+passing `None` is the anonymous NO_AUTH path, `Some(state)` insists on
+USER/PASS and calls `state.verify(name, password)`.
+
+### `packages/android-ffi`
+
+The Android JNI cdylib crate (`libtorsocks5.so`, JNI symbols under
+`Java_org_torproject_android_service_TorSocks5Bridge_*`; see the crate's
+`lib.rs` module docs for the full Kotlin-side contract). Structurally it is
+a second front end over the same engine pieces the CLI uses:
+
+* `lib.rs` — `nativeStart` / `nativeStop` / `nativeGetStatus`. `nativeStart`
+  loads `proxy_config::Config` from the `configPath` argument (there is no
+  env-var/CWD fallback on Android — an explicit path is required), resolves
+  local SOCKS5 authentication from `cfg.auth` (see `docs/auth.md`), builds
+  `arti_wrapper::Settings`, and spawns a dedicated engine thread so the
+  Android main/JNI-calling thread never blocks on Tor bootstrap.
+* `engine.rs` — the engine thread body: bridge probing, Tor bootstrap,
+  binding the SOCKS5 listener, and the accept loop. The accept loop mirrors
+  `apps/socks5-proxy/src/server.rs`'s: `socks5_proto::handshake(&mut client,
+  auth_state.clone())` per connection, `Some` requiring USER/PASS, `None`
+  falling back to NO_AUTH — the same `Option<Arc<AuthState>>` built once in
+  `lib.rs::nativeStart` is cloned into every spawned connection task.
+* `callback.rs` — wraps the Java `BootstrapCallback` object (`GlobalRef` +
+  `JavaVM`) so Tokio worker threads can attach to the JVM and dispatch
+  `onProgress`/`onReady`/`onBlocked`/`onFailed`.
 
 ### `packages/bridge-fetcher`
 
@@ -242,7 +292,9 @@ bridges.lines: []
 
 No `pt_binary` field: the proxy uses its own `current_exe()` for the
 PT child. See `README.md` for the full schema (`upstream.*`,
-`bridges.*`) and `docs/bridges.md` for the bridge-health knobs.
+`bridges.*`) and `docs/bridges.md` for the bridge-health knobs. See
+`docs/auth.md` for `auth.enabled` / `auth.users_file` — the
+Android-facing knobs for RFC 1929 local authentication.
 
 ## Request flow
 

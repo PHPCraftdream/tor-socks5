@@ -38,6 +38,12 @@ upstream.address: 127.0.0.1:9050
 upstream.username:
 upstream.password:
 
+## Local SOCKS5 (RFC 1929) authentication. The CLI auto-detects
+## tor-socks5.users.ktav next to this config without either field set;
+## these mainly matter for the Android JNI FFI crate. See docs/auth.md.
+auth.enabled: true
+auth.users_file:
+
 ## Background bridge-channel warm-pool (opt-in). Keeps channels to the
 ## healthiest candidate bridges open ahead of time; does not change which
 ## bridge carries traffic (that is a separate, not-yet-built feature).
