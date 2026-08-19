@@ -92,6 +92,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arti-wrapper",
+ "auth",
  "bridge-probe",
  "jni 0.21.1",
  "proxy-config",

@@ -125,6 +125,26 @@
 //!
 //! This ensures the state directory lock is released before the next start, avoiding
 //! "state directory is in use" errors.
+//!
+//! ## Local SOCKS5 Authentication
+//!
+//! The SOCKS5 listener started by `nativeStart` shares the exact same RFC 1929
+//! USERNAME/PASSWORD authenticator (`auth::AuthState`, Argon2id + HMAC success cache) as the CLI
+//! (`apps/socks5-proxy`) — see `docs/auth.md` for the full design. Resolution happens once,
+//! synchronously, inside `nativeStart` (step 7a below), *before* the engine thread is spawned:
+//!
+//! 1. `cfg.auth.enabled == false` → anonymous NO_AUTH, logged at `info`.
+//! 2. Otherwise resolve the users-registry path: `cfg.auth.users_file` if non-empty, else
+//!    `auth::UsersConfig::resolve_path(configPath)` (same directory + filename stem as
+//!    `configPath`, `.users.ktav` suffix — identical convention to the CLI).
+//! 3. Load that file with `auth::UsersConfig::load` (a missing file is not an error — empty
+//!    registry) and, if non-empty, build `auth::AuthState::build_persistent` and require
+//!    USER/PASS; if empty, fall back to anonymous NO_AUTH.
+//!
+//! Every branch above logs its decision — this proxy never silently falls back to an
+//! unauthenticated listener. The resulting `Option<Arc<AuthState>>` is threaded through
+//! `engine::engine_main` → `engine_async` → `accept_loop`, cloned once per accepted connection,
+//! and handed to `socks5_proto::handshake` exactly as the CLI does in `server.rs`.
 
 mod callback;
 mod engine;
@@ -134,13 +154,15 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Context;
+use auth::{AuthState, UsersConfig};
 use engine::{EngineHandle, EngineStatus};
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::jstring;
 use jni::JNIEnv;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use proxy_config::{Config, Loaded};
-use tracing::error;
+use tracing::{error, info};
 
 /// Global engine handle. Accessed via `OnceLock::get_or_init` for lazy initialization.
 /// Uses `std::sync::Mutex` (not Tokio's) because JNI entry points are synchronous.
@@ -306,6 +328,52 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
             .unwrap_or_else(|| std::path::Path::new("."));
         let state_dir = config_dir.join("arti-data");
 
+        // 7a. Resolve local SOCKS5 (RFC 1929) authentication. Mirrors the
+        // CLI's `server.rs`: a users registry that exists and is
+        // non-empty switches the listener from anonymous NO_AUTH to
+        // USER/PASS. `cfg.auth.enabled = false` is an explicit escape
+        // hatch that forces NO_AUTH even if a registry is present; the
+        // registry path defaults to the standard sibling-file convention
+        // (`{config_stem}.users.ktav` next to `configPath`) but can be
+        // overridden via `cfg.auth.users_file`. Either way the decision
+        // is logged — this proxy must never silently fall back to
+        // anonymous access.
+        let auth_state: Option<Arc<AuthState>> = if !cfg.auth.enabled {
+            info!("auth: disabled via config (auth.enabled: false) — SOCKS5 will accept anonymous clients");
+            None
+        } else {
+            let users_path = if cfg.auth.users_file.is_empty() {
+                UsersConfig::resolve_path(Some(std::path::Path::new(&config_path_str)))
+            } else {
+                std::path::PathBuf::from(&cfg.auth.users_file)
+            };
+            let users = UsersConfig::load(&users_path)
+                .with_context(|| format!("loading users registry from {}", users_path.display()))
+                .map_err(|e| {
+                    let msg = format!("{:#}", e);
+                    let _ = env.throw_new("java/lang/RuntimeException", &msg);
+                    e
+                })?;
+            if users.users.is_empty() {
+                info!(path = %users_path.display(), "auth: no users configured — SOCKS5 will accept anonymous clients");
+                None
+            } else {
+                let state = AuthState::build_persistent(&users, users_path.clone())
+                    .context("building auth state")
+                    .map_err(|e| {
+                        let msg = format!("{:#}", e);
+                        let _ = env.throw_new("java/lang/RuntimeException", &msg);
+                        e
+                    })?;
+                info!(
+                    path = %users_path.display(),
+                    users = state.len(),
+                    "auth: SOCKS5 will require USER/PASS authentication"
+                );
+                Some(Arc::new(state))
+            }
+        };
+
         // 8. Build Settings
         let settings = arti_wrapper::Settings {
             bridges: parsed_bridges.bridges,
@@ -346,6 +414,7 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
                 engine::engine_main(
                     settings,
                     listen_addr,
+                    auth_state,
                     stop_rx,
                     done_tx,
                     java_callback,
