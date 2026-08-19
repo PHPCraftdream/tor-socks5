@@ -38,6 +38,50 @@ pub struct Config {
     pub conn_health: ConnHealthConfig,
     /// Optional upstream SOCKS5 proxy used as the egress instead of Tor.
     pub upstream: UpstreamConfig,
+    /// Local SOCKS5 (RFC 1929) authentication for the listener. Used by
+    /// both the CLI and the Android JNI FFI crate — see [`AuthConfig`].
+    pub auth: AuthConfig,
+}
+
+/// Controls whether — and from where — the SOCKS5 listener loads its
+/// RFC 1929 USERNAME/PASSWORD user registry.
+///
+/// This is primarily an **Android affordance**: the CLI already derives
+/// its users-file path purely from `--config`/`$TOR_SOCKS5_CONFIG`
+/// (`auth::UsersConfig::resolve_path`, `{config_stem}.users.ktav` next
+/// to the main config) and never needed a config field for it — a users
+/// file simply existing is enough to switch the listener from anonymous
+/// NO_AUTH to USER/PASS. Android's Kotlin side, however, benefits from
+/// an explicit, discoverable knob in the same Ktav file it already
+/// writes for `nativeStart`, rather than relying on an implicit
+/// sibling-file convention it would have to reverse-engineer.
+///
+/// Both fields are optional and additive: an absent `auth` section
+/// preserves today's behaviour exactly (registry auto-discovered next
+/// to the config, empty registry means anonymous access).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuthConfig {
+    /// Master switch. Default `true`: when a non-empty users registry is
+    /// found, the listener requires USER/PASS. Set to `false` to force
+    /// anonymous NO_AUTH even if a users file is present (e.g. to
+    /// temporarily disable auth without deleting the registry).
+    pub enabled: bool,
+    /// Optional explicit path to the `.users.ktav` registry, relative to
+    /// the process's current directory or absolute. Empty (the default)
+    /// falls back to the standard convention:
+    /// `auth::UsersConfig::resolve_path(config_path)` — same directory
+    /// and stem as the main config, `.users.ktav` suffix.
+    pub users_file: String,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            users_file: String::new(),
+        }
+    }
 }
 
 /// An upstream SOCKS5 proxy the daemon can forward through instead of
@@ -396,6 +440,7 @@ impl Default for Config {
             warm_pool: WarmPoolConfig::default(),
             conn_health: ConnHealthConfig::default(),
             upstream: UpstreamConfig::default(),
+            auth: AuthConfig::default(),
         }
     }
 }
@@ -900,5 +945,58 @@ conn_health.interval_secs: 120
         let deserialized: Config = ktav::from_str(&serialized).expect("deserialize");
         assert!(!deserialized.conn_health.enabled);
         assert_eq!(deserialized.conn_health.interval_secs, 90);
+    }
+
+    // -- auth config ---------------------------------------------------
+
+    #[test]
+    fn auth_defaults_to_enabled_with_no_explicit_users_file() {
+        let cfg = Config::default();
+        assert!(cfg.auth.enabled);
+        assert!(cfg.auth.users_file.is_empty());
+    }
+
+    #[test]
+    fn auth_falls_back_to_defaults_when_absent() {
+        // A config predating this field must still parse (`deny_unknown_fields`
+        // only rejects *unknown* keys — an absent optional section is fine).
+        let src = "listen: 127.0.0.1:1080\n";
+        let cfg: Config = ktav::from_str(src).expect("ktav parses without auth section");
+        assert!(cfg.auth.enabled);
+        assert!(cfg.auth.users_file.is_empty());
+    }
+
+    #[test]
+    fn parses_auth_section() {
+        let src = r#"
+listen: 127.0.0.1:1080
+
+auth.enabled: true
+auth.users_file: /data/data/org.torproject.android/files/tor-socks5.users.ktav
+"#;
+        let cfg: Config = ktav::from_str(src).expect("ktav parses");
+        assert!(cfg.auth.enabled);
+        assert_eq!(
+            cfg.auth.users_file,
+            "/data/data/org.torproject.android/files/tor-socks5.users.ktav"
+        );
+    }
+
+    #[test]
+    fn auth_can_be_explicitly_disabled() {
+        let src = "listen: 127.0.0.1:1080\nauth.enabled: false\n";
+        let cfg: Config = ktav::from_str(src).expect("ktav parses");
+        assert!(!cfg.auth.enabled);
+    }
+
+    #[test]
+    fn auth_roundtrip_preserves_fields() {
+        let mut cfg = Config::default();
+        cfg.auth.enabled = false;
+        cfg.auth.users_file = "/tmp/custom.users.ktav".into();
+        let serialized = ktav::to_string(&cfg).expect("serialize");
+        let deserialized: Config = ktav::from_str(&serialized).expect("deserialize");
+        assert!(!deserialized.auth.enabled);
+        assert_eq!(deserialized.auth.users_file, "/tmp/custom.users.ktav");
     }
 }
