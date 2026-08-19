@@ -258,6 +258,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arti-client",
+ "futures",
  "ptrs-gesher-bridge-line",
  "rustls",
  "tempfile",
