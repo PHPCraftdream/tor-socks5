@@ -146,7 +146,10 @@ The user-facing binary. Source modules under `src/`:
   see `docs/bridges.md`).
 * `tor_setup.rs` — parse configured bridges, probe them, persist the
   live ones, and assemble `arti_wrapper::Settings` (including pointing
-  the PT manager at our own binary via `current_exe()`).
+  the PT manager at our own binary via `current_exe()`). The PT binary
+  defaults to our own executable (busybox dispatch) but the `TOR_PT_BINARY`
+  env var overrides it, for embedding hosts (Android JNI) where
+  `current_exe()` is the app process.
 * `seed.rs` — bundled seed bridges (`*.seeds`), the fallback when no
   configured bridge is reachable at startup and `bridges.use_seeds`
   is on.
