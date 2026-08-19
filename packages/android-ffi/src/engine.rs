@@ -366,6 +366,15 @@ async fn handle_connection(
     Ok(())
 }
 
+/// Helper: set the global status from the engine thread.
+///
+/// Poisoning-tolerant (`into_inner`): a panicked holder must not brick
+/// status updates forever — readers/writers share the recovery policy.
+fn set_final_status(status: EngineStatus) {
+    use crate::get_status;
+    *get_status().lock().unwrap_or_else(|p| p.into_inner()) = status;
+}
+
 #[cfg(test)]
 mod auth_wiring_tests {
     //! Proves the Android accept-loop path (`handle_connection`) actually
@@ -564,13 +573,4 @@ mod auth_wiring_tests {
         let req = result.expect("NO_AUTH must still work when auth is not configured");
         assert!(req.authed_user.is_none());
     }
-}
-
-/// Helper: set the global status from the engine thread.
-///
-/// Poisoning-tolerant (`into_inner`): a panicked holder must not brick
-/// status updates forever — readers/writers share the recovery policy.
-fn set_final_status(status: EngineStatus) {
-    use crate::get_status;
-    *get_status().lock().unwrap_or_else(|p| p.into_inner()) = status;
 }
