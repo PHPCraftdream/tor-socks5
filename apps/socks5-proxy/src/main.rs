@@ -87,6 +87,7 @@ fn main() -> Result<()> {
     // `--daemon` only applies to the foreground server. Subcommands
     // (`users`, `bridges`, `service`, `help`) are short-lived CLI tools
     // that must stay attached to the terminal.
+    #[cfg(not(target_os = "android"))]
     if cli.command.is_none() && cli.daemon {
         // Before forking, warn if the configured log sink is stdout/stderr:
         // the daemon redirects both to /dev/null, so those records would be
@@ -94,7 +95,7 @@ fn main() -> Result<()> {
         // stderr is /dev/null), so it lives here, before `daemon::daemonize`.
         // If the config can't be loaded, skip the warning silently — the
         // server startup will surface the real config error.
-        #[cfg(unix)]
+        #[cfg(all(unix, not(target_os = "android")))]
         {
             warn_on_stdout_stderr_logging(cli.config.as_deref());
             daemon::daemonize(cli.pid_file.as_deref())?;
@@ -159,7 +160,7 @@ fn enable_windows_ansi_support() {
 /// stderr explaining that daemonisation will redirect those to `/dev/null`.
 /// No-op for any other sink (file logging survives the daemon fork just fine)
 /// and on any config-load failure (the server startup owns surfacing that).
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "android")))]
 fn warn_on_stdout_stderr_logging(config_override: Option<&std::path::Path>) {
     use crate::config::{Config, LogOutput};
     let Ok(loaded) = Config::load_with_override(config_override) else {

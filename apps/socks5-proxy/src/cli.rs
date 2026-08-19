@@ -64,13 +64,15 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) no_upstream: bool,
 
-    /// Run in the background as a daemon (Unix only): detach from the
+    #[cfg(not(target_os = "android"))]
+    /// Run in the background as a daemon (Unix, not Android): detach from the
     /// controlling terminal, redirect stdio to /dev/null. On Windows,
     /// install as a service instead (`tor-socks5 service install`).
     #[arg(long, short = 'd')]
     pub(crate) daemon: bool,
 
-    /// Path to write the daemon's PID file (Unix only; used with --daemon).
+    #[cfg(not(target_os = "android"))]
+    /// Path to write the daemon's PID file (Unix, not Android; used with --daemon).
     #[arg(long, value_name = "PATH")]
     pub(crate) pid_file: Option<PathBuf>,
 
