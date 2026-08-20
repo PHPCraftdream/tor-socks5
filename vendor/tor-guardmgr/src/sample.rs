@@ -540,6 +540,27 @@ impl GuardSet {
             .collect();
     }
 
+    /// tor-socks5 local patch: test-only helper that sets `dir_info_missing`
+    /// on the single guard matching `id`, leaving every other guard
+    /// untouched. Used to reproduce the narrow-vs-wide oscillation fix in
+    /// [`Self::descriptors_to_request`]: exactly one guard outside the
+    /// conservative top-`maximum` cutoff regains a descriptor, and the fix
+    /// must keep requesting it on every subsequent (narrow) call instead of
+    /// letting `tor_dirmgr::bridgedesc::set_bridges` forget it again.
+    #[cfg(test)]
+    pub(crate) fn set_guard_dir_info_missing_for_test(&mut self, id: &GuardId, missing: bool) {
+        let old = std::mem::take(&mut self.guards);
+        self.guards = old
+            .into_values()
+            .map(|mut g| {
+                if g.guard_id() == id {
+                    g.set_dir_info_missing_for_test(missing);
+                }
+                g
+            })
+            .collect();
+    }
+
     /// tor-socks5 local patch: test-only accessor returning the number of
     /// guards currently in the sample, used by regression tests to confirm a
     /// guard was actually sampled before asserting on error variants.
@@ -1060,16 +1081,55 @@ impl GuardSet {
         // above to share a single function.  Before we do that, however, I want
         // to experiment with this logic a bit to make sure that it works and
         // doesn't give us surprising results.
-        self.preference_order()
+        let eligible: Vec<&Guard> = self
+            .preference_order()
             .filter(|(_, g)| {
                 g.usable()
                     && g.reachable() != Reachable::Unreachable
                     && g.ready_for_usage(&data_usage, now)
                     && self.active_filter.permits(*g)
             })
-            .take(take_n)
             .map(|(_, g)| g)
-            .collect()
+            .collect();
+
+        if take_n >= eligible.len() {
+            return eligible;
+        }
+        let mut selected = eligible[..take_n].to_vec();
+
+        // tor-socks5 local patch: descriptor-retention against the narrow-vs-
+        // wide oscillation the above widening can otherwise cause. Once
+        // `any_guard_usable_for_traffic()` flips true because some guard
+        // *outside* the top-`maximum` got its descriptor during the widened
+        // pass, `take_n` snaps back to `maximum` on the very next call — and
+        // a plain top-N cut would drop that guard from the requested set
+        // again. `tor_dirmgr::bridgedesc::set_bridges` treats "no longer in
+        // the requested set" as "forget this bridge", which deletes the
+        // descriptor we just fetched. That flips
+        // `any_guard_usable_for_traffic()` back to false, which widens the
+        // request again, re-downloads the same descriptor, flips it back to
+        // true — an unbounded livelock with no backoff (observed as tens of
+        // thousands of `bridgedesc` download/forget cycles per minute and
+        // the bootstrap never reaching a directory).
+        //
+        // Fix: only when *none* of the conservative top-`maximum` guards
+        // already has a complete descriptor, ride along the single
+        // best-ranked guard beyond the cutoff that does. That guard is the
+        // one keeping `any_guard_usable_for_traffic()` true, so it must
+        // never disappear from the requested set. This is narrower than
+        // "never drop any descriptor holder": once the top-`maximum` itself
+        // contains a descriptor holder (steady state, or full recovery),
+        // nothing extra is added and the cap is exactly `maximum`, same as
+        // before this patch.
+        if !selected.iter().any(|g| g.has_complete_dir_info()) {
+            if let Some(extra) = eligible[take_n..]
+                .iter()
+                .find(|g| g.has_complete_dir_info())
+            {
+                selected.push(extra);
+            }
+        }
+        selected
     }
 }
 
@@ -1431,6 +1491,74 @@ mod test {
             guards.descriptors_to_request(now, &params).len(),
             maximum,
             "conservative cap must return once a guard becomes usable"
+        );
+    }
+
+    // tor-socks5 local patch: regression test for the narrow-vs-wide
+    // oscillation livelock (docs/checkpoints/obfs4-connect-investigation.md).
+    // A guard outside the top-`maximum` cutoff is the *only* one that has a
+    // descriptor. Once that flips `any_guard_usable_for_traffic()` true, a
+    // plain `.take(maximum)` would drop that guard from every subsequent
+    // request (it is not in the top-2 by preference order) — and
+    // `tor_dirmgr::bridgedesc::set_bridges` treats "not in the requested
+    // set" as "forget this bridge's descriptor", flipping the signal back to
+    // false and re-widening forever. The fix must keep requesting this guard
+    // on the narrow pass because it already has a complete descriptor.
+    #[cfg(feature = "bridge-client")]
+    #[test]
+    fn descriptors_to_request_retains_out_of_band_descriptor() {
+        let netdir = netdir();
+        let params = GuardParams {
+            min_filtered_sample_size: 5,
+            ..GuardParams::default()
+        };
+        let now = Instant::get();
+        let mut guards = GuardSet::default();
+        guards.extend_sample_as_needed(SystemTime::get(), &params, &netdir);
+        guards.select_primary_guards(&params);
+
+        let maximum = std::cmp::max(params.data_parallelism, 2);
+        assert_eq!(maximum, 2);
+        assert!(guards.guards.len() > maximum);
+
+        // Rank-`maximum` among *eligible* guards (same filter
+        // `descriptors_to_request` applies) -- i.e. the first guard just
+        // past the conservative cutoff. `usable()`/reachability/filter
+        // eligibility does not depend on `dir_info_missing`, so this rank is
+        // the same before and after exhausting descriptors below.
+        let data_usage = GuardUsage::default();
+        let recovered_id = guards
+            .preference_order()
+            .filter(|(_, g)| {
+                g.usable()
+                    && g.reachable() != Reachable::Unreachable
+                    && g.ready_for_usage(&data_usage, now)
+                    && guards.active_filter.permits(*g)
+            })
+            .nth(maximum)
+            .expect("sample has more than `maximum` eligible guards")
+            .1
+            .guard_id()
+            .clone();
+
+        // Exhaust every guard, then hand exactly the rank-`maximum` guard
+        // its descriptor back. That is the guard that must survive
+        // narrowing.
+        guards.set_all_guards_dir_info_missing_for_test(true);
+        guards.set_guard_dir_info_missing_for_test(&recovered_id, false);
+        assert!(
+            guards.any_guard_usable_for_traffic(),
+            "the one recovered guard must make the sample usable again"
+        );
+
+        // Narrow pass: the recovered guard must still be present even though
+        // its preference-order rank is `maximum` (i.e. one past the cutoff).
+        let requested = guards.descriptors_to_request(now, &params);
+        assert!(
+            requested.iter().any(|g| g.guard_id() == &recovered_id),
+            "a guard with a complete descriptor must never be dropped from \
+             the requested set, or set_bridges() will forget it and re-open \
+             the oscillation"
         );
     }
 
