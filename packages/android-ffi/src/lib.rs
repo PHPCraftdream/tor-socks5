@@ -396,6 +396,11 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
             pt_binary,
             state_dir: Some(state_dir),
         };
+        // Captured before `loaded`/`cfg` go out of scope: the engine thread
+        // needs its own owned copies to persist/rank bridge health via the
+        // shared `bridge-store` crate (see `engine::engine_async`).
+        let bridges_cfg = cfg.bridges.clone();
+        let engine_config_path = std::path::PathBuf::from(&config_path_str);
 
         // 9. Get Java VM and create global reference to callback
         let vm = env.get_java_vm().map_err(|e| {
@@ -430,6 +435,10 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
                     stop_rx,
                     done_tx,
                     java_callback,
+                    engine::BridgeHealthContext {
+                        config_path: Some(engine_config_path),
+                        bridges_cfg,
+                    },
                 )
             }) {
             Ok(thread) => thread,

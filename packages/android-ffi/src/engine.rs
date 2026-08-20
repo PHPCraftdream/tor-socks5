@@ -9,15 +9,19 @@
 
 use std::net::SocketAddr;
 use std::panic::{self, AssertUnwindSafe};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::callback::JavaCallback;
 use anyhow::{Context, Result};
 use arti_wrapper::{BootstrapEvent, BootstrapEventCallback, TorTunnel};
 use auth::AuthState;
+use bridge_store::BridgeStore;
+use proxy_config::BridgesConfig;
 use socks5_proto::{self, Reply};
+use time::OffsetDateTime;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
@@ -68,6 +72,21 @@ pub(crate) struct EngineHandle {
     pub thread: std::thread::JoinHandle<()>,
 }
 
+/// Everything the engine thread needs to persist and rank bridge
+/// reachability across restarts via the shared `bridge-store` crate.
+/// Bundled into one struct so threading it through `engine_main`/
+/// `engine_async` doesn't push either function over clippy's
+/// `too_many_arguments` threshold.
+pub(crate) struct BridgeHealthContext {
+    /// Path to the ktav config file (`tor-socks5.ktav`), used to derive the
+    /// sibling `<stem>.alive-bridges.log` health-store path — see
+    /// `BridgeStore::resolve_path`.
+    pub config_path: Option<PathBuf>,
+    /// `max_fails` / `fail_window_mins` / `max_circuit_fails` from the
+    /// loaded config, needed by `BridgeStore::note_probe_round`.
+    pub bridges_cfg: BridgesConfig,
+}
+
 /// Entry point for the dedicated engine thread.
 ///
 /// This function:
@@ -89,6 +108,7 @@ pub(crate) fn engine_main(
     stop_rx: tokio::sync::watch::Receiver<bool>,
     done_tx: std::sync::mpsc::Sender<()>,
     java_callback: Arc<JavaCallback>,
+    bridge_health: BridgeHealthContext,
 ) {
     // Attach to the JVM for the entire lifetime of this thread. The guard
     // detaches on drop — `_attach` (and the `vm` it borrows) are the FIRST
@@ -126,9 +146,12 @@ pub(crate) fn engine_main(
 
     // Wrap everything in catch_unwind to prevent panic unwinding.
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
-        // Build Tokio runtime (4 workers for mobile budget)
+        // Build Tokio runtime. 8 workers, not 4: bootstrap's dirmgr/chanmgr
+        // reactors need enough throughput to avoid ChanTimeout under a guard-
+        // descriptor fetch burst (see docs/checkpoints/obfs4-connect-
+        // investigation.md) -- the CLI daemon runs 16 for the same reason.
         let rt = match tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
+            .worker_threads(8)
             .enable_all()
             .thread_name("torsocks5-rt")
             .build()
@@ -149,6 +172,7 @@ pub(crate) fn engine_main(
                 stop_rx,
                 java_callback,
                 failed_already_emitted,
+                bridge_health,
             )
             .await
         })
@@ -197,6 +221,7 @@ async fn engine_async(
     mut stop_rx: tokio::sync::watch::Receiver<bool>,
     java_callback: Arc<JavaCallback>,
     failed_already_emitted: Arc<AtomicBool>,
+    bridge_health: BridgeHealthContext,
 ) -> Result<()> {
     // Create a shared callback that updates status AND emits to Java
     let callback: BootstrapEventCallback = Arc::new({
@@ -237,7 +262,7 @@ async fn engine_async(
         count = settings.bridges.len(),
         "probing bridges for reachability"
     );
-    let alive = tokio::select! {
+    let mut alive = tokio::select! {
         biased;
         _ = stop_rx.changed() => {
             info!("received stop signal while probing bridges");
@@ -245,6 +270,46 @@ async fn engine_async(
         }
         alive = bridge_probe::probe_and_sort(settings.bridges.clone(), Duration::from_secs(5)) => alive,
     };
+
+    // Persist this probe round's reachability outcome to the same
+    // `<config-stem>.alive-bridges.log` health store the CLI daemon uses
+    // (`bridge-store` crate), then re-rank the reachable set by historical
+    // stability (`ok_count`, ties broken by latency) ahead of a bridge seen
+    // reachable for the first time. Best-effort throughout: a missing or
+    // unwritable store must never fail the bootstrap, it just forfeits the
+    // ranking boost for this run.
+    let store_path = BridgeStore::resolve_path(bridge_health.config_path.as_deref());
+    match BridgeStore::load(store_path.clone()) {
+        Ok(mut store) => {
+            let now = OffsetDateTime::now_utc();
+            let fail_window = Duration::from_secs(
+                bridge_health
+                    .bridges_cfg
+                    .fail_window_mins
+                    .saturating_mul(60),
+            );
+            store.note_probe_round(
+                &settings.bridges,
+                &alive,
+                now,
+                fail_window,
+                bridge_health.bridges_cfg.max_fails,
+                bridge_health.bridges_cfg.max_circuit_fails,
+            );
+            if let Err(e) = store.save() {
+                warn!(path = %store_path.display(), error = %e, "could not persist bridge health store");
+            }
+            alive.sort_by(|(ba, la), (bb, lb)| {
+                store
+                    .ok_count(bb)
+                    .cmp(&store.ok_count(ba))
+                    .then_with(|| la.cmp(lb))
+            });
+        }
+        Err(e) => {
+            warn!(path = %store_path.display(), error = %e, "could not load bridge health store");
+        }
+    }
 
     if alive.is_empty() {
         return Err(anyhow::anyhow!(
@@ -295,6 +360,14 @@ async fn engine_async(
     set_final_status(EngineStatus::On(actual_addr));
     set_current_tunnel(Some(tunnel.clone()));
 
+    // Stall watchdog: a real network interruption (Wi-Fi handoff, carrier
+    // switch, a guard going stale) can leave arti's guard/circuit managers
+    // stuck retrying a dead set with nothing to notice and force a reset --
+    // arti has no automatic "rebuild everything" trigger of its own. Runs
+    // for the lifetime of this connection; cancelled by the same stop
+    // signal as the accept loop below.
+    tokio::spawn(stall_watchdog(tunnel.clone(), stop_rx.clone()));
+
     // Create semaphore for concurrency limiting
     let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
 
@@ -329,6 +402,78 @@ async fn engine_async(
 
     info!("engine shutdown complete");
     accept_result
+}
+
+/// How often [`stall_watchdog`] probes connectivity once the tunnel is live.
+const WATCHDOG_PROBE_INTERVAL: Duration = Duration::from_secs(45);
+/// Per-probe timeout -- generous enough that a slow-but-alive circuit isn't
+/// mistaken for a dead one.
+const WATCHDOG_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Consecutive probe failures before forcing a channel rebuild.
+const WATCHDOG_FAILURES_BEFORE_RESET: u32 = 3;
+/// Minimum time between two rebuild attempts, so a genuinely blocked network
+/// doesn't get hammered with resets that can't help it.
+const WATCHDOG_RESET_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+
+/// Background task, spawned once the tunnel reaches `On`: periodically
+/// probes Tor Project's own connectivity-check endpoint through the tunnel
+/// (the same target Tor Browser itself uses for this). After
+/// [`WATCHDOG_FAILURES_BEFORE_RESET`] consecutive failures it calls
+/// [`TorTunnel::terminate_all_channels`] to force arti to rebuild its
+/// channels, giving the guard/circuit managers a clean slate -- mirrors the
+/// CLI daemon's `tor_watchdog.rs`, scoped down to a single canary target
+/// instead of replaying real traffic history (Android's accept loop doesn't
+/// track per-connection success/failure the way the CLI's `TorHealth` does).
+/// Exits when `stop_rx` fires.
+async fn stall_watchdog(tunnel: TorTunnel, mut stop_rx: tokio::sync::watch::Receiver<bool>) {
+    let mut consecutive_failures = 0u32;
+    let mut last_reset: Option<Instant> = None;
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = stop_rx.changed() => return,
+            _ = tokio::time::sleep(WATCHDOG_PROBE_INTERVAL) => {}
+        }
+        if *stop_rx.borrow() {
+            return;
+        }
+
+        let probe = tokio::time::timeout(
+            WATCHDOG_PROBE_TIMEOUT,
+            tunnel.connect("check.torproject.org", 443),
+        )
+        .await;
+
+        if matches!(probe, Ok(Ok(_))) {
+            consecutive_failures = 0;
+            continue;
+        }
+
+        consecutive_failures += 1;
+        debug!(consecutive_failures, "watchdog: connectivity probe failed");
+        if consecutive_failures < WATCHDOG_FAILURES_BEFORE_RESET {
+            continue;
+        }
+
+        let now = Instant::now();
+        let cooled_down = last_reset
+            .map(|t| now.duration_since(t) >= WATCHDOG_RESET_COOLDOWN)
+            .unwrap_or(true);
+        if !cooled_down {
+            continue;
+        }
+
+        warn!(
+            consecutive_failures,
+            "watchdog: forcing channel rebuild after sustained stall"
+        );
+        if let Err(e) = tunnel.terminate_all_channels() {
+            warn!(error = %e, "watchdog: terminate_all_channels failed");
+        }
+        last_reset = Some(now);
+        consecutive_failures = 0;
+    }
 }
 
 /// SOCKS5 accept loop.
