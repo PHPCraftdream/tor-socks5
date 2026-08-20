@@ -13,8 +13,8 @@ use bridge_line::BridgeLine;
 use time::OffsetDateTime;
 use tracing::{info, warn};
 
-use crate::bridge_store::BridgeStore;
 use crate::config::Config;
+use bridge_store::BridgeStore;
 
 /// How long each bridge gets to complete a TCP handshake before we declare
 /// it unreachable for this startup. The probes run in parallel, so the

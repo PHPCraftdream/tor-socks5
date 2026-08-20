@@ -94,7 +94,7 @@ use time::OffsetDateTime;
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::{Context, Layer};
 
-use crate::bridge_store::BridgeStore;
+use bridge_store::BridgeStore;
 
 /// The tracing target prefix we listen on. Pinned to `tor_guardmgr` —
 /// the only crate that emits per-guard usability status with a

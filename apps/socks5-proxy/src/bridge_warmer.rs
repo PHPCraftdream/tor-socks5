@@ -26,7 +26,7 @@
 //!
 //! Candidates are drawn from the currently configured bridges (the same set
 //! [`crate::tor_setup::build_tor_settings`] probes at startup), ranked by
-//! the health signals already tracked in [`crate::bridge_store::BridgeStore`]:
+//! the health signals already tracked in [`bridge_store::BridgeStore`]:
 //! TCP-unreachable bridges (`tcp_fails > 0` per the last probe round) are
 //! excluded outright, then the rest are sorted by ascending `circuit_fails`
 //! (fewest circuit-layer failures first) and, as a tie-breaker, descending
@@ -40,9 +40,9 @@ use std::time::Duration;
 use bridge_line::BridgeLine;
 use tracing::{info, warn};
 
-use crate::bridge_store::BridgeStore;
 use crate::config::{Config, WarmPoolConfig};
 use crate::tor_watchdog::TorHandle;
+use bridge_store::BridgeStore;
 
 /// Per-candidate health snapshot used to rank bridges for warming. Pulled
 /// out of [`BridgeStore`] into a plain struct so the ranking logic

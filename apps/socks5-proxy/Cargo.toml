@@ -18,6 +18,7 @@ auth = { path = "../../packages/auth" }
 bridge-line.workspace = true
 bridge-fetcher = { path = "../../packages/bridge-fetcher" }
 bridge-probe = { path = "../../packages/bridge-probe" }
+bridge-store = { path = "../../packages/bridge-store" }
 proxy-config = { path = "../../packages/proxy-config" }
 socks5-proto = { path = "../../packages/socks5-proto" }
 tor-error.workspace = true

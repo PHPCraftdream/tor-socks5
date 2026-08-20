@@ -112,9 +112,9 @@ use bridge_line::BridgeLine;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::bridge_store::BridgeStore;
 use crate::bridge_warmer::{candidates_with_health, Health};
 use crate::config::{Config, WatchdogConfig};
+use bridge_store::BridgeStore;
 
 /// Shared, lock-free circuit-level health signal, updated from the SOCKS5
 /// hot path on every Tor `connect`. Cheap to clone (two atomics behind an

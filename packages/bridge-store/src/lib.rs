@@ -23,6 +23,10 @@
 //! ```
 //!
 //! Dedup key: `(transport, addr, fingerprint)`.
+//!
+//! Shared by the CLI daemon (`apps/socks5-proxy`) and the Android JNI
+//! engine (`packages/android-ffi`) — both processes probe bridges and want
+//! to remember which ones tend to work across restarts.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -398,6 +402,11 @@ impl BridgeStore {
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     /// Number of bridges currently in a healthy TCP state (`fails == 0`)

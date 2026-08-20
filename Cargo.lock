@@ -95,11 +95,13 @@ dependencies = [
  "auth",
  "bridge-fetcher",
  "bridge-probe",
+ "bridge-store",
  "jni 0.21.1",
  "libc",
  "proxy-config",
  "rustls",
  "socks5-proto",
+ "time",
  "tokio",
  "tokio-util",
  "tracing",
@@ -774,6 +776,16 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "bridge-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ptrs-gesher-bridge-line",
+ "tempfile",
+ "time",
 ]
 
 [[package]]
@@ -5221,6 +5233,7 @@ dependencies = [
  "auth",
  "bridge-fetcher",
  "bridge-probe",
+ "bridge-store",
  "clap",
  "criterion",
  "daemonize",
