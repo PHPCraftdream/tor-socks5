@@ -148,7 +148,10 @@ fn emit_bootstrap_event(
         on_event(BootstrapEvent::Ready);
         true
     } else {
-        on_event(BootstrapEvent::Progress(status.as_frac(), status.to_string()));
+        on_event(BootstrapEvent::Progress(
+            status.as_frac(),
+            status.to_string(),
+        ));
         if let Some(blockage) = status.blocked() {
             on_event(BootstrapEvent::Blocked(blockage.to_string()));
         }

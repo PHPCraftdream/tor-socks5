@@ -451,7 +451,11 @@ async fn bootstrap_stall_watchdog(tunnel: TorTunnel, callback: BootstrapEventCal
     let mut last_change = Instant::now();
     loop {
         tokio::time::sleep(BOOTSTRAP_STALL_CHECK_INTERVAL).await;
-        let current_percent = match crate::get_status().lock().unwrap_or_else(|p| p.into_inner()).clone() {
+        let current_percent = match crate::get_status()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+        {
             EngineStatus::Starting(pct) => pct,
             _ => return, // no longer bootstrapping (ready, stopped, or errored)
         };
@@ -569,7 +573,10 @@ async fn stall_watchdog(
                         cookies: s.cookies.clone(),
                     })
                     .collect();
-                let max_body_bytes = bridge_health.bridges_cfg.max_body_mib.saturating_mul(1024 * 1024);
+                let max_body_bytes = bridge_health
+                    .bridges_cfg
+                    .max_body_mib
+                    .saturating_mul(1024 * 1024);
                 info!(
                     alive = alive.len(),
                     min_alive = bridge_health.bridges_cfg.min_alive,
@@ -592,7 +599,10 @@ async fn stall_watchdog(
                     }
                 }
                 let (unique, duplicates) = bridge_fetcher::dedup_bridges(fetched);
-                info!(unique = unique.len(), duplicates, "watchdog: bridge auto-fetch complete");
+                info!(
+                    unique = unique.len(),
+                    duplicates, "watchdog: bridge auto-fetch complete"
+                );
                 record_auto_fetched_bridges(unique);
             }
             last_bridge_reprobe = Instant::now();
