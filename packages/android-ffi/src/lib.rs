@@ -156,9 +156,10 @@ use std::time::Duration;
 
 use anyhow::Context;
 use auth::{AuthState, UsersConfig};
+use bridge_store::BridgeStore;
 use engine::{EngineHandle, EngineStatus};
 use jni::objects::{JClass, JObject, JString};
-use jni::sys::jstring;
+use jni::sys::{jint, jstring};
 use jni::JNIEnv;
 use proxy_config::{Config, Loaded};
 use std::sync::Arc;
@@ -632,6 +633,51 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
             .join("\n");
         env.new_string(joined).map(|s| s.into_raw()).map_err(|e| {
             error!("failed to create Java string for auto-fetched bridges: {e}");
+            e
+        })
+    })) {
+        Ok(Ok(jstr)) => jstr,
+        Ok(Err(_)) | Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// JNI entry point: `nativeGetHealthyBridges(String configPath, int limit)`
+///
+/// Reads the on-disk bridge-health store (`BridgeStore::resolve_path`, the same file
+/// `persist_and_rank_probe` writes after a probe round) and returns up to `limit` bridges known
+/// reachable at the last probe, ranked best-first by proven stability then latency (see
+/// `BridgeStore::healthiest_bridges`). Newline-joined, one `BridgeLine` per line; an empty
+/// string if the store doesn't exist yet, is empty, or nothing has ever probed reachable --
+/// callers should fall back to the full configured list in that case.
+///
+/// Pure file read: unlike `nativeRefreshBridges`, this does **not** require the engine to be
+/// running.
+///
+/// - **Threading:** Cheap, safe to call from the main thread.
+/// - **Error Signaling:** Does not throw. Returns `null` only on a Java string allocation
+///   failure.
+#[no_mangle]
+pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativeGetHealthyBridges(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+    limit: jint,
+) -> jstring {
+    match panic::catch_unwind(AssertUnwindSafe(|| {
+        let config_path_str: Option<String> = env.get_string(&config_path).ok().map(|s| s.into());
+        let store_path =
+            BridgeStore::resolve_path(config_path_str.as_ref().map(std::path::Path::new));
+        let joined = match BridgeStore::load(store_path) {
+            Ok(store) => store
+                .healthiest_bridges(limit.max(0) as usize)
+                .iter()
+                .map(|b| b.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Err(_) => String::new(),
+        };
+        env.new_string(joined).map(|s| s.into_raw()).map_err(|e| {
+            error!("failed to create Java string for healthy bridges: {e}");
             e
         })
     })) {

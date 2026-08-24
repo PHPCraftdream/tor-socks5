@@ -455,6 +455,31 @@ impl BridgeStore {
     fn fails_of(&self, bridge: &BridgeLine) -> u32 {
         self.entries.get(&key_of(bridge)).map_or(0, |e| e.fails)
     }
+
+    /// Bridges known reachable at the last probe round (`fails == 0`), ranked best-first by
+    /// proven stability (`ok_count`, descending) then latency (ascending) -- the same ordering
+    /// [`Self::note_probe_round`]'s caller applies to a freshly-probed round, read back from
+    /// disk instead of requiring a new probe. A bridge with `ok_count == 0` (never yet seen
+    /// reachable, even if it hasn't failed either) is excluded: absence of failure is not
+    /// evidence the bridge actually works.
+    #[must_use]
+    pub fn healthiest_bridges(&self, limit: usize) -> Vec<BridgeLine> {
+        let mut healthy: Vec<&Entry> = self
+            .entries
+            .values()
+            .filter(|e| e.fails == 0 && e.ok_count > 0)
+            .collect();
+        healthy.sort_by(|a, b| {
+            b.ok_count
+                .cmp(&a.ok_count)
+                .then(a.last_latency.cmp(&b.last_latency))
+        });
+        healthy
+            .into_iter()
+            .take(limit)
+            .map(|e| e.bridge.clone())
+            .collect()
+    }
 }
 
 /// Parsed metadata-comment fields.
@@ -825,6 +850,41 @@ mod tests {
         );
         assert_eq!(pruned.len(), 1, "TCP-alive bridge pruned on circuit_fails");
         assert_eq!(s.len(), 0);
+    }
+
+    #[test]
+    fn healthiest_bridges_ranks_by_ok_count_then_latency() {
+        let mut s = empty();
+        let a = bridge(OBFS4_A);
+        let b = bridge(OBFS4_B);
+        s.record(a.clone(), Duration::from_millis(10)); // ok_count 1
+        s.record(b.clone(), Duration::from_millis(50));
+        s.record(b.clone(), Duration::from_millis(20)); // ok_count 2, latest latency 20ms
+        assert_eq!(
+            s.healthiest_bridges(10),
+            vec![b, a],
+            "higher ok_count ranks first"
+        );
+    }
+
+    #[test]
+    fn healthiest_bridges_excludes_unhealthy_and_never_probed_ok() {
+        let mut s = empty();
+        let a = bridge(OBFS4_A);
+        let d = bridge(OBFS4_B);
+        let t0 = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        s.record_at(a.clone(), Duration::from_millis(5), t0);
+        s.note_failure_at(&d, t0, HOUR); // fails=1, ok_count=0 -- never proven reachable
+        assert_eq!(s.healthiest_bridges(10), vec![a]);
+    }
+
+    #[test]
+    fn healthiest_bridges_respects_limit() {
+        let mut s = empty();
+        s.record(bridge(OBFS4_A), Duration::from_millis(10));
+        s.record(bridge(OBFS4_B), Duration::from_millis(20));
+        assert_eq!(s.healthiest_bridges(1).len(), 1);
+        assert_eq!(s.healthiest_bridges(0).len(), 0);
     }
 
     #[test]
