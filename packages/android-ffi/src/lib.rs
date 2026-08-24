@@ -686,6 +686,29 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
     }
 }
 
+fn refresh_sources_failure(outcomes: &[bridge_fetcher::FetchOutcome]) -> Option<String> {
+    if outcomes.is_empty() || outcomes.iter().all(|outcome| outcome.error.is_some()) {
+        let details = outcomes
+            .iter()
+            .map(|outcome| {
+                format!(
+                    "{}: {}",
+                    outcome.label,
+                    outcome.error.as_deref().unwrap_or("source task failed")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        Some(if details.is_empty() {
+            "all configured bridge sources failed".to_owned()
+        } else {
+            format!("all configured bridge sources failed: {details}")
+        })
+    } else {
+        None
+    }
+}
+
 /// JNI entry point: `nativeRefreshBridges(String configPath)`
 ///
 /// Fetches fresh bridge lines from `configPath`'s `bridges.sources` over the
@@ -705,8 +728,9 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
 /// - **Threading:** Blocks the calling thread for up to the fetch timeout
 ///   (30s) -- call off the Android main thread.
 /// - **Error Signaling:** Throws `java.lang.IllegalStateException` if the
-///   engine isn't currently `On` (no live tunnel to fetch through), or
-///   `java.lang.RuntimeException` if `configPath` can't be read/parsed.
+///   engine isn't currently `On` (no live tunnel to fetch through),
+///   `java.lang.RuntimeException` if `configPath` can't be read/parsed, or if
+///   every configured source fails to fetch.
 #[no_mangle]
 pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativeRefreshBridges(
     mut env: JNIEnv,
@@ -798,6 +822,15 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
             }
         }
 
+        // An empty result is normally a valid "no new bridges" response, but
+        // it is misleading when every source failed. Surface that distinction
+        // to Kotlin so the UI can report a refresh failure instead of silently
+        // claiming that no new bridges exist.
+        if let Some(message) = refresh_sources_failure(&outcomes) {
+            let _ = env.throw_new("java/lang/RuntimeException", &message);
+            return Err(anyhow::anyhow!(message));
+        }
+
         let (unique, duplicates) = bridge_fetcher::dedup_bridges(fetched);
         info!(unique = unique.len(), duplicates, "bridge refresh complete");
 
@@ -822,6 +855,31 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn outcome(label: &str, error: Option<&str>) -> bridge_fetcher::FetchOutcome {
+        bridge_fetcher::FetchOutcome {
+            label: label.to_owned(),
+            bridges_extracted: 0,
+            error: error.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn refresh_reports_all_source_failures() {
+        let message = refresh_sources_failure(&[
+            outcome("primary", Some("timeout")),
+            outcome("backup", Some("403")),
+        ])
+        .expect("all failed sources should produce an error");
+        assert!(message.contains("primary: timeout"));
+        assert!(message.contains("backup: 403"));
+    }
+
+    #[test]
+    fn refresh_keeps_no_new_bridges_for_successful_sources() {
+        assert!(refresh_sources_failure(&[outcome("primary", None)]).is_none());
+        assert!(refresh_sources_failure(&[]).is_some());
+    }
 
     #[test]
     fn test_status_formatting() {

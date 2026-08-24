@@ -330,10 +330,20 @@ async fn engine_async(
     let tunnel = TorTunnel::create_unbootstrapped_with(settings).context("creating Tor client")?;
     tunnel.forward_bootstrap_events(callback.clone());
     let stall_handle = tokio::spawn(bootstrap_stall_watchdog(tunnel.clone(), callback.clone()));
+    // Start opening channels to every TCP-reachable bridge while arti is
+    // downloading its directory. This avoids waiting for guard-manager's
+    // one-at-a-time retry order and leaves a measured warm pool for rotation
+    // after the first circuit is verified.
+    let warm_handle = tokio::spawn(warm_bridge_pool(
+        tunnel.clone(),
+        all_configured_bridges.clone(),
+    ));
     let bootstrap_result = tokio::select! {
         biased;
         _ = stop_rx.changed() => {
             stall_handle.abort();
+            warm_handle.abort();
+            let _ = warm_handle.await;
             info!("received stop signal while bootstrapping");
             return Ok(());
         }
@@ -341,10 +351,51 @@ async fn engine_async(
     };
     stall_handle.abort();
     if let Err(error) = bootstrap_result {
+        warm_handle.abort();
+        let _ = warm_handle.await;
         callback(BootstrapEvent::Failed(format!("{:#}", error)));
         return Err(error).context("failed to bootstrap Tor");
     }
-    info!("Tor is ready");
+    info!("Tor bootstrap completed; verifying live circuit");
+    if !verify_live_circuit(&tunnel, &mut stop_rx, &callback).await? {
+        // A stop signal won the select while the live probe was in flight. The
+        // caller owns the tunnel and will drop it as this function returns.
+        return Ok(());
+    }
+    info!("live Tor circuit verified");
+
+    let warmed_bridges = match warm_handle.await {
+        Ok(warmed) => warmed,
+        Err(error) => {
+            warn!(error = %error, "parallel bridge warm pool task failed");
+            Vec::new()
+        }
+    };
+    persist_warm_results(&warmed_bridges, &bridge_health);
+    let rotation_bridges = warmed_bridges
+        .iter()
+        .map(|(bridge, _)| bridge.clone())
+        .collect::<Vec<_>>();
+    if let Some((fastest, latency)) = warmed_bridges.first() {
+        info!(
+            bridge = %fastest.addr,
+            latency_ms = latency.as_millis() as u64,
+            "selected fastest warmed bridge for rotation"
+        );
+    }
+    for (rank, (bridge, latency)) in warmed_bridges.iter().enumerate().skip(1) {
+        debug!(
+            rank = rank + 1,
+            bridge = %bridge.addr,
+            latency_ms = latency.as_millis() as u64,
+            "kept warmed bridge as rotation fallback"
+        );
+    }
+    info!(
+        warmed = rotation_bridges.len(),
+        configured = all_configured_bridges.len(),
+        "parallel bridge warm pool ready"
+    );
 
     // Bind SOCKS5 listener
     let listener = TcpListener::bind(&listen_addr)
@@ -374,6 +425,7 @@ async fn engine_async(
         tunnel.clone(),
         stop_rx.clone(),
         all_configured_bridges,
+        rotation_bridges,
         bridge_health.clone(),
     ));
 
@@ -424,6 +476,19 @@ const WATCHDOG_FAILURES_BEFORE_RESET: u32 = 3;
 /// doesn't get hammered with resets that can't help it.
 const WATCHDOG_RESET_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
+/// The first readiness signal must include a real end-to-end circuit probe.
+/// A plain TCP bridge probe can succeed while DPI kills the obfs4 stream, and
+/// cached arti state can otherwise make `wait_bootstrapped` look healthy.
+const LIVE_PROBE_TARGET: &str = "check.torproject.org";
+const LIVE_PROBE_PORT: u16 = 443;
+const LIVE_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+const LIVE_PROBE_ATTEMPTS: u32 = 3;
+const LIVE_PROBE_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Bound each parallel PT/channel warm-up so a dead bridge cannot hold the
+/// rotation pool open indefinitely.
+const WARM_BRIDGE_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Per-bridge timeout for the periodic re-probe, matching the bootstrap-time
 /// probe in `engine_async`.
 const BRIDGE_REPROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -435,6 +500,123 @@ const AUTO_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const BOOTSTRAP_STALL_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 /// How long the bootstrap percentage can stay unchanged before this forces a channel reset.
 const BOOTSTRAP_STALL_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Verify that arti can establish a usable circuit before advertising
+/// `EngineStatus::On`/`BootstrapEvent::Ready` to Android.
+///
+/// cancel-safe: NO — cancelling the timeout aborts an in-flight Tor connect;
+/// this is intentional because a stop signal must not wait for a dead circuit.
+async fn verify_live_circuit(
+    tunnel: &TorTunnel,
+    stop_rx: &mut tokio::sync::watch::Receiver<bool>,
+    callback: &BootstrapEventCallback,
+) -> Result<bool> {
+    if *stop_rx.borrow() {
+        return Ok(false);
+    }
+
+    for attempt in 1..=LIVE_PROBE_ATTEMPTS {
+        let probe = tokio::select! {
+            biased;
+            changed = stop_rx.changed() => {
+                if changed.is_err() || *stop_rx.borrow() {
+                    return Ok(false);
+                }
+                continue;
+            }
+            result = tokio::time::timeout(
+                LIVE_PROBE_TIMEOUT,
+                tunnel.connect(LIVE_PROBE_TARGET, LIVE_PROBE_PORT),
+            ) => result,
+        };
+
+        match probe {
+            Ok(Ok(stream)) => {
+                drop(stream);
+                return Ok(true);
+            }
+            Ok(Err(error)) => {
+                let reason = error.to_string();
+                callback(BootstrapEvent::Blocked(format!(
+                    "Tor bootstrapped, but live circuits are not working yet (attempt {attempt}/{LIVE_PROBE_ATTEMPTS}): {reason}"
+                )));
+            }
+            Err(_) => {
+                callback(BootstrapEvent::Blocked(format!(
+                    "Tor bootstrapped, but live circuits are not working yet (attempt {attempt}/{LIVE_PROBE_ATTEMPTS}): probe timed out after {LIVE_PROBE_TIMEOUT:?}"
+                )));
+            }
+        }
+
+        if attempt < LIVE_PROBE_ATTEMPTS {
+            if let Err(error) = tunnel.terminate_all_channels() {
+                warn!(error = %error, "live circuit probe failed; channel rotation was unavailable");
+            } else {
+                info!(
+                    attempt,
+                    "rotated Tor channels after failed live circuit probe"
+                );
+            }
+
+            let changed = tokio::time::sleep(LIVE_PROBE_RETRY_DELAY);
+            tokio::pin!(changed);
+            tokio::select! {
+                biased;
+                result = stop_rx.changed() => {
+                    if result.is_err() || *stop_rx.borrow() {
+                        return Ok(false);
+                    }
+                }
+                _ = &mut changed => {}
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "Tor bootstrap completed, but no live circuit passed the connectivity probe after {LIVE_PROBE_ATTEMPTS} attempts; refusing to report Connected"
+    ))
+}
+
+/// Open a channel to every candidate concurrently and return successful
+/// bridges ordered by measured warm-up latency. The first element is the best
+/// immediate rotation candidate; the remainder stay available as fallbacks.
+///
+/// cancel-safe: NO — dropping this future aborts the in-flight warm-up set;
+/// callers use that behaviour when Android requests stop during bootstrap.
+async fn warm_bridge_pool(
+    tunnel: TorTunnel,
+    bridges: Vec<BridgeLine>,
+) -> Vec<(BridgeLine, Duration)> {
+    let mut tasks = tokio::task::JoinSet::new();
+    for bridge in bridges {
+        let tunnel = tunnel.clone();
+        tasks.spawn(async move {
+            let started = Instant::now();
+            match tokio::time::timeout(WARM_BRIDGE_TIMEOUT, tunnel.warm_bridge(&bridge)).await {
+                Ok(Ok(())) => Some((bridge, started.elapsed())),
+                Ok(Err(error)) => {
+                    debug!(bridge = %bridge, error = %error, "bridge channel warm-up failed");
+                    None
+                }
+                Err(_) => {
+                    debug!(bridge = %bridge, "bridge channel warm-up timed out");
+                    None
+                }
+            }
+        });
+    }
+
+    let mut warmed = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Some(item)) => warmed.push(item),
+            Ok(None) => {}
+            Err(error) => debug!(error = %error, "bridge channel warm-up task failed"),
+        }
+    }
+    warmed.sort_by_key(|(_, elapsed)| *elapsed);
+    warmed
+}
 
 /// Runs alongside `wait_bootstrapped()` (spawned right before it, aborted right after it
 /// resolves either way). Bootstrap has no built-in stall detection: if every currently-tried
@@ -518,6 +700,7 @@ async fn stall_watchdog(
     tunnel: TorTunnel,
     mut stop_rx: tokio::sync::watch::Receiver<bool>,
     bridges: Vec<BridgeLine>,
+    mut rotation_bridges: Vec<BridgeLine>,
     bridge_health: BridgeHealthContext,
 ) {
     let mut consecutive_failures = 0u32;
@@ -639,6 +822,25 @@ async fn stall_watchdog(
         );
         if let Err(e) = tunnel.terminate_all_channels() {
             warn!(error = %e, "watchdog: terminate_all_channels failed");
+        } else {
+            let candidates = if rotation_bridges.is_empty() {
+                bridges.clone()
+            } else {
+                rotation_bridges.clone()
+            };
+            let warmed = tokio::select! {
+                biased;
+                _ = stop_rx.changed() => return,
+                warmed = warm_bridge_pool(tunnel.clone(), candidates) => warmed,
+            };
+            if !warmed.is_empty() {
+                rotation_bridges = warmed.iter().map(|(bridge, _)| bridge.clone()).collect();
+                persist_warm_results(&warmed, &bridge_health);
+                info!(
+                    warmed = rotation_bridges.len(),
+                    "watchdog: rebuilt parallel bridge rotation pool"
+                );
+            }
         }
         last_reset = Some(now);
         consecutive_failures = 0;
@@ -688,14 +890,38 @@ fn persist_and_rank_probe(
             }
             alive.sort_by(|(ba, la), (bb, lb)| {
                 store
-                    .ok_count(bb)
-                    .cmp(&store.ok_count(ba))
+                    .channel_ok_count(bb)
+                    .cmp(&store.channel_ok_count(ba))
+                    .then_with(|| store.ok_count(bb).cmp(&store.ok_count(ba)))
                     .then_with(|| la.cmp(lb))
             });
         }
         Err(e) => {
             warn!(path = %store_path.display(), error = %e, "could not load bridge health store");
         }
+    }
+}
+
+/// Persist the PT-channel rotation signal without confusing it with an
+/// end-to-end circuit success or a plain TCP probe.
+fn persist_warm_results(warmed: &[(BridgeLine, Duration)], bridge_health: &BridgeHealthContext) {
+    if warmed.is_empty() {
+        return;
+    }
+    let path = BridgeStore::resolve_path(bridge_health.config_path.as_deref());
+    let mut store = match BridgeStore::load(path) {
+        Ok(store) => store,
+        Err(error) => {
+            warn!(error = %error, "could not load bridge health store for warm pool");
+            return;
+        }
+    };
+    let now = OffsetDateTime::now_utc();
+    for (bridge, _) in warmed {
+        store.note_channel_success_at(bridge, now);
+    }
+    if let Err(error) = store.save() {
+        warn!(error = %error, "could not persist bridge rotation ranking");
     }
 }
 

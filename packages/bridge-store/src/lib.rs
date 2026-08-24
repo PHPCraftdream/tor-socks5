@@ -62,6 +62,11 @@ struct Entry {
     /// high count, so this is our persistent **stability** signal (used to
     /// order bridges for arti: more-proven first, then by latency).
     ok_count: u32,
+    /// Number of successful PT/channel warm-ups. Unlike `ok_count`, this is
+    /// recorded only after the transport channel itself accepted a connection.
+    channel_ok_count: u32,
+    /// Most recent successful PT/channel warm-up.
+    last_channel_ok: Option<OffsetDateTime>,
     /// Consecutive **circuit-layer** failure count, observed from arti's
     /// own tracing events (per-guard usability reports). Distinct from
     /// `fails` (TCP-probe layer): a bridge whose TCP/TLS works but whose
@@ -149,6 +154,8 @@ impl BridgeStore {
                     last_latency: meta.last_latency,
                     fails: meta.fails,
                     ok_count: meta.ok_count,
+                    channel_ok_count: meta.channel_ok_count,
+                    last_channel_ok: meta.last_channel_ok,
                     circuit_fails: meta.circuit_fails,
                     last_circuit_observation: meta.last_circuit_observation,
                 };
@@ -178,6 +185,8 @@ impl BridgeStore {
             last_latency: latency,
             fails: 0,
             ok_count: 0,
+            channel_ok_count: 0,
+            last_channel_ok: None,
             circuit_fails: 0,
             last_circuit_observation: now,
         });
@@ -258,6 +267,8 @@ impl BridgeStore {
                         last_latency: Duration::ZERO,
                         fails: 0,
                         ok_count: 0,
+                        channel_ok_count: 0,
+                        last_channel_ok: None,
                         circuit_fails: 1,
                         last_circuit_observation: now,
                     },
@@ -275,6 +286,17 @@ impl BridgeStore {
         if let Some(e) = self.entries.get_mut(&key_of(bridge)) {
             e.circuit_fails = 0;
             e.last_circuit_observation = now;
+        }
+    }
+
+    /// Record a successful pluggable-transport channel warm-up. This is
+    /// deliberately separate from TCP probe and end-to-end circuit counters:
+    /// a warm channel is a strong rotation signal, but it is not proof that a
+    /// multi-hop circuit can carry arbitrary traffic.
+    pub fn note_channel_success_at(&mut self, bridge: &BridgeLine, now: OffsetDateTime) {
+        if let Some(e) = self.entries.get_mut(&key_of(bridge)) {
+            e.channel_ok_count = e.channel_ok_count.saturating_add(1);
+            e.last_channel_ok = Some(now);
         }
     }
 
@@ -309,6 +331,8 @@ impl BridgeStore {
                         last_latency: Duration::ZERO,
                         fails: 1,
                         ok_count: 0,
+                        channel_ok_count: 0,
+                        last_channel_ok: None,
                         circuit_fails: 0,
                         last_circuit_observation: now,
                     },
@@ -367,7 +391,15 @@ impl BridgeStore {
             out.push_str(&e.last_ok.map(format_iso).unwrap_or_else(|| "-".to_string()));
             out.push_str(" latency=");
             out.push_str(&e.last_latency.as_millis().to_string());
-            out.push_str("ms cfails=");
+            out.push_str("ms chseen=");
+            out.push_str(&e.channel_ok_count.to_string());
+            out.push_str(" chok=");
+            out.push_str(
+                &e.last_channel_ok
+                    .map(format_iso)
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+            out.push_str(" cfails=");
             out.push_str(&e.circuit_fails.to_string());
             out.push_str(" cobs=");
             out.push_str(&format_iso(e.last_circuit_observation));
@@ -440,6 +472,14 @@ impl BridgeStore {
             .map_or(0, |e| e.circuit_fails)
     }
 
+    /// Number of successful PT/channel warm-ups for a bridge.
+    #[must_use]
+    pub fn channel_ok_count(&self, bridge: &BridgeLine) -> u32 {
+        self.entries
+            .get(&key_of(bridge))
+            .map_or(0, |e| e.channel_ok_count)
+    }
+
     /// Consecutive TCP-probe failure count for a bridge (0 if unknown, which
     /// also covers "never probed"). `0` means the last probe round saw this
     /// bridge as reachable — the same condition [`Self::alive_count`] counts
@@ -470,8 +510,10 @@ impl BridgeStore {
             .filter(|e| e.fails == 0 && e.ok_count > 0)
             .collect();
         healthy.sort_by(|a, b| {
-            b.ok_count
-                .cmp(&a.ok_count)
+            b.channel_ok_count
+                .cmp(&a.channel_ok_count)
+                .then_with(|| b.last_channel_ok.cmp(&a.last_channel_ok))
+                .then_with(|| b.ok_count.cmp(&a.ok_count))
                 .then(a.last_latency.cmp(&b.last_latency))
         });
         healthy
@@ -490,6 +532,8 @@ struct Meta {
     last_latency: Duration,
     fails: u32,
     ok_count: u32,
+    channel_ok_count: u32,
+    last_channel_ok: Option<OffsetDateTime>,
     circuit_fails: u32,
     last_circuit_observation: OffsetDateTime,
 }
@@ -503,6 +547,8 @@ impl Default for Meta {
             last_latency: Duration::ZERO,
             fails: 0,
             ok_count: 0,
+            channel_ok_count: 0,
+            last_channel_ok: None,
             circuit_fails: 0,
             last_circuit_observation: epoch,
         }
@@ -531,6 +577,14 @@ fn parse_meta_comment(s: &str) -> Option<Meta> {
             } else if let Some(v) = tok.strip_prefix("latency=") {
                 let ms = v.strip_suffix("ms")?.parse::<u64>().ok()?;
                 meta.last_latency = Duration::from_millis(ms);
+            } else if let Some(v) = tok.strip_prefix("chseen=") {
+                meta.channel_ok_count = v.parse().ok()?;
+            } else if let Some(v) = tok.strip_prefix("chok=") {
+                meta.last_channel_ok = if v == "-" {
+                    None
+                } else {
+                    Some(OffsetDateTime::parse(v, &Iso8601::DEFAULT).ok()?)
+                };
             } else if let Some(v) = tok.strip_prefix("cfails=") {
                 meta.circuit_fails = v.parse().ok()?;
             } else if let Some(v) = tok.strip_prefix("cobs=") {
@@ -555,6 +609,8 @@ fn parse_meta_comment(s: &str) -> Option<Meta> {
         last_latency: Duration::from_millis(lat_ms),
         fails: 0,
         ok_count: 1,
+        channel_ok_count: 0,
+        last_channel_ok: None,
         circuit_fails: 0,
         last_circuit_observation: when,
     })
@@ -644,6 +700,8 @@ mod tests {
         let b = bridge(OBFS4_A);
         s.record(b.clone(), Duration::from_millis(10));
         s.record(b.clone(), Duration::from_millis(20));
+        s.note_channel_success_at(&b, OffsetDateTime::now_utc());
+        assert_eq!(s.channel_ok_count(&b), 1);
         assert_eq!(s.ok_count(&b), 2, "two successes accumulate");
         s.save().unwrap();
         let loaded = BridgeStore::load(path).unwrap();
@@ -652,7 +710,23 @@ mod tests {
             2,
             "seen= count persisted across save/load"
         );
+        assert_eq!(loaded.channel_ok_count(&bridge(OBFS4_A)), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn healthiest_bridges_prefers_channel_warm_history() {
+        let mut s = empty();
+        let a = bridge(OBFS4_A);
+        let b = bridge(OBFS4_B);
+        s.record(a.clone(), Duration::from_millis(5));
+        s.record(b.clone(), Duration::from_millis(1));
+        let now = OffsetDateTime::now_utc();
+        s.note_channel_success_at(&a, now);
+        s.note_channel_success_at(&a, now);
+        let ranked = s.healthiest_bridges(2);
+        assert_eq!(ranked.first(), Some(&a));
+        assert_eq!(ranked.get(1), Some(&b));
     }
 
     #[test]
