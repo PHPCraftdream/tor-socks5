@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arti_client::config::pt::TransportConfigBuilder;
-use arti_client::config::{BridgeConfigBuilder, CfgPath, TorClientConfigBuilder};
+use arti_client::config::{BridgeConfigBuilder, CfgPath, Reconfigure, TorClientConfigBuilder};
 use arti_client::{DataStream, TorClient, TorClientConfig};
 use bridge_line::BridgeLine;
 use tor_rtcompat::PreferredRuntime;
@@ -19,6 +19,9 @@ use tor_rtcompat::PreferredRuntime;
 pub enum TorError {
     #[error("failed to bootstrap Tor client: {0}")]
     Bootstrap(#[source] arti_client::Error),
+
+    #[error("failed to reconfigure bridge order: {0}")]
+    Reconfigure(#[source] arti_client::Error),
 
     #[error("failed to connect through Tor to {host}:{port}: {source}")]
     Connect {
@@ -432,6 +435,17 @@ impl TorTunnel {
     /// dropped explicitly afterward.
     pub async fn wait_bootstrapped(&self) -> Result<()> {
         self.inner.bootstrap().await.map_err(TorError::Bootstrap)
+    }
+
+    /// Apply a new bridge order before bootstrap starts. The channel manager may already have
+    /// warmed channels for this same client; reconfiguring the guard set makes the measured
+    /// fastest candidates the first choices instead of leaving the initial bootstrap to the
+    /// original config-file order.
+    pub fn reconfigure_bridges(&self, settings: &Settings) -> Result<()> {
+        let config = build_config(settings)?;
+        self.inner
+            .reconfigure(&config, Reconfigure::AllOrNothing)
+            .map_err(TorError::Reconfigure)
     }
 }
 
