@@ -655,7 +655,7 @@ async fn stall_watchdog(
 /// this round.
 fn persist_and_rank_probe(
     all_bridges: &[BridgeLine],
-    alive: &mut Vec<(BridgeLine, Duration)>,
+    alive: &mut [(BridgeLine, Duration)],
     bridge_health: &BridgeHealthContext,
 ) {
     let store_path = BridgeStore::resolve_path(bridge_health.config_path.as_deref());
