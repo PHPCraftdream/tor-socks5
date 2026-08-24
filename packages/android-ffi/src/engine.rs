@@ -24,7 +24,6 @@ use proxy_config::BridgesConfig;
 use socks5_proto::{self, Reply};
 use time::OffsetDateTime;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
 use tokio::sync::Semaphore;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tracing::{debug, error, info, warn};
@@ -34,6 +33,11 @@ use tracing::{debug, error, info, warn};
 /// Each connection may perform network I/O and hold a Tor circuit, so we bound
 /// concurrency to avoid resource exhaustion under connection floods.
 const MAX_CONCURRENT_CONNECTIONS: usize = 256;
+
+/// Keep channel warm-up bounded even when a bridge refresh has produced thousands of TCP-live
+/// candidates. The full candidate set remains persisted and is re-probed on later runs; only the
+/// best-ranked slice is worth holding open for immediate rotation.
+const MAX_WARM_BRIDGES: usize = 16;
 
 /// Engine status, used internally and formatted for the JNI status protocol.
 #[derive(Debug, Clone, PartialEq)]
@@ -341,73 +345,10 @@ async fn engine_async(
         TorTunnel::create_unbootstrapped_with(settings.clone()).context("creating Tor client")?;
     tunnel.forward_bootstrap_events(callback.clone());
     let stall_handle = tokio::spawn(bootstrap_stall_watchdog(tunnel.clone(), callback.clone()));
-    // Warm every TCP-reachable bridge concurrently. The first successful channel is applied to
-    // the guard configuration immediately; the remaining attempts keep running in the same
-    // task and are collected for rotation without producing one log line per bridge.
-    info!(
-        active = settings.bridges.len(),
-        completed = 0,
-        successful = 0,
-        failed = 0,
-        "parallel bridge warm-up started"
-    );
-    let (first_success_tx, first_success_rx) = oneshot::channel();
-    let warm_handle = tokio::spawn(warm_bridge_pool(
-        tunnel.clone(),
-        settings.bridges.clone(),
-        first_success_tx,
-    ));
-    let first_success = tokio::select! {
-        biased;
-        _ = stop_rx.changed() => {
-            warm_handle.abort();
-            info!("received stop signal while warming bridges");
-            return Ok(());
-        }
-        first = first_success_rx => first.unwrap_or(None),
-    };
-    if let Some((first_bridge, latency)) = first_success {
-        let mut ordered_settings = settings.clone();
-        ordered_settings.bridges = std::iter::once(first_bridge.clone())
-            .chain(
-                settings
-                    .bridges
-                    .iter()
-                    .filter(|bridge| *bridge != &first_bridge)
-                    .cloned(),
-            )
-            .collect();
-        if let Err(error) = tunnel.reconfigure_bridges(&ordered_settings) {
-            // A reconfigure failure must not discard a usable warm channel. Bootstrap can still
-            // proceed with the probe-ranked order and the warm results remain valid rotation
-            // candidates.
-            warn!(error = %error, "could not apply measured bridge order before bootstrap");
-        } else {
-            info!(
-                active = settings.bridges.len(),
-                completed = 1,
-                successful = 1,
-                failed = 0,
-                latency_ms = latency.as_millis() as u64,
-                "selected fastest bridge for initial bootstrap"
-            );
-        }
-    } else {
-        warn!(
-            active = 0,
-            completed = settings.bridges.len(),
-            successful = 0,
-            failed = settings.bridges.len(),
-            "parallel bridge warm-up found no usable channels; falling back to probe order"
-        );
-    }
-
     let bootstrap_result = tokio::select! {
         biased;
         _ = stop_rx.changed() => {
             stall_handle.abort();
-            warm_handle.abort();
-            let _ = warm_handle.await;
             info!("received stop signal while bootstrapping");
             return Ok(());
         }
@@ -415,8 +356,6 @@ async fn engine_async(
     };
     stall_handle.abort();
     if let Err(error) = bootstrap_result {
-        warm_handle.abort();
-        let _ = warm_handle.await;
         callback(BootstrapEvent::Failed(format!("{:#}", error)));
         return Err(error).context("failed to bootstrap Tor");
     }
@@ -428,12 +367,24 @@ async fn engine_async(
     }
     info!("live Tor circuit verified");
 
-    let warmed_bridges = match warm_handle.await {
-        Ok(warmed) => warmed,
-        Err(error) => {
-            warn!(error = %error, "parallel bridge warm-up task failed");
-            Vec::new()
+    // A TorClient created with `create_unbootstrapped` is not in Arti's `running` state yet;
+    // `TorTunnel::warm_bridge` consequently cannot access its channel manager before
+    // `wait_bootstrapped` completes. The TCP probe above already sorted the bootstrap order, so
+    // bootstrap first and only then warm a bounded top slice for channel rotation.
+    info!(
+        active = settings.bridges.len().min(MAX_WARM_BRIDGES),
+        completed = 0,
+        successful = 0,
+        failed = 0,
+        "parallel bridge warm-up started"
+    );
+    let warmed_bridges = tokio::select! {
+        biased;
+        _ = stop_rx.changed() => {
+            info!("received stop signal while warming bridges");
+            return Ok(());
         }
+        warmed = warm_bridge_pool(tunnel.clone(), settings.bridges.clone()) => warmed,
     };
     persist_warm_results(&warmed_bridges, &bridge_health);
     let rotation_bridges = warmed_bridges
@@ -650,8 +601,8 @@ async fn verify_live_circuit(
 async fn warm_bridge_pool(
     tunnel: TorTunnel,
     bridges: Vec<BridgeLine>,
-    first_success_tx: oneshot::Sender<Option<(BridgeLine, Duration)>>,
 ) -> Vec<(BridgeLine, Duration)> {
+    let bridges = bridges.into_iter().take(MAX_WARM_BRIDGES);
     let total = bridges.len();
     let mut tasks = tokio::task::JoinSet::new();
     for bridge in bridges {
@@ -660,8 +611,18 @@ async fn warm_bridge_pool(
             let started = Instant::now();
             match tokio::time::timeout(WARM_BRIDGE_TIMEOUT, tunnel.warm_bridge(&bridge)).await {
                 Ok(Ok(())) => Some((bridge, started.elapsed())),
-                Ok(Err(_)) => None,
-                Err(_) => None,
+                Ok(Err(error)) => {
+                    debug!(bridge = %bridge.addr, error = %error, "bridge warm-up failed");
+                    None
+                }
+                Err(_) => {
+                    debug!(
+                        bridge = %bridge.addr,
+                        timeout = ?WARM_BRIDGE_TIMEOUT,
+                        "bridge warm-up timed out"
+                    );
+                    None
+                }
             }
         });
     }
@@ -669,18 +630,15 @@ async fn warm_bridge_pool(
     let mut warmed = Vec::new();
     let mut completed = 0usize;
     let mut failed = 0usize;
-    let mut first_success_tx = Some(first_success_tx);
     while let Some(result) = tasks.join_next().await {
         completed += 1;
         match result {
             Ok(Some(item)) => {
-                if let Some(sender) = first_success_tx.take() {
-                    let _ = sender.send(Some(item.clone()));
-                }
                 warmed.push(item);
             }
             Ok(None) => failed += 1,
-            Err(_error) => {
+            Err(error) => {
+                debug!(error = %error, "parallel bridge warm-up task failed");
                 failed += 1;
             }
         }
@@ -691,9 +649,6 @@ async fn warm_bridge_pool(
             failed,
             "parallel bridge warm-up progress"
         );
-    }
-    if let Some(sender) = first_success_tx.take() {
-        let _ = sender.send(None);
     }
     warmed.sort_by_key(|(_, elapsed)| *elapsed);
     info!(
@@ -916,11 +871,10 @@ async fn stall_watchdog(
             } else {
                 rotation_bridges.clone()
             };
-            let (first_success_tx, _first_success_rx) = oneshot::channel();
             let warmed = tokio::select! {
                 biased;
                 _ = stop_rx.changed() => return,
-                warmed = warm_bridge_pool(tunnel.clone(), candidates, first_success_tx) => warmed,
+                warmed = warm_bridge_pool(tunnel.clone(), candidates) => warmed,
             };
             if !warmed.is_empty() {
                 rotation_bridges = warmed.iter().map(|(bridge, _)| bridge.clone()).collect();
