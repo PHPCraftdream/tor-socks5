@@ -69,8 +69,12 @@ pub type Result<T, E = TorError> = std::result::Result<T, E>;
 /// underlying watch stream coalesces and may repeat values.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BootstrapEvent {
-    /// Rough progress estimate, `0.0..=1.0` (arti's `as_frac()`).
-    Progress(f32),
+    /// Rough progress estimate (`0.0..=1.0`, arti's `as_frac()`) plus arti's own
+    /// human-readable phase description (`BootstrapStatus`'s `Display` impl, e.g.
+    /// "15%: connecting successfully; directory is fetching a consensus") -- the exact text
+    /// already visible in this crate's own tracing logs, now also handed to embedders instead
+    /// of being dropped at this boundary.
+    Progress(f32, String),
     /// The client is ready to carry traffic (`ready_for_traffic()`).
     Ready,
     /// arti currently reports it cannot make forward progress
@@ -144,7 +148,7 @@ fn emit_bootstrap_event(
         on_event(BootstrapEvent::Ready);
         true
     } else {
-        on_event(BootstrapEvent::Progress(status.as_frac()));
+        on_event(BootstrapEvent::Progress(status.as_frac(), status.to_string()));
         if let Some(blockage) = status.blocked() {
             on_event(BootstrapEvent::Blocked(blockage.to_string()));
         }
@@ -813,7 +817,7 @@ mod tests {
         let collected = events.lock().unwrap();
         assert_eq!(collected.len(), 1, "should emit exactly one event");
         assert!(
-            matches!(collected[0], BootstrapEvent::Progress(0.0)),
+            matches!(collected[0], BootstrapEvent::Progress(f, _) if f == 0.0),
             "default status should emit Progress(0.0), got: {:?}",
             collected[0]
         );
@@ -848,7 +852,7 @@ mod tests {
             .expect("timeout waiting for initial event")
             .expect("channel should not close");
         assert!(
-            matches!(event, BootstrapEvent::Progress(_)),
+            matches!(event, BootstrapEvent::Progress(_, _)),
             "first event should be Progress, got: {:?}",
             event
         );

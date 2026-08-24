@@ -24,6 +24,7 @@ socks5-proto = { path = "../socks5-proto" }
 bridge-probe = { path = "../bridge-probe" }
 bridge-fetcher = { path = "../bridge-fetcher" }
 bridge-store = { path = "../bridge-store" }
+bridge-line.workspace = true
 tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["compat"] }
 anyhow = { workspace = true }

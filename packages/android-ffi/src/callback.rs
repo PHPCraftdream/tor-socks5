@@ -64,14 +64,22 @@ impl JavaCallback {
         let obj = self.global.as_obj();
 
         let result = match event {
-            BootstrapEvent::Progress(fraction) => {
-                // Call `void onProgress(float fraction)` with signature "(F)V"
+            BootstrapEvent::Progress(fraction, status_text) => {
+                // Call `void onProgress(float fraction, String statusText)` with signature
+                // "(FLjava/lang/String;)V"
                 let clamped = fraction.clamp(0.0, 1.0);
+                let jstr = match env.new_string(&status_text) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(error = %e, "failed to create Java string for Progress event");
+                        return;
+                    }
+                };
                 env.call_method(
                     obj,
                     "onProgress",
-                    "(F)V",
-                    &[JValue::Float(clamped as jfloat)],
+                    "(FLjava/lang/String;)V",
+                    &[JValue::Float(clamped as jfloat), JValue::Object(&jstr)],
                 )
             }
             BootstrapEvent::Ready => {

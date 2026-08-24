@@ -18,6 +18,7 @@ use crate::callback::JavaCallback;
 use anyhow::{Context, Result};
 use arti_wrapper::{BootstrapEvent, BootstrapEventCallback, TorTunnel};
 use auth::AuthState;
+use bridge_line::BridgeLine;
 use bridge_store::BridgeStore;
 use proxy_config::BridgesConfig;
 use socks5_proto::{self, Reply};
@@ -77,6 +78,7 @@ pub(crate) struct EngineHandle {
 /// Bundled into one struct so threading it through `engine_main`/
 /// `engine_async` doesn't push either function over clippy's
 /// `too_many_arguments` threshold.
+#[derive(Clone)]
 pub(crate) struct BridgeHealthContext {
     /// Path to the ktav config file (`tor-socks5.ktav`), used to derive the
     /// sibling `<stem>.alive-bridges.log` health-store path — see
@@ -215,7 +217,7 @@ pub(crate) fn engine_main(
 
 /// Async engine body, runs inside a Tokio runtime.
 async fn engine_async(
-    settings: arti_wrapper::Settings,
+    mut settings: arti_wrapper::Settings,
     listen_addr: SocketAddr,
     auth_state: Option<Arc<AuthState>>,
     mut stop_rx: tokio::sync::watch::Receiver<bool>,
@@ -230,12 +232,21 @@ async fn engine_async(
         move |event| {
             // Update status based on event
             match &event {
-                BootstrapEvent::Progress(fraction) => {
+                BootstrapEvent::Progress(fraction, _status_text) => {
                     let pct = (fraction.clamp(0.0, 1.0) * 100.0).round() as u8;
                     set_final_status(EngineStatus::Starting(pct));
                 }
                 BootstrapEvent::Ready => {
-                    // Status will be set to On after listener binds
+                    // Not forwarded to Java here: this closure runs on a task spawned by
+                    // `TorTunnel::forward_bootstrap_events`, independent of `engine_async`'s
+                    // own `wait_bootstrapped().await` below -- there is no ordering guarantee
+                    // between the two, so emitting Ready here can call Java's onReady() before
+                    // `set_final_status(EngineStatus::On(..))` runs. A caller that reacts to
+                    // onReady() by immediately calling nativeGetStatus() can then observe a
+                    // stale "Starting:N" even though Tor is already up. `engine_async` sets the
+                    // status and emits this event itself, in that order, right after the SOCKS
+                    // listener is actually bound.
+                    return;
                 }
                 BootstrapEvent::Blocked(_) => {
                     // Blocked is non-fatal, don't change status
@@ -252,97 +263,87 @@ async fn engine_async(
         }
     });
 
-    // Probe bridges for reachability (5s timeout per bridge). Cancellable:
-    // without this select!, a stop signal received while probing (which can
-    // itself take up to 5s per bridge) is not observed until the accept-loop
-    // select! further down, which is never reached if bridges never come up
-    // -- nativeStop would then block for its full 10s timeout instead of
-    // returning immediately.
-    info!(
-        count = settings.bridges.len(),
-        "probing bridges for reachability"
-    );
-    let mut alive = tokio::select! {
-        biased;
-        _ = stop_rx.changed() => {
-            info!("received stop signal while probing bridges");
-            return Ok(());
-        }
-        alive = bridge_probe::probe_and_sort(settings.bridges.clone(), Duration::from_secs(5)) => alive,
-    };
+    // Full, pristine set of configured bridges -- captured before the probe below narrows
+    // `settings.bridges` down to just the ones alive at bootstrap time (see the reassignment
+    // a few lines down). `stall_watchdog`'s periodic re-probe (docs/circuit-speed-plan.md's
+    // Tier 1) needs the *original* list: a bridge dead at bootstrap can come back later, and
+    // that is exactly the information the persisted ranking should pick up for the next
+    // connect.
+    let all_configured_bridges = settings.bridges.clone();
 
-    // Persist this probe round's reachability outcome to the same
-    // `<config-stem>.alive-bridges.log` health store the CLI daemon uses
-    // (`bridge-store` crate), then re-rank the reachable set by historical
-    // stability (`ok_count`, ties broken by latency) ahead of a bridge seen
-    // reachable for the first time. Best-effort throughout: a missing or
-    // unwritable store must never fail the bootstrap, it just forfeits the
-    // ranking boost for this run.
-    let store_path = BridgeStore::resolve_path(bridge_health.config_path.as_deref());
-    match BridgeStore::load(store_path.clone()) {
-        Ok(mut store) => {
-            let now = OffsetDateTime::now_utc();
-            let fail_window = Duration::from_secs(
-                bridge_health
-                    .bridges_cfg
-                    .fail_window_mins
-                    .saturating_mul(60),
-            );
-            store.note_probe_round(
-                &settings.bridges,
-                &alive,
-                now,
-                fail_window,
-                bridge_health.bridges_cfg.max_fails,
-                bridge_health.bridges_cfg.max_circuit_fails,
-            );
-            if let Err(e) = store.save() {
-                warn!(path = %store_path.display(), error = %e, "could not persist bridge health store");
+    // Probe bridges for reachability (5s timeout per bridge), but only when bridges were
+    // actually configured -- a direct connection (no bridges/PT at all) has nothing to probe,
+    // and skipping this block entirely (rather than probing an empty list) matters: probing
+    // zero bridges trivially returns zero alive ones, and the "alive.is_empty()" check below
+    // would then reject a direct connection outright, even though "no bridges configured" was
+    // the user's intent, not a reachability failure.
+    if !settings.bridges.is_empty() {
+        // Cancellable: without this select!, a stop signal received while probing (which can
+        // itself take up to 5s per bridge) is not observed until the accept-loop select!
+        // further down, which is never reached if bridges never come up -- nativeStop would
+        // then block for its full 10s timeout instead of returning immediately.
+        info!(
+            count = settings.bridges.len(),
+            "probing bridges for reachability"
+        );
+        let mut alive = tokio::select! {
+            biased;
+            _ = stop_rx.changed() => {
+                info!("received stop signal while probing bridges");
+                return Ok(());
             }
-            alive.sort_by(|(ba, la), (bb, lb)| {
-                store
-                    .ok_count(bb)
-                    .cmp(&store.ok_count(ba))
-                    .then_with(|| la.cmp(lb))
-            });
+            alive = bridge_probe::probe_and_sort(settings.bridges.clone(), Duration::from_secs(5)) => alive,
+        };
+
+        persist_and_rank_probe(&settings.bridges, &mut alive, &bridge_health);
+
+        if alive.is_empty() {
+            return Err(anyhow::anyhow!(
+                "no reachable bridge responded to a TCP probe within 5s (configured bridges)"
+            ));
         }
-        Err(e) => {
-            warn!(path = %store_path.display(), error = %e, "could not load bridge health store");
-        }
+
+        info!(
+            alive = alive.len(),
+            total = settings.bridges.len(),
+            "bridge probe complete"
+        );
+
+        // Rebuild settings with only reachable bridges (fastest first)
+        settings.bridges = alive.into_iter().map(|(bridge, _)| bridge).collect();
     }
-
-    if alive.is_empty() {
-        return Err(anyhow::anyhow!(
-            "no reachable bridge responded to a TCP probe within 5s (configured bridges)"
-        ));
-    }
-
-    info!(
-        alive = alive.len(),
-        total = settings.bridges.len(),
-        "bridge probe complete"
-    );
-
-    // Rebuild settings with only reachable bridges (fastest first)
-    let mut settings = settings;
-    settings.bridges = alive.into_iter().map(|(bridge, _)| bridge).collect();
 
     // Bootstrap Tor with event notifications. Cancellable for the same
     // reason as the bridge probe above -- bootstrap can run for tens of
     // seconds, and a stop signal received mid-bootstrap must tear the
     // half-built `TorTunnel` down immediately rather than being ignored
     // until bootstrap finishes or times out on its own.
+    //
+    // Manual two-step (create_unbootstrapped + wait_bootstrapped) instead of the one-shot
+    // bootstrap_with_notify: we need the TorTunnel handle DURING the wait so
+    // bootstrap_stall_watchdog can call terminate_all_channels() on it. Bootstrap has no
+    // built-in stall detection of its own -- if every candidate bridge's PT/TLS handshake
+    // fails (bridges dying deeper than the plain TCP probe already ran can catch), arti can
+    // sit retrying the same small pool indefinitely at a fixed percentage with nothing to
+    // force a fresh attempt.
     info!("bootstrapping Tor client...");
-    let tunnel = tokio::select! {
+    let tunnel = TorTunnel::create_unbootstrapped_with(settings).context("creating Tor client")?;
+    tunnel.forward_bootstrap_events(callback.clone());
+    let stall_handle = tokio::spawn(bootstrap_stall_watchdog(tunnel.clone(), callback.clone()));
+    let bootstrap_result = tokio::select! {
         biased;
         _ = stop_rx.changed() => {
+            stall_handle.abort();
             info!("received stop signal while bootstrapping");
             return Ok(());
         }
-        result = TorTunnel::bootstrap_with_notify(settings, Some(callback.clone())) => {
-            result.context("failed to bootstrap Tor")?
-        }
+        result = tunnel.wait_bootstrapped() => result,
     };
+    stall_handle.abort();
+    if let Err(error) = bootstrap_result {
+        callback(BootstrapEvent::Failed(format!("{:#}", error)));
+        return Err(error).context("failed to bootstrap Tor");
+    }
     info!("Tor is ready");
 
     // Bind SOCKS5 listener
@@ -356,8 +357,11 @@ async fn engine_async(
 
     info!(listen_addr = %actual_addr, "SOCKS5 proxy is listening");
 
-    // Set status to On
+    // Set status to On, then tell Java -- in that order, so nativeGetStatus() never lags
+    // behind onReady() (see the suppressed BootstrapEvent::Ready arm above for why the
+    // event isn't forwarded from there instead).
     set_final_status(EngineStatus::On(actual_addr));
+    java_callback.emit(BootstrapEvent::Ready);
     set_current_tunnel(Some(tunnel.clone()));
 
     // Stall watchdog: a real network interruption (Wi-Fi handoff, carrier
@@ -366,7 +370,12 @@ async fn engine_async(
     // arti has no automatic "rebuild everything" trigger of its own. Runs
     // for the lifetime of this connection; cancelled by the same stop
     // signal as the accept loop below.
-    tokio::spawn(stall_watchdog(tunnel.clone(), stop_rx.clone()));
+    tokio::spawn(stall_watchdog(
+        tunnel.clone(),
+        stop_rx.clone(),
+        all_configured_bridges,
+        bridge_health.clone(),
+    ));
 
     // Create semaphore for concurrency limiting
     let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
@@ -415,19 +424,109 @@ const WATCHDOG_FAILURES_BEFORE_RESET: u32 = 3;
 /// doesn't get hammered with resets that can't help it.
 const WATCHDOG_RESET_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
-/// Background task, spawned once the tunnel reaches `On`: periodically
-/// probes Tor Project's own connectivity-check endpoint through the tunnel
-/// (the same target Tor Browser itself uses for this). After
-/// [`WATCHDOG_FAILURES_BEFORE_RESET`] consecutive failures it calls
-/// [`TorTunnel::terminate_all_channels`] to force arti to rebuild its
-/// channels, giving the guard/circuit managers a clean slate -- mirrors the
-/// CLI daemon's `tor_watchdog.rs`, scoped down to a single canary target
-/// instead of replaying real traffic history (Android's accept loop doesn't
-/// track per-connection success/failure the way the CLI's `TorHealth` does).
+/// Per-bridge timeout for the periodic re-probe, matching the bootstrap-time
+/// probe in `engine_async`.
+const BRIDGE_REPROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Timeout for the whole auto-fetch-from-sources call, matching
+/// `nativeRefreshBridges`'s manual equivalent (`lib.rs`).
+const AUTO_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often [`bootstrap_stall_watchdog`] checks bootstrap progress.
+const BOOTSTRAP_STALL_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+/// How long the bootstrap percentage can stay unchanged before this forces a channel reset.
+const BOOTSTRAP_STALL_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Runs alongside `wait_bootstrapped()` (spawned right before it, aborted right after it
+/// resolves either way). Bootstrap has no built-in stall detection: if every currently-tried
+/// bridge fails at the PT/TLS layer (deeper than the plain TCP reachability probe already run
+/// before bootstrap started), arti can sit retrying the same small pool indefinitely at a
+/// fixed percentage. Polls the global `EngineStatus` (the same one `nativeGetStatus` reads)
+/// every [`BOOTSTRAP_STALL_CHECK_INTERVAL`]; if the percentage hasn't moved for
+/// [`BOOTSTRAP_STALL_TIMEOUT`], calls [`TorTunnel::terminate_all_channels`] to force arti to
+/// drop its dead channels and retry fresh ones, and reports it via `BootstrapEvent::Blocked`
+/// (already surfaced to the user as a log line on the Kotlin side) so a stall is visible
+/// instead of just a frozen percentage.
+async fn bootstrap_stall_watchdog(tunnel: TorTunnel, callback: BootstrapEventCallback) {
+    let mut last_percent: Option<u8> = None;
+    let mut last_change = Instant::now();
+    loop {
+        tokio::time::sleep(BOOTSTRAP_STALL_CHECK_INTERVAL).await;
+        let current_percent = match crate::get_status().lock().unwrap_or_else(|p| p.into_inner()).clone() {
+            EngineStatus::Starting(pct) => pct,
+            _ => return, // no longer bootstrapping (ready, stopped, or errored)
+        };
+        if last_percent != Some(current_percent) {
+            last_percent = Some(current_percent);
+            last_change = Instant::now();
+            continue;
+        }
+        if last_change.elapsed() < BOOTSTRAP_STALL_TIMEOUT {
+            continue;
+        }
+        warn!(
+            percent = current_percent,
+            stalled_for_secs = last_change.elapsed().as_secs(),
+            "bootstrap stalled, forcing a channel reset"
+        );
+        callback(BootstrapEvent::Blocked(format!(
+            "stalled at {current_percent}% for {}s, retrying with fresh channels",
+            last_change.elapsed().as_secs()
+        )));
+        if let Err(e) = tunnel.terminate_all_channels() {
+            warn!(error = %e, "bootstrap watchdog: terminate_all_channels failed");
+        }
+        last_change = Instant::now();
+    }
+}
+
+/// Background task, spawned once the tunnel reaches `On`, with three independent jobs on
+/// their own cadences:
+///
+/// 1. Every [`WATCHDOG_PROBE_INTERVAL`], probes Tor Project's own connectivity-check endpoint
+///    through the tunnel (the same target Tor Browser itself uses for this). After
+///    [`WATCHDOG_FAILURES_BEFORE_RESET`] consecutive failures it calls
+///    [`TorTunnel::terminate_all_channels`] to force arti to rebuild its channels, giving the
+///    guard/circuit managers a clean slate -- mirrors the CLI daemon's `tor_watchdog.rs`,
+///    scoped down to a single canary target instead of replaying real traffic history
+///    (Android's accept loop doesn't track per-connection success/failure the way the CLI's
+///    `TorHealth` does).
+/// 2. Every `bridge_health.bridges_cfg.recheck_interval_mins` minutes (`0` disables this and
+///    job 3 entirely, deliberately far longer than [`WATCHDOG_PROBE_INTERVAL`] -- bridges have
+///    their own flood protection, and re-probing the same set too often risks tripping it, see
+///    `arti-wrapper`'s `build_config` doc for the earlier incident that taught this fork to be
+///    conservative here), re-probes `bridges` for reachability and persists the outcome via
+///    [`persist_and_rank_probe`] -- the same store `engine_async` writes to at bootstrap. This
+///    session's already-chosen bridge/circuit is unaffected; the point is keeping the
+///    persisted ranking fresh so the *next* connect starts from the genuinely fastest known
+///    bridge (docs/circuit-speed-plan.md's Tier 1) instead of whatever was fastest whenever
+///    bootstrap last probed.
+/// 3. Immediately after job 2, if the reachable count fell below
+///    `bridge_health.bridges_cfg.min_alive` and `auto_fetch` is enabled, fetches fresh
+///    candidates from `bridges_cfg.sources` over this *already-live* tunnel -- the same fetch
+///    `nativeRefreshBridges` does on a manual tap, just triggered automatically instead of only
+///    from the menu (docs/android-bridge-freshness-plan.md's Phase 2). Newly found bridges are
+///    handed to Kotlin via [`take_auto_fetched_bridges`]/`nativeTakeAutoFetchedBridges`, mirroring
+///    [`take_pruned_bridges`]'s pattern -- this task has no access to `Prefs.bridgesList`, only
+///    Kotlin does.
+///
 /// Exits when `stop_rx` fires.
-async fn stall_watchdog(tunnel: TorTunnel, mut stop_rx: tokio::sync::watch::Receiver<bool>) {
+async fn stall_watchdog(
+    tunnel: TorTunnel,
+    mut stop_rx: tokio::sync::watch::Receiver<bool>,
+    bridges: Vec<BridgeLine>,
+    bridge_health: BridgeHealthContext,
+) {
     let mut consecutive_failures = 0u32;
     let mut last_reset: Option<Instant> = None;
+    // Bootstrap already probed once; the first periodic re-probe is due one full interval
+    // from now, not immediately.
+    let mut last_bridge_reprobe = Instant::now();
+    let reprobe_interval = Duration::from_secs(
+        bridge_health
+            .bridges_cfg
+            .recheck_interval_mins
+            .saturating_mul(60),
+    );
 
     loop {
         tokio::select! {
@@ -437,6 +536,66 @@ async fn stall_watchdog(tunnel: TorTunnel, mut stop_rx: tokio::sync::watch::Rece
         }
         if *stop_rx.borrow() {
             return;
+        }
+
+        if !bridges.is_empty()
+            && !reprobe_interval.is_zero()
+            && last_bridge_reprobe.elapsed() >= reprobe_interval
+        {
+            let mut alive = tokio::select! {
+                biased;
+                _ = stop_rx.changed() => return,
+                alive = bridge_probe::probe_and_sort(bridges.clone(), BRIDGE_REPROBE_TIMEOUT) => alive,
+            };
+            persist_and_rank_probe(&bridges, &mut alive, &bridge_health);
+            debug!(
+                alive = alive.len(),
+                total = bridges.len(),
+                "watchdog: periodic bridge re-probe complete"
+            );
+
+            if alive.len() < bridge_health.bridges_cfg.min_alive
+                && bridge_health.bridges_cfg.auto_fetch
+                && !bridge_health.bridges_cfg.sources.is_empty()
+            {
+                let sources: Vec<bridge_fetcher::Source> = bridge_health
+                    .bridges_cfg
+                    .sources
+                    .iter()
+                    .map(|s| bridge_fetcher::Source {
+                        label: s.label.clone(),
+                        url: s.url.clone(),
+                        headers: s.headers.clone(),
+                        cookies: s.cookies.clone(),
+                    })
+                    .collect();
+                let max_body_bytes = bridge_health.bridges_cfg.max_body_mib.saturating_mul(1024 * 1024);
+                info!(
+                    alive = alive.len(),
+                    min_alive = bridge_health.bridges_cfg.min_alive,
+                    "watchdog: alive bridge pool is thin, auto-fetching more"
+                );
+                let (fetched, outcomes) = tokio::select! {
+                    biased;
+                    _ = stop_rx.changed() => return,
+                    result = bridge_fetcher::fetch_all(&tunnel, &sources, AUTO_FETCH_TIMEOUT, max_body_bytes) => result,
+                };
+                for outcome in &outcomes {
+                    if let Some(err) = &outcome.error {
+                        warn!(label = %outcome.label, error = %err, "watchdog: bridge auto-fetch source failed");
+                    } else {
+                        info!(
+                            label = %outcome.label,
+                            bridges = outcome.bridges_extracted,
+                            "watchdog: bridge auto-fetch source OK"
+                        );
+                    }
+                }
+                let (unique, duplicates) = bridge_fetcher::dedup_bridges(fetched);
+                info!(unique = unique.len(), duplicates, "watchdog: bridge auto-fetch complete");
+                record_auto_fetched_bridges(unique);
+            }
+            last_bridge_reprobe = Instant::now();
         }
 
         let probe = tokio::time::timeout(
@@ -473,6 +632,60 @@ async fn stall_watchdog(tunnel: TorTunnel, mut stop_rx: tokio::sync::watch::Rece
         }
         last_reset = Some(now);
         consecutive_failures = 0;
+    }
+}
+
+/// Persist a probe round's reachability outcome to the shared bridge-health store
+/// (`<config-stem>.alive-bridges.log`, same file the CLI daemon uses) and re-sort `alive` by
+/// historical stability (`ok_count`, ties broken by latency) ahead of a bridge seen reachable
+/// for the first time. Shared between the bootstrap-time probe in `engine_async` and
+/// `stall_watchdog`'s periodic re-probe -- both need the identical persist-and-rank step, just
+/// with different cancellation/error handling around the probe itself. Best-effort throughout:
+/// a missing or unwritable store never fails the caller, it just forfeits the ranking boost for
+/// this round.
+fn persist_and_rank_probe(
+    all_bridges: &[BridgeLine],
+    alive: &mut Vec<(BridgeLine, Duration)>,
+    bridge_health: &BridgeHealthContext,
+) {
+    let store_path = BridgeStore::resolve_path(bridge_health.config_path.as_deref());
+    match BridgeStore::load(store_path.clone()) {
+        Ok(mut store) => {
+            let now = OffsetDateTime::now_utc();
+            let fail_window = Duration::from_secs(
+                bridge_health
+                    .bridges_cfg
+                    .fail_window_mins
+                    .saturating_mul(60),
+            );
+            let pruned = store.note_probe_round(
+                all_bridges,
+                alive,
+                now,
+                fail_window,
+                bridge_health.bridges_cfg.max_fails,
+                bridge_health.bridges_cfg.max_circuit_fails,
+            );
+            if !pruned.is_empty() {
+                info!(
+                    count = pruned.len(),
+                    "bridges crossed max_fails/max_circuit_fails, pruning"
+                );
+                record_pruned_bridges(pruned);
+            }
+            if let Err(e) = store.save() {
+                warn!(path = %store_path.display(), error = %e, "could not persist bridge health store");
+            }
+            alive.sort_by(|(ba, la), (bb, lb)| {
+                store
+                    .ok_count(bb)
+                    .cmp(&store.ok_count(ba))
+                    .then_with(|| la.cmp(lb))
+            });
+        }
+        Err(e) => {
+            warn!(path = %store_path.display(), error = %e, "could not load bridge health store");
+        }
     }
 }
 
@@ -612,6 +825,59 @@ pub(crate) fn get_current_tunnel() -> Option<TorTunnel> {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clone()
+}
+
+/// Bridges `persist_and_rank_probe` has pruned (crossed `max_fails`/`max_circuit_fails`)
+/// since the last time Kotlin drained them via `nativeTakePrunedBridges`
+/// (docs/android-bridge-freshness-plan.md's Phase 1). `Prefs.bridgesList` on the Kotlin side
+/// is the actual source of truth for what gets probed/bootstrapped next -- this is just the
+/// handoff channel, mirroring `CURRENT_TUNNEL`'s pattern.
+static PRUNED_BRIDGES: OnceLock<Mutex<Vec<BridgeLine>>> = OnceLock::new();
+
+fn record_pruned_bridges(mut pruned: Vec<BridgeLine>) {
+    if pruned.is_empty() {
+        return;
+    }
+    PRUNED_BRIDGES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .append(&mut pruned);
+}
+
+/// Drain and return every bridge pruned since the last call. Called from the
+/// `nativeTakePrunedBridges` JNI entry point (`lib.rs`).
+pub(crate) fn take_pruned_bridges() -> Vec<BridgeLine> {
+    let Some(lock) = PRUNED_BRIDGES.get() else {
+        return Vec::new();
+    };
+    std::mem::take(&mut *lock.lock().unwrap_or_else(|p| p.into_inner()))
+}
+
+/// Bridges `stall_watchdog`'s auto-fetch has found (docs/android-bridge-freshness-plan.md's
+/// Phase 2) since the last time Kotlin drained them via `nativeTakeAutoFetchedBridges`. Same
+/// handoff pattern as [`PRUNED_BRIDGES`] -- `stall_watchdog` has no access to
+/// `Prefs.bridgesList`, only Kotlin does.
+static AUTO_FETCHED_BRIDGES: OnceLock<Mutex<Vec<BridgeLine>>> = OnceLock::new();
+
+fn record_auto_fetched_bridges(mut fetched: Vec<BridgeLine>) {
+    if fetched.is_empty() {
+        return;
+    }
+    AUTO_FETCHED_BRIDGES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .append(&mut fetched);
+}
+
+/// Drain and return every bridge auto-fetched since the last call. Called from the
+/// `nativeTakeAutoFetchedBridges` JNI entry point (`lib.rs`).
+pub(crate) fn take_auto_fetched_bridges() -> Vec<BridgeLine> {
+    let Some(lock) = AUTO_FETCHED_BRIDGES.get() else {
+        return Vec::new();
+    };
+    std::mem::take(&mut *lock.lock().unwrap_or_else(|p| p.into_inner()))
 }
 
 #[cfg(test)]

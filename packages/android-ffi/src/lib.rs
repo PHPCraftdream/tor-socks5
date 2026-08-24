@@ -395,6 +395,7 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
             bridges: parsed_bridges.bridges,
             pt_binary,
             state_dir: Some(state_dir),
+            ..Default::default()
         };
         // Captured before `loaded`/`cfg` go out of scope: the engine thread
         // needs its own owned copies to persist/rank bridge health via the
@@ -559,6 +560,78 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
         let text = status.to_string();
         env.new_string(text).map(|s| s.into_raw()).map_err(|e| {
             error!("failed to create Java string for status: {e}");
+            e
+        })
+    })) {
+        Ok(Ok(jstr)) => jstr,
+        Ok(Err(_)) | Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// JNI entry point: `nativeTakePrunedBridges()`
+///
+/// Drains and returns the bridges the engine has pruned (crossed `max_fails`/
+/// `max_circuit_fails` during a TCP-probe round -- see `BridgeStore::note_probe_round`) since
+/// the last call, newline-joined one `BridgeLine` per line. Returns an empty string if none
+/// have been pruned since the last drain. `Prefs.bridgesList` on the Kotlin side stays the
+/// actual source of truth for what gets probed/bootstrapped next -- this call is purely the
+/// handoff so Kotlin can remove these specific lines from that list (subject to its own "never
+/// prune below a floor" check) and log the removal to the connect-screen journal. See
+/// docs/android-bridge-freshness-plan.md's Phase 1.
+///
+/// - **Threading:** May be called from any thread. Cheap (a mutex lock and a `mem::take`), safe
+///   to call on every `start()`.
+/// - **Error Signaling:** Does not throw. Returns `null` only on a Java string allocation
+///   failure; an empty string (not `null`) means "nothing pruned since the last call".
+#[no_mangle]
+pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativeTakePrunedBridges(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    match panic::catch_unwind(AssertUnwindSafe(|| {
+        let pruned = engine::take_pruned_bridges();
+        let joined = pruned
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        env.new_string(joined).map(|s| s.into_raw()).map_err(|e| {
+            error!("failed to create Java string for pruned bridges: {e}");
+            e
+        })
+    })) {
+        Ok(Ok(jstr)) => jstr,
+        Ok(Err(_)) | Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// JNI entry point: `nativeTakeAutoFetchedBridges()`
+///
+/// Drains and returns bridges the engine's own background watchdog auto-fetched (when the
+/// alive pool fell below `bridges.min_alive` and `bridges.auto_fetch` is enabled -- see
+/// `engine::stall_watchdog`) since the last call, newline-joined one `BridgeLine` per line, or
+/// an empty string if none. Same shape and same "only helps the *next* start" caveat as
+/// `nativeRefreshBridges`'s manual equivalent, just triggered automatically. See
+/// docs/android-bridge-freshness-plan.md's Phase 2.
+///
+/// - **Threading:** May be called from any thread. Cheap (a mutex lock and a `mem::take`), safe
+///   to call on every `start()` alongside `nativeTakePrunedBridges`.
+/// - **Error Signaling:** Does not throw. Returns `null` only on a Java string allocation
+///   failure; an empty string (not `null`) means "nothing auto-fetched since the last call".
+#[no_mangle]
+pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativeTakeAutoFetchedBridges(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    match panic::catch_unwind(AssertUnwindSafe(|| {
+        let fetched = engine::take_auto_fetched_bridges();
+        let joined = fetched
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        env.new_string(joined).map(|s| s.into_raw()).map_err(|e| {
+            error!("failed to create Java string for auto-fetched bridges: {e}");
             e
         })
     })) {
