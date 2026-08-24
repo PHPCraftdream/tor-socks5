@@ -106,11 +106,24 @@ pub struct Settings {
     /// run can shadow the bridges we configure here. An app-local dir makes
     /// state predictable and wipeable. `None` keeps arti's default.
     pub state_dir: Option<PathBuf>,
+    /// Tier 2 (docs/circuit-speed-plan.md): restrict middle/exit relay selection to the
+    /// upper `min_bandwidth_percentile`-th percentile of consensus bandwidth. `0` (default)
+    /// disables the floor -- stock, bandwidth-weighted-but-unrestricted selection. Trades
+    /// anonymity (a smaller candidate pool) for fewer slow hops.
+    pub min_bandwidth_percentile: u8,
+    /// Tier 3 (docs/circuit-speed-plan.md): build 2-hop circuits (`[guard, exit]`), skipping
+    /// the middle relay entirely. `false` (default) keeps the stock 3-hop path. Severe
+    /// anonymity cost (entry and exit become directly adjacent) for the largest available
+    /// latency win.
+    pub two_hop_paths: bool,
 }
 
 impl Settings {
     pub fn is_default(&self) -> bool {
-        self.bridges.is_empty() && self.pt_binary.is_none()
+        self.bridges.is_empty()
+            && self.pt_binary.is_none()
+            && self.min_bandwidth_percentile == 0
+            && !self.two_hop_paths
     }
 }
 
@@ -487,6 +500,13 @@ fn build_config(settings: &Settings) -> Result<TorClientConfig> {
             .state_dir(join("state"));
     }
 
+    // Tiers 2/3 (docs/circuit-speed-plan.md): both default to stock behavior (0 / false), so
+    // this is a no-op unless explicitly opted into.
+    builder
+        .path_rules()
+        .min_bandwidth_percentile(settings.min_bandwidth_percentile)
+        .two_hop_paths(settings.two_hop_paths);
+
     if !settings.bridges.is_empty() {
         for line in &settings.bridges {
             let serialized = line.to_string();
@@ -589,6 +609,7 @@ mod tests {
             bridges: vec![bridge],
             pt_binary: None,
             state_dir: None,
+            ..Default::default()
         };
         assert!(!s.is_default());
     }
@@ -608,6 +629,7 @@ mod tests {
             bridges: vec![bridge],
             pt_binary: None,
             state_dir: None,
+            ..Default::default()
         };
         let cfg = build_config(&s);
         assert!(
@@ -626,6 +648,7 @@ mod tests {
             bridges: vec![bridge],
             pt_binary: None,
             state_dir: None,
+            ..Default::default()
         };
         let err = build_config(&s).unwrap_err();
         assert!(
@@ -649,6 +672,7 @@ mod tests {
             bridges: vec![bridge],
             pt_binary: Some(PathBuf::from("/nonexistent/path/lyrebird")),
             state_dir: None,
+            ..Default::default()
         };
         let err = build_config(&s).unwrap_err();
         assert!(matches!(err, TorError::InvalidPt(_)));
@@ -668,6 +692,7 @@ mod tests {
             bridges: vec![bridge],
             pt_binary: Some(fake_binary),
             state_dir: None,
+            ..Default::default()
         };
         let cfg = build_config(&s);
         assert!(cfg.is_ok(), "valid pt_binary should produce a valid config");
@@ -690,6 +715,7 @@ mod tests {
             bridges: vec![obfs4, webtunnel],
             pt_binary: Some(fake_binary),
             state_dir: None,
+            ..Default::default()
         };
         let cfg = build_config(&s);
         assert!(
