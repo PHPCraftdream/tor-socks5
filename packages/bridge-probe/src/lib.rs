@@ -13,7 +13,7 @@
 //! `resolve_probe_target` computes the correct `(host, port)` pair per
 //! transport before the TCP handshake.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -97,6 +97,37 @@ fn doh_pool() -> &'static Vec<hickory_resolver::TokioResolver> {
 fn doh_slots() -> &'static std::sync::Arc<Semaphore> {
     static SLOTS: OnceLock<std::sync::Arc<Semaphore>> = OnceLock::new();
     SLOTS.get_or_init(|| std::sync::Arc::new(Semaphore::new(32)))
+}
+
+/// Per-provider bound on one DoH lookup, so a blocked or black-holed provider
+/// releases its [`doh_slots`] permit promptly instead of pinning it for the
+/// caller's entire DNS budget.
+const DOH_PROVIDER_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Process-lifetime cache of successful DoH answers.
+///
+/// A bridge list routinely points many bridge lines at a handful of fronting
+/// hosts, and every probe round re-resolves the same names. Each miss costs a
+/// full TLS session to a DoH provider, so caching removes the bulk of the
+/// resolution work from any round after the first.
+fn doh_cache() -> &'static std::sync::Mutex<HashMap<String, IpAddr>> {
+    static CACHE: OnceLock<std::sync::Mutex<HashMap<String, IpAddr>>> = OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn cached_doh_answer(host: &str) -> Option<IpAddr> {
+    doh_cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(host)
+        .copied()
+}
+
+fn remember_doh_answer(host: &str, ip: IpAddr) {
+    doh_cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(host.to_owned(), ip);
 }
 
 /// Return whether a bridge address is a real network endpoint rather than a
@@ -195,9 +226,18 @@ fn webtunnel_probe_target(params: &BTreeMap<String, String>) -> Result<(String, 
     Ok((host.to_string(), port))
 }
 
+/// Floor for the DNS half of [`resolve_and_probe`].
+///
+/// `per_bridge_timeout` is sized for a bare TCP handshake (a few seconds), but
+/// a DoH lookup has to open its own TCP+TLS session to the resolver before it
+/// can even ask the question. Sharing the TCP budget made every hostname-based
+/// bridge — i.e. every webtunnel bridge — time out on a mobile link. The TCP
+/// probe still gets the caller's budget in full.
+const MIN_DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Resolve the probe target for `bridge`, then perform a TCP handshake.
-/// DNS resolution (when needed) shares the same `per_bridge_timeout` budget
-/// as the TCP probe itself.
+/// DNS resolution (when needed) gets its own budget — at least
+/// [`MIN_DNS_RESOLVE_TIMEOUT`] — on top of the TCP probe's.
 async fn resolve_and_probe(
     bridge: &BridgeLine,
     per_bridge_timeout: Duration,
@@ -216,17 +256,13 @@ async fn resolve_and_probe(
     let addr = if let Ok(ip) = host.parse::<IpAddr>() {
         SocketAddr::new(ip, port)
     } else {
-        match timeout(
-            per_bridge_timeout,
-            resolve_addr(&host, port, resolver_policy),
-        )
-        .await
-        {
+        let dns_timeout = per_bridge_timeout.max(MIN_DNS_RESOLVE_TIMEOUT);
+        match timeout(dns_timeout, resolve_addr(&host, port, resolver_policy)).await {
             Ok(Ok(a)) => a,
             Ok(Err(reason)) => return Outcome::Unreachable { reason },
             Err(_) => {
                 return Outcome::Unreachable {
-                    reason: format!("DNS resolution timed out after {per_bridge_timeout:?}"),
+                    reason: format!("DNS resolution timed out after {dns_timeout:?}"),
                 }
             }
         }
@@ -244,6 +280,10 @@ async fn resolve_addr(
 ) -> Result<SocketAddr, String> {
     let query = host.trim_end_matches('.');
     if resolver_policy.doh_enabled {
+        if let Some(ip) = cached_doh_answer(query) {
+            return Ok(SocketAddr::new(ip, port));
+        }
+
         let mut attempts = futures::stream::FuturesUnordered::new();
         for resolver in doh_pool().iter() {
             let resolver = resolver.clone();
@@ -252,14 +292,23 @@ async fn resolve_addr(
             attempts.push(async move {
                 let _permit = slots.acquire_owned().await.ok();
                 let started = Instant::now();
-                let response = resolver.lookup_ip(format!("{query}.")).await;
+                // Per-provider bound. Without it a blocked provider holds its
+                // semaphore permit for the caller's whole budget, starving the
+                // providers that would have answered -- with one lookup per
+                // bridge and 18 providers each, that reliably exhausted the
+                // pool before any answer arrived.
+                let response = timeout(DOH_PROVIDER_TIMEOUT, resolver.lookup_ip(format!("{query}.")))
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
                 (started.elapsed(), response)
             });
         }
         while let Some((latency, response)) = attempts.next().await {
-            if let Ok(lookup) = response {
+            if let Some(lookup) = response {
                 if let Some(ip) = lookup.iter().next() {
                     tracing::debug!(provider_latency_ms = latency.as_millis() as u64, host = %query, "DoH provider won the resolution race");
+                    remember_doh_answer(query, ip);
                     return Ok(SocketAddr::new(ip, port));
                 }
             }

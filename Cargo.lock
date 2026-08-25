@@ -2572,6 +2572,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "url",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]
@@ -2615,6 +2616,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]
