@@ -905,7 +905,10 @@ mod tests {
                 .parse()
                 .expect("obfs4 line parses");
         let rewritten = with_iat_mode_override(&obfs4, Some(1));
-        assert_eq!(rewritten.params.get("iat-mode").map(String::as_str), Some("1"));
+        assert_eq!(
+            rewritten.params.get("iat-mode").map(String::as_str),
+            Some("1")
+        );
         assert!(rewritten.to_string().contains("iat-mode=1"));
 
         // No override configured: line is untouched.
@@ -921,10 +924,14 @@ mod tests {
 
     #[test]
     fn iat_mode_override_adds_the_param_when_the_line_omits_it() {
-        let obfs4: BridgeLine = "obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA"
-            .parse()
-            .expect("obfs4 line parses");
+        let obfs4: BridgeLine =
+            "obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA"
+                .parse()
+                .expect("obfs4 line parses");
         let rewritten = with_iat_mode_override(&obfs4, Some(2));
-        assert_eq!(rewritten.params.get("iat-mode").map(String::as_str), Some("2"));
+        assert_eq!(
+            rewritten.params.get("iat-mode").map(String::as_str),
+            Some("2")
+        );
     }
 }

@@ -297,10 +297,13 @@ async fn resolve_addr(
                 // providers that would have answered -- with one lookup per
                 // bridge and 18 providers each, that reliably exhausted the
                 // pool before any answer arrived.
-                let response = timeout(DOH_PROVIDER_TIMEOUT, resolver.lookup_ip(format!("{query}.")))
-                    .await
-                    .ok()
-                    .and_then(Result::ok);
+                let response = timeout(
+                    DOH_PROVIDER_TIMEOUT,
+                    resolver.lookup_ip(format!("{query}.")),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok);
                 (started.elapsed(), response)
             });
         }
