@@ -81,6 +81,17 @@ struct Entry {
     last_circuit_observation: OffsetDateTime,
 }
 
+/// `circuit_fails` value marking a bridge as permanently unusable, rather than
+/// merely failing often. Written by
+/// [`BridgeStore::note_permanent_failure_at`].
+const RETIRED_CIRCUIT_FAILS: u32 = u32::MAX;
+
+impl Entry {
+    fn is_retired(&self) -> bool {
+        self.circuit_fails == RETIRED_CIRCUIT_FAILS
+    }
+}
+
 impl Entry {
     fn key(&self) -> Key {
         key_of(&self.bridge)
@@ -307,8 +318,18 @@ impl BridgeStore {
             circuit_fails: 0,
             last_circuit_observation: now,
         });
-        entry.circuit_fails = u32::MAX;
+        entry.circuit_fails = RETIRED_CIRCUIT_FAILS;
         entry.last_circuit_observation = now;
+    }
+
+    /// Whether this bridge has been retired, i.e. proven unusable as configured
+    /// rather than just unreliable. Callers selecting candidates should skip
+    /// these: they stay reachable, so reachability-based checks keep voting for
+    /// them.
+    pub fn is_retired(&self, bridge: &BridgeLine) -> bool {
+        self.entries
+            .get(&key_of(bridge))
+            .is_some_and(Entry::is_retired)
     }
 
     /// Record a circuit-layer success observed from arti's tracing events:
@@ -540,7 +561,12 @@ impl BridgeStore {
         let mut healthy: Vec<&Entry> = self
             .entries
             .values()
-            .filter(|e| e.fails == 0 && e.ok_count > 0)
+            // Retired bridges must be excluded rather than merely ranked low. A
+            // retirement means the bridge answers but can never serve as
+            // configured -- a stale fingerprint -- so it keeps a clean probe
+            // record and an excellent latency, and any ranking that considers
+            // only reachability promotes it straight back into the active pool.
+            .filter(|e| e.fails == 0 && e.ok_count > 0 && !e.is_retired())
             .collect();
         healthy.sort_by(|a, b| {
             b.channel_ok_count
@@ -983,6 +1009,25 @@ mod tests {
         s.record_at(a.clone(), Duration::from_millis(5), t0);
         s.note_failure_at(&d, t0, HOUR); // fails=1, ok_count=0 -- never proven reachable
         assert_eq!(s.healthiest_bridges(10), vec![a]);
+    }
+
+    #[test]
+    fn healthiest_bridges_excludes_a_retired_bridge_despite_perfect_probes() {
+        // The case this guards: a retired bridge is retired precisely because it
+        // answers. Its probe record stays spotless and its latency excellent, so
+        // any filter that looks only at reachability re-promotes it forever.
+        let mut s = empty();
+        let good = bridge(OBFS4_A);
+        let retired = bridge(OBFS4_B);
+        let t0 = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        s.record_at(good.clone(), Duration::from_millis(50), t0);
+        s.record_at(retired.clone(), Duration::from_millis(1), t0);
+        s.note_permanent_failure_at(&retired, t0);
+
+        assert!(s.is_retired(&retired));
+        assert!(!s.is_retired(&good));
+        // Retired one is faster, so ordering alone would put it first.
+        assert_eq!(s.healthiest_bridges(10), vec![good]);
     }
 
     #[test]

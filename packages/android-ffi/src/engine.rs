@@ -1145,16 +1145,51 @@ fn select_active_probe_bridges(
     configured: &[BridgeLine],
     bridge_health: &BridgeHealthContext,
 ) -> Vec<BridgeLine> {
-    if configured.len() <= MAX_ACTIVE_BRIDGES {
-        return configured.to_vec();
+    let store_path = BridgeStore::resolve_path(bridge_health.config_path.as_deref());
+    let store = BridgeStore::load(store_path).ok();
+
+    // Drop retired bridges before anything else looks at the list. They are
+    // reachable by construction -- a retirement means the endpoint answers but
+    // the relay's identity does not match the line -- so every reachability
+    // check votes for them, and the short-pool shortcut below would hand them
+    // straight back. Keep them if that would leave nothing at all: a pool of
+    // known-bad bridges is still a better starting point than an empty one.
+    let usable: Vec<BridgeLine> = match &store {
+        Some(store) => {
+            let live: Vec<BridgeLine> = configured
+                .iter()
+                .filter(|bridge| !store.is_retired(bridge))
+                .cloned()
+                .collect();
+            if live.is_empty() {
+                warn!(
+                    configured = configured.len(),
+                    "every configured bridge has been retired; using them anyway"
+                );
+                configured.to_vec()
+            } else {
+                if live.len() < configured.len() {
+                    info!(
+                        retired = configured.len() - live.len(),
+                        remaining = live.len(),
+                        "skipped retired bridges when choosing the active pool"
+                    );
+                }
+                live
+            }
+        }
+        None => configured.to_vec(),
+    };
+
+    if usable.len() <= MAX_ACTIVE_BRIDGES {
+        return usable;
     }
 
-    let by_text: HashMap<String, BridgeLine> = configured
+    let by_text: HashMap<String, BridgeLine> = usable
         .iter()
         .map(|bridge| (bridge.to_string(), bridge.clone()))
         .collect();
-    let store_path = BridgeStore::resolve_path(bridge_health.config_path.as_deref());
-    if let Ok(store) = BridgeStore::load(store_path) {
+    if let Some(store) = &store {
         let ranked: Vec<BridgeLine> = store
             .healthiest_bridges(MAX_ACTIVE_BRIDGES)
             .into_iter()
@@ -1165,11 +1200,7 @@ fn select_active_probe_bridges(
         }
     }
 
-    configured
-        .iter()
-        .take(MAX_ACTIVE_BRIDGES)
-        .cloned()
-        .collect()
+    usable.into_iter().take(MAX_ACTIVE_BRIDGES).collect()
 }
 
 /// Persist a probe round's reachability outcome to the shared bridge-health store
