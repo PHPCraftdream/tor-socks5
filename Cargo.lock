@@ -775,10 +775,14 @@ dependencies = [
  "criterion",
  "futures",
  "hickory-resolver",
+ "httparse",
  "ptrs-gesher-bridge-line",
+ "rustls",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "url",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
