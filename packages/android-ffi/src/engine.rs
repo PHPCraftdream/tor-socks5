@@ -442,6 +442,9 @@ async fn engine_async(
     // Set status to On, then tell Java -- in that order, so nativeGetStatus() never lags
     // behind onReady() (see the suppressed BootstrapEvent::Ready arm above for why the
     // event isn't forwarded from there instead).
+    // The verified set is the honest answer until warm-up narrows it: these are
+    // the bridges the working circuit was built from.
+    crate::set_active_bridges(&settings.bridges);
     set_final_status(EngineStatus::On(actual_addr));
     java_callback.emit(BootstrapEvent::Ready);
     set_current_tunnel(Some(tunnel.clone()));
@@ -485,6 +488,16 @@ async fn engine_async(
                 latency_ms = latency.as_millis() as u64,
                 "kept warmed bridge as rotation fallback"
             );
+        }
+        if !pool.warmed.is_empty() {
+            // Narrow the published set once channels have actually been opened:
+            // now we know which bridges carry, not merely which bootstrapped.
+            let warmed: Vec<BridgeLine> = pool
+                .warmed
+                .iter()
+                .map(|(bridge, _)| bridge.clone())
+                .collect();
+            crate::set_active_bridges(&warmed);
         }
         info!(
             warmed = pool.warmed.len(),
@@ -545,6 +558,7 @@ async fn engine_async(
     // clone left behind in CURRENT_TUNNEL would keep the tunnel alive and
     // could let a concurrent nativeRefreshBridges call reach it mid-teardown.
     set_current_tunnel(None);
+    crate::set_active_bridges(&[]);
     info!("shutting down Tor client");
     drop(tunnel);
     tokio::time::sleep(Duration::from_millis(500)).await;

@@ -187,6 +187,29 @@ fn get_engine() -> &'static Mutex<Option<EngineHandle>> {
     ENGINE.get_or_init(|| Mutex::new(None))
 }
 
+/// Bridges this session has proven can carry a Tor channel, newline-joined.
+///
+/// Distinct from the configured pool and from the probe-alive set: those say
+/// what might work, this says what did. Read by `nativeGetActiveBridges` so the
+/// UI can state which transport is actually in use rather than which one was
+/// preferred -- with a preference of "any", or after a rotation, the two are
+/// routinely different.
+static ACTIVE_BRIDGES: OnceLock<Mutex<String>> = OnceLock::new();
+
+pub(crate) fn active_bridges() -> &'static Mutex<String> {
+    ACTIVE_BRIDGES.get_or_init(|| Mutex::new(String::new()))
+}
+
+/// Publish the bridges known to be carrying, or `&[]` to clear on teardown.
+pub(crate) fn set_active_bridges(bridges: &[bridge_line::BridgeLine]) {
+    let joined = bridges
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    *active_bridges().lock().unwrap_or_else(|p| p.into_inner()) = joined;
+}
+
 /// Helper: update the global status.
 /// Poisoning-tolerant: a panicked holder must not brick status updates forever.
 fn set_status(status: EngineStatus) {
@@ -697,6 +720,43 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
         };
         env.new_string(joined).map(|s| s.into_raw()).map_err(|e| {
             error!("failed to create Java string for healthy bridges: {e}");
+            e
+        })
+    })) {
+        Ok(Ok(jstr)) => jstr,
+        Ok(Err(_)) | Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// JNI entry point: `nativeGetActiveBridges()`
+///
+/// Returns the bridges this session has proven can carry a Tor channel,
+/// newline-joined, or an empty string when nothing is connected.
+///
+/// This is deliberately not the configured pool nor the probe-alive set. Those
+/// answer "what might work"; a UI showing which transport the user is *on* has
+/// to answer "what did". The two diverge routinely -- with a transport
+/// preference of "any", after a rotation, or whenever a probe-alive bridge
+/// turns out to be a website with no relay behind it.
+///
+/// Narrows as the connection matures: the bridges the working circuit was built
+/// from at first, then just those that completed a channel warm-up.
+///
+/// - **Threading:** Cheap, safe to call from the main thread; reads a mutex.
+/// - **Error Signaling:** Does not throw. Returns `null` only on a Java string
+///   allocation failure.
+#[no_mangle]
+pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativeGetActiveBridges(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    match panic::catch_unwind(AssertUnwindSafe(|| {
+        let joined = active_bridges()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        env.new_string(joined).map(|s| s.into_raw()).map_err(|e| {
+            error!("failed to create Java string for active bridges: {e}");
             e
         })
     })) {
