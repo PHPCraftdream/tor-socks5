@@ -313,7 +313,8 @@ async fn engine_async(
         // itself take up to 5s per bridge) is not observed until the accept-loop select!
         // further down, which is never reached if bridges never come up -- nativeStop would
         // then block for its full 10s timeout instead of returning immediately.
-        let active_probe_bridges = select_active_probe_bridges(&settings.bridges, &bridge_health);
+        let preferred = preferred_transport_bridges(&settings.bridges, &bridge_health);
+        let active_probe_bridges = select_active_probe_bridges(&preferred, &bridge_health);
         let probing_all_configured = active_probe_bridges.len() == settings.bridges.len();
         info!(
             count = active_probe_bridges.len(),
@@ -1028,6 +1029,47 @@ async fn stall_watchdog(
         last_reset = Some(now);
         consecutive_failures = 0;
     }
+}
+
+/// Narrow the startup pool to the user's preferred transport, if they set one.
+///
+/// Blocking is transport-specific: a network that fingerprints obfs4 and kills
+/// its streams routinely lets webtunnel through untouched, since webtunnel is
+/// ordinary HTTPS to a real web server. Honouring the preference here — before
+/// the health ranking — keeps the choice meaningful even when the background
+/// pool is dominated by the other transport.
+///
+/// Deliberately a preference, not a filter: an empty result falls back to the
+/// full list, and `engine_async`'s existing "active slice failed, retry with
+/// the full background pool" path still covers a preference whose bridges are
+/// all dead.
+fn preferred_transport_bridges(
+    configured: &[BridgeLine],
+    bridge_health: &BridgeHealthContext,
+) -> Vec<BridgeLine> {
+    let Some(preferred) = bridge_health.bridges_cfg.preferred_transport() else {
+        return configured.to_vec();
+    };
+    let matching: Vec<BridgeLine> = configured
+        .iter()
+        .filter(|bridge| bridge.transport.as_deref() == Some(preferred))
+        .cloned()
+        .collect();
+    if matching.is_empty() {
+        warn!(
+            preferred,
+            configured = configured.len(),
+            "no bridge uses the preferred transport; using the full pool"
+        );
+        return configured.to_vec();
+    }
+    info!(
+        preferred,
+        matching = matching.len(),
+        configured = configured.len(),
+        "restricted startup pool to the preferred transport"
+    );
+    matching
 }
 
 /// Choose the small, latency-sensitive startup pool from the persisted bridge ranking.

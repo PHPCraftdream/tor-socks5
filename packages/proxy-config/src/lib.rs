@@ -384,6 +384,54 @@ pub struct BridgesConfig {
     /// `30`, half of `fail_window_mins` because circuit signals arrive
     /// more frequently than TCP probes.
     pub circuit_observation_window_mins: u64,
+    /// Override `iat-mode` on every obfs4 bridge line (`0` off, `1` on,
+    /// `2` paranoid). obfs4's inter-arrival-time randomiser reshapes the
+    /// packet-size/timing distribution that a statistical or ML-based DPI
+    /// classifier fingerprints; virtually every published bridge line ships
+    /// `iat-mode=0`, so it can only be turned on here. `0` (default) keeps
+    /// each line's published value. Costs latency and throughput.
+    #[serde(default)]
+    pub iat_mode: u8,
+    /// Preferred pluggable transport: `any` (default), `obfs4`, or
+    /// `webtunnel`.
+    ///
+    /// Censorship is transport-specific — a network that fingerprints and
+    /// kills obfs4 streams often passes webtunnel untouched, because the
+    /// latter is indistinguishable from ordinary HTTPS. This is a
+    /// *preference*, not a restriction: bridges of the named transport are
+    /// tried first, and the complete pool stays available as fallback, so a
+    /// choice that turns out to have no working bridges cannot strand the
+    /// client.
+    #[serde(default = "default_bridge_transport")]
+    pub transport: String,
+}
+
+/// Default for [`BridgesConfig::transport`]: no preference.
+fn default_bridge_transport() -> String {
+    "any".to_owned()
+}
+
+impl BridgesConfig {
+    /// [`iat_mode`](Self::iat_mode) as an override, or `None` to keep each
+    /// bridge line's published value. Values above `2` are not defined by
+    /// obfs4 and are ignored rather than passed through to the transport.
+    pub fn iat_mode_override(&self) -> Option<u8> {
+        match self.iat_mode {
+            1 | 2 => Some(self.iat_mode),
+            _ => None,
+        }
+    }
+
+    /// [`transport`](Self::transport) as a transport name, or `None` for no
+    /// preference. Unrecognised values are treated as "no preference" rather
+    /// than silently matching nothing.
+    pub fn preferred_transport(&self) -> Option<&str> {
+        match self.transport.trim().to_ascii_lowercase().as_str() {
+            "obfs4" => Some("obfs4"),
+            "webtunnel" => Some("webtunnel"),
+            _ => None,
+        }
+    }
 }
 
 /// An HTTPS endpoint to fetch a bridge list from. The minimal form is just
@@ -439,6 +487,8 @@ impl Default for BridgesConfig {
             recheck_interval_mins: 60,
             max_circuit_fails: 5,
             circuit_observation_window_mins: 30,
+            iat_mode: 0,
+            transport: default_bridge_transport(),
         }
     }
 }
@@ -648,6 +698,43 @@ mod tests {
     fn default_listen_address_is_loopback_1080() {
         let cfg = Config::default();
         assert_eq!(cfg.listen, "127.0.0.1:1080");
+    }
+
+    #[test]
+    fn bridge_transport_defaults_to_no_preference() {
+        let cfg = BridgesConfig::default();
+        assert_eq!(cfg.transport, "any");
+        assert_eq!(cfg.preferred_transport(), None);
+    }
+
+    #[test]
+    fn bridge_transport_accepts_known_names_case_insensitively() {
+        for (raw, expected) in [
+            ("obfs4", Some("obfs4")),
+            ("WebTunnel", Some("webtunnel")),
+            (" webtunnel ", Some("webtunnel")),
+            // Unknown values mean "no preference" rather than matching nothing,
+            // so a typo cannot silently empty the bridge pool.
+            ("snowflake", None),
+            ("", None),
+        ] {
+            let cfg = BridgesConfig {
+                transport: raw.to_owned(),
+                ..Default::default()
+            };
+            assert_eq!(cfg.preferred_transport(), expected, "input {raw:?}");
+        }
+    }
+
+    #[test]
+    fn iat_mode_override_only_accepts_defined_obfs4_modes() {
+        for (raw, expected) in [(0, None), (1, Some(1)), (2, Some(2)), (7, None)] {
+            let cfg = BridgesConfig {
+                iat_mode: raw,
+                ..Default::default()
+            };
+            assert_eq!(cfg.iat_mode_override(), expected, "iat_mode {raw}");
+        }
     }
 
     #[test]

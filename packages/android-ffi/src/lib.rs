@@ -408,6 +408,7 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
             bridges: parsed_bridges.bridges,
             pt_binary,
             state_dir: Some(state_dir),
+            obfs4_iat_mode: cfg.bridges.iat_mode_override(),
             ..Default::default()
         };
         let block_onion = cfg.security.block_onion;

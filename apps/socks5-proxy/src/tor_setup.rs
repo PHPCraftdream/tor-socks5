@@ -140,6 +140,7 @@ pub(crate) async fn build_tor_settings(
         bridges,
         pt_binary,
         state_dir: Some(arti_base),
+        obfs4_iat_mode: cfg.bridges.iat_mode_override(),
         ..Default::default()
     })
 }

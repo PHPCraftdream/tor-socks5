@@ -118,12 +118,44 @@ pub struct Settings {
     /// disables the floor -- stock, bandwidth-weighted-but-unrestricted selection. Trades
     /// anonymity (a smaller candidate pool) for fewer slow hops.
     pub min_bandwidth_percentile: u8,
+    /// Override the `iat-mode` parameter on every obfs4 bridge line before
+    /// handing it to arti. `iat-mode` is a *client-side* obfs4 knob: `0`
+    /// sends cells as they come (fastest, but leaves obfs4's packet-size and
+    /// timing distribution intact for a statistical/ML classifier to
+    /// fingerprint), `1` splits and delays writes, `2` is the paranoid
+    /// variant. Nearly every published bridge line ships `iat-mode=0`, so
+    /// enabling the randomiser has to happen here rather than by picking
+    /// different bridges. `None` (default) keeps whatever each line
+    /// published. Costs latency and throughput -- only worth it where DPI
+    /// actively kills obfs4 streams.
+    pub obfs4_iat_mode: Option<u8>,
 }
 
 impl Settings {
     pub fn is_default(&self) -> bool {
-        self.bridges.is_empty() && self.pt_binary.is_none() && self.min_bandwidth_percentile == 0
+        self.bridges.is_empty()
+            && self.pt_binary.is_none()
+            && self.min_bandwidth_percentile == 0
+            && self.obfs4_iat_mode.is_none()
     }
+}
+
+/// Apply [`Settings::obfs4_iat_mode`] to one bridge line.
+///
+/// Only obfs4 carries `iat-mode`; other transports (webtunnel, plain) are
+/// returned untouched, as is every line when no override is configured.
+fn with_iat_mode_override(line: &BridgeLine, iat_mode: Option<u8>) -> BridgeLine {
+    let Some(mode) = iat_mode else {
+        return line.clone();
+    };
+    if line.transport.as_deref() != Some("obfs4") {
+        return line.clone();
+    }
+    let mut overridden = line.clone();
+    overridden
+        .params
+        .insert("iat-mode".to_owned(), mode.to_string());
+    overridden
 }
 
 /// Tor tunnel client. Cheap to clone (uses `Arc` internally).
@@ -521,7 +553,7 @@ fn build_config(settings: &Settings) -> Result<TorClientConfig> {
 
     if !settings.bridges.is_empty() {
         for line in &settings.bridges {
-            let serialized = line.to_string();
+            let serialized = with_iat_mode_override(line, settings.obfs4_iat_mode).to_string();
             let bridge: BridgeConfigBuilder =
                 serialized
                     .parse()
@@ -864,5 +896,35 @@ mod tests {
             "first event should be Progress, got: {:?}",
             event
         );
+    }
+
+    #[test]
+    fn iat_mode_override_rewrites_obfs4_and_leaves_others_alone() {
+        let obfs4: BridgeLine =
+            "obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA iat-mode=0"
+                .parse()
+                .expect("obfs4 line parses");
+        let rewritten = with_iat_mode_override(&obfs4, Some(1));
+        assert_eq!(rewritten.params.get("iat-mode").map(String::as_str), Some("1"));
+        assert!(rewritten.to_string().contains("iat-mode=1"));
+
+        // No override configured: line is untouched.
+        assert_eq!(with_iat_mode_override(&obfs4, None), obfs4);
+
+        // webtunnel has no iat-mode concept; it must not gain one.
+        let webtunnel: BridgeLine =
+            "webtunnel 192.0.2.3:1 2852538D49D7D73C1A6694FC492104983A9C4FA2 url=https://example.com/x"
+                .parse()
+                .expect("webtunnel line parses");
+        assert_eq!(with_iat_mode_override(&webtunnel, Some(1)), webtunnel);
+    }
+
+    #[test]
+    fn iat_mode_override_adds_the_param_when_the_line_omits_it() {
+        let obfs4: BridgeLine = "obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA"
+            .parse()
+            .expect("obfs4 line parses");
+        let rewritten = with_iat_mode_override(&obfs4, Some(2));
+        assert_eq!(rewritten.params.get("iat-mode").map(String::as_str), Some("2"));
     }
 }
