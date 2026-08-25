@@ -7,6 +7,7 @@
 //! - [`engine_main`]: Entry point for the dedicated engine thread.
 //! - [`accept_loop`]: SOCKS5 accept loop with semaphore-bounded concurrency.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
@@ -38,6 +39,11 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 /// candidates. The full candidate set remains persisted and is re-probed on later runs; only the
 /// best-ranked slice is worth holding open for immediate rotation.
 const MAX_WARM_BRIDGES: usize = 16;
+
+/// Keep the startup probe bounded. The complete configured list remains the background
+/// discovery pool (the watchdog re-probes it periodically), while only the best bridges
+/// known from the persisted health store participate in the latency-sensitive connect path.
+const MAX_ACTIVE_BRIDGES: usize = 30;
 
 /// Engine status, used internally and formatted for the JNI status protocol.
 #[derive(Debug, Clone, PartialEq)]
@@ -296,9 +302,12 @@ async fn engine_async(
         // itself take up to 5s per bridge) is not observed until the accept-loop select!
         // further down, which is never reached if bridges never come up -- nativeStop would
         // then block for its full 10s timeout instead of returning immediately.
+        let active_probe_bridges = select_active_probe_bridges(&settings.bridges, &bridge_health);
+        let probing_all_configured = active_probe_bridges.len() == settings.bridges.len();
         info!(
-            count = settings.bridges.len(),
-            "probing bridges for reachability"
+            count = active_probe_bridges.len(),
+            configured = settings.bridges.len(),
+            "probing active bridge pool for reachability"
         );
         let mut alive = tokio::select! {
             biased;
@@ -306,10 +315,31 @@ async fn engine_async(
                 info!("received stop signal while probing bridges");
                 return Ok(());
             }
-            alive = bridge_probe::probe_and_sort(settings.bridges.clone(), Duration::from_secs(5)) => alive,
+            alive = bridge_probe::probe_and_sort(active_probe_bridges.clone(), Duration::from_secs(5)) => alive,
         };
 
-        persist_and_rank_probe(&settings.bridges, &mut alive, &bridge_health);
+        persist_and_rank_probe(&active_probe_bridges, &mut alive, &bridge_health);
+
+        // A stale health store must not make a new installation unusable. If none of the
+        // ranked active candidates responds, probe the complete background pool once as a
+        // deliberate fallback and persist that round. The common path never waits on all
+        // thousands of imported bridges.
+        if alive.is_empty() && !probing_all_configured {
+            info!(
+                active = active_probe_bridges.len(),
+                configured = settings.bridges.len(),
+                "active bridge pool was unreachable; probing full background pool as fallback"
+            );
+            alive = tokio::select! {
+                biased;
+                _ = stop_rx.changed() => {
+                    info!("received stop signal while probing bridge fallback pool");
+                    return Ok(());
+                }
+                alive = bridge_probe::probe_and_sort(settings.bridges.clone(), Duration::from_secs(5)) => alive,
+            };
+            persist_and_rank_probe(&settings.bridges, &mut alive, &bridge_health);
+        }
 
         if alive.is_empty() {
             return Err(anyhow::anyhow!(
@@ -367,52 +397,10 @@ async fn engine_async(
     }
     info!("live Tor circuit verified");
 
-    // A TorClient created with `create_unbootstrapped` is not in Arti's `running` state yet;
-    // `TorTunnel::warm_bridge` consequently cannot access its channel manager before
-    // `wait_bootstrapped` completes. The TCP probe above already sorted the bootstrap order, so
-    // bootstrap first and only then warm a bounded top slice for channel rotation.
-    info!(
-        active = settings.bridges.len().min(MAX_WARM_BRIDGES),
-        completed = 0,
-        successful = 0,
-        failed = 0,
-        "parallel bridge warm-up started"
-    );
-    let warmed_bridges = tokio::select! {
-        biased;
-        _ = stop_rx.changed() => {
-            info!("received stop signal while warming bridges");
-            return Ok(());
-        }
-        warmed = warm_bridge_pool(tunnel.clone(), settings.bridges.clone()) => warmed,
-    };
-    persist_warm_results(&warmed_bridges, &bridge_health);
-    let rotation_bridges = warmed_bridges
-        .iter()
-        .map(|(bridge, _)| bridge.clone())
-        .collect::<Vec<_>>();
-    if let Some((fastest, latency)) = warmed_bridges.first() {
-        info!(
-            bridge = %fastest.addr,
-            latency_ms = latency.as_millis() as u64,
-            "selected fastest warmed bridge for rotation"
-        );
-    }
-    for (rank, (bridge, latency)) in warmed_bridges.iter().enumerate().skip(1) {
-        debug!(
-            rank = rank + 1,
-            bridge = %bridge.addr,
-            latency_ms = latency.as_millis() as u64,
-            "kept warmed bridge as rotation fallback"
-        );
-    }
-    info!(
-        warmed = rotation_bridges.len(),
-        configured = all_configured_bridges.len(),
-        "parallel bridge warm pool ready for rotation"
-    );
-
-    // Bind SOCKS5 listener
+    // Bind the listener and advertise readiness as soon as the end-to-end Tor circuit is
+    // verified. Channel warm-up is useful for rotation, but it is a background optimization:
+    // holding the UI in Connecting while dead candidates consume their 20s timeouts makes a
+    // working tunnel look broken and delays clients unnecessarily.
     let listener = TcpListener::bind(&listen_addr)
         .await
         .with_context(|| format!("failed to bind SOCKS5 listener to {}", listen_addr))?;
@@ -429,6 +417,62 @@ async fn engine_async(
     set_final_status(EngineStatus::On(actual_addr));
     java_callback.emit(BootstrapEvent::Ready);
     set_current_tunnel(Some(tunnel.clone()));
+
+    // A TorClient created with `create_unbootstrapped` is not in Arti's `running` state yet;
+    // `TorTunnel::warm_bridge` consequently must run after bootstrap. Start it only after the
+    // real circuit and listener are ready, and persist successful channels for the next start.
+    let warm_bridges = settings.bridges.clone();
+    let warm_health = bridge_health.clone();
+    let warm_tunnel = tunnel.clone();
+    let configured_count = all_configured_bridges.len();
+    let mut warm_stop_rx = stop_rx.clone();
+    info!(
+        active = warm_bridges.len().min(MAX_WARM_BRIDGES),
+        completed = 0,
+        successful = 0,
+        failed = 0,
+        "parallel bridge warm-up started in background"
+    );
+    tokio::spawn(async move {
+        let warmed_bridges = tokio::select! {
+            biased;
+            _ = warm_stop_rx.changed() => {
+                info!("received stop signal while warming bridges");
+                return;
+            }
+            warmed = warm_bridge_pool(warm_tunnel, warm_bridges) => warmed,
+        };
+        persist_warm_results(&warmed_bridges, &warm_health);
+        if let Some((fastest, latency)) = warmed_bridges.first() {
+            info!(
+                bridge = %fastest.addr,
+                latency_ms = latency.as_millis() as u64,
+                "selected fastest warmed bridge for rotation"
+            );
+        }
+        for (rank, (bridge, latency)) in warmed_bridges.iter().enumerate().skip(1) {
+            debug!(
+                rank = rank + 1,
+                bridge = %bridge.addr,
+                latency_ms = latency.as_millis() as u64,
+                "kept warmed bridge as rotation fallback"
+            );
+        }
+        info!(
+            warmed = warmed_bridges.len(),
+            configured = configured_count,
+            "parallel bridge warm pool ready for rotation"
+        );
+    });
+
+    // The watchdog starts with the probe-ranked active pool as its immediate rotation fallback;
+    // the background warm-up persists better candidates for the next connect.
+    let rotation_bridges = settings
+        .bridges
+        .iter()
+        .take(MAX_WARM_BRIDGES)
+        .cloned()
+        .collect::<Vec<_>>();
 
     // Stall watchdog: a real network interruption (Wi-Fi handoff, carrier
     // switch, a guard going stale) can leave arti's guard/circuit managers
@@ -888,6 +932,43 @@ async fn stall_watchdog(
         last_reset = Some(now);
         consecutive_failures = 0;
     }
+}
+
+/// Choose the small, latency-sensitive startup pool from the persisted bridge ranking.
+///
+/// `configured` is intentionally not reduced here: the watchdog still owns the complete
+/// imported list and uses it as the background discovery/re-probe pool. A missing or stale
+/// health store falls back to the first bounded slice; the caller performs a full probe only
+/// when that slice produces no reachable bridge.
+fn select_active_probe_bridges(
+    configured: &[BridgeLine],
+    bridge_health: &BridgeHealthContext,
+) -> Vec<BridgeLine> {
+    if configured.len() <= MAX_ACTIVE_BRIDGES {
+        return configured.to_vec();
+    }
+
+    let by_text: HashMap<String, BridgeLine> = configured
+        .iter()
+        .map(|bridge| (bridge.to_string(), bridge.clone()))
+        .collect();
+    let store_path = BridgeStore::resolve_path(bridge_health.config_path.as_deref());
+    if let Ok(store) = BridgeStore::load(store_path) {
+        let ranked: Vec<BridgeLine> = store
+            .healthiest_bridges(MAX_ACTIVE_BRIDGES)
+            .into_iter()
+            .filter_map(|bridge| by_text.get(&bridge.to_string()).cloned())
+            .collect();
+        if !ranked.is_empty() {
+            return ranked;
+        }
+    }
+
+    configured
+        .iter()
+        .take(MAX_ACTIVE_BRIDGES)
+        .cloned()
+        .collect()
 }
 
 /// Persist a probe round's reachability outcome to the shared bridge-health store
