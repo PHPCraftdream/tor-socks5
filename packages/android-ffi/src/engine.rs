@@ -368,38 +368,50 @@ async fn engine_async(
         settings.bridges = alive.into_iter().map(|(bridge, _)| bridge).collect();
     }
 
-    // Bootstrap Tor with event notifications. Cancellable for the same
-    // reason as the bridge probe above -- bootstrap can run for tens of
-    // seconds, and a stop signal received mid-bootstrap must tear the
-    // half-built `TorTunnel` down immediately rather than being ignored
-    // until bootstrap finishes or times out on its own.
-    //
-    // Manual two-step (create_unbootstrapped + wait_bootstrapped) instead of the one-shot
-    // bootstrap_with_notify: we need the TorTunnel handle DURING the wait so
-    // bootstrap_stall_watchdog can call terminate_all_channels() on it. Bootstrap has no
-    // built-in stall detection of its own -- if every candidate bridge's PT/TLS handshake
-    // fails (bridges dying deeper than the plain TCP probe already ran can catch), arti can
-    // sit retrying the same small pool indefinitely at a fixed percentage with nothing to
-    // force a fresh attempt.
-    info!("bootstrapping Tor client...");
-    let tunnel =
-        TorTunnel::create_unbootstrapped_with(settings.clone()).context("creating Tor client")?;
-    tunnel.forward_bootstrap_events(callback.clone());
-    let stall_handle = tokio::spawn(bootstrap_stall_watchdog(tunnel.clone(), callback.clone()));
-    let bootstrap_result = tokio::select! {
-        biased;
-        _ = stop_rx.changed() => {
-            stall_handle.abort();
-            info!("received stop signal while bootstrapping");
-            return Ok(());
+    // Bootstrap Tor with event notifications. The helper keeps the tunnel
+    // alive for the stall watchdog while waiting and tears it down on stop or
+    // timeout so the next retry starts with a fresh Arti client.
+    // A TCP probe only proves that a socket can be opened; DPI can still kill
+    // the subsequent obfs4/PT/TLS handshake. Try the latency-ranked active
+    // slice first, but if Arti cannot bootstrap that slice within a bounded
+    // attempt, retry with the complete background pool.
+    let active_settings = settings.clone();
+    let has_full_pool_fallback = all_configured_bridges.len() > active_settings.bridges.len();
+    let (tunnel, bootstrap_bridges) = match bootstrap_tunnel_attempt(
+        active_settings.clone(),
+        &mut stop_rx,
+        callback.clone(),
+    )
+    .await
+    {
+        Ok(Some(tunnel)) => (tunnel, active_settings.bridges.clone()),
+        Ok(None) => return Ok(()),
+        Err(active_error) if has_full_pool_fallback => {
+            info!(
+                active = active_settings.bridges.len(),
+                configured = all_configured_bridges.len(),
+                error = %active_error,
+                "active bridge bootstrap failed; retrying with full background pool"
+            );
+            callback(BootstrapEvent::Blocked(
+                "active bridge slice failed; retrying the full background pool".to_owned(),
+            ));
+            let mut fallback_settings = active_settings.clone();
+            fallback_settings.bridges = all_configured_bridges.clone();
+            match bootstrap_tunnel_attempt(fallback_settings, &mut stop_rx, callback.clone()).await
+            {
+                Ok(Some(tunnel)) => (tunnel, all_configured_bridges.clone()),
+                Ok(None) => return Ok(()),
+                Err(full_error) => {
+                    return Err(full_error).context(format!(
+                        "failed to bootstrap Tor with active slice ({active_error:#}) and full bridge pool"
+                    ));
+                }
+            }
         }
-        result = tunnel.wait_bootstrapped() => result,
+        Err(error) => return Err(error).context("failed to bootstrap Tor"),
     };
-    stall_handle.abort();
-    if let Err(error) = bootstrap_result {
-        callback(BootstrapEvent::Failed(format!("{:#}", error)));
-        return Err(error).context("failed to bootstrap Tor");
-    }
+    settings.bridges = bootstrap_bridges;
     info!("Tor bootstrap completed; verifying live circuit");
     if !verify_live_circuit(&tunnel, &mut stop_rx, &callback).await? {
         // A stop signal won the select while the live probe was in flight. The
@@ -535,6 +547,77 @@ async fn engine_async(
     accept_result
 }
 
+/// Give one active bridge slice enough time to make a real PT/TLS attempt,
+/// then let the caller retry with the complete background pool. Without this
+/// bound `wait_bootstrapped()` can keep retrying a dead set forever while the
+/// UI remains in Connecting.
+// A cold Android start may need several descriptor/consensus retries over a
+// high-latency obfs4 channel.  The old 75s ceiling expired after the first
+// usable channel had already been established, before the consensus could be
+// downloaded.  Keep a finite upper bound, but make it long enough for a cold
+// cache miss; the stall watchdog still resets genuinely idle channels.
+const BOOTSTRAP_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Bootstrap one bridge set while retaining a handle for the stall watchdog.
+///
+/// Returns `Ok(None)` when Android requested stop. The returned tunnel is
+/// owned by the caller; all spawned watchdog work is aborted before this
+/// future resolves. The timeout intentionally cancels only the wait future,
+/// then drops the tunnel, so the next attempt gets a fresh Arti client and
+/// state-dir lifecycle.
+///
+/// cancel-safe: NO — cancelling this future drops the in-flight tunnel and
+/// aborts its bootstrap attempt; callers use that behaviour for stop/retry.
+async fn bootstrap_tunnel_attempt(
+    settings: arti_wrapper::Settings,
+    stop_rx: &mut tokio::sync::watch::Receiver<bool>,
+    callback: BootstrapEventCallback,
+) -> Result<Option<TorTunnel>> {
+    info!(
+        bridges = settings.bridges.len(),
+        "bootstrapping Tor client..."
+    );
+    let tunnel = TorTunnel::create_unbootstrapped_with(settings).context("creating Tor client")?;
+    tunnel.forward_bootstrap_events(callback.clone());
+    let stall_handle = tokio::spawn(bootstrap_stall_watchdog(tunnel.clone(), callback));
+
+    let result = tokio::select! {
+        biased;
+        changed = stop_rx.changed() => {
+            stall_handle.abort();
+            info!(changed = changed.is_ok(), "received stop signal while bootstrapping");
+            drop(tunnel);
+            return Ok(None);
+        }
+        result = tokio::time::timeout(
+            BOOTSTRAP_ATTEMPT_TIMEOUT,
+            tunnel.wait_bootstrapped(),
+        ) => result,
+    };
+    stall_handle.abort();
+
+    match result {
+        Ok(Ok(())) => Ok(Some(tunnel)),
+        Ok(Err(error)) => {
+            drop(tunnel);
+            Err(error).context("failed to bootstrap Tor")
+        }
+        Err(_) => {
+            warn!(
+                timeout_secs = BOOTSTRAP_ATTEMPT_TIMEOUT.as_secs(),
+                "Tor bootstrap attempt timed out; releasing bridge slice"
+            );
+            if let Err(error) = tunnel.terminate_all_channels() {
+                debug!(error = %error, "failed to terminate channels after bootstrap timeout");
+            }
+            drop(tunnel);
+            Err(anyhow::anyhow!(
+                "Tor bootstrap attempt timed out after {BOOTSTRAP_ATTEMPT_TIMEOUT:?}"
+            ))
+        }
+    }
+}
+
 /// How often [`stall_watchdog`] probes connectivity once the tunnel is live.
 const WATCHDOG_PROBE_INTERVAL: Duration = Duration::from_secs(45);
 /// Per-probe timeout -- generous enough that a slow-but-alive circuit isn't
@@ -569,7 +652,7 @@ const AUTO_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often [`bootstrap_stall_watchdog`] checks bootstrap progress.
 const BOOTSTRAP_STALL_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 /// How long the bootstrap percentage can stay unchanged before this forces a channel reset.
-const BOOTSTRAP_STALL_TIMEOUT: Duration = Duration::from_secs(45);
+const BOOTSTRAP_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Verify that arti can establish a usable circuit before advertising
 /// `EngineStatus::On`/`BootstrapEvent::Ready` to Android.

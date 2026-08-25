@@ -245,17 +245,24 @@ impl<R: Runtime> mockable::MockableAPI<R> for () {
             let output = response.into_output_string()?;
             Ok::<Option<String>, Error>(Some(output))
         };
-        // Short per-attempt timeout: get_or_launch_dir_specific can hang for
-        // the whole budget waiting on an obfs4 channel that the bridge keeps
-        // resetting (os 10054/10053). A big consensus succeeds on roughly one
-        // attempt in N once a channel happens to hold; the tiny descriptor
-        // fetch needs the same luck, so we abandon a stuck attempt quickly and
-        // try again rather than burning 30s per attempt.
-        match runtime.timeout(Duration::from_secs(10), fetch).await {
+        // Bound each attempt: get_or_launch_dir_specific can hang while an
+        // obfs4 channel keeps resetting (os 10054/10053).  The bound must still
+        // cover a cold channel establishment; the previous 10s value expired
+        // after SOCKS/TLS had succeeded but before the descriptor response.
+        // Obfs4 channels commonly need more than ten seconds on a cold start
+        // (the TCP/SOCKS/TLS sequence itself can consume that budget).  Ten
+        // seconds made every otherwise-working bridge look broken immediately
+        // after the binary update.  Keep a finite bound so a dead bridge cannot
+        // block the descriptor queue forever, but give a real channel enough
+        // time to return its descriptor.
+        match runtime.timeout(Duration::from_secs(30), fetch).await {
             Ok(r) => r,
-            Err(_) => {
-                Err(internal!("bridge descriptor fetch timed out (tor-socks5 patch)").into())
-            }
+            Err(_) => Err(Error::RequestFailed(
+                tor_dirclient::RequestFailedError {
+                    source: None,
+                    error: tor_dirclient::RequestError::DirTimeout,
+                },
+            )),
         }
     }
 }
