@@ -1100,10 +1100,12 @@ async fn stall_watchdog(
 /// the health ranking — keeps the choice meaningful even when the background
 /// pool is dominated by the other transport.
 ///
-/// Deliberately a preference, not a filter: an empty result falls back to the
-/// full list, and `engine_async`'s existing "active slice failed, retry with
-/// the full background pool" path still covers a preference whose bridges are
-/// all dead.
+/// A preference rather than a filter, but only in one direction: matching
+/// nothing falls back to the full list, since asking for a transport the pool
+/// does not contain should not amount to asking for nothing. A preference whose
+/// bridges all turn out to be dead is deliberately *not* rescued — which
+/// transport a network actually permits is what the setting exists to reveal,
+/// so that failure is reported rather than papered over.
 fn preferred_transport_bridges(
     configured: &[BridgeLine],
     bridge_health: &BridgeHealthContext,
