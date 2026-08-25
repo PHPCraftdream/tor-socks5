@@ -100,6 +100,15 @@ pub(crate) struct BridgeHealthContext {
     pub bridges_cfg: BridgesConfig,
 }
 
+/// Connection policy shared by the accept loop and each spawned client task.
+/// Keeping authentication and destination policy together also prevents the
+/// engine entry points from accumulating unrelated boolean arguments.
+#[derive(Clone)]
+pub(crate) struct ConnectionPolicy {
+    pub auth_state: Option<Arc<AuthState>>,
+    pub block_onion: bool,
+}
+
 /// Entry point for the dedicated engine thread.
 ///
 /// This function:
@@ -117,7 +126,7 @@ pub(crate) struct BridgeHealthContext {
 pub(crate) fn engine_main(
     settings: arti_wrapper::Settings,
     listen_addr: SocketAddr,
-    auth_state: Option<Arc<AuthState>>,
+    policy: ConnectionPolicy,
     stop_rx: tokio::sync::watch::Receiver<bool>,
     done_tx: std::sync::mpsc::Sender<()>,
     java_callback: Arc<JavaCallback>,
@@ -181,7 +190,7 @@ pub(crate) fn engine_main(
             engine_async(
                 settings,
                 listen_addr,
-                auth_state,
+                policy,
                 stop_rx,
                 java_callback,
                 failed_already_emitted,
@@ -230,7 +239,7 @@ pub(crate) fn engine_main(
 async fn engine_async(
     mut settings: arti_wrapper::Settings,
     listen_addr: SocketAddr,
-    auth_state: Option<Arc<AuthState>>,
+    policy: ConnectionPolicy,
     mut stop_rx: tokio::sync::watch::Receiver<bool>,
     java_callback: Arc<JavaCallback>,
     failed_already_emitted: Arc<AtomicBool>,
@@ -501,7 +510,7 @@ async fn engine_async(
             info!("received stop signal");
             Ok(())
         }
-        res = accept_loop(&listener, &tunnel, permits, auth_state) => {
+        res = accept_loop(&listener, &tunnel, permits, policy) => {
             if let Err(e) = res {
                 error!(error = %e, "accept loop exited with error");
                 Err(e.context("accept loop failed"))
@@ -1065,7 +1074,7 @@ async fn accept_loop(
     listener: &TcpListener,
     tunnel: &TorTunnel,
     permits: Arc<Semaphore>,
-    auth_state: Option<Arc<AuthState>>,
+    policy: ConnectionPolicy,
 ) -> Result<()> {
     loop {
         // Accept a new connection
@@ -1080,14 +1089,15 @@ async fn accept_loop(
 
         // Spawn a task for this connection
         let tunnel = tunnel.clone();
-        let auth = auth_state.clone();
+        let auth = policy.auth_state.clone();
+        let block_onion = policy.block_onion;
         tokio::spawn(async move {
             // Permit is moved into the task and dropped on exit
             let _permit = permit;
 
             debug!(%peer, "new SOCKS5 connection");
 
-            match handle_connection(client, tunnel, auth).await {
+            match handle_connection(client, tunnel, auth, block_onion).await {
                 Ok(()) => {
                     debug!(%peer, "connection closed normally");
                 }
@@ -1120,11 +1130,20 @@ async fn handle_connection(
     mut client: TcpStream,
     tunnel: TorTunnel,
     auth: Option<Arc<AuthState>>,
+    block_onion: bool,
 ) -> Result<()> {
     // SOCKS5 handshake: USER/PASS when `auth` is configured, NO_AUTH otherwise.
     let req = socks5_proto::handshake(&mut client, auth)
         .await
         .context("SOCKS5 handshake")?;
+
+    if !onion_destination_allowed(&req, block_onion) {
+        info!(host = %req.host, port = req.port, "rejecting onion destination by local policy");
+        socks5_proto::reply(&mut client, Reply::ConnectionNotAllowed)
+            .await
+            .context("failed to send onion policy reply")?;
+        return Ok(());
+    }
 
     debug!(host = %req.host, port = req.port, "SOCKS5 CONNECT request");
 
@@ -1148,6 +1167,12 @@ async fn handle_connection(
         .context("data relay failed")?;
 
     Ok(())
+}
+
+/// Apply the Android listener's global destination policy after SOCKS5
+/// authentication and before any Tor stream is opened.
+fn onion_destination_allowed(req: &socks5_proto::ConnectRequest, block_onion: bool) -> bool {
+    !block_onion || !req.is_onion()
 }
 
 /// Helper: set the global status from the engine thread.
@@ -1256,6 +1281,7 @@ mod auth_wiring_tests {
 
     use std::sync::Arc;
 
+    use super::onion_destination_allowed;
     use auth::{AuthState, User, UsersConfig};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -1437,5 +1463,22 @@ mod auth_wiring_tests {
 
         let req = result.expect("NO_AUTH must still work when auth is not configured");
         assert!(req.authed_user.is_none());
+    }
+
+    #[test]
+    fn onion_policy_blocks_only_when_enabled() {
+        let onion = socks5_proto::ConnectRequest {
+            host: "example.onion".into(),
+            port: 443,
+            authed_user: None,
+        };
+        let clearnet = socks5_proto::ConnectRequest {
+            host: "example.com".into(),
+            port: 443,
+            authed_user: None,
+        };
+        assert!(!onion_destination_allowed(&onion, true));
+        assert!(onion_destination_allowed(&onion, false));
+        assert!(onion_destination_allowed(&clearnet, true));
     }
 }

@@ -46,6 +46,11 @@ All commands accept `--config <path>` to locate the registry. `--allow-onion` al
 
 ## Onion access
 
+The global `security.block_onion` policy is checked before account-level permissions. It defaults
+to `true`, so new and legacy configurations refuse `.onion` destinations unless the operator
+explicitly sets `security.block_onion: false`. With the global switch off, the per-account
+`allowed_onion` rules below apply.
+
 Each account carries an `allowed_onion` flag (**default `false`**). When a SOCKS5 CONNECT targets
 a `.onion` hidden-service address, the proxy checks the **authenticated** account:
 
@@ -114,6 +119,9 @@ At `nativeStart`, the engine:
 5. Otherwise builds `auth::AuthState::build_persistent(&users, users_path)` (so a TOFU `init`
    account provisioned from an Android client gets its real hash written back to the same file)
    and requires RFC 1929 USER/PASS for every accepted connection.
+
+Android differs from the CLI at step 4: an empty or missing registry is a startup error, not
+anonymous access. This prevents a malformed or deleted registry from exposing the loopback proxy.
 
 This decision is made once per `nativeStart` call and threaded through the accept loop
 (`packages/android-ffi/src/engine.rs`) as `Option<Arc<AuthState>>`, passed to

@@ -44,6 +44,11 @@ upstream.password:
 auth.enabled: true
 auth.users_file:
 
+## Circuit and destination policy. Two-hop paths are faster but materially
+## reduce anonymity; onion blocking is enabled by default.
+path.two_hop_paths: false
+security.block_onion: true
+
 ## Background bridge-channel warm-pool (opt-in). Keeps channels to the
 ## healthiest candidate bridges open ahead of time; does not change which
 ## bridge carries traffic (that is a separate, not-yet-built feature).

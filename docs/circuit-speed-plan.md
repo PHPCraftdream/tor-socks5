@@ -1,7 +1,9 @@
 # Plan: circuit speed knobs — hop count and fast-relay preference
 
-Status: **researched, not implemented**. Companion to `docs/bridges.md` (bridge lifecycle already
-shipping) and `docs/android-bridge-freshness-plan.md` (bridge freshness on Android).
+Status: **implemented behind an opt-in config/UI switch**. The vendored `tor-circmgr` path
+builder and `arti-wrapper::Settings` now honor `path.two_hop_paths`; Android exposes the same
+choice as “Use two-hop Tor circuits”. It remains off by default. Companion to `docs/bridges.md`
+and `docs/android-bridge-freshness-plan.md`.
 
 Context: this fork is explicitly a personal-stability client, not an anonymity-preserving one
 ("анонимность понижаем — делаем для себя"). The knobs below trade anonymity for latency; they
@@ -14,19 +16,17 @@ Two things the request conflated, which are not the same knob:
 | | what it is | minimum | today |
 |---|---|---|---|
 | **Bridges** (`bridges.lines`) | the *entry point* — a bridge is hop #1 (the guard) | **1** — no hardcoded floor of 2 (`tor-guardmgr/src/config.rs:67-70`: `bridges_enabled()` is just `!self.bridges.is_empty()`) | N configured; extras are failover redundancy, **not** extra hops |
-| **Hops** | relays a circuit traverses | 3 for ordinary traffic | fixed at 3 |
+| **Hops** | relays a circuit traverses | 3 for ordinary traffic | 3 by default; optional 2-hop path |
 
 1. **Hop count is structural, not a variable.** `tor-circmgr/src/path.rs:305-382`, `pick_path()`
    builds `vec![guard, MaybeOwnedRelay::from(middle), MaybeOwnedRelay::from(exit)]`. There is no
    loop and no count — "3" is just how many steps the function performs. (The 1-hop directory
    path is a separate code path, `dirpath.rs`, used for `OneHopDirectory` usage only.)
-2. **No config knob exists for path length.** `PathConfig` (`tor-circmgr/src/config.rs:18-51`)
-   exposes only `ipv4_subnet_family_prefix`, `ipv6_subnet_family_prefix`, `long_lived_ports`,
-   `reachable_addrs`. Nothing is plumbed to `arti_client::TorClientConfigBuilder`, and there is no
-   feature flag. Changing it means patching the crate.
-3. **`tor-circmgr` is NOT currently vendored here.** It resolves from crates.io. The repo already
-   vendors 5 crates (`tor-guardmgr`, `tor-chanmgr`, `tor-dirmgr`, `tor-dirclient`, `arti-client`)
-   via `[patch.crates-io]`; this would be the 6th.
+2. **The path knob is now plumbed.** `path.two_hop_paths` is parsed by `proxy-config`, passed
+   through Android JNI into `arti_wrapper::Settings`, and applied by the vendored
+   `tor-circmgr` path builder.
+3. The setting is deliberately opt-in: it removes the middle relay and therefore materially
+   reduces anonymity. Existing configs without the key retain the stock three-hop behavior.
 4. **Relay selection is already bandwidth-weighted.** `path.rs:367` / `path/exitpath.rs:175` call
    `selector.select_relay()` → `tor-relay-selection/src/selector.rs:277-279` →
    `netdir.pick_relay(rng, role, ...)`, the standard consensus-bandwidth-weighted choice. So
@@ -73,7 +73,7 @@ directly reduces anonymity, and if set too aggressively can cause circuit-build 
 the filtered set is too small. Needs a floor on set size, mirroring the "never prune below a
 floor" rule already adopted for bridges.
 
-### Tier 3 — 2-hop circuits (expensive, largest anonymity cost, largest speed win)
+### Tier 3 — 2-hop circuits (implemented, largest anonymity cost, largest speed win)
 
 Patch the vendored `pick_path` to optionally emit `vec![guard, exit]`, skipping the middle hop.
 

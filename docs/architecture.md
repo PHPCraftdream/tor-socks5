@@ -84,7 +84,7 @@ including the Android-specific `Config.auth` section.
 ### `packages/proxy-config`
 
 The Ktav `Config` schema (`listen` / `log` / `bridges` / `watchdog` /
-`warm_pool` / `conn_health` / `upstream` / `auth`), shared verbatim by
+`warm_pool` / `conn_health` / `upstream` / `auth` / `path` / `security`), shared verbatim by
 `apps/socks5-proxy` (via the `crate::config` re-export shim) and
 `packages/android-ffi` (loaded directly from the `configPath` argument to
 `nativeStart`). Depends only on `ktav`/`serde`/`indexmap`/`bridge-line` — no

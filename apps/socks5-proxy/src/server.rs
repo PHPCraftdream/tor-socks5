@@ -203,7 +203,7 @@ pub(crate) async fn run_server(
     tokio::select! {
         biased;
         () = shutdown => {}
-        _ = accept_loop(listener, egress.clone(), auth_state.clone(), Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS)), conn_health.clone()) => {
+        _ = accept_loop(listener, egress.clone(), auth_state.clone(), Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS)), conn_health.clone(), cfg.security.block_onion) => {
             // The accept loop is unbounded: this branch means the listener
             // died (probably an OS error we already logged).
             warn!("accept loop exited unexpectedly");
@@ -271,6 +271,7 @@ async fn accept_loop(
     auth: Option<Arc<AuthState>>,
     permits: Arc<tokio::sync::Semaphore>,
     conn_health: ConnHealthCounters,
+    block_onion: bool,
 ) {
     loop {
         let (client, peer) = match listener.accept().await {
@@ -291,7 +292,9 @@ async fn accept_loop(
         tokio::spawn(async move {
             debug!(%peer, "new connection");
             conn_health.record_attempt();
-            if let Err(e) = handle_client(client, egress, auth, conn_health.clone()).await {
+            if let Err(e) =
+                handle_client(client, egress, auth, conn_health.clone(), block_onion).await
+            {
                 let kind = classify_conn_error(&e);
                 conn_health.record_error(kind);
                 // `{:#}` (anyhow's alternate Display) prints the full cause
@@ -379,10 +382,21 @@ async fn handle_client(
     egress: Egress,
     auth: Option<Arc<AuthState>>,
     conn_health: ConnHealthCounters,
+    block_onion: bool,
 ) -> Result<()> {
     let req = socks5::handshake(&mut client, auth.clone())
         .await
         .context("SOCKS5 handshake")?;
+
+    // Global onion gate comes first. The per-account gate below remains
+    // useful for CLI deployments that grant onion access selectively.
+    if block_onion && req.is_onion() {
+        warn!(host = %req.host, "refused .onion connection: blocked by security.block_onion");
+        socks5::reply(&mut client, Reply::ConnectionNotAllowed)
+            .await
+            .ok();
+        return Ok(());
+    }
 
     // Per-account onion gate: a `.onion` destination is allowed only
     // when the authenticated account carries `allowed_onion`. Anonymous

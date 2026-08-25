@@ -372,8 +372,13 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
                     e
                 })?;
             if users.users.is_empty() {
-                info!(path = %users_path.display(), "auth: no users configured — SOCKS5 will accept anonymous clients");
-                None
+                let msg = format!(
+                    "auth is enabled but the users registry is empty: {}",
+                    users_path.display()
+                );
+                error!(path = %users_path.display(), "auth: refusing to start an anonymous Android SOCKS5 listener");
+                let _ = env.throw_new("java/lang/RuntimeException", &msg);
+                return Err(anyhow::anyhow!(msg));
             } else {
                 let state = AuthState::build_persistent(&users, users_path.clone())
                     .context("building auth state")
@@ -396,8 +401,10 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
             bridges: parsed_bridges.bridges,
             pt_binary,
             state_dir: Some(state_dir),
+            two_hop_paths: cfg.path.two_hop_paths,
             ..Default::default()
         };
+        let block_onion = cfg.security.block_onion;
         // Captured before `loaded`/`cfg` go out of scope: the engine thread
         // needs its own owned copies to persist/rank bridge health via the
         // shared `bridge-store` crate (see `engine::engine_async`).
@@ -433,7 +440,10 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
                 engine::engine_main(
                     settings,
                     listen_addr,
-                    auth_state,
+                    engine::ConnectionPolicy {
+                        auth_state,
+                        block_onion,
+                    },
                     stop_rx,
                     done_tx,
                     java_callback,

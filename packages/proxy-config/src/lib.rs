@@ -41,6 +41,36 @@ pub struct Config {
     /// Local SOCKS5 (RFC 1929) authentication for the listener. Used by
     /// both the CLI and the Android JNI FFI crate — see [`AuthConfig`].
     pub auth: AuthConfig,
+    /// Circuit path selection. These knobs intentionally default to the
+    /// stock, three-hop Tor path.
+    pub path: PathConfig,
+    /// Destination policy enforced by the local SOCKS5 listener.
+    pub security: SecurityConfig,
+}
+
+/// Circuit-path knobs shared by the CLI and Android JNI engines.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct PathConfig {
+    /// Build two-hop circuits (`guard -> exit`) instead of the stock
+    /// three-hop path. This is a deliberate anonymity trade-off and is
+    /// disabled by default.
+    pub two_hop_paths: bool,
+}
+
+/// Security policy for destinations accepted by the local SOCKS5 listener.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SecurityConfig {
+    /// Reject `.onion` destinations before a Tor stream is opened. Enabled by default;
+    /// set to `false` only when onion access is explicitly desired.
+    pub block_onion: bool,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self { block_onion: true }
+    }
 }
 
 /// Controls whether — and from where — the SOCKS5 listener loads its
@@ -441,6 +471,8 @@ impl Default for Config {
             conn_health: ConnHealthConfig::default(),
             upstream: UpstreamConfig::default(),
             auth: AuthConfig::default(),
+            path: PathConfig::default(),
+            security: SecurityConfig::default(),
         }
     }
 }
@@ -998,5 +1030,28 @@ auth.users_file: /data/data/org.torproject.android/files/tor-socks5.users.ktav
         let deserialized: Config = ktav::from_str(&serialized).expect("deserialize");
         assert!(!deserialized.auth.enabled);
         assert_eq!(deserialized.auth.users_file, "/tmp/custom.users.ktav");
+    }
+
+    #[test]
+    fn path_and_security_defaults_are_safe() {
+        let cfg = Config::default();
+        assert!(!cfg.path.two_hop_paths);
+        assert!(cfg.security.block_onion);
+    }
+
+    #[test]
+    fn parses_path_and_security_sections() {
+        let src = "listen: 127.0.0.1:1080\npath.two_hop_paths: true\nsecurity.block_onion: true\n";
+        let cfg: Config = ktav::from_str(src).expect("ktav parses path and security sections");
+        assert!(cfg.path.two_hop_paths);
+        assert!(cfg.security.block_onion);
+    }
+
+    #[test]
+    fn path_and_security_sections_fall_back_when_absent() {
+        let src = "listen: 127.0.0.1:1080\n";
+        let cfg: Config = ktav::from_str(src).expect("old config remains valid");
+        assert!(!cfg.path.two_hop_paths);
+        assert!(cfg.security.block_onion);
     }
 }
