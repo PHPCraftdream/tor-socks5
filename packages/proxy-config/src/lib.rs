@@ -454,30 +454,86 @@ pub struct BridgeSource {
     pub cookies: Vec<String>,
 }
 
+/// Bridge-list collectors shipped as defaults, as `(label, url)`.
+///
+/// Public, regenerated automatically, and reachable over plain HTTPS — they are
+/// fetched through the running tunnel, so one blocked locally is still usable.
+/// The `_tested` variants are listed alongside the full ones: they are much
+/// smaller and pre-filtered upstream, which gives a fresh client a usable pool
+/// before it has probed anything itself.
+pub fn default_bridge_sources() -> &'static [(&'static str, &'static str)] {
+    &[
+        // scriptzteam v2 — successor to the original collector, regenerated daily.
+        (
+            "scriptzteam-v2-webtunnel",
+            "https://raw.githubusercontent.com/scriptzteam/Tor-Bridges-Collector-v2/main/bridges/webtunnel.txt",
+        ),
+        (
+            "scriptzteam-v2-webtunnel-tested",
+            "https://raw.githubusercontent.com/scriptzteam/Tor-Bridges-Collector-v2/main/bridges/webtunnel_tested.txt",
+        ),
+        (
+            "scriptzteam-v2-obfs4",
+            "https://raw.githubusercontent.com/scriptzteam/Tor-Bridges-Collector-v2/main/bridges/obfs4.txt",
+        ),
+        // Delta-Kronecker — independent collector, same layout, regenerated daily.
+        (
+            "delta-webtunnel",
+            "https://raw.githubusercontent.com/Delta-Kronecker/Tor-Bridges-Collector/main/bridge/webtunnel.txt",
+        ),
+        (
+            "delta-webtunnel-tested",
+            "https://raw.githubusercontent.com/Delta-Kronecker/Tor-Bridges-Collector/main/bridge/webtunnel_tested.txt",
+        ),
+        (
+            "delta-obfs4",
+            "https://raw.githubusercontent.com/Delta-Kronecker/Tor-Bridges-Collector/main/bridge/obfs4.txt",
+        ),
+        // OnionHop — third independent collector.
+        (
+            "onionhop-webtunnel",
+            "https://raw.githubusercontent.com/center2055/OnionHop-Bridges-Collector/main/bridge/webtunnel.txt",
+        ),
+        (
+            "onionhop-webtunnel-tested",
+            "https://raw.githubusercontent.com/center2055/OnionHop-Bridges-Collector/main/bridge/webtunnel_tested.txt",
+        ),
+        (
+            "onionhop-obfs4",
+            "https://raw.githubusercontent.com/center2055/OnionHop-Bridges-Collector/main/bridge/obfs4.txt",
+        ),
+        // The Tor Project's own built-in lists, as shipped with Tor Browser.
+        (
+            "tor-browser-obfs4",
+            "https://gitlab.torproject.org/tpo/applications/tor-browser/-/raw/main/projects/common/bridges_list.obfs4.txt",
+        ),
+        (
+            "tor-browser-webtunnel",
+            "https://gitlab.torproject.org/tpo/applications/tor-browser/-/raw/main/projects/common/bridges_list.webtunnel.txt",
+        ),
+    ]
+}
+
 impl Default for BridgesConfig {
     fn default() -> Self {
         Self {
             lines: Vec::new(),
-            sources: vec![
-                BridgeSource {
-                    label: "scriptzteam-obfs4".into(),
-                    url: "https://raw.githubusercontent.com/scriptzteam/Tor-Bridges-Collector/main/bridges-obfs4".into(),
+            // Several independent collectors rather than one, and freshness over
+            // size: webtunnel bridges run on volunteers' own web servers and
+            // rotate constantly, so a list that has not been regenerated in
+            // weeks is mostly dead entries. The original scriptzteam repo had
+            // gone 27 days without an update while its v2 successor and two
+            // other collectors were regenerating daily; keeping only the former
+            // is what left the pool without a single live webtunnel bridge.
+            sources: default_bridge_sources()
+                .iter()
+                .map(|(label, url)| BridgeSource {
+                    label: (*label).into(),
+                    url: (*url).into(),
                     headers: Vec::new(),
                     cookies: Vec::new(),
-                },
-                BridgeSource {
-                    label: "scriptzteam-webtunnel".into(),
-                    url: "https://raw.githubusercontent.com/scriptzteam/Tor-Bridges-Collector/main/bridges-webtunnel".into(),
-                    headers: Vec::new(),
-                    cookies: Vec::new(),
-                },
-                BridgeSource {
-                    label: "tor-browser-obfs4".into(),
-                    url: "https://gitlab.torproject.org/tpo/applications/tor-browser/-/raw/main/projects/common/bridges_list.obfs4.txt".into(),
-                    headers: Vec::new(),
-                    cookies: Vec::new(),
-                },
-            ],
+                })
+                .collect(),
             use_seeds: true,
             auto_fetch: true,
             min_alive: 8,
