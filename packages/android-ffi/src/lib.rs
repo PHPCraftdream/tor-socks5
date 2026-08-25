@@ -765,6 +765,62 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
     }
 }
 
+/// JNI entry point: `nativeGetBridgeStats(String configPath)`
+///
+/// Per-transport health summary as one `|`-separated line per transport:
+/// `transport|known|alive|channel_proven|retired|last_probe_ok|last_channel_ok`
+/// where the two timestamps are Unix seconds, or `0` when never.
+///
+/// Computed here rather than by re-parsing the store's log format on the Java
+/// side, so the two cannot disagree about what "alive" means — a distinction
+/// that matters because the counts deliberately differ: `alive` is reachability,
+/// `channel_proven` is a completed Tor channel, and a transport can have plenty
+/// of the former and none of the latter.
+///
+/// Pure file read: works whether or not the engine is running.
+///
+/// - **Threading:** Reads a file; call off the main thread if the store is large.
+/// - **Error Signaling:** Does not throw. Empty string when the store is absent.
+#[no_mangle]
+pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativeGetBridgeStats(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+) -> jstring {
+    match panic::catch_unwind(AssertUnwindSafe(|| {
+        let config_path_str: Option<String> = env.get_string(&config_path).ok().map(|s| s.into());
+        let store_path =
+            BridgeStore::resolve_path(config_path_str.as_ref().map(std::path::Path::new));
+        let joined = match BridgeStore::load(store_path) {
+            Ok(store) => store
+                .transport_summary()
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{}|{}|{}|{}|{}|{}|{}",
+                        s.transport,
+                        s.known,
+                        s.alive,
+                        s.channel_proven,
+                        s.retired,
+                        s.last_probe_ok.map(|t| t.unix_timestamp()).unwrap_or(0),
+                        s.last_channel_ok.map(|t| t.unix_timestamp()).unwrap_or(0),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Err(_) => String::new(),
+        };
+        env.new_string(joined).map(|s| s.into_raw()).map_err(|e| {
+            error!("failed to create Java string for bridge stats: {e}");
+            e
+        })
+    })) {
+        Ok(Ok(jstr)) => jstr,
+        Ok(Err(_)) | Err(_) => std::ptr::null_mut(),
+    }
+}
+
 fn refresh_sources_failure(outcomes: &[bridge_fetcher::FetchOutcome]) -> Option<String> {
     if outcomes.is_empty() || outcomes.iter().all(|outcome| outcome.error.is_some()) {
         let details = outcomes

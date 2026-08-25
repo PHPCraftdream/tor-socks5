@@ -86,13 +86,30 @@ struct Entry {
 /// [`BridgeStore::note_permanent_failure_at`].
 const RETIRED_CIRCUIT_FAILS: u32 = u32::MAX;
 
+/// One transport's slice of the health store, for a status display.
+///
+/// The three counts answer progressively stronger questions, and the gaps
+/// between them are the interesting part: `known` is what has been seen,
+/// `alive` what answered a reachability probe, `channel_proven` what actually
+/// completed a Tor channel. A transport with many alive and no channel-proven
+/// bridges looks healthy and is not — the case that cost this project a day.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransportStats {
+    /// `obfs4`, `webtunnel`, or `plain` for bridges with no transport.
+    pub transport: String,
+    pub known: usize,
+    pub alive: usize,
+    pub channel_proven: usize,
+    pub retired: usize,
+    pub last_probe_ok: Option<OffsetDateTime>,
+    pub last_channel_ok: Option<OffsetDateTime>,
+}
+
 impl Entry {
     fn is_retired(&self) -> bool {
         self.circuit_fails == RETIRED_CIRCUIT_FAILS
     }
-}
 
-impl Entry {
     fn key(&self) -> Key {
         key_of(&self.bridge)
     }
@@ -320,6 +337,48 @@ impl BridgeStore {
         });
         entry.circuit_fails = RETIRED_CIRCUIT_FAILS;
         entry.last_circuit_observation = now;
+    }
+
+    /// Per-transport counts and freshest timestamps, for a status display.
+    ///
+    /// Only covers bridges the store has seen. The configured total is not
+    /// knowable here — that lives in the caller's own bridge list — and the
+    /// difference between the two is itself informative: a large configured
+    /// pool with few known entries means most of it has never been probed.
+    pub fn transport_summary(&self) -> Vec<TransportStats> {
+        let mut by_transport: BTreeMap<String, TransportStats> = BTreeMap::new();
+        for entry in self.entries.values() {
+            let name = entry
+                .bridge
+                .transport
+                .clone()
+                .unwrap_or_else(|| "plain".to_owned());
+            let stats = by_transport
+                .entry(name.clone())
+                .or_insert_with(|| TransportStats {
+                    transport: name,
+                    ..TransportStats::default()
+                });
+            stats.known += 1;
+            if entry.is_retired() {
+                stats.retired += 1;
+                // A retired bridge is excluded from the usable counts even
+                // though its probe record looks perfect — that record is
+                // exactly what makes it misleading.
+                continue;
+            }
+            if entry.fails == 0 && entry.ok_count > 0 {
+                stats.alive += 1;
+            }
+            if entry.channel_ok_count > 0 {
+                stats.channel_proven += 1;
+            }
+            if let Some(ok) = entry.last_ok {
+                stats.last_probe_ok = stats.last_probe_ok.max(Some(ok));
+            }
+            stats.last_channel_ok = stats.last_channel_ok.max(entry.last_channel_ok);
+        }
+        by_transport.into_values().collect()
     }
 
     /// Whether this bridge has been retired, i.e. proven unusable as configured
@@ -1028,6 +1087,45 @@ mod tests {
         assert!(!s.is_retired(&good));
         // Retired one is faster, so ordering alone would put it first.
         assert_eq!(s.healthiest_bridges(10), vec![good]);
+    }
+
+    #[test]
+    fn transport_summary_separates_reachable_from_channel_proven() {
+        let mut s = empty();
+        let reachable_only = bridge(OBFS4_A);
+        let proven = bridge(OBFS4_B);
+        let t0 = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        s.record_at(reachable_only.clone(), Duration::from_millis(10), t0);
+        s.record_at(proven.clone(), Duration::from_millis(10), t0);
+        s.note_channel_success_at(&proven, t0);
+
+        let summary = s.transport_summary();
+        assert_eq!(summary.len(), 1);
+        let obfs4 = &summary[0];
+        assert_eq!(obfs4.transport, "obfs4");
+        assert_eq!(obfs4.known, 2);
+        // Both answer a probe; only one ever completed a channel. Collapsing
+        // these two into one number is what made a dead pool look healthy.
+        assert_eq!(obfs4.alive, 2);
+        assert_eq!(obfs4.channel_proven, 1);
+        assert_eq!(obfs4.retired, 0);
+        assert_eq!(obfs4.last_channel_ok, Some(t0));
+    }
+
+    #[test]
+    fn transport_summary_counts_a_retired_bridge_as_neither_alive_nor_proven() {
+        let mut s = empty();
+        let retired = bridge(OBFS4_A);
+        let t0 = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        s.record_at(retired.clone(), Duration::from_millis(1), t0);
+        s.note_channel_success_at(&retired, t0);
+        s.note_permanent_failure_at(&retired, t0);
+
+        let summary = s.transport_summary();
+        assert_eq!(summary[0].known, 1);
+        assert_eq!(summary[0].retired, 1);
+        assert_eq!(summary[0].alive, 0);
+        assert_eq!(summary[0].channel_proven, 0);
     }
 
     #[test]
