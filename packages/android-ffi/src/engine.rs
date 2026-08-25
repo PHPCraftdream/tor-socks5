@@ -378,7 +378,7 @@ async fn engine_async(
     // attempt, retry with the complete background pool.
     let active_settings = settings.clone();
     let has_full_pool_fallback = all_configured_bridges.len() > active_settings.bridges.len();
-    let (tunnel, bootstrap_bridges) = match bootstrap_and_verify(
+    let (tunnel, bootstrap_bridges) = match bootstrap_tunnel_attempt(
         active_settings.clone(),
         &mut stop_rx,
         callback.clone(),
@@ -392,23 +392,20 @@ async fn engine_async(
                 active = active_settings.bridges.len(),
                 configured = all_configured_bridges.len(),
                 error = %active_error,
-                "active bridge slice produced no working circuit; retrying with full background pool"
+                "active bridge bootstrap failed; retrying with full background pool"
             );
             callback(BootstrapEvent::Blocked(
                 "active bridge slice failed; retrying the full background pool".to_owned(),
             ));
-            // Arti holds an exclusive lock on the state dir; the failed attempt's
-            // client is dropped by now, but give it the same grace the teardown
-            // path uses before a second client tries to take the lock.
-            tokio::time::sleep(Duration::from_millis(500)).await;
             let mut fallback_settings = active_settings.clone();
             fallback_settings.bridges = all_configured_bridges.clone();
-            match bootstrap_and_verify(fallback_settings, &mut stop_rx, callback.clone()).await {
+            match bootstrap_tunnel_attempt(fallback_settings, &mut stop_rx, callback.clone()).await
+            {
                 Ok(Some(tunnel)) => (tunnel, all_configured_bridges.clone()),
                 Ok(None) => return Ok(()),
                 Err(full_error) => {
                     return Err(full_error).context(format!(
-                        "failed to reach a working Tor circuit with the active slice ({active_error:#}) and the full bridge pool"
+                        "failed to bootstrap Tor with active slice ({active_error:#}) and full bridge pool"
                     ));
                 }
             }
@@ -416,6 +413,16 @@ async fn engine_async(
         Err(error) => return Err(error).context("failed to bootstrap Tor"),
     };
     settings.bridges = bootstrap_bridges;
+    // Deliberately no pool widening when this fails: a preferred transport that
+    // cannot carry traffic should be visible as such, not silently papered over
+    // by falling back to the other one. Switching transports stays a user
+    // decision, made with the failure in front of them.
+    info!("Tor bootstrap completed; verifying live circuit");
+    if !verify_live_circuit(&tunnel, &mut stop_rx, &callback).await? {
+        // A stop signal won the select while the live probe was in flight. The
+        // caller owns the tunnel and will drop it as this function returns.
+        return Ok(());
+    }
     info!("live Tor circuit verified");
 
     // Bind the listener and advertise readiness as soon as the end-to-end Tor circuit is
@@ -556,37 +563,6 @@ async fn engine_async(
 // downloaded.  Keep a finite upper bound, but make it long enough for a cold
 // cache miss; the stall watchdog still resets genuinely idle channels.
 const BOOTSTRAP_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// Bootstrap one bridge set and prove it can actually carry traffic.
-///
-/// Returns `Ok(None)` when Android requested stop, and an error when the set
-/// produced no working circuit — which the caller uses to widen the pool.
-///
-/// Bootstrapping and verifying belong together because bootstrap alone stopped
-/// being evidence of anything once the directory cache could be warm: arti
-/// reports "bootstrapped" from cached state in about a second without opening a
-/// single channel. The pool-widening retry used to hang off bootstrap failure,
-/// so with a warm cache it never ran, and a preferred transport whose bridges
-/// were all unusable would fail the live probe with no second attempt. Hanging
-/// the retry off *this* function restores the fallback: whatever the preference
-/// asked for, a set that cannot carry traffic is abandoned for the full pool.
-///
-/// cancel-safe: NO — inherits [`bootstrap_tunnel_attempt`]'s behaviour.
-async fn bootstrap_and_verify(
-    settings: arti_wrapper::Settings,
-    stop_rx: &mut tokio::sync::watch::Receiver<bool>,
-    callback: BootstrapEventCallback,
-) -> Result<Option<TorTunnel>> {
-    let Some(tunnel) = bootstrap_tunnel_attempt(settings, stop_rx, callback.clone()).await? else {
-        return Ok(None);
-    };
-    info!("Tor bootstrap completed; verifying live circuit");
-    if !verify_live_circuit(&tunnel, stop_rx, &callback).await? {
-        // Stop signal won the select while the probe was in flight.
-        return Ok(None);
-    }
-    Ok(Some(tunnel))
-}
 
 /// Bootstrap one bridge set while retaining a handle for the stall watchdog.
 ///
