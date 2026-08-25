@@ -3,6 +3,7 @@
 //! Shared by the server startup path ([`crate::server::run_server`]) and
 //! the `bridges fetch` command ([`crate::bridges_cmd::cmd_bridges`]).
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
@@ -20,6 +21,14 @@ use bridge_store::BridgeStore;
 /// it unreachable for this startup. The probes run in parallel, so the
 /// total wait is bounded by this value, not multiplied by the bridge count.
 pub(crate) const BRIDGE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Keep the startup probe bounded when the configured list is large (a
+/// full auto-fetched pool can run into the thousands). The complete list
+/// remains the background pool that `spawn_bridge_maintenance` re-probes
+/// periodically; only the best-known slice participates in the
+/// latency-sensitive startup path. Mirrors `android-ffi`'s
+/// `MAX_ACTIVE_BRIDGES`.
+const MAX_ACTIVE_BRIDGES: usize = 30;
 
 /// Parse the configured bridges, probe them for reachability, persist the
 /// live ones to the alive-bridges log, and assemble arti [`Settings`]
@@ -47,26 +56,54 @@ pub(crate) async fn build_tor_settings(
         );
     }
     let parsed_bridges = parsed.bridges;
-    // Everything we attempt this round, for the health store. Starts with
-    // the configured bridges (covers both obfs4 and webtunnel — the store
-    // is transport-agnostic) and grows if we fall back to seeds.
-    let mut probed: Vec<BridgeLine> = parsed_bridges.clone();
 
-    // Probe configured bridges and keep only the reachable ones, sorted
-    // by latency (fastest first). Arti's guard manager tries bridges
-    // roughly in list order with long per-bridge back-offs, so a list
-    // pre-filtered by reachability dramatically speeds up cold start when
-    // some configured bridges are dead.
-    let mut alive = if parsed_bridges.is_empty() {
+    // Narrow to the preferred transport (if any), then bound the slice that
+    // actually gets probed at startup — the full configured list can run
+    // into the thousands once `bridges fetch`/auto_fetch has been promoting
+    // for a while. Both steps are preferences, not filters: an unmatched
+    // transport or an empty/stale health store falls back toward the full
+    // list, and the "active pool was unreachable" branch below covers a
+    // narrowed slice that turns out fully dead.
+    let preferred_bridges = preferred_transport_bridges(&parsed_bridges, cfg);
+    let active_probe_bridges = select_active_probe_bridges(&preferred_bridges, config_path);
+    let probing_all_configured = active_probe_bridges.len() == parsed_bridges.len();
+
+    // Everything we attempt this round, for the health store. Starts with
+    // the bridges actually probed this round (covers both obfs4 and
+    // webtunnel — the store is transport-agnostic) and grows if we fall
+    // back to the full configured list or to seeds.
+    let mut probed: Vec<BridgeLine> = active_probe_bridges.clone();
+
+    // Probe the active pool and keep only the reachable ones, sorted by
+    // latency (fastest first). Arti's guard manager tries bridges roughly
+    // in list order with long per-bridge back-offs, so a list pre-filtered
+    // by reachability dramatically speeds up cold start when some
+    // configured bridges are dead.
+    let mut alive = if active_probe_bridges.is_empty() {
         Vec::new()
     } else {
         info!(
-            count = parsed_bridges.len(),
+            count = active_probe_bridges.len(),
+            configured = parsed_bridges.len(),
             timeout_ms = BRIDGE_PROBE_TIMEOUT.as_millis() as u64,
-            "probing configured bridge reachability"
+            "probing active bridge pool for reachability"
         );
-        bridge_probe::probe_and_sort(parsed_bridges, BRIDGE_PROBE_TIMEOUT).await
+        bridge_probe::probe_and_sort(active_probe_bridges, BRIDGE_PROBE_TIMEOUT).await
     };
+
+    // A stale health store or an unlucky transport preference must not make
+    // an otherwise-working config unusable: if the active/preferred slice
+    // produced nothing, retry once against the complete configured pool
+    // before falling back to seeds. The common path (a small config, or a
+    // healthy active slice) never pays for this.
+    if alive.is_empty() && !probing_all_configured {
+        info!(
+            configured = parsed_bridges.len(),
+            "active bridge pool was unreachable; probing full configured pool as fallback"
+        );
+        probed = parsed_bridges.clone();
+        alive = bridge_probe::probe_and_sort(parsed_bridges.clone(), BRIDGE_PROBE_TIMEOUT).await;
+    }
 
     // Chicken-and-egg fallback: if no configured bridge is reachable,
     // probe the binary's built-in seed bridges so a fresh or stale config
@@ -143,6 +180,78 @@ pub(crate) async fn build_tor_settings(
         obfs4_iat_mode: cfg.bridges.iat_mode_override(),
         ..Default::default()
     })
+}
+
+/// Narrow the startup pool to the configured preferred transport, if any.
+///
+/// Deliberately a preference, not a filter: an unmatched preference
+/// (nothing configured uses it) falls back to the full list rather than
+/// probing nothing, and `build_tor_settings`'s active/full-pool fallback
+/// still covers a preference whose bridges all turn out unreachable.
+fn preferred_transport_bridges(configured: &[BridgeLine], cfg: &Config) -> Vec<BridgeLine> {
+    let Some(preferred) = cfg.bridges.preferred_transport() else {
+        return configured.to_vec();
+    };
+    let matching: Vec<BridgeLine> = configured
+        .iter()
+        .filter(|bridge| bridge.transport.as_deref() == Some(preferred))
+        .cloned()
+        .collect();
+    if matching.is_empty() {
+        warn!(
+            preferred,
+            configured = configured.len(),
+            "no bridge uses the preferred transport; using the full pool"
+        );
+        return configured.to_vec();
+    }
+    info!(
+        preferred,
+        matching = matching.len(),
+        configured = configured.len(),
+        "restricted startup pool to the preferred transport"
+    );
+    matching
+}
+
+/// Choose the small, latency-sensitive startup pool from the persisted
+/// bridge ranking (mirrors `android-ffi`'s `select_active_probe_bridges`).
+///
+/// `configured` is intentionally not reduced beyond the returned slice for
+/// anyone else's bookkeeping: `build_tor_settings`'s full-pool fallback and
+/// `spawn_bridge_maintenance`'s periodic re-probe still see the complete
+/// configured list. A missing or stale health store falls back to the first
+/// bounded slice; the caller performs a full probe only when that slice
+/// produces no reachable bridge.
+fn select_active_probe_bridges(
+    configured: &[BridgeLine],
+    config_path: Option<&Path>,
+) -> Vec<BridgeLine> {
+    if configured.len() <= MAX_ACTIVE_BRIDGES {
+        return configured.to_vec();
+    }
+
+    let by_text: HashMap<String, BridgeLine> = configured
+        .iter()
+        .map(|bridge| (bridge.to_string(), bridge.clone()))
+        .collect();
+    let store_path = BridgeStore::resolve_path(config_path);
+    if let Ok(store) = BridgeStore::load(store_path) {
+        let ranked: Vec<BridgeLine> = store
+            .healthiest_bridges(MAX_ACTIVE_BRIDGES)
+            .into_iter()
+            .filter_map(|bridge| by_text.get(&bridge.to_string()).cloned())
+            .collect();
+        if !ranked.is_empty() {
+            return ranked;
+        }
+    }
+
+    configured
+        .iter()
+        .take(MAX_ACTIVE_BRIDGES)
+        .cloned()
+        .collect()
 }
 
 /// Update the on-disk bridge health store with this probe round's outcome
@@ -316,5 +425,81 @@ mod tests {
     fn test_pt_binary_override_from_empty() {
         let result = pt_binary_override_from(Some(std::ffi::OsStr::new("")));
         assert_eq!(result, None);
+    }
+
+    fn obfs4_line(addr: &str) -> BridgeLine {
+        format!("obfs4 {addr} ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA iat-mode=0")
+            .parse()
+            .expect("valid obfs4 bridge line")
+    }
+
+    fn webtunnel_line(addr: &str) -> BridgeLine {
+        format!(
+            "webtunnel {addr} ABCDEF0123456789ABCDEF0123456789ABCDEF01 url=https://example.com/x"
+        )
+        .parse()
+        .expect("valid webtunnel bridge line")
+    }
+
+    #[test]
+    fn preferred_transport_bridges_no_preference_keeps_full_list() {
+        let bridges = vec![obfs4_line("1.2.3.4:443"), webtunnel_line("5.6.7.8:443")];
+        let cfg = Config::default();
+        assert_eq!(cfg.bridges.transport, "any");
+        assert_eq!(preferred_transport_bridges(&bridges, &cfg), bridges);
+    }
+
+    #[test]
+    fn preferred_transport_bridges_narrows_to_matching_transport() {
+        let bridges = vec![
+            obfs4_line("1.2.3.4:443"),
+            webtunnel_line("5.6.7.8:443"),
+            obfs4_line("9.10.11.12:443"),
+        ];
+        let cfg = Config {
+            bridges: proxy_config::BridgesConfig {
+                transport: "webtunnel".to_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let narrowed = preferred_transport_bridges(&bridges, &cfg);
+        assert_eq!(narrowed.len(), 1);
+        assert_eq!(narrowed[0].transport.as_deref(), Some("webtunnel"));
+    }
+
+    #[test]
+    fn preferred_transport_bridges_falls_back_when_nothing_matches() {
+        let bridges = vec![obfs4_line("1.2.3.4:443")];
+        let cfg = Config {
+            bridges: proxy_config::BridgesConfig {
+                transport: "webtunnel".to_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(preferred_transport_bridges(&bridges, &cfg), bridges);
+    }
+
+    #[test]
+    fn select_active_probe_bridges_keeps_small_list_unchanged() {
+        let bridges: Vec<BridgeLine> = (0..5)
+            .map(|i| obfs4_line(&format!("10.0.0.{i}:443")))
+            .collect();
+        assert_eq!(select_active_probe_bridges(&bridges, None), bridges);
+    }
+
+    #[test]
+    fn select_active_probe_bridges_bounds_large_list_without_a_health_store() {
+        let bridges: Vec<BridgeLine> = (0..(MAX_ACTIVE_BRIDGES + 10))
+            .map(|i| obfs4_line(&format!("10.0.{}.{}:443", i / 256, i % 256)))
+            .collect();
+        // A path with no sibling `.alive-bridges.log` behaves like a fresh
+        // install: the health store loads empty, so this falls back to the
+        // first `MAX_ACTIVE_BRIDGES` bridges in configured order.
+        let missing_config = Path::new("/nonexistent/does-not-exist/tor-socks5.ktav");
+        let active = select_active_probe_bridges(&bridges, Some(missing_config));
+        assert_eq!(active.len(), MAX_ACTIVE_BRIDGES);
+        assert_eq!(active, bridges[..MAX_ACTIVE_BRIDGES]);
     }
 }
