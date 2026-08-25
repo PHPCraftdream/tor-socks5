@@ -283,6 +283,34 @@ impl BridgeStore {
         }
     }
 
+    /// Mark a bridge as permanently unusable, regardless of the caller's
+    /// failure window or threshold.
+    ///
+    /// Most channel failures are transient and deserve the rate-limited
+    /// counting `note_circuit_failure_at` does. Some are verdicts: a relay whose
+    /// identity does not match the fingerprint in the bridge line will never
+    /// match it, because the line is stale rather than the relay unreachable.
+    /// Counting those slowly means re-selecting a known-dead bridge for hours,
+    /// and they are especially costly for webtunnel, where the endpoint stays
+    /// perfectly reachable and so keeps ranking well.
+    pub fn note_permanent_failure_at(&mut self, bridge: &BridgeLine, now: OffsetDateTime) {
+        let key = key_of(bridge);
+        let entry = self.entries.entry(key).or_insert_with(|| Entry {
+            bridge: bridge.clone(),
+            last_ok: None,
+            last_attempt: now,
+            last_latency: Duration::ZERO,
+            fails: 0,
+            ok_count: 0,
+            channel_ok_count: 0,
+            last_channel_ok: None,
+            circuit_fails: 0,
+            last_circuit_observation: now,
+        });
+        entry.circuit_fails = u32::MAX;
+        entry.last_circuit_observation = now;
+    }
+
     /// Record a circuit-layer success observed from arti's tracing events:
     /// resets `circuit_fails` to 0 and stamps `last_circuit_observation`.
     /// No-op for an unknown bridge — circuit successes only matter for

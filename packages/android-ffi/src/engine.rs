@@ -7,7 +7,7 @@
 //! - [`engine_main`]: Entry point for the dedicated engine thread.
 //! - [`accept_loop`]: SOCKS5 accept loop with semaphore-bounded concurrency.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
@@ -378,7 +378,7 @@ async fn engine_async(
     // attempt, retry with the complete background pool.
     let active_settings = settings.clone();
     let has_full_pool_fallback = all_configured_bridges.len() > active_settings.bridges.len();
-    let (tunnel, bootstrap_bridges) = match bootstrap_tunnel_attempt(
+    let (tunnel, bootstrap_bridges) = match bootstrap_and_verify(
         active_settings.clone(),
         &mut stop_rx,
         callback.clone(),
@@ -392,20 +392,23 @@ async fn engine_async(
                 active = active_settings.bridges.len(),
                 configured = all_configured_bridges.len(),
                 error = %active_error,
-                "active bridge bootstrap failed; retrying with full background pool"
+                "active bridge slice produced no working circuit; retrying with full background pool"
             );
             callback(BootstrapEvent::Blocked(
                 "active bridge slice failed; retrying the full background pool".to_owned(),
             ));
+            // Arti holds an exclusive lock on the state dir; the failed attempt's
+            // client is dropped by now, but give it the same grace the teardown
+            // path uses before a second client tries to take the lock.
+            tokio::time::sleep(Duration::from_millis(500)).await;
             let mut fallback_settings = active_settings.clone();
             fallback_settings.bridges = all_configured_bridges.clone();
-            match bootstrap_tunnel_attempt(fallback_settings, &mut stop_rx, callback.clone()).await
-            {
+            match bootstrap_and_verify(fallback_settings, &mut stop_rx, callback.clone()).await {
                 Ok(Some(tunnel)) => (tunnel, all_configured_bridges.clone()),
                 Ok(None) => return Ok(()),
                 Err(full_error) => {
                     return Err(full_error).context(format!(
-                        "failed to bootstrap Tor with active slice ({active_error:#}) and full bridge pool"
+                        "failed to reach a working Tor circuit with the active slice ({active_error:#}) and the full bridge pool"
                     ));
                 }
             }
@@ -413,12 +416,6 @@ async fn engine_async(
         Err(error) => return Err(error).context("failed to bootstrap Tor"),
     };
     settings.bridges = bootstrap_bridges;
-    info!("Tor bootstrap completed; verifying live circuit");
-    if !verify_live_circuit(&tunnel, &mut stop_rx, &callback).await? {
-        // A stop signal won the select while the live probe was in flight. The
-        // caller owns the tunnel and will drop it as this function returns.
-        return Ok(());
-    }
     info!("live Tor circuit verified");
 
     // Bind the listener and advertise readiness as soon as the end-to-end Tor circuit is
@@ -458,23 +455,23 @@ async fn engine_async(
         "parallel bridge warm-up started in background"
     );
     tokio::spawn(async move {
-        let warmed_bridges = tokio::select! {
+        let pool = tokio::select! {
             biased;
             _ = warm_stop_rx.changed() => {
                 info!("received stop signal while warming bridges");
                 return;
             }
-            warmed = warm_bridge_pool(warm_tunnel, warm_bridges) => warmed,
+            pool = warm_bridge_pool(warm_tunnel, warm_bridges) => pool,
         };
-        persist_warm_results(&warmed_bridges, &warm_health);
-        if let Some((fastest, latency)) = warmed_bridges.first() {
+        persist_warm_results(&pool, &warm_health);
+        if let Some((fastest, latency)) = pool.warmed.first() {
             info!(
                 bridge = %fastest.addr,
                 latency_ms = latency.as_millis() as u64,
                 "selected fastest warmed bridge for rotation"
             );
         }
-        for (rank, (bridge, latency)) in warmed_bridges.iter().enumerate().skip(1) {
+        for (rank, (bridge, latency)) in pool.warmed.iter().enumerate().skip(1) {
             debug!(
                 rank = rank + 1,
                 bridge = %bridge.addr,
@@ -483,7 +480,8 @@ async fn engine_async(
             );
         }
         info!(
-            warmed = warmed_bridges.len(),
+            warmed = pool.warmed.len(),
+            retired = pool.retired.len(),
             configured = configured_count,
             "parallel bridge warm pool ready for rotation"
         );
@@ -558,6 +556,37 @@ async fn engine_async(
 // downloaded.  Keep a finite upper bound, but make it long enough for a cold
 // cache miss; the stall watchdog still resets genuinely idle channels.
 const BOOTSTRAP_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Bootstrap one bridge set and prove it can actually carry traffic.
+///
+/// Returns `Ok(None)` when Android requested stop, and an error when the set
+/// produced no working circuit — which the caller uses to widen the pool.
+///
+/// Bootstrapping and verifying belong together because bootstrap alone stopped
+/// being evidence of anything once the directory cache could be warm: arti
+/// reports "bootstrapped" from cached state in about a second without opening a
+/// single channel. The pool-widening retry used to hang off bootstrap failure,
+/// so with a warm cache it never ran, and a preferred transport whose bridges
+/// were all unusable would fail the live probe with no second attempt. Hanging
+/// the retry off *this* function restores the fallback: whatever the preference
+/// asked for, a set that cannot carry traffic is abandoned for the full pool.
+///
+/// cancel-safe: NO — inherits [`bootstrap_tunnel_attempt`]'s behaviour.
+async fn bootstrap_and_verify(
+    settings: arti_wrapper::Settings,
+    stop_rx: &mut tokio::sync::watch::Receiver<bool>,
+    callback: BootstrapEventCallback,
+) -> Result<Option<TorTunnel>> {
+    let Some(tunnel) = bootstrap_tunnel_attempt(settings, stop_rx, callback.clone()).await? else {
+        return Ok(None);
+    };
+    info!("Tor bootstrap completed; verifying live circuit");
+    if !verify_live_circuit(&tunnel, stop_rx, &callback).await? {
+        // Stop signal won the select while the probe was in flight.
+        return Ok(None);
+    }
+    Ok(Some(tunnel))
+}
 
 /// Bootstrap one bridge set while retaining a handle for the stall watchdog.
 ///
@@ -737,10 +766,7 @@ async fn verify_live_circuit(
 ///
 /// cancel-safe: NO — dropping this future aborts the in-flight warm-up set;
 /// callers use that behaviour when Android requests stop during bootstrap.
-async fn warm_bridge_pool(
-    tunnel: TorTunnel,
-    bridges: Vec<BridgeLine>,
-) -> Vec<(BridgeLine, Duration)> {
+async fn warm_bridge_pool(tunnel: TorTunnel, bridges: Vec<BridgeLine>) -> WarmPool {
     let bridges = bridges.into_iter().take(MAX_WARM_BRIDGES);
     let total = bridges.len();
     let mut tasks = tokio::task::JoinSet::new();
@@ -749,10 +775,20 @@ async fn warm_bridge_pool(
         tasks.spawn(async move {
             let started = Instant::now();
             match tokio::time::timeout(WARM_BRIDGE_TIMEOUT, tunnel.warm_bridge(&bridge)).await {
-                Ok(Ok(())) => Some((bridge, started.elapsed())),
+                Ok(Ok(())) => WarmOutcome::Warm(bridge, started.elapsed()),
                 Ok(Err(error)) => {
-                    debug!(bridge = %bridge.addr, error = %error, "bridge warm-up failed");
-                    None
+                    let rendered = format!("{error:#}");
+                    if is_permanent_bridge_failure(&rendered) {
+                        warn!(
+                            bridge = %bridge.addr,
+                            error = %rendered,
+                            "bridge is permanently unusable; retiring it"
+                        );
+                        WarmOutcome::Retired(bridge)
+                    } else {
+                        debug!(bridge = %bridge.addr, error = %rendered, "bridge warm-up failed");
+                        WarmOutcome::Failed
+                    }
                 }
                 Err(_) => {
                     debug!(
@@ -760,22 +796,25 @@ async fn warm_bridge_pool(
                         timeout = ?WARM_BRIDGE_TIMEOUT,
                         "bridge warm-up timed out"
                     );
-                    None
+                    WarmOutcome::Failed
                 }
             }
         });
     }
 
     let mut warmed = Vec::new();
+    let mut retired = Vec::new();
     let mut completed = 0usize;
     let mut failed = 0usize;
     while let Some(result) = tasks.join_next().await {
         completed += 1;
         match result {
-            Ok(Some(item)) => {
-                warmed.push(item);
+            Ok(WarmOutcome::Warm(bridge, elapsed)) => warmed.push((bridge, elapsed)),
+            Ok(WarmOutcome::Retired(bridge)) => {
+                retired.push(bridge);
+                failed += 1;
             }
-            Ok(None) => failed += 1,
+            Ok(WarmOutcome::Failed) => failed += 1,
             Err(error) => {
                 debug!(error = %error, "parallel bridge warm-up task failed");
                 failed += 1;
@@ -794,10 +833,45 @@ async fn warm_bridge_pool(
         active = 0,
         completed,
         successful = warmed.len(),
+        retired = retired.len(),
         failed,
         "parallel bridge warm-up finished"
     );
-    warmed
+    WarmPool { warmed, retired }
+}
+
+/// What one bridge's warm-up attempt established.
+enum WarmOutcome {
+    /// A channel opened; the bridge is proven usable and timed.
+    Warm(BridgeLine, Duration),
+    /// The bridge answered but can never work as configured — retire it.
+    Retired(BridgeLine),
+    /// Transient failure or timeout; the bridge keeps its place in the pool.
+    Failed,
+}
+
+/// Result of warming a set of bridges.
+pub(crate) struct WarmPool {
+    /// Bridges that opened a channel, fastest first.
+    pub warmed: Vec<(BridgeLine, Duration)>,
+    /// Bridges whose failure was a verdict rather than bad luck.
+    pub retired: Vec<BridgeLine>,
+}
+
+/// Whether a warm-up error means the bridge line itself is wrong, rather than
+/// the network being uncooperative.
+///
+/// An identity mismatch is the case that matters in practice: the relay behind
+/// the endpoint presents a different key than the fingerprint in the bridge
+/// line, so the line is stale and no retry can fix it. Public webtunnel lists
+/// carry many of these, and they are invisible to reachability probing --
+/// the fronting web server answers perfectly, which is exactly why they
+/// otherwise keep ranking well and crowding out working bridges.
+///
+/// Matching on the rendered message is deliberate: arti surfaces this as an
+/// opaque `HandshakeProto` string, with no typed variant to match on.
+fn is_permanent_bridge_failure(rendered_error: &str) -> bool {
+    rendered_error.contains("does not match target")
 }
 
 /// Runs alongside `wait_bootstrapped()` (spawned right before it, aborted right after it
@@ -1012,16 +1086,27 @@ async fn stall_watchdog(
             } else {
                 rotation_bridges.clone()
             };
-            let warmed = tokio::select! {
+            let pool = tokio::select! {
                 biased;
                 _ = stop_rx.changed() => return,
-                warmed = warm_bridge_pool(tunnel.clone(), candidates) => warmed,
+                pool = warm_bridge_pool(tunnel.clone(), candidates) => pool,
             };
-            if !warmed.is_empty() {
-                rotation_bridges = warmed.iter().map(|(bridge, _)| bridge.clone()).collect();
-                persist_warm_results(&warmed, &bridge_health);
+            // Persist even when nothing warmed: a round that only retired stale
+            // bridges is still progress worth keeping.
+            persist_warm_results(&pool, &bridge_health);
+            if !pool.retired.is_empty() {
+                let retired: HashSet<String> = pool.retired.iter().map(|b| b.to_string()).collect();
+                rotation_bridges.retain(|b| !retired.contains(&b.to_string()));
+            }
+            if !pool.warmed.is_empty() {
+                rotation_bridges = pool
+                    .warmed
+                    .iter()
+                    .map(|(bridge, _)| bridge.clone())
+                    .collect();
                 info!(
                     warmed = rotation_bridges.len(),
+                    retired = pool.retired.len(),
                     "watchdog: rebuilt parallel bridge rotation pool"
                 );
             }
@@ -1166,8 +1251,8 @@ fn persist_and_rank_probe(
 
 /// Persist the PT-channel rotation signal without confusing it with an
 /// end-to-end circuit success or a plain TCP probe.
-fn persist_warm_results(warmed: &[(BridgeLine, Duration)], bridge_health: &BridgeHealthContext) {
-    if warmed.is_empty() {
+fn persist_warm_results(pool: &WarmPool, bridge_health: &BridgeHealthContext) {
+    if pool.warmed.is_empty() && pool.retired.is_empty() {
         return;
     }
     let path = BridgeStore::resolve_path(bridge_health.config_path.as_deref());
@@ -1179,8 +1264,14 @@ fn persist_warm_results(warmed: &[(BridgeLine, Duration)], bridge_health: &Bridg
         }
     };
     let now = OffsetDateTime::now_utc();
-    for (bridge, _) in warmed {
+    for (bridge, _) in &pool.warmed {
         store.note_channel_success_at(bridge, now);
+    }
+    // Retiring is the only way a stale bridge line ever leaves the pool: it
+    // stays reachable, so probing keeps voting for it, and the ranking keeps
+    // promoting it.
+    for bridge in &pool.retired {
+        store.note_permanent_failure_at(bridge, now);
     }
     if let Err(error) = store.save() {
         warn!(error = %error, "could not persist bridge rotation ranking");
