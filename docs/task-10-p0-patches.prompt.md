@@ -1,0 +1,20 @@
+Работай в D:\dev\rust\tor-socks5, ветка `android-ffi` (уже активна). Кросс-компиляция под все 4 Android ABI уже подтверждена (коммит `304ecb0`, `docs/android-cross-compile.md`) — весь workspace собирается через `cargo ndk -t <abi> build -p socks5-proxy --release` с `ANDROID_NDK_HOME`/`ANDROID_HOME` (NDK r27c лежит в `D:\system_artefact\android-sdk\ndk\27.2.12479018`, эти переменные не видны в новой shell-сессии — передавай инлайн).
+
+ВАЖНО про git-гигиену: в рабочем дереве есть ЧУЖИЕ незакоммиченные изменения (`docs/upstream-reports.md`, `docs/upstream/`) и мои временные `.prompt.md` файлы в корне — НЕ трогай, НЕ коммить их. `git add <конкретные пути>`, никогда `-A`/`.`.
+
+## Три независимые P0-доработки для будущей Android/JNI-интеграции. Каждая — отдельный коммит.
+
+### 1. Загейтить `--daemon`/daemonize на Android
+`apps/socks5-proxy/src/main.rs` (~строки 90-110) и `apps/socks5-proxy/src/daemon.rs` — оберни в `cfg(all(unix, not(target_os = "android")))` вместо просто `cfg(unix)`. Зависимость `daemonize` в `apps/socks5-proxy/Cargo.toml` (сейчас в `[target.'cfg(unix)'.dependencies]`, ~строки 61-62) — перенести в `[target.'cfg(all(unix, not(target_os = "android")))'.dependencies]`. Проверь также `--pid-file` флаг (связан с `-d`/daemon) — должен остаться недоступен на Android тем же гейтом. Коммит: `fix: gate daemonize/--daemon out of Android builds`.
+
+### 2. Переопределяемый путь PT-бинарника (устраняет жёсткую зависимость от `current_exe()`)
+Найди место, где для запуска pluggable transport arti получает путь к бинарнику — по предыдущему ресёрчу это `apps/socks5-proxy/src/tor_setup.rs` (~строки 117-124, `std::env::current_exe()`) и передача в `packages/arti-wrapper/src/lib.rs` (~строки 393-417, `TransportConfig.path`). Добавь override: если задана переменная окружения `TOR_PT_BINARY` (или аналогичное поле в ktav-конфиге, что покажется чище по месту в коде — на твоё усмотрение, задокументируй выбор), использовать её вместо `current_exe()`. Без этого override будущий JNI-движок на Android не сможет запускать PT (current_exe() в JNI-контексте укажет на процесс приложения, а не на нужный exec-хелпер). Сохрани текущее поведение (`current_exe()`) как fallback, когда override не задан — не ломай существующий CLI-сценарий. Коммит: `feat: allow overriding the PT transport binary path via TOR_PT_BINARY`.
+
+### 3. Callback-канал для bootstrap-прогресса (готовит почву для будущего JNI FFI)
+Сейчас `TorClient::bootstrap_events()` (в `vendor/arti-client/src/client.rs`, поток `BootstrapStatus` с `as_frac()`/`ready_for_traffic()`/`blocked()`) никем не используется. В `packages/arti-wrapper/src/lib.rs`, в `TorTunnel::bootstrap_with` (~строки 106-109, использует `create_unbootstrapped`/`wait_bootstrapped`, ~строки 270-299) — добавь опциональный callback-параметр (например `Option<Box<dyn Fn(BootstrapEvent) + Send + Sync>>` или через `tokio::sync::watch`/`mpsc` канал — выбери, что естественнее ложится на существующий API `TorTunnel`), которым подписчик может получать события: bootstrap-прогресс (as_frac → 0.0-1.0 или проценты), ready_for_traffic (готовность), ошибки старта. НЕ обязательно сериализовать в JSON/stdout прямо сейчас — просто дай Rust-API для подписки, которым позже воспользуется JNI FFI-крейт (следующая задача в цепочке) и, если удобно, CLI-режим (для консистентности, необязательно). Убедись, что существующий CLI-путь (`apps/socks5-proxy/src/server.rs`) как минимум продолжает работать без регрессий (можно проигнорировать новый API, просто не передавать callback). Коммит: `feat: expose bootstrap progress via callback in TorTunnel`.
+
+## Проверка
+После каждого коммита прогоняй `cargo build -p socks5-proxy` (host-таргет, быстрая проверка) и хотя бы раз в конце `cargo ndk -t arm64-v8a build -p socks5-proxy --release` (подтвердить, что Android-сборка не сломана). `cargo test --workspace` если есть время — не обязательно гонять все интеграционные тесты, но unit-тесты затронутых крейтов (arti-wrapper) стоит прогнать.
+
+## Отчёт
+Финальный текст: что сделано по каждому из 3 пунктов, точные новые сигнатуры/API (для использования в следующей задаче про FFI-крейт), хэши коммитов, статус сборки (host + Android).
