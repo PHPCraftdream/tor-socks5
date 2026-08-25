@@ -56,13 +56,18 @@ also bad
 
     #[test]
     fn parse_bridges_drops_documentation_addresses_from_sources() {
+        // A plain (non-webtunnel) 2001:db8::/32 ORPort is a real placeholder and
+        // must be dropped. A webtunnel line with the same placeholder ORPort is
+        // legitimate — its real endpoint is in url=, so it is kept.
         let body = "\
+obfs4 [2001:db8::1]:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA iat-mode=0
 webtunnel [2001:db8::1]:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 url=https://example.com/x ver=0.0.3
 obfs4 5.45.101.108:36781 0123456789ABCDEF0123456789ABCDEF01234567 cert=BBB iat-mode=0
 ";
         let bridges = parse_bridges_from_body(body);
-        assert_eq!(bridges.len(), 1);
-        assert_eq!(bridges[0].addr.to_string(), "5.45.101.108:36781");
+        assert_eq!(bridges.len(), 2);
+        assert_eq!(bridges[0].transport.as_deref(), Some("webtunnel"));
+        assert_eq!(bridges[1].addr.to_string(), "5.45.101.108:36781");
     }
 }
 

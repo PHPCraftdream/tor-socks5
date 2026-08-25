@@ -107,7 +107,14 @@ fn doh_slots() -> &'static std::sync::Arc<Semaphore> {
 /// canonical policy. Loopback and IPv4 documentation ranges remain accepted
 /// because the probe crate deliberately supports local test listeners and
 /// callers may use them in offline integration tests.
+///
+/// Exception: webtunnel bridges legitimately carry a `2001:db8::/32` ORPort
+/// placeholder — the real endpoint lives in the `url=`/`addr=` param (see
+/// [`resolve_probe_target`]), so the RFC 3849 check must not apply to them.
 pub fn usable_for_tor(bridge: &BridgeLine) -> bool {
+    if bridge.transport.as_deref() == Some("webtunnel") {
+        return bridge.params.contains_key("url") || bridge.params.contains_key("addr");
+    }
     match bridge.addr.ip() {
         std::net::IpAddr::V4(_) => true,
         std::net::IpAddr::V6(ip) => !ip.octets().starts_with(&[0x20, 0x01, 0x0d, 0xb8]),
@@ -664,8 +671,29 @@ mod tests {
 
     #[test]
     fn rejects_documentation_ipv6_bridge_addresses() {
+        // A plain bridge with a 2001:db8::/32 ORPort is a real placeholder.
+        let bridge: BridgeLine =
+            "obfs4 [2001:db8::1]:443 2852538D49D7D73C1A6694FC492104983A9C4FA2 cert=AAA iat-mode=0"
+                .parse()
+                .expect("bridge line parses");
+        assert!(!usable_for_tor(&bridge));
+    }
+
+    #[test]
+    fn keeps_webtunnel_with_documentation_orport_placeholder() {
+        // webtunnel legitimately uses a 2001:db8::/32 ORPort placeholder; the
+        // real endpoint is in url=, so the bridge must be kept.
         let bridge: BridgeLine =
             "webtunnel [2001:db8::1]:443 2852538D49D7D73C1A6694FC492104983A9C4FA2 url=https://example.com/x"
+                .parse()
+                .expect("bridge line parses");
+        assert!(usable_for_tor(&bridge));
+    }
+
+    #[test]
+    fn rejects_webtunnel_missing_url_and_addr() {
+        let bridge: BridgeLine =
+            "webtunnel [2001:db8::1]:443 2852538D49D7D73C1A6694FC492104983A9C4FA2 ver=0.0.3"
                 .parse()
                 .expect("bridge line parses");
         assert!(!usable_for_tor(&bridge));

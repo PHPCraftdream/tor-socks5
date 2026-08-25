@@ -17,8 +17,11 @@ async fn local_tcp_probe_reports_live_bridge_and_skips_documentation_address() {
         format!("obfs4 {live_addr} ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA iat-mode=0")
             .parse()
             .expect("live bridge syntax");
+    // A plain bridge on a 2001:db8::/32 ORPort is a real documentation
+    // placeholder. (A webtunnel line with the same ORPort is legitimate — its
+    // endpoint lives in url= — and is covered by the unit tests.)
     let documentation: bridge_line::BridgeLine =
-        "webtunnel [2001:db8::1]:443 0123456789ABCDEF0123456789ABCDEF01234567 url=https://example.com/path ver=0.0.3"
+        "obfs4 [2001:db8::1]:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=BBB iat-mode=0"
             .parse()
             .expect("documentation bridge syntax");
 
