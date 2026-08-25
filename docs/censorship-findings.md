@@ -120,6 +120,40 @@ directory is world-writable (`must be o-w`), so fix permissions after copying.
   preference, not a filter: if the chosen transport has no live bridge, the full
   pool is still used, so a wrong choice cannot strand a user.
 
+## The public webtunnel pool is mostly already burned
+
+Measured against the union of three actively regenerated collectors — 240
+bridge lines, 168 distinct fronting hosts:
+
+| vantage point | host unreachable | host answers | real bridge (101) |
+| --- | --- | --- | --- |
+| desktop, one ISP | 148 | 20 | 3 |
+| phone, a different network | 147 | 21 | — |
+
+Two independent networks agree to within one host, so this is the state of the
+pool rather than an artefact of one connection or of the probe. Of the handful
+that do answer, most serve an ordinary website; three completed a WebSocket
+upgrade.
+
+The obvious reading — "there are only three webtunnel bridges in the world" —
+is wrong, and the right one follows from how these lists are built. A
+webtunnel bridge published on GitHub is discoverable by anyone, censors
+included, so the scraped pool is a record of bridges that have *already been
+handed out publicly*, which is the same as saying already burned. The bridges
+that still work are the ones distributed on request through BridgeDB and moat,
+rate-limited and CAPTCHA-gated precisely so they cannot be harvested.
+
+The practical consequence is that adding more scraping collectors buys very
+little: they all scrape the same exhausted set, and three of them already
+agreed. What would actually raise the yield is a distribution channel that is
+not public — moat, or bridges shared directly between people, which is what the
+QR sharing path is for.
+
+It also means a thin webtunnel pool is the normal condition, not a fault to be
+fixed. Selection has to assume most candidates are dead: probe before use,
+retire on a verdict, and never let a preference for webtunnel imply that
+webtunnel bridges will be available.
+
 ## Open direction
 
 Client-side TLS ClientHello fragmentation (the zapret/GoodbyeDPI technique) is
