@@ -408,7 +408,6 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
             bridges: parsed_bridges.bridges,
             pt_binary,
             state_dir: Some(state_dir),
-            two_hop_paths: cfg.path.two_hop_paths,
             ..Default::default()
         };
         let block_onion = cfg.security.block_onion;

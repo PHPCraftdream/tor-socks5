@@ -112,10 +112,9 @@ arti-client = { path = "vendor/arti-client" }
 ## (docs/circuit-speed-plan.md): Tier 2 — an opt-in bandwidth floor for
 ## middle/exit relay selection (`min_bandwidth_percentile`, default 0 =
 ## stock behaviour; falls back to the unfiltered pool rather than ever
-## shrinking the candidate set below a safety floor), and Tier 3 —
-## opt-in 2-hop (guard+exit) paths (`two_hop_paths`, default false).
-## Both are latency-over-anonymity trades acceptable only in this
-## personal-use fork; defaults keep behaviour identical to upstream.
+## shrinking the candidate set below a safety floor). This is a
+## latency-over-anonymity trade acceptable only in this personal-use fork;
+## the default keeps behaviour identical to upstream.
 tor-circmgr = { path = "vendor/tor-circmgr" }
 ## NOTE: ptrs-gesher 0.5.0 is published on crates.io and consumed directly
 ## from there (see [workspace.dependencies] above) — no path override needed.

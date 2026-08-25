@@ -451,62 +451,6 @@ mod test {
         });
     }
 
-    // tor-socks5 local patch (docs/circuit-speed-plan.md Tier 3): 2-hop
-    // paths are [guard, exit], with the middle hop skipped entirely.
-    fn assert_two_hop_exit_path_ok(relays: &[MaybeOwnedRelay<'_>], family_rules: FamilyRules) {
-        assert_eq!(relays.len(), 2);
-
-        let r1 = &relays[0];
-        let r2 = &relays[1];
-
-        if let MaybeOwnedRelay::Relay(r1) = r1 {
-            assert!(r1.low_level_details().is_suitable_as_guard());
-        }
-
-        assert!(!r1.same_relay_ids(r2));
-
-        let subnet_config = SubnetConfig::default();
-        assert!(r1.can_share_circuit(r2, subnet_config, family_rules));
-    }
-
-    // tor-socks5 local patch (docs/circuit-speed-plan.md Tier 3).
-    #[test]
-    fn two_hop_paths() {
-        tor_rtcompat::test_with_all_runtimes!(|rt| async move {
-            let mut rng = testing_rng();
-            let family_rules = FamilyRules::all_family_info();
-            let netdir = testnet::construct_netdir().unwrap_if_sufficient().unwrap();
-            let ports = vec![TargetPort::ipv4(443), TargetPort::ipv4(1119)];
-            let dirinfo = (&netdir).into();
-            let config = PathConfig::builder().two_hop_paths(true).build().unwrap();
-            let statemgr = TestingStateMgr::new();
-            let guards =
-                tor_guardmgr::GuardMgr::new(rt.clone(), statemgr, &TestConfig::default()).unwrap();
-            guards.install_test_netdir(&netdir);
-            let now = SystemTime::get();
-
-            for _ in 0..1000 {
-                let (path, _, _) = ExitPathBuilder::from_target_ports(ports.clone())
-                    .pick_path(&mut rng, dirinfo, &guards, &config, now)
-                    .unwrap();
-
-                assert_same_path_when_owned(&path);
-                assert_eq!(path.len(), 2);
-
-                if let TorPathInner::Path(p) = path.inner {
-                    assert_two_hop_exit_path_ok(&p[..], family_rules);
-                    let exit = match &p[1] {
-                        MaybeOwnedRelay::Relay(r) => r,
-                        MaybeOwnedRelay::Owned(_) => panic!("Didn't asked for an owned target!"),
-                    };
-                    assert!(exit.low_level_details().ipv4_policy().allows_port(1119));
-                } else {
-                    panic!("Generated the wrong kind of path");
-                }
-            }
-        });
-    }
-
     // tor-socks5 local patch (docs/circuit-speed-plan.md Tier 2): an
     // over-aggressive floor must fall back, not fail.
     #[test]

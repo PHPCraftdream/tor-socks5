@@ -42,9 +42,6 @@ pub struct Config {
     /// Local SOCKS5 (RFC 1929) authentication for the listener. Used by
     /// both the CLI and the Android JNI FFI crate — see [`AuthConfig`].
     pub auth: AuthConfig,
-    /// Circuit path selection. These knobs intentionally default to the
-    /// stock, three-hop Tor path.
-    pub path: PathConfig,
     /// Destination policy enforced by the local SOCKS5 listener.
     pub security: SecurityConfig,
     /// Name-resolution policy used by bridge reachability probes.
@@ -79,16 +76,6 @@ impl DnsConfig {
             system_fallback: self.system_fallback,
         }
     }
-}
-
-/// Circuit-path knobs shared by the CLI and Android JNI engines.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default, deny_unknown_fields)]
-pub struct PathConfig {
-    /// Build two-hop circuits (`guard -> exit`) instead of the stock
-    /// three-hop path. This is a deliberate anonymity trade-off and is
-    /// disabled by default.
-    pub two_hop_paths: bool,
 }
 
 /// Security policy for destinations accepted by the local SOCKS5 listener.
@@ -513,7 +500,6 @@ impl Default for Config {
             conn_health: ConnHealthConfig::default(),
             upstream: UpstreamConfig::default(),
             auth: AuthConfig::default(),
-            path: PathConfig::default(),
             security: SecurityConfig::default(),
             dns: DnsConfig::default(),
         }
@@ -1076,27 +1062,24 @@ auth.users_file: /data/data/org.torproject.android/files/tor-socks5.users.ktav
     }
 
     #[test]
-    fn path_and_security_defaults_are_safe() {
+    fn security_and_dns_defaults_are_safe() {
         let cfg = Config::default();
-        assert!(!cfg.path.two_hop_paths);
         assert!(cfg.security.block_onion);
         assert!(cfg.dns.doh_enabled);
         assert!(!cfg.dns.system_fallback);
     }
 
     #[test]
-    fn parses_path_and_security_sections() {
-        let src = "listen: 127.0.0.1:1080\npath.two_hop_paths: true\nsecurity.block_onion: true\n";
-        let cfg: Config = ktav::from_str(src).expect("ktav parses path and security sections");
-        assert!(cfg.path.two_hop_paths);
+    fn parses_security_section() {
+        let src = "listen: 127.0.0.1:1080\nsecurity.block_onion: true\n";
+        let cfg: Config = ktav::from_str(src).expect("ktav parses security section");
         assert!(cfg.security.block_onion);
     }
 
     #[test]
-    fn path_and_security_sections_fall_back_when_absent() {
+    fn security_and_dns_sections_fall_back_when_absent() {
         let src = "listen: 127.0.0.1:1080\n";
         let cfg: Config = ktav::from_str(src).expect("old config remains valid");
-        assert!(!cfg.path.two_hop_paths);
         assert!(cfg.security.block_onion);
         assert!(cfg.dns.doh_enabled);
         assert!(!cfg.dns.system_fallback);

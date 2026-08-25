@@ -366,36 +366,23 @@ fn pick_path<'a, B: AnonymousPathBuilder, R: Rng, RT: Runtime>(
     let mut exclusion = family_exclusion;
     exclusion.extend(&target_exclusion);
 
-    // tor-socks5 local patch (docs/circuit-speed-plan.md Tiers 2 and 3):
-    // with both knobs at their defaults this is exactly the stock code —
-    // the same RelaySelector, the same `select_relay` RNG consumption, and
-    // the same 3-hop `vec![guard, middle, exit]`.
-    let hops = if config.two_hop_paths {
-        // Tier 3: skip the middle hop entirely — [guard, exit]. One fewer
-        // relay round-trip and one less layer of onion crypto per circuit,
-        // at a severe anonymity cost (entry and exit become directly
-        // adjacent). Applies uniformly to every `AnonymousPathBuilder`
-        // path, onion-service circuit stems included.
-        vec![guard, MaybeOwnedRelay::from(exit)]
-    } else {
-        let selector = RelaySelector::new(middle_usage, exclusion);
-        // Tier 2: the middle relay is optionally restricted to the upper
-        // band of the consensus bandwidth distribution.
-        let middle = select_relay_with_bandwidth_floor(
-            &selector,
-            rng,
-            netdir,
-            config.min_bandwidth_percentile,
-            WeightRole::Middle,
-            builder.path_kind(),
-            "middle relay",
-        )?;
-        vec![
-            guard,
-            MaybeOwnedRelay::from(middle),
-            MaybeOwnedRelay::from(exit),
-        ]
-    };
+    let selector = RelaySelector::new(middle_usage, exclusion);
+    // Tier 2: the middle relay is optionally restricted to the upper
+    // band of the consensus bandwidth distribution.
+    let middle = select_relay_with_bandwidth_floor(
+        &selector,
+        rng,
+        netdir,
+        config.min_bandwidth_percentile,
+        WeightRole::Middle,
+        builder.path_kind(),
+        "middle relay",
+    )?;
+    let hops = vec![
+        guard,
+        MaybeOwnedRelay::from(middle),
+        MaybeOwnedRelay::from(exit),
+    ];
 
     ensure_unique_hops(&hops)?;
 

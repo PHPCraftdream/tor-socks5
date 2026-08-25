@@ -61,14 +61,6 @@ pub struct PathConfig {
     #[deftly(tor_config(default = "default_min_bandwidth_percentile()"))]
     pub(crate) min_bandwidth_percentile: u8,
 
-    // tor-socks5 local patch (docs/circuit-speed-plan.md Tier 3): build
-    // 2-hop (guard + exit) paths instead of the standard 3-hop
-    // (guard + middle + exit). false (the default) keeps stock behaviour.
-    // Severe anonymity cost (entry and exit directly adjacent); applied in
-    // `path.rs`'s `pick_path`. Latency-over-anonymity trade, personal-use
-    // fork only.
-    #[deftly(tor_config(default = "default_two_hop_paths()"))]
-    pub(crate) two_hop_paths: bool,
 }
 
 /// Return the default list of reachable addresses (namely, "*:*")
@@ -97,12 +89,6 @@ fn default_min_bandwidth_percentile() -> u8 {
     0
 }
 
-/// tor-socks5 local patch: default for `two_hop_paths` (false = stock
-/// 3-hop paths).
-fn default_two_hop_paths() -> bool {
-    false
-}
-
 impl PathConfig {
     /// Return a subnet configuration based on these rules.
     pub fn subnet_config(&self) -> tor_netdir::SubnetConfig {
@@ -118,12 +104,6 @@ impl PathConfig {
         self.min_bandwidth_percentile
     }
 
-    /// tor-socks5 local patch: whether 2-hop (guard + exit) paths are
-    /// enabled. See the `two_hop_paths` field.
-    pub fn two_hop_paths(&self) -> bool {
-        self.two_hop_paths
-    }
-
     /// Return true if this configuration is at least as permissive as `other`.
     ///
     /// In other words, in other words, return true if every circuit permitted
@@ -136,15 +116,10 @@ impl PathConfig {
         self.ipv4_subnet_family_prefix >= other.ipv4_subnet_family_prefix
             && self.ipv6_subnet_family_prefix >= other.ipv6_subnet_family_prefix
             && self.reachable_addrs == other.reachable_addrs
-            // tor-socks5 local patch: our circuit-speed knobs must compare
-            // conservatively. A higher bandwidth floor is strictly less
-            // permissive, and any change in hop count makes old and new
-            // rules incomparable — returning false here only causes
-            // circuits to be discarded on reconfigure, which is the safe
-            // direction (this function may return "false" inaccurately but
-            // must never return "true" inaccurately).
+            // tor-socks5 local patch: a higher bandwidth floor is strictly
+            // less permissive. Returning false here only causes circuits to
+            // be discarded on reconfigure, which is the safe direction.
             && self.min_bandwidth_percentile <= other.min_bandwidth_percentile
-            && self.two_hop_paths == other.two_hop_paths
     }
 
     /// Return a new [`GuardFilter`] reflecting the rules in this configuration.
@@ -483,27 +458,23 @@ mod test {
         assert!(!pc3.at_least_as_permissive_as(&pc2));
     }
 
-    // tor-socks5 local patch: the circuit-speed knobs default to stock
-    // behaviour, round-trip through the builder, and compare
-    // conservatively in `at_least_as_permissive_as`.
+    // tor-socks5 local patch: the bandwidth floor defaults to stock behaviour,
+    // round-trips through the builder, and compares conservatively in
+    // `at_least_as_permissive_as`.
     #[test]
-    fn path_config_circuit_speed_knobs() {
+    fn path_config_bandwidth_floor() {
         let pc = PathConfig::default();
         assert_eq!(pc.min_bandwidth_percentile(), 0);
-        assert!(!pc.two_hop_paths());
 
         let stricter = PathConfig::builder()
             .min_bandwidth_percentile(75)
-            .two_hop_paths(true)
             .build()
             .unwrap();
         assert_eq!(stricter.min_bandwidth_percentile(), 75);
-        assert!(stricter.two_hop_paths());
 
-        // Equal knobs are mutually permissive.
+        // Equal floors are mutually permissive.
         let same = PathConfig::builder()
             .min_bandwidth_percentile(75)
-            .two_hop_paths(true)
             .build()
             .unwrap();
         assert!(same.at_least_as_permissive_as(&stricter));
@@ -514,11 +485,6 @@ mod test {
         assert!(lower_floor.at_least_as_permissive_as(&stricter_floor_only()));
         // ...and not the other way around.
         assert!(!stricter_floor_only().at_least_as_permissive_as(&lower_floor));
-
-        // Any hop-count difference is incomparable (never "as permissive").
-        let other_hops = PathConfig::builder().two_hop_paths(true).build().unwrap();
-        assert!(!pc.at_least_as_permissive_as(&other_hops));
-        assert!(!other_hops.at_least_as_permissive_as(&pc));
     }
 
     // tor-socks5 local patch: helper for the test above.

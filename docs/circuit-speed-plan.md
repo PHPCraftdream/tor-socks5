@@ -1,9 +1,7 @@
-# Plan: circuit speed knobs — hop count and fast-relay preference
+# Plan: circuit speed knobs — bridge ranking and fast-relay preference
 
-Status: **implemented behind an opt-in config/UI switch**. The vendored `tor-circmgr` path
-builder and `arti-wrapper::Settings` now honor `path.two_hop_paths`; Android exposes the same
-choice as “Use two-hop Tor circuits”. It remains off by default. Companion to `docs/bridges.md`
-and `docs/android-bridge-freshness-plan.md`.
+Status: **bridge ranking and bandwidth-floor relay selection are implemented**. Companion to
+`docs/bridges.md` and `docs/android-bridge-freshness-plan.md`.
 
 Context: this fork is explicitly a personal-stability client, not an anonymity-preserving one
 ("анонимность понижаем — делаем для себя"). The knobs below trade anonymity for latency; they
@@ -16,23 +14,18 @@ Two things the request conflated, which are not the same knob:
 | | what it is | minimum | today |
 |---|---|---|---|
 | **Bridges** (`bridges.lines`) | the *entry point* — a bridge is hop #1 (the guard) | **1** — no hardcoded floor of 2 (`tor-guardmgr/src/config.rs:67-70`: `bridges_enabled()` is just `!self.bridges.is_empty()`) | N configured; extras are failover redundancy, **not** extra hops |
-| **Hops** | relays a circuit traverses | 3 for ordinary traffic | 3 by default; optional 2-hop path |
+| **Hops** | relays a circuit traverses | 3 for ordinary traffic | 3 |
 
 1. **Hop count is structural, not a variable.** `tor-circmgr/src/path.rs:305-382`, `pick_path()`
    builds `vec![guard, MaybeOwnedRelay::from(middle), MaybeOwnedRelay::from(exit)]`. There is no
    loop and no count — "3" is just how many steps the function performs. (The 1-hop directory
    path is a separate code path, `dirpath.rs`, used for `OneHopDirectory` usage only.)
-2. **The path knob is now plumbed.** `path.two_hop_paths` is parsed by `proxy-config`, passed
-   through Android JNI into `arti_wrapper::Settings`, and applied by the vendored
-   `tor-circmgr` path builder.
-3. The setting is deliberately opt-in: it removes the middle relay and therefore materially
-   reduces anonymity. Existing configs without the key retain the stock three-hop behavior.
-4. **Relay selection is already bandwidth-weighted.** `path.rs:367` / `path/exitpath.rs:175` call
+2. **Relay selection is already bandwidth-weighted.** `path.rs:367` / `path/exitpath.rs:175` call
    `selector.select_relay()` → `tor-relay-selection/src/selector.rs:277-279` →
    `netdir.pick_relay(rng, role, ...)`, the standard consensus-bandwidth-weighted choice. So
    "prefer fast relays" is **already the default behaviour** — a naive toggle for it would be a
    no-op.
-5. **Latency data exists but never feeds selection.** `tor-circmgr/src/timeouts/pareto.rs`
+3. **Latency data exists but never feeds selection.** `tor-circmgr/src/timeouts/pareto.rs`
    (`note_hop_completed`, line 566) models per-hop build times purely to decide *when to give up*
    on a circuit build. Nothing routes it back into which relay gets picked.
 
@@ -73,21 +66,6 @@ directly reduces anonymity, and if set too aggressively can cause circuit-build 
 the filtered set is too small. Needs a floor on set size, mirroring the "never prune below a
 floor" rule already adopted for bridges.
 
-### Tier 3 — 2-hop circuits (implemented, largest anonymity cost, largest speed win)
-
-Patch the vendored `pick_path` to optionally emit `vec![guard, exit]`, skipping the middle hop.
-
-- **Gain:** removes one relay round-trip and one layer of onion crypto from every request.
-  Typically the single biggest latency win available, since the middle hop is frequently the slow
-  link.
-- **Cost:** severe anonymity loss. With 3 hops, guard and exit colluding still need the middle to
-  correlate; with 2 hops the entry (our bridge) and the exit are directly adjacent, so any pair
-  that colludes — or any observer of both ends — deanonymizes the stream immediately.
-- **1 hop is not an option** for general traffic: bridges are not exit relays, so there is no
-  single node that can both accept our connection and reach the open internet.
-- Must be config-gated and default-off, and `pick_path` is generic over `AnonymousPathBuilder`,
-  so `exitpath.rs`'s own path assembly needs the matching change, not just the one function.
-
 ### Explicitly out of scope
 
 - **Client-side latency probing of middle/exit relays.** Actively measuring public relays from
@@ -104,4 +82,4 @@ Patch the vendored `pick_path` to optionally emit `vec![guard, exit]`, skipping 
 Tier 1 first — it is nearly free, carries no anonymity cost beyond what the fork already accepts,
 and its effect (always starting from the fastest live bridge) is the one most likely to fix the
 symptom actually observed on device: slow/stalled bootstraps behind a marginal first hop. Only
-then evaluate whether Tier 2/3 are still needed, with Tier 1's measurements as the baseline.
+then evaluate whether Tier 2 is still needed, with Tier 1's measurements as the baseline.

@@ -118,19 +118,11 @@ pub struct Settings {
     /// disables the floor -- stock, bandwidth-weighted-but-unrestricted selection. Trades
     /// anonymity (a smaller candidate pool) for fewer slow hops.
     pub min_bandwidth_percentile: u8,
-    /// Tier 3 (docs/circuit-speed-plan.md): build 2-hop circuits (`[guard, exit]`), skipping
-    /// the middle relay entirely. `false` (default) keeps the stock 3-hop path. Severe
-    /// anonymity cost (entry and exit become directly adjacent) for the largest available
-    /// latency win.
-    pub two_hop_paths: bool,
 }
 
 impl Settings {
     pub fn is_default(&self) -> bool {
-        self.bridges.is_empty()
-            && self.pt_binary.is_none()
-            && self.min_bandwidth_percentile == 0
-            && !self.two_hop_paths
+        self.bridges.is_empty() && self.pt_binary.is_none() && self.min_bandwidth_percentile == 0
     }
 }
 
@@ -521,12 +513,11 @@ fn build_config(settings: &Settings) -> Result<TorClientConfig> {
             .state_dir(join("state"));
     }
 
-    // Tiers 2/3 (docs/circuit-speed-plan.md): both default to stock behavior (0 / false), so
-    // this is a no-op unless explicitly opted into.
+    // Tier 2 (docs/circuit-speed-plan.md): the default floor is zero, so this is a no-op
+    // unless explicitly opted into.
     builder
         .path_rules()
-        .min_bandwidth_percentile(settings.min_bandwidth_percentile)
-        .two_hop_paths(settings.two_hop_paths);
+        .min_bandwidth_percentile(settings.min_bandwidth_percentile);
 
     if !settings.bridges.is_empty() {
         for line in &settings.bridges {
