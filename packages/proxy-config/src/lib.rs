@@ -15,6 +15,7 @@ use std::{env, fs};
 
 use anyhow::{Context, Result};
 use bridge_line::BridgeLine;
+use bridge_probe::usable_for_tor;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
@@ -428,6 +429,9 @@ impl Default for BridgesConfig {
 pub struct ParsedBridges {
     pub bridges: Vec<BridgeLine>,
     pub duplicates: usize,
+    /// Bridge lines that parsed successfully but use documentation/local-only
+    /// addresses and were therefore ignored.
+    pub rejected: usize,
 }
 
 impl BridgesConfig {
@@ -438,10 +442,15 @@ impl BridgesConfig {
         let mut bridges = Vec::with_capacity(self.lines.len());
         let mut seen: HashSet<(Option<String>, SocketAddr, Option<String>)> = HashSet::new();
         let mut duplicates = 0usize;
+        let mut rejected = 0usize;
         for (idx, line) in self.lines.iter().enumerate() {
             let parsed: BridgeLine = line
                 .parse()
                 .with_context(|| format!("invalid bridge at index {idx}: {line:?}"))?;
+            if !usable_for_tor(&parsed) {
+                rejected += 1;
+                continue;
+            }
             let key = (
                 parsed.transport.clone(),
                 parsed.addr,
@@ -456,6 +465,7 @@ impl BridgesConfig {
         Ok(ParsedBridges {
             bridges,
             duplicates,
+            rejected,
         })
     }
 }

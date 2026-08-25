@@ -17,4 +17,5 @@ ktav.workspace = true
 serde.workspace = true
 indexmap.workspace = true
 bridge-line.workspace = true
+bridge-probe = { path = "../bridge-probe" }
 anyhow.workspace = true

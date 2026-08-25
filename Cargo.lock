@@ -752,6 +752,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arti-wrapper",
+ "bridge-probe",
  "criterion",
  "futures",
  "httparse",
@@ -784,6 +785,7 @@ name = "bridge-store"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bridge-probe",
  "ptrs-gesher-bridge-line",
  "tempfile",
  "time",
@@ -4100,6 +4102,7 @@ name = "proxy-config"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bridge-probe",
  "indexmap 2.14.0",
  "ktav",
  "ptrs-gesher-bridge-line",

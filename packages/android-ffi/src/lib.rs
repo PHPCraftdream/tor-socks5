@@ -164,7 +164,7 @@ use jni::JNIEnv;
 use proxy_config::{Config, Loaded};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Global engine handle. Accessed via `OnceLock::get_or_init` for lazy initialization.
 /// Uses `std::sync::Mutex` (not Tokio's) because JNI entry points are synchronous.
@@ -301,6 +301,13 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
                 let _ = env.throw_new("java/lang/RuntimeException", &msg);
                 e
             })?;
+        if parsed_bridges.rejected > 0 {
+            warn!(
+                rejected = parsed_bridges.rejected,
+                configured = cfg.bridges.lines.len(),
+                "ignored documentation/local-only bridge addresses"
+            );
+        }
 
         // 5. Parse listen address
         let listen_addr: std::net::SocketAddr = cfg

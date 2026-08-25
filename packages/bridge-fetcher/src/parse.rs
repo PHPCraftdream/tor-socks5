@@ -2,6 +2,8 @@
 
 use bridge_line::BridgeLine;
 
+use bridge_probe::usable_for_tor;
+
 /// Parse bridge lines from a text body, skipping blank lines, `#`
 /// comments, and any line that does not parse as a `BridgeLine`.
 pub fn parse_bridges_from_body(body: &str) -> Vec<BridgeLine> {
@@ -11,6 +13,7 @@ pub fn parse_bridges_from_body(body: &str) -> Vec<BridgeLine> {
             !trimmed.is_empty() && !trimmed.starts_with('#')
         })
         .filter_map(|line| line.trim().parse::<BridgeLine>().ok())
+        .filter(usable_for_tor)
         .collect()
 }
 
@@ -49,6 +52,17 @@ also bad
 ";
         let bridges = parse_bridges_from_body(body);
         assert_eq!(bridges.len(), 2);
+    }
+
+    #[test]
+    fn parse_bridges_drops_documentation_addresses_from_sources() {
+        let body = "\
+webtunnel [2001:db8::1]:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 url=https://example.com/x ver=0.0.3
+obfs4 5.45.101.108:36781 0123456789ABCDEF0123456789ABCDEF01234567 cert=BBB iat-mode=0
+";
+        let bridges = parse_bridges_from_body(body);
+        assert_eq!(bridges.len(), 1);
+        assert_eq!(bridges[0].addr.to_string(), "5.45.101.108:36781");
     }
 }
 

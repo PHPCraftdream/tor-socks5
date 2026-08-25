@@ -801,8 +801,10 @@ async fn stall_watchdog(
 ) {
     let mut consecutive_failures = 0u32;
     let mut last_reset: Option<Instant> = None;
-    // Bootstrap already probed once; the first periodic re-probe is due one full interval
-    // from now, not immediately.
+    // Bootstrap already probed once, but a thin pool should be refreshed shortly after the
+    // first successful connection. Waiting a full hour here made `auto_fetch` effectively
+    // invisible on Android, especially after a fresh install with only a few seed bridges.
+    let mut first_bridge_reprobe = true;
     let mut last_bridge_reprobe = Instant::now();
     let reprobe_interval = Duration::from_secs(
         bridge_health
@@ -821,10 +823,10 @@ async fn stall_watchdog(
             return;
         }
 
-        if !bridges.is_empty()
-            && !reprobe_interval.is_zero()
-            && last_bridge_reprobe.elapsed() >= reprobe_interval
-        {
+        let should_reprobe = !reprobe_interval.is_zero()
+            && (first_bridge_reprobe || last_bridge_reprobe.elapsed() >= reprobe_interval);
+        if !bridges.is_empty() && should_reprobe {
+            first_bridge_reprobe = false;
             let mut alive = tokio::select! {
                 biased;
                 _ = stop_rx.changed() => return,

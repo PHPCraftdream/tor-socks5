@@ -39,6 +39,13 @@ pub(crate) async fn build_tor_settings(
             "config contains duplicate bridge entries — skipped"
         );
     }
+    if parsed.rejected > 0 {
+        warn!(
+            rejected = parsed.rejected,
+            configured = cfg.bridges.lines.len(),
+            "ignored documentation/local-only bridge addresses"
+        );
+    }
     let parsed_bridges = parsed.bridges;
     // Everything we attempt this round, for the health store. Starts with
     // the configured bridges (covers both obfs4 and webtunnel — the store

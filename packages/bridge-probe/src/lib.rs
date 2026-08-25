@@ -22,6 +22,21 @@ use futures::stream::{self, StreamExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
+/// Return whether a bridge address is a real network endpoint rather than a
+/// documentation/test placeholder.  The public webtunnel collector currently
+/// publishes `2001:db8::/32` addresses; that prefix is reserved by RFC 3849
+/// and can never identify a reachable Tor relay.  Keeping this check here
+/// gives every consumer (config loading, source fetches, and probes) one
+/// canonical policy. Loopback and IPv4 documentation ranges remain accepted
+/// because the probe crate deliberately supports local test listeners and
+/// callers may use them in offline integration tests.
+pub fn usable_for_tor(bridge: &BridgeLine) -> bool {
+    match bridge.addr.ip() {
+        std::net::IpAddr::V4(_) => true,
+        std::net::IpAddr::V6(ip) => !ip.octets().starts_with(&[0x20, 0x01, 0x0d, 0xb8]),
+    }
+}
+
 /// Outcome of probing a single bridge.
 #[derive(Debug, Clone)]
 pub enum Outcome {
@@ -100,6 +115,11 @@ fn webtunnel_probe_target(params: &BTreeMap<String, String>) -> Result<(String, 
 /// DNS resolution (when needed) shares the same `per_bridge_timeout` budget
 /// as the TCP probe itself.
 async fn resolve_and_probe(bridge: &BridgeLine, per_bridge_timeout: Duration) -> Outcome {
+    if !usable_for_tor(bridge) {
+        return Outcome::Unreachable {
+            reason: "documentation or local-only bridge address".to_owned(),
+        };
+    }
     let (host, port) = match resolve_probe_target(bridge) {
         Ok(v) => v,
         Err(reason) => return Outcome::Unreachable { reason },
@@ -453,6 +473,24 @@ mod tests {
         let (host, port) = resolve_probe_target(&bridge).unwrap();
         assert_eq!(host, "example.com");
         assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn rejects_documentation_ipv6_bridge_addresses() {
+        let bridge: BridgeLine =
+            "webtunnel [2001:db8::1]:443 2852538D49D7D73C1A6694FC492104983A9C4FA2 url=https://example.com/x"
+                .parse()
+                .expect("bridge line parses");
+        assert!(!usable_for_tor(&bridge));
+    }
+
+    #[test]
+    fn keeps_public_ipv4_bridge_addresses_usable() {
+        let bridge: BridgeLine =
+            "obfs4 5.45.101.108:36781 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA iat-mode=0"
+                .parse()
+                .expect("bridge line parses");
+        assert!(usable_for_tor(&bridge));
     }
 
     #[test]

@@ -37,6 +37,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bridge_line::BridgeLine;
+use bridge_probe::usable_for_tor;
 use time::format_description::well_known::Iso8601;
 use time::OffsetDateTime;
 
@@ -146,6 +147,10 @@ impl BridgeStore {
                 continue;
             }
             if let Ok(bridge) = line.parse::<BridgeLine>() {
+                if !usable_for_tor(&bridge) {
+                    pending_meta = None;
+                    continue;
+                }
                 let meta = pending_meta.take().unwrap_or_default();
                 let entry = Entry {
                     bridge,
