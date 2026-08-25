@@ -190,6 +190,20 @@ bridges.sources: [
 
 Header/cookie values are stripped of CR/LF to prevent header injection.
 
+## Hostname resolution for bridge probes
+
+Bridge lines with literal IP addresses do not need DNS. For hostname-bearing
+webtunnel lines, the probe uses encrypted DNS-over-HTTPS by default
+(`dns.doh_enabled: true`). It keeps a built-in list of public providers and
+their bootstrap IP addresses, opens HTTPS with the provider's TLS name, and
+races the providers; the first valid answer is used. This means a working
+provider address becomes a direct bootstrap gateway even when the carrier's
+DNS is unavailable. Set `dns.doh_enabled: false` to disable DoH. Set
+`dns.system_fallback: true` to permit the operating-system/network resolver
+when DoH is disabled or all DoH providers fail. Both switches are independent;
+with both off, hostname bridge probes fail explicitly while IP bridges remain
+unaffected.
+
 ## The `bridges fetch` command
 
 Manually refresh the pool and promote reachable newcomers:

@@ -114,6 +114,12 @@ upstream.password:
 ## path with no implicit CWD/env-var fallback. See docs/auth.md.
 auth.enabled: true
 auth.users_file:
+
+## Bridge hostname resolution. DoH uses a built-in pool of public providers
+## with pinned IP bootstrap addresses and races them; the fastest successful
+## response wins. System DNS is opt-in because carrier DNS may be blocked.
+dns.doh_enabled: true
+dns.system_fallback: false
 ```
 
 > **Ktav comments are `##` at the start of a line** (a single `#` is content, and there are no

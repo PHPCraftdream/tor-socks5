@@ -47,6 +47,38 @@ pub struct Config {
     pub path: PathConfig,
     /// Destination policy enforced by the local SOCKS5 listener.
     pub security: SecurityConfig,
+    /// Name-resolution policy used by bridge reachability probes.
+    pub dns: DnsConfig,
+}
+
+/// Name-resolution policy for bridge probes. DoH is deliberately the default:
+/// it avoids relying on a carrier-provided DNS server which may be blocked or
+/// tampered with. System DNS is an explicit opt-in fallback.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DnsConfig {
+    /// Resolve bridge hostnames through the built-in multi-provider DoH pool.
+    pub doh_enabled: bool,
+    /// If DoH cannot resolve a name, also try the operating-system resolver.
+    pub system_fallback: bool,
+}
+
+impl Default for DnsConfig {
+    fn default() -> Self {
+        Self {
+            doh_enabled: true,
+            system_fallback: false,
+        }
+    }
+}
+
+impl DnsConfig {
+    pub fn resolver_policy(self) -> bridge_probe::ResolverPolicy {
+        bridge_probe::ResolverPolicy {
+            doh_enabled: self.doh_enabled,
+            system_fallback: self.system_fallback,
+        }
+    }
 }
 
 /// Circuit-path knobs shared by the CLI and Android JNI engines.
@@ -483,6 +515,7 @@ impl Default for Config {
             auth: AuthConfig::default(),
             path: PathConfig::default(),
             security: SecurityConfig::default(),
+            dns: DnsConfig::default(),
         }
     }
 }
@@ -1047,6 +1080,8 @@ auth.users_file: /data/data/org.torproject.android/files/tor-socks5.users.ktav
         let cfg = Config::default();
         assert!(!cfg.path.two_hop_paths);
         assert!(cfg.security.block_onion);
+        assert!(cfg.dns.doh_enabled);
+        assert!(!cfg.dns.system_fallback);
     }
 
     #[test]
@@ -1063,5 +1098,18 @@ auth.users_file: /data/data/org.torproject.android/files/tor-socks5.users.ktav
         let cfg: Config = ktav::from_str(src).expect("old config remains valid");
         assert!(!cfg.path.two_hop_paths);
         assert!(cfg.security.block_onion);
+        assert!(cfg.dns.doh_enabled);
+        assert!(!cfg.dns.system_fallback);
+    }
+
+    #[test]
+    fn parses_dns_policy_and_roundtrips() {
+        let src = "listen: 127.0.0.1:1080\ndns.doh_enabled: false\ndns.system_fallback: true\n";
+        let cfg: Config = ktav::from_str(src).expect("ktav parses DNS policy");
+        assert!(!cfg.dns.doh_enabled);
+        assert!(cfg.dns.system_fallback);
+        let serialized = ktav::to_string(&cfg).expect("serialize DNS policy");
+        let restored: Config = ktav::from_str(&serialized).expect("deserialize DNS policy");
+        assert_eq!(restored.dns, cfg.dns);
     }
 }

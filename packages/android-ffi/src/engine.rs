@@ -98,6 +98,8 @@ pub(crate) struct BridgeHealthContext {
     /// `max_fails` / `fail_window_mins` / `max_circuit_fails` from the
     /// loaded config, needed by `BridgeStore::note_probe_round`.
     pub bridges_cfg: BridgesConfig,
+    /// Resolver policy for hostname-bearing bridge lines.
+    pub resolver_policy: bridge_probe::ResolverPolicy,
 }
 
 /// Connection policy shared by the accept loop and each spawned client task.
@@ -324,7 +326,7 @@ async fn engine_async(
                 info!("received stop signal while probing bridges");
                 return Ok(());
             }
-            alive = bridge_probe::probe_and_sort(active_probe_bridges.clone(), Duration::from_secs(5)) => alive,
+            alive = bridge_probe::probe_and_sort_with_policy(active_probe_bridges.clone(), Duration::from_secs(5), bridge_health.resolver_policy) => alive,
         };
 
         persist_and_rank_probe(&active_probe_bridges, &mut alive, &bridge_health);
@@ -345,7 +347,7 @@ async fn engine_async(
                     info!("received stop signal while probing bridge fallback pool");
                     return Ok(());
                 }
-                alive = bridge_probe::probe_and_sort(settings.bridges.clone(), Duration::from_secs(5)) => alive,
+                alive = bridge_probe::probe_and_sort_with_policy(settings.bridges.clone(), Duration::from_secs(5), bridge_health.resolver_policy) => alive,
             };
             persist_and_rank_probe(&settings.bridges, &mut alive, &bridge_health);
         }
@@ -830,7 +832,7 @@ async fn stall_watchdog(
             let mut alive = tokio::select! {
                 biased;
                 _ = stop_rx.changed() => return,
-                alive = bridge_probe::probe_and_sort(bridges.clone(), BRIDGE_REPROBE_TIMEOUT) => alive,
+                alive = bridge_probe::probe_and_sort_with_policy(bridges.clone(), BRIDGE_REPROBE_TIMEOUT, bridge_health.resolver_policy) => alive,
             };
             persist_and_rank_probe(&bridges, &mut alive, &bridge_health);
             debug!(

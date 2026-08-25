@@ -34,6 +34,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 futures = "0.3"
+hickory-resolver = { version = "0.26.1", default-features = false, features = ["tokio", "https-ring"] }
 
 ktav = "0.6.0"
 serde = { version = "1", features = ["derive"] }

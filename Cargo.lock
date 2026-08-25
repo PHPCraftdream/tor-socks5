@@ -774,6 +774,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "futures",
+ "hickory-resolver",
  "ptrs-gesher-bridge-line",
  "tokio",
  "tracing",

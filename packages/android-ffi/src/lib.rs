@@ -416,6 +416,7 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
         // needs its own owned copies to persist/rank bridge health via the
         // shared `bridge-store` crate (see `engine::engine_async`).
         let bridges_cfg = cfg.bridges.clone();
+        let resolver_policy = cfg.dns.resolver_policy();
         let engine_config_path = std::path::PathBuf::from(&config_path_str);
 
         // 9. Get Java VM and create global reference to callback
@@ -457,6 +458,7 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
                     engine::BridgeHealthContext {
                         config_path: Some(engine_config_path),
                         bridges_cfg,
+                        resolver_policy,
                     },
                 )
             }) {

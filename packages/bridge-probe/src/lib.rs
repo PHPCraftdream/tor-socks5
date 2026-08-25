@@ -14,13 +14,90 @@
 //! transport before the TCP handshake.
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use bridge_line::BridgeLine;
 use futures::stream::{self, StreamExt};
 use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
 use tokio::time::timeout;
+
+/// Controls how hostname-based bridge targets are resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolverPolicy {
+    /// Use the built-in pool of encrypted DNS-over-HTTPS providers.
+    pub doh_enabled: bool,
+    /// Permit the operating-system resolver if DoH is disabled or unavailable.
+    pub system_fallback: bool,
+}
+
+impl Default for ResolverPolicy {
+    fn default() -> Self {
+        Self {
+            doh_enabled: true,
+            system_fallback: false,
+        }
+    }
+}
+
+/// Public DoH services are queried in parallel. The first successful answer
+/// wins, which naturally prefers the currently reachable/fastest provider;
+/// this also avoids pinning Android users to a single blocked DNS service.
+const DOH_PROVIDERS: &[(&str, &str, &str)] = &[
+    // Cloudflare (two anycast addresses, unfiltered).
+    ("1.1.1.1", "cloudflare-dns.com", "/dns-query"),
+    ("1.0.0.1", "cloudflare-dns.com", "/dns-query"),
+    // Quad9 secure and no-threat-blocking variants.
+    ("9.9.9.9", "dns.quad9.net", "/dns-query"),
+    ("149.112.112.112", "dns.quad9.net", "/dns-query"),
+    ("9.9.9.10", "dns10.quad9.net", "/dns-query"),
+    ("149.112.112.10", "dns10.quad9.net", "/dns-query"),
+    // AdGuard default and explicitly unfiltered endpoints.
+    ("94.140.14.14", "dns.adguard-dns.com", "/dns-query"),
+    ("94.140.15.15", "dns.adguard-dns.com", "/dns-query"),
+    ("94.140.14.140", "unfiltered.adguard-dns.com", "/dns-query"),
+    ("94.140.14.141", "unfiltered.adguard-dns.com", "/dns-query"),
+    // Independent privacy-focused anycast/single-site operators.
+    ("194.242.2.2", "dns.mullvad.net", "/dns-query"),
+    ("185.222.222.222", "dns.sb", "/dns-query"),
+    ("45.11.45.11", "dns.sb", "/dns-query"),
+    ("76.76.2.0", "p0.freedns.controld.com", "/dns-query"),
+    ("86.54.11.100", "unfiltered.joindns4.eu", "/dns-query"),
+    ("88.198.92.222", "doh.libredns.gr", "/dns-query"),
+    ("176.9.93.198", "dnsforge.de", "/dns-query"),
+    ("5.2.75.75", "doh.nl.ahadns.net", "/dns-query"),
+];
+
+fn doh_pool() -> &'static Vec<hickory_resolver::TokioResolver> {
+    static POOL: OnceLock<Vec<hickory_resolver::TokioResolver>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+        use hickory_resolver::net::runtime::TokioRuntimeProvider;
+        use std::sync::Arc;
+
+        DOH_PROVIDERS
+            .iter()
+            .filter_map(|(ip, server_name, path)| {
+                let ip = ip.parse::<IpAddr>().ok()?;
+                let nameserver =
+                    NameServerConfig::https(ip, Arc::from(*server_name), Some(Arc::from(*path)));
+                hickory_resolver::TokioResolver::builder_with_config(
+                    ResolverConfig::from_parts(None, vec![], vec![nameserver]),
+                    TokioRuntimeProvider::default(),
+                )
+                .build()
+                .ok()
+            })
+            .collect()
+    })
+}
+
+fn doh_slots() -> &'static std::sync::Arc<Semaphore> {
+    static SLOTS: OnceLock<std::sync::Arc<Semaphore>> = OnceLock::new();
+    SLOTS.get_or_init(|| std::sync::Arc::new(Semaphore::new(32)))
+}
 
 /// Return whether a bridge address is a real network endpoint rather than a
 /// documentation/test placeholder.  The public webtunnel collector currently
@@ -114,7 +191,11 @@ fn webtunnel_probe_target(params: &BTreeMap<String, String>) -> Result<(String, 
 /// Resolve the probe target for `bridge`, then perform a TCP handshake.
 /// DNS resolution (when needed) shares the same `per_bridge_timeout` budget
 /// as the TCP probe itself.
-async fn resolve_and_probe(bridge: &BridgeLine, per_bridge_timeout: Duration) -> Outcome {
+async fn resolve_and_probe(
+    bridge: &BridgeLine,
+    per_bridge_timeout: Duration,
+    resolver_policy: ResolverPolicy,
+) -> Outcome {
     if !usable_for_tor(bridge) {
         return Outcome::Unreachable {
             reason: "documentation or local-only bridge address".to_owned(),
@@ -125,10 +206,15 @@ async fn resolve_and_probe(bridge: &BridgeLine, per_bridge_timeout: Duration) ->
         Err(reason) => return Outcome::Unreachable { reason },
     };
 
-    let addr = if let Ok(a) = host.parse::<SocketAddr>() {
-        a
+    let addr = if let Ok(ip) = host.parse::<IpAddr>() {
+        SocketAddr::new(ip, port)
     } else {
-        match timeout(per_bridge_timeout, resolve_addr(&host, port)).await {
+        match timeout(
+            per_bridge_timeout,
+            resolve_addr(&host, port, resolver_policy),
+        )
+        .await
+        {
             Ok(Ok(a)) => a,
             Ok(Err(reason)) => return Outcome::Unreachable { reason },
             Err(_) => {
@@ -144,14 +230,49 @@ async fn resolve_and_probe(bridge: &BridgeLine, per_bridge_timeout: Duration) ->
 
 /// Resolve a `(host, port)` pair to a `SocketAddr` via DNS.
 /// Takes the first address returned by the resolver.
-async fn resolve_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
-    let host_port = format!("{host}:{port}");
-    let mut addrs = tokio::net::lookup_host(&host_port)
-        .await
-        .map_err(|e| format!("DNS lookup failed for {host_port}: {e}"))?;
-    addrs
-        .next()
-        .ok_or_else(|| format!("DNS lookup returned no addresses for {host_port}"))
+async fn resolve_addr(
+    host: &str,
+    port: u16,
+    resolver_policy: ResolverPolicy,
+) -> Result<SocketAddr, String> {
+    let query = host.trim_end_matches('.');
+    if resolver_policy.doh_enabled {
+        let mut attempts = futures::stream::FuturesUnordered::new();
+        for resolver in doh_pool().iter() {
+            let resolver = resolver.clone();
+            let query = query.to_owned();
+            let slots = std::sync::Arc::clone(doh_slots());
+            attempts.push(async move {
+                let _permit = slots.acquire_owned().await.ok();
+                let started = Instant::now();
+                let response = resolver.lookup_ip(format!("{query}.")).await;
+                (started.elapsed(), response)
+            });
+        }
+        while let Some((latency, response)) = attempts.next().await {
+            if let Ok(lookup) = response {
+                if let Some(ip) = lookup.iter().next() {
+                    tracing::debug!(provider_latency_ms = latency.as_millis() as u64, host = %query, "DoH provider won the resolution race");
+                    return Ok(SocketAddr::new(ip, port));
+                }
+            }
+        }
+        tracing::warn!(host = %query, "all DoH providers failed");
+    }
+
+    if resolver_policy.system_fallback {
+        let host_port = format!("{host}:{port}");
+        let mut addrs = tokio::net::lookup_host(&host_port)
+            .await
+            .map_err(|e| format!("system DNS lookup failed for {host_port}: {e}"))?;
+        return addrs
+            .next()
+            .ok_or_else(|| format!("system DNS lookup returned no addresses for {host_port}"));
+    }
+
+    Err(format!(
+        "no DNS resolver available for {host}:{port} (DoH disabled/failed and system fallback disabled)"
+    ))
 }
 
 /// Perform a single TCP reachability probe against `addr` within the
@@ -180,9 +301,17 @@ const MAX_INFLIGHT_PROBES: usize = 64;
 /// flight at any time. The returned vector is **not** guaranteed to
 /// preserve input order.
 pub async fn probe_all(bridges: Vec<BridgeLine>, per_bridge_timeout: Duration) -> Vec<Report> {
+    probe_all_with_policy(bridges, per_bridge_timeout, ResolverPolicy::default()).await
+}
+
+pub async fn probe_all_with_policy(
+    bridges: Vec<BridgeLine>,
+    per_bridge_timeout: Duration,
+    resolver_policy: ResolverPolicy,
+) -> Vec<Report> {
     stream::iter(bridges)
         .map(|bridge| async move {
-            let outcome = resolve_and_probe(&bridge, per_bridge_timeout).await;
+            let outcome = resolve_and_probe(&bridge, per_bridge_timeout, resolver_policy).await;
             Report { bridge, outcome }
         })
         .buffer_unordered(MAX_INFLIGHT_PROBES)
@@ -198,7 +327,15 @@ pub async fn probe_and_sort(
     bridges: Vec<BridgeLine>,
     per_bridge_timeout: Duration,
 ) -> Vec<(BridgeLine, Duration)> {
-    let reports = probe_all(bridges, per_bridge_timeout).await;
+    probe_and_sort_with_policy(bridges, per_bridge_timeout, ResolverPolicy::default()).await
+}
+
+pub async fn probe_and_sort_with_policy(
+    bridges: Vec<BridgeLine>,
+    per_bridge_timeout: Duration,
+    resolver_policy: ResolverPolicy,
+) -> Vec<(BridgeLine, Duration)> {
+    let reports = probe_all_with_policy(bridges, per_bridge_timeout, resolver_policy).await;
     summarise(&reports);
 
     let mut alive: Vec<(BridgeLine, Duration)> = reports
@@ -218,7 +355,15 @@ pub async fn probe_and_sort(
 /// pool-drainer uses this to walk candidates one at a time while deciding,
 /// per bridge, whether to promote (alive) or discard (dead).
 pub async fn probe_one(bridge: &BridgeLine, per_bridge_timeout: Duration) -> Option<Duration> {
-    match resolve_and_probe(bridge, per_bridge_timeout).await {
+    probe_one_with_policy(bridge, per_bridge_timeout, ResolverPolicy::default()).await
+}
+
+pub async fn probe_one_with_policy(
+    bridge: &BridgeLine,
+    per_bridge_timeout: Duration,
+    resolver_policy: ResolverPolicy,
+) -> Option<Duration> {
+    match resolve_and_probe(bridge, per_bridge_timeout, resolver_policy).await {
         Outcome::Reachable { latency } => Some(latency),
         Outcome::Unreachable { .. } => None,
     }
@@ -241,6 +386,23 @@ pub async fn probe_until(
     target: usize,
     max_attempts: usize,
 ) -> Vec<(BridgeLine, Duration)> {
+    probe_until_with_policy(
+        bridges,
+        per_bridge_timeout,
+        target,
+        max_attempts,
+        ResolverPolicy::default(),
+    )
+    .await
+}
+
+pub async fn probe_until_with_policy(
+    bridges: Vec<BridgeLine>,
+    per_bridge_timeout: Duration,
+    target: usize,
+    max_attempts: usize,
+    resolver_policy: ResolverPolicy,
+) -> Vec<(BridgeLine, Duration)> {
     let mut live: Vec<(BridgeLine, Duration)> = Vec::new();
     if target == 0 {
         return live;
@@ -252,7 +414,7 @@ pub async fn probe_until(
             break;
         }
         attempts += 1;
-        match resolve_and_probe(&bridge, per_bridge_timeout).await {
+        match resolve_and_probe(&bridge, per_bridge_timeout, resolver_policy).await {
             Outcome::Reachable { latency } => {
                 tracing::debug!(
                     addr = %bridge.addr,
@@ -452,6 +614,31 @@ mod tests {
         let (host, port) = resolve_probe_target(&bridge).unwrap();
         assert_eq!(host, "10.0.0.1");
         assert_eq!(port, 9001);
+    }
+
+    #[test]
+    fn default_resolver_policy_uses_doh_without_system_fallback() {
+        assert!(ResolverPolicy::default().doh_enabled);
+        assert!(!ResolverPolicy::default().system_fallback);
+        assert!(
+            DOH_PROVIDERS.len() >= 10,
+            "keep a broad provider/address pool"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_resolvers_fail_hostname_explicitly() {
+        let result = resolve_addr(
+            "bridge.example.invalid",
+            443,
+            ResolverPolicy {
+                doh_enabled: false,
+                system_fallback: false,
+            },
+        )
+        .await;
+        let error = result.expect_err("both resolver paths are disabled");
+        assert!(error.contains("no DNS resolver available"));
     }
 
     #[test]

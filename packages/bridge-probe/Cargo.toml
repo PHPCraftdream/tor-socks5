@@ -17,6 +17,7 @@ bridge-line.workspace = true
 
 tokio = { workspace = true, features = ["net", "time", "macros", "rt"] }
 futures.workspace = true
+hickory-resolver.workspace = true
 tracing.workspace = true
 url.workspace = true
 
