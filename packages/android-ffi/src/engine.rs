@@ -1486,7 +1486,7 @@ const BARREN_SOURCE_RETRY_EVERY: u32 = 6;
 /// HTTP 200 with a full list. Skipping is periodic rather than permanent so a
 /// revived collector re-earns its place on its own.
 fn barren_sources(bridge_health: &BridgeHealthContext, round: u32) -> HashSet<String> {
-    if round % BARREN_SOURCE_RETRY_EVERY == 0 {
+    if round.is_multiple_of(BARREN_SOURCE_RETRY_EVERY) {
         return HashSet::new();
     }
     let path = BridgeStore::resolve_path(bridge_health.config_path.as_deref());
