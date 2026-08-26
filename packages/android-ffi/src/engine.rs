@@ -1023,77 +1023,13 @@ async fn stall_watchdog(
             return;
         }
 
-        let should_reprobe = !reprobe_interval.is_zero()
-            && (first_bridge_reprobe || last_bridge_reprobe.elapsed() >= reprobe_interval);
-        if !bridges.is_empty() && should_reprobe {
-            first_bridge_reprobe = false;
-            let mut round = tokio::select! {
-                biased;
-                _ = stop_rx.changed() => return,
-                round = bridge_probe::probe_round_with_policy(bridges.clone(), BRIDGE_REPROBE_TIMEOUT, bridge_health.resolver_policy) => round,
-            };
-            persist_and_rank_probe(&bridges, &mut round, &bridge_health);
-            let alive = std::mem::take(&mut round.alive);
-            debug!(
-                alive = alive.len(),
-                total = bridges.len(),
-                "watchdog: periodic bridge re-probe complete"
-            );
-
-            if alive.len() < bridge_health.bridges_cfg.min_alive
-                && bridge_health.bridges_cfg.auto_fetch
-                && !bridge_health.bridges_cfg.sources.is_empty()
-            {
-                let barren = barren_sources(&bridge_health, auto_fetch_round);
-                let sources: Vec<bridge_fetcher::Source> = bridge_health
-                    .bridges_cfg
-                    .sources
-                    .iter()
-                    .filter(|s| !barren.contains(&s.label))
-                    .map(|s| bridge_fetcher::Source {
-                        label: s.label.clone(),
-                        url: s.url.clone(),
-                        headers: s.headers.clone(),
-                        cookies: s.cookies.clone(),
-                    })
-                    .collect();
-                auto_fetch_round = auto_fetch_round.wrapping_add(1);
-                let max_body_bytes = bridge_health
-                    .bridges_cfg
-                    .max_body_mib
-                    .saturating_mul(1024 * 1024);
-                info!(
-                    alive = alive.len(),
-                    min_alive = bridge_health.bridges_cfg.min_alive,
-                    "watchdog: alive bridge pool is thin, auto-fetching more"
-                );
-                let (fetched, outcomes) = tokio::select! {
-                    biased;
-                    _ = stop_rx.changed() => return,
-                    result = bridge_fetcher::fetch_all(&tunnel, &sources, AUTO_FETCH_TIMEOUT, max_body_bytes) => result,
-                };
-                for outcome in &outcomes {
-                    if let Some(err) = &outcome.error {
-                        warn!(label = %outcome.label, error = %err, "watchdog: bridge auto-fetch source failed");
-                    } else {
-                        info!(
-                            label = %outcome.label,
-                            bridges = outcome.bridges_extracted,
-                            "watchdog: bridge auto-fetch source OK"
-                        );
-                    }
-                }
-                persist_bridge_sources(&outcomes, &bridge_health);
-                let (unique, duplicates) = bridge_fetcher::dedup_bridges(fetched);
-                info!(
-                    unique = unique.len(),
-                    duplicates, "watchdog: bridge auto-fetch complete"
-                );
-                record_auto_fetched_bridges(unique);
-            }
-            last_bridge_reprobe = Instant::now();
-        }
-
+        // Runs before the reachability re-probe below on purpose: that re-probe walks the
+        // *entire* configured pool (thousands of bridges) and, on this loop's first tick, is
+        // forced regardless of `recheck_interval_mins` -- with webtunnel's up-to-27s-per-bridge
+        // worst case, a full sweep can take minutes. Running the top-up after it would delay a
+        // connection's very first top-up round by however long that sweep takes, defeating the
+        // point of "proactively". The health store already has plenty of history from earlier
+        // rounds and earlier sessions for `select_active_probe_bridges` to draw on immediately.
         if last_topup.elapsed() >= WARM_TOPUP_INTERVAL {
             last_topup = Instant::now();
             let active = rotation_bridges.len();
@@ -1171,6 +1107,77 @@ async fn stall_watchdog(
                     "warm pool: rotation updated"
                 );
             }
+        }
+
+        let should_reprobe = !reprobe_interval.is_zero()
+            && (first_bridge_reprobe || last_bridge_reprobe.elapsed() >= reprobe_interval);
+        if !bridges.is_empty() && should_reprobe {
+            first_bridge_reprobe = false;
+            let mut round = tokio::select! {
+                biased;
+                _ = stop_rx.changed() => return,
+                round = bridge_probe::probe_round_with_policy(bridges.clone(), BRIDGE_REPROBE_TIMEOUT, bridge_health.resolver_policy) => round,
+            };
+            persist_and_rank_probe(&bridges, &mut round, &bridge_health);
+            let alive = std::mem::take(&mut round.alive);
+            debug!(
+                alive = alive.len(),
+                total = bridges.len(),
+                "watchdog: periodic bridge re-probe complete"
+            );
+
+            if alive.len() < bridge_health.bridges_cfg.min_alive
+                && bridge_health.bridges_cfg.auto_fetch
+                && !bridge_health.bridges_cfg.sources.is_empty()
+            {
+                let barren = barren_sources(&bridge_health, auto_fetch_round);
+                let sources: Vec<bridge_fetcher::Source> = bridge_health
+                    .bridges_cfg
+                    .sources
+                    .iter()
+                    .filter(|s| !barren.contains(&s.label))
+                    .map(|s| bridge_fetcher::Source {
+                        label: s.label.clone(),
+                        url: s.url.clone(),
+                        headers: s.headers.clone(),
+                        cookies: s.cookies.clone(),
+                    })
+                    .collect();
+                auto_fetch_round = auto_fetch_round.wrapping_add(1);
+                let max_body_bytes = bridge_health
+                    .bridges_cfg
+                    .max_body_mib
+                    .saturating_mul(1024 * 1024);
+                info!(
+                    alive = alive.len(),
+                    min_alive = bridge_health.bridges_cfg.min_alive,
+                    "watchdog: alive bridge pool is thin, auto-fetching more"
+                );
+                let (fetched, outcomes) = tokio::select! {
+                    biased;
+                    _ = stop_rx.changed() => return,
+                    result = bridge_fetcher::fetch_all(&tunnel, &sources, AUTO_FETCH_TIMEOUT, max_body_bytes) => result,
+                };
+                for outcome in &outcomes {
+                    if let Some(err) = &outcome.error {
+                        warn!(label = %outcome.label, error = %err, "watchdog: bridge auto-fetch source failed");
+                    } else {
+                        info!(
+                            label = %outcome.label,
+                            bridges = outcome.bridges_extracted,
+                            "watchdog: bridge auto-fetch source OK"
+                        );
+                    }
+                }
+                persist_bridge_sources(&outcomes, &bridge_health);
+                let (unique, duplicates) = bridge_fetcher::dedup_bridges(fetched);
+                info!(
+                    unique = unique.len(),
+                    duplicates, "watchdog: bridge auto-fetch complete"
+                );
+                record_auto_fetched_bridges(unique);
+            }
+            last_bridge_reprobe = Instant::now();
         }
 
         let probe = tokio::time::timeout(
