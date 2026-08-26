@@ -1127,6 +1127,117 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
     }
 }
 
+/// JNI entry point: `nativeProbeBridgeTransport(String configPath, String transport)`
+///
+/// An on-demand reachability probe over raw sockets -- unlike `nativeRefreshBridges`, this needs
+/// no live Tor connection, the same way the bootstrap-time probe in `engine::engine_async` runs
+/// before any circuit exists. Filters `configPath`'s configured bridges to `transport`
+/// (`"obfs4"`/`"webtunnel"`; an empty string probes every configured bridge), probes them, and
+/// persists the outcome to the same health store every other probe round writes to -- a manual
+/// check from the UI improves the *next* connect's ranking exactly like the automatic rounds do.
+///
+/// Returns `"<alive>|<total>|<unmeasured>"`, or throws on a config error.
+///
+/// - **Threading:** Blocks the calling thread for the probe's duration (a per-bridge timeout of a
+///   few seconds times however many candidates match `transport`) -- call off the Android main
+///   thread, same convention as `nativeRefreshBridges`.
+/// - **Error Signaling:** Throws `java.lang.IllegalArgumentException` if `configPath` is invalid,
+///   `java.lang.RuntimeException` if the config or its bridge lines can't be parsed.
+#[no_mangle]
+pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativeProbeBridgeTransport(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+    transport: JString,
+) -> jstring {
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        let config_path_str: String = env
+            .get_string(&config_path)
+            .inspect_err(|_| {
+                env.throw_new(
+                    "java/lang/IllegalArgumentException",
+                    "configPath is null or invalid",
+                )
+                .ok();
+            })?
+            .into();
+        let transport_str: String = env
+            .get_string(&transport)
+            .map(|s| s.into())
+            .unwrap_or_default();
+
+        let loaded = Config::load_with_override(Some(std::path::Path::new(&config_path_str)))
+            .with_context(|| format!("loading config from {}", config_path_str))
+            .map_err(|e| {
+                let msg = format!("{:#}", e);
+                let _ = env.throw_new("java/lang/RuntimeException", &msg);
+                e
+            })?;
+        let cfg = match &loaded {
+            Loaded::FromFile { config, .. } => config,
+            Loaded::Defaults(config) => config,
+        };
+
+        let parsed = cfg.bridges.parsed().map_err(|e| {
+            let msg = format!("{:#}", e);
+            let _ = env.throw_new("java/lang/RuntimeException", &msg);
+            e
+        })?;
+        let candidates: Vec<bridge_line::BridgeLine> = parsed
+            .bridges
+            .into_iter()
+            .filter(|b| {
+                transport_str.is_empty() || b.transport.as_deref() == Some(transport_str.as_str())
+            })
+            .collect();
+        let total = candidates.len();
+
+        let bridge_health = engine::BridgeHealthContext {
+            config_path: Some(std::path::PathBuf::from(&config_path_str)),
+            bridges_cfg: cfg.bridges.clone(),
+            resolver_policy: cfg.dns.resolver_policy(),
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                let msg = format!("failed to create probe runtime: {e}");
+                let _ = env.throw_new("java/lang/RuntimeException", &msg);
+                anyhow::anyhow!(msg)
+            })?;
+
+        let mut round = rt.block_on(bridge_probe::probe_round_with_policy(
+            candidates.clone(),
+            Duration::from_secs(5),
+            bridge_health.resolver_policy,
+        ));
+        let alive = round.alive.len();
+        let unmeasured = round.unmeasured.len();
+        engine::persist_and_rank_probe(&candidates, &mut round, &bridge_health);
+
+        info!(
+            transport = %transport_str,
+            alive,
+            total,
+            unmeasured,
+            "on-demand bridge probe complete"
+        );
+
+        env.new_string(format!("{alive}|{total}|{unmeasured}"))
+            .map(|s| s.into_raw())
+            .map_err(|e| {
+                error!("failed to create Java string for probe result: {e}");
+                anyhow::anyhow!(e)
+            })
+    }));
+
+    match result {
+        Ok(Ok(jstr)) => jstr,
+        Ok(Err(_)) | Err(_) => std::ptr::null_mut(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

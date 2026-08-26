@@ -1367,12 +1367,12 @@ fn select_active_probe_bridges(
 /// Persist a probe round's reachability outcome to the shared bridge-health store
 /// (`<config-stem>.alive-bridges.log`, same file the CLI daemon uses) and re-sort `alive` by
 /// historical stability (`ok_count`, ties broken by latency) ahead of a bridge seen reachable
-/// for the first time. Shared between the bootstrap-time probe in `engine_async` and
-/// `stall_watchdog`'s periodic re-probe -- both need the identical persist-and-rank step, just
-/// with different cancellation/error handling around the probe itself. Best-effort throughout:
-/// a missing or unwritable store never fails the caller, it just forfeits the ranking boost for
-/// this round.
-fn persist_and_rank_probe(
+/// for the first time. Shared between the bootstrap-time probe in `engine_async`,
+/// `stall_watchdog`'s periodic re-probe, and `nativeProbeBridgeTransport`'s on-demand probe --
+/// all three need the identical persist-and-rank step, just with different cancellation/error
+/// handling and triggers around the probe itself. Best-effort throughout: a missing or
+/// unwritable store never fails the caller, it just forfeits the ranking boost for this round.
+pub(crate) fn persist_and_rank_probe(
     all_bridges: &[BridgeLine],
     round: &mut bridge_probe::ProbeRound,
     bridge_health: &BridgeHealthContext,
