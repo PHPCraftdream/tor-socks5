@@ -752,7 +752,7 @@ impl BridgeStore {
     /// evidence the bridge actually works.
     #[must_use]
     pub fn healthiest_bridges(&self, limit: usize) -> Vec<BridgeLine> {
-        let mut healthy: Vec<&Entry> = self
+        let healthy: Vec<&Entry> = self
             .entries
             .values()
             // Retired bridges must be excluded rather than merely ranked low. A
@@ -762,6 +762,37 @@ impl BridgeStore {
             // only reachability promotes it straight back into the active pool.
             .filter(|e| e.fails == 0 && e.ok_count > 0 && !e.is_retired())
             .collect();
+        Self::rank_and_take(healthy, limit)
+    }
+
+    /// Like [`healthiest_bridges`](Self::healthiest_bridges), but ranks only entries whose
+    /// bridge appears in `candidates`, rather than the whole store.
+    ///
+    /// Ranking globally and then intersecting with a candidate set -- the obvious way to combine
+    /// "healthiest" with "restricted to this pool" -- silently starves a small pool: a store
+    /// dominated by one transport's history fills the global top `limit` before a smaller
+    /// transport's own candidates are even considered, so "the healthiest of these 441 webtunnel
+    /// bridges" could come back as five, not because only five are healthy, but because the rest
+    /// don't outrank several thousand healthy obfs4 entries globally. Measured on a phone: this
+    /// was the actual reason a webtunnel-preferred pool kept landing on a handful of bridges
+    /// through every fix to the probing and warming logic above it -- all of them fed candidates
+    /// through this same global-then-intersect pattern. Filtering to `candidates` first means a
+    /// small pool's own best members always survive to be ranked.
+    #[must_use]
+    pub fn healthiest_among(&self, candidates: &[BridgeLine], limit: usize) -> Vec<BridgeLine> {
+        use std::collections::HashSet;
+        let allowed: HashSet<Key> = candidates.iter().map(key_of).collect();
+        let healthy: Vec<&Entry> = self
+            .entries
+            .values()
+            .filter(|e| {
+                e.fails == 0 && e.ok_count > 0 && !e.is_retired() && allowed.contains(&e.key())
+            })
+            .collect();
+        Self::rank_and_take(healthy, limit)
+    }
+
+    fn rank_and_take(mut healthy: Vec<&Entry>, limit: usize) -> Vec<BridgeLine> {
         healthy.sort_by(|a, b| {
             b.channel_ok_count
                 .cmp(&a.channel_ok_count)
@@ -1344,6 +1375,38 @@ mod tests {
         s.record(bridge(OBFS4_B), Duration::from_millis(20));
         assert_eq!(s.healthiest_bridges(1).len(), 1);
         assert_eq!(s.healthiest_bridges(0).len(), 0);
+    }
+
+    /// Regression test for the bug behind a persistently thin warm pool on a real device: a
+    /// caller that wanted "the healthiest of my (small, single-transport) candidate set" was
+    /// getting the global top N intersected with that set, so a much larger transport's history
+    /// crowded the small one out before its own candidates were even considered.
+    #[test]
+    fn healthiest_among_ranks_within_the_candidate_set_not_globally() {
+        let mut s = empty();
+        let obfs4 = bridge(OBFS4_A);
+        let webtunnel = bridge(
+            "webtunnel [2001:db8::1]:443 0123456789ABCDEF0123456789ABCDEF01234567 \
+             url=https://example.test/secret",
+        );
+        s.record(obfs4.clone(), Duration::from_millis(5));
+        let now = OffsetDateTime::now_utc();
+        s.note_channel_success_at(&obfs4, now);
+        // Merely reachable, no channel history at all -- ranks far below the obfs4 entry
+        // in any global comparison.
+        s.record(webtunnel.clone(), Duration::from_millis(50));
+
+        assert_eq!(
+            s.healthiest_bridges(1),
+            vec![obfs4],
+            "sanity check: obfs4 does dominate the global ranking here"
+        );
+        assert_eq!(
+            s.healthiest_among(std::slice::from_ref(&webtunnel), 1),
+            vec![webtunnel],
+            "restricted to a candidate set that excludes the obfs4 entry, the webtunnel \
+             bridge must still come back rather than an empty result"
+        );
     }
 
     #[test]

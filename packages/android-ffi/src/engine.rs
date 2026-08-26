@@ -7,7 +7,7 @@
 //! - [`engine_main`]: Entry point for the dedicated engine thread.
 //! - [`accept_loop`]: SOCKS5 accept loop with semaphore-bounded concurrency.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
@@ -1375,16 +1375,12 @@ fn select_active_probe_bridges(
         return usable;
     }
 
-    let by_text: HashMap<String, BridgeLine> = usable
-        .iter()
-        .map(|bridge| (bridge.to_string(), bridge.clone()))
-        .collect();
     if let Some(store) = &store {
-        let ranked: Vec<BridgeLine> = store
-            .healthiest_bridges(MAX_ACTIVE_BRIDGES)
-            .into_iter()
-            .filter_map(|bridge| by_text.get(&bridge.to_string()).cloned())
-            .collect();
+        // Ranks within `usable` rather than globally-then-intersect: see
+        // `BridgeStore::healthiest_among`'s doc for why that distinction is the whole point --
+        // a webtunnel-preferred `usable` ranked against the *global* top bridges would mostly
+        // disappear behind a much larger obfs4 history.
+        let ranked = store.healthiest_among(&usable, MAX_ACTIVE_BRIDGES);
         if !ranked.is_empty() {
             return ranked;
         }
