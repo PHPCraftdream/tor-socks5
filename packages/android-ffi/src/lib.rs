@@ -821,6 +821,52 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
     }
 }
 
+/// JNI entry point: `nativeGetSourceStats(String configPath)`
+///
+/// Per-source yield as one `|`-separated line each:
+/// `label|offered|alive|channel_proven|retired`
+///
+/// Lets the sources screen show what a collector actually contributes. Fetch
+/// success is not that: a source that has stopped regenerating keeps answering
+/// HTTP 200 with a full list, so "it works" and "it is useful" have to be
+/// displayed as different things.
+///
+/// - **Threading:** Reads a file; call off the main thread if the store is large.
+/// - **Error Signaling:** Does not throw. Empty string when the store is absent.
+#[no_mangle]
+pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativeGetSourceStats(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+) -> jstring {
+    match panic::catch_unwind(AssertUnwindSafe(|| {
+        let config_path_str: Option<String> = env.get_string(&config_path).ok().map(|s| s.into());
+        let store_path =
+            BridgeStore::resolve_path(config_path_str.as_ref().map(std::path::Path::new));
+        let joined = match BridgeStore::load(store_path) {
+            Ok(store) => store
+                .source_summary()
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{}|{}|{}|{}|{}",
+                        s.label, s.offered, s.alive, s.channel_proven, s.retired
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Err(_) => String::new(),
+        };
+        env.new_string(joined).map(|s| s.into_raw()).map_err(|e| {
+            error!("failed to create Java string for source stats: {e}");
+            e
+        })
+    })) {
+        Ok(Ok(jstr)) => jstr,
+        Ok(Err(_)) | Err(_) => std::ptr::null_mut(),
+    }
+}
+
 fn refresh_sources_failure(outcomes: &[bridge_fetcher::FetchOutcome]) -> Option<String> {
     if outcomes.is_empty() || outcomes.iter().all(|outcome| outcome.error.is_some()) {
         let details = outcomes
