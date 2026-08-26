@@ -400,6 +400,33 @@ impl BridgeStore {
         entry.sources.insert(source.to_owned());
     }
 
+    /// Bridges that have actually carried a Tor channel, most recently first.
+    ///
+    /// Stricter than [`healthiest_bridges`](Self::healthiest_bridges), which
+    /// also admits bridges that merely answered a reachability probe. For
+    /// handing bridges to someone else that difference is the whole point: the
+    /// recipient is typically offline at import and cannot check anything, so
+    /// whatever is passed on has to be already known good rather than merely
+    /// plausible. A webtunnel bridge in particular can answer probes forever
+    /// while the relay behind its website is long gone.
+    pub fn channel_proven_bridges(&self, limit: usize) -> Vec<BridgeLine> {
+        let mut proven: Vec<&Entry> = self
+            .entries
+            .values()
+            .filter(|e| e.channel_ok_count > 0 && !e.is_retired())
+            .collect();
+        proven.sort_by(|a, b| {
+            b.last_channel_ok
+                .cmp(&a.last_channel_ok)
+                .then_with(|| b.channel_ok_count.cmp(&a.channel_ok_count))
+        });
+        proven
+            .into_iter()
+            .take(limit)
+            .map(|e| e.bridge.clone())
+            .collect()
+    }
+
     /// What each source has actually yielded, keyed by its label.
     ///
     /// A source is judged by the bridges it supplied, not by whether its fetch
@@ -1293,6 +1320,21 @@ mod tests {
         assert!(!by_label["fresh"].is_barren(1));
         // A floor above the sample size withholds judgement.
         assert!(!by_label["stale"].is_barren(2));
+    }
+
+    #[test]
+    fn channel_proven_bridges_excludes_merely_reachable_ones() {
+        let mut s = empty();
+        let reachable = bridge(OBFS4_A);
+        let proven = bridge(OBFS4_B);
+        let t0 = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        s.record_at(reachable.clone(), Duration::from_millis(1), t0);
+        s.record_at(proven.clone(), Duration::from_millis(900), t0);
+        s.note_channel_success_at(&proven, t0);
+
+        // The merely-reachable one is far faster, so any latency-led ranking
+        // would prefer it. Sharing has to prefer proof instead.
+        assert_eq!(s.channel_proven_bridges(10), vec![proven]);
     }
 
     #[test]

@@ -821,6 +821,49 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
     }
 }
 
+/// JNI entry point: `nativeGetProvenBridges(String configPath, int limit)`
+///
+/// Bridges that have actually carried a Tor channel, most recent first,
+/// newline-joined.
+///
+/// Stricter than `nativeGetHealthyBridges`, which also admits bridges that only
+/// answered a reachability probe. The distinction matters when handing bridges
+/// to someone else: they are usually offline at import and cannot verify
+/// anything, so a shared code must carry bridges already known to work rather
+/// than ones that merely look plausible.
+///
+/// - **Threading:** Reads a file; call off the main thread if the store is large.
+/// - **Error Signaling:** Does not throw. Empty string when nothing qualifies.
+#[no_mangle]
+pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativeGetProvenBridges(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+    limit: jint,
+) -> jstring {
+    match panic::catch_unwind(AssertUnwindSafe(|| {
+        let config_path_str: Option<String> = env.get_string(&config_path).ok().map(|s| s.into());
+        let store_path =
+            BridgeStore::resolve_path(config_path_str.as_ref().map(std::path::Path::new));
+        let joined = match BridgeStore::load(store_path) {
+            Ok(store) => store
+                .channel_proven_bridges(limit.max(0) as usize)
+                .iter()
+                .map(|b| b.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Err(_) => String::new(),
+        };
+        env.new_string(joined).map(|s| s.into_raw()).map_err(|e| {
+            error!("failed to create Java string for proven bridges: {e}");
+            e
+        })
+    })) {
+        Ok(Ok(jstr)) => jstr,
+        Ok(Err(_)) | Err(_) => std::ptr::null_mut(),
+    }
+}
+
 /// JNI entry point: `nativeGetSourceStats(String configPath)`
 ///
 /// Per-source yield as one `|`-separated line each:
