@@ -15,6 +15,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -94,10 +95,30 @@ fn doh_pool() -> &'static Vec<hickory_resolver::TokioResolver> {
     })
 }
 
+/// Cap on concurrent DoH lookups. Each one opens its own TLS session to a
+/// provider, so this bounds sockets rather than answers.
 fn doh_slots() -> &'static std::sync::Arc<Semaphore> {
     static SLOTS: OnceLock<std::sync::Arc<Semaphore>> = OnceLock::new();
-    SLOTS.get_or_init(|| std::sync::Arc::new(Semaphore::new(32)))
+    SLOTS.get_or_init(|| std::sync::Arc::new(Semaphore::new(64)))
 }
+
+/// How many providers are raced for one hostname before widening.
+///
+/// Racing the whole list per hostname is affordable for a handful of bridges
+/// and ruinous for hundreds: 425 webtunnel hosts against 18 providers is 7650
+/// lookups queued behind [`doh_slots`], each able to hold its permit for
+/// [`DOH_PROVIDER_TIMEOUT`], while one bridge waits only
+/// [`MIN_DNS_RESOLVE_TIMEOUT`] for its answer. Later bridges then failed DNS
+/// having never been asked, and were recorded as dead bridges.
+const DOH_FANOUT: usize = 4;
+
+/// Waves of [`DOH_FANOUT`] providers tried for one hostname before giving up.
+///
+/// Two waves keep the worst case at `2 * DOH_PROVIDER_TIMEOUT`, inside the DNS
+/// budget. Giving up on eight providers would be premature if the order were
+/// arbitrary, but [`doh_order`] puts the ones answering on this network first,
+/// so a wave is a considered choice rather than the head of a fixed list.
+const DOH_MAX_WAVES: usize = 2;
 
 /// Per-provider bound on one DoH lookup, so a blocked or black-holed provider
 /// releases its [`doh_slots`] permit promptly instead of pinning it for the
@@ -110,24 +131,61 @@ const DOH_PROVIDER_TIMEOUT: Duration = Duration::from_secs(4);
 /// hosts, and every probe round re-resolves the same names. Each miss costs a
 /// full TLS session to a DoH provider, so caching removes the bulk of the
 /// resolution work from any round after the first.
-fn doh_cache() -> &'static std::sync::Mutex<HashMap<String, IpAddr>> {
-    static CACHE: OnceLock<std::sync::Mutex<HashMap<String, IpAddr>>> = OnceLock::new();
+fn doh_cache() -> &'static std::sync::Mutex<HashMap<String, Vec<IpAddr>>> {
+    static CACHE: OnceLock<std::sync::Mutex<HashMap<String, Vec<IpAddr>>>> = OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-fn cached_doh_answer(host: &str) -> Option<IpAddr> {
+fn cached_doh_answer(host: &str) -> Option<Vec<IpAddr>> {
     doh_cache()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .get(host)
-        .copied()
+        .cloned()
 }
 
-fn remember_doh_answer(host: &str, ip: IpAddr) {
+fn remember_doh_answer(host: &str, ips: &[IpAddr]) {
     doh_cache()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .insert(host.to_owned(), ip);
+        .insert(host.to_owned(), ips.to_vec());
+}
+
+/// Running tally per provider: `+1` when it answers, `-1` when it does not.
+///
+/// Which providers are usable is a property of the network, not of the
+/// hostname being looked up, so it is worth learning once and reusing. Without
+/// this, every hostname pays the same timeouts against the same blocked
+/// providers; with it, a censored provider sinks below the working ones after
+/// the first few lookups of a round and the narrow fan-out above stays cheap.
+fn doh_scores() -> &'static Vec<AtomicI64> {
+    static SCORES: OnceLock<Vec<AtomicI64>> = OnceLock::new();
+    SCORES.get_or_init(|| doh_pool().iter().map(|_| AtomicI64::new(0)).collect())
+}
+
+/// Bound on the tally so a provider that worked all day cannot need an equally
+/// long run of failures before the order reacts to it going dark.
+const DOH_SCORE_LIMIT: i64 = 8;
+
+fn note_doh_result(index: usize, answered: bool) {
+    let Some(slot) = doh_scores().get(index) else {
+        return;
+    };
+    let delta = if answered { 1 } else { -1 };
+    let _ = slot.fetch_update(
+        AtomicOrdering::Relaxed,
+        AtomicOrdering::Relaxed,
+        |current| Some((current + delta).clamp(-DOH_SCORE_LIMIT, DOH_SCORE_LIMIT)),
+    );
+}
+
+/// Provider indices, best-scoring first. Ties keep the declaration order, so
+/// an untried pool resolves against the list as written.
+fn doh_order() -> Vec<usize> {
+    let scores = doh_scores();
+    let mut order: Vec<usize> = (0..scores.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(scores[i].load(AtomicOrdering::Relaxed)));
+    order
 }
 
 /// Return whether a bridge address is a real network endpoint rather than a
@@ -155,8 +213,24 @@ pub fn usable_for_tor(bridge: &BridgeLine) -> bool {
 /// Outcome of probing a single bridge.
 #[derive(Debug, Clone)]
 pub enum Outcome {
-    Reachable { latency: Duration },
-    Unreachable { reason: String },
+    Reachable {
+        latency: Duration,
+    },
+    Unreachable {
+        reason: String,
+    },
+    /// The round never got far enough to learn anything about this bridge —
+    /// its hostname would not resolve.
+    ///
+    /// Distinct from [`Outcome::Unreachable`] because it is a statement about
+    /// our own resolver, not about the bridge. Counting it as a failure was
+    /// filling the health store with verdicts we had not earned: on a phone
+    /// where DoH was struggling, two thirds of all webtunnel "failures" were
+    /// this, and each one pushed a possibly-live bridge towards being pruned
+    /// and its source towards being written off as barren.
+    Unmeasured {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -170,10 +244,16 @@ impl Report {
         matches!(self.outcome, Outcome::Reachable { .. })
     }
 
+    /// True when the probe produced no evidence either way, so no caller
+    /// should record a result for this bridge.
+    pub fn is_unmeasured(&self) -> bool {
+        matches!(self.outcome, Outcome::Unmeasured { .. })
+    }
+
     pub fn latency(&self) -> Option<Duration> {
         match &self.outcome {
             Outcome::Reachable { latency } => Some(*latency),
-            Outcome::Unreachable { .. } => None,
+            Outcome::Unreachable { .. } | Outcome::Unmeasured { .. } => None,
         }
     }
 }
@@ -213,7 +293,7 @@ fn webtunnel_probe_target(params: &BTreeMap<String, String>) -> Result<(String, 
         .get("url")
         .ok_or_else(|| "webtunnel bridge missing both url= and addr=".to_string())?;
 
-    let parsed = url::Url::parse(url_str).map_err(|e| format!("invalid url={url_str:?}: {e}"))?;
+    let parsed = parse_webtunnel_url(url_str)?;
 
     let host = parsed
         .host_str()
@@ -224,6 +304,23 @@ fn webtunnel_probe_target(params: &BTreeMap<String, String>) -> Result<(String, 
         .ok_or_else(|| format!("url={url_str:?} has no port and an unrecognised scheme"))?;
 
     Ok((host.to_string(), port))
+}
+
+/// Parse a webtunnel `url=` value, tolerating a missing scheme.
+///
+/// Collectors publish the occasional bare host (`url=tor.cenesp.es`), which
+/// `Url::parse` rejects as a relative URL. webtunnel is HTTPS by construction,
+/// so assuming that scheme recovers the bridge instead of discarding it
+/// unprobed.
+fn parse_webtunnel_url(url_str: &str) -> Result<url::Url, String> {
+    match url::Url::parse(url_str) {
+        Ok(url) => Ok(url),
+        Err(url::ParseError::RelativeUrlWithoutBase) => {
+            url::Url::parse(&format!("https://{url_str}"))
+                .map_err(|e| format!("invalid url={url_str:?} (even as https): {e}"))
+        }
+        Err(e) => Err(format!("invalid url={url_str:?}: {e}")),
+    }
 }
 
 /// Floor for the DNS half of [`resolve_and_probe`].
@@ -253,15 +350,15 @@ async fn resolve_and_probe(
         Err(reason) => return Outcome::Unreachable { reason },
     };
 
-    let addr = if let Ok(ip) = host.parse::<IpAddr>() {
-        SocketAddr::new(ip, port)
+    let addrs = if let Ok(ip) = host.parse::<IpAddr>() {
+        vec![SocketAddr::new(ip, port)]
     } else {
         let dns_timeout = per_bridge_timeout.max(MIN_DNS_RESOLVE_TIMEOUT);
-        match timeout(dns_timeout, resolve_addr(&host, port, resolver_policy)).await {
+        match timeout(dns_timeout, resolve_addrs(&host, port, resolver_policy)).await {
             Ok(Ok(a)) => a,
-            Ok(Err(reason)) => return Outcome::Unreachable { reason },
+            Ok(Err(reason)) => return Outcome::Unmeasured { reason },
             Err(_) => {
-                return Outcome::Unreachable {
+                return Outcome::Unmeasured {
                     reason: format!("DNS resolution timed out after {dns_timeout:?}"),
                 }
             }
@@ -278,7 +375,7 @@ async fn resolve_and_probe(
             };
         };
         return webtunnel_upgrade_probe(
-            addr,
+            &addrs,
             &host,
             url,
             per_bridge_timeout.max(MIN_WEBTUNNEL_TIMEOUT),
@@ -286,7 +383,7 @@ async fn resolve_and_probe(
         .await;
     }
 
-    tcp_probe(addr, per_bridge_timeout).await
+    tcp_probe(&addrs, per_bridge_timeout).await
 }
 
 /// Floor for the webtunnel probe: it has to complete a TLS handshake and an
@@ -328,13 +425,26 @@ fn webtunnel_tls_config() -> std::sync::Arc<rustls::ClientConfig> {
 /// cancel-safe: NO — cancelling mid-handshake leaves partial TLS state, which
 /// is fine because the connection is dropped either way.
 async fn webtunnel_upgrade_probe(
-    addr: SocketAddr,
+    addrs: &[SocketAddr],
     host: &str,
     url: &str,
     budget: Duration,
 ) -> Outcome {
     let started = Instant::now();
-    match timeout(budget, webtunnel_upgrade_inner(addr, host, url)).await {
+    // One budget for the whole candidate list, not one per candidate: a host
+    // with several addresses must not cost several times the wall clock of a
+    // host with one.
+    let attempt = async {
+        let mut last = "hostname resolved to no usable address".to_owned();
+        for addr in addrs {
+            match webtunnel_upgrade_inner(*addr, host, url).await {
+                Ok(()) => return Ok(()),
+                Err(reason) => last = format!("{addr}: {reason}"),
+            }
+        }
+        Err(last)
+    };
+    match timeout(budget, attempt).await {
         Ok(Ok(())) => Outcome::Reachable {
             latency: started.elapsed(),
         },
@@ -348,7 +458,7 @@ async fn webtunnel_upgrade_probe(
 async fn webtunnel_upgrade_inner(addr: SocketAddr, host: &str, url: &str) -> Result<(), String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let parsed = url::Url::parse(url).map_err(|e| format!("invalid url={url:?}: {e}"))?;
+    let parsed = parse_webtunnel_url(url)?;
     // Path and query exactly as configured: the secret path is what identifies
     // the bridge, and a wrong one is answered by the site rather than the bridge.
     let mut path = parsed.path().to_owned();
@@ -424,49 +534,102 @@ async fn webtunnel_upgrade_inner(addr: SocketAddr, host: &str, url: &str) -> Res
     }
 }
 
-/// Resolve a `(host, port)` pair to a `SocketAddr` via DNS.
-/// Takes the first address returned by the resolver.
-async fn resolve_addr(
+/// Most addresses tried for one hostname.
+///
+/// A resolver may hand back a long RR set; connecting to every entry would let
+/// one hostname consume the budget of several bridges. Two covers the case
+/// this exists for — one address per family — with a little room to spare.
+const MAX_PROBE_ADDRS: usize = 3;
+
+/// Order resolved addresses so an unroutable family costs a failed `connect`
+/// rather than the whole bridge.
+///
+/// The phone that exposed this has no IPv6 route at all, only the app's own
+/// `tun0`, so every AAAA answer came back `Network is unreachable` and the
+/// bridge was filed as dead — 29% of one round's webtunnel failures. IPv4 goes
+/// first because it is the family that is nearly always routable, but both are
+/// tried: an unroutable address fails instantly, so the ordering costs a
+/// dual-stack host nothing and rescues a single-stack one.
+fn order_candidates(ips: &[IpAddr], port: u16) -> Vec<SocketAddr> {
+    let mut seen = std::collections::HashSet::new();
+    let mut sorted: Vec<IpAddr> = ips.iter().copied().filter(|ip| seen.insert(*ip)).collect();
+    // Stable, so the resolver's own ordering survives within each family.
+    sorted.sort_by_key(|ip| u8::from(ip.is_ipv6()));
+    sorted
+        .into_iter()
+        .take(MAX_PROBE_ADDRS)
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect()
+}
+
+/// Race one wave of DoH providers for `query`, returning the first non-empty
+/// answer. Records each provider's behaviour so [`doh_order`] can learn.
+async fn race_doh_wave(wave: &[usize], query: &str) -> Option<Vec<IpAddr>> {
+    let pool = doh_pool();
+    let mut attempts = futures::stream::FuturesUnordered::new();
+    for &index in wave {
+        let Some(resolver) = pool.get(index).cloned() else {
+            continue;
+        };
+        let query = query.to_owned();
+        let slots = std::sync::Arc::clone(doh_slots());
+        attempts.push(async move {
+            let _permit = slots.acquire_owned().await.ok();
+            let started = Instant::now();
+            // Per-provider bound. Without it a blocked provider holds its
+            // semaphore permit for the caller's whole budget, starving the
+            // providers that would have answered.
+            let response = timeout(
+                DOH_PROVIDER_TIMEOUT,
+                resolver.lookup_ip(format!("{query}.")),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok);
+            (index, started.elapsed(), response)
+        });
+    }
+
+    let mut answer = None;
+    while let Some((index, latency, response)) = attempts.next().await {
+        // An empty answer still proves the provider is usable here — the name
+        // simply does not exist — so it must not be scored as a failure.
+        note_doh_result(index, response.is_some());
+        if answer.is_some() {
+            continue;
+        }
+        if let Some(lookup) = response {
+            let ips: Vec<IpAddr> = lookup.iter().collect();
+            if !ips.is_empty() {
+                tracing::debug!(
+                    provider_latency_ms = latency.as_millis() as u64,
+                    host = %query,
+                    "DoH provider won the resolution race"
+                );
+                answer = Some(ips);
+            }
+        }
+    }
+    answer
+}
+
+/// Resolve a `(host, port)` pair to the addresses worth trying, best first.
+async fn resolve_addrs(
     host: &str,
     port: u16,
     resolver_policy: ResolverPolicy,
-) -> Result<SocketAddr, String> {
+) -> Result<Vec<SocketAddr>, String> {
     let query = host.trim_end_matches('.');
     if resolver_policy.doh_enabled {
-        if let Some(ip) = cached_doh_answer(query) {
-            return Ok(SocketAddr::new(ip, port));
+        if let Some(ips) = cached_doh_answer(query) {
+            return Ok(order_candidates(&ips, port));
         }
 
-        let mut attempts = futures::stream::FuturesUnordered::new();
-        for resolver in doh_pool().iter() {
-            let resolver = resolver.clone();
-            let query = query.to_owned();
-            let slots = std::sync::Arc::clone(doh_slots());
-            attempts.push(async move {
-                let _permit = slots.acquire_owned().await.ok();
-                let started = Instant::now();
-                // Per-provider bound. Without it a blocked provider holds its
-                // semaphore permit for the caller's whole budget, starving the
-                // providers that would have answered -- with one lookup per
-                // bridge and 18 providers each, that reliably exhausted the
-                // pool before any answer arrived.
-                let response = timeout(
-                    DOH_PROVIDER_TIMEOUT,
-                    resolver.lookup_ip(format!("{query}.")),
-                )
-                .await
-                .ok()
-                .and_then(Result::ok);
-                (started.elapsed(), response)
-            });
-        }
-        while let Some((latency, response)) = attempts.next().await {
-            if let Some(lookup) = response {
-                if let Some(ip) = lookup.iter().next() {
-                    tracing::debug!(provider_latency_ms = latency.as_millis() as u64, host = %query, "DoH provider won the resolution race");
-                    remember_doh_answer(query, ip);
-                    return Ok(SocketAddr::new(ip, port));
-                }
+        let order = doh_order();
+        for wave in order.chunks(DOH_FANOUT).take(DOH_MAX_WAVES) {
+            if let Some(ips) = race_doh_wave(wave, query).await {
+                remember_doh_answer(query, &ips);
+                return Ok(order_candidates(&ips, port));
             }
         }
         tracing::warn!(host = %query, "all DoH providers failed");
@@ -474,12 +637,17 @@ async fn resolve_addr(
 
     if resolver_policy.system_fallback {
         let host_port = format!("{host}:{port}");
-        let mut addrs = tokio::net::lookup_host(&host_port)
+        let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&host_port)
             .await
-            .map_err(|e| format!("system DNS lookup failed for {host_port}: {e}"))?;
-        return addrs
-            .next()
-            .ok_or_else(|| format!("system DNS lookup returned no addresses for {host_port}"));
+            .map_err(|e| format!("system DNS lookup failed for {host_port}: {e}"))?
+            .collect();
+        if addrs.is_empty() {
+            return Err(format!(
+                "system DNS lookup returned no addresses for {host_port}"
+            ));
+        }
+        let ips: Vec<IpAddr> = addrs.iter().map(|a| a.ip()).collect();
+        return Ok(order_candidates(&ips, port));
     }
 
     Err(format!(
@@ -487,21 +655,23 @@ async fn resolve_addr(
     ))
 }
 
-/// Perform a single TCP reachability probe against `addr` within the
-/// per-bridge timeout budget.
-async fn tcp_probe(addr: SocketAddr, per_bridge_timeout: Duration) -> Outcome {
+/// Perform a TCP reachability probe against the resolved candidates, within
+/// the per-bridge timeout budget per candidate.
+async fn tcp_probe(addrs: &[SocketAddr], per_bridge_timeout: Duration) -> Outcome {
     let started = Instant::now();
-    match timeout(per_bridge_timeout, TcpStream::connect(addr)).await {
-        Ok(Ok(_)) => Outcome::Reachable {
-            latency: started.elapsed(),
-        },
-        Ok(Err(e)) => Outcome::Unreachable {
-            reason: e.to_string(),
-        },
-        Err(_) => Outcome::Unreachable {
-            reason: format!("timed out after {per_bridge_timeout:?}"),
-        },
+    let mut last = "hostname resolved to no usable address".to_owned();
+    for addr in addrs {
+        match timeout(per_bridge_timeout, TcpStream::connect(*addr)).await {
+            Ok(Ok(_)) => {
+                return Outcome::Reachable {
+                    latency: started.elapsed(),
+                }
+            }
+            Ok(Err(e)) => last = format!("{addr}: {e}"),
+            Err(_) => last = format!("{addr}: timed out after {per_bridge_timeout:?}"),
+        }
     }
+    Outcome::Unreachable { reason: last }
 }
 
 /// Cap on simultaneous in-flight TCP probes — absorbs a large fetched
@@ -547,19 +717,46 @@ pub async fn probe_and_sort_with_policy(
     per_bridge_timeout: Duration,
     resolver_policy: ResolverPolicy,
 ) -> Vec<(BridgeLine, Duration)> {
+    probe_round_with_policy(bridges, per_bridge_timeout, resolver_policy)
+        .await
+        .alive
+}
+
+/// What one probe round established, split by whether it established anything.
+///
+/// Callers that persist results need both halves: recording only the live
+/// bridges and treating every other input as dead is what turned a struggling
+/// resolver into a pile of false failures.
+#[derive(Debug, Clone, Default)]
+pub struct ProbeRound {
+    /// Reachable bridges, fastest first.
+    pub alive: Vec<(BridgeLine, Duration)>,
+    /// Bridges the round could not test at all. Not evidence of anything —
+    /// leave their health record untouched.
+    pub unmeasured: Vec<BridgeLine>,
+}
+
+/// Probe `bridges`, log a summary, and report both the live ones and the ones
+/// that were never actually tested.
+pub async fn probe_round_with_policy(
+    bridges: Vec<BridgeLine>,
+    per_bridge_timeout: Duration,
+    resolver_policy: ResolverPolicy,
+) -> ProbeRound {
     let reports = probe_all_with_policy(bridges, per_bridge_timeout, resolver_policy).await;
     summarise(&reports);
 
-    let mut alive: Vec<(BridgeLine, Duration)> = reports
-        .into_iter()
-        .filter_map(|r| match r.outcome {
-            Outcome::Reachable { latency } => Some((r.bridge, latency)),
-            Outcome::Unreachable { .. } => None,
-        })
-        .collect();
+    let mut round = ProbeRound::default();
+    for report in reports {
+        match report.outcome {
+            Outcome::Reachable { latency } => round.alive.push((report.bridge, latency)),
+            Outcome::Unmeasured { .. } => round.unmeasured.push(report.bridge),
+            Outcome::Unreachable { .. } => {}
+        }
+    }
 
-    alive.sort_by_key(|(_, latency)| *latency);
-    alive
+    round.alive.sort_by_key(|(_, latency)| *latency);
+    round
 }
 
 /// Probe a single bridge: `Some(latency)` if its (transport-resolved) TCP
@@ -577,7 +774,7 @@ pub async fn probe_one_with_policy(
 ) -> Option<Duration> {
     match resolve_and_probe(bridge, per_bridge_timeout, resolver_policy).await {
         Outcome::Reachable { latency } => Some(latency),
-        Outcome::Unreachable { .. } => None,
+        Outcome::Unreachable { .. } | Outcome::Unmeasured { .. } => None,
     }
 }
 
@@ -640,6 +837,9 @@ pub async fn probe_until_with_policy(
                 dead += 1;
                 tracing::trace!(addr = %bridge.addr, reason = %reason, "bridge unreachable (lazy probe)");
             }
+            Outcome::Unmeasured { reason } => {
+                tracing::trace!(addr = %bridge.addr, reason = %reason, "bridge not measured (lazy probe)");
+            }
         }
     }
     tracing::info!(
@@ -655,10 +855,12 @@ pub async fn probe_until_with_policy(
 fn summarise(reports: &[Report]) {
     let total = reports.len();
     let alive = reports.iter().filter(|r| r.is_reachable()).count();
+    let unmeasured = reports.iter().filter(|r| r.is_unmeasured()).count();
     tracing::info!(
         total,
         alive,
-        dead = total - alive,
+        dead = total - alive - unmeasured,
+        unmeasured,
         "bridge reachability probe done"
     );
     for r in reports {
@@ -674,6 +876,12 @@ fn summarise(reports: &[Report]) {
                 transport = ?r.bridge.transport,
                 reason = %reason,
                 "bridge unreachable"
+            ),
+            Outcome::Unmeasured { reason } => tracing::warn!(
+                addr = %r.bridge.addr,
+                transport = ?r.bridge.transport,
+                reason = %reason,
+                "bridge not measured; leaving its health record alone"
             ),
         }
     }
@@ -691,6 +899,91 @@ mod tests {
             "obfs4 {addr} ABCDEF0123456789ABCDEF0123456789ABCDEF01"
         ))
         .expect("synthetic bridge line parses")
+    }
+
+    #[test]
+    fn scheme_less_webtunnel_url_is_read_as_https() {
+        let url = parse_webtunnel_url("tor.cenesp.es").expect("a bare host is accepted");
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("tor.cenesp.es"));
+    }
+
+    #[test]
+    fn candidates_put_ipv4_ahead_of_ipv6() {
+        let ips: Vec<IpAddr> = vec![
+            "2001:4860:4860::8888".parse().unwrap(),
+            "93.184.216.34".parse().unwrap(),
+        ];
+        let ordered = order_candidates(&ips, 443);
+        assert_eq!(ordered.len(), 2);
+        assert!(ordered[0].is_ipv4(), "IPv4 must be tried first");
+        assert!(ordered[1].is_ipv6(), "IPv6 is still tried, just second");
+    }
+
+    #[test]
+    fn candidates_drop_duplicates_and_cap_the_list() {
+        let ips: Vec<IpAddr> = vec![
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            "10.0.0.3".parse().unwrap(),
+            "10.0.0.4".parse().unwrap(),
+        ];
+        let ordered = order_candidates(&ips, 443);
+        assert_eq!(ordered.len(), MAX_PROBE_ADDRS);
+        assert_eq!(ordered[0].ip(), "10.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(ordered[1].ip(), "10.0.0.2".parse::<IpAddr>().unwrap());
+    }
+
+    /// A bridge we could not resolve must not be reported as dead — that
+    /// verdict belongs to the resolver, not the bridge.
+    #[tokio::test]
+    async fn unresolvable_hostname_is_unmeasured_rather_than_unreachable() {
+        let bridge = BridgeLine::from_str(
+            "webtunnel [2001:db8::1]:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 \
+             url=https://nothing.invalid/secret",
+        )
+        .expect("webtunnel bridge line parses");
+
+        let no_resolver = ResolverPolicy {
+            doh_enabled: false,
+            system_fallback: false,
+        };
+        let reports =
+            probe_all_with_policy(vec![bridge], Duration::from_millis(200), no_resolver).await;
+
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].is_unmeasured());
+        assert!(!reports[0].is_reachable());
+        assert!(reports[0].latency().is_none());
+    }
+
+    /// The round's two halves must stay separate all the way to the caller.
+    #[tokio::test]
+    async fn probe_round_keeps_unmeasured_out_of_alive() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let unresolvable = BridgeLine::from_str(
+            "webtunnel [2001:db8::1]:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 \
+             url=https://nothing.invalid/secret",
+        )
+        .unwrap();
+
+        let round = probe_round_with_policy(
+            vec![bridge_for(addr), unresolvable],
+            Duration::from_millis(500),
+            ResolverPolicy {
+                doh_enabled: false,
+                system_fallback: false,
+            },
+        )
+        .await;
+
+        assert_eq!(round.alive.len(), 1);
+        assert_eq!(round.unmeasured.len(), 1);
     }
 
     #[tokio::test]
@@ -840,7 +1133,7 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_resolvers_fail_hostname_explicitly() {
-        let result = resolve_addr(
+        let result = resolve_addrs(
             "bridge.example.invalid",
             443,
             ResolverPolicy {

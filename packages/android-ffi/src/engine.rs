@@ -321,16 +321,17 @@ async fn engine_async(
             configured = settings.bridges.len(),
             "probing active bridge pool for reachability"
         );
-        let mut alive = tokio::select! {
+        let mut round = tokio::select! {
             biased;
             _ = stop_rx.changed() => {
                 info!("received stop signal while probing bridges");
                 return Ok(());
             }
-            alive = bridge_probe::probe_and_sort_with_policy(active_probe_bridges.clone(), Duration::from_secs(5), bridge_health.resolver_policy) => alive,
+            round = bridge_probe::probe_round_with_policy(active_probe_bridges.clone(), Duration::from_secs(5), bridge_health.resolver_policy) => round,
         };
 
-        persist_and_rank_probe(&active_probe_bridges, &mut alive, &bridge_health);
+        persist_and_rank_probe(&active_probe_bridges, &mut round, &bridge_health);
+        let mut alive = std::mem::take(&mut round.alive);
 
         // A stale health store must not make a new installation unusable. If none of the
         // ranked active candidates responds, probe the complete background pool once as a
@@ -342,15 +343,16 @@ async fn engine_async(
                 configured = settings.bridges.len(),
                 "active bridge pool was unreachable; probing full background pool as fallback"
             );
-            alive = tokio::select! {
+            round = tokio::select! {
                 biased;
                 _ = stop_rx.changed() => {
                     info!("received stop signal while probing bridge fallback pool");
                     return Ok(());
                 }
-                alive = bridge_probe::probe_and_sort_with_policy(settings.bridges.clone(), Duration::from_secs(5), bridge_health.resolver_policy) => alive,
+                round = bridge_probe::probe_round_with_policy(settings.bridges.clone(), Duration::from_secs(5), bridge_health.resolver_policy) => round,
             };
-            persist_and_rank_probe(&settings.bridges, &mut alive, &bridge_health);
+            persist_and_rank_probe(&settings.bridges, &mut round, &bridge_health);
+            alive = std::mem::take(&mut round.alive);
         }
 
         if alive.is_empty() {
@@ -978,12 +980,13 @@ async fn stall_watchdog(
             && (first_bridge_reprobe || last_bridge_reprobe.elapsed() >= reprobe_interval);
         if !bridges.is_empty() && should_reprobe {
             first_bridge_reprobe = false;
-            let mut alive = tokio::select! {
+            let mut round = tokio::select! {
                 biased;
                 _ = stop_rx.changed() => return,
-                alive = bridge_probe::probe_and_sort_with_policy(bridges.clone(), BRIDGE_REPROBE_TIMEOUT, bridge_health.resolver_policy) => alive,
+                round = bridge_probe::probe_round_with_policy(bridges.clone(), BRIDGE_REPROBE_TIMEOUT, bridge_health.resolver_policy) => round,
             };
-            persist_and_rank_probe(&bridges, &mut alive, &bridge_health);
+            persist_and_rank_probe(&bridges, &mut round, &bridge_health);
+            let alive = std::mem::take(&mut round.alive);
             debug!(
                 alive = alive.len(),
                 total = bridges.len(),
@@ -1232,9 +1235,31 @@ fn select_active_probe_bridges(
 /// this round.
 fn persist_and_rank_probe(
     all_bridges: &[BridgeLine],
-    alive: &mut [(BridgeLine, Duration)],
+    round: &mut bridge_probe::ProbeRound,
     bridge_health: &BridgeHealthContext,
 ) {
+    // A bridge whose hostname would not resolve was never contacted, so this
+    // round has nothing to say about it. Recording a failure would be recording
+    // our own resolver's trouble against the bridge -- and, through the source
+    // tally, against whoever supplied it.
+    let measured: Vec<BridgeLine> = if round.unmeasured.is_empty() {
+        all_bridges.to_vec()
+    } else {
+        let skip: HashSet<String> = round.unmeasured.iter().map(|b| b.to_string()).collect();
+        all_bridges
+            .iter()
+            .filter(|b| !skip.contains(&b.to_string()))
+            .cloned()
+            .collect()
+    };
+    if !round.unmeasured.is_empty() {
+        info!(
+            unmeasured = round.unmeasured.len(),
+            measured = measured.len(),
+            "probe round left some bridges untested; their health is unchanged"
+        );
+    }
+
     let store_path = BridgeStore::resolve_path(bridge_health.config_path.as_deref());
     match BridgeStore::load(store_path.clone()) {
         Ok(mut store) => {
@@ -1246,8 +1271,8 @@ fn persist_and_rank_probe(
                     .saturating_mul(60),
             );
             let pruned = store.note_probe_round(
-                all_bridges,
-                alive,
+                &measured,
+                &round.alive,
                 now,
                 fail_window,
                 bridge_health.bridges_cfg.max_fails,
@@ -1263,7 +1288,7 @@ fn persist_and_rank_probe(
             if let Err(e) = store.save() {
                 warn!(path = %store_path.display(), error = %e, "could not persist bridge health store");
             }
-            alive.sort_by(|(ba, la), (bb, lb)| {
+            round.alive.sort_by(|(ba, la), (bb, lb)| {
                 store
                     .channel_ok_count(bb)
                     .cmp(&store.channel_ok_count(ba))
