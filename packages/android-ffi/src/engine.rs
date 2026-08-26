@@ -45,6 +45,35 @@ const MAX_WARM_BRIDGES: usize = 16;
 /// known from the persisted health store participate in the latency-sensitive connect path.
 const MAX_ACTIVE_BRIDGES: usize = 30;
 
+/// Target size of the actively-warmed rotation pool.
+///
+/// Distinct from [`MAX_ACTIVE_BRIDGES`] even though they share a value today: that constant
+/// bounds how many bridges get *reachability*-probed, this one is how many should end up
+/// *channel*-proven. The two used to be conflated in practice -- the only warm attempt ran
+/// once at connect time, over a slice of at most [`MAX_WARM_BRIDGES`] candidates, and never
+/// again -- so a pool with plenty of reachable bridges could sit at a handful of proven ones
+/// indefinitely (observed on a phone: 26 reachable, 3 proven). [`WARM_TOPUP_INTERVAL`] exists
+/// to close that gap.
+const TARGET_WARM_POOL_SIZE: usize = 30;
+
+/// How many new candidates one top-up round attempts to warm while below [`TARGET_WARM_POOL_SIZE`].
+/// Bounds concurrent channel-opens per round; the target is reached over several rounds.
+const WARM_TOPUP_BATCH: usize = 10;
+
+/// How many untried candidates a round still attempts once the pool is at
+/// [`TARGET_WARM_POOL_SIZE`]. Small, since the goal has shifted from filling the pool to
+/// occasionally finding something faster than its current slowest member.
+const WARM_REFRESH_BATCH: usize = 2;
+
+/// Cadence for the top-up/refresh round.
+///
+/// Deliberately its own interval, not [`WATCHDOG_PROBE_INTERVAL`] (a liveness check on a much
+/// tighter cadence) and not `recheck_interval_mins` (a reachability re-probe with its own
+/// flood-protection concerns, see `arti-wrapper`'s `build_config` doc). Warming is inherently
+/// bounded per round by [`WARM_TOPUP_BATCH`]/[`WARM_REFRESH_BATCH`], so this only controls how
+/// quickly the pool fills, not how much load one round can generate.
+const WARM_TOPUP_INTERVAL: Duration = Duration::from_secs(2 * 60);
+
 /// Engine status, used internally and formatted for the JNI status protocol.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum EngineStatus {
@@ -516,26 +545,23 @@ async fn engine_async(
         );
     });
 
-    // The watchdog starts with the probe-ranked active pool as its immediate rotation fallback;
-    // the background warm-up persists better candidates for the next connect.
-    let rotation_bridges = settings
-        .bridges
-        .iter()
-        .take(MAX_WARM_BRIDGES)
-        .cloned()
-        .collect::<Vec<_>>();
-
     // Stall watchdog: a real network interruption (Wi-Fi handoff, carrier
     // switch, a guard going stale) can leave arti's guard/circuit managers
     // stuck retrying a dead set with nothing to notice and force a reset --
     // arti has no automatic "rebuild everything" trigger of its own. Runs
     // for the lifetime of this connection; cancelled by the same stop
     // signal as the accept loop below.
+    //
+    // Its rotation pool starts empty rather than seeded with an unconfirmed guess: the
+    // background warm-up above is already independently warming a first slice, and the
+    // watchdog's own top-up round (see WARM_TOPUP_INTERVAL) fills the pool with real,
+    // measured warm latencies within its first couple of ticks. A confirmed-empty pool
+    // already falls back to the full configured list if a stall forces a rebuild before
+    // that happens, so there is nothing to lose by not guessing here.
     tokio::spawn(stall_watchdog(
         tunnel.clone(),
         stop_rx.clone(),
         all_configured_bridges,
-        rotation_bridges,
         bridge_health.clone(),
     ));
 
@@ -955,7 +981,6 @@ async fn stall_watchdog(
     tunnel: TorTunnel,
     mut stop_rx: tokio::sync::watch::Receiver<bool>,
     bridges: Vec<BridgeLine>,
-    mut rotation_bridges: Vec<BridgeLine>,
     bridge_health: BridgeHealthContext,
 ) {
     let mut consecutive_failures = 0u32;
@@ -972,6 +997,21 @@ async fn stall_watchdog(
             .recheck_interval_mins
             .saturating_mul(60),
     );
+
+    // The confirmed-warm rotation pool, fastest first, and the top-up round's own state.
+    // Starts empty: see the spawn site's comment for why that beats guessing.
+    let mut rotation_bridges: Vec<(BridgeLine, Duration)> = Vec::new();
+    // Candidates that failed to warm this session. Nothing demotes a merely-reachable bridge
+    // in the health store just because opening a channel to it failed -- reachability and
+    // warm success are different questions, see `usable_for_tor`'s webtunnel note for why the
+    // gap can be large -- so without this a bridge stuck failing PT/Tor handshake would be
+    // re-selected and re-attempted by every single top-up round for the life of the connection.
+    let mut warm_session_failed: HashSet<String> = HashSet::new();
+    // Due immediately: the first top-up round runs on this loop's first tick rather than
+    // waiting a full `WARM_TOPUP_INTERVAL` on top of `WATCHDOG_PROBE_INTERVAL`.
+    let mut last_topup = Instant::now()
+        .checked_sub(WARM_TOPUP_INTERVAL)
+        .unwrap_or_else(Instant::now);
 
     loop {
         tokio::select! {
@@ -1054,6 +1094,85 @@ async fn stall_watchdog(
             last_bridge_reprobe = Instant::now();
         }
 
+        if last_topup.elapsed() >= WARM_TOPUP_INTERVAL {
+            last_topup = Instant::now();
+            let active = rotation_bridges.len();
+            let batch_size = if active < TARGET_WARM_POOL_SIZE {
+                WARM_TOPUP_BATCH
+            } else {
+                WARM_REFRESH_BATCH
+            };
+
+            let already_active: HashSet<String> = rotation_bridges
+                .iter()
+                .map(|(bridge, _)| bridge.to_string())
+                .collect();
+            let batch: Vec<BridgeLine> = select_active_probe_bridges(&bridges, &bridge_health)
+                .into_iter()
+                .filter(|bridge| {
+                    let text = bridge.to_string();
+                    !already_active.contains(&text) && !warm_session_failed.contains(&text)
+                })
+                .take(batch_size)
+                .collect();
+
+            if !batch.is_empty() {
+                info!(
+                    count = batch.len(),
+                    active,
+                    target = TARGET_WARM_POOL_SIZE,
+                    "warm pool: attempting new candidates"
+                );
+                let pool = tokio::select! {
+                    biased;
+                    _ = stop_rx.changed() => return,
+                    pool = warm_bridge_pool(tunnel.clone(), batch.clone()) => pool,
+                };
+                persist_warm_results(&pool, &bridge_health);
+
+                let warmed_keys: HashSet<String> =
+                    pool.warmed.iter().map(|(b, _)| b.to_string()).collect();
+                for bridge in &batch {
+                    let text = bridge.to_string();
+                    if !warmed_keys.contains(&text) {
+                        warm_session_failed.insert(text);
+                    }
+                }
+                let retired_keys: HashSet<String> =
+                    pool.retired.iter().map(|b| b.to_string()).collect();
+                rotation_bridges.retain(|(bridge, _)| !retired_keys.contains(&bridge.to_string()));
+
+                let newly_warmed = pool.warmed.len();
+                rotation_bridges.extend(pool.warmed);
+                // Fastest first; a full pool sheds its slowest members here, which is how a
+                // newly-discovered fast bridge displaces an already-active slow one.
+                rotation_bridges.sort_by_key(|(_, latency)| *latency);
+                if rotation_bridges.len() > TARGET_WARM_POOL_SIZE {
+                    let dropped = rotation_bridges.split_off(TARGET_WARM_POOL_SIZE);
+                    for (bridge, latency) in &dropped {
+                        debug!(
+                            bridge = %bridge.addr,
+                            latency_ms = latency.as_millis() as u64,
+                            "warm pool: dropped in favour of a faster bridge"
+                        );
+                    }
+                }
+
+                crate::set_active_bridges(
+                    &rotation_bridges
+                        .iter()
+                        .map(|(bridge, _)| bridge.clone())
+                        .collect::<Vec<_>>(),
+                );
+                info!(
+                    active = rotation_bridges.len(),
+                    target = TARGET_WARM_POOL_SIZE,
+                    newly_warmed,
+                    "warm pool: rotation updated"
+                );
+            }
+        }
+
         let probe = tokio::time::timeout(
             WATCHDOG_PROBE_TIMEOUT,
             tunnel.connect("check.torproject.org", 443),
@@ -1090,10 +1209,10 @@ async fn stall_watchdog(
         if let Err(e) = tunnel.terminate_all_channels() {
             warn!(error = %e, "watchdog: terminate_all_channels failed");
         } else {
-            let candidates = if rotation_bridges.is_empty() {
+            let candidates: Vec<BridgeLine> = if rotation_bridges.is_empty() {
                 bridges.clone()
             } else {
-                rotation_bridges.clone()
+                rotation_bridges.iter().map(|(b, _)| b.clone()).collect()
             };
             let pool = tokio::select! {
                 biased;
@@ -1105,14 +1224,16 @@ async fn stall_watchdog(
             persist_warm_results(&pool, &bridge_health);
             if !pool.retired.is_empty() {
                 let retired: HashSet<String> = pool.retired.iter().map(|b| b.to_string()).collect();
-                rotation_bridges.retain(|b| !retired.contains(&b.to_string()));
+                rotation_bridges.retain(|(b, _)| !retired.contains(&b.to_string()));
             }
             if !pool.warmed.is_empty() {
-                rotation_bridges = pool
-                    .warmed
-                    .iter()
-                    .map(|(bridge, _)| bridge.clone())
-                    .collect();
+                rotation_bridges = pool.warmed;
+                crate::set_active_bridges(
+                    &rotation_bridges
+                        .iter()
+                        .map(|(bridge, _)| bridge.clone())
+                        .collect::<Vec<_>>(),
+                );
                 info!(
                     warmed = rotation_bridges.len(),
                     retired = pool.retired.len(),
