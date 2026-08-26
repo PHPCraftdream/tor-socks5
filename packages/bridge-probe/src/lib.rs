@@ -125,30 +125,147 @@ const DOH_MAX_WAVES: usize = 2;
 /// caller's entire DNS budget.
 const DOH_PROVIDER_TIMEOUT: Duration = Duration::from_secs(4);
 
-/// Process-lifetime cache of successful DoH answers.
+/// One remembered resolution and the moment it stops being trustworthy.
+///
+/// An empty address list is a remembered *failure*: worth keeping, because a
+/// bridge list points several lines at the same fronting host and a name that
+/// nobody could resolve a moment ago is not worth eight more provider queries
+/// in the same round.
+#[derive(Clone)]
+struct CachedAnswer {
+    addrs: Vec<IpAddr>,
+    expires_at: Instant,
+}
+
+/// Floor on how long an answer is kept.
+///
+/// Fronting hosts sit behind CDNs that publish 20-30 second TTLs. Honouring
+/// those literally would re-resolve hundreds of names every round and rebuild
+/// the very lookup storm the narrow fan-out exists to prevent; a minute is
+/// still short next to the re-probe interval.
+const DNS_MIN_TTL: Duration = Duration::from_secs(60);
+
+/// Ceiling on how long an answer is kept, whatever the record claims. A
+/// webtunnel bridge that moves to a new address has to become reachable again
+/// without waiting for the process to restart.
+const DNS_MAX_TTL: Duration = Duration::from_secs(30 * 60);
+
+/// How long a failed resolution is remembered. Long enough to cover the
+/// duplicate hostnames inside one round, short enough that a passing DoH
+/// outage cannot keep a host unresolvable into the next one.
+const DNS_NEGATIVE_TTL: Duration = Duration::from_secs(120);
+
+/// Bound on remembered hosts. The pool churns as sources refresh, and entries
+/// for bridges that have left it should not accumulate for the life of a VPN
+/// session.
+const DNS_CACHE_CAP: usize = 2048;
+
+/// Cache of DoH resolutions, positive and negative.
 ///
 /// A bridge list routinely points many bridge lines at a handful of fronting
 /// hosts, and every probe round re-resolves the same names. Each miss costs a
 /// full TLS session to a DoH provider, so caching removes the bulk of the
 /// resolution work from any round after the first.
-fn doh_cache() -> &'static std::sync::Mutex<HashMap<String, Vec<IpAddr>>> {
-    static CACHE: OnceLock<std::sync::Mutex<HashMap<String, Vec<IpAddr>>>> = OnceLock::new();
+fn doh_cache() -> &'static std::sync::Mutex<HashMap<String, CachedAnswer>> {
+    static CACHE: OnceLock<std::sync::Mutex<HashMap<String, CachedAnswer>>> = OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-fn cached_doh_answer(host: &str) -> Option<Vec<IpAddr>> {
-    doh_cache()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(host)
-        .cloned()
+/// What the cache knows about a hostname right now.
+enum CacheHit {
+    /// Addresses still inside their TTL.
+    Addrs(Vec<IpAddr>),
+    /// Resolution failed recently; skip the providers and move on.
+    Unresolvable,
 }
 
-fn remember_doh_answer(host: &str, ips: &[IpAddr]) {
+fn cached_doh_answer(host: &str) -> Option<CacheHit> {
+    let mut cache = doh_cache().lock().unwrap_or_else(|p| p.into_inner());
+    let entry = cache.get(host)?;
+    if entry.expires_at <= Instant::now() {
+        cache.remove(host);
+        return None;
+    }
+    if entry.addrs.is_empty() {
+        Some(CacheHit::Unresolvable)
+    } else {
+        Some(CacheHit::Addrs(entry.addrs.clone()))
+    }
+}
+
+fn remember_doh_answer(host: &str, ips: &[IpAddr], valid_for: Duration) {
+    let ttl = valid_for.clamp(DNS_MIN_TTL, DNS_MAX_TTL);
+    store_cached(
+        host,
+        CachedAnswer {
+            addrs: ips.to_vec(),
+            expires_at: Instant::now() + ttl,
+        },
+    );
+}
+
+fn remember_doh_failure(host: &str) {
+    store_cached(
+        host,
+        CachedAnswer {
+            addrs: Vec::new(),
+            expires_at: Instant::now() + DNS_NEGATIVE_TTL,
+        },
+    );
+}
+
+/// Drop what we remember about `host`.
+///
+/// Called when every address we handed out failed to connect. A cached answer
+/// that no longer works is worse than no answer: without eviction the probe
+/// would keep dialling the stale address for the rest of the TTL and keep
+/// filing the bridge as dead. Re-resolving a host that is genuinely blocked
+/// costs one lookup per round, which is what it cost before there was a cache.
+fn forget_dns_answer(host: &str) {
     doh_cache()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .insert(host.to_owned(), ips.to_vec());
+        .remove(host);
+}
+
+fn store_cached(host: &str, answer: CachedAnswer) {
+    let mut cache = doh_cache().lock().unwrap_or_else(|p| p.into_inner());
+    if cache.len() >= DNS_CACHE_CAP {
+        let now = Instant::now();
+        cache.retain(|_, entry| entry.expires_at > now);
+        if cache.len() >= DNS_CACHE_CAP {
+            // Still full of live entries: shed the ones closest to expiring,
+            // which have the least left to give.
+            let mut by_expiry: Vec<(String, Instant)> = cache
+                .iter()
+                .map(|(host, entry)| (host.clone(), entry.expires_at))
+                .collect();
+            by_expiry.sort_by_key(|(_, expires_at)| *expires_at);
+            for (host, _) in by_expiry.into_iter().take(DNS_CACHE_CAP / 4) {
+                cache.remove(&host);
+            }
+        }
+    }
+    cache.insert(host.to_owned(), answer);
+}
+
+/// Forget every cached answer and every provider score.
+///
+/// Both describe the network the device is attached to, not the bridges:
+/// which resolver is reachable and which address a name maps to can both
+/// change the moment the phone moves between mobile data and Wi-Fi. Carrying
+/// the old answers across that boundary produces precisely the failure this
+/// module exists to avoid — a live bridge dialled at an address that is no
+/// longer right, and recorded as dead for it.
+pub fn flush_dns_cache() {
+    doh_cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
+    for slot in doh_scores() {
+        slot.store(0, AtomicOrdering::Relaxed);
+    }
+    tracing::debug!("DNS cache and DoH provider scores cleared");
 }
 
 /// Running tally per provider: `+1` when it answers, `-1` when it does not.
@@ -350,6 +467,7 @@ async fn resolve_and_probe(
         Err(reason) => return Outcome::Unreachable { reason },
     };
 
+    let resolved_by_dns = host.parse::<IpAddr>().is_err();
     let addrs = if let Ok(ip) = host.parse::<IpAddr>() {
         vec![SocketAddr::new(ip, port)]
     } else {
@@ -365,7 +483,7 @@ async fn resolve_and_probe(
         }
     };
 
-    if bridge.transport.as_deref() == Some("webtunnel") {
+    let outcome = if bridge.transport.as_deref() == Some("webtunnel") {
         // The TCP target for webtunnel is the fronting web server, which answers
         // whether or not a bridge lives behind it, so a bare connect proves
         // nothing. Ask the endpoint to upgrade instead -- only a real bridge can.
@@ -374,16 +492,25 @@ async fn resolve_and_probe(
                 reason: "webtunnel bridge has no url= to upgrade against".to_owned(),
             };
         };
-        return webtunnel_upgrade_probe(
+        webtunnel_upgrade_probe(
             &addrs,
             &host,
             url,
             per_bridge_timeout.max(MIN_WEBTUNNEL_TIMEOUT),
         )
-        .await;
+        .await
+    } else {
+        tcp_probe(&addrs, per_bridge_timeout).await
+    };
+
+    // Every address we were given failed. The name may simply have moved, and
+    // holding the answer for the rest of its TTL would keep the bridge dead in
+    // the store for no better reason than a stale cache line.
+    if resolved_by_dns && matches!(outcome, Outcome::Unreachable { .. }) {
+        forget_dns_answer(host.trim_end_matches('.'));
     }
 
-    tcp_probe(&addrs, per_bridge_timeout).await
+    outcome
 }
 
 /// Floor for the webtunnel probe: it has to complete a TLS handshake and an
@@ -563,8 +690,9 @@ fn order_candidates(ips: &[IpAddr], port: u16) -> Vec<SocketAddr> {
 }
 
 /// Race one wave of DoH providers for `query`, returning the first non-empty
-/// answer. Records each provider's behaviour so [`doh_order`] can learn.
-async fn race_doh_wave(wave: &[usize], query: &str) -> Option<Vec<IpAddr>> {
+/// answer together with how long the records claim to be good for. Records
+/// each provider's behaviour so [`doh_order`] can learn.
+async fn race_doh_wave(wave: &[usize], query: &str) -> Option<(Vec<IpAddr>, Duration)> {
     let pool = doh_pool();
     let mut attempts = futures::stream::FuturesUnordered::new();
     for &index in wave {
@@ -606,7 +734,12 @@ async fn race_doh_wave(wave: &[usize], query: &str) -> Option<Vec<IpAddr>> {
                     host = %query,
                     "DoH provider won the resolution race"
                 );
-                answer = Some(ips);
+                // The record's own TTL, so a short-lived CDN answer is not
+                // held as long as a stable one. Clamped by the caller.
+                let ttl = lookup
+                    .valid_until()
+                    .saturating_duration_since(Instant::now());
+                answer = Some((ips, ttl));
             }
         }
     }
@@ -621,18 +754,32 @@ async fn resolve_addrs(
 ) -> Result<Vec<SocketAddr>, String> {
     let query = host.trim_end_matches('.');
     if resolver_policy.doh_enabled {
-        if let Some(ips) = cached_doh_answer(query) {
-            return Ok(order_candidates(&ips, port));
-        }
-
-        let order = doh_order();
-        for wave in order.chunks(DOH_FANOUT).take(DOH_MAX_WAVES) {
-            if let Some(ips) = race_doh_wave(wave, query).await {
-                remember_doh_answer(query, &ips);
-                return Ok(order_candidates(&ips, port));
+        match cached_doh_answer(query) {
+            Some(CacheHit::Addrs(ips)) => return Ok(order_candidates(&ips, port)),
+            // Remembered failure: skip the providers, but still let the system
+            // resolver below have its turn if policy allows one.
+            Some(CacheHit::Unresolvable) => {}
+            None => {
+                let order = doh_order();
+                let mut resolved = None;
+                for wave in order.chunks(DOH_FANOUT).take(DOH_MAX_WAVES) {
+                    if let Some(answer) = race_doh_wave(wave, query).await {
+                        resolved = Some(answer);
+                        break;
+                    }
+                }
+                match resolved {
+                    Some((ips, ttl)) => {
+                        remember_doh_answer(query, &ips, ttl);
+                        return Ok(order_candidates(&ips, port));
+                    }
+                    None => {
+                        remember_doh_failure(query);
+                        tracing::warn!(host = %query, "all DoH providers failed");
+                    }
+                }
             }
         }
-        tracing::warn!(host = %query, "all DoH providers failed");
     }
 
     if resolver_policy.system_fallback {
@@ -899,6 +1046,72 @@ mod tests {
             "obfs4 {addr} ABCDEF0123456789ABCDEF0123456789ABCDEF01"
         ))
         .expect("synthetic bridge line parses")
+    }
+
+    /// The cache tests share one process-wide map, so each uses its own
+    /// hostname and cleans up after itself rather than flushing the lot.
+    #[test]
+    fn cached_answer_is_returned_until_it_expires() {
+        let host = "cache-hit.test.invalid";
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        remember_doh_answer(host, &[ip], Duration::from_secs(300));
+
+        match cached_doh_answer(host) {
+            Some(CacheHit::Addrs(addrs)) => assert_eq!(addrs, vec![ip]),
+            _ => panic!("a fresh answer must be served from the cache"),
+        }
+
+        forget_dns_answer(host);
+        assert!(cached_doh_answer(host).is_none());
+    }
+
+    #[test]
+    fn expired_answer_is_not_served() {
+        let host = "cache-stale.test.invalid";
+        // Straight into the map with an expiry already in the past — the
+        // public helper clamps TTLs upwards, so it cannot express this.
+        store_cached(
+            host,
+            CachedAnswer {
+                addrs: vec!["203.0.113.8".parse().unwrap()],
+                expires_at: Instant::now() - Duration::from_secs(1),
+            },
+        );
+        assert!(cached_doh_answer(host).is_none());
+        assert!(
+            !doh_cache().lock().unwrap().contains_key(host),
+            "reading an expired entry should also drop it"
+        );
+    }
+
+    #[test]
+    fn a_failed_resolution_is_remembered_briefly() {
+        let host = "cache-negative.test.invalid";
+        remember_doh_failure(host);
+        assert!(matches!(
+            cached_doh_answer(host),
+            Some(CacheHit::Unresolvable)
+        ));
+        forget_dns_answer(host);
+    }
+
+    #[test]
+    fn ttl_is_clamped_into_the_useful_range() {
+        let host = "cache-ttl.test.invalid";
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+
+        // A CDN's 20-second TTL must not send us back to the providers on the
+        // next round.
+        remember_doh_answer(host, &[ip], Duration::from_secs(20));
+        let floor = doh_cache().lock().unwrap()[host].expires_at;
+        assert!(floor >= Instant::now() + DNS_MIN_TTL - Duration::from_secs(1));
+
+        // A record claiming a day must not outlive the bridge moving.
+        remember_doh_answer(host, &[ip], Duration::from_secs(86_400));
+        let ceiling = doh_cache().lock().unwrap()[host].expires_at;
+        assert!(ceiling <= Instant::now() + DNS_MAX_TTL);
+
+        forget_dns_answer(host);
     }
 
     #[test]

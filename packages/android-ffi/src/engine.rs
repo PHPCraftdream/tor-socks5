@@ -247,6 +247,13 @@ async fn engine_async(
     failed_already_emitted: Arc<AtomicBool>,
     bridge_health: BridgeHealthContext,
 ) -> Result<()> {
+    // A start is the one moment we know nothing about the current network:
+    // the user may have switched carriers, moved to Wi-Fi, or simply be
+    // retrying because the last attempt failed. Cached addresses and provider
+    // scores from the previous attempt would be answers to a question about a
+    // different network.
+    bridge_probe::flush_dns_cache();
+
     // Create a shared callback that updates status AND emits to Java
     let callback: BootstrapEventCallback = Arc::new({
         let cb = Arc::clone(&java_callback);
@@ -1076,6 +1083,10 @@ async fn stall_watchdog(
             consecutive_failures,
             "watchdog: forcing channel rebuild after sustained stall"
         );
+        // A sustained stall is what a network change looks like from in here,
+        // and the DNS cache plus the DoH provider scores both describe the
+        // network we were on, not the one we may now be on.
+        bridge_probe::flush_dns_cache();
         if let Err(e) = tunnel.terminate_all_channels() {
             warn!(error = %e, "watchdog: terminate_all_channels failed");
         } else {
