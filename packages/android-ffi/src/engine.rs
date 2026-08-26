@@ -1043,7 +1043,14 @@ async fn stall_watchdog(
                 .iter()
                 .map(|(bridge, _)| bridge.to_string())
                 .collect();
-            let batch: Vec<BridgeLine> = select_active_probe_bridges(&bridges, &bridge_health)
+            // Respect the transport preference the same way the bootstrap-time probe pool
+            // does. Without this, ranking-by-reachability over the unfiltered configured pool
+            // hands most of every batch to whichever transport is largest and most TCP-reachable
+            // -- typically obfs4 -- even on a network where obfs4 is blocked at the flow-shape
+            // layer and every one of those attempts is doomed before it starts, starving the
+            // transport the user actually asked for of its share of each round's batch.
+            let preferred = preferred_transport_bridges(&bridges, &bridge_health);
+            let batch: Vec<BridgeLine> = select_active_probe_bridges(&preferred, &bridge_health)
                 .into_iter()
                 .filter(|bridge| {
                     let text = bridge.to_string();
