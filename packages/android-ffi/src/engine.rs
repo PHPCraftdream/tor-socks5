@@ -1119,72 +1119,94 @@ async fn stall_watchdog(
         let should_reprobe = !reprobe_interval.is_zero()
             && (first_bridge_reprobe || last_bridge_reprobe.elapsed() >= reprobe_interval);
         if !bridges.is_empty() && should_reprobe {
+            // Bumped synchronously, before the spawn: this guards against starting a second
+            // sweep while one is still running, not against the loop moving on without waiting
+            // for this one -- moving on is the fix, not a race to prevent.
             first_bridge_reprobe = false;
-            let mut round = tokio::select! {
-                biased;
-                _ = stop_rx.changed() => return,
-                round = bridge_probe::probe_round_with_policy(bridges.clone(), BRIDGE_REPROBE_TIMEOUT, bridge_health.resolver_policy) => round,
-            };
-            persist_and_rank_probe(&bridges, &mut round, &bridge_health);
-            let alive = std::mem::take(&mut round.alive);
-            debug!(
-                alive = alive.len(),
-                total = bridges.len(),
-                "watchdog: periodic bridge re-probe complete"
-            );
-
-            if alive.len() < bridge_health.bridges_cfg.min_alive
-                && bridge_health.bridges_cfg.auto_fetch
-                && !bridge_health.bridges_cfg.sources.is_empty()
-            {
-                let barren = barren_sources(&bridge_health, auto_fetch_round);
-                let sources: Vec<bridge_fetcher::Source> = bridge_health
-                    .bridges_cfg
-                    .sources
-                    .iter()
-                    .filter(|s| !barren.contains(&s.label))
-                    .map(|s| bridge_fetcher::Source {
-                        label: s.label.clone(),
-                        url: s.url.clone(),
-                        headers: s.headers.clone(),
-                        cookies: s.cookies.clone(),
-                    })
-                    .collect();
-                auto_fetch_round = auto_fetch_round.wrapping_add(1);
-                let max_body_bytes = bridge_health
-                    .bridges_cfg
-                    .max_body_mib
-                    .saturating_mul(1024 * 1024);
-                info!(
-                    alive = alive.len(),
-                    min_alive = bridge_health.bridges_cfg.min_alive,
-                    "watchdog: alive bridge pool is thin, auto-fetching more"
-                );
-                let (fetched, outcomes) = tokio::select! {
-                    biased;
-                    _ = stop_rx.changed() => return,
-                    result = bridge_fetcher::fetch_all(&tunnel, &sources, AUTO_FETCH_TIMEOUT, max_body_bytes) => result,
-                };
-                for outcome in &outcomes {
-                    if let Some(err) = &outcome.error {
-                        warn!(label = %outcome.label, error = %err, "watchdog: bridge auto-fetch source failed");
-                    } else {
-                        info!(
-                            label = %outcome.label,
-                            bridges = outcome.bridges_extracted,
-                            "watchdog: bridge auto-fetch source OK"
-                        );
-                    }
-                }
-                persist_bridge_sources(&outcomes, &bridge_health);
-                let (unique, duplicates) = bridge_fetcher::dedup_bridges(fetched);
-                info!(
-                    unique = unique.len(),
-                    duplicates, "watchdog: bridge auto-fetch complete"
-                );
-                record_auto_fetched_bridges(unique);
-            }
             last_bridge_reprobe = Instant::now();
+            auto_fetch_round = auto_fetch_round.wrapping_add(1);
+
+            let reprobe_tunnel = tunnel.clone();
+            let reprobe_bridges = bridges.clone();
+            let reprobe_health = bridge_health.clone();
+            let mut reprobe_stop_rx = stop_rx.clone();
+            let this_round = auto_fetch_round;
+            // Spawned rather than awaited inline: a full sweep of the configured pool (thousands
+            // of bridges, some with multi-second timeouts) previously blocked this entire loop --
+            // including the warm-pool top-up and the liveness check below -- for as long as the
+            // sweep took. Measured on a phone: still running 7+ minutes after the connection came
+            // up, during which the top-up round that should fire every WARM_TOPUP_INTERVAL never
+            // got a second chance to run. Neither the top-up cadence nor the liveness check has
+            // any reason to wait on this; only the health store needs the result, and that's
+            // written from inside the spawned task itself.
+            tokio::spawn(async move {
+                if *reprobe_stop_rx.borrow() {
+                    return;
+                }
+                let mut round = tokio::select! {
+                    biased;
+                    _ = reprobe_stop_rx.changed() => return,
+                    round = bridge_probe::probe_round_with_policy(reprobe_bridges.clone(), BRIDGE_REPROBE_TIMEOUT, reprobe_health.resolver_policy) => round,
+                };
+                persist_and_rank_probe(&reprobe_bridges, &mut round, &reprobe_health);
+                let alive = std::mem::take(&mut round.alive);
+                debug!(
+                    alive = alive.len(),
+                    total = reprobe_bridges.len(),
+                    "watchdog: periodic bridge re-probe complete"
+                );
+
+                if alive.len() < reprobe_health.bridges_cfg.min_alive
+                    && reprobe_health.bridges_cfg.auto_fetch
+                    && !reprobe_health.bridges_cfg.sources.is_empty()
+                {
+                    let barren = barren_sources(&reprobe_health, this_round);
+                    let sources: Vec<bridge_fetcher::Source> = reprobe_health
+                        .bridges_cfg
+                        .sources
+                        .iter()
+                        .filter(|s| !barren.contains(&s.label))
+                        .map(|s| bridge_fetcher::Source {
+                            label: s.label.clone(),
+                            url: s.url.clone(),
+                            headers: s.headers.clone(),
+                            cookies: s.cookies.clone(),
+                        })
+                        .collect();
+                    let max_body_bytes = reprobe_health
+                        .bridges_cfg
+                        .max_body_mib
+                        .saturating_mul(1024 * 1024);
+                    info!(
+                        alive = alive.len(),
+                        min_alive = reprobe_health.bridges_cfg.min_alive,
+                        "watchdog: alive bridge pool is thin, auto-fetching more"
+                    );
+                    let (fetched, outcomes) = tokio::select! {
+                        biased;
+                        _ = reprobe_stop_rx.changed() => return,
+                        result = bridge_fetcher::fetch_all(&reprobe_tunnel, &sources, AUTO_FETCH_TIMEOUT, max_body_bytes) => result,
+                    };
+                    for outcome in &outcomes {
+                        if let Some(err) = &outcome.error {
+                            warn!(label = %outcome.label, error = %err, "watchdog: bridge auto-fetch source failed");
+                        } else {
+                            info!(
+                                label = %outcome.label,
+                                bridges = outcome.bridges_extracted,
+                                "watchdog: bridge auto-fetch source OK"
+                            );
+                        }
+                    }
+                    persist_bridge_sources(&outcomes, &reprobe_health);
+                    let (unique, duplicates) = bridge_fetcher::dedup_bridges(fetched);
+                    info!(
+                        unique = unique.len(),
+                        duplicates, "watchdog: bridge auto-fetch complete"
+                    );
+                    record_auto_fetched_bridges(unique);
+                }
+            });
         }
 
         let probe = tokio::time::timeout(
