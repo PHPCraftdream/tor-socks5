@@ -39,6 +39,16 @@ pub struct FetchOutcome {
     pub label: String,
     pub bridges_extracted: usize,
     pub error: Option<String>,
+    /// The lines this source contributed, kept alongside the count so a bridge
+    /// can be attributed back to where it came from.
+    ///
+    /// Judging a collector by whether its fetch succeeded is not enough: one
+    /// that has stopped regenerating still answers HTTP 200 with hundreds of
+    /// lines. A source in this repo's defaults did exactly that for 27 days
+    /// while contributing almost nothing that worked, and no transport-level
+    /// health check could have noticed. Scoring a source by what it actually
+    /// yields requires knowing which bridges were its.
+    pub bridges: Vec<BridgeLine>,
 }
 
 /// cancel-safe: NO — spawns concurrent fetches that may be in-flight.
@@ -83,12 +93,13 @@ pub async fn fetch_all(
                     body_bytes = body.len(),
                     "source fetched successfully"
                 );
+                all_bridges.extend(bridges.iter().cloned());
                 outcomes.push(FetchOutcome {
                     label,
                     bridges_extracted: bridges.len(),
                     error: None,
+                    bridges,
                 });
-                all_bridges.extend(bridges);
             }
             Err(e) => {
                 warn!(label = %label, error = %e, "source fetch failed");
@@ -96,6 +107,7 @@ pub async fn fetch_all(
                     label,
                     bridges_extracted: 0,
                     error: Some(e.to_string()),
+                    bridges: Vec::new(),
                 });
             }
         }

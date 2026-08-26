@@ -996,6 +996,7 @@ mod tests {
             label: label.to_owned(),
             bridges_extracted: 0,
             error: error.map(str::to_owned),
+            bridges: Vec::new(),
         }
     }
 

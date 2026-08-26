@@ -79,6 +79,10 @@ struct Entry {
     /// `circuit_observation_window` (arti retries quickly; we mustn't
     /// count each retry as a fresh failure).
     last_circuit_observation: OffsetDateTime,
+    /// Labels of the sources that offered this bridge. A line published by
+    /// several collectors credits all of them, or a good source looks barren
+    /// merely because another published the same line first.
+    sources: std::collections::BTreeSet<String>,
 }
 
 /// `circuit_fails` value marking a bridge as permanently unusable, rather than
@@ -191,6 +195,7 @@ impl BridgeStore {
                     last_channel_ok: meta.last_channel_ok,
                     circuit_fails: meta.circuit_fails,
                     last_circuit_observation: meta.last_circuit_observation,
+                    sources: meta.sources,
                 };
                 entries.insert(entry.key(), entry);
             } else {
@@ -222,6 +227,7 @@ impl BridgeStore {
             last_channel_ok: None,
             circuit_fails: 0,
             last_circuit_observation: now,
+            sources: Default::default(),
         });
         e.bridge = bridge;
         e.last_ok = Some(now);
@@ -304,6 +310,7 @@ impl BridgeStore {
                         last_channel_ok: None,
                         circuit_fails: 1,
                         last_circuit_observation: now,
+                        sources: Default::default(),
                     },
                 );
                 true
@@ -334,9 +341,42 @@ impl BridgeStore {
             last_channel_ok: None,
             circuit_fails: 0,
             last_circuit_observation: now,
+            sources: Default::default(),
         });
         entry.circuit_fails = RETIRED_CIRCUIT_FAILS;
         entry.last_circuit_observation = now;
+    }
+
+    /// Credit `source` with having offered `bridge`.
+    ///
+    /// Additive rather than overwriting: the same line is routinely published
+    /// by several collectors, and crediting only the first would make every
+    /// other one look barren for bridges it genuinely supplies. Creates a
+    /// bare entry if the bridge has not been probed yet, so a source can be
+    /// judged even before its bridges have been tried.
+    pub fn note_source_at(&mut self, bridge: &BridgeLine, source: &str, now: OffsetDateTime) {
+        let entry = self.entries.entry(key_of(bridge)).or_insert_with(|| Entry {
+            bridge: bridge.clone(),
+            last_ok: None,
+            last_attempt: now,
+            last_latency: Duration::ZERO,
+            fails: 0,
+            ok_count: 0,
+            channel_ok_count: 0,
+            last_channel_ok: None,
+            circuit_fails: 0,
+            last_circuit_observation: now,
+            sources: Default::default(),
+        });
+        entry.sources.insert(source.to_owned());
+    }
+
+    /// Sources credited with a bridge, empty when it predates attribution.
+    pub fn sources_of(&self, bridge: &BridgeLine) -> Vec<String> {
+        self.entries
+            .get(&key_of(bridge))
+            .map(|e| e.sources.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Per-transport counts and freshest timestamps, for a status display.
@@ -448,6 +488,7 @@ impl BridgeStore {
                         last_channel_ok: None,
                         circuit_fails: 0,
                         last_circuit_observation: now,
+                        sources: Default::default(),
                     },
                 );
                 true
@@ -516,6 +557,12 @@ impl BridgeStore {
             out.push_str(&e.circuit_fails.to_string());
             out.push_str(" cobs=");
             out.push_str(&format_iso(e.last_circuit_observation));
+            // Omitted when unknown, so entries written before attribution
+            // existed round-trip unchanged.
+            if !e.sources.is_empty() {
+                out.push_str(" src=");
+                out.push_str(&e.sources.iter().cloned().collect::<Vec<_>>().join(","));
+            }
             out.push('\n');
             out.push_str(&e.bridge.to_string());
             out.push('\n');
@@ -654,6 +701,7 @@ struct Meta {
     last_channel_ok: Option<OffsetDateTime>,
     circuit_fails: u32,
     last_circuit_observation: OffsetDateTime,
+    sources: std::collections::BTreeSet<String>,
 }
 
 impl Default for Meta {
@@ -668,6 +716,7 @@ impl Default for Meta {
             channel_ok_count: 0,
             last_channel_ok: None,
             circuit_fails: 0,
+            sources: Default::default(),
             last_circuit_observation: epoch,
         }
     }
@@ -707,6 +756,12 @@ fn parse_meta_comment(s: &str) -> Option<Meta> {
                 meta.circuit_fails = v.parse().ok()?;
             } else if let Some(v) = tok.strip_prefix("cobs=") {
                 meta.last_circuit_observation = OffsetDateTime::parse(v, &Iso8601::DEFAULT).ok()?;
+            } else if let Some(v) = tok.strip_prefix("src=") {
+                meta.sources = v
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect();
             }
         }
         return Some(meta);
@@ -730,6 +785,7 @@ fn parse_meta_comment(s: &str) -> Option<Meta> {
         channel_ok_count: 0,
         last_channel_ok: None,
         circuit_fails: 0,
+        sources: Default::default(),
         last_circuit_observation: when,
     })
 }
@@ -1126,6 +1182,25 @@ mod tests {
         assert_eq!(summary[0].retired, 1);
         assert_eq!(summary[0].alive, 0);
         assert_eq!(summary[0].channel_proven, 0);
+    }
+
+    #[test]
+    fn source_attribution_credits_every_collector_and_survives_a_round_trip() {
+        let dir = tmp_dir();
+        let path = dir.join("t.alive-bridges.log");
+        let b = bridge(OBFS4_A);
+        let t0 = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+
+        let mut s = BridgeStore::load(path.clone()).unwrap();
+        s.record_at(b.clone(), Duration::from_millis(10), t0);
+        // Same line published by two collectors: crediting only the first would
+        // make the second look barren for a bridge it genuinely supplies.
+        s.note_source_at(&b, "delta", t0);
+        s.note_source_at(&b, "onionhop", t0);
+        s.save().unwrap();
+
+        let reloaded = BridgeStore::load(path).unwrap();
+        assert_eq!(reloaded.sources_of(&b), vec!["delta", "onionhop"]);
     }
 
     #[test]

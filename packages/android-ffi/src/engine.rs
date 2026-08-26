@@ -1029,6 +1029,7 @@ async fn stall_watchdog(
                         );
                     }
                 }
+                persist_bridge_sources(&outcomes, &bridge_health);
                 let (unique, duplicates) = bridge_fetcher::dedup_bridges(fetched);
                 info!(
                     unique = unique.len(),
@@ -1274,6 +1275,34 @@ fn persist_and_rank_probe(
 
 /// Persist the PT-channel rotation signal without confusing it with an
 /// end-to-end circuit success or a plain TCP probe.
+/// Credit each source with the bridges it supplied, so a collector can later be
+/// judged by what it yields rather than by whether its fetch returned 200.
+fn persist_bridge_sources(
+    outcomes: &[bridge_fetcher::FetchOutcome],
+    bridge_health: &BridgeHealthContext,
+) {
+    if outcomes.iter().all(|o| o.bridges.is_empty()) {
+        return;
+    }
+    let path = BridgeStore::resolve_path(bridge_health.config_path.as_deref());
+    let mut store = match BridgeStore::load(path) {
+        Ok(store) => store,
+        Err(error) => {
+            warn!(error = %error, "could not load bridge health store for source attribution");
+            return;
+        }
+    };
+    let now = OffsetDateTime::now_utc();
+    for outcome in outcomes {
+        for bridge in &outcome.bridges {
+            store.note_source_at(bridge, &outcome.label, now);
+        }
+    }
+    if let Err(error) = store.save() {
+        warn!(error = %error, "could not persist bridge source attribution");
+    }
+}
+
 fn persist_warm_results(pool: &WarmPool, bridge_health: &BridgeHealthContext) {
     if pool.warmed.is_empty() && pool.retired.is_empty() {
         return;
