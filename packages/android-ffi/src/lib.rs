@@ -1183,11 +1183,15 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
             let _ = env.throw_new("java/lang/RuntimeException", &msg);
             e
         })?;
+        // "plain" is the Kotlin side's label for a bridge line with no pluggable transport at
+        // all (BridgeLine::transport == None) -- not a literal transport name to match against.
         let candidates: Vec<bridge_line::BridgeLine> = parsed
             .bridges
             .into_iter()
-            .filter(|b| {
-                transport_str.is_empty() || b.transport.as_deref() == Some(transport_str.as_str())
+            .filter(|b| match transport_str.as_str() {
+                "" => true,
+                "plain" => b.transport.is_none(),
+                t => b.transport.as_deref() == Some(t),
             })
             .collect();
         let total = candidates.len();
