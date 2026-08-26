@@ -187,27 +187,51 @@ fn get_engine() -> &'static Mutex<Option<EngineHandle>> {
     ENGINE.get_or_init(|| Mutex::new(None))
 }
 
-/// Bridges this session has proven can carry a Tor channel, newline-joined.
+/// Path to the small file that carries "bridges known to be carrying traffic right now"
+/// between processes, next to the config -- same `<stem>.<suffix>` convention as
+/// `BridgeStore::resolve_path`'s `<stem>.alive-bridges.log`.
 ///
-/// Distinct from the configured pool and from the probe-alive set: those say
-/// what might work, this says what did. Read by `nativeGetActiveBridges` so the
-/// UI can state which transport is actually in use rather than which one was
-/// preferred -- with a preference of "any", or after a rotation, the two are
-/// routinely different.
-static ACTIVE_BRIDGES: OnceLock<Mutex<String>> = OnceLock::new();
-
-pub(crate) fn active_bridges() -> &'static Mutex<String> {
-    ACTIVE_BRIDGES.get_or_init(|| Mutex::new(String::new()))
+/// This used to be a plain in-memory static, which is wrong for what it's used for:
+/// `XorbotService` runs in `android:process=":tor"`, a separate Android process from the UI
+/// (`XorbotActivity` has no process override), and each process gets its own independent copy
+/// of the loaded native library's statics. The engine thread published to *its* process's copy;
+/// `nativeGetActiveBridges` called from a UI fragment read a different, permanently-empty copy
+/// in the *main* process -- so the bridge-status sheet said "not connected" no matter how many
+/// bridges the engine had actually warmed. Every other cross-process getter in this file
+/// (bridge stats, source stats, healthy bridges) already reads a file next to the config for
+/// exactly this reason; this makes active-bridges consistent with them instead of the one
+/// in-memory exception.
+fn active_bridges_path(config_path: Option<&std::path::Path>) -> std::path::PathBuf {
+    match config_path {
+        Some(cfg) => {
+            let dir = cfg.parent().unwrap_or_else(|| std::path::Path::new("."));
+            let stem = cfg
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "tor-socks5".to_string());
+            dir.join(format!("{stem}.active-bridges"))
+        }
+        None => std::path::PathBuf::from("tor-socks5.active-bridges"),
+    }
 }
 
 /// Publish the bridges known to be carrying, or `&[]` to clear on teardown.
-pub(crate) fn set_active_bridges(bridges: &[bridge_line::BridgeLine]) {
+///
+/// Best-effort: a write failure here must not fail engine startup/shutdown over what is purely
+/// a UI signal -- nothing inside the engine reads this back.
+pub(crate) fn set_active_bridges(
+    config_path: Option<&std::path::Path>,
+    bridges: &[bridge_line::BridgeLine],
+) {
     let joined = bridges
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
-    *active_bridges().lock().unwrap_or_else(|p| p.into_inner()) = joined;
+    let path = active_bridges_path(config_path);
+    if let Err(e) = std::fs::write(&path, joined) {
+        warn!(path = %path.display(), error = %e, "could not persist active bridges");
+    }
 }
 
 /// Helper: update the global status.
@@ -728,7 +752,7 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
     }
 }
 
-/// JNI entry point: `nativeGetActiveBridges()`
+/// JNI entry point: `nativeGetActiveBridges(String configPath)`
 ///
 /// Returns the bridges this session has proven can carry a Tor channel,
 /// newline-joined, or an empty string when nothing is connected.
@@ -742,19 +766,23 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
 /// Narrows as the connection matures: the bridges the working circuit was built
 /// from at first, then just those that completed a channel warm-up.
 ///
-/// - **Threading:** Cheap, safe to call from the main thread; reads a mutex.
+/// Reads the same file `set_active_bridges` writes (see [`active_bridges_path`]'s doc for why
+/// this has to be file-based rather than an in-memory static): works whether the caller is in
+/// the `:tor` process (where the engine actually runs) or the main UI process.
+///
+/// - **Threading:** Cheap, safe to call from the main thread; a small file read.
 /// - **Error Signaling:** Does not throw. Returns `null` only on a Java string
-///   allocation failure.
+///   allocation failure; a missing/unreadable file reads back as empty.
 #[no_mangle]
 pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativeGetActiveBridges(
     mut env: JNIEnv,
     _class: JClass,
+    config_path: JString,
 ) -> jstring {
     match panic::catch_unwind(AssertUnwindSafe(|| {
-        let joined = active_bridges()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
+        let config_path_str: Option<String> = env.get_string(&config_path).ok().map(|s| s.into());
+        let path = active_bridges_path(config_path_str.as_ref().map(std::path::Path::new));
+        let joined = std::fs::read_to_string(&path).unwrap_or_default();
         env.new_string(joined).map(|s| s.into_raw()).map_err(|e| {
             error!("failed to create Java string for active bridges: {e}");
             e

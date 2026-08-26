@@ -482,7 +482,7 @@ async fn engine_async(
     // event isn't forwarded from there instead).
     // The verified set is the honest answer until warm-up narrows it: these are
     // the bridges the working circuit was built from.
-    crate::set_active_bridges(&settings.bridges);
+    crate::set_active_bridges(bridge_health.config_path.as_deref(), &settings.bridges);
     set_final_status(EngineStatus::On(actual_addr));
     java_callback.emit(BootstrapEvent::Ready);
     set_current_tunnel(Some(tunnel.clone()));
@@ -535,7 +535,7 @@ async fn engine_async(
                 .iter()
                 .map(|(bridge, _)| bridge.clone())
                 .collect();
-            crate::set_active_bridges(&warmed);
+            crate::set_active_bridges(warm_health.config_path.as_deref(), &warmed);
         }
         info!(
             warmed = pool.warmed.len(),
@@ -593,7 +593,7 @@ async fn engine_async(
     // clone left behind in CURRENT_TUNNEL would keep the tunnel alive and
     // could let a concurrent nativeRefreshBridges call reach it mid-teardown.
     set_current_tunnel(None);
-    crate::set_active_bridges(&[]);
+    crate::set_active_bridges(bridge_health.config_path.as_deref(), &[]);
     info!("shutting down Tor client");
     drop(tunnel);
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1102,6 +1102,7 @@ async fn stall_watchdog(
                 }
 
                 crate::set_active_bridges(
+                    bridge_health.config_path.as_deref(),
                     &rotation_bridges
                         .iter()
                         .map(|(bridge, _)| bridge.clone())
@@ -1265,6 +1266,7 @@ async fn stall_watchdog(
             if !pool.warmed.is_empty() {
                 rotation_bridges = pool.warmed;
                 crate::set_active_bridges(
+                    bridge_health.config_path.as_deref(),
                     &rotation_bridges
                         .iter()
                         .map(|(bridge, _)| bridge.clone())
