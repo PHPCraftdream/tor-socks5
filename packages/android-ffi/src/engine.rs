@@ -956,6 +956,7 @@ async fn stall_watchdog(
     // invisible on Android, especially after a fresh install with only a few seed bridges.
     let mut first_bridge_reprobe = true;
     let mut last_bridge_reprobe = Instant::now();
+    let mut auto_fetch_round: u32 = 0;
     let reprobe_interval = Duration::from_secs(
         bridge_health
             .bridges_cfg
@@ -993,10 +994,12 @@ async fn stall_watchdog(
                 && bridge_health.bridges_cfg.auto_fetch
                 && !bridge_health.bridges_cfg.sources.is_empty()
             {
+                let barren = barren_sources(&bridge_health, auto_fetch_round);
                 let sources: Vec<bridge_fetcher::Source> = bridge_health
                     .bridges_cfg
                     .sources
                     .iter()
+                    .filter(|s| !barren.contains(&s.label))
                     .map(|s| bridge_fetcher::Source {
                         label: s.label.clone(),
                         url: s.url.clone(),
@@ -1004,6 +1007,7 @@ async fn stall_watchdog(
                         cookies: s.cookies.clone(),
                     })
                     .collect();
+                auto_fetch_round = auto_fetch_round.wrapping_add(1);
                 let max_body_bytes = bridge_health
                     .bridges_cfg
                     .max_body_mib
@@ -1275,6 +1279,44 @@ fn persist_and_rank_probe(
 
 /// Persist the PT-channel rotation signal without confusing it with an
 /// end-to-end circuit success or a plain TCP probe.
+/// A source must have offered this many bridges before its yield is judged.
+/// Below it, a run of bad luck is indistinguishable from a dead collector.
+const SOURCE_MIN_SAMPLE: usize = 40;
+
+/// How often a barren source is retried anyway. Collectors do resume, and a
+/// source struck off permanently could never prove it.
+const BARREN_SOURCE_RETRY_EVERY: u32 = 6;
+
+/// Labels of sources worth skipping this round.
+///
+/// Barren means "has supplied a meaningful number of bridges and not one of
+/// them was ever reachable" — the state a collector reaches when it stops
+/// regenerating, which no fetch-level check can see because it keeps answering
+/// HTTP 200 with a full list. Skipping is periodic rather than permanent so a
+/// revived collector re-earns its place on its own.
+fn barren_sources(bridge_health: &BridgeHealthContext, round: u32) -> HashSet<String> {
+    if round % BARREN_SOURCE_RETRY_EVERY == 0 {
+        return HashSet::new();
+    }
+    let path = BridgeStore::resolve_path(bridge_health.config_path.as_deref());
+    let Ok(store) = BridgeStore::load(path) else {
+        return HashSet::new();
+    };
+    let barren: HashSet<String> = store
+        .source_summary()
+        .into_iter()
+        .filter(|s| s.is_barren(SOURCE_MIN_SAMPLE))
+        .map(|s| s.label)
+        .collect();
+    if !barren.is_empty() {
+        info!(
+            skipped = barren.len(),
+            "watchdog: skipping sources that have yielded no reachable bridge"
+        );
+    }
+    barren
+}
+
 /// Credit each source with the bridges it supplied, so a collector can later be
 /// judged by what it yields rather than by whether its fetch returned 200.
 fn persist_bridge_sources(

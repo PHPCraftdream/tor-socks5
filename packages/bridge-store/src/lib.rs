@@ -109,6 +109,35 @@ pub struct TransportStats {
     pub last_channel_ok: Option<OffsetDateTime>,
 }
 
+/// What one bridge-list source has yielded, for scoring and for display.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceStats {
+    pub label: String,
+    /// Bridges this source has offered, whether or not they ever worked.
+    pub offered: usize,
+    /// Of those, how many answered a reachability probe.
+    pub alive: usize,
+    /// Of those, how many actually carried a Tor channel.
+    pub channel_proven: usize,
+    /// Of those, how many were retired as permanently unusable.
+    pub retired: usize,
+}
+
+impl SourceStats {
+    /// Whether this source has supplied enough bridges to be judged, and none
+    /// of them ever worked.
+    ///
+    /// The sample floor matters: a source that has offered two bridges and had
+    /// no luck yet is unremarkable, while one that has offered hundreds without
+    /// a single reachable bridge has stopped being a source of bridges. Judged
+    /// on reachability rather than on completed channels, because
+    /// channel-proven counts stay at zero for any bridge the client has simply
+    /// never selected.
+    pub fn is_barren(&self, min_sample: usize) -> bool {
+        self.offered >= min_sample && self.alive == 0
+    }
+}
+
 impl Entry {
     fn is_retired(&self) -> bool {
         self.circuit_fails == RETIRED_CIRCUIT_FAILS
@@ -369,6 +398,38 @@ impl BridgeStore {
             sources: Default::default(),
         });
         entry.sources.insert(source.to_owned());
+    }
+
+    /// What each source has actually yielded, keyed by its label.
+    ///
+    /// A source is judged by the bridges it supplied, not by whether its fetch
+    /// succeeded — those answer different questions, and only the first one
+    /// matters. A collector that has stopped regenerating keeps returning HTTP
+    /// 200 with hundreds of lines indefinitely.
+    pub fn source_summary(&self) -> Vec<SourceStats> {
+        let mut by_source: BTreeMap<String, SourceStats> = BTreeMap::new();
+        for entry in self.entries.values() {
+            for label in &entry.sources {
+                let stats = by_source
+                    .entry(label.clone())
+                    .or_insert_with(|| SourceStats {
+                        label: label.clone(),
+                        ..SourceStats::default()
+                    });
+                stats.offered += 1;
+                if entry.is_retired() {
+                    stats.retired += 1;
+                    continue;
+                }
+                if entry.fails == 0 && entry.ok_count > 0 {
+                    stats.alive += 1;
+                }
+                if entry.channel_ok_count > 0 {
+                    stats.channel_proven += 1;
+                }
+            }
+        }
+        by_source.into_values().collect()
     }
 
     /// Sources credited with a bridge, empty when it predates attribution.
@@ -1201,6 +1262,37 @@ mod tests {
 
         let reloaded = BridgeStore::load(path).unwrap();
         assert_eq!(reloaded.sources_of(&b), vec!["delta", "onionhop"]);
+    }
+
+    #[test]
+    fn source_summary_scores_by_yield_not_by_fetch_success() {
+        let mut s = empty();
+        let works = bridge(OBFS4_A);
+        let dead = bridge(OBFS4_B);
+        let t0 = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+
+        // "stale" supplied only a bridge that never came up; "fresh" supplied
+        // both. Both sources fetched fine -- the difference is what they yielded.
+        s.note_source_at(&dead, "stale", t0);
+        s.note_source_at(&dead, "fresh", t0);
+        s.note_source_at(&works, "fresh", t0);
+        s.record_at(works.clone(), Duration::from_millis(10), t0);
+        s.note_failure_at(&dead, t0, HOUR);
+
+        let by_label: std::collections::HashMap<_, _> = s
+            .source_summary()
+            .into_iter()
+            .map(|st| (st.label.clone(), st))
+            .collect();
+        assert_eq!(by_label["stale"].offered, 1);
+        assert_eq!(by_label["stale"].alive, 0);
+        assert_eq!(by_label["fresh"].offered, 2);
+        assert_eq!(by_label["fresh"].alive, 1);
+        // With a sample floor of 1, only the barren one is barren.
+        assert!(by_label["stale"].is_barren(1));
+        assert!(!by_label["fresh"].is_barren(1));
+        // A floor above the sample size withholds judgement.
+        assert!(!by_label["stale"].is_barren(2));
     }
 
     #[test]
