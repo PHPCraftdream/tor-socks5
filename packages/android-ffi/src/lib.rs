@@ -821,6 +821,57 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
     }
 }
 
+/// JNI entry point: `nativeNoteBridgeSource(String configPath, String label, String lines)`
+///
+/// Credits `label` with the newline-separated bridge `lines`, so bridges
+/// obtained outside the engine's own fetcher still carry attribution.
+///
+/// Needed because not every bridge arrives through `bridge_fetcher`: moat is
+/// driven from Kotlin, and without this its bridges would be indistinguishable
+/// from scraped ones — invisible to the per-source verdict and to the
+/// barren-source scoring, despite being the only ones not already burned.
+///
+/// - **Threading:** Reads and writes a file; call off the main thread.
+/// - **Error Signaling:** Does not throw. Silently does nothing when the store
+///   cannot be loaded, since attribution must never break bridge acquisition.
+#[no_mangle]
+pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativeNoteBridgeSource(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_path: JString,
+    label: JString,
+    lines: JString,
+) {
+    let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+        let config_path_str: Option<String> = env.get_string(&config_path).ok().map(|s| s.into());
+        let Ok(label) = env.get_string(&label).map(String::from) else {
+            return;
+        };
+        let Ok(lines) = env.get_string(&lines).map(String::from) else {
+            return;
+        };
+        let bridges: Vec<bridge_line::BridgeLine> = lines
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect();
+        if bridges.is_empty() {
+            return;
+        }
+        let store_path =
+            BridgeStore::resolve_path(config_path_str.as_ref().map(std::path::Path::new));
+        let Ok(mut store) = BridgeStore::load(store_path) else {
+            return;
+        };
+        let now = time::OffsetDateTime::now_utc();
+        for bridge in &bridges {
+            store.note_source_at(bridge, &label, now);
+        }
+        if let Err(e) = store.save() {
+            error!("could not persist bridge source attribution: {e}");
+        }
+    }));
+}
+
 /// JNI entry point: `nativeGetProvenBridges(String configPath, int limit)`
 ///
 /// Bridges that have actually carried a Tor channel, most recent first,
