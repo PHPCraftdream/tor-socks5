@@ -154,6 +154,49 @@ fixed. Selection has to assume most candidates are dead: probe before use,
 retire on a verdict, and never let a preference for webtunnel imply that
 webtunnel bridges will be available.
 
+## Part of that yield was our own resolver, not the pool
+
+The section above is right about the direction and was wrong about the
+magnitude. Reading back the *reasons* a probe round recorded — rather than
+just its verdicts — showed that most webtunnel "failures" were never about a
+bridge. One round on a phone, sampled from the engine's log:
+
+| reason | share | what it actually means |
+| --- | --- | --- |
+| `tcp connect: Network is unreachable` | 29% | the resolver returned AAAA; the device has no IPv6 route |
+| `no DNS resolver available` | 24% | every DoH provider failed and system fallback is off |
+| `DNS resolution timed out after 15s` | 15% | DoH starvation, see below |
+| `webtunnel upgrade timed out` | 18% | plausibly the censor, or a dead host |
+| a real verdict (HTTP 502, bad cert…) | 15% | genuinely not a bridge |
+
+Two thirds of the pool was being condemned by our own name resolution. Three
+mechanisms, all upstream of the bridge:
+
+- **One address per name.** The resolver kept only the first record, often
+  AAAA, and a device with no IPv6 route cannot dial it. Keeping the whole set
+  and trying IPv4 first costs an instant `connect` failure instead of a bridge.
+- **Fan-out that could not scale.** Every hostname raced all 18 DoH providers
+  through 32 permits, each held up to four seconds. 425 hostnames is 7650
+  queued lookups while a bridge waits fifteen seconds for its answer, so late
+  bridges failed DNS unasked. Scoring providers by whether they answer — a
+  property of the network, learned once — and racing only the best four fixed
+  it.
+- **A DNS failure was recorded as a bridge failure.** It is not evidence about
+  the bridge; it now leaves the health record untouched, so an unresolvable
+  host no longer walks a live bridge towards pruning or writes off its source
+  as barren.
+
+After the fix, on the same network and the same pool: webtunnel alive went from
+**5 of 425 to 26 of 439**, and total alive across all transports from 760 to
+814. `Network is unreachable` fell from 29% of failures to about 4%, and DNS
+timeouts vanished from the sample. What now dominates is the upgrade timing out
+— which is what a block, or a dead host, is supposed to look like.
+
+The general lesson is worth more than the fix: a probe that only reports
+pass/fail cannot be audited. Every one of these defects was invisible in the
+verdicts and obvious in the reasons, and the health store had been recording
+them as facts about bridges for weeks.
+
 ## Open direction
 
 Client-side TLS ClientHello fragmentation (the zapret/GoodbyeDPI technique) is
