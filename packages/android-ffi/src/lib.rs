@@ -355,6 +355,18 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
                 "ignored documentation/local-only bridge addresses"
             );
         }
+        // Seed any DNS hints carried alongside the configured bridges (e.g.
+        // from a QR-imported bridge whose exporter already had it resolved)
+        // into the DNS fallback store. Safe regardless of call order versus
+        // `engine_async`'s own `load_persisted_dns_cache` -- both merge by
+        // recency (see `bridge_probe::seed_disk_fallback`).
+        if !parsed_bridges.dns_hints.is_empty() {
+            info!(
+                hints = parsed_bridges.dns_hints.len(),
+                "seeding DNS fallback cache from configured bridge hints"
+            );
+            bridge_probe::seed_disk_fallback(&parsed_bridges.dns_hints);
+        }
 
         // 5. Parse listen address
         let listen_addr: std::net::SocketAddr = cfg
@@ -1270,6 +1282,69 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
     }
 }
 
+/// JNI entry point: `nativeGetDnsHints(String bridgeLines) -> String`
+///
+/// `bridgeLines` is newline-joined bridge-line strings -- typically the same
+/// slice `ShareBridgesBottomSheet` is about to export. For each bridge whose
+/// target is a hostname (currently: webtunnel bridges using `url=`, not
+/// `addr=`), looks up the best DNS answer this process currently knows
+/// (fresh, stale-but-recent, or persisted from a previous run -- see
+/// `bridge_probe::best_known_answer`) and, if one exists, formats it as a
+/// `# xorbot:dns ...` directive line.
+///
+/// Returns the directive lines newline-joined (empty string if none apply),
+/// ready to be appended verbatim to the same list of strings being exported
+/// -- `proxy_config::BridgesConfig::parsed` recognises and diverts these on
+/// the importing side, scoped to only the bridges imported alongside them
+/// (see that function's doc for why the scope check matters).
+///
+/// Reads only in-process state (no file I/O, no `configPath`): the DNS
+/// caches this draws from are process-wide, not per-config.
+///
+/// - **Threading:** Cheap -- no network access, just cache lookups. Safe to
+///   call from the main thread.
+/// - **Error Signaling:** Does not throw. An unparseable bridge line is
+///   simply skipped (not every bridge needs a hint); a Java string
+///   allocation failure returns `null`.
+#[no_mangle]
+pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativeGetDnsHints(
+    mut env: JNIEnv,
+    _class: JClass,
+    bridge_lines: JString,
+) -> jstring {
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        let lines_str: String = env.get_string(&bridge_lines).map(|s| s.into()).unwrap_or_default();
+        env.new_string(dns_hints_for_lines(&lines_str))
+            .map(|s| s.into_raw())
+            .map_err(|e| {
+                error!("failed to create Java string for DNS hints: {e}");
+                anyhow::anyhow!(e)
+            })
+    }));
+
+    match result {
+        Ok(Ok(jstr)) => jstr,
+        Ok(Err(_)) | Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Pure glue behind [`nativeGetDnsHints`], factored out so it can be unit
+/// tested without a JVM: parse each bridge line, keep only the (deduplicated)
+/// hostnames that actually need DNS resolution, look up the best known
+/// answer for each, and format whatever exists as directive lines.
+fn dns_hints_for_lines(lines_str: &str) -> String {
+    let mut seen = std::collections::HashSet::new();
+    lines_str
+        .lines()
+        .filter_map(|line| line.parse::<bridge_line::BridgeLine>().ok())
+        .filter_map(|bridge| bridge_probe::dns_hostname_of(&bridge))
+        .filter(|host| seen.insert(host.clone()))
+        .filter_map(|host| bridge_probe::best_known_answer(&host))
+        .map(|hint| bridge_probe::format_dns_hint_line(&hint))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1281,6 +1356,48 @@ mod tests {
             error: error.map(str::to_owned),
             bridges: Vec::new(),
         }
+    }
+
+    #[test]
+    fn dns_hints_for_lines_is_empty_when_nothing_is_cached() {
+        let lines = "webtunnel 192.0.2.3:1 0123456789ABCDEF0123456789ABCDEF01234567 \
+                      url=https://never-cached.example.test/x";
+        assert_eq!(dns_hints_for_lines(lines), "");
+    }
+
+    #[test]
+    fn dns_hints_for_lines_is_empty_for_ip_only_bridges() {
+        // obfs4 without a hostname target has nothing worth hinting at.
+        let lines = "obfs4 192.0.2.1:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA iat-mode=0";
+        assert_eq!(dns_hints_for_lines(lines), "");
+    }
+
+    #[test]
+    fn dns_hints_for_lines_finds_a_cached_webtunnel_host() {
+        let host = "cached-for-export.example.test";
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        bridge_probe::seed_disk_fallback(&[bridge_probe::DnsHint {
+            host: host.to_owned(),
+            addrs: vec!["203.0.113.77".parse().unwrap()],
+            resolved_at_unix: now,
+        }]);
+        let lines =
+            format!("webtunnel 192.0.2.3:1 0123456789ABCDEF0123456789ABCDEF01234567 url=https://{host}/x");
+        let result = dns_hints_for_lines(&lines);
+        assert!(result.starts_with(bridge_probe::DNS_HINT_PREFIX), "got: {result:?}");
+        let parsed = bridge_probe::parse_dns_hint_line(&result).expect("must parse back");
+        assert_eq!(parsed.host, host);
+    }
+
+    #[test]
+    fn dns_hints_for_lines_ignores_unparseable_lines() {
+        // A garbage line must not abort the whole call -- other lines still
+        // get a chance.
+        let lines = "not a bridge line at all\nalso garbage";
+        assert_eq!(dns_hints_for_lines(lines), "");
     }
 
     #[test]

@@ -282,16 +282,46 @@ async fn engine_async(
     // scores from the previous attempt would be answers to a question about a
     // different network.
     bridge_probe::flush_dns_cache();
+    // Deliberately separate from the wipe above: this loads into a store the
+    // *live* cache never reads from directly, consulted only once every DoH
+    // provider and the in-memory stale fallback have both failed this run.
+    // Carrying it across a network change cannot shadow a fresh answer --
+    // it can only provide one where a cold start would otherwise have none.
+    bridge_probe::load_persisted_dns_cache(&dns_cache_path(bridge_health.config_path.as_deref()));
 
     // Create a shared callback that updates status AND emits to Java
+    // Set once `engine_async` itself has declared the engine On (see the explicit
+    // `set_final_status(EngineStatus::On(..))` below `verify_live_circuit`'s success), and
+    // checked inside `callback` below to suppress any later `Progress` event.
+    //
+    // Without this, a real, sustained bug follows: `forward_bootstrap_events`'s subscription
+    // is documented to stop delivering once "ready" fires, but that stream and our own
+    // On-transition are driven by two different readiness notions -- arti's own
+    // `bootstrap_status().ready_for_traffic()` heuristic, vs. this app's `verify_live_circuit`
+    // probe -- and the two do not always agree on the same instant. When they don't, the
+    // subscription can still be alive, still watching arti's *own* routine periodic
+    // directory/cert refresh (harmless, and logged as "Attempted to bootstrap twice;
+    // ignoring" -- ordinary Tor client maintenance, not a reconnect), and it keeps forwarding
+    // every one of those refreshes as a fresh `Progress` event indefinitely. Each one used to
+    // call `set_final_status(EngineStatus::Starting(pct))`, permanently regressing a fully
+    // working connection's status back to "Connecting..." -- confirmed on-device via
+    // `nativeGetStatus() == "Starting:100"` while circuits were actively carrying live
+    // traffic. Once On, no further Progress is real news for the user; the connection does
+    // not depend on arti's internal directory-freshness bookkeeping fluctuating.
+    let reached_ready = Arc::new(AtomicBool::new(false));
+
     let callback: BootstrapEventCallback = Arc::new({
         let cb = Arc::clone(&java_callback);
         let failed_flag = Arc::clone(&failed_already_emitted);
         let last_progress = Arc::new(AtomicU8::new(0));
+        let reached_ready = Arc::clone(&reached_ready);
         move |event| {
             // Update status based on event
             match &event {
                 BootstrapEvent::Progress(fraction, _status_text) => {
+                    if reached_ready.load(Ordering::SeqCst) {
+                        return;
+                    }
                     let pct = (fraction.clamp(0.0, 1.0) * 100.0).round() as u8;
                     // Arti reports progress from several concurrent directory/guard tasks.
                     // Their callbacks can arrive out of order (for example 80% handshake,
@@ -392,6 +422,16 @@ async fn engine_async(
         }
 
         if alive.is_empty() {
+            match cold_start_rescue_fetch(&bridge_health, &mut stop_rx).await {
+                ColdStartRescue::Alive(found) => alive = found,
+                ColdStartRescue::StopRequested => {
+                    info!("received stop signal during cold-start rescue fetch");
+                    return Ok(());
+                }
+            }
+        }
+
+        if alive.is_empty() {
             return Err(anyhow::anyhow!(
                 "no reachable bridge responded to a TCP probe within 5s (configured bridges)"
             ));
@@ -484,6 +524,7 @@ async fn engine_async(
     // the bridges the working circuit was built from.
     crate::set_active_bridges(bridge_health.config_path.as_deref(), &settings.bridges);
     set_final_status(EngineStatus::On(actual_addr));
+    reached_ready.store(true, Ordering::SeqCst);
     java_callback.emit(BootstrapEvent::Ready);
     set_current_tunnel(Some(tunnel.clone()));
 
@@ -1023,6 +1064,16 @@ async fn stall_watchdog(
             return;
         }
 
+        // Cheap, unconditional per-tick housekeeping: keep the on-disk DNS fallback
+        // fresh so a future cold start (possibly with DNS fully blocked from the
+        // first moment) has something recent to fall back to, not just whatever
+        // was known the last time this file happened to get written.
+        if let Err(error) =
+            bridge_probe::save_persisted_dns_cache(&dns_cache_path(bridge_health.config_path.as_deref()))
+        {
+            warn!(error = %error, "could not persist DNS fallback cache");
+        }
+
         // Runs before the reachability re-probe below on purpose: that re-probe walks the
         // *entire* configured pool (thousands of bridges) and, on this loop's first tick, is
         // forced regardless of `recheck_interval_mins` -- with webtunnel's up-to-27s-per-bridge
@@ -1468,6 +1519,22 @@ pub(crate) fn persist_and_rank_probe(
     }
 }
 
+/// Path for the on-disk DNS fallback cache, next to the config file --
+/// same sibling-file convention as `active_bridges_path` in `lib.rs`.
+fn dns_cache_path(config_path: Option<&std::path::Path>) -> std::path::PathBuf {
+    match config_path {
+        Some(cfg) => {
+            let dir = cfg.parent().unwrap_or_else(|| std::path::Path::new("."));
+            let stem = cfg
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "tor-socks5".to_string());
+            dir.join(format!("{stem}.dns-cache"))
+        }
+        None => std::path::PathBuf::from("tor-socks5.dns-cache"),
+    }
+}
+
 /// Persist the PT-channel rotation signal without confusing it with an
 /// end-to-end circuit success or a plain TCP probe.
 /// A source must have offered this many bridges before its yield is judged.
@@ -1534,6 +1601,96 @@ fn persist_bridge_sources(
     if let Err(error) = store.save() {
         warn!(error = %error, "could not persist bridge source attribution");
     }
+}
+
+/// Outcome of [`cold_start_rescue_fetch`]: either a (possibly still empty)
+/// set of newly-alive bridges, or an early exit because the caller asked to
+/// stop while the rescue fetch was in flight.
+enum ColdStartRescue {
+    Alive(Vec<(BridgeLine, Duration)>),
+    StopRequested,
+}
+
+/// True cold start: every configured bridge (active slice and, where tried,
+/// the full background pool) failed its TCP probe, and there is no
+/// `TorTunnel` yet to route a normal auto-fetch through — `bridge_fetcher`'s
+/// usual path requires one. Without this, a fresh install (or a health store
+/// wiped by all-dead bridges) can never recover on its own: `auto_fetch`
+/// exists specifically for this, but the watchdog's version of it only runs
+/// after a tunnel is already up.
+///
+/// Fetches the configured collateral-freedom sources directly (no Tor,
+/// hostnames resolved through `bridge-probe`'s DoH pool -- see
+/// `bridge_fetcher::fetch_all_direct`), persists source attribution the same
+/// way the watchdog's own auto-fetch does, records anything found so Kotlin
+/// can persist it into the user's saved bridge list, and re-probes the
+/// result before handing it back. Returns an empty `Alive` set (not an
+/// error) when `auto_fetch` is disabled, no sources are configured, or the
+/// rescue fetch itself turns up nothing reachable -- the caller already
+/// knows how to fail on an empty set.
+async fn cold_start_rescue_fetch(
+    bridge_health: &BridgeHealthContext,
+    stop_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> ColdStartRescue {
+    if !bridge_health.bridges_cfg.auto_fetch || bridge_health.bridges_cfg.sources.is_empty() {
+        return ColdStartRescue::Alive(Vec::new());
+    }
+
+    info!(
+        "no configured bridge is reachable; attempting a direct (non-Tor) fetch of fresh \
+         bridges before giving up"
+    );
+
+    let sources: Vec<bridge_fetcher::Source> = bridge_health
+        .bridges_cfg
+        .sources
+        .iter()
+        .map(|s| bridge_fetcher::Source {
+            label: s.label.clone(),
+            url: s.url.clone(),
+            headers: s.headers.clone(),
+            cookies: s.cookies.clone(),
+        })
+        .collect();
+    let max_body_bytes = bridge_health
+        .bridges_cfg
+        .max_body_mib
+        .saturating_mul(1024 * 1024);
+
+    let (fetched, outcomes) = tokio::select! {
+        biased;
+        _ = stop_rx.changed() => return ColdStartRescue::StopRequested,
+        result = bridge_fetcher::fetch_all_direct(&sources, bridge_health.resolver_policy, AUTO_FETCH_TIMEOUT, max_body_bytes) => result,
+    };
+    for outcome in &outcomes {
+        if let Some(err) = &outcome.error {
+            warn!(label = %outcome.label, error = %err, "cold-start rescue fetch source failed");
+        } else {
+            info!(
+                label = %outcome.label,
+                bridges = outcome.bridges_extracted,
+                "cold-start rescue fetch source OK"
+            );
+        }
+    }
+    persist_bridge_sources(&outcomes, bridge_health);
+    let (unique, duplicates) = bridge_fetcher::dedup_bridges(fetched);
+    info!(
+        unique = unique.len(),
+        duplicates, "cold-start rescue fetch complete"
+    );
+    if unique.is_empty() {
+        return ColdStartRescue::Alive(Vec::new());
+    }
+    record_auto_fetched_bridges(unique.clone());
+
+    let mut round = tokio::select! {
+        biased;
+        _ = stop_rx.changed() => return ColdStartRescue::StopRequested,
+        round = bridge_probe::probe_round_with_policy(unique.clone(), Duration::from_secs(5), bridge_health.resolver_policy) => round,
+    };
+    persist_and_rank_probe(&unique, &mut round, bridge_health);
+    ColdStartRescue::Alive(std::mem::take(&mut round.alive))
 }
 
 fn persist_warm_results(pool: &WarmPool, bridge_health: &BridgeHealthContext) {
