@@ -4,9 +4,12 @@ use std::time::Duration;
 
 use arti_wrapper::TorTunnel;
 use bridge_line::BridgeLine;
+use bridge_probe::ResolverPolicy;
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::http::fetch_one;
+use crate::error::FetchError;
+use crate::http::{fetch_one, fetch_one_direct};
 use crate::parse::parse_bridges_from_body;
 
 /// An HTTPS endpoint from which bridge lines can be fetched. `headers` and
@@ -72,6 +75,43 @@ pub async fn fetch_all(
         }));
     }
 
+    collect_fetch_results(handles).await
+}
+
+/// Cold-start rescue fetch: same fan-out and collection as [`fetch_all`], but
+/// every source is fetched directly (no Tor, hostnames resolved through
+/// `bridge-probe`'s DoH pool) instead of over a `TorTunnel`. Only meant for
+/// the narrow case where zero bridges are reachable yet -- see
+/// [`crate::http::fetch_one_direct`].
+///
+/// cancel-safe: NO — same reason as `fetch_all`.
+pub async fn fetch_all_direct(
+    sources: &[Source],
+    resolver_policy: ResolverPolicy,
+    timeout: Duration,
+    max_body_bytes: usize,
+) -> (Vec<BridgeLine>, Vec<FetchOutcome>) {
+    let mut handles = Vec::with_capacity(sources.len());
+
+    for source in sources {
+        let url = source.url.clone();
+        let label = source.label.clone();
+        let headers = source.headers.clone();
+        let cookies = source.cookies.clone();
+        handles.push(tokio::spawn(async move {
+            let result =
+                fetch_one_direct(resolver_policy, &url, timeout, max_body_bytes, &headers, &cookies)
+                    .await;
+            (label, result)
+        }));
+    }
+
+    collect_fetch_results(handles).await
+}
+
+async fn collect_fetch_results(
+    handles: Vec<JoinHandle<(String, Result<String, FetchError>)>>,
+) -> (Vec<BridgeLine>, Vec<FetchOutcome>) {
     let mut all_bridges = Vec::new();
     let mut outcomes = Vec::new();
 

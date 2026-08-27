@@ -2,16 +2,58 @@
 //! config, and the single-URL fetch (with redirect following and bounded
 //! body reads).
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arti_wrapper::TorTunnel;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use bridge_probe::ResolverPolicy;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tracing::debug;
 
+use crate::direct::connect_direct;
 use crate::error::FetchError;
 use crate::url_parse::parse_https_url;
+
+/// A connected-but-not-yet-TLS-wrapped byte stream, boxed so the redirect
+/// loop below does not need to be generic over which connection strategy
+/// produced it.
+type BoxedIo = Pin<Box<dyn AsyncStream>>;
+
+trait AsyncStream: AsyncRead + AsyncWrite + Send {}
+impl<T: AsyncRead + AsyncWrite + Send> AsyncStream for T {}
+
+/// How to establish the raw connection for one hop. A redirect can point at
+/// a different host, so this is re-invoked per hop rather than once per
+/// fetch.
+enum Connector<'a> {
+    /// Route through an already-bootstrapped Tor circuit -- the normal path,
+    /// used once at least one bridge is up.
+    Tor(&'a TorTunnel),
+    /// Resolve and connect directly, bypassing Tor entirely. Only used for
+    /// the cold-start rescue fetch (see `fetch_one_direct`), when zero
+    /// bridges are reachable and there is no tunnel to route through yet.
+    Direct(ResolverPolicy),
+}
+
+impl Connector<'_> {
+    async fn connect(&self, host: &str, port: u16) -> Result<BoxedIo, FetchError> {
+        match self {
+            Connector::Tor(tor) => {
+                let stream = tor
+                    .connect(host, port)
+                    .await
+                    .map_err(|e| FetchError::TorConnect(e.to_string()))?;
+                Ok(Box::pin(stream.compat()))
+            }
+            Connector::Direct(policy) => {
+                let stream = connect_direct(host, port, *policy).await?;
+                Ok(Box::pin(stream))
+            }
+        }
+    }
+}
 
 pub(crate) const MAX_REDIRECTS: usize = 3;
 const READ_BUF_SIZE: usize = 8192;
@@ -123,14 +165,50 @@ pub async fn fetch_one(
 ) -> Result<String, FetchError> {
     tokio::time::timeout(
         timeout,
-        fetch_one_inner(tor, url, tls_config(), max_body_bytes, headers, cookies),
+        fetch_one_inner(
+            &Connector::Tor(tor),
+            url,
+            tls_config(),
+            max_body_bytes,
+            headers,
+            cookies,
+        ),
+    )
+    .await
+    .map_err(|_| FetchError::Timeout(timeout))?
+}
+
+/// Cold-start rescue fetch: same as [`fetch_one`], but bypasses Tor entirely
+/// (direct TCP, hostnames resolved via `bridge-probe`'s DoH pool). Only
+/// meant for the narrow case where zero bridges are reachable yet and there
+/// is no tunnel to route [`fetch_one`] through.
+///
+/// cancel-safe: NO — same reason as `fetch_one`.
+pub async fn fetch_one_direct(
+    resolver_policy: ResolverPolicy,
+    url: &str,
+    timeout: Duration,
+    max_body_bytes: usize,
+    headers: &[String],
+    cookies: &[String],
+) -> Result<String, FetchError> {
+    tokio::time::timeout(
+        timeout,
+        fetch_one_inner(
+            &Connector::Direct(resolver_policy),
+            url,
+            tls_config(),
+            max_body_bytes,
+            headers,
+            cookies,
+        ),
     )
     .await
     .map_err(|_| FetchError::Timeout(timeout))?
 }
 
 async fn fetch_one_inner(
-    tor: &TorTunnel,
+    connector: &Connector<'_>,
     url: &str,
     tls_cfg: Arc<rustls::ClientConfig>,
     max_body_bytes: usize,
@@ -150,22 +228,17 @@ async fn fetch_one_inner(
             port = target.port,
             path = %target.path_and_query,
             hop,
-            "fetching via Tor"
+            "fetching"
         );
 
-        let data_stream = tor
-            .connect(&target.host, target.port)
-            .await
-            .map_err(|e| FetchError::TorConnect(e.to_string()))?;
-
-        let compat = data_stream.compat();
+        let raw = connector.connect(&target.host, target.port).await?;
 
         let server_name = rustls::pki_types::ServerName::try_from(target.host.clone())
             .map_err(|e| FetchError::Tls(format!("invalid SNI: {e}")))?;
 
-        let connector = tokio_rustls::TlsConnector::from(tls_cfg.clone());
-        let mut tls = connector
-            .connect(server_name, compat)
+        let tls_connector = tokio_rustls::TlsConnector::from(tls_cfg.clone());
+        let mut tls = tls_connector
+            .connect(server_name, raw)
             .await
             .map_err(|e| FetchError::Tls(e.to_string()))?;
 

@@ -12,6 +12,8 @@ pub enum FetchError {
     InvalidUrl(String),
     #[error("tor connection failed: {0}")]
     TorConnect(String),
+    #[error("direct (non-Tor) resolve/connect failed: {0}")]
+    Resolve(String),
     #[error("tls handshake failed: {0}")]
     Tls(String),
     #[error("http error: {0}")]
