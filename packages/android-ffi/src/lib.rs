@@ -1313,7 +1313,10 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
     bridge_lines: JString,
 ) -> jstring {
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
-        let lines_str: String = env.get_string(&bridge_lines).map(|s| s.into()).unwrap_or_default();
+        let lines_str: String = env
+            .get_string(&bridge_lines)
+            .map(|s| s.into())
+            .unwrap_or_default();
         env.new_string(dns_hints_for_lines(&lines_str))
             .map(|s| s.into_raw())
             .map_err(|e| {
@@ -1368,7 +1371,8 @@ mod tests {
     #[test]
     fn dns_hints_for_lines_is_empty_for_ip_only_bridges() {
         // obfs4 without a hostname target has nothing worth hinting at.
-        let lines = "obfs4 192.0.2.1:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA iat-mode=0";
+        let lines =
+            "obfs4 192.0.2.1:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA iat-mode=0";
         assert_eq!(dns_hints_for_lines(lines), "");
     }
 
@@ -1384,10 +1388,14 @@ mod tests {
             addrs: vec!["203.0.113.77".parse().unwrap()],
             resolved_at_unix: now,
         }]);
-        let lines =
-            format!("webtunnel 192.0.2.3:1 0123456789ABCDEF0123456789ABCDEF01234567 url=https://{host}/x");
+        let lines = format!(
+            "webtunnel 192.0.2.3:1 0123456789ABCDEF0123456789ABCDEF01234567 url=https://{host}/x"
+        );
         let result = dns_hints_for_lines(&lines);
-        assert!(result.starts_with(bridge_probe::DNS_HINT_PREFIX), "got: {result:?}");
+        assert!(
+            result.starts_with(bridge_probe::DNS_HINT_PREFIX),
+            "got: {result:?}"
+        );
         let parsed = bridge_probe::parse_dns_hint_line(&result).expect("must parse back");
         assert_eq!(parsed.host, host);
     }

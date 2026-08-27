@@ -615,8 +615,10 @@ impl BridgesConfig {
         // compromise. Without this check, the same channel could poison the
         // cache for an unrelated hostname (e.g. this app's own
         // collateral-freedom bridge-list sources).
-        let known_hosts: HashSet<String> =
-            bridges.iter().filter_map(bridge_probe::dns_hostname_of).collect();
+        let known_hosts: HashSet<String> = bridges
+            .iter()
+            .filter_map(bridge_probe::dns_hostname_of)
+            .collect();
         let dns_hints: Vec<bridge_probe::DnsHint> = hint_lines
             .iter()
             .filter_map(|line| bridge_probe::parse_dns_hint_line(line))
@@ -932,7 +934,9 @@ log.targets.other: warn
             sources: Vec::new(),
             ..Default::default()
         };
-        let parsed = cfg.parsed().expect("hint lines must not be treated as invalid bridges");
+        let parsed = cfg
+            .parsed()
+            .expect("hint lines must not be treated as invalid bridges");
         assert_eq!(parsed.bridges.len(), 1);
         assert_eq!(parsed.dns_hints.len(), 1);
         assert_eq!(parsed.dns_hints[0].host, "fronting.example.test");

@@ -24,6 +24,8 @@ mod url_parse;
 pub use dedup::dedup_bridges;
 pub use error::FetchError;
 pub use fetch::{fetch_all, fetch_all_direct, FetchOutcome, Source};
-pub use http::{build_get_request, fetch_one, fetch_one_direct, parse_response_headers, HttpResponse};
+pub use http::{
+    build_get_request, fetch_one, fetch_one_direct, parse_response_headers, HttpResponse,
+};
 pub use parse::parse_bridges_from_body;
 pub use url_parse::{parse_https_url, UrlTarget};

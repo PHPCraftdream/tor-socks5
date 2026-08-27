@@ -1068,9 +1068,9 @@ async fn stall_watchdog(
         // fresh so a future cold start (possibly with DNS fully blocked from the
         // first moment) has something recent to fall back to, not just whatever
         // was known the last time this file happened to get written.
-        if let Err(error) =
-            bridge_probe::save_persisted_dns_cache(&dns_cache_path(bridge_health.config_path.as_deref()))
-        {
+        if let Err(error) = bridge_probe::save_persisted_dns_cache(&dns_cache_path(
+            bridge_health.config_path.as_deref(),
+        )) {
             warn!(error = %error, "could not persist DNS fallback cache");
         }
 

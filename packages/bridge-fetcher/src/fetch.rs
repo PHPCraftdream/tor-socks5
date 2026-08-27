@@ -99,9 +99,15 @@ pub async fn fetch_all_direct(
         let headers = source.headers.clone();
         let cookies = source.cookies.clone();
         handles.push(tokio::spawn(async move {
-            let result =
-                fetch_one_direct(resolver_policy, &url, timeout, max_body_bytes, &headers, &cookies)
-                    .await;
+            let result = fetch_one_direct(
+                resolver_policy,
+                &url,
+                timeout,
+                max_body_bytes,
+                &headers,
+                &cookies,
+            )
+            .await;
             (label, result)
         }));
     }

@@ -363,7 +363,13 @@ fn parse_persisted_line(line: &str) -> Option<(String, PersistedAnswer)> {
     if addrs.is_empty() {
         return None;
     }
-    Some((host, PersistedAnswer { addrs, resolved_at_unix }))
+    Some((
+        host,
+        PersistedAnswer {
+            addrs,
+            resolved_at_unix,
+        },
+    ))
 }
 
 /// Insert `entry` for `host` unless the store already holds a strictly newer
@@ -372,7 +378,9 @@ fn parse_persisted_line(line: &str) -> Option<(String, PersistedAnswer)> {
 /// in any order without either clobbering a more recent answer the other
 /// already knows about.
 fn merge_disk_fallback_entry(host: String, entry: PersistedAnswer) {
-    let mut store = disk_fallback_store().lock().unwrap_or_else(|p| p.into_inner());
+    let mut store = disk_fallback_store()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let keep_existing = store
         .get(&host)
         .is_some_and(|existing| existing.resolved_at_unix >= entry.resolved_at_unix);
@@ -436,7 +444,9 @@ pub fn save_persisted_dns_cache(path: &std::path::Path) -> std::io::Result<()> {
 /// [`DNS_STALE_FALLBACK_WINDOW`] bound, measured from when the entry was
 /// persisted rather than from an in-memory TTL expiry.
 fn disk_fallback_answer(host: &str) -> Option<Vec<IpAddr>> {
-    let store = disk_fallback_store().lock().unwrap_or_else(|p| p.into_inner());
+    let store = disk_fallback_store()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let entry = store.get(host)?;
     let age = now_unix().saturating_sub(entry.resolved_at_unix);
     if age > DNS_STALE_FALLBACK_WINDOW.as_secs() {
@@ -476,7 +486,10 @@ pub fn format_dns_hint_line(hint: &DnsHint) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    format!("{DNS_HINT_PREFIX}{} {addrs} {}", hint.host, hint.resolved_at_unix)
+    format!(
+        "{DNS_HINT_PREFIX}{} {addrs} {}",
+        hint.host, hint.resolved_at_unix
+    )
 }
 
 /// Parse one directive line produced by [`format_dns_hint_line`]. `None` for
@@ -544,7 +557,9 @@ pub fn best_known_answer(host: &str) -> Option<DnsHint> {
             }
         }
     }
-    let store = disk_fallback_store().lock().unwrap_or_else(|p| p.into_inner());
+    let store = disk_fallback_store()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let entry = store.get(host)?;
     let age = now_unix().saturating_sub(entry.resolved_at_unix);
     if age > DNS_STALE_FALLBACK_WINDOW.as_secs() {
@@ -1453,7 +1468,11 @@ mod tests {
         // the stale path -- `resolve_addrs` only calls the latter after a
         // live DoH round has already failed.
         let host = "cache-fresh-not-stale.test.invalid";
-        remember_doh_answer(host, &["203.0.113.22".parse().unwrap()], Duration::from_secs(300));
+        remember_doh_answer(
+            host,
+            &["203.0.113.22".parse().unwrap()],
+            Duration::from_secs(300),
+        );
         assert!(stale_fallback_answer(host).is_none());
         forget_dns_answer(host);
     }
@@ -1474,7 +1493,10 @@ mod tests {
     #[test]
     fn persisted_line_round_trips() {
         let entry = PersistedAnswer {
-            addrs: vec!["203.0.113.30".parse().unwrap(), "203.0.113.31".parse().unwrap()],
+            addrs: vec![
+                "203.0.113.30".parse().unwrap(),
+                "203.0.113.31".parse().unwrap(),
+            ],
             resolved_at_unix: 1_700_000_000,
         };
         let line = format_persisted_line("example.test.invalid", &entry);
@@ -1536,7 +1558,10 @@ mod tests {
     fn dns_hint_line_round_trips() {
         let hint = DnsHint {
             host: "bridge.example.test".to_owned(),
-            addrs: vec!["198.51.100.5".parse().unwrap(), "198.51.100.6".parse().unwrap()],
+            addrs: vec![
+                "198.51.100.5".parse().unwrap(),
+                "198.51.100.6".parse().unwrap(),
+            ],
             resolved_at_unix: 1_700_000_500,
         };
         let line = format_dns_hint_line(&hint);
@@ -1640,7 +1665,12 @@ mod tests {
             resolved_at_unix: 1_000_000_000,
         }]);
         assert_eq!(
-            disk_fallback_store().lock().unwrap().get(host).unwrap().addrs,
+            disk_fallback_store()
+                .lock()
+                .unwrap()
+                .get(host)
+                .unwrap()
+                .addrs,
             vec![newer]
         );
     }
