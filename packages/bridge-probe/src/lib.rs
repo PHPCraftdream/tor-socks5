@@ -50,6 +50,11 @@ const DOH_PROVIDERS: &[(&str, &str, &str)] = &[
     // Cloudflare (two anycast addresses, unfiltered).
     ("1.1.1.1", "cloudflare-dns.com", "/dns-query"),
     ("1.0.0.1", "cloudflare-dns.com", "/dns-query"),
+    // Google Public DNS -- one of the most heavily anycast-routed, hardest-to-block
+    // IP pairs in existence; blocking it costs the censor collateral damage far
+    // beyond DNS circumvention. Notably absent before: adding it is one line.
+    ("8.8.8.8", "dns.google", "/dns-query"),
+    ("8.8.4.4", "dns.google", "/dns-query"),
     // Quad9 secure and no-threat-blocking variants.
     ("9.9.9.9", "dns.quad9.net", "/dns-query"),
     ("149.112.112.112", "dns.quad9.net", "/dns-query"),
@@ -160,6 +165,17 @@ const DNS_NEGATIVE_TTL: Duration = Duration::from_secs(120);
 /// session.
 const DNS_CACHE_CAP: usize = 2048;
 
+/// How long an expired (but not overwritten) positive answer stays eligible
+/// as a last-resort fallback once every DoH provider is unreachable.
+///
+/// Far longer than [`DNS_MAX_TTL`] on purpose: a fully unreachable resolver
+/// pool is evidence about the *network*, not about whether the bridge moved.
+/// A self-hosted webtunnel bridge is far more likely to still be listening at
+/// the same address after a few hours of DoH being down than to have both
+/// moved AND had DoH recover in that same window. Never served in place of a
+/// fresh lookup -- see [`stale_fallback_answer`].
+const DNS_STALE_FALLBACK_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Cache of DoH resolutions, positive and negative.
 ///
 /// A bridge list routinely points many bridge lines at a handful of fronting
@@ -180,10 +196,12 @@ enum CacheHit {
 }
 
 fn cached_doh_answer(host: &str) -> Option<CacheHit> {
-    let mut cache = doh_cache().lock().unwrap_or_else(|p| p.into_inner());
+    let cache = doh_cache().lock().unwrap_or_else(|p| p.into_inner());
     let entry = cache.get(host)?;
+    // Expired entries are no longer served here -- but are deliberately not
+    // deleted either; they stay put for `stale_fallback_answer` until the
+    // fallback window itself elapses (see `store_cached`'s retain criterion).
     if entry.expires_at <= Instant::now() {
-        cache.remove(host);
         return None;
     }
     if entry.addrs.is_empty() {
@@ -191,6 +209,31 @@ fn cached_doh_answer(host: &str) -> Option<CacheHit> {
     } else {
         Some(CacheHit::Addrs(entry.addrs.clone()))
     }
+}
+
+/// Last-resort answer for `host` when every DoH provider in this round's
+/// wave(s) has failed: an expired-but-not-yet-stale-expired positive answer,
+/// if one exists.
+///
+/// Never a substitute for a fresh lookup -- callers must attempt DoH first
+/// (see `resolve_addrs`) and only reach for this once every provider failed.
+/// Deliberately does not touch the cache: leaving the entry as-is lets it
+/// keep serving as a fallback on a later attempt too, rather than being
+/// clobbered by a negative marker the moment DoH has one bad round.
+fn stale_fallback_answer(host: &str) -> Option<Vec<IpAddr>> {
+    let cache = doh_cache().lock().unwrap_or_else(|p| p.into_inner());
+    let entry = cache.get(host)?;
+    if entry.addrs.is_empty() {
+        return None; // a remembered failure has nothing to fall back to
+    }
+    let now = Instant::now();
+    if entry.expires_at > now {
+        return None; // still fresh -- cached_doh_answer already serves this
+    }
+    if now.duration_since(entry.expires_at) > DNS_STALE_FALLBACK_WINDOW {
+        return None; // too old to trust
+    }
+    Some(entry.addrs.clone())
 }
 
 fn remember_doh_answer(host: &str, ips: &[IpAddr], valid_for: Duration) {
@@ -232,10 +275,13 @@ fn store_cached(host: &str, answer: CachedAnswer) {
     let mut cache = doh_cache().lock().unwrap_or_else(|p| p.into_inner());
     if cache.len() >= DNS_CACHE_CAP {
         let now = Instant::now();
-        cache.retain(|_, entry| entry.expires_at > now);
+        // Sweep by the fallback window, not the TTL itself -- an expired-but-
+        // still-fallback-eligible entry must survive cap pressure, or
+        // `stale_fallback_answer` loses exactly the answers it exists for.
+        cache.retain(|_, entry| entry.expires_at + DNS_STALE_FALLBACK_WINDOW > now);
         if cache.len() >= DNS_CACHE_CAP {
-            // Still full of live entries: shed the ones closest to expiring,
-            // which have the least left to give.
+            // Still full: shed the ones closest to falling out of the
+            // fallback window, which have the least left to give.
             let mut by_expiry: Vec<(String, Instant)> = cache
                 .iter()
                 .map(|(host, entry)| (host.clone(), entry.expires_at))
@@ -266,6 +312,268 @@ pub fn flush_dns_cache() {
         slot.store(0, AtomicOrdering::Relaxed);
     }
     tracing::debug!("DNS cache and DoH provider scores cleared");
+}
+
+/// Wall-clock-anchored answer for the on-disk last-known-good store.
+/// `Instant` cannot survive a process restart (no fixed epoch); this uses
+/// Unix time instead. Only ever consulted as an absolute last resort (see
+/// [`disk_fallback_answer`]) -- below both a fresh DoH lookup and the
+/// in-memory [`stale_fallback_answer`], never a substitute for either.
+struct PersistedAnswer {
+    addrs: Vec<IpAddr>,
+    resolved_at_unix: u64,
+}
+
+fn disk_fallback_store() -> &'static std::sync::Mutex<HashMap<String, PersistedAnswer>> {
+    static STORE: OnceLock<std::sync::Mutex<HashMap<String, PersistedAnswer>>> = OnceLock::new();
+    STORE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// One line per host: `host\tip1,ip2,...\tresolved_at_unix`. Plain text,
+/// matching this codebase's other file-based persistence (e.g. the
+/// active-bridges file) rather than pulling in a serialization dependency
+/// for a handful of fields.
+fn format_persisted_line(host: &str, entry: &PersistedAnswer) -> String {
+    let addrs = entry
+        .addrs
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{host}\t{addrs}\t{}", entry.resolved_at_unix)
+}
+
+fn parse_persisted_line(line: &str) -> Option<(String, PersistedAnswer)> {
+    let mut parts = line.splitn(3, '\t');
+    let host = parts.next()?.to_owned();
+    let addrs: Vec<IpAddr> = parts
+        .next()?
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    let resolved_at_unix: u64 = parts.next()?.trim().parse().ok()?;
+    if addrs.is_empty() {
+        return None;
+    }
+    Some((host, PersistedAnswer { addrs, resolved_at_unix }))
+}
+
+/// Insert `entry` for `host` unless the store already holds a strictly newer
+/// one. Shared by every writer of `disk_fallback_store` (the on-disk loader
+/// and imported [`DnsHint`]s via [`seed_disk_fallback`]) so the two can race
+/// in any order without either clobbering a more recent answer the other
+/// already knows about.
+fn merge_disk_fallback_entry(host: String, entry: PersistedAnswer) {
+    let mut store = disk_fallback_store().lock().unwrap_or_else(|p| p.into_inner());
+    let keep_existing = store
+        .get(&host)
+        .is_some_and(|existing| existing.resolved_at_unix >= entry.resolved_at_unix);
+    if !keep_existing {
+        store.insert(host, entry);
+    }
+}
+
+/// Load the on-disk last-known-good DNS answers from a previous run into
+/// memory, for [`disk_fallback_answer`] to serve once every DoH provider and
+/// the in-memory stale fallback have both failed.
+///
+/// Call once at engine start. Deliberately independent of
+/// [`flush_dns_cache`]'s wipe of the *live* cache: this store only ever acts
+/// as an absolute last resort (see the age check in
+/// [`disk_fallback_answer`]), so carrying it across a network change cannot
+/// shadow a fresh answer -- it can only provide one where a cold start would
+/// otherwise have none at all. Silently does nothing if the file is missing
+/// or unreadable: a first run, or one with nothing worth persisting yet.
+pub fn load_persisted_dns_cache(path: &std::path::Path) {
+    let Ok(data) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let mut loaded = 0usize;
+    for line in data.lines() {
+        if let Some((host, entry)) = parse_persisted_line(line) {
+            merge_disk_fallback_entry(host, entry);
+            loaded += 1;
+        }
+    }
+    tracing::debug!(loaded, path = %path.display(), "loaded persisted DNS fallback cache");
+}
+
+/// Persist every positive DNS answer currently in memory (fresh or still
+/// within the stale-fallback window) to `path`, so a future cold start has
+/// something to fall back to even before that run has resolved anything
+/// itself. Call periodically (e.g. from the watchdog loop), not per-lookup.
+pub fn save_persisted_dns_cache(path: &std::path::Path) -> std::io::Result<()> {
+    let now = now_unix();
+    let lines: Vec<String> = {
+        let cache = doh_cache().lock().unwrap_or_else(|p| p.into_inner());
+        cache
+            .iter()
+            .filter(|(_, entry)| !entry.addrs.is_empty())
+            .map(|(host, entry)| {
+                format_persisted_line(
+                    host,
+                    &PersistedAnswer {
+                        addrs: entry.addrs.clone(),
+                        resolved_at_unix: now,
+                    },
+                )
+            })
+            .collect()
+    };
+    std::fs::write(path, lines.join("\n"))
+}
+
+/// Last-resort answer for `host` sourced from a previous run, once every DoH
+/// provider AND the in-memory [`stale_fallback_answer`] have failed. Same
+/// [`DNS_STALE_FALLBACK_WINDOW`] bound, measured from when the entry was
+/// persisted rather than from an in-memory TTL expiry.
+fn disk_fallback_answer(host: &str) -> Option<Vec<IpAddr>> {
+    let store = disk_fallback_store().lock().unwrap_or_else(|p| p.into_inner());
+    let entry = store.get(host)?;
+    let age = now_unix().saturating_sub(entry.resolved_at_unix);
+    if age > DNS_STALE_FALLBACK_WINDOW.as_secs() {
+        return None;
+    }
+    Some(entry.addrs.clone())
+}
+
+/// A portable DNS resolution, shareable across devices and processes.
+///
+/// Shareability is the whole point of this type existing separately from the
+/// internal [`CachedAnswer`]/[`PersistedAnswer`] representations: an answer
+/// only belongs here if the (host, addrs) pairing is a fact about the
+/// Internet, not a fact about the network the resolving device happened to
+/// be on. A CDN-fronted hostname's resolved IP is viewpoint-dependent and
+/// must never become a `DnsHint` -- see [`best_known_answer`], the only
+/// constructor, for where that line is actually drawn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsHint {
+    pub host: String,
+    pub addrs: Vec<IpAddr>,
+    pub resolved_at_unix: u64,
+}
+
+/// Prefix marking a DNS-hint directive line among otherwise plain bridge
+/// lines (see `proxy-config::BridgesConfig::parsed`, which must recognise
+/// and divert these before attempting to parse a line as a `BridgeLine`).
+/// Chosen to look like an ordinary comment to anything that does not know
+/// about it, and to be unambiguous with any real bridge-line syntax.
+pub const DNS_HINT_PREFIX: &str = "# xorbot:dns ";
+
+/// Render one hint as `"{DNS_HINT_PREFIX}{host} {ip1,ip2,...} {resolved_at_unix}"`.
+pub fn format_dns_hint_line(hint: &DnsHint) -> String {
+    let addrs = hint
+        .addrs
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{DNS_HINT_PREFIX}{} {addrs} {}", hint.host, hint.resolved_at_unix)
+}
+
+/// Parse one directive line produced by [`format_dns_hint_line`]. `None` for
+/// anything that is not a well-formed hint line, including a plain bridge
+/// line or an unrelated comment -- callers should treat that the same as
+/// "not a hint", never as an error.
+pub fn parse_dns_hint_line(line: &str) -> Option<DnsHint> {
+    let rest = line.strip_prefix(DNS_HINT_PREFIX)?;
+    let mut parts = rest.split_whitespace();
+    let host = parts.next()?.to_owned();
+    let addrs: Vec<IpAddr> = parts
+        .next()?
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    let resolved_at_unix: u64 = parts.next()?.parse().ok()?;
+    if addrs.is_empty() {
+        return None;
+    }
+    Some(DnsHint {
+        host,
+        addrs,
+        resolved_at_unix,
+    })
+}
+
+/// The hostname `bridge` needs resolved, if any.
+///
+/// `None` when the bridge's own target is already a literal IP (obfs4 and
+/// plain bridges: the address in the bridge line itself; a webtunnel bridge
+/// pinned via `addr=`) -- there is nothing to hint at for those. `Some` only
+/// for a webtunnel bridge whose target comes from a `url=` hostname, the one
+/// case that actually costs a DNS lookup.
+pub fn dns_hostname_of(bridge: &BridgeLine) -> Option<String> {
+    let (host, _port) = resolve_probe_target(bridge).ok()?;
+    if host.parse::<IpAddr>().is_ok() {
+        return None;
+    }
+    Some(host)
+}
+
+/// The best answer currently known for `host`, wall-clock-stamped, from
+/// whichever tier has one: the live cache (fresh, or stale-but-inside the
+/// fallback window) first, then the on-disk store from a previous run.
+/// Read-only -- never attempts a network resolution. This is the query side
+/// of exporting [`DnsHint`]s (see `dns_hostname_of` for picking which
+/// bridges are worth asking about); resolving a hostname to serve live
+/// traffic goes through [`resolve_addrs`] instead.
+pub fn best_known_answer(host: &str) -> Option<DnsHint> {
+    {
+        let cache = doh_cache().lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(entry) = cache.get(host) {
+            if !entry.addrs.is_empty() {
+                let now = Instant::now();
+                let fresh_or_recent = entry.expires_at > now
+                    || now.duration_since(entry.expires_at) <= DNS_STALE_FALLBACK_WINDOW;
+                if fresh_or_recent {
+                    return Some(DnsHint {
+                        host: host.to_owned(),
+                        addrs: entry.addrs.clone(),
+                        resolved_at_unix: now_unix(),
+                    });
+                }
+            }
+        }
+    }
+    let store = disk_fallback_store().lock().unwrap_or_else(|p| p.into_inner());
+    let entry = store.get(host)?;
+    let age = now_unix().saturating_sub(entry.resolved_at_unix);
+    if age > DNS_STALE_FALLBACK_WINDOW.as_secs() {
+        return None;
+    }
+    Some(DnsHint {
+        host: host.to_owned(),
+        addrs: entry.addrs.clone(),
+        resolved_at_unix: entry.resolved_at_unix,
+    })
+}
+
+/// Merge imported [`DnsHint`]s into the on-disk fallback store, so an
+/// imported bridge (typically from a QR code, see
+/// `proxy-config::BridgesConfig::parsed`'s scope check on the caller side)
+/// can skip DNS entirely on a device whose network cannot resolve it.
+///
+/// Last-write-wins by `resolved_at_unix` via the same merge as
+/// [`load_persisted_dns_cache`] -- call order between the two never matters.
+pub fn seed_disk_fallback(hints: &[DnsHint]) {
+    for hint in hints {
+        merge_disk_fallback_entry(
+            hint.host.clone(),
+            PersistedAnswer {
+                addrs: hint.addrs.clone(),
+                resolved_at_unix: hint.resolved_at_unix,
+            },
+        );
+    }
 }
 
 /// Running tally per provider: `+1` when it answers, `-1` when it does not.
@@ -747,7 +1055,12 @@ async fn race_doh_wave(wave: &[usize], query: &str) -> Option<(Vec<IpAddr>, Dura
 }
 
 /// Resolve a `(host, port)` pair to the addresses worth trying, best first.
-async fn resolve_addrs(
+///
+/// Public so other crates that need to resolve a hostname without going
+/// through the OS resolver (e.g. `bridge-fetcher`'s direct, non-Tor fetch
+/// path for a cold start with zero live bridges) can reuse this crate's DoH
+/// pool instead of duplicating it.
+pub async fn resolve_addrs(
     host: &str,
     port: u16,
     resolver_policy: ResolverPolicy,
@@ -774,6 +1087,23 @@ async fn resolve_addrs(
                         return Ok(order_candidates(&ips, port));
                     }
                     None => {
+                        if let Some(stale) = stale_fallback_answer(query) {
+                            tracing::warn!(
+                                host = %query,
+                                addrs = stale.len(),
+                                "all DoH providers failed; falling back to a stale cached answer"
+                            );
+                            return Ok(order_candidates(&stale, port));
+                        }
+                        if let Some(persisted) = disk_fallback_answer(query) {
+                            tracing::warn!(
+                                host = %query,
+                                addrs = persisted.len(),
+                                "all DoH providers failed and no in-memory answer remains; \
+                                 falling back to a previous run's persisted answer"
+                            );
+                            return Ok(order_candidates(&persisted, port));
+                        }
                         remember_doh_failure(query);
                         tracing::warn!(host = %query, "all DoH providers failed");
                     }
@@ -1066,7 +1396,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_answer_is_not_served() {
+    fn expired_answer_is_not_served_by_the_normal_path() {
         let host = "cache-stale.test.invalid";
         // Straight into the map with an expiry already in the past — the
         // public helper clamps TTLs upwards, so it cannot express this.
@@ -1078,9 +1408,240 @@ mod tests {
             },
         );
         assert!(cached_doh_answer(host).is_none());
+        // Deliberately NOT dropped: an expired-but-recent positive answer
+        // must survive for `stale_fallback_answer` to serve as a last
+        // resort when every DoH provider is unreachable.
         assert!(
-            !doh_cache().lock().unwrap().contains_key(host),
-            "reading an expired entry should also drop it"
+            doh_cache().lock().unwrap().contains_key(host),
+            "an expired positive answer must stay available for the stale fallback"
+        );
+        forget_dns_answer(host);
+    }
+
+    #[test]
+    fn stale_fallback_serves_a_recently_expired_positive_answer() {
+        let host = "cache-stale-fallback.test.invalid";
+        let ip: IpAddr = "203.0.113.20".parse().unwrap();
+        store_cached(
+            host,
+            CachedAnswer {
+                addrs: vec![ip],
+                expires_at: Instant::now() - Duration::from_secs(60),
+            },
+        );
+        assert_eq!(stale_fallback_answer(host), Some(vec![ip]));
+        forget_dns_answer(host);
+    }
+
+    #[test]
+    fn stale_fallback_refuses_an_answer_past_the_fallback_window() {
+        let host = "cache-too-stale.test.invalid";
+        store_cached(
+            host,
+            CachedAnswer {
+                addrs: vec!["203.0.113.21".parse().unwrap()],
+                expires_at: Instant::now() - DNS_STALE_FALLBACK_WINDOW - Duration::from_secs(1),
+            },
+        );
+        assert!(stale_fallback_answer(host).is_none());
+        forget_dns_answer(host);
+    }
+
+    #[test]
+    fn stale_fallback_refuses_a_fresh_answer() {
+        // A still-valid entry must be served by `cached_doh_answer`, not by
+        // the stale path -- `resolve_addrs` only calls the latter after a
+        // live DoH round has already failed.
+        let host = "cache-fresh-not-stale.test.invalid";
+        remember_doh_answer(host, &["203.0.113.22".parse().unwrap()], Duration::from_secs(300));
+        assert!(stale_fallback_answer(host).is_none());
+        forget_dns_answer(host);
+    }
+
+    #[test]
+    fn stale_fallback_refuses_a_remembered_failure() {
+        let host = "cache-negative-not-stale.test.invalid";
+        remember_doh_failure(host);
+        // Force it into the past so it would otherwise look "expired".
+        {
+            let mut cache = doh_cache().lock().unwrap();
+            cache.get_mut(host).unwrap().expires_at = Instant::now() - Duration::from_secs(1);
+        }
+        assert!(stale_fallback_answer(host).is_none());
+        forget_dns_answer(host);
+    }
+
+    #[test]
+    fn persisted_line_round_trips() {
+        let entry = PersistedAnswer {
+            addrs: vec!["203.0.113.30".parse().unwrap(), "203.0.113.31".parse().unwrap()],
+            resolved_at_unix: 1_700_000_000,
+        };
+        let line = format_persisted_line("example.test.invalid", &entry);
+        let (host, parsed) = parse_persisted_line(&line).expect("line must parse back");
+        assert_eq!(host, "example.test.invalid");
+        assert_eq!(parsed.addrs, entry.addrs);
+        assert_eq!(parsed.resolved_at_unix, entry.resolved_at_unix);
+    }
+
+    #[test]
+    fn parse_persisted_line_rejects_garbage() {
+        assert!(parse_persisted_line("").is_none());
+        assert!(parse_persisted_line("only-a-host").is_none());
+        assert!(parse_persisted_line("host\t\tnotanumber").is_none());
+        assert!(parse_persisted_line("host\tnotanip\t123").is_none());
+    }
+
+    #[test]
+    fn save_and_load_persisted_cache_round_trips_through_disk_fallback() {
+        let host = "cache-disk-roundtrip.test.invalid";
+        let ip: IpAddr = "203.0.113.40".parse().unwrap();
+        remember_doh_answer(host, &[ip], Duration::from_secs(300));
+
+        let dir = std::env::temp_dir().join(format!("bridge-probe-dns-cache-test-{}", now_unix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dns-cache.txt");
+        save_persisted_dns_cache(&path).expect("save must succeed");
+        forget_dns_answer(host); // wipe the in-memory entry entirely
+
+        load_persisted_dns_cache(&path);
+        assert_eq!(disk_fallback_answer(host), Some(vec![ip]));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn disk_fallback_refuses_an_answer_past_the_fallback_window() {
+        let host = "cache-disk-too-stale.test.invalid";
+        {
+            let mut store = disk_fallback_store().lock().unwrap();
+            store.insert(
+                host.to_owned(),
+                PersistedAnswer {
+                    addrs: vec!["203.0.113.41".parse().unwrap()],
+                    resolved_at_unix: now_unix() - DNS_STALE_FALLBACK_WINDOW.as_secs() - 1,
+                },
+            );
+        }
+        assert!(disk_fallback_answer(host).is_none());
+    }
+
+    #[test]
+    fn load_persisted_dns_cache_is_a_no_op_for_a_missing_file() {
+        // Must not panic -- a first run, or one predating this feature.
+        load_persisted_dns_cache(std::path::Path::new("/nonexistent/does-not-exist.txt"));
+    }
+
+    #[test]
+    fn dns_hint_line_round_trips() {
+        let hint = DnsHint {
+            host: "bridge.example.test".to_owned(),
+            addrs: vec!["198.51.100.5".parse().unwrap(), "198.51.100.6".parse().unwrap()],
+            resolved_at_unix: 1_700_000_500,
+        };
+        let line = format_dns_hint_line(&hint);
+        assert!(line.starts_with(DNS_HINT_PREFIX));
+        assert_eq!(parse_dns_hint_line(&line), Some(hint));
+    }
+
+    #[test]
+    fn parse_dns_hint_line_rejects_non_hint_lines() {
+        assert!(parse_dns_hint_line("obfs4 1.2.3.4:443 ABCDEF cert=x").is_none());
+        assert!(parse_dns_hint_line("# just a comment").is_none());
+        assert!(parse_dns_hint_line("").is_none());
+        assert!(parse_dns_hint_line("# xorbot:dns onlyhost").is_none());
+        assert!(parse_dns_hint_line("# xorbot:dns host notanip 123").is_none());
+    }
+
+    #[test]
+    fn dns_hostname_of_is_none_for_ip_only_bridges() {
+        let obfs4: BridgeLine =
+            "obfs4 192.0.2.1:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA iat-mode=0"
+                .parse()
+                .unwrap();
+        assert_eq!(dns_hostname_of(&obfs4), None);
+
+        let webtunnel_addr: BridgeLine =
+            "webtunnel 192.0.2.2:1 0123456789ABCDEF0123456789ABCDEF01234567 addr=192.0.2.9:443 url=https://example.com/x"
+                .parse()
+                .unwrap();
+        assert_eq!(dns_hostname_of(&webtunnel_addr), None);
+    }
+
+    #[test]
+    fn dns_hostname_of_finds_the_webtunnel_url_host() {
+        let webtunnel: BridgeLine =
+            "webtunnel 192.0.2.3:1 0123456789ABCDEF0123456789ABCDEF01234567 url=https://fronting.example.test/x"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            dns_hostname_of(&webtunnel),
+            Some("fronting.example.test".to_owned())
+        );
+    }
+
+    #[test]
+    fn best_known_answer_prefers_live_cache_over_disk() {
+        let host = "best-answer-live.test.invalid";
+        let live_ip: IpAddr = "203.0.113.50".parse().unwrap();
+        remember_doh_answer(host, &[live_ip], Duration::from_secs(300));
+        {
+            let mut store = disk_fallback_store().lock().unwrap();
+            store.insert(
+                host.to_owned(),
+                PersistedAnswer {
+                    addrs: vec!["203.0.113.51".parse().unwrap()],
+                    resolved_at_unix: now_unix(),
+                },
+            );
+        }
+        let hint = best_known_answer(host).expect("must find an answer");
+        assert_eq!(hint.addrs, vec![live_ip]);
+        forget_dns_answer(host);
+    }
+
+    #[test]
+    fn best_known_answer_falls_back_to_disk_when_live_cache_is_empty() {
+        let host = "best-answer-disk.test.invalid";
+        let ip: IpAddr = "203.0.113.52".parse().unwrap();
+        {
+            let mut store = disk_fallback_store().lock().unwrap();
+            store.insert(
+                host.to_owned(),
+                PersistedAnswer {
+                    addrs: vec![ip],
+                    resolved_at_unix: now_unix(),
+                },
+            );
+        }
+        let hint = best_known_answer(host).expect("must find an answer");
+        assert_eq!(hint.addrs, vec![ip]);
+    }
+
+    #[test]
+    fn best_known_answer_is_none_when_nothing_is_known() {
+        assert!(best_known_answer("never-seen.test.invalid").is_none());
+    }
+
+    #[test]
+    fn seed_disk_fallback_respects_last_write_wins() {
+        let host = "seed-lww.test.invalid";
+        let older: IpAddr = "203.0.113.60".parse().unwrap();
+        let newer: IpAddr = "203.0.113.61".parse().unwrap();
+        seed_disk_fallback(&[DnsHint {
+            host: host.to_owned(),
+            addrs: vec![newer],
+            resolved_at_unix: 2_000_000_000,
+        }]);
+        // An older hint must not overwrite the newer one already seeded.
+        seed_disk_fallback(&[DnsHint {
+            host: host.to_owned(),
+            addrs: vec![older],
+            resolved_at_unix: 1_000_000_000,
+        }]);
+        assert_eq!(
+            disk_fallback_store().lock().unwrap().get(host).unwrap().addrs,
+            vec![newer]
         );
     }
 
