@@ -557,18 +557,36 @@ pub struct ParsedBridges {
     /// Bridge lines that parsed successfully but use documentation/local-only
     /// addresses and were therefore ignored.
     pub rejected: usize,
+    /// DNS resolution hints carried alongside the bridge lines (see
+    /// `bridge_probe::DnsHint`), e.g. from a QR-shared bridge whose exporter
+    /// already had it resolved. Already scope-checked: only hints whose host
+    /// matches one of `bridges`' own targets survive -- a hint for anything
+    /// else (in particular, one of this app's own collateral-freedom source
+    /// domains) is dropped rather than trusted, since nothing here vouches
+    /// for `lines`' origin.
+    pub dns_hints: Vec<bridge_probe::DnsHint>,
 }
 
 impl BridgesConfig {
     /// Parse the raw config strings into `BridgeLine`s, dropping any
     /// duplicates by `(transport, addr, fingerprint)`. The first
     /// occurrence wins; subsequent ones contribute to `duplicates`.
+    ///
+    /// `lines` may also contain DNS-hint directives (see
+    /// [`bridge_probe::DNS_HINT_PREFIX`]) interleaved with bridge lines --
+    /// these are diverted before the per-line `BridgeLine::from_str` below,
+    /// which would otherwise reject them as invalid bridges.
     pub fn parsed(&self) -> Result<ParsedBridges> {
         let mut bridges = Vec::with_capacity(self.lines.len());
+        let mut hint_lines: Vec<&str> = Vec::new();
         let mut seen: HashSet<(Option<String>, SocketAddr, Option<String>)> = HashSet::new();
         let mut duplicates = 0usize;
         let mut rejected = 0usize;
         for (idx, line) in self.lines.iter().enumerate() {
+            if line.starts_with(bridge_probe::DNS_HINT_PREFIX) {
+                hint_lines.push(line);
+                continue;
+            }
             let parsed: BridgeLine = line
                 .parse()
                 .with_context(|| format!("invalid bridge at index {idx}: {line:?}"))?;
@@ -587,10 +605,29 @@ impl BridgesConfig {
                 duplicates += 1;
             }
         }
+
+        // Scope check: a hint only survives if its host is one this same
+        // batch of bridges actually needs resolved. This is what makes it
+        // safe to carry hints through an untrusted, unsigned channel like a
+        // scanned QR code -- the worst an attacker can do is offer a bad IP
+        // for a bridge they already control the line of, which Tor's own
+        // relay-fingerprint check turns into a failed handshake, not a
+        // compromise. Without this check, the same channel could poison the
+        // cache for an unrelated hostname (e.g. this app's own
+        // collateral-freedom bridge-list sources).
+        let known_hosts: HashSet<String> =
+            bridges.iter().filter_map(bridge_probe::dns_hostname_of).collect();
+        let dns_hints: Vec<bridge_probe::DnsHint> = hint_lines
+            .iter()
+            .filter_map(|line| bridge_probe::parse_dns_hint_line(line))
+            .filter(|hint| known_hosts.contains(&hint.host))
+            .collect();
+
         Ok(ParsedBridges {
             bridges,
             duplicates,
             rejected,
+            dns_hints,
         })
     }
 }
@@ -881,6 +918,60 @@ log.targets.other: warn
         let err = cfg.parsed().expect_err("must reject");
         let msg = format!("{err:?}");
         assert!(msg.contains("index 1"), "error mentions which row: {msg}");
+    }
+
+    #[test]
+    fn bridges_parsed_diverts_dns_hint_lines_instead_of_rejecting_them() {
+        let cfg = BridgesConfig {
+            lines: vec![
+                "webtunnel 192.0.2.3:1 0123456789ABCDEF0123456789ABCDEF01234567 \
+                 url=https://fronting.example.test/x"
+                    .into(),
+                "# xorbot:dns fronting.example.test 203.0.113.9 1700000000".into(),
+            ],
+            sources: Vec::new(),
+            ..Default::default()
+        };
+        let parsed = cfg.parsed().expect("hint lines must not be treated as invalid bridges");
+        assert_eq!(parsed.bridges.len(), 1);
+        assert_eq!(parsed.dns_hints.len(), 1);
+        assert_eq!(parsed.dns_hints[0].host, "fronting.example.test");
+    }
+
+    #[test]
+    fn bridges_parsed_drops_a_hint_for_a_host_no_bridge_actually_uses() {
+        // The scope check: a hint whose host is not one of the bridges in
+        // this same batch must be dropped, not trusted -- otherwise an
+        // untrusted imported blob could poison the cache for an unrelated
+        // hostname (e.g. this app's own collateral-freedom source domains).
+        let cfg = BridgesConfig {
+            lines: vec![
+                "webtunnel 192.0.2.3:1 0123456789ABCDEF0123456789ABCDEF01234567 \
+                 url=https://fronting.example.test/x"
+                    .into(),
+                "# xorbot:dns raw.githubusercontent.com 203.0.113.9 1700000000".into(),
+            ],
+            sources: Vec::new(),
+            ..Default::default()
+        };
+        let parsed = cfg.parsed().expect("parses");
+        assert!(
+            parsed.dns_hints.is_empty(),
+            "a hint for an unrelated host must be dropped, got: {:?}",
+            parsed.dns_hints
+        );
+    }
+
+    #[test]
+    fn bridges_parsed_ignores_a_hint_with_no_bridges_at_all() {
+        let cfg = BridgesConfig {
+            lines: vec!["# xorbot:dns fronting.example.test 203.0.113.9 1700000000".into()],
+            sources: Vec::new(),
+            ..Default::default()
+        };
+        let parsed = cfg.parsed().expect("parses");
+        assert!(parsed.bridges.is_empty());
+        assert!(parsed.dns_hints.is_empty());
     }
 
     #[test]
