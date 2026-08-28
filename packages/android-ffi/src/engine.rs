@@ -74,6 +74,27 @@ const WARM_REFRESH_BATCH: usize = 2;
 /// quickly the pool fills, not how much load one round can generate.
 const WARM_TOPUP_INTERVAL: Duration = Duration::from_secs(2 * 60);
 
+/// Cadence for the background circuit-verify tick -- see `docs/design/real-connectivity-
+/// bridge-verification.md`. Deliberately much longer than [`WARM_TOPUP_INTERVAL`]: a full
+/// end-to-end check (throwaway client, PT handshake, circuit build, live probe) costs real Tor
+/// network resources per bridge, not just a local socket, so it runs against a slow trickle of
+/// the already channel-proven pool rather than the whole pool on every round.
+const CIRCUIT_VERIFY_INTERVAL: Duration = Duration::from_secs(30 * 60);
+/// How many channel-proven bridges one tick checks. Small on purpose -- see
+/// [`CIRCUIT_VERIFY_INTERVAL`]'s doc; the whole channel-proven pool is covered gradually over
+/// many ticks, oldest/never-verified first (`BridgeStore::needing_circuit_verification`).
+const CIRCUIT_VERIFY_BATCH: usize = 2;
+/// A bridge verified within this window is not due again yet.
+const CIRCUIT_VERIFY_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// Same bootstrap budget as the QR-scan flow (`lib.rs`'s `VERIFY_BRIDGE_BOOTSTRAP_TIMEOUT`) --
+/// a cold descriptor fetch for a never-contacted bridge needs real patience regardless of caller.
+const CIRCUIT_VERIFY_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(60);
+/// Shorter than the QR-scan flow's probe timeout (180s): this tick is a continuous background
+/// signal, not a one-shot user-facing action -- a bridge that times out here simply stays "due"
+/// and gets tried again next cycle, so there is no need to chase the same worst-case patience a
+/// user actively watching a scan result needs.
+const CIRCUIT_VERIFY_PROBE_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// Engine status, used internally and formatted for the JNI status protocol.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum EngineStatus {
@@ -604,6 +625,7 @@ async fn engine_async(
         stop_rx.clone(),
         all_configured_bridges,
         bridge_health.clone(),
+        settings.pt_binary.clone(),
     ));
 
     // Create semaphore for concurrency limiting
@@ -728,8 +750,11 @@ const WATCHDOG_RESET_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 /// The first readiness signal must include a real end-to-end circuit probe.
 /// A plain TCP bridge probe can succeed while DPI kills the obfs4 stream, and
 /// cached arti state can otherwise make `wait_bootstrapped` look healthy.
-const LIVE_PROBE_TARGET: &str = "check.torproject.org";
-const LIVE_PROBE_PORT: u16 = 443;
+// pub(crate): also the reachability bar `lib.rs`'s nativeVerifyBridges holds
+// scanned candidate bridges to -- one canonical "does this actually carry
+// Tor traffic" target, not a duplicated literal.
+pub(crate) const LIVE_PROBE_TARGET: &str = "check.torproject.org";
+pub(crate) const LIVE_PROBE_PORT: u16 = 443;
 const LIVE_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const LIVE_PROBE_ATTEMPTS: u32 = 3;
 const LIVE_PROBE_RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -1023,6 +1048,7 @@ async fn stall_watchdog(
     mut stop_rx: tokio::sync::watch::Receiver<bool>,
     bridges: Vec<BridgeLine>,
     bridge_health: BridgeHealthContext,
+    pt_binary: Option<PathBuf>,
 ) {
     let mut consecutive_failures = 0u32;
     let mut last_reset: Option<Instant> = None;
@@ -1052,6 +1078,12 @@ async fn stall_watchdog(
     // waiting a full `WARM_TOPUP_INTERVAL` on top of `WATCHDOG_PROBE_INTERVAL`.
     let mut last_topup = Instant::now()
         .checked_sub(WARM_TOPUP_INTERVAL)
+        .unwrap_or_else(Instant::now);
+    // Same "due immediately" reasoning as `last_topup`, but the store itself already tracks
+    // per-bridge staleness (`BridgeStore::needing_circuit_verification`'s `max_age`) -- this
+    // only paces how often a *tick* happens, not which bridges within it are actually checked.
+    let mut last_circuit_verify = Instant::now()
+        .checked_sub(CIRCUIT_VERIFY_INTERVAL)
         .unwrap_or_else(Instant::now);
 
     loop {
@@ -1165,6 +1197,71 @@ async fn stall_watchdog(
                     newly_warmed,
                     "warm pool: rotation updated"
                 );
+            }
+        }
+
+        // Background circuit-verify tick: the standard this whole app now holds bridges to
+        // ("reachable" means a live circuit actually reached the open internet, not merely a
+        // TCP handshake or an open channel) applied to a slow trickle of the pool, not just the
+        // QR-scan flow's user-initiated checks. See `docs/design/real-connectivity-bridge-
+        // verification.md` for why this can't simply replace the TCP reprobe above: a full
+        // check costs a real Tor circuit per bridge, not a local socket.
+        if last_circuit_verify.elapsed() >= CIRCUIT_VERIFY_INTERVAL {
+            last_circuit_verify = Instant::now();
+            let store_path = BridgeStore::resolve_path(bridge_health.config_path.as_deref());
+            let due = match BridgeStore::load(store_path) {
+                Ok(store) => store.needing_circuit_verification(
+                    OffsetDateTime::now_utc(),
+                    CIRCUIT_VERIFY_MAX_AGE,
+                    CIRCUIT_VERIFY_BATCH,
+                ),
+                Err(error) => {
+                    warn!(error = %error, "circuit-verify: failed to load bridge store");
+                    Vec::new()
+                }
+            };
+
+            if !due.is_empty() {
+                info!(count = due.len(), "circuit-verify: checking due bridges");
+                let live_cache_dir = bridge_health
+                    .config_path
+                    .as_deref()
+                    .map(crate::arti_cache_dir)
+                    .unwrap_or_else(|| std::path::PathBuf::from("arti-data/cache"));
+                let scratch_base = std::env::temp_dir()
+                    .join(format!("torsocks5-circuit-verify-{}", std::process::id()));
+                let verify_pt_binary = pt_binary.clone();
+                let verify_health = bridge_health.clone();
+                tokio::spawn(async move {
+                    // `verify_bridges_sequential` blocks its calling thread (it builds and
+                    // drives its own throwaway tokio runtimes internally, one per bridge) --
+                    // `spawn_blocking` moves it off this runtime's async worker threads, the
+                    // same reason `nativeVerifyBridges` runs it on a dedicated OS thread rather
+                    // than as a plain async task.
+                    let results = tokio::task::spawn_blocking(move || {
+                        let mut results = Vec::new();
+                        crate::verify_bridges_sequential(
+                            &live_cache_dir,
+                            &scratch_base,
+                            due,
+                            verify_pt_binary,
+                            CIRCUIT_VERIFY_BOOTSTRAP_TIMEOUT,
+                            CIRCUIT_VERIFY_PROBE_TIMEOUT,
+                            |bridge, result| results.push((bridge.clone(), result.is_ok())),
+                        );
+                        let _ = std::fs::remove_dir_all(&scratch_base);
+                        results
+                    })
+                    .await
+                    .unwrap_or_default();
+
+                    let verified = results.iter().filter(|(_, ok)| *ok).count();
+                    info!(
+                        checked = results.len(),
+                        verified, "circuit-verify: tick complete"
+                    );
+                    persist_circuit_verify_results(&results, &verify_health);
+                });
             }
         }
 
@@ -1717,6 +1814,37 @@ fn persist_warm_results(pool: &WarmPool, bridge_health: &BridgeHealthContext) {
     }
     if let Err(error) = store.save() {
         warn!(error = %error, "could not persist bridge rotation ranking");
+    }
+}
+
+/// Persist the background circuit-verify tick's results. Only successes are recorded
+/// (`BridgeStore::note_circuit_verified_at`) -- a failed end-to-end check does not demote the
+/// bridge or bump any failure counter, it simply stays due for the next tick, since a single
+/// timeout is routine (see `verify_bridges_sequential`'s doc) rather than proof the bridge is
+/// actually bad.
+fn persist_circuit_verify_results(
+    results: &[(BridgeLine, bool)],
+    bridge_health: &BridgeHealthContext,
+) {
+    if results.is_empty() {
+        return;
+    }
+    let path = BridgeStore::resolve_path(bridge_health.config_path.as_deref());
+    let mut store = match BridgeStore::load(path) {
+        Ok(store) => store,
+        Err(error) => {
+            warn!(error = %error, "circuit-verify: could not load bridge health store");
+            return;
+        }
+    };
+    let now = OffsetDateTime::now_utc();
+    for (bridge, ok) in results {
+        if *ok {
+            store.note_circuit_verified_at(bridge, now);
+        }
+    }
+    if let Err(error) = store.save() {
+        warn!(error = %error, "circuit-verify: could not persist results");
     }
 }
 

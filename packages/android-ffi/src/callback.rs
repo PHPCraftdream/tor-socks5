@@ -139,3 +139,107 @@ impl JavaCallback {
 // already `Send + Sync` in jni 0.21.1 (the crate has audited manual impls
 // for both), so the auto-derived traits on `JavaCallback` are exactly the
 // ones the JNI contract supports: a global ref may be used from any thread.
+
+/// A thread-safe wrapper around a Java `BridgeCheckCallback` object (see
+/// `nativeVerifyBridges` in `lib.rs`). Same attach-per-call pattern as
+/// [`JavaCallback`], kept separate rather than folded into it: the two
+/// callback interfaces share nothing beyond "attach a thread and call a
+/// Java method", and BootstrapEvent's four-variant match would not fit this
+/// callback's two plain methods cleanly.
+pub(crate) struct JavaBridgeCheckCallback {
+    vm: Arc<JavaVM>,
+    global: jni::objects::GlobalRef,
+}
+
+impl JavaBridgeCheckCallback {
+    pub(crate) fn new(vm: JavaVM, global: jni::objects::GlobalRef) -> Self {
+        Self {
+            vm: Arc::new(vm),
+            global,
+        }
+    }
+
+    /// Call `void onBridgeChecked(String bridgeLine, boolean reachable, long latencyMs,
+    /// String error)` -- `error` is `null` on success, `latencyMs` is `0` on failure.
+    pub(crate) fn emit_checked(
+        &self,
+        bridge_line: &str,
+        reachable: bool,
+        latency_ms: i64,
+        error: Option<&str>,
+    ) {
+        let mut env_guard = match self.vm.attach_current_thread() {
+            Ok(guard) => guard,
+            Err(e) => {
+                warn!(error = %e, "failed to attach thread to JVM for bridge-check callback");
+                return;
+            }
+        };
+        let env = &mut *env_guard;
+        let obj = self.global.as_obj();
+
+        let jbridge = match env.new_string(bridge_line) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "failed to create Java string for bridge line");
+                return;
+            }
+        };
+        // Both declared outside the match so whichever arm runs, its value outlives
+        // `jerror`'s use below (NLL allows this: each arm only reads its own binding).
+        let error_jstring;
+        let null_obj = jni::objects::JObject::null();
+        let jerror = match error {
+            Some(e) => {
+                error_jstring = match env.new_string(e) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(error = %e, "failed to create Java string for check error");
+                        return;
+                    }
+                };
+                JValue::Object(&error_jstring)
+            }
+            None => JValue::Object(&null_obj),
+        };
+
+        let result = env.call_method(
+            obj,
+            "onBridgeChecked",
+            "(Ljava/lang/String;ZJLjava/lang/String;)V",
+            &[
+                JValue::Object(&jbridge),
+                JValue::Bool(reachable as jni::sys::jboolean),
+                JValue::Long(latency_ms),
+                jerror,
+            ],
+        );
+        if let Err(e) = result {
+            warn!(error = %e, "JNI error calling onBridgeChecked");
+        }
+        if let Ok(true) = env.exception_check() {
+            warn!("onBridgeChecked threw an exception; clearing and continuing");
+            let _ = env.exception_clear();
+        }
+    }
+
+    /// Call `void onCheckComplete()` once every bridge in the batch has been checked.
+    pub(crate) fn emit_done(&self) {
+        let mut env_guard = match self.vm.attach_current_thread() {
+            Ok(guard) => guard,
+            Err(e) => {
+                warn!(error = %e, "failed to attach thread to JVM for bridge-check callback");
+                return;
+            }
+        };
+        let env = &mut *env_guard;
+        let obj = self.global.as_obj();
+        if let Err(e) = env.call_method(obj, "onCheckComplete", "()V", &[]) {
+            warn!(error = %e, "JNI error calling onCheckComplete");
+        }
+        if let Ok(true) = env.exception_check() {
+            warn!("onCheckComplete threw an exception; clearing and continuing");
+            let _ = env.exception_clear();
+        }
+    }
+}

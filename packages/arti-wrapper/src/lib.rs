@@ -8,6 +8,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arti_client::config::pt::TransportConfigBuilder;
 use arti_client::config::{BridgeConfigBuilder, CfgPath, Reconfigure, TorClientConfigBuilder};
@@ -56,6 +57,12 @@ pub enum TorError {
         #[source]
         source: arti_client::Error,
     },
+
+    #[error("bridge reachability check: bootstrap timed out after {0:?}")]
+    BridgeCheckBootstrapTimeout(Duration),
+
+    #[error("bridge reachability check: live probe timed out after {0:?}")]
+    BridgeCheckProbeTimeout(Duration),
 }
 
 /// Re-exported so callers (e.g. `apps/socks5-proxy/src/tor_watchdog.rs`) do
@@ -113,6 +120,17 @@ pub struct Settings {
     /// run can shadow the bridges we configure here. An app-local dir makes
     /// state predictable and wipeable. `None` keeps arti's default.
     pub state_dir: Option<PathBuf>,
+    /// Override just the **cache** location, independent of `state_dir`. Only meaningful
+    /// when `state_dir` is also set (state_dir's own `cache/` subdir is the default cache
+    /// location otherwise). `None` keeps the `state_dir`-derived default.
+    ///
+    /// Exists for [`TorTunnel::verify_bridge_reachable`]: consensus/microdescriptor data is
+    /// public and bridge-independent, so a one-off throwaway client checking a single
+    /// candidate bridge can safely share an already-bootstrapped client's cache (turning a
+    /// from-scratch multi-minute directory fetch into a near-instant hit) while still using
+    /// its own, unshared `state_dir` for guard state -- an unverified candidate must never
+    /// become part of anyone's real guard sample.
+    pub cache_dir: Option<PathBuf>,
     /// Tier 2 (docs/circuit-speed-plan.md): restrict middle/exit relay selection to the
     /// upper `min_bandwidth_percentile`-th percentile of consensus bandwidth. `0` (default)
     /// disables the floor -- stock, bandwidth-weighted-but-unrestricted selection. Trades
@@ -129,6 +147,19 @@ pub struct Settings {
     /// published. Costs latency and throughput -- only worth it where DPI
     /// actively kills obfs4 streams.
     pub obfs4_iat_mode: Option<u8>,
+    /// Disables preemptive circuit-building (`false` keeps arti's normal
+    /// "keep a couple of circuits warm for common ports" behavior).
+    ///
+    /// Exists for [`TorTunnel::verify_bridge_reachable`]'s single-bridge,
+    /// single-purpose client: with exactly one guard in the whole sample,
+    /// arti's preemptive builder, its timeout-calibration builder, and our
+    /// own explicit connect all try to open a channel to that *one* bridge
+    /// at once. A real obfs4 bridge's flood/abuse protection can reset a
+    /// burst of simultaneous connections like that (the same failure mode
+    /// `build_config`'s download-schedule comment above already documents
+    /// for consensus-fetch parallelism) -- and even when it doesn't, it is
+    /// pure waste for a client that will be torn down after one probe.
+    pub disable_preemptive_circuits: bool,
 }
 
 impl Settings {
@@ -137,6 +168,7 @@ impl Settings {
             && self.pt_binary.is_none()
             && self.min_bandwidth_percentile == 0
             && self.obfs4_iat_mode.is_none()
+            && !self.disable_preemptive_circuits
     }
 }
 
@@ -471,6 +503,94 @@ impl TorTunnel {
             .reconfigure(&config, Reconfigure::AllOrNothing)
             .map_err(TorError::Reconfigure)
     }
+
+    /// Check whether `check.bridge` can carry real Tor traffic to the open internet, not
+    /// merely answer a TCP handshake or open a channel.
+    ///
+    /// Builds a throwaway `TorTunnel` configured with exactly this one bridge, waits for it
+    /// to bootstrap, then makes a live connection to `probe_target` and confirms the stream
+    /// opens -- the same bar `engine.rs`'s own `verify_live_circuit` holds this app's main
+    /// connection to, because a TCP-reachable or even channel-open bridge is not proof: DPI
+    /// can kill the PT stream after the handshake, and a webtunnel "bridge" can be a live
+    /// website with no relay behind it at all.
+    ///
+    /// Never touches any other `TorTunnel` -- this is a fully separate client instance, torn
+    /// down when the returned future completes (success or error). `bootstrap_timeout` bounds
+    /// reaching a usable directory (dominated by the candidate bridge's own PT handshake once
+    /// `check.cache_dir` is shared with an already-warm client -- see
+    /// [`BridgeCheckSettings::cache_dir`]); `probe_timeout` separately bounds the live circuit
+    /// probe. Returns the probe's latency on success.
+    pub async fn verify_bridge_reachable(
+        check: BridgeCheckSettings,
+        probe_target: (&str, u16),
+        bootstrap_timeout: Duration,
+        probe_timeout: Duration,
+    ) -> Result<Duration> {
+        let settings = Settings {
+            bridges: vec![check.bridge],
+            pt_binary: check.pt_binary,
+            state_dir: Some(check.state_dir),
+            cache_dir: check.cache_dir,
+            disable_preemptive_circuits: true,
+            ..Settings::default()
+        };
+        let config = build_config(&settings)?;
+        let tunnel = Self::create_unbootstrapped(config)?;
+
+        tokio::time::timeout(bootstrap_timeout, tunnel.wait_bootstrapped())
+            .await
+            .map_err(|_| TorError::BridgeCheckBootstrapTimeout(bootstrap_timeout))??;
+
+        let started = Instant::now();
+        // A single throwaway bridge's own microdescriptors can still be
+        // arriving in the background when the first `connect()` attempt
+        // runs (bootstrap only waits for the directory as a whole to look
+        // usable, not for every relay this specific candidate might need
+        // for its own exit hop -- see `verify_bridges_blocking`'s doc on
+        // shared cache snapshots). That first attempt can fail with
+        // "failed to obtain exit circuit" even though the guard/entry hop
+        // through the candidate bridge itself is fine; a retry a couple of
+        // seconds later, once more of that data has landed, often succeeds
+        // where the first attempt didn't. Retried inside the same overall
+        // `probe_timeout` budget, not on top of it.
+        tokio::time::timeout(probe_timeout, async {
+            let mut last_err = None;
+            for attempt in 0..3 {
+                if attempt > 0 {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
+                match tunnel.connect(probe_target.0, probe_target.1).await {
+                    Ok(stream) => return Ok(stream),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            Err(last_err.expect("loop runs at least once"))
+        })
+        .await
+        .map_err(|_| TorError::BridgeCheckProbeTimeout(probe_timeout))??;
+
+        Ok(started.elapsed())
+    }
+}
+
+/// Settings for [`TorTunnel::verify_bridge_reachable`] -- deliberately narrower than
+/// [`Settings`]: a reachability check configures exactly one bridge and never needs
+/// sources/iat-mode overrides.
+#[derive(Debug, Clone)]
+pub struct BridgeCheckSettings {
+    pub bridge: BridgeLine,
+    /// Same requirement as [`Settings::pt_binary`]: required if `bridge` uses a transport.
+    pub pt_binary: Option<PathBuf>,
+    /// Shared, read+write consensus/microdescriptor cache. Safe -- and strongly
+    /// recommended -- to point this at an already-bootstrapped client's own cache dir: see
+    /// [`Settings::cache_dir`]'s doc for why sharing it is safe and turns a from-scratch
+    /// multi-minute directory fetch into a near-instant cache hit. `None` fetches fresh
+    /// (slow -- only use this when no already-warm cache is available).
+    pub cache_dir: Option<PathBuf>,
+    /// Guard/state directory, unique to this one check. Deliberately never shared with a
+    /// real client's state -- an unverified candidate bridge must never become part of
+    /// anyone's real guard sample. The caller owns creating and cleaning up this directory.
+    pub state_dir: PathBuf,
 }
 
 // tor-socks5 local patch: build every `TorClient` through this helper so the
@@ -539,9 +659,13 @@ fn build_config(settings: &Settings) -> Result<TorClientConfig> {
     // bridges configured below (observed with webtunnel-only configs).
     if let Some(base) = &settings.state_dir {
         let join = |sub: &str| CfgPath::new(base.join(sub).to_string_lossy().into_owned());
+        let cache_dir = match &settings.cache_dir {
+            Some(cache) => CfgPath::new(cache.to_string_lossy().into_owned()),
+            None => join("cache"),
+        };
         builder
             .storage()
-            .cache_dir(join("cache"))
+            .cache_dir(cache_dir)
             .state_dir(join("state"));
     }
 
@@ -550,6 +674,13 @@ fn build_config(settings: &Settings) -> Result<TorClientConfig> {
     builder
         .path_rules()
         .min_bandwidth_percentile(settings.min_bandwidth_percentile);
+
+    if settings.disable_preemptive_circuits {
+        builder
+            .preemptive_circuits()
+            .initial_predicted_ports()
+            .clear();
+    }
 
     if !settings.bridges.is_empty() {
         for line in &settings.bridges {
@@ -662,6 +793,33 @@ mod tests {
     fn build_config_empty_settings_succeeds() {
         let cfg = build_config(&Settings::default());
         assert!(cfg.is_ok());
+    }
+
+    #[test]
+    fn build_config_with_separate_cache_dir_succeeds() {
+        let state = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let s = Settings {
+            state_dir: Some(state.path().to_path_buf()),
+            cache_dir: Some(cache.path().to_path_buf()),
+            ..Default::default()
+        };
+        assert!(
+            build_config(&s).is_ok(),
+            "a state_dir + separate cache_dir override must build a valid config"
+        );
+    }
+
+    #[test]
+    fn build_config_cache_dir_without_state_dir_is_ignored() {
+        // cache_dir only takes effect alongside state_dir (see its doc) -- setting it alone
+        // must not error, just have no effect.
+        let cache = tempfile::tempdir().unwrap();
+        let s = Settings {
+            cache_dir: Some(cache.path().to_path_buf()),
+            ..Default::default()
+        };
+        assert!(build_config(&s).is_ok());
     }
 
     #[test]
@@ -932,6 +1090,38 @@ mod tests {
         assert_eq!(
             rewritten.params.get("iat-mode").map(String::as_str),
             Some("2")
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_bridge_reachable_reports_bootstrap_timeout_for_an_unreachable_bridge() {
+        // 192.0.2.0/24 is RFC 5737 documentation space -- guaranteed to have nothing
+        // listening, so bootstrap can never succeed and this exercises the timeout path
+        // deterministically without any real network access. Same state_dir rationale as
+        // signal_bridge_failure_requires_running_client above.
+        ensure_crypto_provider();
+        let state = tempfile::tempdir().unwrap();
+        let bridge: BridgeLine = "192.0.2.1:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01"
+            .parse()
+            .unwrap();
+        let check = BridgeCheckSettings {
+            bridge,
+            pt_binary: None,
+            cache_dir: None,
+            state_dir: state.path().to_path_buf(),
+        };
+        let bootstrap_timeout = Duration::from_millis(500);
+        let err = TorTunnel::verify_bridge_reachable(
+            check,
+            ("check.torproject.org", 443),
+            bootstrap_timeout,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("an unreachable bridge must never bootstrap");
+        assert!(
+            matches!(err, TorError::BridgeCheckBootstrapTimeout(d) if d == bootstrap_timeout),
+            "expected BridgeCheckBootstrapTimeout, got: {err}"
         );
     }
 }

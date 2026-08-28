@@ -68,6 +68,18 @@ struct Entry {
     channel_ok_count: u32,
     /// Most recent successful PT/channel warm-up.
     last_channel_ok: Option<OffsetDateTime>,
+    /// Number of times a full circuit through this bridge actually reached
+    /// the open internet (`arti_wrapper::TorTunnel::verify_bridge_reachable`),
+    /// not merely opened a channel. This is the standard the QR-scan
+    /// verification flow already holds every scanned bridge to; the
+    /// background watchdog applies the same check to a slow trickle of the
+    /// already channel-proven pool (see `engine.rs`'s circuit-verify tick),
+    /// since running it against the whole pool on every reprobe would be
+    /// prohibitively expensive (see `docs/design/real-connectivity-bridge-
+    /// verification.md`).
+    verified_count: u32,
+    /// Most recent successful end-to-end circuit verification.
+    last_verified: Option<OffsetDateTime>,
     /// Consecutive **circuit-layer** failure count, observed from arti's
     /// own tracing events (per-guard usability reports). Distinct from
     /// `fails` (TCP-probe layer): a bridge whose TCP/TLS works but whose
@@ -222,6 +234,8 @@ impl BridgeStore {
                     ok_count: meta.ok_count,
                     channel_ok_count: meta.channel_ok_count,
                     last_channel_ok: meta.last_channel_ok,
+                    verified_count: meta.verified_count,
+                    last_verified: meta.last_verified,
                     circuit_fails: meta.circuit_fails,
                     last_circuit_observation: meta.last_circuit_observation,
                     sources: meta.sources,
@@ -254,6 +268,8 @@ impl BridgeStore {
             ok_count: 0,
             channel_ok_count: 0,
             last_channel_ok: None,
+            verified_count: 0,
+            last_verified: None,
             circuit_fails: 0,
             last_circuit_observation: now,
             sources: Default::default(),
@@ -337,6 +353,8 @@ impl BridgeStore {
                         ok_count: 0,
                         channel_ok_count: 0,
                         last_channel_ok: None,
+                        verified_count: 0,
+                        last_verified: None,
                         circuit_fails: 1,
                         last_circuit_observation: now,
                         sources: Default::default(),
@@ -368,6 +386,8 @@ impl BridgeStore {
             ok_count: 0,
             channel_ok_count: 0,
             last_channel_ok: None,
+            verified_count: 0,
+            last_verified: None,
             circuit_fails: 0,
             last_circuit_observation: now,
             sources: Default::default(),
@@ -393,6 +413,8 @@ impl BridgeStore {
             ok_count: 0,
             channel_ok_count: 0,
             last_channel_ok: None,
+            verified_count: 0,
+            last_verified: None,
             circuit_fails: 0,
             last_circuit_observation: now,
             sources: Default::default(),
@@ -541,6 +563,18 @@ impl BridgeStore {
         }
     }
 
+    /// Record that a full circuit through this bridge actually reached the
+    /// open internet (`verify_bridge_reachable`, not merely a channel open).
+    /// No-op if the bridge is not already tracked -- verification only ever
+    /// runs against bridges the store already knows about (channel-proven
+    /// candidates), never as a way to introduce a new entry.
+    pub fn note_circuit_verified_at(&mut self, bridge: &BridgeLine, now: OffsetDateTime) {
+        if let Some(e) = self.entries.get_mut(&key_of(bridge)) {
+            e.verified_count = e.verified_count.saturating_add(1);
+            e.last_verified = Some(now);
+        }
+    }
+
     /// Bump the failure counter for one bridge, respecting the rate limit.
     /// Returns true if the counter was incremented this call.
     fn note_failure_at(
@@ -574,6 +608,8 @@ impl BridgeStore {
                         ok_count: 0,
                         channel_ok_count: 0,
                         last_channel_ok: None,
+                        verified_count: 0,
+                        last_verified: None,
                         circuit_fails: 0,
                         last_circuit_observation: now,
                         sources: Default::default(),
@@ -638,6 +674,14 @@ impl BridgeStore {
             out.push_str(" chok=");
             out.push_str(
                 &e.last_channel_ok
+                    .map(format_iso)
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+            out.push_str(" evseen=");
+            out.push_str(&e.verified_count.to_string());
+            out.push_str(" evok=");
+            out.push_str(
+                &e.last_verified
                     .map(format_iso)
                     .unwrap_or_else(|| "-".to_string()),
             );
@@ -728,6 +772,54 @@ impl BridgeStore {
             .map_or(0, |e| e.channel_ok_count)
     }
 
+    /// Number of times a full circuit through this bridge was proven to
+    /// reach the open internet. `0` covers both "never checked" and "the
+    /// bridge is not even tracked".
+    #[must_use]
+    pub fn verified_count(&self, bridge: &BridgeLine) -> u32 {
+        self.entries
+            .get(&key_of(bridge))
+            .map_or(0, |e| e.verified_count)
+    }
+
+    /// When a full circuit through this bridge last reached the open
+    /// internet, if ever.
+    #[must_use]
+    pub fn last_verified(&self, bridge: &BridgeLine) -> Option<OffsetDateTime> {
+        self.entries
+            .get(&key_of(bridge))
+            .and_then(|e| e.last_verified)
+    }
+
+    /// Channel-proven bridges (see [`Self::channel_proven_bridges`]) that either have never
+    /// passed a full end-to-end circuit verification, or whose last one is older than
+    /// `max_age` -- the candidate pool for the background watchdog's slow circuit-verify tick.
+    /// Ranked oldest-verified (or never-verified) first, so the tick always makes progress
+    /// through the whole channel-proven pool rather than repeatedly re-checking the same few
+    /// bridges. Retired bridges are excluded.
+    #[must_use]
+    pub fn needing_circuit_verification(
+        &self,
+        now: OffsetDateTime,
+        max_age: Duration,
+        limit: usize,
+    ) -> Vec<BridgeLine> {
+        let mut due: Vec<&Entry> = self
+            .entries
+            .values()
+            .filter(|e| e.channel_ok_count > 0 && !e.is_retired())
+            .filter(|e| match e.last_verified {
+                None => true,
+                Some(t) => now - t >= max_age,
+            })
+            .collect();
+        due.sort_by_key(|e| e.last_verified);
+        due.into_iter()
+            .take(limit)
+            .map(|e| e.bridge.clone())
+            .collect()
+    }
+
     /// Consecutive TCP-probe failure count for a bridge (0 if unknown, which
     /// also covers "never probed"). `0` means the last probe round saw this
     /// bridge as reachable — the same condition [`Self::alive_count`] counts
@@ -794,8 +886,13 @@ impl BridgeStore {
 
     fn rank_and_take(mut healthy: Vec<&Entry>, limit: usize) -> Vec<BridgeLine> {
         healthy.sort_by(|a, b| {
-            b.channel_ok_count
-                .cmp(&a.channel_ok_count)
+            // End-to-end verified (a real circuit reached the open internet) outranks
+            // merely channel-proven, which outranks merely TCP-reachable -- the same three
+            // tiers `docs/design/real-connectivity-bridge-verification.md` documents.
+            b.verified_count
+                .cmp(&a.verified_count)
+                .then_with(|| b.last_verified.cmp(&a.last_verified))
+                .then_with(|| b.channel_ok_count.cmp(&a.channel_ok_count))
                 .then_with(|| b.last_channel_ok.cmp(&a.last_channel_ok))
                 .then_with(|| b.ok_count.cmp(&a.ok_count))
                 .then(a.last_latency.cmp(&b.last_latency))
@@ -818,6 +915,8 @@ struct Meta {
     ok_count: u32,
     channel_ok_count: u32,
     last_channel_ok: Option<OffsetDateTime>,
+    verified_count: u32,
+    last_verified: Option<OffsetDateTime>,
     circuit_fails: u32,
     last_circuit_observation: OffsetDateTime,
     sources: std::collections::BTreeSet<String>,
@@ -834,6 +933,8 @@ impl Default for Meta {
             ok_count: 0,
             channel_ok_count: 0,
             last_channel_ok: None,
+            verified_count: 0,
+            last_verified: None,
             circuit_fails: 0,
             sources: Default::default(),
             last_circuit_observation: epoch,
@@ -871,6 +972,14 @@ fn parse_meta_comment(s: &str) -> Option<Meta> {
                 } else {
                     Some(OffsetDateTime::parse(v, &Iso8601::DEFAULT).ok()?)
                 };
+            } else if let Some(v) = tok.strip_prefix("evseen=") {
+                meta.verified_count = v.parse().ok()?;
+            } else if let Some(v) = tok.strip_prefix("evok=") {
+                meta.last_verified = if v == "-" {
+                    None
+                } else {
+                    Some(OffsetDateTime::parse(v, &Iso8601::DEFAULT).ok()?)
+                };
             } else if let Some(v) = tok.strip_prefix("cfails=") {
                 meta.circuit_fails = v.parse().ok()?;
             } else if let Some(v) = tok.strip_prefix("cobs=") {
@@ -903,6 +1012,8 @@ fn parse_meta_comment(s: &str) -> Option<Meta> {
         ok_count: 1,
         channel_ok_count: 0,
         last_channel_ok: None,
+        verified_count: 0,
+        last_verified: None,
         circuit_fails: 0,
         sources: Default::default(),
         last_circuit_observation: when,
@@ -1020,6 +1131,123 @@ mod tests {
         let ranked = s.healthiest_bridges(2);
         assert_eq!(ranked.first(), Some(&a));
         assert_eq!(ranked.get(1), Some(&b));
+    }
+
+    #[test]
+    fn circuit_verified_is_noop_for_unknown_bridge() {
+        let mut s = empty();
+        let b = bridge(OBFS4_A);
+        s.note_circuit_verified_at(&b, OffsetDateTime::now_utc());
+        assert_eq!(
+            s.verified_count(&b),
+            0,
+            "no entry to attach the verification to"
+        );
+    }
+
+    #[test]
+    fn circuit_verified_accumulates_and_stamps_last_verified() {
+        let mut s = empty();
+        let b = bridge(OBFS4_A);
+        s.record(b.clone(), Duration::from_millis(5));
+        let t0 = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        s.note_circuit_verified_at(&b, t0);
+        s.note_circuit_verified_at(&b, t0 + HOUR);
+        assert_eq!(s.verified_count(&b), 2);
+        assert_eq!(s.last_verified(&b), Some(t0 + HOUR));
+    }
+
+    #[test]
+    fn healthiest_bridges_prefers_end_to_end_verified_over_merely_channel_warm() {
+        let mut s = empty();
+        let a = bridge(OBFS4_A);
+        let b = bridge(OBFS4_B);
+        s.record(a.clone(), Duration::from_millis(5));
+        s.record(b.clone(), Duration::from_millis(1));
+        let now = OffsetDateTime::now_utc();
+        // b has more/better channel history, but a is the one actually proven to reach
+        // the open internet -- a must still rank first.
+        s.note_channel_success_at(&b, now);
+        s.note_channel_success_at(&b, now);
+        s.note_channel_success_at(&a, now);
+        s.note_circuit_verified_at(&a, now);
+        let ranked = s.healthiest_bridges(2);
+        assert_eq!(
+            ranked.first(),
+            Some(&a),
+            "end-to-end verified outranks merely channel-warm"
+        );
+        assert_eq!(ranked.get(1), Some(&b));
+    }
+
+    #[test]
+    fn needing_circuit_verification_excludes_fresh_and_unproven_and_retired() {
+        let mut s = empty();
+        let never_verified = bridge(OBFS4_A);
+        let freshly_verified = bridge(OBFS4_B);
+        let stale_verified = bridge(
+            "obfs4 9.9.9.9:443 1111111111111111111111111111111111111111 cert=VVV iat-mode=0",
+        );
+        let not_channel_proven = bridge(
+            "obfs4 8.8.8.8:443 2222222222222222222222222222222222222222 cert=UUU iat-mode=0",
+        );
+        let retired = bridge(
+            "obfs4 7.7.7.7:443 3333333333333333333333333333333333333333 cert=TTT iat-mode=0",
+        );
+
+        for b in [
+            &never_verified,
+            &freshly_verified,
+            &stale_verified,
+            &not_channel_proven,
+        ] {
+            s.record((*b).clone(), Duration::from_millis(5));
+        }
+        s.record(retired.clone(), Duration::from_millis(5));
+
+        let now = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        s.note_channel_success_at(&never_verified, now);
+        s.note_channel_success_at(&freshly_verified, now);
+        s.note_channel_success_at(&stale_verified, now);
+        s.note_channel_success_at(&retired, now);
+        // not_channel_proven deliberately gets no note_channel_success_at.
+
+        s.note_circuit_verified_at(&freshly_verified, now);
+        s.note_circuit_verified_at(&stale_verified, now - 2 * HOUR);
+        s.note_permanent_failure_at(&retired, now);
+
+        let due = s.needing_circuit_verification(now, HOUR, 10);
+        assert!(due.contains(&never_verified), "never verified is due");
+        assert!(
+            due.contains(&stale_verified),
+            "verified longer ago than max_age is due"
+        );
+        assert!(
+            !due.contains(&freshly_verified),
+            "verified within max_age is not due"
+        );
+        assert!(
+            !due.contains(&not_channel_proven),
+            "not even channel-proven yet"
+        );
+        assert!(!due.contains(&retired), "retired bridges are excluded");
+    }
+
+    #[test]
+    fn circuit_verified_metadata_persists_across_save_load() {
+        let dir = tmp_dir();
+        let path = dir.join("bridges.log");
+        let mut s = BridgeStore::load(path.clone()).unwrap();
+        let b = bridge(OBFS4_A);
+        s.record(b.clone(), Duration::from_millis(5));
+        let now = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        s.note_circuit_verified_at(&b, now);
+        s.save().unwrap();
+
+        let loaded = BridgeStore::load(path).unwrap();
+        assert_eq!(loaded.verified_count(&b), 1);
+        assert_eq!(loaded.last_verified(&b), Some(now));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
