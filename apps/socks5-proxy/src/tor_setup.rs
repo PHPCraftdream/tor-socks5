@@ -62,16 +62,17 @@ pub(crate) async fn build_tor_settings(
     // into the thousands once `bridges fetch`/auto_fetch has been promoting
     // for a while. Both steps are preferences, not filters: an unmatched
     // transport or an empty/stale health store falls back toward the full
-    // list, and the "active pool was unreachable" branch below covers a
-    // narrowed slice that turns out fully dead.
+    // list, and the "active pool was unreachable" branch below re-probes
+    // the rest of the preferred pool when a bounded slice turns out fully
+    // dead — deliberately never widening to other transports.
     let preferred_bridges = preferred_transport_bridges(&parsed_bridges, cfg);
     let active_probe_bridges = select_active_probe_bridges(&preferred_bridges, config_path);
-    let probing_all_configured = active_probe_bridges.len() == parsed_bridges.len();
+    let probing_all_preferred = active_probe_bridges.len() == preferred_bridges.len();
 
     // Everything we attempt this round, for the health store. Starts with
     // the bridges actually probed this round (covers both obfs4 and
     // webtunnel — the store is transport-agnostic) and grows if we fall
-    // back to the full configured list or to seeds.
+    // back to the full preferred pool or to seeds.
     let mut probed: Vec<BridgeLine> = active_probe_bridges.clone();
 
     // Probe the active pool and keep only the reachable ones, sorted by
@@ -94,15 +95,19 @@ pub(crate) async fn build_tor_settings(
     // A stale health store or an unlucky transport preference must not make
     // an otherwise-working config unusable: if the active/preferred slice
     // produced nothing, retry once against the complete configured pool
-    // before falling back to seeds. The common path (a small config, or a
-    // healthy active slice) never pays for this.
-    if alive.is_empty() && !probing_all_configured {
+    // before falling back to seeds. The retry stays inside the preferred
+    // transport — a preference whose bridges are all currently down is not
+    // answered by other transports (see `fallback_probe_pool`). The common
+    // path (a small config, or a healthy active slice) never pays for this.
+    if let Some(pool) =
+        fallback_probe_pool(alive.is_empty(), &preferred_bridges, probing_all_preferred)
+    {
         info!(
-            configured = parsed_bridges.len(),
-            "active bridge pool was unreachable; probing full configured pool as fallback"
+            count = pool.len(),
+            "active bridge pool was unreachable; probing full preferred pool as fallback"
         );
-        probed = parsed_bridges.clone();
-        alive = bridge_probe::probe_and_sort(parsed_bridges.clone(), BRIDGE_PROBE_TIMEOUT).await;
+        probed = pool.clone();
+        alive = bridge_probe::probe_and_sort(pool, BRIDGE_PROBE_TIMEOUT).await;
     }
 
     // Chicken-and-egg fallback: if no configured bridge is reachable,
@@ -168,10 +173,7 @@ pub(crate) async fn build_tor_settings(
     // Keep arti's state/cache app-local (next to the config when we have a
     // path, else `./arti-data`). Shared OS-default arti dirs persist a guard
     // sample / cached consensus across runs that can shadow our bridges.
-    let arti_base = match config_path.and_then(Path::parent) {
-        Some(dir) if !dir.as_os_str().is_empty() => dir.join("arti-data"),
-        _ => std::path::PathBuf::from("arti-data"),
-    };
+    let arti_base = arti_base_dir(config_path);
 
     Ok(Settings {
         bridges,
@@ -182,12 +184,27 @@ pub(crate) async fn build_tor_settings(
     })
 }
 
+/// The arti state base dir `build_tor_settings` hands to arti: next to the
+/// config file when we have a path, else `./arti-data`. Extracted so the
+/// background circuit-verify task (`bridge_verifier.rs`) derives the live
+/// client's cache dir (`base.join("cache")`, per `arti_wrapper::build_config`)
+/// from the same logic and cannot drift from the actually-running client.
+pub(crate) fn arti_base_dir(config_path: Option<&Path>) -> std::path::PathBuf {
+    match config_path.and_then(Path::parent) {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join("arti-data"),
+        _ => std::path::PathBuf::from("arti-data"),
+    }
+}
+
 /// Narrow the startup pool to the configured preferred transport, if any.
 ///
 /// Deliberately a preference, not a filter: an unmatched preference
 /// (nothing configured uses it) falls back to the full list rather than
-/// probing nothing, and `build_tor_settings`'s active/full-pool fallback
-/// still covers a preference whose bridges all turn out unreachable.
+/// probing nothing — asking for a transport the pool does not contain
+/// should not amount to asking for nothing. The reverse does not hold: a
+/// preference matching bridges that then all fail at probing is not
+/// rescued by other transports — it fails through to the seeds branch or
+/// the hard error.
 fn preferred_transport_bridges(configured: &[BridgeLine], cfg: &Config) -> Vec<BridgeLine> {
     let Some(preferred) = cfg.bridges.preferred_transport() else {
         return configured.to_vec();
@@ -218,9 +235,10 @@ fn preferred_transport_bridges(configured: &[BridgeLine], cfg: &Config) -> Vec<B
 /// bridge ranking (mirrors `android-ffi`'s `select_active_probe_bridges`).
 ///
 /// `configured` is intentionally not reduced beyond the returned slice for
-/// anyone else's bookkeeping: `build_tor_settings`'s full-pool fallback and
-/// `spawn_bridge_maintenance`'s periodic re-probe still see the complete
-/// configured list. A missing or stale health store falls back to the first
+/// anyone else's bookkeeping: `build_tor_settings`'s fallback sees the
+/// complete preferred list, while `spawn_bridge_maintenance`'s periodic
+/// re-probe still sees the complete configured list. A missing or stale
+/// health store falls back to the first
 /// bounded slice; the caller performs a full probe only when that slice
 /// produces no reachable bridge.
 fn select_active_probe_bridges(
@@ -252,6 +270,30 @@ fn select_active_probe_bridges(
         .take(MAX_ACTIVE_BRIDGES)
         .cloned()
         .collect()
+}
+
+/// The pool to re-probe when the active slice produced no reachable bridge:
+/// the complete preferred-transport list, or `None` when no fallback probe
+/// is due.
+///
+/// Deliberately never the full configured list: when a transport preference
+/// matched anything, a currently-dead preferred slice must not widen the
+/// fallback across transports (upstream `82a3d76` — a matching preference
+/// that fails is reported as-is, not silently answered by another
+/// transport). When the preference matched nothing, `preferred_bridges`
+/// already IS the full pool, so nothing widens there either. `None` is
+/// returned when the active slice is still alive, or when the startup
+/// probe already covered the whole preferred pool (a retry could only
+/// repeat it).
+fn fallback_probe_pool(
+    active_slice_dead: bool,
+    preferred_bridges: &[BridgeLine],
+    probing_all_preferred: bool,
+) -> Option<Vec<BridgeLine>> {
+    if !active_slice_dead || probing_all_preferred {
+        return None;
+    }
+    Some(preferred_bridges.to_vec())
 }
 
 /// Update the on-disk bridge health store with this probe round's outcome
@@ -393,7 +435,7 @@ fn pt_binary_override_from(value: Option<&std::ffi::OsStr>) -> Option<std::path:
 /// binaries without runtime metadata). Existence validation is deferred to
 /// `arti_wrapper::build_config`, which rejects a non-existent path with
 /// `TorError::InvalidPt`.
-fn resolve_pt_binary() -> anyhow::Result<std::path::PathBuf> {
+pub(crate) fn resolve_pt_binary() -> anyhow::Result<std::path::PathBuf> {
     if let Some(path) = pt_binary_override_from(std::env::var_os("TOR_PT_BINARY").as_deref()) {
         info!(path = %path.display(), "using TOR_PT_BINARY override as PT binary");
         return Ok(path);
@@ -501,5 +543,46 @@ mod tests {
         let active = select_active_probe_bridges(&bridges, Some(missing_config));
         assert_eq!(active.len(), MAX_ACTIVE_BRIDGES);
         assert_eq!(active, bridges[..MAX_ACTIVE_BRIDGES]);
+    }
+
+    #[test]
+    fn fallback_probe_pool_stays_within_formed_preferred_transport() {
+        // The webtunnel preference matched (the slice is non-empty), but the
+        // whole slice comes back unreachable at probing, while live obfs4
+        // bridges exist in the full configured pool. The fallback re-probe
+        // must stay inside the preferred slice — never widen to obfs4.
+        let configured = vec![
+            obfs4_line("1.2.3.4:443"),
+            webtunnel_line("5.6.7.8:443"),
+            webtunnel_line("9.10.11.12:443"),
+            obfs4_line("13.14.15.16:443"),
+        ];
+        let cfg = Config {
+            bridges: proxy_config::BridgesConfig {
+                transport: "webtunnel".to_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let preferred_bridges = preferred_transport_bridges(&configured, &cfg);
+        assert_eq!(preferred_bridges.len(), 2);
+
+        let pool = fallback_probe_pool(true, &preferred_bridges, false)
+            .expect("dead preferred slice must produce a fallback probe");
+        assert_eq!(pool, preferred_bridges);
+        assert!(
+            pool.iter()
+                .all(|b| b.transport.as_deref() == Some("webtunnel")),
+            "fallback must not widen to other transports"
+        );
+    }
+
+    #[test]
+    fn fallback_probe_pool_skips_when_nothing_new_to_probe() {
+        let preferred = vec![webtunnel_line("5.6.7.8:443")];
+        // The startup probe already covered the whole preferred pool.
+        assert_eq!(fallback_probe_pool(true, &preferred, true), None);
+        // A still-live active slice never triggers the fallback.
+        assert_eq!(fallback_probe_pool(false, &preferred, false), None);
     }
 }

@@ -73,7 +73,8 @@ pub(crate) async fn cmd_bridges(
     } else {
         // Step 2: drain — lazily probe the pool and promote up to `count`
         // reachable bridges into the working config.
-        let promoted = crate::fetch_merge::drain_pool(Some(&config_path), count).await?;
+        let promoted =
+            crate::fetch_merge::drain_pool(Some(&config_path), count, Some(&tor)).await?;
         if promoted == 0 {
             println!("pool refreshed (+{added}); no reachable new bridges promoted");
         } else {

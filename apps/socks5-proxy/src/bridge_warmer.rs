@@ -29,8 +29,11 @@
 //! the health signals already tracked in [`bridge_store::BridgeStore`]:
 //! TCP-unreachable bridges (`tcp_fails > 0` per the last probe round) are
 //! excluded outright, then the rest are sorted by ascending `circuit_fails`
-//! (fewest circuit-layer failures first) and, as a tie-breaker, descending
-//! `ok_count` (more cumulative successful probes first). This mirrors the
+//! (fewest circuit-layer failures first), then by descending `verified_count`
+//! (a bridge with a confirmed live circuit must not lose to a never-verified
+//! one merely because both sit at `circuit_fails == 0`), and finally by
+//! descending `ok_count` (more cumulative successful probes first). This
+//! mirrors the
 //! stability-first ordering `tor_setup.rs` already applies when handing
 //! bridges to arti at bootstrap.
 
@@ -38,6 +41,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use bridge_line::BridgeLine;
+use time::OffsetDateTime;
 use tracing::{info, warn};
 
 use crate::config::{Config, WarmPoolConfig};
@@ -55,8 +59,17 @@ pub(crate) struct Health {
     /// Consecutive circuit-layer failures observed from arti's tracing.
     /// Lower is better.
     pub circuit_fails: u32,
+    /// Count of full end-to-end circuit verifications recorded by the store.
+    /// Higher is better.
+    pub verified_count: u32,
     /// Cumulative successful-probe count. Higher is better (tie-breaker).
     pub ok_count: u32,
+    /// When the bridge's circuit-failure counter was last touched, per the
+    /// on-disk store — `None` when the bridge is unknown to the store. Lets
+    /// the soft-failover watchdog tell evidence produced by the current
+    /// process run from counts inherited from a previous run (see
+    /// `BridgeStore::last_circuit_observation`).
+    pub cobs: Option<OffsetDateTime>,
 }
 
 /// Select up to `n` candidates to warm, given each bridge's current health.
@@ -64,7 +77,11 @@ pub(crate) struct Health {
 /// Pure function: filters out any bridge whose `tcp_fails > 0` (per the
 /// last probe round — the same TCP-health condition
 /// [`BridgeStore::alive_count`] uses), then sorts the remainder by ascending
-/// `circuit_fails`, breaking ties by descending `ok_count`. The input order
+/// `circuit_fails` (the primary key: an arti-observed circuit failure is a
+/// live negative signal and must keep dominating), then by descending
+/// `verified_count` — a circuit-verified bridge must not lose to a
+/// never-verified one merely because both sit at `circuit_fails == 0` — and
+/// finally by descending `ok_count`. The input order
 /// otherwise has no bearing on the result — this is a full sort, not a
 /// stable "keep first N alive" filter.
 pub(crate) fn select_top_n(candidates: &[(BridgeLine, Health)], n: usize) -> Vec<BridgeLine> {
@@ -75,6 +92,7 @@ pub(crate) fn select_top_n(candidates: &[(BridgeLine, Health)], n: usize) -> Vec
     healthy.sort_by(|(_, a), (_, b)| {
         a.circuit_fails
             .cmp(&b.circuit_fails)
+            .then_with(|| b.verified_count.cmp(&a.verified_count))
             .then_with(|| b.ok_count.cmp(&a.ok_count))
     });
     healthy
@@ -125,12 +143,16 @@ pub(crate) fn candidates_with_health(
                 Some(store) => Health {
                     tcp_fails: store.tcp_fails(&bridge),
                     circuit_fails: store.circuit_fails(&bridge),
+                    verified_count: store.verified_count(&bridge),
                     ok_count: store.ok_count(&bridge),
+                    cobs: store.last_circuit_observation(&bridge),
                 },
                 None => Health {
                     tcp_fails: 0,
                     circuit_fails: 0,
+                    verified_count: 0,
                     ok_count: 0,
+                    cobs: None,
                 },
             };
             (bridge, health)
@@ -200,13 +222,39 @@ pub fn spawn_bridge_warmer(handle: TorHandle, config_path: Option<PathBuf>, cfg:
                 count = selected.len(),
                 "warm-pool: warming channels to top candidate bridges"
             );
+            let mut warmed: Vec<&BridgeLine> = Vec::new();
             for bridge in &selected {
                 match tor.warm_bridge(bridge).await {
                     Ok(()) => {
                         info!(bridge = %bridge, "warm-pool: channel warmed");
+                        warmed.push(bridge);
                     }
                     Err(e) => {
                         warn!(bridge = %bridge, error = %e, "warm-pool: failed to warm channel");
+                    }
+                }
+            }
+
+            // Persist channel-warm successes to the on-disk store (best-effort).
+            // Failures are deliberately not recorded: the store has no
+            // channel-failure counters by design — `chseen`/`chok` only track
+            // successes, because a failed channel warm is not proof a bridge is
+            // dead (same convention as android's `persist_warm_results`, which
+            // records successes and retirements only).
+            if !warmed.is_empty() {
+                let store_path = BridgeStore::resolve_path(config_path.as_deref());
+                match BridgeStore::load(store_path) {
+                    Ok(mut store) => {
+                        let now = OffsetDateTime::now_utc();
+                        for bridge in &warmed {
+                            store.note_channel_success_at(bridge, now);
+                        }
+                        if let Err(e) = store.save() {
+                            warn!(error = %e, "warm-pool: could not save bridge health store");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "warm-pool: could not load bridge health store");
                     }
                 }
             }
@@ -230,10 +278,21 @@ mod tests {
         "obfs4 9.9.9.9:443 1111111111111111111111111111111111111111 cert=YYY iat-mode=0";
 
     fn h(tcp_fails: u32, circuit_fails: u32, ok_count: u32) -> Health {
+        h_verified(tcp_fails, circuit_fails, ok_count, 0)
+    }
+
+    fn h_verified(
+        tcp_fails: u32,
+        circuit_fails: u32,
+        ok_count: u32,
+        verified_count: u32,
+    ) -> Health {
         Health {
             tcp_fails,
             circuit_fails,
+            verified_count,
             ok_count,
+            cobs: None,
         }
     }
 
@@ -322,6 +381,67 @@ mod tests {
             selected[0],
             bridge(OBFS4_B),
             "lower circuit_fails ranks first"
+        );
+    }
+
+    #[test]
+    fn verified_bridge_outranks_unverified_at_equal_circuit_fails() {
+        // Equal circuit_fails=0: the verified bridge wins even though the
+        // unverified one has a much higher ok_count.
+        let candidates = vec![
+            (bridge(OBFS4_A), h_verified(0, 0, 1, 7)),
+            (bridge(OBFS4_B), h(0, 0, 1000)),
+        ];
+        let selected = select_top_n(&candidates, 2);
+        assert_eq!(
+            selected,
+            vec![bridge(OBFS4_A), bridge(OBFS4_B)],
+            "circuit-verified bridge must outrank a never-verified one"
+        );
+    }
+
+    #[test]
+    fn circuit_fails_still_dominates_verification() {
+        // A with no verifications still beats B with many, because B has
+        // circuit failures and A has none.
+        let candidates = vec![
+            (bridge(OBFS4_A), h(0, 0, 1)),
+            (bridge(OBFS4_B), h_verified(0, 3, 1, 100)),
+        ];
+        let selected = select_top_n(&candidates, 2);
+        assert_eq!(
+            selected,
+            vec![bridge(OBFS4_A), bridge(OBFS4_B)],
+            "circuit_fails must dominate verified_count"
+        );
+    }
+
+    #[test]
+    fn higher_verified_count_ranks_first_among_verified() {
+        let candidates = vec![
+            (bridge(OBFS4_A), h_verified(0, 0, 0, 2)),
+            (bridge(OBFS4_B), h_verified(0, 0, 0, 50)),
+            (bridge(OBFS4_C), h_verified(0, 0, 0, 10)),
+        ];
+        let selected = select_top_n(&candidates, 3);
+        assert_eq!(
+            selected,
+            vec![bridge(OBFS4_B), bridge(OBFS4_C), bridge(OBFS4_A)],
+            "higher verified_count ranks first"
+        );
+    }
+
+    #[test]
+    fn tcp_fails_excludes_even_highly_verified_bridge() {
+        let candidates = vec![
+            (bridge(OBFS4_A), h_verified(1, 0, 100, 500)),
+            (bridge(OBFS4_B), h(0, 0, 1)),
+        ];
+        let selected = select_top_n(&candidates, 2);
+        assert_eq!(
+            selected,
+            vec![bridge(OBFS4_B)],
+            "tcp_fails > 0 excludes regardless of verified_count"
         );
     }
 

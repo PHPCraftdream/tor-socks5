@@ -6,9 +6,11 @@
 //!    public collectors; no bridge probing.
 //! 2. **drain** ([`drain_pool`]) — walk the pool **lazily, one bridge at a
 //!    time**, promote the reachable ones into the working config, and remove
-//!    every probed candidate from the pool (alive → promoted, dead →
-//!    discarded; unprobed stay for next time). Touches the network only to
-//!    the bridges; needs no Tor.
+//!    removed
+//!    from the pool (alive → promoted, dead → discarded; unprobed stay for
+//!    next time). Touches the network to the bridges; when a live [`TorTunnel`]
+//!    is available, admission also requires a real Tor channel to the bridge,
+//!    so mere TCP-alive impostors are rejected.
 //! 3. [`top_up_working`] ties them together: drain what we already have,
 //!    and only fetch more if the pool can't cover the shortfall.
 //!
@@ -22,10 +24,12 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use arti_wrapper::TorTunnel;
 use bridge_line::BridgeLine;
+use futures::future::BoxFuture;
 use tracing::{info, warn};
 
 use crate::candidate_pool::{key_of, CandidatePool, Key};
 use crate::config::Config;
+use bridge_store::BridgeStore;
 
 /// Per-bridge timeout for the **lazy** pool drain. Shorter than the startup
 /// config probe ([`crate::tor_setup::BRIDGE_PROBE_TIMEOUT`]): a live bridge's
@@ -140,14 +144,96 @@ pub(crate) async fn refresh_candidate_pool(
     Ok(added)
 }
 
+/// Injectable channel-admission check: wraps `TorTunnel::warm_bridge` so the
+/// admission decision can be tested without a network. `true` means a real
+/// Tor link handshake succeeded against the bridge.
+type ChannelCheck<'a> =
+    Box<dyn for<'b> Fn(&'b BridgeLine) -> BoxFuture<'b, bool> + Send + Sync + 'a>;
+
+/// Two-layer admission for one pool candidate: the TCP probe must pass, and
+/// when a channel check is available, the bridge must also accept a real Tor
+/// channel. `channel: None` keeps the documented cold-start fallback alive:
+/// before Tor bootstraps there is no `TorTunnel` to warm through, and getting
+/// something TCP-alive beats waiting for full channel verification — TCP-only
+/// admission is a documented fallback, not an omission.
+async fn admits_candidate(
+    tcp_latency: Option<Duration>,
+    bridge: &BridgeLine,
+    channel: Option<&ChannelCheck<'_>>,
+) -> bool {
+    let Some(latency) = tcp_latency else {
+        // TCP-dead candidates are never admitted and never channel-checked:
+        // a Tor link handshake to a dead address would only re-prove the
+        // failure the probe just established.
+        return false;
+    };
+    match channel {
+        Some(check) => {
+            if check(bridge).await {
+                info!(
+                    addr = %bridge.addr,
+                    transport = ?bridge.transport,
+                    latency_ms = latency.as_millis() as u64,
+                    "candidate reachable — Tor channel verified, promoting to working bridges"
+                );
+                true
+            } else {
+                warn!(
+                    addr = %bridge.addr,
+                    transport = ?bridge.transport,
+                    latency_ms = latency.as_millis() as u64,
+                    "candidate answered TCP but is not a Tor bridge — rejecting"
+                );
+                false
+            }
+        }
+        None => {
+            info!(
+                addr = %bridge.addr,
+                transport = ?bridge.transport,
+                latency_ms = latency.as_millis() as u64,
+                "candidate reachable — promoting to working bridges (TCP-only, no channel check available)"
+            );
+            true
+        }
+    }
+}
+
 /// Drain the candidate pool: walk it lazily (one bridge at a time), promote
 /// up to `target` reachable bridges into the working config, and remove
 /// every probed candidate from the pool. Returns how many were promoted.
 ///
-/// No Tor needed — this only probes bridge reachability directly.
+/// Admission is two-layer: a TCP probe must pass, and when `tor` is `Some`,
+/// the candidate must additionally accept a real Tor channel
+/// (`TorTunnel::warm_bridge`), so any TCP-alive non-Tor service is rejected.
+/// Passing `tor: None` deliberately falls back to TCP-only admission — that
+/// is the cold-start path, where no live tunnel exists yet to warm through.
 ///
 /// cancel-safe: NO — probes the network and writes the pool + config.
-pub(crate) async fn drain_pool(config_path: Option<&Path>, target: usize) -> Result<usize> {
+pub(crate) async fn drain_pool(
+    config_path: Option<&Path>,
+    target: usize,
+    tor: Option<&TorTunnel>,
+) -> Result<usize> {
+    let checker: Option<ChannelCheck<'static>> = tor.map(|tor| -> ChannelCheck<'static> {
+        // Clone the tunnel handle (cheap, Arc-backed) so the future owns its
+        // data and the checker is HRTB over the bridge reference alone.
+        let tor = tor.clone();
+        let check: ChannelCheck<'static> =
+            Box::new(move |bridge: &BridgeLine| -> BoxFuture<'_, bool> {
+                let tor = tor.clone();
+                Box::pin(async move { tor.warm_bridge(bridge).await.is_ok() })
+            });
+        check
+    });
+    drain_pool_with(config_path, target, checker.as_ref()).await
+}
+
+async fn drain_pool_with(
+    config_path: Option<&Path>,
+    target: usize,
+    checker: Option<&ChannelCheck<'_>>,
+) -> Result<usize> {
     if target == 0 {
         return Ok(0);
     }
@@ -168,6 +254,7 @@ pub(crate) async fn drain_pool(config_path: Option<&Path>, target: usize) -> Res
     shuffle(&mut batch);
 
     let mut promoted: Vec<BridgeLine> = Vec::new();
+    let mut channel_ok: Vec<BridgeLine> = Vec::new();
     let mut unprobed: Vec<BridgeLine> = Vec::new();
     let mut attempts = 0usize;
     for bridge in batch {
@@ -176,18 +263,14 @@ pub(crate) async fn drain_pool(config_path: Option<&Path>, target: usize) -> Res
             continue;
         }
         attempts += 1;
-        match bridge_probe::probe_one(&bridge, LAZY_PROBE_TIMEOUT).await {
-            Some(latency) => {
-                info!(
-                    addr = %bridge.addr,
-                    transport = ?bridge.transport,
-                    latency_ms = latency.as_millis() as u64,
-                    "candidate reachable — promoting to working bridges"
-                );
-                promoted.push(bridge);
+        let latency = bridge_probe::probe_one(&bridge, LAZY_PROBE_TIMEOUT).await;
+        if admits_candidate(latency, &bridge, checker).await {
+            promoted.push(bridge.clone());
+            if latency.is_some() && checker.is_some() {
+                channel_ok.push(bridge);
             }
-            None => { /* dead: already removed from the pool by take() */ }
         }
+        // Dead: already removed from the pool by take().
     }
 
     // Unprobed candidates return to the pool; probed (alive + dead) do not.
@@ -203,6 +286,31 @@ pub(crate) async fn drain_pool(config_path: Option<&Path>, target: usize) -> Res
     if promoted.is_empty() {
         return Ok(0);
     }
+
+    // Best-effort: record a channel success for every bridge admitted via a
+    // verified channel so health accounting sees the confirmation. A failed
+    // warm is never recorded — there is deliberately no channel-failure
+    // counter in the store, because a failed channel warm is not proof a
+    // bridge is dead.
+    if !channel_ok.is_empty() {
+        match BridgeStore::load(BridgeStore::resolve_path(config_path)) {
+            Ok(mut store) => {
+                let now = time::OffsetDateTime::now_utc();
+                for b in &channel_ok {
+                    // No-op for bridges the store doesn't track yet: fresh
+                    // candidates get store entries via the next probe round
+                    // after promotion (mirrors android-ffi's
+                    // `persist_warm_results`).
+                    store.note_channel_success_at(b, now);
+                }
+                if let Err(e) = store.save() {
+                    warn!(error = %e, "could not persist channel successes after drain");
+                }
+            }
+            Err(e) => warn!(error = %e, "could not load bridge store after drain"),
+        }
+    }
+
     let Some(path) = config_path else {
         return Ok(0);
     };
@@ -241,7 +349,7 @@ pub(crate) async fn top_up_working(
     if target == 0 {
         return Ok(0);
     }
-    let mut promoted = drain_pool(config_path, target).await?;
+    let mut promoted = drain_pool(config_path, target, Some(tor)).await?;
     if promoted < target && !cfg.bridges.sources.is_empty() {
         info!(
             have = promoted,
@@ -249,7 +357,57 @@ pub(crate) async fn top_up_working(
             "pool short — refreshing candidates from sources over Tor"
         );
         refresh_candidate_pool(tor, cfg, config_path, REFRESH_FETCH_TIMEOUT).await?;
-        promoted += drain_pool(config_path, target - promoted).await?;
+        promoted += drain_pool(config_path, target - promoted, Some(tor)).await?;
     }
     Ok(promoted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(ok: bool) -> ChannelCheck<'static> {
+        Box::new(move |_: &BridgeLine| Box::pin(async move { ok }))
+    }
+
+    fn bridge() -> BridgeLine {
+        "obfs4 1.2.3.4:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA iat-mode=0"
+            .parse()
+            .expect("valid bridge line")
+    }
+
+    #[tokio::test]
+    async fn tcp_ok_and_channel_ok_promotes() {
+        let b = bridge();
+        assert!(admits_candidate(Some(Duration::from_millis(120)), &b, Some(&check(true))).await);
+    }
+
+    #[tokio::test]
+    async fn tcp_ok_but_channel_fails_rejects() {
+        let b = bridge();
+        assert!(!admits_candidate(Some(Duration::from_millis(120)), &b, Some(&check(false))).await);
+    }
+
+    #[tokio::test]
+    async fn tcp_ok_with_no_channel_check_falls_back_to_tcp_only() {
+        // Documented cold-start fallback: no live tunnel to warm through.
+        let b = bridge();
+        assert!(admits_candidate(Some(Duration::from_millis(120)), &b, None).await);
+    }
+
+    #[tokio::test]
+    async fn tcp_dead_rejects_without_consulting_channel_check() {
+        let consulted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = consulted.clone();
+        let spy: ChannelCheck<'static> = Box::new(move |_: &BridgeLine| {
+            let flag = flag.clone();
+            Box::pin(async move {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                true
+            })
+        });
+        let b = bridge();
+        assert!(!admits_candidate(None, &b, Some(&spy)).await);
+        assert!(!consulted.load(std::sync::atomic::Ordering::SeqCst));
+    }
 }

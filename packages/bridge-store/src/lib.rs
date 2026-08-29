@@ -764,6 +764,23 @@ impl BridgeStore {
             .map_or(0, |e| e.circuit_fails)
     }
 
+    /// When the circuit-failure counter for a bridge was last touched (bumped
+    /// or reset), if the bridge is known to the store. `None` covers "not
+    /// tracked here". Surfaced for the soft-failover watchdog
+    /// (`apps/socks5-proxy/src/tor_watchdog.rs`), which must only signal guard
+    /// failures on evidence produced by the *current* process run — a
+    /// `circuit_fails` count inherited from a previous run's store file
+    /// (possibly days old, per docs/plans/2026-08-28-stability-plan.md §1b)
+    /// must not arm a guard-failure signal seconds after boot. Note: entries
+    /// parsed from legacy store lines without a `cobs=` field carry the Unix
+    /// epoch here, which naturally compares as stale.
+    #[must_use]
+    pub fn last_circuit_observation(&self, bridge: &BridgeLine) -> Option<OffsetDateTime> {
+        self.entries
+            .get(&key_of(bridge))
+            .map(|e| e.last_circuit_observation)
+    }
+
     /// Number of successful PT/channel warm-ups for a bridge.
     #[must_use]
     pub fn channel_ok_count(&self, bridge: &BridgeLine) -> u32 {
@@ -1406,6 +1423,32 @@ mod tests {
         s.note_circuit_success_at(&b, now);
         assert_eq!(s.len(), 0, "no entry created from a success-only signal");
         assert_eq!(s.circuit_fails(&b), 0);
+    }
+
+    #[test]
+    fn last_circuit_observation_unknown_bridge_is_none() {
+        let s = empty();
+        let b = bridge(OBFS4_A);
+        assert!(s.last_circuit_observation(&b).is_none());
+    }
+
+    #[test]
+    fn last_circuit_observation_reflects_last_touch() {
+        let mut s = empty();
+        let b = bridge(OBFS4_A);
+        let t0 = OffsetDateTime::from_unix_timestamp(2_500_000).unwrap();
+        assert!(s.note_circuit_failure_at(&b, t0, HALF_HOUR));
+        assert_eq!(s.last_circuit_observation(&b), Some(t0));
+        let t1 = t0 + HALF_HOUR + Duration::from_secs(1);
+        assert!(s.note_circuit_failure_at(&b, t1, HALF_HOUR));
+        assert_eq!(s.last_circuit_observation(&b), Some(t1));
+        let t2 = t1 + HALF_HOUR;
+        s.note_circuit_success_at(&b, t2);
+        assert_eq!(
+            s.last_circuit_observation(&b),
+            Some(t2),
+            "success resets also count as a touch"
+        );
     }
 
     #[test]

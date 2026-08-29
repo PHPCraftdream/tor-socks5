@@ -1,4 +1,5 @@
 mod arti_observability;
+mod bridge_verifier;
 mod bridge_warmer;
 mod bridges_cmd;
 mod candidate_pool;

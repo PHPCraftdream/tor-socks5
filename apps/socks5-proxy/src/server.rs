@@ -183,6 +183,15 @@ pub(crate) async fn run_server(
                 cfg.warm_pool,
             );
 
+            // Periodic circuit-level bridge verification: every 30 min, checks
+            // a small batch of channel-proven bridges for real end-to-end
+            // reachability (throwaway clients, live probe) and records the
+            // successes into the bridge store. This is the CLI counterpart of
+            // android-ffi's background circuit-verify tick; it is self-paced
+            // by store state (a tick with no due bridges is nearly free) and
+            // needs no TorHandle — it never touches the live tunnel.
+            crate::bridge_verifier::spawn_bridge_circuit_verifier(config_path.clone());
+
             Egress::Tor(handle)
         }
     };
@@ -637,7 +646,12 @@ fn spawn_bridge_maintenance(
                     want = deficit,
                     "maintenance: short on healthy bridges — draining candidate pool"
                 );
-                match crate::fetch_merge::drain_pool(config_path.as_deref(), deficit).await {
+                // Snapshot the current tunnel so admission verifies a real
+                // Tor channel; None (tunnel down) falls back to TCP-only.
+                let tor = handle.tunnel().await;
+                match crate::fetch_merge::drain_pool(config_path.as_deref(), deficit, tor.as_ref())
+                    .await
+                {
                     Ok(n) if n > 0 => info!(promoted = n, "maintenance: promoted fresh bridges"),
                     Ok(_) => {}
                     Err(e) => warn!(error = %e, "maintenance: drain failed"),

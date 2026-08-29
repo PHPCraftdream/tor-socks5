@@ -109,8 +109,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arti_wrapper::TorTunnel;
 use bridge_line::BridgeLine;
+use time::OffsetDateTime;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::bridge_warmer::{candidates_with_health, Health};
 use crate::config::{Config, WatchdogConfig};
@@ -349,6 +350,19 @@ const CONSECUTIVE_FAILURES_BEFORE_BACKOFF: u32 = 3;
 /// alone for a while", independent of how aggressive the normal cooldown is.
 const EXTENDED_REBUILD_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 
+/// How many consecutive ticks must pass with all three trigger conditions
+/// (stale success, fresh attempts, alive bridges) satisfied but the
+/// signature gate ([`should_decline_rebuild`]) declining, before the gate
+/// is overridden and the heal proceeds despite the declined signature.
+/// Two ticks at the default `check_interval_secs = 45` is ~90+ seconds of
+/// *proven* total outage: attempts kept coming, bridges were alive, and no
+/// circuit succeeded — the exact production signature (7 consecutive
+/// declined ticks at `established=0`, docs/plans/2026-08-28-stability-plan.md
+/// §1) the gate was never meant to block forever. The July incident's
+/// 8-attempts-in-218s trigger cannot reach this: it fails
+/// [`MIN_ATTEMPTS_TO_TRIGGER`] on a single tick, let alone two in a row.
+const GATED_TICKS_BEFORE_OVERRIDE: u32 = 2;
+
 /// Cooldown that will gate the *next* heal attempt after `consecutive_failures`
 /// failed attempts. Pure helper so the loop's failure branches log the
 /// cooldown that will actually apply, without duplicating the threshold.
@@ -405,6 +419,40 @@ fn should_decline_rebuild(
     !net_is_strict_max && (new_remote_timeout > 0 || new_access_failed > 0)
 }
 
+/// Whether enough consecutive gate-declined ticks have accumulated to
+/// override the signature gate (see [`GATED_TICKS_BEFORE_OVERRIDE`] and
+/// `step_gated_ticks`). The counter counts ticks in a row where the gate
+/// DECLINED while trigger conditions 1-3 held; it is reset only by a
+/// successful `TorTunnel::connect` (`reset_gated_ticks_on_success`) or by
+/// an actually-performed heal of any outcome. Pure: no side effects.
+fn should_override_decline(gated_ticks: u32) -> bool {
+    gated_ticks >= GATED_TICKS_BEFORE_OVERRIDE
+}
+
+/// Advance the gate-escalation counter for one tick: a declined gate
+/// increments the consecutive-declined-ticks counter; a tick where the
+/// gate passes neither increments nor resets it (the counter simply stays
+/// put and keeps counting from where it was on the next declined tick).
+fn step_gated_ticks(gated_ticks: u32, gate_declined: bool) -> u32 {
+    if gate_declined {
+        gated_ticks.saturating_add(1)
+    } else {
+        gated_ticks
+    }
+}
+
+/// Reset the gate-escalation counter when a successful `TorTunnel::connect`
+/// happened since the previous tick (`last_success` moved) — the outage was
+/// demonstrably interrupted, so the escalation restarts from zero. A tick
+/// without a new success leaves the counter untouched.
+fn reset_gated_ticks_on_success(gated_ticks: u32, success_since_prev_tick: bool) -> u32 {
+    if success_since_prev_tick {
+        0
+    } else {
+        gated_ticks
+    }
+}
+
 /// Decide whether the current bridge's circuit-layer health has degraded
 /// enough — relative to the healthiest configured alternative — that arti's
 /// guard manager should be nudged away from it.
@@ -448,6 +496,54 @@ fn should_signal_failover(
     margin >= min_margin
 }
 
+/// Maximum number of guard-failure signals this process will send for any
+/// single bridge over its entire lifetime. Production showed the
+/// failover task signalling the same ~10 bridges every ~5 minutes for a
+/// whole run (7-12 signals each) with no rehabilitation path — a bridge
+/// pushed out of rotation cannot reset its `circuit_fails` (reset only
+/// happens on a successful circuit), so after cooldown expiry it gets
+/// signalled again forever. The budget turns that metronome into a rare
+/// correction: either the bridge recovers via Phase 2 verification /
+/// pruning, or arti handles it, or we stop punishing it (see
+/// docs/plans/2026-08-28-stability-plan.md §1b, principle "every actuator
+/// gets a budget and backoff").
+const MAX_SIGNALS_PER_BRIDGE: u32 = 3;
+
+/// Per-bridge failover-signal bookkeeping, keyed by the bridge's canonical
+/// string form (the same key `last_signalled` used before this became a
+/// struct).
+#[derive(Default)]
+struct SignalRecord {
+    /// When this bridge was last successfully signalled, for the
+    /// per-bridge cooldown. `None` = never signalled.
+    last: Option<Instant>,
+    /// How many signals were successfully sent for this bridge so far.
+    /// Budget: never exceeds [`MAX_SIGNALS_PER_BRIDGE`].
+    count: u32,
+    /// Whether the one-time "giving up on signalling" INFO has already
+    /// been logged for this bridge — without the flag the budget
+    /// exhaustion would either stay silent forever or re-log every tick.
+    exhausted_logged: bool,
+}
+
+/// Whether a bridge's circuit-layer evidence was produced by the CURRENT
+/// process run: the observation must exist and be strictly newer than the
+/// moment the failover task started. Evidence inherited from a previous
+/// run (the store can be days old — production fired its first signal
+/// volley 45 seconds after boot on `cobs` from three days earlier) must
+/// not arm a guard-failure signal against a freshly bootstrapped client.
+/// `None` (bridge unknown to the store, or a legacy store line without a
+/// `cobs=` timestamp, which parses as the Unix epoch) compares as stale.
+fn evidence_is_fresh(cobs: Option<OffsetDateTime>, task_start: OffsetDateTime) -> bool {
+    cobs.is_some_and(|cobs| cobs > task_start)
+}
+
+/// Whether the per-bridge signal budget still has room for one more
+/// signal.
+fn signal_budget_available(signals_sent: u32) -> bool {
+    signals_sent < MAX_SIGNALS_PER_BRIDGE
+}
+
 /// Spawn the soft-failover watchdog as a detached tokio task.
 ///
 /// There is no public arti API to ask "which bridge is currently the
@@ -473,6 +569,17 @@ fn should_signal_failover(
 /// (there is no swap performed here). A per-bridge cooldown
 /// (`failover_signal_cooldown_secs`) prevents re-signalling the same bridge
 /// every tick while it hovers at/above the threshold.
+///
+/// Two further constraints bound the signaler (see
+/// docs/plans/2026-08-28-stability-plan.md §1b):
+/// - **Freshness**: a signal is only armed when the bridge's circuit-layer
+///   evidence (`Health::cobs`) is strictly newer than this task's start —
+///   observations inherited from a previous run must not push a guard
+///   decision against a freshly bootstrapped client (see
+///   `evidence_is_fresh`).
+/// - **Budget**: at most [`MAX_SIGNALS_PER_BRIDGE`] signals per bridge per
+///   process; once exhausted, a one-time INFO is logged and the bridge is
+///   never signalled again by this task.
 ///
 /// A `check_interval_secs == 0` (or `enabled == false`) config disables
 /// this the same way it disables [`spawn_tor_watchdog`] — the two share one
@@ -504,11 +611,18 @@ pub fn spawn_bridge_failover_watchdog(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticker.tick().await; // consume the immediate first tick
 
-        // Per-bridge last-signalled time, keyed by the bridge's canonical
-        // string form (`BridgeLine` has no `Eq`/`Hash` impl of its own).
-        // Rate-limits re-signalling the same degraded bridge every tick —
-        // mirrors `rebuild_cooldown_secs`'s role for channel termination.
-        let mut last_signalled: HashMap<String, Instant> = HashMap::new();
+        // Per-bridge last-signalled time and signal budget, keyed by the
+        // bridge's canonical string form (`BridgeLine` has no `Eq`/`Hash`
+        // impl of its own). Rate-limits re-signalling the same degraded
+        // bridge every tick — mirrors `rebuild_cooldown_secs`'s role for
+        // channel termination — and caps the total signals per bridge for
+        // the process's whole lifetime (see [`SignalRecord`]).
+        let mut signalled: HashMap<String, SignalRecord> = HashMap::new();
+
+        // Freshness anchor: circuit-layer observations older than this moment
+        // are inherited from a previous run and never arm a signal (see
+        // `evidence_is_fresh`).
+        let task_start = OffsetDateTime::now_utc();
 
         loop {
             ticker.tick().await;
@@ -537,6 +651,15 @@ pub fn spawn_bridge_failover_watchdog(
                     continue;
                 }
 
+                if !evidence_is_fresh(health.cobs, task_start) {
+                    debug!(
+                        bridge = %bridge,
+                        "soft-failover: circuit-failure evidence predates this process — \
+                         ignoring stale evidence"
+                    );
+                    continue;
+                }
+
                 let alternatives: Vec<(BridgeLine, Health)> = candidates
                     .iter()
                     .enumerate()
@@ -556,11 +679,23 @@ pub fn spawn_bridge_failover_watchdog(
                     continue;
                 }
 
-                let key = bridge.to_string();
-                if let Some(last) = last_signalled.get(&key) {
+                let record = signalled.entry(bridge.to_string()).or_default();
+                if let Some(last) = record.last {
                     if last.elapsed() < signal_cooldown {
                         continue;
                     }
+                }
+                if !signal_budget_available(record.count) {
+                    if !record.exhausted_logged {
+                        info!(
+                            bridge = %bridge,
+                            signals_sent = record.count,
+                            "soft-failover: giving up on signalling this bridge — \
+                             per-bridge signal budget exhausted"
+                        );
+                        record.exhausted_logged = true;
+                    }
+                    continue;
                 }
 
                 warn!(
@@ -572,7 +707,8 @@ pub fn spawn_bridge_failover_watchdog(
                 );
                 match tor.signal_bridge_failure(bridge, arti_wrapper::ExternalActivity::DirCache) {
                     Ok(()) => {
-                        last_signalled.insert(key, Instant::now());
+                        record.last = Some(Instant::now());
+                        record.count += 1;
                     }
                     Err(e) => {
                         warn!(bridge = %bridge, error = %e, "soft-failover: failed to signal guard failure");
@@ -637,6 +773,11 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
         ticker.tick().await; // consume the immediate first tick
 
         let mut prev_attempts = handle.health().attempt_count();
+        let mut prev_last_success = handle.health().last_success_secs();
+        // Consecutive ticks during which conditions 1-3 held but the signature
+        // gate declined the heal (see `step_gated_ticks` /
+        // `should_override_decline`). Reset by any success or any performed heal.
+        let mut gated_ticks: u32 = 0;
         // Baselines for the signature gate (see `should_decline_rebuild`):
         // same delta-between-ticks convention as `prev_attempts` above, one
         // per classified failure kind.
@@ -657,6 +798,12 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
             let health = handle.health();
             let now_secs = unix_secs();
             let last_success = health.last_success_secs();
+            // Any successful connect since the previous tick restarts the gate
+            // escalation — even if this tick exits early below, the outage was
+            // demonstrably interrupted.
+            gated_ticks =
+                reset_gated_ticks_on_success(gated_ticks, last_success != prev_last_success);
+            prev_last_success = last_success;
             let attempts = health.attempt_count();
             let new_attempts = attempts.saturating_sub(prev_attempts);
             prev_attempts = attempts;
@@ -721,17 +868,37 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
             // the cooldown timer does not arm and a legitimate heal is not
             // deferred if the signature flips to net-timeout-dominated on a
             // later tick.
-            if should_decline_rebuild(new_remote_timeout, new_access_failed, new_net_timeout) {
-                warn!(
-                    new_remote_timeout,
-                    new_access_failed,
-                    new_net_timeout,
-                    "declining channel termination: failures in this window are \
-                     RemoteNetworkTimeout/TorAccessFailed, not TorNetworkTimeout \
-                     — reconnecting over the same guards would reproduce the same \
-                     state, not fix it"
-                );
-                continue;
+            //
+            // After [`GATED_TICKS_BEFORE_OVERRIDE`] consecutive declined
+            // ticks the gate is overridden: the heal proceeds anyway (with
+            // cooldown/backoff/canary still applying), per the stability plan
+            // §1a — a sustained total outage is worth healing even when the
+            // failure signature is ambiguous.
+            let gate_declined =
+                should_decline_rebuild(new_remote_timeout, new_access_failed, new_net_timeout);
+            gated_ticks = step_gated_ticks(gated_ticks, gate_declined);
+            if gate_declined {
+                if should_override_decline(gated_ticks) {
+                    warn!(
+                        gated_ticks,
+                        new_remote_timeout,
+                        new_access_failed,
+                        new_net_timeout,
+                        "signature override: total outage persists — healing despite a \
+                         RemoteNetworkTimeout/TorAccessFailed-dominated window"
+                    );
+                } else {
+                    warn!(
+                        new_remote_timeout,
+                        new_access_failed,
+                        new_net_timeout,
+                        "declining channel termination: failures in this window are \
+                         RemoteNetworkTimeout/TorAccessFailed, not TorNetworkTimeout \
+                         — reconnecting over the same guards would reproduce the same \
+                         state, not fix it"
+                    );
+                    continue;
+                }
             }
             // Cooldown: never act more often than configured, even when it
             // cannot help (a real network block). After a run of consecutive
@@ -817,6 +984,10 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
                     );
                 }
             }
+            // A heal was performed — the gate escalation restarts regardless of
+            // outcome; how soon the *next* heal may run is the cooldown/backoff
+            // machinery's job, not this counter's.
+            gated_ticks = 0;
         }
     });
 }
@@ -1244,6 +1415,118 @@ mod tests {
         assert!(!should_signal_failover(10, 6, 3, 5));
     }
 
+    // -- gated-tick heal override --------------------------------------------
+
+    fn obs(unix: i64) -> Option<OffsetDateTime> {
+        Some(OffsetDateTime::from_unix_timestamp(unix).expect("valid timestamp"))
+    }
+
+    #[test]
+    fn should_override_decline_requires_two_gated_ticks() {
+        // One declined tick is not enough; two (or more) override the gate.
+        assert!(!should_override_decline(0));
+        assert!(!should_override_decline(1));
+        assert!(should_override_decline(2));
+        assert!(should_override_decline(3));
+    }
+
+    #[test]
+    fn incident_signature_single_gated_tick_does_not_escalate() {
+        // The July incident (8 attempts / 218 s, all RemoteNetworkTimeout)
+        // is exactly the signature the gate declines...
+        assert!(should_decline_rebuild(8, 0, 0));
+        // ...but a single declined tick must not reach the override.
+        let gated = step_gated_ticks(0, true);
+        assert!(!should_override_decline(gated));
+    }
+
+    #[test]
+    fn two_consecutive_gated_ticks_trigger_override() {
+        // Today's production signature: two fully-failed ticks in a row
+        // escalate to a heal despite the declined signature.
+        let gated = step_gated_ticks(step_gated_ticks(0, true), true);
+        assert!(should_override_decline(gated));
+    }
+
+    #[test]
+    fn success_between_gated_ticks_restarts_escalation() {
+        // One declined tick has accumulated...
+        let gated = step_gated_ticks(0, true);
+        assert_eq!(gated, 1);
+        // ...then a success happens — the counter resets to zero...
+        assert_eq!(reset_gated_ticks_on_success(gated, true), 0);
+        // ...and the next declined tick starts counting from scratch, so it
+        // must NOT override.
+        let restarted = step_gated_ticks(0, true);
+        assert!(!should_override_decline(restarted));
+        // One more declined tick (two in a row again) must.
+        assert!(should_override_decline(step_gated_ticks(restarted, true)));
+    }
+
+    #[test]
+    fn no_success_leaves_gated_counter_alone() {
+        // Without a new success the reset is a no-op.
+        assert_eq!(reset_gated_ticks_on_success(1, false), 1);
+    }
+
+    // -- failover freshness + signal budget -----------------------------------
+
+    #[test]
+    fn stale_circuit_evidence_blocks_signal() {
+        let task_start = obs(2_000_000).expect("task start");
+        // Strictly older than the task start: inherited from a previous run.
+        assert!(!evidence_is_fresh(obs(1_999_999), task_start));
+        // No observation at all compares as stale.
+        assert!(!evidence_is_fresh(None, task_start));
+        // Equal is NOT fresh — strictly newer required.
+        assert!(!evidence_is_fresh(obs(2_000_000), task_start));
+    }
+
+    #[test]
+    fn fresh_circuit_evidence_allows_signal() {
+        let task_start = obs(2_000_000).expect("task start");
+        assert!(evidence_is_fresh(obs(2_000_001), task_start));
+    }
+
+    #[test]
+    fn signal_budget_caps_at_three_signals() {
+        assert!(signal_budget_available(0));
+        assert!(signal_budget_available(1));
+        assert!(signal_budget_available(2));
+        assert!(!signal_budget_available(3));
+        assert!(!signal_budget_available(4));
+    }
+
+    #[test]
+    fn signal_budget_is_per_bridge() {
+        // One bridge exhausts its budget...
+        let exhausted = SignalRecord {
+            count: MAX_SIGNALS_PER_BRIDGE,
+            ..Default::default()
+        };
+        assert!(!signal_budget_available(exhausted.count));
+        // ...another bridge starts fresh — the budget is per-bridge.
+        let fresh = SignalRecord::default();
+        assert!(signal_budget_available(fresh.count));
+    }
+
+    #[test]
+    fn budget_exhaustion_logs_once() {
+        let mut r = SignalRecord {
+            count: 3,
+            exhausted_logged: false,
+            last: None,
+        };
+        // First pass: budget is gone and the flag has not been set yet —
+        // this is where the one-time INFO fires.
+        assert!(!signal_budget_available(r.count));
+        assert!(!r.exhausted_logged);
+        r.exhausted_logged = true;
+        // Second pass: the flag is set, so no repeated logging.
+        assert!(!signal_budget_available(r.count));
+        assert!(r.exhausted_logged);
+    }
+
     // -- healthiest -----------------------------------------------------------
 
     fn bridge(line: &str) -> BridgeLine {
@@ -1254,7 +1537,9 @@ mod tests {
         Health {
             tcp_fails,
             circuit_fails,
+            verified_count: 0,
             ok_count,
+            cobs: None,
         }
     }
 
