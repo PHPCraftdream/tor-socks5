@@ -203,15 +203,132 @@ fn snapshot_cache_dir(src: &Path, dest: &Path) -> bool {
 /// - **A cache snapshot, not the live directory** — see
 ///   [`snapshot_cache_dir`].
 ///
-/// Deliberately NOT ported: android's `pt_reap` child-kill helper
-/// (lib.rs, `#[cfg(target_os = "android")]`). It exists because
-/// `tor-ptmgr`'s graceful-shutdown thread is a plain OS thread blocked in a
-/// synchronous read of the PT child's stdout, and on Android nothing else
-/// reaps the leaked child. On desktop (this CLI), leaked PT children are
-/// reaped by the process-wide Job Object at exit, and with
-/// [`CIRCUIT_VERIFY_BATCH`] = 2 every 30 minutes the worst-case growth is
-/// bounded — production should still observe PT child counts after long
-/// sessions to confirm that assumption holds.
+/// Ported: android's `pt_reap` child-kill helper (lib.rs:1599-1660), now as
+/// the Win32-based [`pt_reap`] module below. It exists because `tor-ptmgr`
+/// 0.43's graceful-shutdown thread is a plain OS thread blocked in a
+/// synchronous read of the PT child's stdout, so an idle PT child is never
+/// noticed or terminated. Here the child is our own binary re-invoked with
+/// `TOR_PT_MANAGED_TRANSPORT_VER`, and it survives every throwaway client's
+/// drop and runtime shutdown. The process-wide Job Object only fires at
+/// whole-process exit, so it cannot bound per-tick growth in a long-lived
+/// service (production: 22 orphaned processes after ~13h, 1-2 per tick). The
+/// snapshot-before/diff-and-kill-after pairing per bridge check is narrow by
+/// construction: the main engine's own long-lived PT predates the baseline
+/// and is never a candidate.
+#[cfg(windows)]
+mod pt_reap {
+    use std::collections::HashSet;
+
+    /// PIDs of live children of this process, read from the Win32 process
+    /// snapshot. Like /proc on Linux, the process tree has no concept of
+    /// "which logical client spawned this" — every child of our own PID shows
+    /// up here regardless of which throwaway `TorTunnel` (or the long-lived
+    /// main engine) started it, which is why callers snapshot this immediately
+    /// before their own check and diff against a fresh snapshot after, rather
+    /// than trusting any single call's result alone.
+    pub(crate) fn own_child_pids() -> HashSet<u32> {
+        use std::mem::{size_of, zeroed};
+
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+
+        // SAFETY: CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) per its
+        // documented contract takes a snapshot of every process on the system;
+        // INVALID_HANDLE_VALUE means failure and there is nothing to clean up.
+        // Best-effort, like android's /proc read-failure path: return empty.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
+            return HashSet::new();
+        }
+
+        let mut children = HashSet::new();
+        // SAFETY: `entry` is a fully-initialized PROCESSENTRY32W (the all-zero
+        // bit pattern from `zeroed()` is valid — all fields are integers or
+        // fixed-size arrays), with dwSize set to its exact size before the
+        // first Process32FirstW call, as the contract requires.
+        let mut entry: PROCESSENTRY32W = unsafe { zeroed() };
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+
+        // SAFETY: Process32FirstW/Process32NextW iterate the snapshot handle
+        // from CreateToolhelp32Snapshot above, filling `entry` (dwSize kept
+        // set) until Next reports there are no more entries.
+        unsafe {
+            if Process32FirstW(snapshot, &mut entry) != 0 {
+                let my_pid = GetCurrentProcessId();
+                loop {
+                    if entry.th32ParentProcessID == my_pid {
+                        children.insert(entry.th32ProcessID);
+                    }
+                    if Process32NextW(snapshot, &mut entry) == 0 {
+                        break;
+                    }
+                }
+            }
+
+            // SAFETY: `snapshot` is a live handle we own from
+            // CreateToolhelp32Snapshot; unlike shutdown.rs's job object it is
+            // not meant to leak, so close it when done iterating.
+            CloseHandle(snapshot);
+        }
+        children
+    }
+
+    /// Kills (`TerminateProcess`) every currently-live child not present in
+    /// `baseline`. Narrow by construction, not by filtering on process name:
+    /// a caller that snapshots `baseline` immediately before its own check,
+    /// and calls this immediately after, only ever sees its own check's child
+    /// as "new" — the main engine's own long-lived PT child was already
+    /// running before the snapshot and is therefore never a candidate.
+    pub(crate) fn kill_new_children(baseline: &HashSet<u32>) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+        };
+
+        for pid in own_child_pids() {
+            if baseline.contains(&pid) {
+                continue;
+            }
+            // SAFETY: `pid` was just observed as our own child in a fresh
+            // snapshot; we only ask for PROCESS_TERMINATE. A null return means
+            // the process already exited between the snapshots — that is the
+            // expected race, and failure is not an error worth surfacing: the
+            // end state either way is "not running". Otherwise we terminate
+            // with an arbitrary non-zero exit code (matching android's
+            // SIGKILL) and close the handle we opened.
+            let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+            if handle.is_null() {
+                continue;
+            }
+            unsafe {
+                TerminateProcess(handle, 1);
+                CloseHandle(handle);
+            }
+            tracing::info!(pid, "circuit-verify: killed leaked PT child process");
+        }
+    }
+}
+
+/// Non-Windows stub: mirrors android-ffi's non-android stub. Host builds
+/// (`cargo test`) never spawn a real PT child, so there is nothing to reap.
+/// See the `#[cfg(windows)]` module above for the Win32 implementation and
+/// `packages/android-ffi/src/lib.rs` (`#[cfg(target_os = "android")]`) for
+/// the original.
+#[cfg(not(windows))]
+mod pt_reap {
+    use std::collections::HashSet;
+
+    pub(crate) fn own_child_pids() -> HashSet<u32> {
+        HashSet::new()
+    }
+
+    pub(crate) fn kill_new_children(_baseline: &HashSet<u32>) {}
+}
+
 pub(crate) fn verify_bridges_sequential(
     live_cache_dir: &Path,
     scratch_base: &Path,
@@ -262,6 +379,7 @@ pub(crate) fn verify_bridges_sequential(
             cache_dir: cache_dir.clone(),
             state_dir: check_dir.clone(),
         };
+        let baseline_children = pt_reap::own_child_pids();
         let result = rt.block_on(arti_wrapper::TorTunnel::verify_bridge_reachable(
             check,
             (LIVE_PROBE_TARGET, LIVE_PROBE_PORT),
@@ -269,6 +387,7 @@ pub(crate) fn verify_bridges_sequential(
             probe_timeout,
         ));
         rt.shutdown_timeout(VERIFY_RUNTIME_SHUTDOWN_GRACE);
+        pt_reap::kill_new_children(&baseline_children);
 
         on_result(&bridge, result.map_err(|e| e.to_string()));
         let _ = std::fs::remove_dir_all(&check_dir);
@@ -320,6 +439,11 @@ fn persist_circuit_verify_results(results: &[(BridgeLine, bool)], config_path: O
 mod tests {
     use super::*;
     use std::time::Duration as StdDuration;
+
+    #[test]
+    fn own_child_pids_never_contains_self() {
+        assert!(!pt_reap::own_child_pids().contains(&std::process::id()));
+    }
 
     fn seed_failed_bridge(dir: &Path, bridge: &BridgeLine) -> Option<PathBuf> {
         let config_path = Some(dir.join("tor-socks5.ktav"));
