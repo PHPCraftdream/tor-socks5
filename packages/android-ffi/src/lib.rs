@@ -1473,6 +1473,20 @@ pub(crate) fn arti_cache_dir(config_path: &std::path::Path) -> std::path::PathBu
         .join("cache")
 }
 
+/// A scratch directory for [`verify_bridges_sequential`]'s per-bridge check state and cache-dir
+/// snapshot, named `<config file's directory>/verify-scratch/<name>`. Deliberately *not*
+/// `std::env::temp_dir()`: that resolves to `/tmp` on Android (via `TMPDIR`'s absence), a path
+/// no app is allowed to write to under SELinux -- confirmed on a retail device (`create_dir_all`
+/// fails there, though not on the emulator, which is looser). `config_path`'s own directory is
+/// always inside the app's private storage, so it is guaranteed writable.
+pub(crate) fn scratch_dir(config_path: &std::path::Path, name: &str) -> std::path::PathBuf {
+    config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("verify-scratch")
+        .join(name)
+}
+
 /// Recursively copies every regular file under `src` into `dest` (creating
 /// directories as needed). Used to snapshot the live engine's directory
 /// cache for [`verify_bridges_sequential`] -- see that function's doc for why
@@ -1679,9 +1693,9 @@ fn verify_bridges_blocking(
     pt_binary: Option<std::path::PathBuf>,
     callback: &callback::JavaBridgeCheckCallback,
 ) {
-    let live_cache_dir = arti_cache_dir(std::path::Path::new(config_path));
-    let scratch_base =
-        std::env::temp_dir().join(format!("torsocks5-bridge-check-{}", std::process::id()));
+    let config_path = std::path::Path::new(config_path);
+    let live_cache_dir = arti_cache_dir(config_path);
+    let scratch_base = scratch_dir(config_path, &format!("bridge-check-{}", std::process::id()));
 
     verify_bridges_sequential(
         &live_cache_dir,

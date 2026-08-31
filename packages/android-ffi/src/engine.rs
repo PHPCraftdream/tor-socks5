@@ -1234,8 +1234,18 @@ async fn stall_watchdog(
                     .as_deref()
                     .map(crate::arti_cache_dir)
                     .unwrap_or_else(|| std::path::PathBuf::from("arti-data/cache"));
-                let scratch_base = std::env::temp_dir()
-                    .join(format!("torsocks5-circuit-verify-{}", std::process::id()));
+                let scratch_base = bridge_health
+                    .config_path
+                    .as_deref()
+                    .map(|p| {
+                        crate::scratch_dir(p, &format!("circuit-verify-{}", std::process::id()))
+                    })
+                    .unwrap_or_else(|| {
+                        std::path::PathBuf::from(format!(
+                            "verify-scratch/circuit-verify-{}",
+                            std::process::id()
+                        ))
+                    });
                 let verify_pt_binary = pt_binary.clone();
                 let verify_health = bridge_health.clone();
                 tokio::spawn(async move {
