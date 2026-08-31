@@ -35,6 +35,12 @@ use tracing::{debug, error, info, warn};
 /// concurrency to avoid resource exhaustion under connection floods.
 const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 
+/// Pause before retrying after a failed `accept()`. Any accept error is
+/// treated as transient: the loop logs it and retries instead of tearing
+/// down the whole engine. The sleep also prevents a busy-spin (and a log
+/// flood) if the error is persistent.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(500);
+
 /// Keep channel warm-up bounded even when a bridge refresh has produced thousands of TCP-live
 /// candidates. The full candidate set remains persisted and is re-probed on later runs; only the
 /// best-ranked slice is worth holding open for immediate rotation.
@@ -1859,7 +1865,8 @@ fn persist_circuit_verify_results(
 /// 4. Bidirectionally copies data.
 ///
 /// All errors are logged and swallowed; individual connection failures don't
-/// crash the loop.
+/// crash the loop. Accept errors are also treated as transient and retried
+/// after `ACCEPT_ERROR_BACKOFF`.
 async fn accept_loop(
     listener: &TcpListener,
     tunnel: &TorTunnel,
@@ -1867,8 +1874,16 @@ async fn accept_loop(
     policy: ConnectionPolicy,
 ) -> Result<()> {
     loop {
-        // Accept a new connection
-        let (client, peer) = listener.accept().await.context("accept failed")?;
+        // Accept a new connection; any accept error is treated as transient —
+        // log it, back off, and retry instead of tearing down the engine.
+        let (client, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                error!(?e, "accept failed; retrying in {ACCEPT_ERROR_BACKOFF:?}");
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                continue;
+            }
+        };
 
         // Acquire a permit before spawning (bounds task growth)
         let permit = permits
@@ -2070,8 +2085,9 @@ mod auth_wiring_tests {
     //! short-circuits before `tunnel.connect` / `socks5_proto::reply` run.
 
     use std::sync::Arc;
+    use std::time::Duration;
 
-    use super::onion_destination_allowed;
+    use super::{onion_destination_allowed, ACCEPT_ERROR_BACKOFF};
     use auth::{AuthState, User, UsersConfig};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -2126,6 +2142,12 @@ mod auth_wiring_tests {
 
         let _ = client_task.await;
         result
+    }
+
+    #[test]
+    fn accept_error_backoff_is_sane() {
+        assert!(ACCEPT_ERROR_BACKOFF > Duration::ZERO);
+        assert!(ACCEPT_ERROR_BACKOFF <= Duration::from_secs(5));
     }
 
     #[tokio::test]

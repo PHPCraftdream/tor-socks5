@@ -24,6 +24,12 @@ use crate::{shutdown, upstream};
 /// exhaustion under connection floods.
 const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 
+/// Pause before retrying after a failed `accept()`. Any accept error is
+/// treated as transient: the loop logs it and retries instead of tearing
+/// down the whole server. The sleep also prevents a busy-spin (and a log
+/// flood) if the error is persistent.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(500);
+
 /// Where accepted connections egress. An enabled upstream SOCKS5 proxy
 /// replaces Tor entirely.
 #[derive(Clone)]
@@ -213,8 +219,8 @@ pub(crate) async fn run_server(
         biased;
         () = shutdown => {}
         _ = accept_loop(listener, egress.clone(), auth_state.clone(), Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS)), conn_health.clone(), cfg.security.block_onion) => {
-            // The accept loop is unbounded: this branch means the listener
-            // died (probably an OS error we already logged).
+            // The accept loop retries accept errors internally with a
+            // backoff, so this branch means the loop itself ended.
             warn!("accept loop exited unexpectedly");
         }
     }
@@ -286,8 +292,9 @@ async fn accept_loop(
         let (client, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
-                error!(?e, "accept failed");
-                return;
+                error!(?e, "accept failed; retrying in {ACCEPT_ERROR_BACKOFF:?}");
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                continue;
             }
         };
         let egress = egress.clone();
@@ -788,6 +795,12 @@ mod tests {
         assert!(!onion_permitted(Some(&disabled), Some("ghost")));
         // Auth required but the request carries no account: fail-closed.
         assert!(!onion_permitted(Some(&disabled), None));
+    }
+
+    #[test]
+    fn accept_error_backoff_is_sane() {
+        assert!(ACCEPT_ERROR_BACKOFF > Duration::ZERO);
+        assert!(ACCEPT_ERROR_BACKOFF <= Duration::from_secs(5));
     }
 
     #[tokio::test]
