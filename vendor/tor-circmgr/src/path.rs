@@ -412,6 +412,7 @@ fn ensure_unique_hops<'a>(hops: &'a [MaybeOwnedRelay<'a>]) -> StdResult<(), Bug>
 // would leave fewer than this many usable middle/exit candidates, we fall
 // back to the stock unfiltered selection instead — an over-aggressive
 // floor must degrade to "usually fast", never to "cannot build circuits".
+/// Minimum candidate count retained when applying a bandwidth floor.
 const MIN_FILTERED_POOL: usize = 20;
 
 /// tor-socks5 local patch (docs/circuit-speed-plan.md Tier 2): pick a
@@ -515,11 +516,7 @@ fn bandwidth_percentile_threshold(sorted: &[RelayWeight], percentile: u8) -> Rel
     // into range (p >= 100 selects only relays carrying the maximum
     // weight). The product cannot overflow usize on any realistic
     // consensus (n <= ~10_000 relays, p <= 255 → n * p <= ~2.55M).
-    let idx = (sorted
-        .len()
-        .saturating_mul(percentile as usize)
-        / 100)
-        .min(sorted.len() - 1);
+    let idx = (sorted.len().saturating_mul(percentile as usize) / 100).min(sorted.len() - 1);
     sorted[idx]
 }
 
@@ -627,7 +624,7 @@ mod bandwidth_floor_tests {
 
     #[test]
     fn percentile_threshold_indices() {
-        let weights: Vec<RelayWeight> = (1..=100u64).map(RelayWeight::from).collect();
+        let weights: Vec<RelayWeight> = (1..=100_u64).map(RelayWeight::from).collect();
         // 50th percentile of 100 values: index 50 (value 51).
         assert_eq!(
             bandwidth_percentile_threshold(&weights, 50),

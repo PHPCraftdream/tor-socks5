@@ -131,6 +131,36 @@ impl CandidatePool {
         taken
     }
 
+    /// Select across the whole pool; other transports keep their queue positions.
+    pub fn take_transport(&mut self, n: usize, transport: Option<&str>) -> Vec<BridgeLine> {
+        if transport.is_none() {
+            return self.take(n);
+        }
+        let mut taken = Vec::new();
+        self.bridges.retain(|bridge| {
+            if taken.len() < n && bridge.transport.as_deref() == transport {
+                taken.push(bridge.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for bridge in &taken {
+            self.keys.remove(&key_of(bridge));
+        }
+        taken
+    }
+
+    pub fn prioritize(&mut self, fresh: &[BridgeLine], transport: Option<&str>) {
+        let keys: HashSet<_> = fresh
+            .iter()
+            .filter(|bridge| transport.is_none_or(|name| bridge.transport.as_deref() == Some(name)))
+            .map(key_of)
+            .collect();
+        self.bridges
+            .sort_by_key(|bridge| !keys.contains(&key_of(bridge)));
+    }
+
     /// Put bridges back at the front of the pool (e.g. a taken batch that
     /// was not probed this round), preserving dedup.
     pub fn return_front(&mut self, bridges: Vec<BridgeLine>) {
@@ -257,6 +287,35 @@ mod tests {
         assert_eq!(p.len(), 1, "one left");
         // Re-merging a taken one succeeds (it was removed from keys).
         assert_eq!(p.merge(vec![b(A)], &HashSet::new()), 1);
+    }
+
+    #[test]
+    fn preferred_transport_is_found_beyond_the_front_batch() {
+        let mut pool = empty(PathBuf::from("mem"));
+        let obfs: Vec<_> = (1..=100)
+            .map(|i| {
+                b(&format!(
+                    "obfs4 1.2.3.{i}:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA"
+                ))
+            })
+            .collect();
+        pool.merge(obfs.clone(), &HashSet::new());
+        pool.merge([b(WT)], &HashSet::new());
+        assert_eq!(pool.take_transport(1, Some("webtunnel")), vec![b(WT)]);
+        assert_eq!(pool.take(100), obfs, "fallback candidates must stay queued");
+    }
+
+    #[test]
+    fn a_migrated_tested_list_moves_a_cached_candidate_to_the_front() {
+        let mut pool = empty(PathBuf::from("mem"));
+        let wt = b(WT);
+        let mut old = wt.clone();
+        old.fingerprint = Some("2222222222222222222222222222222222222222".into());
+        pool.merge([b(A), old.clone(), wt.clone()], &HashSet::new());
+        pool.prioritize(std::slice::from_ref(&wt), Some("webtunnel"));
+        assert_eq!(pool.take_transport(1, Some("webtunnel")), vec![wt]);
+        assert_eq!(pool.take_transport(1, Some("webtunnel")), vec![old]);
+        assert_eq!(pool.take(1), vec![b(A)]);
     }
 
     #[test]

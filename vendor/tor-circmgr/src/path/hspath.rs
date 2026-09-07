@@ -432,6 +432,9 @@ mod test {
     use std::sync::Arc;
 
     use super::*;
+    use crate::path::OwnedPath;
+    use tor_basic_utils::test_rng::testing_rng;
+    use tor_netdir::testnet::construct_custom_netdir;
 
     use tor_linkspec::{ChannelMethod, OwnedCircTarget};
     use tor_netdir::{NetDirProvider, testnet::NodeBuilders, testprovider::TestNetDirProvider};
@@ -441,10 +444,7 @@ mod test {
     use tor_rtmock::MockRuntime;
 
     #[cfg(all(feature = "vanguards", feature = "hs-common"))]
-    use {
-        crate::path::OwnedPath, tor_basic_utils::test_rng::testing_rng,
-        tor_guardmgr::VanguardMgrError, tor_netdir::testnet::construct_custom_netdir,
-    };
+    use tor_guardmgr::VanguardMgrError;
 
     /// The maximum number of relays in a test network.
     const MAX_NET_SIZE: usize = 40;
@@ -588,6 +588,7 @@ mod test {
     }
 
     /// Helper for calling `HsPathBuilder::pick_path_with_vanguards`.
+    #[cfg(all(feature = "vanguards", feature = "hs-common"))]
     async fn pick_vanguard_path<'a>(
         runtime: &MockRuntime,
         netdir: &'a NetDir,

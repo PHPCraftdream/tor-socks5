@@ -4128,8 +4128,6 @@ dependencies = [
 [[package]]
 name = "ptrs-gesher-bridge-line"
 version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3831a7f47cede698e2dd6fc95efb15e8ba38502da922b2b544f8e748c48285e"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -4137,8 +4135,6 @@ dependencies = [
 [[package]]
 name = "ptrs-gesher-core"
 version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b4964e94a68a171d8922023afd54a0d3f266b4af61aea48897dce1e6a8f73d2"
 dependencies = [
  "futures",
  "itertools 0.14.0",
@@ -4152,8 +4148,6 @@ dependencies = [
 [[package]]
 name = "ptrs-gesher-lyrebird"
 version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93160817acfe1266d44fdbfa1b03564029316e3792c2a195880f87065d78180a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4176,8 +4170,6 @@ dependencies = [
 [[package]]
 name = "ptrs-gesher-obfs4"
 version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "945b4ea1a68083a9f3f1b3d5b144e07bfbcd792d211adcca1dae411abbd0dd68"
 dependencies = [
  "base64",
  "bytes",
@@ -4215,8 +4207,6 @@ dependencies = [
 [[package]]
 name = "ptrs-gesher-webtunnel"
 version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "537affb84ff63edd4a57af7ec635cfd4bf08e91a6202d59e40fbf627f005038a"
 dependencies = [
  "base64",
  "getrandom 0.2.17",
@@ -5258,6 +5248,7 @@ dependencies = [
  "rpassword",
  "rustls",
  "serde",
+ "serde_json",
  "service-manager",
  "socks5-proto",
  "tempfile",
@@ -5983,6 +5974,8 @@ dependencies = [
  "dyn-clone",
  "educe",
  "futures",
+ "futures-await-test",
+ "hex",
  "humantime-serde",
  "itertools 0.14.0",
  "once_cell",
@@ -6003,6 +5996,7 @@ dependencies = [
  "tor-geoip",
  "tor-guardmgr",
  "tor-linkspec",
+ "tor-llcrypto",
  "tor-memquota",
  "tor-netdir",
  "tor-netdoc",
@@ -6011,6 +6005,7 @@ dependencies = [
  "tor-protover",
  "tor-relay-selection",
  "tor-rtcompat",
+ "tor-rtmock",
  "tor-units",
  "tracing",
  "visibility",

@@ -1,0 +1,544 @@
+use super::*;
+
+#[test]
+fn default_listen_address_is_loopback_1080() {
+    let cfg = Config::default();
+    assert_eq!(cfg.listen, "127.0.0.1:1080");
+}
+
+#[test]
+fn bridge_transport_defaults_to_no_preference() {
+    let cfg = BridgesConfig::default();
+    assert_eq!(cfg.transport, "any");
+    assert_eq!(cfg.preferred_transport(), None);
+}
+
+#[test]
+fn bridge_transport_accepts_known_names_case_insensitively() {
+    for (raw, expected) in [
+        ("obfs4", Some("obfs4")),
+        ("WebTunnel", Some("webtunnel")),
+        (" webtunnel ", Some("webtunnel")),
+        // Unknown values mean "no preference" rather than matching nothing,
+        // so a typo cannot silently empty the bridge pool.
+        ("snowflake", None),
+        ("", None),
+    ] {
+        let cfg = BridgesConfig {
+            transport: raw.to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(cfg.preferred_transport(), expected, "input {raw:?}");
+    }
+}
+
+#[test]
+fn iat_mode_override_only_accepts_defined_obfs4_modes() {
+    for (raw, expected) in [(0, None), (1, Some(1)), (2, Some(2)), (7, None)] {
+        let cfg = BridgesConfig {
+            iat_mode: raw,
+            ..Default::default()
+        };
+        assert_eq!(cfg.iat_mode_override(), expected, "iat_mode {raw}");
+    }
+}
+
+#[test]
+fn log_to_filter_renders_default_then_targets_in_order() {
+    let log = LogConfig::default();
+    let filter = log.to_filter();
+    // Default level first, then comma-separated target=level pairs in
+    // their insertion order.
+    assert!(filter.starts_with("info"));
+    assert!(filter.contains(",socks5_proxy=debug"));
+    assert!(filter.contains(",arti_wrapper=debug"));
+    assert!(filter.contains(",tor_=warn"));
+    // The first comma comes immediately after `info` — no whitespace.
+    assert_eq!(filter.find(','), Some("info".len()));
+}
+
+#[test]
+fn log_to_filter_handles_no_targets() {
+    let mut log = LogConfig::default();
+    log.targets.clear();
+    assert_eq!(log.to_filter(), log.default);
+}
+
+#[test]
+fn parses_minimal_ktav() {
+    let src = r#"
+listen: 127.0.0.1:9050
+"#;
+    let cfg: Config = ktav::from_str(src).expect("ktav parses");
+    assert_eq!(cfg.listen, "127.0.0.1:9050");
+    // Other fields should fall back to defaults.
+    assert_eq!(cfg.log.default, LogConfig::default().default);
+    assert!(cfg.bridges.lines.is_empty());
+}
+
+#[test]
+fn parses_dotted_log_targets() {
+    let src = r#"
+listen: 127.0.0.1:1080
+
+log.default: trace
+log.targets.my_crate: debug
+log.targets.other: warn
+"#;
+    let cfg: Config = ktav::from_str(src).expect("ktav parses");
+    assert_eq!(cfg.log.default, "trace");
+    assert_eq!(
+        cfg.log.targets.get("my_crate").map(String::as_str),
+        Some("debug")
+    );
+    assert_eq!(
+        cfg.log.targets.get("other").map(String::as_str),
+        Some("warn")
+    );
+}
+
+#[test]
+fn bridges_parsed_dedupes_by_transport_addr_fingerprint() {
+    let cfg = BridgesConfig {
+        lines: vec![
+            "obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA iat-mode=0".into(),
+            // Same key, different params — counts as a duplicate.
+            "obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=BBB iat-mode=1".into(),
+            // Different addr — distinct.
+            "obfs4 5.6.7.8:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=CCC iat-mode=0".into(),
+        ],
+        sources: Vec::new(),
+        ..Default::default()
+    };
+    let parsed = cfg.parsed().expect("parses");
+    assert_eq!(parsed.bridges.len(), 2);
+    assert_eq!(parsed.duplicates, 1);
+}
+
+#[test]
+fn bridges_parsed_reports_invalid_line_with_index() {
+    let cfg = BridgesConfig {
+        lines: vec![
+            "obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01".into(),
+            "not-a-bridge".into(),
+        ],
+        sources: Vec::new(),
+        ..Default::default()
+    };
+    let err = cfg.parsed().expect_err("must reject");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("index 1"), "error mentions which row: {msg}");
+}
+
+#[test]
+fn bridges_parsed_diverts_dns_hint_lines_instead_of_rejecting_them() {
+    let cfg = BridgesConfig {
+        lines: vec![
+            "webtunnel 192.0.2.3:1 0123456789ABCDEF0123456789ABCDEF01234567 \
+             url=https://fronting.example.test/x"
+                .into(),
+            "# xorbot:dns fronting.example.test 203.0.113.9 1700000000".into(),
+        ],
+        sources: Vec::new(),
+        ..Default::default()
+    };
+    let parsed = cfg
+        .parsed()
+        .expect("hint lines must not be treated as invalid bridges");
+    assert_eq!(parsed.bridges.len(), 1);
+    assert_eq!(parsed.dns_hints.len(), 1);
+    assert_eq!(parsed.dns_hints[0].host, "fronting.example.test");
+}
+
+#[test]
+fn bridges_parsed_drops_a_hint_for_a_host_no_bridge_actually_uses() {
+    // The scope check: a hint whose host is not one of the bridges in
+    // this same batch must be dropped, not trusted -- otherwise an
+    // untrusted imported blob could poison the cache for an unrelated
+    // hostname (e.g. this app's own collateral-freedom source domains).
+    let cfg = BridgesConfig {
+        lines: vec![
+            "webtunnel 192.0.2.3:1 0123456789ABCDEF0123456789ABCDEF01234567 \
+             url=https://fronting.example.test/x"
+                .into(),
+            "# xorbot:dns raw.githubusercontent.com 203.0.113.9 1700000000".into(),
+        ],
+        sources: Vec::new(),
+        ..Default::default()
+    };
+    let parsed = cfg.parsed().expect("parses");
+    assert!(
+        parsed.dns_hints.is_empty(),
+        "a hint for an unrelated host must be dropped, got: {:?}",
+        parsed.dns_hints
+    );
+}
+
+#[test]
+fn bridges_parsed_ignores_a_hint_with_no_bridges_at_all() {
+    let cfg = BridgesConfig {
+        lines: vec!["# xorbot:dns fronting.example.test 203.0.113.9 1700000000".into()],
+        sources: Vec::new(),
+        ..Default::default()
+    };
+    let parsed = cfg.parsed().expect("parses");
+    assert!(parsed.bridges.is_empty());
+    assert!(parsed.dns_hints.is_empty());
+}
+
+#[test]
+fn parses_config_with_double_hash_comments() {
+    // ktav >= 0.5: comments are `##`; a single `#` is content. A
+    // config that uses `##` headers and a block array (with the odd
+    // blank line between items) must load cleanly. Synthetic data —
+    // no real bridges.
+    let src = "\
+## Startup configuration for the tor-socks5 proxy.
+## ktav comments use a double hash.
+listen: 127.0.0.1:1080
+
+bridges.lines: [
+\tobfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=aa+bb/cc+dd/ee iat-mode=0
+
+\tobfs4 5.6.7.8:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=ff/gg+hh/ii iat-mode=0
+]
+";
+    let cfg: Config = ktav::from_str(src).expect("double-hash comments + block array parse");
+    assert_eq!(cfg.listen, "127.0.0.1:1080");
+    assert_eq!(cfg.bridges.lines.len(), 2);
+}
+
+#[test]
+fn single_hash_line_is_content_not_comment() {
+    // Regression guard for the 0.3 -> 0.6 migration gotcha: a single
+    // `#` line is NO LONGER a comment (it is content), so a config
+    // header written the old way fails to parse. This documents why
+    // our shipped examples must use `##`.
+    let src = "# old-style comment\nlisten: 127.0.0.1:1080\n";
+    assert!(
+        ktav::from_str::<Config>(src).is_err(),
+        "a single-# header is content under ktav 0.6 and must not parse as a comment"
+    );
+}
+
+#[test]
+fn parses_bridges_array() {
+    let src = r#"
+listen: 127.0.0.1:1080
+
+bridges.lines: [
+    obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=ZZZ iat-mode=0
+    obfs4 5.6.7.8:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=YYY iat-mode=0
+]
+"#;
+    let cfg: Config = ktav::from_str(src).expect("ktav parses");
+    assert_eq!(cfg.bridges.lines.len(), 2);
+    assert!(cfg.bridges.lines[0].starts_with("obfs4 1.2.3.4:80"));
+}
+
+#[test]
+fn parses_source_with_headers_and_cookies() {
+    // Mirrors the README example: a source with custom headers + cookies.
+    let src = "listen: 127.0.0.1:1080\nbridges.sources: [\n\t{\n\t\tlabel: private\n\t\turl: https://api.example.org/bridges\n\t\theaders: [\n\t\t\tAuthorization: Bearer SECRET\n\t\t]\n\t\tcookies: [\n\t\t\tsession=abc123\n\t\t]\n\t}\n]\n";
+    let cfg: Config = ktav::from_str(src).expect("source with headers/cookies parses");
+    assert_eq!(cfg.bridges.sources.len(), 1);
+    let s = &cfg.bridges.sources[0];
+    assert_eq!(s.url, "https://api.example.org/bridges");
+    assert_eq!(s.headers, vec!["Authorization: Bearer SECRET".to_string()]);
+    assert_eq!(s.cookies, vec!["session=abc123".to_string()]);
+}
+
+#[test]
+fn minimal_source_is_just_a_url() {
+    // A source can be the bare `{ url: ... }` form; label/headers/cookies
+    // default to empty.
+    let src =
+        "listen: 127.0.0.1:1080\nbridges.sources: [\n\t{\n\t\turl: https://x.example/a\n\t}\n]\n";
+    let cfg: Config = ktav::from_str(src).expect("minimal {url} source parses");
+    assert_eq!(cfg.bridges.sources.len(), 1);
+    assert_eq!(cfg.bridges.sources[0].url, "https://x.example/a");
+    assert!(cfg.bridges.sources[0].label.is_empty());
+    assert!(cfg.bridges.sources[0].headers.is_empty());
+    assert!(cfg.bridges.sources[0].cookies.is_empty());
+}
+
+// -- Config extension tests ---
+
+#[test]
+fn default_circuit_pruning_knobs_are_sensible() {
+    let cfg = BridgesConfig::default();
+    assert_eq!(cfg.max_circuit_fails, 5);
+    assert_eq!(cfg.circuit_observation_window_mins, 30);
+    // Sanity: the circuit window is finer-grained than the TCP one,
+    // matching the relative arrival rates of the two signal classes.
+    assert!(cfg.circuit_observation_window_mins < cfg.fail_window_mins);
+}
+
+#[test]
+fn circuit_pruning_knobs_are_overridable_in_ktav() {
+    let src = "\
+listen: 127.0.0.1:1080
+bridges.max_circuit_fails: 12
+bridges.circuit_observation_window_mins: 10
+";
+    let cfg: Config = ktav::from_str(src).expect("ktav parses circuit knobs");
+    assert_eq!(cfg.bridges.max_circuit_fails, 12);
+    assert_eq!(cfg.bridges.circuit_observation_window_mins, 10);
+}
+
+#[test]
+fn circuit_pruning_knobs_fall_back_to_defaults_when_absent() {
+    // A minimal config touches none of the new knobs — defaults stick.
+    let src = "listen: 127.0.0.1:1080\n";
+    let cfg: Config = ktav::from_str(src).expect("ktav parses without circuit knobs");
+    assert_eq!(cfg.bridges.max_circuit_fails, 5);
+    assert_eq!(cfg.bridges.circuit_observation_window_mins, 30);
+}
+
+#[test]
+fn default_bridge_sources_are_populated() {
+    let cfg = BridgesConfig::default();
+    assert!(cfg.sources.len() >= 3, "expect at least 3 default sources");
+    assert!(cfg.sources.iter().any(|s| s.label.contains("obfs4")));
+    assert!(cfg.sources.iter().any(|s| s.label.contains("webtunnel")));
+}
+
+#[test]
+fn bridge_source_serde_roundtrip() {
+    let src = BridgeSource {
+        label: "test-src".into(),
+        url: "https://example.com/bridges".into(),
+        headers: vec!["Authorization: Bearer x".into()],
+        cookies: vec!["sid=abc".into()],
+    };
+    let serialized = ktav::to_string(&src).expect("serialize");
+    let deserialized: BridgeSource = ktav::from_str(&serialized).expect("deserialize");
+    assert_eq!(src, deserialized);
+}
+
+#[test]
+fn upstream_defaults_to_disabled() {
+    let cfg = Config::default();
+    assert!(!cfg.upstream.enabled);
+    assert!(cfg.upstream.address.is_empty());
+    assert!(cfg.upstream.username.is_empty());
+}
+
+#[test]
+fn parses_upstream_section() {
+    let src = r#"
+listen: 127.0.0.1:1080
+
+upstream.enabled: true
+upstream.address: 127.0.0.1:9050
+upstream.username: alice
+upstream.password: s3cret
+"#;
+    let cfg: Config = ktav::from_str(src).expect("ktav parses");
+    assert!(cfg.upstream.enabled);
+    assert_eq!(cfg.upstream.address, "127.0.0.1:9050");
+    assert_eq!(cfg.upstream.username, "alice");
+    assert_eq!(cfg.upstream.password, "s3cret");
+}
+
+#[test]
+fn upstream_roundtrip_preserves_fields() {
+    let mut cfg = Config::default();
+    cfg.upstream.enabled = true;
+    cfg.upstream.address = "10.0.0.1:1080".into();
+    let serialized = ktav::to_string(&cfg).expect("serialize");
+    let deserialized: Config = ktav::from_str(&serialized).expect("deserialize");
+    assert!(deserialized.upstream.enabled);
+    assert_eq!(deserialized.upstream.address, "10.0.0.1:1080");
+}
+
+#[test]
+fn config_serialized_roundtrip_preserves_sources() {
+    let cfg = Config::default();
+    let serialized = ktav::to_string(&cfg).expect("serialize");
+    let deserialized: Config = ktav::from_str(&serialized).expect("deserialize");
+    assert_eq!(
+        deserialized.bridges.sources.len(),
+        cfg.bridges.sources.len()
+    );
+    assert_eq!(
+        deserialized.bridges.sources[0].label,
+        cfg.bridges.sources[0].label
+    );
+}
+
+// -- warm_pool config --------------------------------------------------
+
+#[test]
+fn warm_pool_defaults_to_disabled_with_sensible_knobs() {
+    let cfg = Config::default();
+    assert!(!cfg.warm_pool.enabled);
+    assert_eq!(cfg.warm_pool.pool_size, 3);
+    assert_eq!(cfg.warm_pool.refresh_interval_secs, 60);
+}
+
+#[test]
+fn parses_warm_pool_section() {
+    let src = r#"
+listen: 127.0.0.1:1080
+
+warm_pool.enabled: true
+warm_pool.pool_size: 5
+warm_pool.refresh_interval_secs: 30
+"#;
+    let cfg: Config = ktav::from_str(src).expect("ktav parses");
+    assert!(cfg.warm_pool.enabled);
+    assert_eq!(cfg.warm_pool.pool_size, 5);
+    assert_eq!(cfg.warm_pool.refresh_interval_secs, 30);
+}
+
+#[test]
+fn warm_pool_falls_back_to_defaults_when_absent() {
+    let src = "listen: 127.0.0.1:1080\n";
+    let cfg: Config = ktav::from_str(src).expect("ktav parses without warm_pool");
+    assert!(!cfg.warm_pool.enabled);
+    assert_eq!(cfg.warm_pool.pool_size, 3);
+    assert_eq!(cfg.warm_pool.refresh_interval_secs, 60);
+}
+
+#[test]
+fn warm_pool_roundtrip_preserves_fields() {
+    let mut cfg = Config::default();
+    cfg.warm_pool.enabled = true;
+    cfg.warm_pool.pool_size = 7;
+    cfg.warm_pool.refresh_interval_secs = 120;
+    let serialized = ktav::to_string(&cfg).expect("serialize");
+    let deserialized: Config = ktav::from_str(&serialized).expect("deserialize");
+    assert!(deserialized.warm_pool.enabled);
+    assert_eq!(deserialized.warm_pool.pool_size, 7);
+    assert_eq!(deserialized.warm_pool.refresh_interval_secs, 120);
+}
+
+// -- conn_health config -------------------------------------------------
+
+#[test]
+fn conn_health_defaults_to_enabled_with_sensible_interval() {
+    let cfg = Config::default();
+    assert!(cfg.conn_health.enabled);
+    assert_eq!(cfg.conn_health.interval_secs, 60);
+}
+
+#[test]
+fn parses_conn_health_section() {
+    let src = r#"
+listen: 127.0.0.1:1080
+
+conn_health.enabled: false
+conn_health.interval_secs: 120
+"#;
+    let cfg: Config = ktav::from_str(src).expect("ktav parses");
+    assert!(!cfg.conn_health.enabled);
+    assert_eq!(cfg.conn_health.interval_secs, 120);
+}
+
+#[test]
+fn conn_health_falls_back_to_defaults_when_absent() {
+    let src = "listen: 127.0.0.1:1080\n";
+    let cfg: Config = ktav::from_str(src).expect("ktav parses without conn_health");
+    assert!(cfg.conn_health.enabled);
+    assert_eq!(cfg.conn_health.interval_secs, 60);
+}
+
+#[test]
+fn conn_health_roundtrip_preserves_fields() {
+    let mut cfg = Config::default();
+    cfg.conn_health.enabled = false;
+    cfg.conn_health.interval_secs = 90;
+    let serialized = ktav::to_string(&cfg).expect("serialize");
+    let deserialized: Config = ktav::from_str(&serialized).expect("deserialize");
+    assert!(!deserialized.conn_health.enabled);
+    assert_eq!(deserialized.conn_health.interval_secs, 90);
+}
+
+// -- auth config ---------------------------------------------------
+
+#[test]
+fn auth_defaults_to_enabled_with_no_explicit_users_file() {
+    let cfg = Config::default();
+    assert!(cfg.auth.enabled);
+    assert!(cfg.auth.users_file.is_empty());
+}
+
+#[test]
+fn auth_falls_back_to_defaults_when_absent() {
+    // A config predating this field must still parse (`deny_unknown_fields`
+    // only rejects *unknown* keys — an absent optional section is fine).
+    let src = "listen: 127.0.0.1:1080\n";
+    let cfg: Config = ktav::from_str(src).expect("ktav parses without auth section");
+    assert!(cfg.auth.enabled);
+    assert!(cfg.auth.users_file.is_empty());
+}
+
+#[test]
+fn parses_auth_section() {
+    let src = r#"
+listen: 127.0.0.1:1080
+
+auth.enabled: true
+auth.users_file: /data/data/org.torproject.android/files/tor-socks5.users.ktav
+"#;
+    let cfg: Config = ktav::from_str(src).expect("ktav parses");
+    assert!(cfg.auth.enabled);
+    assert_eq!(
+        cfg.auth.users_file,
+        "/data/data/org.torproject.android/files/tor-socks5.users.ktav"
+    );
+}
+
+#[test]
+fn auth_can_be_explicitly_disabled() {
+    let src = "listen: 127.0.0.1:1080\nauth.enabled: false\n";
+    let cfg: Config = ktav::from_str(src).expect("ktav parses");
+    assert!(!cfg.auth.enabled);
+}
+
+#[test]
+fn auth_roundtrip_preserves_fields() {
+    let mut cfg = Config::default();
+    cfg.auth.enabled = false;
+    cfg.auth.users_file = "/tmp/custom.users.ktav".into();
+    let serialized = ktav::to_string(&cfg).expect("serialize");
+    let deserialized: Config = ktav::from_str(&serialized).expect("deserialize");
+    assert!(!deserialized.auth.enabled);
+    assert_eq!(deserialized.auth.users_file, "/tmp/custom.users.ktav");
+}
+
+#[test]
+fn security_and_dns_defaults_are_safe() {
+    let cfg = Config::default();
+    assert!(cfg.security.block_onion);
+    assert!(cfg.dns.doh_enabled);
+    assert!(!cfg.dns.system_fallback);
+}
+
+#[test]
+fn parses_security_section() {
+    let src = "listen: 127.0.0.1:1080\nsecurity.block_onion: true\n";
+    let cfg: Config = ktav::from_str(src).expect("ktav parses security section");
+    assert!(cfg.security.block_onion);
+}
+
+#[test]
+fn security_and_dns_sections_fall_back_when_absent() {
+    let src = "listen: 127.0.0.1:1080\n";
+    let cfg: Config = ktav::from_str(src).expect("old config remains valid");
+    assert!(cfg.security.block_onion);
+    assert!(cfg.dns.doh_enabled);
+    assert!(!cfg.dns.system_fallback);
+}
+
+#[test]
+fn parses_dns_policy_and_roundtrips() {
+    let src = "listen: 127.0.0.1:1080\ndns.doh_enabled: false\ndns.system_fallback: true\n";
+    let cfg: Config = ktav::from_str(src).expect("ktav parses DNS policy");
+    assert!(!cfg.dns.doh_enabled);
+    assert!(cfg.dns.system_fallback);
+    let serialized = ktav::to_string(&cfg).expect("serialize DNS policy");
+    let restored: Config = ktav::from_str(&serialized).expect("deserialize DNS policy");
+    assert_eq!(restored.dns, cfg.dns);
+}

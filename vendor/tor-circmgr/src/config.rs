@@ -59,8 +59,8 @@ pub struct PathConfig {
     // the pool below a safety minimum. Latency-over-anonymity trade,
     // personal-use fork only.
     #[deftly(tor_config(default = "default_min_bandwidth_percentile()"))]
+    /// Optional bandwidth floor for middle and exit selection.
     pub(crate) min_bandwidth_percentile: u8,
-
 }
 
 /// Return the default list of reachable addresses (namely, "*:*")
@@ -481,7 +481,10 @@ mod test {
         assert!(stricter.at_least_as_permissive_as(&same));
 
         // A lower floor is more permissive than a higher one...
-        let lower_floor = PathConfig::builder().min_bandwidth_percentile(10).build().unwrap();
+        let lower_floor = PathConfig::builder()
+            .min_bandwidth_percentile(10)
+            .build()
+            .unwrap();
         assert!(lower_floor.at_least_as_permissive_as(&stricter_floor_only()));
         // ...and not the other way around.
         assert!(!stricter_floor_only().at_least_as_permissive_as(&lower_floor));
@@ -489,6 +492,9 @@ mod test {
 
     // tor-socks5 local patch: helper for the test above.
     fn stricter_floor_only() -> PathConfig {
-        PathConfig::builder().min_bandwidth_percentile(75).build().unwrap()
+        PathConfig::builder()
+            .min_bandwidth_percentile(75)
+            .build()
+            .unwrap()
     }
 }

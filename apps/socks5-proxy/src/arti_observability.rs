@@ -96,6 +96,24 @@ use tracing_subscriber::layer::{Context, Layer};
 
 use bridge_store::BridgeStore;
 
+thread_local! {
+    static IGNORE_GUARD_OBSERVATIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Isolate a throwaway client's current-thread runtime from live guard health.
+pub(crate) fn without_guard_observations<T>(run: impl FnOnce() -> T) -> T {
+    IGNORE_GUARD_OBSERVATIONS.with(|flag| {
+        struct Restore<'a>(&'a std::cell::Cell<bool>, bool);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.1);
+            }
+        }
+        let _restore = Restore(flag, flag.replace(true));
+        run()
+    })
+}
+
 /// The tracing target prefix we listen on. Pinned to `tor_guardmgr` —
 /// the only crate that emits per-guard usability status with a
 /// structured `guard_id` field in arti 0.42.
@@ -242,6 +260,9 @@ where
     S: tracing::Subscriber,
 {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        if IGNORE_GUARD_OBSERVATIONS.get() {
+            return;
+        }
         let metadata = event.metadata();
         // Cheap target filter first — bail before allocating the visitor.
         if !metadata.target().starts_with(ARTI_GUARDMGR_TARGET) {
@@ -425,6 +446,41 @@ mod tests {
             "CD193CF0D0C29551928C01FCB28D1200D9F27CFA"
         );
         assert!(obs[0].usable);
+    }
+
+    #[test]
+    fn throwaway_runtime_cannot_change_live_guard_health() {
+        let sink = ObservationSink::new();
+        let captured = sink.clone();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let emit = || {
+            let guard_id = "RsaIdentity { $aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa }";
+            tracing::event!(target: "tor_guardmgr", Level::TRACE,
+                guard_id = ?guard_id, usable = false, "Known usability status");
+        };
+        with_layer(sink, || {
+            without_guard_observations(|| {
+                runtime.block_on(async {
+                    tokio::spawn(async move {
+                        emit();
+                    })
+                    .await
+                    .unwrap();
+                })
+            });
+            assert!(captured.drain().is_empty());
+            emit();
+        });
+        let events = captured.drain();
+        assert_eq!(
+            events.len(),
+            1,
+            "live observations must resume after verification"
+        );
+        assert!(!events[0].usable);
     }
 
     #[test]

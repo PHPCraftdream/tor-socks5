@@ -41,6 +41,18 @@ const LAZY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Default per-source HTTPS fetch timeout for the background refresh.
 const REFRESH_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
+const MAX_DRAIN_ATTEMPTS: usize = 12;
+const DRAIN_BUDGET: Duration = Duration::from_secs(60);
+const CHANNEL_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn current_source_url(url: &str) -> &str {
+    match url {
+        "https://raw.githubusercontent.com/scriptzteam/Tor-Bridges-Collector/main/bridges-webtunnel" =>
+            "https://raw.githubusercontent.com/scriptzteam/Tor-Bridges-Collector-v2/main/bridges/webtunnel_tested.txt",
+        _ => url,
+    }
+}
+
 /// Shuffle in place using a `getrandom`-seeded xorshift (Fisher–Yates).
 /// Non-cryptographic — only used so a drain batch mixes transports/sources
 /// rather than probing a long run of one kind first. RNG failure → no-op.
@@ -85,7 +97,7 @@ async fn fetch_sources(
         .iter()
         .map(|s| bridge_fetcher::Source {
             label: s.label.clone(),
-            url: s.url.clone(),
+            url: current_source_url(&s.url).to_owned(),
             headers: s.headers.clone(),
             cookies: s.cookies.clone(),
         })
@@ -134,8 +146,26 @@ pub(crate) async fn refresh_candidate_pool(
     let exclude = working_keys(cfg);
     let mut pool = CandidatePool::load(CandidatePool::resolve_path(config_path))
         .context("loading candidate pool")?;
-    let added = pool.merge(fetched, &exclude);
+    let migration = cfg
+        .bridges
+        .sources
+        .iter()
+        .any(|source| current_source_url(&source.url) != source.url);
+    let added = pool.merge(fetched.iter().cloned(), &exclude);
+    if migration {
+        pool.prioritize(&fetched, cfg.bridges.preferred_transport());
+    }
     pool.save().context("saving candidate pool")?;
+    if migration {
+        if let Some(path) = config_path {
+            let mut latest = Config::load_with_override(Some(path))?.into_config();
+            for source in &mut latest.bridges.sources {
+                source.url = current_source_url(&source.url).to_owned();
+            }
+            latest.write(path)?;
+            info!("updated the legacy WebTunnel source to the current tested list");
+        }
+    }
     info!(
         added,
         pool = pool.len(),
@@ -149,6 +179,9 @@ pub(crate) async fn refresh_candidate_pool(
 /// Tor link handshake succeeded against the bridge.
 type ChannelCheck<'a> =
     Box<dyn for<'b> Fn(&'b BridgeLine) -> BoxFuture<'b, bool> + Send + Sync + 'a>;
+
+type ProbeCheck<'a> =
+    Box<dyn for<'b> Fn(&'b BridgeLine) -> BoxFuture<'b, bridge_probe::Outcome> + Send + Sync + 'a>;
 
 /// Two-layer admission for one pool candidate: the TCP probe must pass, and
 /// when a channel check is available, the bridge must also accept a real Tor
@@ -182,7 +215,7 @@ async fn admits_candidate(
                     addr = %bridge.addr,
                     transport = ?bridge.transport,
                     latency_ms = latency.as_millis() as u64,
-                    "candidate answered TCP but is not a Tor bridge — rejecting"
+                    "candidate channel verification failed; deferring"
                 );
                 false
             }
@@ -215,6 +248,7 @@ pub(crate) async fn drain_pool(
     target: usize,
     tor: Option<&TorTunnel>,
 ) -> Result<usize> {
+    let admission_config = config_path.map(Path::to_path_buf);
     let checker: Option<ChannelCheck<'static>> = tor.map(|tor| -> ChannelCheck<'static> {
         // Clone the tunnel handle (cheap, Arc-backed) so the future owns its
         // data and the checker is HRTB over the bridge reference alone.
@@ -222,21 +256,60 @@ pub(crate) async fn drain_pool(
         let check: ChannelCheck<'static> =
             Box::new(move |bridge: &BridgeLine| -> BoxFuture<'_, bool> {
                 let tor = tor.clone();
-                Box::pin(async move { tor.warm_bridge(bridge).await.is_ok() })
+                let admission_config = admission_config.clone();
+                Box::pin(async move {
+                    if bridge.transport.as_deref() == Some("webtunnel") {
+                        return match crate::bridge_verifier::verify_for_admission(
+                            bridge.clone(),
+                            admission_config,
+                        )
+                        .await
+                        {
+                            Ok(verified) => verified,
+                            Err(error) => {
+                                warn!(%error, "candidate HTTPS verification could not complete");
+                                false
+                            }
+                        };
+                    }
+                    matches!(
+                        tokio::time::timeout(CHANNEL_CHECK_TIMEOUT, tor.warm_bridge(bridge)).await,
+                        Ok(Ok(()))
+                    )
+                })
             });
         check
     });
-    drain_pool_with(config_path, target, checker.as_ref()).await
+    let cfg = Config::load_with_override(config_path)?.into_config();
+    let policy = bridge_probe::ResolverPolicy {
+        doh_enabled: cfg.dns.doh_enabled,
+        system_fallback: cfg.dns.system_fallback,
+    };
+    let probe: ProbeCheck<'static> = Box::new(move |bridge| {
+        Box::pin(async move {
+            bridge_probe::probe_all_with_policy(vec![bridge.clone()], LAZY_PROBE_TIMEOUT, policy)
+                .await
+                .pop()
+                .expect("one bridge produces one report")
+                .outcome
+        })
+    });
+    drain_pool_with(config_path, target, checker.as_ref(), &probe).await
 }
 
 async fn drain_pool_with(
     config_path: Option<&Path>,
     target: usize,
     checker: Option<&ChannelCheck<'_>>,
+    probe: &ProbeCheck<'_>,
 ) -> Result<usize> {
     if target == 0 {
         return Ok(0);
     }
+    let Some(path) = config_path else {
+        return Ok(0);
+    };
+    let cfg = Config::load_with_override(Some(path))?.into_config();
     let pool_path = CandidatePool::resolve_path(config_path);
     let mut pool = CandidatePool::load(pool_path).context("loading candidate pool")?;
     if pool.is_empty() {
@@ -248,33 +321,61 @@ async fn drain_pool_with(
     // unprobed ones go back for next time. Because dead entries are removed,
     // the pool steadily advances across drains rather than re-probing a
     // dead head.
-    let max_attempts = target.saturating_mul(50).max(50);
+    let max_attempts = target.saturating_mul(50).min(MAX_DRAIN_ATTEMPTS);
     let batch_size = max_attempts.min(pool.len());
-    let mut batch = pool.take(batch_size);
+    let mut batch = pool.take_transport(batch_size, cfg.bridges.preferred_transport());
     shuffle(&mut batch);
 
     let mut promoted: Vec<BridgeLine> = Vec::new();
     let mut channel_ok: Vec<BridgeLine> = Vec::new();
     let mut unprobed: Vec<BridgeLine> = Vec::new();
+    let mut deferred = Vec::new();
+    let mut reachable = Vec::new();
+    let deadline = tokio::time::Instant::now() + DRAIN_BUDGET;
     let mut attempts = 0usize;
     for bridge in batch {
-        if promoted.len() >= target || attempts >= max_attempts {
+        if promoted.len() >= target
+            || attempts >= max_attempts
+            || tokio::time::Instant::now() >= deadline
+        {
             unprobed.push(bridge);
             continue;
         }
         attempts += 1;
-        let latency = bridge_probe::probe_one(&bridge, LAZY_PROBE_TIMEOUT).await;
+        let latency = match tokio::time::timeout_at(deadline, probe(&bridge)).await {
+            Ok(bridge_probe::Outcome::Reachable { latency }) => Some(latency),
+            Ok(bridge_probe::Outcome::Unreachable { reason }) => {
+                tracing::debug!(transport = ?bridge.transport, %reason, "candidate probe failed");
+                None
+            }
+            Ok(bridge_probe::Outcome::Unmeasured { reason }) => {
+                tracing::debug!(transport = ?bridge.transport, %reason, "candidate probe deferred");
+                deferred.push(bridge);
+                continue;
+            }
+            Err(_) => {
+                deferred.push(bridge);
+                continue;
+            }
+        };
+        // The owned verification worker has its own budgets and must be joined.
         if admits_candidate(latency, &bridge, checker).await {
             promoted.push(bridge.clone());
+            if let Some(latency) = latency {
+                reachable.push((bridge.clone(), latency));
+            }
             if latency.is_some() && checker.is_some() {
                 channel_ok.push(bridge);
             }
+        } else if latency.is_some() {
+            deferred.push(bridge);
         }
         // Dead: already removed from the pool by take().
     }
 
     // Unprobed candidates return to the pool; probed (alive + dead) do not.
     pool.return_front(unprobed);
+    pool.merge(deferred, &HashSet::new());
     pool.save().context("saving candidate pool after drain")?;
     info!(
         promoted = promoted.len(),
@@ -296,12 +397,20 @@ async fn drain_pool_with(
         match BridgeStore::load(BridgeStore::resolve_path(config_path)) {
             Ok(mut store) => {
                 let now = time::OffsetDateTime::now_utc();
+                store.note_probe_round(
+                    &promoted,
+                    &reachable,
+                    now,
+                    Duration::ZERO,
+                    u32::MAX,
+                    u32::MAX,
+                );
                 for b in &channel_ok {
-                    // No-op for bridges the store doesn't track yet: fresh
-                    // candidates get store entries via the next probe round
-                    // after promotion (mirrors android-ffi's
-                    // `persist_warm_results`).
                     store.note_channel_success_at(b, now);
+                    if b.transport.as_deref() == Some("webtunnel") {
+                        store.note_circuit_verified_at(b, now);
+                        store.note_circuit_success_at(b, now);
+                    }
                 }
                 if let Err(e) = store.save() {
                     warn!(error = %e, "could not persist channel successes after drain");
@@ -311,9 +420,6 @@ async fn drain_pool_with(
         }
     }
 
-    let Some(path) = config_path else {
-        return Ok(0);
-    };
     // Reload from disk so we don't clobber concurrent edits/prunes.
     let mut latest = Config::load_with_override(Some(path))
         .context("reloading config to promote bridges")?
@@ -365,6 +471,120 @@ pub(crate) async fn top_up_working(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_migration_only_changes_the_known_legacy_webtunnel_list() {
+        let old = "https://raw.githubusercontent.com/scriptzteam/Tor-Bridges-Collector/main/bridges-webtunnel";
+        let current = current_source_url(old);
+        assert!(current.ends_with("Tor-Bridges-Collector-v2/main/bridges/webtunnel_tested.txt"));
+        assert_eq!(current_source_url(current), current);
+        let custom = "https://private.example/bridges-webtunnel";
+        assert_eq!(current_source_url(custom), custom);
+    }
+
+    fn discovery_fixture() -> (tempfile::TempDir, std::path::PathBuf, BridgeLine) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.ktav");
+        let mut cfg = Config::default();
+        cfg.bridges.transport = "webtunnel".into();
+        cfg.bridges.lines = vec![bridge().to_string()];
+        cfg.write(&path).unwrap();
+        let wt: BridgeLine = "webtunnel [2001:db8::1]:443 0123456789ABCDEF0123456789ABCDEF01234567 url=https://example.com/bridge"
+            .parse().unwrap();
+        let mut pool = CandidatePool::load(CandidatePool::resolve_path(Some(&path))).unwrap();
+        let obfs = (1..=100).map(|i| {
+            format!("obfs4 1.2.4.{i}:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA")
+                .parse::<BridgeLine>()
+                .unwrap()
+        });
+        pool.merge(obfs.chain([wt.clone()]), &HashSet::new());
+        pool.save().unwrap();
+        (dir, path, wt)
+    }
+
+    fn reachable_probe() -> ProbeCheck<'static> {
+        Box::new(|bridge| {
+            assert_eq!(bridge.transport.as_deref(), Some("webtunnel"));
+            Box::pin(async {
+                bridge_probe::Outcome::Reachable {
+                    latency: Duration::from_millis(10),
+                }
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn discovery_promotes_webtunnel_and_records_channel_evidence() {
+        let (_dir, path, wt) = discovery_fixture();
+        let added = drain_pool_with(Some(&path), 1, Some(&check(true)), &reachable_probe())
+            .await
+            .unwrap();
+        assert_eq!(added, 1);
+        let cfg = Config::load_with_override(Some(&path))
+            .unwrap()
+            .into_config();
+        assert!(cfg.bridges.parsed().unwrap().bridges.contains(&wt));
+        let store = BridgeStore::load(BridgeStore::resolve_path(Some(&path))).unwrap();
+        assert_eq!(store.channel_ok_count(&wt), 1);
+        assert_eq!(store.ok_count(&wt), 1);
+        let mut pool = CandidatePool::load(CandidatePool::resolve_path(Some(&path))).unwrap();
+        assert_eq!(pool.len(), 100);
+        assert!(pool
+            .take(100)
+            .iter()
+            .all(|b| b.transport.as_deref() == Some("obfs4")));
+    }
+
+    #[tokio::test]
+    async fn resolver_failure_keeps_webtunnel_for_a_later_successful_attempt() {
+        let (_dir, path, wt) = discovery_fixture();
+        let unavailable: ProbeCheck<'static> = Box::new(|_| {
+            Box::pin(async {
+                bridge_probe::Outcome::Unmeasured {
+                    reason: "resolver unavailable".into(),
+                }
+            })
+        });
+        assert_eq!(
+            drain_pool_with(Some(&path), 1, Some(&check(true)), &unavailable)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            CandidatePool::load(CandidatePool::resolve_path(Some(&path)))
+                .unwrap()
+                .len(),
+            101
+        );
+        assert_eq!(
+            drain_pool_with(Some(&path), 1, Some(&check(true)), &reachable_probe())
+                .await
+                .unwrap(),
+            1
+        );
+        let cfg = Config::load_with_override(Some(&path))
+            .unwrap()
+            .into_config();
+        assert!(cfg.bridges.parsed().unwrap().bridges.contains(&wt));
+    }
+
+    #[tokio::test]
+    async fn transient_channel_failure_does_not_discard_a_candidate() {
+        let (_dir, path, _) = discovery_fixture();
+        assert_eq!(
+            drain_pool_with(Some(&path), 1, Some(&check(false)), &reachable_probe())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            drain_pool_with(Some(&path), 1, Some(&check(true)), &reachable_probe())
+                .await
+                .unwrap(),
+            1
+        );
+    }
 
     fn check(ok: bool) -> ChannelCheck<'static> {
         Box::new(move |_: &BridgeLine| Box::pin(async move { ok }))

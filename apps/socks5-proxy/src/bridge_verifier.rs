@@ -25,6 +25,7 @@
 //! deviations from the android original.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use bridge_line::BridgeLine;
@@ -69,8 +70,41 @@ const VERIFY_RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// Host the check client's exit circuit must reach live. Matches android's
 /// `LIVE_PROBE_TARGET`/`LIVE_PROBE_PORT` (engine.rs:756-757): a plain HTTPS
 /// endpoint that answers a real Tor circuit, not a local socket.
-const LIVE_PROBE_TARGET: &str = "check.torproject.org";
-const LIVE_PROBE_PORT: u16 = 443;
+const LIVE_PROBE_URL: &str = "https://check.torproject.org/api/ip";
+static VERIFY_LOCK: Mutex<()> = Mutex::new(());
+
+fn confirms_tor(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("IsTor").and_then(serde_json::Value::as_bool))
+        == Some(true)
+}
+
+/// Joined to completion: cancelling an outer timeout must not leak the blocking check.
+pub(crate) async fn verify_for_admission(
+    bridge: BridgeLine,
+    config_path: Option<PathBuf>,
+) -> anyhow::Result<bool> {
+    let live_cache = crate::tor_setup::arti_base_dir(config_path.as_deref()).join("cache");
+    let pt = Some(crate::tor_setup::resolve_pt_binary()?);
+    tokio::task::spawn_blocking(move || {
+        let scratch = tempfile::Builder::new()
+            .prefix("tor-socks5-admission-")
+            .tempdir()?;
+        let mut verified = false;
+        verify_bridges_sequential(
+            &live_cache,
+            scratch.path(),
+            vec![bridge],
+            pt,
+            CIRCUIT_VERIFY_BOOTSTRAP_TIMEOUT,
+            CIRCUIT_VERIFY_PROBE_TIMEOUT,
+            |_, result| verified = result.is_ok(),
+        );
+        Ok(verified)
+    })
+    .await?
+}
 
 /// Spawn the detached background circuit-verify task.
 ///
@@ -79,7 +113,10 @@ const LIVE_PROBE_PORT: u16 = 443;
 /// bootstrapping and the channel-proven pool is empty anyway, so the first
 /// interval is consumed (same pattern as `spawn_bridge_warmer` /
 /// `spawn_bridge_maintenance`) and checks only start one interval in.
-pub(crate) fn spawn_bridge_circuit_verifier(config_path: Option<PathBuf>) {
+pub(crate) fn spawn_bridge_circuit_verifier(
+    config_path: Option<PathBuf>,
+    handle: crate::tor_watchdog::TorHandle,
+) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(CIRCUIT_VERIFY_INTERVAL);
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -87,19 +124,24 @@ pub(crate) fn spawn_bridge_circuit_verifier(config_path: Option<PathBuf>) {
 
         loop {
             tick.tick().await;
-            run_circuit_verify_tick(config_path.as_deref()).await;
+            run_circuit_verify_tick(config_path.as_deref(), &handle.active_bridges()).await;
         }
     });
 }
 
 /// One tick: pick the due batch, verify it, persist the results.
-async fn run_circuit_verify_tick(config_path: Option<&Path>) {
+async fn run_circuit_verify_tick(config_path: Option<&Path>, active: &[BridgeLine]) {
     let due = match BridgeStore::load(BridgeStore::resolve_path(config_path)) {
-        Ok(store) => store.needing_circuit_verification(
-            OffsetDateTime::now_utc(),
-            CIRCUIT_VERIFY_MAX_AGE,
-            CIRCUIT_VERIFY_BATCH,
-        ),
+        Ok(store) => store
+            .needing_circuit_verification(
+                OffsetDateTime::now_utc(),
+                CIRCUIT_VERIFY_MAX_AGE,
+                usize::MAX,
+            )
+            .into_iter()
+            .filter(|bridge| active.contains(bridge))
+            .take(CIRCUIT_VERIFY_BATCH)
+            .collect::<Vec<_>>(),
         Err(error) => {
             warn!(error = %error, "circuit-verify: failed to load bridge store");
             return;
@@ -338,6 +380,11 @@ pub(crate) fn verify_bridges_sequential(
     probe_timeout: Duration,
     mut on_result: impl FnMut(&BridgeLine, Result<Duration, String>),
 ) {
+    // Only mutual exclusion is stored; each check owns its resources.
+    let _serial = VERIFY_LOCK.lock().unwrap_or_else(|error| {
+        VERIFY_LOCK.clear_poison();
+        error.into_inner()
+    });
     let cache_snapshot = scratch_base.join("cache-snapshot");
     let cache_dir = (live_cache_dir.is_dir()
         && snapshot_cache_dir(live_cache_dir, &cache_snapshot))
@@ -380,15 +427,44 @@ pub(crate) fn verify_bridges_sequential(
             state_dir: check_dir.clone(),
         };
         let baseline_children = pt_reap::own_child_pids();
-        let result = rt.block_on(arti_wrapper::TorTunnel::verify_bridge_reachable(
-            check,
-            (LIVE_PROBE_TARGET, LIVE_PROBE_PORT),
-            bootstrap_timeout,
-            probe_timeout,
-        ));
+        let result: anyhow::Result<Duration> =
+            crate::arti_observability::without_guard_observations(|| {
+                rt.block_on(async {
+                    let tunnel = arti_wrapper::TorTunnel::create_unbootstrapped_with(
+                        arti_wrapper::Settings {
+                            bridges: vec![check.bridge],
+                            pt_binary: check.pt_binary,
+                            state_dir: Some(check.state_dir),
+                            cache_dir: check.cache_dir,
+                            disable_preemptive_circuits: true,
+                            ..Default::default()
+                        },
+                    )?;
+                    tokio::time::timeout(bootstrap_timeout, tunnel.wait_bootstrapped()).await??;
+                    let started = std::time::Instant::now();
+                    let body = bridge_fetcher::fetch_one(
+                        &tunnel,
+                        LIVE_PROBE_URL,
+                        probe_timeout,
+                        4096,
+                        &[],
+                        &[],
+                    )
+                    .await?;
+                    anyhow::ensure!(
+                        confirms_tor(&body),
+                        "HTTPS canary did not confirm Tor egress"
+                    );
+                    Ok(started.elapsed())
+                })
+            });
         rt.shutdown_timeout(VERIFY_RUNTIME_SHUTDOWN_GRACE);
         pt_reap::kill_new_children(&baseline_children);
 
+        if let Err(error) = &result {
+            warn!(transport = ?bridge.transport, addr = %bridge.addr, %error,
+                "circuit-verify: bridge check failed");
+        }
         on_result(&bridge, result.map_err(|e| e.to_string()));
         let _ = std::fs::remove_dir_all(&check_dir);
     }
@@ -408,9 +484,7 @@ pub(crate) fn verify_bridges_sequential(
 /// verified bridge gets its `circuit_fails` back to 0. Android doesn't need
 /// this because its failover machinery differs.
 ///
-/// As on android, failures are deliberately not recorded: a single timeout is
-/// routine rather than proof the bridge is bad, so a failed check simply
-/// leaves the bridge due for the next tick instead of demoting it.
+/// Failed attempts advance the queue without demoting the live bridge.
 fn persist_circuit_verify_results(results: &[(BridgeLine, bool)], config_path: Option<&Path>) {
     if results.is_empty() {
         return;
@@ -425,6 +499,7 @@ fn persist_circuit_verify_results(results: &[(BridgeLine, bool)], config_path: O
     };
     let now = OffsetDateTime::now_utc();
     for (bridge, ok) in results {
+        store.note_verification_attempt_at(bridge, now);
         if *ok {
             store.note_circuit_verified_at(bridge, now);
             store.note_circuit_success_at(bridge, now);
@@ -439,6 +514,19 @@ fn persist_circuit_verify_results(results: &[(BridgeLine, bool)], config_path: O
 mod tests {
     use super::*;
     use std::time::Duration as StdDuration;
+
+    #[test]
+    fn canary_requires_a_real_positive_tor_response() {
+        assert!(confirms_tor(r#"{ "IsTor": true, "IP": "192.0.2.1" }"#));
+        for body in [
+            r#"{"IsTor":false}"#,
+            r#"{"IsTor":"true"}"#,
+            "{}",
+            "<html>OK</html>",
+        ] {
+            assert!(!confirms_tor(body), "must reject {body}");
+        }
+    }
 
     #[test]
     fn own_child_pids_never_contains_self() {

@@ -132,7 +132,7 @@ pub(crate) async fn run_server(
             let alive = settings.bridges.len();
             info!(count = alive, "using bridges");
 
-            let tor = TorTunnel::bootstrap_with(settings)
+            let tor = TorTunnel::bootstrap_with(settings.clone())
                 .await
                 .context("failed to bootstrap Tor")?;
 
@@ -142,10 +142,6 @@ pub(crate) async fn run_server(
             // candidates over the now-live Tor only if the pool is short.
             // One-shot: takes a direct `TorTunnel` clone and runs to
             // completion long before the watchdog could ever fire.
-            let deficit = cfg.bridges.min_alive.saturating_sub(alive);
-            if cfg.bridges.auto_fetch && deficit > 0 {
-                spawn_auto_fetch(tor.clone(), cfg.clone(), config_path.clone(), deficit);
-            }
 
             // Single indirection point for the live `TorClient`: the accept
             // loop and the maintenance loop read the *current* tunnel
@@ -153,17 +149,23 @@ pub(crate) async fn run_server(
             // both without re-distribution. Cheap to clone (one
             // `Arc<RwLock<_>>` + two atomics).
             let handle = TorHandle::new(tor);
+            handle.set_active_bridges(settings.bridges.clone());
+            handle.bridge_refresh().set_needed(
+                cfg.bridges.auto_fetch
+                    && crate::bridge_maintenance::preferred_missing(&cfg, &settings.bridges),
+            );
 
             // Periodic upkeep: re-probe, prune dead bridges, top up when short,
             // drain circuit-layer observations from arti's tracing into the
             // health store so descriptor-mismatch / unsuitable bridges are
             // pruned alongside the TCP-dead ones. Reads the tunnel through
             // the handle so pool refreshes follow a watchdog rebuild.
-            spawn_bridge_maintenance(
+            crate::bridge_maintenance::spawn(
                 handle.clone(),
                 config_path.clone(),
                 cfg.bridges.recheck_interval_mins,
                 obs_sink.clone(),
+                settings,
             );
 
             // Stale-channel watchdog: rebuilds the `TorClient` when circuits
@@ -196,7 +198,10 @@ pub(crate) async fn run_server(
             // android-ffi's background circuit-verify tick; it is self-paced
             // by store state (a tick with no due bridges is nearly free) and
             // needs no TorHandle — it never touches the live tunnel.
-            crate::bridge_verifier::spawn_bridge_circuit_verifier(config_path.clone());
+            crate::bridge_verifier::spawn_bridge_circuit_verifier(
+                config_path.clone(),
+                handle.clone(),
+            );
 
             Egress::Tor(handle)
         }
@@ -432,6 +437,7 @@ async fn handle_client(
 
     match egress {
         Egress::Tor(handle) => {
+            handle.bridge_refresh().request();
             info!(host = ?req.host, port = req.port, "tunneling through Tor");
             // Read the *current* tunnel through the handle: a watchdog
             // rebuild swaps the slot, and new connections must pick up the
@@ -505,169 +511,6 @@ fn onion_permitted(auth: Option<&AuthState>, authed_user: Option<&str>) -> bool 
     }
 }
 
-/// Spawn a detached one-shot task that tops up the working bridge list by
-/// `deficit` bridges: it drains the candidate pool first and only fetches
-/// fresh candidates over the live Tor circuit if the pool falls short.
-/// Fire-and-forget: a dropped `JoinHandle` does not cancel it, failures
-/// only log.
-fn spawn_auto_fetch(
-    tor: TorTunnel,
-    cfg: Config,
-    config_path: Option<std::path::PathBuf>,
-    deficit: usize,
-) {
-    tokio::spawn(async move {
-        info!(
-            want = deficit,
-            "auto-fetch: topping up working bridges in the background"
-        );
-        match crate::fetch_merge::top_up_working(&tor, &cfg, config_path.as_deref(), deficit).await
-        {
-            Ok(0) => info!("auto-fetch: no new reachable bridges promoted"),
-            Ok(n) => info!(
-                promoted = n,
-                "auto-fetch: promoted fresh bridges into config"
-            ),
-            Err(e) => warn!(error = %e, "auto-fetch failed"),
-        }
-    });
-}
-
-/// Spawn the periodic bridge-maintenance loop: every
-/// `interval_mins` it re-probes our configured bridges (both obfs4 and
-/// webtunnel), updates the health store, prunes bridges that reached
-/// `max_fails`, and — if we are short on healthy bridges — fetches more
-/// from the configured sources. `interval_mins == 0` disables it.
-///
-/// Deliberately gentle to avoid network flood: a generous default
-/// interval, bounded-concurrency probing, the once-per-window failure
-/// counter, and a top-up fetch only when actually short.
-fn spawn_bridge_maintenance(
-    handle: TorHandle,
-    config_path: Option<std::path::PathBuf>,
-    interval_mins: u64,
-    obs_sink: crate::arti_observability::ObservationSink,
-) {
-    if interval_mins == 0 {
-        info!("bridge maintenance disabled (recheck_interval_mins = 0)");
-        return;
-    }
-    let interval = Duration::from_secs(interval_mins.saturating_mul(60));
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        ticker.tick().await; // consume the immediate first tick
-
-        loop {
-            ticker.tick().await;
-
-            let cfg = match Config::load_with_override(config_path.as_deref()) {
-                Ok(loaded) => loaded.into_config(),
-                Err(e) => {
-                    warn!(error = %e, "maintenance: could not reload config");
-                    continue;
-                }
-            };
-            let parsed = match cfg.bridges.parsed() {
-                Ok(p) => p.bridges,
-                Err(e) => {
-                    warn!(error = %e, "maintenance: config has invalid bridges");
-                    continue;
-                }
-            };
-            if parsed.is_empty() {
-                continue;
-            }
-
-            info!(
-                count = parsed.len(),
-                "maintenance: re-probing configured bridges"
-            );
-            let alive = bridge_probe::probe_and_sort(
-                parsed.clone(),
-                crate::tor_setup::BRIDGE_PROBE_TIMEOUT,
-            )
-            .await;
-            let store = crate::tor_setup::update_health_and_prune(
-                config_path.as_deref(),
-                &parsed,
-                &alive,
-                &cfg,
-                Some(&obs_sink),
-            );
-
-            if cfg.bridges.auto_fetch && !cfg.bridges.sources.is_empty() {
-                // Periodically refresh the candidate pool from the sources
-                // (over Tor) — keeps it fresh and drops anything that has
-                // since become a working bridge. Snapshot the *current*
-                // tunnel through the handle so a refresh follows a watchdog
-                // rebuild rather than pinning the dying original.
-                if let Some(tor) = handle.tunnel().await {
-                    if let Err(e) = crate::fetch_merge::refresh_candidate_pool(
-                        &tor,
-                        &cfg,
-                        config_path.as_deref(),
-                        Duration::from_secs(30),
-                    )
-                    .await
-                    {
-                        warn!(error = %e, "maintenance: pool refresh failed");
-                    }
-                }
-            }
-
-            // A bridge counts toward the healthy working set only if it is
-            // reachable at BOTH layers: TCP-alive (already filtered by
-            // `alive`) AND not saturated with circuit-layer failures. TCP
-            // probes stay green while the obfs4/circuit layer is degraded
-            // (e.g. DPI interference on the transport handshake), so
-            // counting only TCP-alive bridges here would mask a total
-            // outage and never trigger a pool top-up.
-            let circuit_healthy = match &store {
-                Some(s) => alive
-                    .iter()
-                    .filter(|(b, _)| s.circuit_fails(b) < cfg.bridges.max_circuit_fails)
-                    .count(),
-                // No store → no circuit signal; fall back to the TCP-only
-                // behaviour so a missing store never blocks a top-up the
-                // TCP layer alone would have requested.
-                None => alive.len(),
-            };
-
-            info!(
-                tcp_alive = alive.len(),
-                circuit_healthy,
-                min = cfg.bridges.min_alive,
-                "maintenance: bridge health snapshot"
-            );
-
-            // Top up the working list from the pool when we are short on
-            // genuinely healthy bridges (lazy probe, no fetch — the refresh
-            // above already filled the pool).
-            let deficit = compute_deficit(cfg.bridges.min_alive, alive.len(), circuit_healthy);
-            if deficit > 0 {
-                info!(
-                    tcp_alive = alive.len(),
-                    circuit_healthy,
-                    min = cfg.bridges.min_alive,
-                    want = deficit,
-                    "maintenance: short on healthy bridges — draining candidate pool"
-                );
-                // Snapshot the current tunnel so admission verifies a real
-                // Tor channel; None (tunnel down) falls back to TCP-only.
-                let tor = handle.tunnel().await;
-                match crate::fetch_merge::drain_pool(config_path.as_deref(), deficit, tor.as_ref())
-                    .await
-                {
-                    Ok(n) if n > 0 => info!(promoted = n, "maintenance: promoted fresh bridges"),
-                    Ok(_) => {}
-                    Err(e) => warn!(error = %e, "maintenance: drain failed"),
-                }
-            }
-        }
-    });
-}
-
 /// How many working bridges we are short of, accounting for *both* layers
 /// of bridge health: TCP reachability and circuit-layer usability.
 ///
@@ -676,9 +519,9 @@ fn spawn_bridge_maintenance(
 /// layer failures are still below the pruning threshold. Only a bridge
 /// healthy at *both* layers can actually carry traffic, so the deficit is
 /// driven by the smaller (circuit-aware) count. Used by
-/// [`spawn_bridge_maintenance`] to decide whether to promote fresh
+/// [`crate::bridge_maintenance`] to decide whether to promote fresh
 /// candidates from the pool into the working set.
-fn compute_deficit(min_alive: usize, tcp_alive: usize, circuit_healthy: usize) -> usize {
+pub(crate) fn compute_deficit(min_alive: usize, tcp_alive: usize, circuit_healthy: usize) -> usize {
     // `circuit_healthy` is by construction a subset of `tcp_alive`, but
     // take the min defensively: a caller passing independent counts must
     // never over-report healthy bridges.

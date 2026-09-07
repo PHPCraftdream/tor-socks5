@@ -209,7 +209,11 @@ pub fn spawn_bridge_warmer(handle: TorHandle, config_path: Option<PathBuf>, cfg:
                 }
             };
 
-            let candidates = candidates_with_health(&cfg, config_path.as_deref());
+            let active = handle.active_bridges();
+            let candidates: Vec<_> = candidates_with_health(&cfg, config_path.as_deref())
+                .into_iter()
+                .filter(|(bridge, _)| active.contains(bridge))
+                .collect();
             if candidates.is_empty() {
                 continue;
             }

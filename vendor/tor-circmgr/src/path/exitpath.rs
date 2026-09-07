@@ -474,10 +474,9 @@ mod test {
             let now = SystemTime::get();
 
             for _ in 0..100 {
-                let (path, _, _) =
-                    ExitPathBuilder::from_target_ports(vec![TargetPort::ipv4(443)])
-                        .pick_path(&mut rng, dirinfo, &guards, &config, now)
-                        .unwrap();
+                let (path, _, _) = ExitPathBuilder::from_target_ports(vec![TargetPort::ipv4(443)])
+                    .pick_path(&mut rng, dirinfo, &guards, &config, now)
+                    .unwrap();
                 assert_eq!(path.len(), 3);
             }
         });
