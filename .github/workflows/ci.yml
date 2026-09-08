@@ -1,5 +1,7 @@
-# CI — fmt, clippy, test across Linux / macOS / Windows.
-# Mirrors the local pre-push hook at .githooks/pre-push.
+# CI — fmt, clippy, test across Linux / macOS / Windows; first-party line
+# limit, MSRV 1.89 and Android arm64 cross-compile checks.
+# fmt/clippy/test mirror the local pre-push hook at .githooks/pre-push;
+# line-limit/msrv/android are CI-only.
 
 name: CI
 
@@ -59,3 +61,54 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --workspace
+
+  line-limit:
+    name: First-party line limit (1000)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check first-party Rust files stay under 1000 lines
+        run: sh scripts/check-line-limit.sh
+
+  msrv:
+    name: MSRV (1.89)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-1.89
+      - run: cargo check --locked --workspace --all-targets
+
+  android:
+    name: Android arm64 (aarch64-linux-android)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      # r27c matches the locally verified build in docs/android-cross-compile.md.
+      - id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          add-to-path: true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-linux-android
+      # cargo-ndk injects the per-target CARGO_TARGET_*_LINKER plus CC/AR/CXX
+      # env vars; without it, cc-based build scripts (ring, libsqlite3-sys
+      # bundled sqlite, zstd-sys) have no NDK toolchain to compile C against
+      # (see docs/android-cross-compile.md, "Why no .cargo/config.toml").
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - name: cargo ndk check (workspace, arm64-v8a)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: cargo ndk -t arm64-v8a check --locked --workspace
+      - name: cargo ndk build (android-ffi cdylib, arm64-v8a)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: cargo ndk -t arm64-v8a build --locked -p android-ffi
