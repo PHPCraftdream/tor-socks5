@@ -253,22 +253,108 @@ fn snapshot_cache_dir(src: &Path, dest: &Path) -> bool {
 /// `TOR_PT_MANAGED_TRANSPORT_VER`, and it survives every throwaway client's
 /// drop and runtime shutdown. The process-wide Job Object only fires at
 /// whole-process exit, so it cannot bound per-tick growth in a long-lived
-/// service (production: 22 orphaned processes after ~13h, 1-2 per tick). The
-/// snapshot-before/diff-and-kill-after pairing per bridge check is narrow by
-/// construction: the main engine's own long-lived PT predates the baseline
-/// and is never a candidate.
+/// service (production: 22 orphaned processes after ~13h, 1-2 per tick).
+///
+/// The kill is ownership-based, not time-of-appearance-based: before the
+/// batch, [`pt_reap::create_kill_marker`] makes a per-batch uniquely named
+/// executable copy of the PT binary (hard link where the volume allows,
+/// copy otherwise) and registers its file name in a module-level FIFO
+/// registry. The check is launched with that copy as its `pt_binary`, so
+/// whatever PT child `tor-ptmgr` spawns from it is identifiable by exe
+/// file name alone; after each check [`pt_reap::kill_marked_children`]
+/// terminates only own children whose exe name matches a registered
+/// marker. An earlier version snapshotted child PIDs before each check
+/// and killed anything "new" after — but the main engine's PT transport
+/// (also spawned by tor-ptmgr inside this process) can RESTART inside
+/// the check window and would then appear "new" and get killed, taking
+/// the user's live tunnels down with the cleanup. A restarted main PT
+/// child has the normal exe name and can never match a marker. See
+/// `docs/stability-review-2026-09-08.md` section 2.
+///
+/// Deliberate tradeoffs: the marker copy costs one file link/copy per
+/// batch (cheap, and the scratch dir is wiped with the batch); the
+/// registry never shrinks mid-process so children that escaped their own
+/// call's kill keep getting reaped by later calls (capped at 128 names,
+/// FIFO); and a `%TEMP%` marker file may occasionally survive if a child
+/// could not be terminated and the file is locked — cleanup is
+/// best-effort with ignored errors.
 #[cfg(windows)]
 mod pt_reap {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
 
-    /// PIDs of live children of this process, read from the Win32 process
-    /// snapshot. Like /proc on Linux, the process tree has no concept of
-    /// "which logical client spawned this" — every child of our own PID shows
-    /// up here regardless of which throwaway `TorTunnel` (or the long-lived
-    /// main engine) started it, which is why callers snapshot this immediately
-    /// before their own check and diff against a fresh snapshot after, rather
-    /// than trusting any single call's result alone.
-    pub(crate) fn own_child_pids() -> HashSet<u32> {
+    /// FIFO registry of marker file names that identify "our" PT children.
+    /// Never shrinks per-check: a leaked child that escaped its own call's
+    /// kill sweep keeps matching (and gets reaped) on every later call.
+    static KILL_MARKERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// Distinguishes markers created within the same nanosecond tick.
+    static MARKER_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// 128 registered names is far beyond anything a long-lived service can
+    /// accumulate (each batch adds at most one); the cap just guarantees the
+    /// registry cannot grow without bound over a multi-day process.
+    const KILL_MARKERS_CAP: usize = 128;
+
+    /// Creates a uniquely named executable copy of `pt_binary` inside
+    /// `scratch_base` (which must already exist) and registers its file
+    /// name. Hard link first (cheap, same-volume case), fall back to a full
+    /// copy. Returns the marker FILE NAME (not the path) on success, None
+    /// on any failure — callers must treat None as "leak reaping disabled
+    /// for this batch", never as "fall back to diff-based killing".
+    pub(crate) fn create_kill_marker(pt_binary: &Path, scratch_base: &Path) -> Option<String> {
+        let unique = format!(
+            "{:016x}",
+            (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+                ^ (u64::from(std::process::id()) << 32))
+                ^ MARKER_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let marker_name = format!("pt-{unique}.exe");
+        let marker_path = scratch_base.join(&marker_name);
+        let created = std::fs::hard_link(pt_binary, &marker_path)
+            .or_else(|_| std::fs::copy(pt_binary, &marker_path).map(|_| ()));
+        if let Err(error) = created {
+            tracing::warn!(%error, marker = %marker_name,
+                "circuit-verify: could not create PT kill marker; \
+                 leaked-child reaping disabled for this batch");
+            return None;
+        }
+
+        let mut markers = KILL_MARKERS.lock().unwrap_or_else(|error| {
+            KILL_MARKERS.clear_poison();
+            error.into_inner()
+        });
+        if !markers.contains(&marker_name) {
+            markers.push(marker_name.clone());
+            if markers.len() > KILL_MARKERS_CAP {
+                markers.remove(0); // FIFO eviction of the oldest name
+            }
+        }
+        Some(marker_name)
+    }
+
+    /// Snapshot of the currently registered marker names (test-visible via
+    /// `pub(crate)`).
+    pub(crate) fn current_markers() -> HashSet<String> {
+        let markers = KILL_MARKERS.lock().unwrap_or_else(|error| {
+            KILL_MARKERS.clear_poison();
+            error.into_inner()
+        });
+        markers.iter().cloned().collect()
+    }
+
+    /// Live children of this process as (pid, exe-file-name) pairs, read
+    /// from the Win32 process snapshot. Like /proc on Linux, the process
+    /// tree has no concept of "which logical client spawned this" — every
+    /// child of our own PID shows up here regardless of which throwaway
+    /// `TorTunnel` (or the long-lived main engine) started it. Ownership is
+    /// therefore established by the exe file name (see [`create_kill_marker`]).
+    fn own_children_with_names() -> HashMap<u32, String> {
         use std::mem::{size_of, zeroed};
 
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
@@ -284,10 +370,10 @@ mod pt_reap {
         // Best-effort, like android's /proc read-failure path: return empty.
         let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
         if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
-            return HashSet::new();
+            return HashMap::new();
         }
 
-        let mut children = HashSet::new();
+        let mut children = HashMap::new();
         // SAFETY: `entry` is a fully-initialized PROCESSENTRY32W (the all-zero
         // bit pattern from `zeroed()` is valid — all fields are integers or
         // fixed-size arrays), with dwSize set to its exact size before the
@@ -303,7 +389,15 @@ mod pt_reap {
                 let my_pid = GetCurrentProcessId();
                 loop {
                     if entry.th32ParentProcessID == my_pid {
-                        children.insert(entry.th32ProcessID);
+                        let len = entry
+                            .szExeFile
+                            .iter()
+                            .position(|&unit| unit == 0)
+                            .unwrap_or(entry.szExeFile.len());
+                        children.insert(
+                            entry.th32ProcessID,
+                            String::from_utf16_lossy(&entry.szExeFile[..len]),
+                        );
                     }
                     if Process32NextW(snapshot, &mut entry) == 0 {
                         break;
@@ -319,29 +413,86 @@ mod pt_reap {
         children
     }
 
-    /// Kills (`TerminateProcess`) every currently-live child not present in
-    /// `baseline`. Narrow by construction, not by filtering on process name:
-    /// a caller that snapshots `baseline` immediately before its own check,
-    /// and calls this immediately after, only ever sees its own check's child
-    /// as "new" — the main engine's own long-lived PT child was already
-    /// running before the snapshot and is therefore never a candidate.
-    pub(crate) fn kill_new_children(baseline: &HashSet<u32>) {
+    /// PIDs of live children of this process. Test-only: production code
+    /// identifies ownership via [`create_kill_marker`]/[`kill_marked_children`].
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) fn own_child_pids() -> HashSet<u32> {
+        own_children_with_names().into_keys().collect()
+    }
+
+    /// Pure decision core of [`kill_marked_children`], kept free of OS APIs
+    /// for testability. `children` must already contain only own children
+    /// (ppid-is-own is implied by the caller's snapshot filter). A child is
+    /// killed iff its exe file name matches ANY registered marker
+    /// (case-insensitively — Windows file names are case-insensitive), and
+    /// never when it is `my_pid` itself. An empty registry kills nothing:
+    /// the copy-failure degenerate path must never regress to guessing.
+    fn kill_targets(
+        children: impl IntoIterator<Item = (u32, Option<String>)>,
+        my_pid: u32,
+        markers: &HashSet<String>,
+    ) -> Vec<u32> {
+        if markers.is_empty() {
+            return Vec::new();
+        }
+        children
+            .into_iter()
+            .filter(|(pid, exe)| {
+                *pid != my_pid
+                    && exe.as_ref().is_some_and(|exe| {
+                        markers
+                            .iter()
+                            .any(|marker| marker.eq_ignore_ascii_case(exe))
+                    })
+            })
+            .map(|(pid, _)| pid)
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kill_targets_for_test(
+        children: impl IntoIterator<Item = (u32, Option<String>)>,
+        my_pid: u32,
+        markers: &HashSet<String>,
+    ) -> Vec<u32> {
+        kill_targets(children, my_pid, markers)
+    }
+
+    /// Terminates every currently-live own child whose exe file name matches
+    /// a registered kill marker (see [`create_kill_marker`]). A no-op while
+    /// the registry is empty. Deliberately name-verified, not
+    /// time-of-appearance-verified: the main engine's PT child — however
+    /// freshly restarted — carries the normal exe name and can never match.
+    pub(crate) fn kill_marked_children() {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{
-            OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+            GetCurrentProcessId, OpenProcess, TerminateProcess, PROCESS_TERMINATE,
         };
 
-        for pid in own_child_pids() {
-            if baseline.contains(&pid) {
-                continue;
-            }
+        let markers = current_markers();
+        if markers.is_empty() {
+            return;
+        }
+        // SAFETY: GetCurrentProcessId takes no arguments and cannot fail.
+        let my_pid = unsafe { GetCurrentProcessId() };
+        let targets = kill_targets(
+            own_children_with_names()
+                .into_iter()
+                .map(|(pid, exe)| (pid, Some(exe))),
+            my_pid,
+            &markers,
+        );
+
+        for pid in targets {
             // SAFETY: `pid` was just observed as our own child in a fresh
-            // snapshot; we only ask for PROCESS_TERMINATE. A null return means
-            // the process already exited between the snapshots — that is the
-            // expected race, and failure is not an error worth surfacing: the
-            // end state either way is "not running". Otherwise we terminate
-            // with an arbitrary non-zero exit code (matching android's
-            // SIGKILL) and close the handle we opened.
+            // snapshot AND its exe name matches one of the marker copies we
+            // created ourselves; we only ask for PROCESS_TERMINATE. A null
+            // return means the process already exited between the snapshot
+            // and here — that is the expected race, and failure is not an
+            // error worth surfacing: the end state either way is "not
+            // running". Otherwise we terminate with an arbitrary non-zero
+            // exit code (matching android's SIGKILL) and close the handle
+            // we opened.
             let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
             if handle.is_null() {
                 continue;
@@ -363,12 +514,17 @@ mod pt_reap {
 #[cfg(not(windows))]
 mod pt_reap {
     use std::collections::HashSet;
+    use std::path::Path;
 
     pub(crate) fn own_child_pids() -> HashSet<u32> {
         HashSet::new()
     }
 
-    pub(crate) fn kill_new_children(_baseline: &HashSet<u32>) {}
+    pub(crate) fn create_kill_marker(_pt_binary: &Path, _scratch_base: &Path) -> Option<String> {
+        None
+    }
+
+    pub(crate) fn kill_marked_children() {}
 }
 
 pub(crate) fn verify_bridges_sequential(
@@ -389,6 +545,28 @@ pub(crate) fn verify_bridges_sequential(
     let cache_dir = (live_cache_dir.is_dir()
         && snapshot_cache_dir(live_cache_dir, &cache_snapshot))
     .then_some(cache_snapshot);
+
+    // Ownership marker for this batch (Windows; see `pt_reap` module docs).
+    // Created once per batch, before the Vec is consumed, only when a PT is
+    // actually in play: the marker is the uniquely named executable copy the
+    // checks below launch instead of the shared PT binary, and its file name
+    // is what the post-check kill sweep verifies against. If creation fails,
+    // no diff-based fallback runs on purpose: killing collateral (the main
+    // engine's PT) is worse than a leak, so reaping is simply disabled for
+    // this batch.
+    let needs_pt = pt_binary.is_some() && bridges.iter().any(|b| b.transport.is_some());
+    let kill_marker = if needs_pt {
+        pt_reap::create_kill_marker(pt_binary.as_ref().expect("checked above"), scratch_base)
+    } else {
+        None
+    };
+    let kill_marker_path = kill_marker.as_ref().map(|name| scratch_base.join(name));
+    if needs_pt && kill_marker.is_none() {
+        tracing::warn!(
+            "circuit-verify: no PT ownership marker could be created; \
+             leaked-child reaping is disabled for this batch"
+        );
+    }
 
     for (idx, bridge) in bridges.into_iter().enumerate() {
         if bridge.transport.is_some() && pt_binary.is_none() {
@@ -422,11 +600,13 @@ pub(crate) fn verify_bridges_sequential(
 
         let check = arti_wrapper::BridgeCheckSettings {
             bridge: bridge.clone(),
-            pt_binary: pt_binary.clone(),
+            // The check's effective PT binary is the batch's unique marker
+            // copy when one exists — that is what makes its spawned child
+            // identifiable as OURS by exe name (see `pt_reap`).
+            pt_binary: kill_marker_path.clone().or_else(|| pt_binary.clone()),
             cache_dir: cache_dir.clone(),
             state_dir: check_dir.clone(),
         };
-        let baseline_children = pt_reap::own_child_pids();
         let result: anyhow::Result<Duration> =
             crate::arti_observability::without_guard_observations(|| {
                 rt.block_on(async {
@@ -459,7 +639,7 @@ pub(crate) fn verify_bridges_sequential(
                 })
             });
         rt.shutdown_timeout(VERIFY_RUNTIME_SHUTDOWN_GRACE);
-        pt_reap::kill_new_children(&baseline_children);
+        pt_reap::kill_marked_children();
 
         if let Err(error) = &result {
             warn!(transport = ?bridge.transport, addr = %bridge.addr, %error,
@@ -515,6 +695,7 @@ async fn persist_circuit_verify_results(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::time::Duration as StdDuration;
 
     #[test]
@@ -533,6 +714,90 @@ mod tests {
     #[test]
     fn own_child_pids_never_contains_self() {
         assert!(!pt_reap::own_child_pids().contains(&std::process::id()));
+    }
+
+    /// The P1 regression pin (stability review 2026-09-08 §2): a child with
+    /// the NORMAL exe name — i.e. the main engine's PT restarted mid-check —
+    /// must never be a kill target, no matter how "new" it looks.
+    #[cfg(windows)]
+    #[test]
+    fn kill_targets_spares_restarted_main_pt_child() {
+        let markers = HashSet::from(["pt-abcdef0123456789.exe".to_owned()]);
+        let targets = pt_reap::kill_targets_for_test(
+            vec![(1001, Some("socks5-proxy.exe".to_owned()))],
+            std::process::id(),
+            &markers,
+        );
+        assert!(!targets.contains(&1001));
+        assert!(targets.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn kill_targets_kills_only_marker_named_children() {
+        let markers = HashSet::from(["pt-abcdef0123456789.exe".to_owned()]);
+        let targets = pt_reap::kill_targets_for_test(
+            vec![
+                (1002, Some("pt-abcdef0123456789.exe".to_owned())),
+                (1003, Some("unrelated.exe".to_owned())),
+            ],
+            std::process::id(),
+            &markers,
+        );
+        assert_eq!(targets, vec![1002]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn kill_targets_empty_registry_kills_nothing() {
+        // The copy-failure degenerate path never kills.
+        let targets = pt_reap::kill_targets_for_test(
+            vec![(1004, Some("pt-abcdef0123456789.exe".to_owned()))],
+            std::process::id(),
+            &HashSet::new(),
+        );
+        assert!(targets.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn kill_targets_never_targets_self() {
+        let my_pid = std::process::id();
+        let markers = HashSet::from(["pt-abcdef0123456789.exe".to_owned()]);
+        let targets = pt_reap::kill_targets_for_test(
+            vec![(my_pid, Some("pt-abcdef0123456789.exe".to_owned()))],
+            my_pid,
+            &markers,
+        );
+        assert!(targets.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn create_kill_marker_makes_unique_executable_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(&scratch).expect("mkdir scratch");
+        let fake_pt = dir.path().join("fake-pt.exe");
+        std::fs::write(&fake_pt, b"pretend PT binary").expect("write fake pt");
+
+        let marker_a = pt_reap::create_kill_marker(&fake_pt, &scratch).expect("marker a");
+        let marker_b = pt_reap::create_kill_marker(&fake_pt, &scratch).expect("marker b");
+        assert_ne!(marker_a, marker_b, "names must be unique per call");
+        assert!(marker_a.starts_with("pt-") && marker_a.ends_with(".exe"));
+
+        let content = std::fs::read(&fake_pt).expect("read fake pt");
+        assert_eq!(
+            std::fs::read(scratch.join(&marker_a)).expect("read marker a"),
+            content
+        );
+        assert_eq!(
+            std::fs::read(scratch.join(&marker_b)).expect("read marker b"),
+            content
+        );
+        let markers = pt_reap::current_markers();
+        assert!(markers.contains(&marker_a));
+        assert!(markers.contains(&marker_b));
     }
 
     fn seed_failed_bridge(dir: &Path, bridge: &BridgeLine) -> Option<PathBuf> {
