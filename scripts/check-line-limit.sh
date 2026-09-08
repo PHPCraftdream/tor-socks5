@@ -16,10 +16,7 @@ set -u
 
 MAX_LINES=1000
 
-BASELINE="
-apps/socks5-proxy/src/server.rs
-apps/socks5-proxy/src/arti_observability.rs
-"
+BASELINE=""
 
 status=0
 
