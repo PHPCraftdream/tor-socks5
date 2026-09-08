@@ -201,231 +201,11 @@ async fn run_circuit_verify_tick(config_path: Option<&Path>, active: &[BridgeLin
     persist_circuit_verify_results(&results, config_path).await;
 }
 
-/// Builds `dest` as a usable check-client cache dir: either a CONSISTENT
-/// snapshot of the live cache's SQLite database — taken with sqlite's Online
-/// Backup API, which is safe against concurrent writers — plus a best-effort
-/// copy of the rest of the source dir (`dir_blobs/**` and any unknown files),
-/// or, when nothing consistent can be produced, an explicitly clean EMPTY
-/// cache dir the check client cold-starts in. Returns `true` when `dest` is
-/// usable. Never copies the live `dir.sqlite3` file directly (a plain file
-/// copy of a hot database can interleave with the main engine's writes and
-/// its journal/WAL sidecars, producing a torn copy), and never falls back to
-/// sharing the live directory. Ported verbatim from android-ffi's
-/// `snapshot_cache_dir` (jni_verify.rs). Used to snapshot the live client's
-/// directory cache for [`verify_bridges_sequential`] — a snapshot, not the
-/// live directory, is what a throwaway check client gets: tor-dirmgr storage
-/// is a single sqlite file, and a second client opening the live one
-/// contends with the main client's routine writes (`SQLITE_BUSY`).
+/// Thin delegate to the shared implementation in `bridge-verify-core`, keeping
+/// this crate's historical `"circuit-verify: "` log prefix. See the shared
+/// `snapshot_cache_dir` doc for the full contract.
 fn snapshot_cache_dir(src: &Path, dest: &Path) -> bool {
-    // ~4 MiB per step at the default 4 KiB page size: few steps for a
-    // tor-dirmgr-sized DB, without hogging the writer between steps.
-    const SNAPSHOT_BACKUP_PAGES_PER_STEP: i32 = 1024;
-    // Bounded total budget. `Backup::run_to_completion` is deliberately NOT
-    // used: it retries Busy forever.
-    const SNAPSHOT_BACKUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
-
-    const DB_NAME: &str = "dir.sqlite3";
-    // Sidecars must never travel with a backup-API snapshot: a stale journal
-    // or WAL next to the fresh DB would be actively harmful.
-    const SIDECAR_NAMES: [&str; 3] = ["dir.sqlite3-journal", "dir.sqlite3-wal", "dir.sqlite3-shm"];
-    // Per-process lock state; the check client makes its own.
-    const REST_COPY_SKIP: [&str; 5] = [
-        DB_NAME,
-        "dir.sqlite3-journal",
-        "dir.sqlite3-wal",
-        "dir.sqlite3-shm",
-        "dir.lock",
-    ];
-
-    fn remove_db_and_sidecars(dest: &Path) -> bool {
-        // A missing sidecar is success (nothing to remove), not failure --
-        // the backup API rarely leaves WAL/journal sidecars behind, so this
-        // is the common case, not an edge case.
-        fn remove_if_exists(path: &Path) -> bool {
-            match std::fs::remove_file(path) {
-                Ok(()) => true,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-                Err(_) => false,
-            }
-        }
-        let mut ok = remove_if_exists(&dest.join(DB_NAME));
-        for sidecar in SIDECAR_NAMES {
-            ok &= remove_if_exists(&dest.join(sidecar));
-        }
-        ok
-    }
-
-    // Best-effort recursive copy of everything in `src` EXCEPT the skip list.
-    // Only the DB travels via the backup API; blobs (written atomically by
-    // tor-dirmgr, which also tolerates vanished/orphaned blobs) and unknown
-    // files are copied file-wise, so copy failures mean a refetch, not
-    // corruption — hence warn-only.
-    fn copy_rest_recursive(src: &Path, dest: &Path, skip: &[&str]) {
-        if let Err(e) = std::fs::create_dir_all(dest) {
-            tracing::warn!(
-                error = %e,
-                "circuit-verify: cannot create snapshot subdirectory"
-            );
-            return;
-        }
-        let entries = match std::fs::read_dir(src) {
-            Ok(entries) => entries,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "circuit-verify: cannot list snapshot source dir"
-                );
-                return;
-            }
-        };
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "circuit-verify: cannot read snapshot source entry"
-                    );
-                    continue;
-                }
-            };
-            let name = entry.file_name();
-            if skip
-                .iter()
-                .any(|s| std::ffi::OsStr::new(s) == name.as_os_str())
-            {
-                continue;
-            }
-            let dest_path = dest.join(&name);
-            match entry.file_type() {
-                Ok(ft) if ft.is_dir() => copy_rest_recursive(&entry.path(), &dest_path, skip),
-                Ok(_) => {
-                    if let Err(e) = std::fs::copy(entry.path(), &dest_path) {
-                        tracing::warn!(
-                            error = %e,
-                            file = %name.to_string_lossy(),
-                            "circuit-verify: snapshot file copy failed; check client will refetch"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "circuit-verify: cannot stat snapshot source entry"
-                    );
-                }
-            }
-        }
-    }
-
-    // 1. Ensure the destination exists.
-    if let Err(e) = std::fs::create_dir_all(dest) {
-        tracing::warn!(
-            error = %e,
-            "circuit-verify: cannot create cache snapshot directory"
-        );
-        return false;
-    }
-
-    // 2. Scratch dirs can persist between batches: drop any stale snapshot
-    // DB and sidecars first.
-    if dest.join(DB_NAME).exists() && std::fs::remove_file(dest.join(DB_NAME)).is_err() {
-        tracing::warn!("circuit-verify: cannot remove stale snapshot dir.sqlite3");
-        return false;
-    }
-    for sidecar in SIDECAR_NAMES {
-        let _ = std::fs::remove_file(dest.join(sidecar));
-    }
-
-    // 3. No live DB at all (fresh engine): leave dest EMPTY — an explicitly
-    // clean empty cache dir the check client cold-starts in.
-    let src_db = src.join(DB_NAME);
-    if !src_db.exists() {
-        return true;
-    }
-
-    // Open the live DB read-only (matches tor-dirmgr's own readonly store;
-    // a hot-journal DB may refuse a read-only open — that lands in the
-    // empty-cache fallback below).
-    let src_conn = match rusqlite::Connection::open_with_flags(
-        &src_db,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    ) {
-        Ok(conn) => conn,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "circuit-verify: cannot open live dir.sqlite3 read-only"
-            );
-            return if remove_db_and_sidecars(dest) {
-                true
-            } else {
-                tracing::warn!("circuit-verify: cannot clean snapshot dir after failed open");
-                false
-            };
-        }
-    };
-
-    let backup_result: Result<(), String> = {
-        let dest_conn: Result<rusqlite::Connection, String> =
-            match rusqlite::Connection::open(dest.join(DB_NAME)) {
-                Ok(conn) => Ok(conn),
-                Err(e) => Err(e.to_string()),
-            };
-        // Scoped so both connections are closed before any cleanup below.
-        match dest_conn {
-            Ok(mut dest_conn) => match rusqlite::backup::Backup::new(&src_conn, &mut dest_conn) {
-                Ok(backup) => {
-                    let deadline = std::time::Instant::now() + SNAPSHOT_BACKUP_DEADLINE;
-                    loop {
-                        // Checked on EVERY iteration, not just Busy/Locked:
-                        // a source that keeps growing (concurrent writer)
-                        // can make step() return `More` forever without
-                        // ever reporting Busy/Locked, which would starve a
-                        // deadline check placed only in that arm.
-                        if std::time::Instant::now() >= deadline {
-                            break Err("online backup did not finish within 15s".to_owned());
-                        }
-                        match backup.step(SNAPSHOT_BACKUP_PAGES_PER_STEP) {
-                            Ok(rusqlite::backup::StepResult::Done) => break Ok(()),
-                            Ok(rusqlite::backup::StepResult::More) => {}
-                            Ok(
-                                rusqlite::backup::StepResult::Busy
-                                | rusqlite::backup::StepResult::Locked,
-                            ) => {
-                                std::thread::sleep(std::time::Duration::from_millis(10));
-                            }
-                            Err(e) => break Err(e.to_string()),
-                            // StepResult is #[non_exhaustive]; treat any
-                            // future variant like More (keep going).
-                            Ok(_) => {}
-                        }
-                    }
-                }
-                Err(e) => Err(e.to_string()),
-            },
-            Err(e) => Err(e),
-        }
-    };
-    drop(src_conn);
-
-    if let Err(e) = backup_result {
-        tracing::warn!(
-            error = %e,
-            "circuit-verify: sqlite online backup failed; falling back to an empty cache snapshot"
-        );
-        // Never keep a partial DB: wipe it and its sidecars, then serve an
-        // empty cache dir instead.
-        if !remove_db_and_sidecars(dest) {
-            tracing::warn!("circuit-verify: cannot clean snapshot dir after failed backup");
-            return false;
-        }
-        return true;
-    }
-
-    // 4. DB snapshot done: best-effort copy of the rest of the cache dir.
-    copy_rest_recursive(src, dest, &REST_COPY_SKIP);
-    true
+    bridge_verify_core::snapshot::snapshot_cache_dir(src, dest, "circuit-verify: ")
 }
 
 /// Verifies each of `bridges` for real end-to-end reachability, sequentially,
@@ -482,21 +262,12 @@ fn snapshot_cache_dir(src: &Path, dest: &Path) -> bool {
 mod pt_reap {
     use std::collections::{HashMap, HashSet};
     use std::path::Path;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Mutex;
 
-    /// FIFO registry of marker file names that identify "our" PT children.
-    /// Never shrinks per-check: a leaked child that escaped its own call's
-    /// kill sweep keeps matching (and gets reaped) on every later call.
-    static KILL_MARKERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-    /// Distinguishes markers created within the same nanosecond tick.
-    static MARKER_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    /// 128 registered names is far beyond anything a long-lived service can
-    /// accumulate (each batch adds at most one); the cap just guarantees the
-    /// registry cannot grow without bound over a multi-day process.
-    const KILL_MARKERS_CAP: usize = 128;
+    // The marker registry (statics, FIFO cap, registration) and the pure
+    // kill decision live in `bridge-verify-core::pt_reap`; this module keeps
+    // only the Win32 platform parts: the Toolhelp32 snapshot, the marker
+    // file creation (Windows `pt-{:016x}.exe` naming, hard link with copy
+    // fallback), and the `TerminateProcess` sweep.
 
     /// Creates a uniquely named executable copy of `pt_binary` inside
     /// `scratch_base` (which must already exist) and registers its file
@@ -505,16 +276,10 @@ mod pt_reap {
     /// on any failure — callers must treat None as "leak reaping disabled
     /// for this batch", never as "fall back to diff-based killing".
     pub(crate) fn create_kill_marker(pt_binary: &Path, scratch_base: &Path) -> Option<String> {
-        let unique = format!(
-            "{:016x}",
-            (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0)
-                ^ (u64::from(std::process::id()) << 32))
-                ^ MARKER_COUNTER.fetch_add(1, Ordering::Relaxed)
+        let marker_name = format!(
+            "pt-{:016x}.exe",
+            bridge_verify_core::pt_reap::unique_marker_bits()
         );
-        let marker_name = format!("pt-{unique}.exe");
         let marker_path = scratch_base.join(&marker_name);
         let created = std::fs::hard_link(pt_binary, &marker_path)
             .or_else(|_| std::fs::copy(pt_binary, &marker_path).map(|_| ()));
@@ -524,28 +289,17 @@ mod pt_reap {
                  leaked-child reaping disabled for this batch");
             return None;
         }
-
-        let mut markers = KILL_MARKERS.lock().unwrap_or_else(|error| {
-            KILL_MARKERS.clear_poison();
-            error.into_inner()
-        });
-        if !markers.contains(&marker_name) {
-            markers.push(marker_name.clone());
-            if markers.len() > KILL_MARKERS_CAP {
-                markers.remove(0); // FIFO eviction of the oldest name
-            }
-        }
-        Some(marker_name)
+        Some(bridge_verify_core::pt_reap::register_kill_marker(
+            marker_name,
+        ))
     }
 
     /// Snapshot of the currently registered marker names (test-visible via
-    /// `pub(crate)`).
+    /// `pub(crate)`); the registry itself is shared, in
+    /// `bridge-verify-core::pt_reap`.
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn current_markers() -> HashSet<String> {
-        let markers = KILL_MARKERS.lock().unwrap_or_else(|error| {
-            KILL_MARKERS.clear_poison();
-            error.into_inner()
-        });
-        markers.iter().cloned().collect()
+        bridge_verify_core::pt_reap::current_markers()
     }
 
     /// Live children of this process as (pid, exe-file-name) pairs, read
@@ -620,44 +374,6 @@ mod pt_reap {
         own_children_with_names().into_keys().collect()
     }
 
-    /// Pure decision core of [`kill_marked_children`], kept free of OS APIs
-    /// for testability. `children` must already contain only own children
-    /// (ppid-is-own is implied by the caller's snapshot filter). A child is
-    /// killed iff its exe file name matches ANY registered marker
-    /// (case-insensitively — Windows file names are case-insensitive), and
-    /// never when it is `my_pid` itself. An empty registry kills nothing:
-    /// the copy-failure degenerate path must never regress to guessing.
-    fn kill_targets(
-        children: impl IntoIterator<Item = (u32, Option<String>)>,
-        my_pid: u32,
-        markers: &HashSet<String>,
-    ) -> Vec<u32> {
-        if markers.is_empty() {
-            return Vec::new();
-        }
-        children
-            .into_iter()
-            .filter(|(pid, exe)| {
-                *pid != my_pid
-                    && exe.as_ref().is_some_and(|exe| {
-                        markers
-                            .iter()
-                            .any(|marker| marker.eq_ignore_ascii_case(exe))
-                    })
-            })
-            .map(|(pid, _)| pid)
-            .collect()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn kill_targets_for_test(
-        children: impl IntoIterator<Item = (u32, Option<String>)>,
-        my_pid: u32,
-        markers: &HashSet<String>,
-    ) -> Vec<u32> {
-        kill_targets(children, my_pid, markers)
-    }
-
     /// Terminates every currently-live own child whose exe file name matches
     /// a registered kill marker (see [`create_kill_marker`]). A no-op while
     /// the registry is empty. Deliberately name-verified, not
@@ -669,16 +385,23 @@ mod pt_reap {
             GetCurrentProcessId, OpenProcess, TerminateProcess, PROCESS_TERMINATE,
         };
 
-        let markers = current_markers();
+        // The snapshot only yields own children, so each child's ppid is
+        // `my_pid`; names and marker names are both normalized to lowercase
+        // bytes so the shared decision's exact byte match equals the former
+        // case-insensitive comparison (marker names are generated lowercase).
+        let markers: HashSet<Vec<u8>> = bridge_verify_core::pt_reap::current_markers()
+            .into_iter()
+            .map(|marker| marker.to_ascii_lowercase().into_bytes())
+            .collect();
         if markers.is_empty() {
             return;
         }
         // SAFETY: GetCurrentProcessId takes no arguments and cannot fail.
         let my_pid = unsafe { GetCurrentProcessId() };
-        let targets = kill_targets(
+        let targets = bridge_verify_core::pt_reap::kill_targets(
             own_children_with_names()
                 .into_iter()
-                .map(|(pid, exe)| (pid, Some(exe))),
+                .map(|(pid, exe)| (pid, my_pid, exe.to_ascii_lowercase().into_bytes())),
             my_pid,
             &markers,
         );
@@ -709,8 +432,8 @@ mod pt_reap {
 /// Non-Windows stub: mirrors android-ffi's non-android stub. Host builds
 /// (`cargo test`) never spawn a real PT child, so there is nothing to reap.
 /// See the `#[cfg(windows)]` module above for the Win32 implementation and
-/// `packages/android-ffi/src/lib.rs` (`#[cfg(target_os = "android")]`) for
-/// the original.
+/// `bridge-verify-core::pt_reap` for the shared registry/decision logic the
+/// platforms' real implementations both use.
 #[cfg(not(windows))]
 mod pt_reap {
     use std::collections::HashSet;
@@ -893,7 +616,6 @@ async fn persist_circuit_verify_results(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
     use std::time::Duration as StdDuration;
 
     #[test]
@@ -914,62 +636,9 @@ mod tests {
         assert!(!pt_reap::own_child_pids().contains(&std::process::id()));
     }
 
-    /// The P1 regression pin (stability review 2026-09-08 §2): a child with
-    /// the NORMAL exe name — i.e. the main engine's PT restarted mid-check —
-    /// must never be a kill target, no matter how "new" it looks.
-    #[cfg(windows)]
-    #[test]
-    fn kill_targets_spares_restarted_main_pt_child() {
-        let markers = HashSet::from(["pt-abcdef0123456789.exe".to_owned()]);
-        let targets = pt_reap::kill_targets_for_test(
-            vec![(1001, Some("socks5-proxy.exe".to_owned()))],
-            std::process::id(),
-            &markers,
-        );
-        assert!(!targets.contains(&1001));
-        assert!(targets.is_empty());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn kill_targets_kills_only_marker_named_children() {
-        let markers = HashSet::from(["pt-abcdef0123456789.exe".to_owned()]);
-        let targets = pt_reap::kill_targets_for_test(
-            vec![
-                (1002, Some("pt-abcdef0123456789.exe".to_owned())),
-                (1003, Some("unrelated.exe".to_owned())),
-            ],
-            std::process::id(),
-            &markers,
-        );
-        assert_eq!(targets, vec![1002]);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn kill_targets_empty_registry_kills_nothing() {
-        // The copy-failure degenerate path never kills.
-        let targets = pt_reap::kill_targets_for_test(
-            vec![(1004, Some("pt-abcdef0123456789.exe".to_owned()))],
-            std::process::id(),
-            &HashSet::new(),
-        );
-        assert!(targets.is_empty());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn kill_targets_never_targets_self() {
-        let my_pid = std::process::id();
-        let markers = HashSet::from(["pt-abcdef0123456789.exe".to_owned()]);
-        let targets = pt_reap::kill_targets_for_test(
-            vec![(my_pid, Some("pt-abcdef0123456789.exe".to_owned()))],
-            my_pid,
-            &markers,
-        );
-        assert!(targets.is_empty());
-    }
-
+    /// The P1 regression pin (stability review 2026-09-08 §2) and its sibling
+    /// kill-decision scenarios moved to `bridge-verify-core::pt_reap`'s tests
+    /// (suffix `_cli`) when the decision logic was extracted.
     #[cfg(windows)]
     #[test]
     fn create_kill_marker_makes_unique_executable_names() {
@@ -1051,207 +720,5 @@ mod tests {
             .expect("reload store");
         assert_eq!(store.circuit_fails(&bridge), 1, "circuit_fails unchanged");
         assert_eq!(store.verified_count(&bridge), 0, "no verification recorded");
-    }
-
-    /// Builds a small valid source cache DB at `dir/dir.sqlite3` with a
-    /// `t(seq INTEGER PRIMARY KEY)` table of `n` rows.
-    fn seed_source_db(dir: &Path, n: i64) {
-        std::fs::create_dir_all(dir).expect("mkdir src");
-        let conn = rusqlite::Connection::open(dir.join("dir.sqlite3")).expect("open src db");
-        conn.execute_batch(
-            "CREATE TABLE t(seq INTEGER PRIMARY KEY, payload BLOB);
-             INSERT INTO t(seq, payload) VALUES (0, x'00');",
-        )
-        .expect("seed");
-        for seq in 1..n {
-            conn.execute(
-                "INSERT INTO t(seq, payload) VALUES (?1, ?2)",
-                rusqlite::params![seq, [0u8; 16]],
-            )
-            .expect("seed row");
-        }
-    }
-
-    fn payload_for(seq: i64) -> [u8; 8192] {
-        [(seq % 251) as u8; 8192]
-    }
-
-    /// THE key test: while a writer keeps committing rows to the live DB, the
-    /// snapshot must still yield a consistent, standalone SQLite file — the
-    /// whole point of using the Online Backup API instead of a file copy.
-    #[test]
-    fn snapshot_is_consistent_under_concurrent_writes() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let src = dir.path().join("src");
-        std::fs::create_dir_all(&src).expect("mkdir src");
-        {
-            let conn = rusqlite::Connection::open(src.join("dir.sqlite3")).expect("open src db");
-            conn.execute_batch(
-                "PRAGMA journal_mode=WAL;
-                 CREATE TABLE t(seq INTEGER PRIMARY KEY, payload BLOB);",
-            )
-            .expect("create table");
-            let mut stmt = conn
-                .prepare("INSERT INTO t(seq, payload) VALUES (?1, ?2)")
-                .expect("prepare insert");
-            for seq in 0..200i64 {
-                stmt.execute(rusqlite::params![seq, payload_for(seq)])
-                    .expect("seed row");
-            }
-        }
-
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let writer_stop = stop.clone();
-        let writer_src = src.clone();
-        let writer = std::thread::spawn(move || {
-            let conn =
-                rusqlite::Connection::open(writer_src.join("dir.sqlite3")).expect("open writer db");
-            conn.busy_timeout(std::time::Duration::from_secs(5))
-                .expect("busy_timeout");
-            let mut seq = 200i64;
-            while !writer_stop.load(std::sync::atomic::Ordering::Relaxed) {
-                conn.execute(
-                    "INSERT INTO t(seq, payload) VALUES (?1, ?2)",
-                    rusqlite::params![seq, payload_for(seq)],
-                )
-                .expect("writer insert");
-                // A realistic writer rate: tor-dirmgr commits routine
-                // upkeep occasionally, not in an unthrottled tight loop.
-                // An unthrottled writer can dirty pages faster than the
-                // backup can copy them, so the source never stops growing
-                // and the backup can never observe a quiet moment to finish.
-                std::thread::sleep(std::time::Duration::from_millis(5));
-                seq += 1;
-            }
-            seq
-        });
-
-        let dest = dir.path().join("dest");
-        assert!(
-            snapshot_cache_dir(&src, &dest),
-            "snapshot must succeed under concurrent writes"
-        );
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        writer.join().expect("join writer");
-
-        // The "check client opens it" proof: a fresh read-write connection.
-        let snap = rusqlite::Connection::open(dest.join("dir.sqlite3")).expect("open snapshot db");
-        let integrity: String = snap
-            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
-            .expect("integrity_check");
-        assert_eq!(integrity, "ok", "snapshot must be a consistent DB");
-
-        // Contiguous committed prefix starting at seq 0, no torn/garbage rows.
-        let (count, max_seq): (i64, Option<i64>) = snap
-            .query_row("SELECT COUNT(*), MAX(seq) FROM t", [], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
-            .expect("count/max");
-        assert_eq!(count, max_seq.expect("nonempty") + 1, "contiguous prefix");
-        let min_seq: i64 = snap
-            .query_row("SELECT MIN(seq) FROM t", [], |row| row.get(0))
-            .expect("min");
-        assert_eq!(min_seq, 0, "prefix starts at 0");
-        let mut stmt = snap
-            .prepare("SELECT seq, payload FROM t")
-            .expect("prepare scan");
-        let rows: Vec<(i64, Vec<u8>)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .expect("query map")
-            .collect::<Result<_, _>>()
-            .expect("scan rows");
-        for (seq, payload) in rows {
-            assert_eq!(payload, payload_for(seq), "row {seq} payload intact");
-        }
-
-        // Check clients write descriptors: one INSERT into the snapshot works.
-        snap.execute(
-            "INSERT INTO t(seq, payload) VALUES (?1, ?2)",
-            rusqlite::params![max_seq.unwrap() + 1, payload_for(0)],
-        )
-        .expect("insert into snapshot");
-        drop(stmt);
-        drop(snap);
-
-        // Clean standalone snapshot: no sidecars travel with it.
-        assert!(!dest.join("dir.sqlite3-wal").exists(), "no wal sidecar");
-        assert!(
-            !dest.join("dir.sqlite3-journal").exists(),
-            "no journal sidecar"
-        );
-    }
-
-    #[test]
-    fn snapshot_falls_back_to_empty_cache_on_bad_source_db() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let src = dir.path().join("src");
-        std::fs::create_dir_all(&src).expect("mkdir src");
-        std::fs::write(src.join("dir.sqlite3"), b"definitely not a sqlite db").expect("garbage");
-
-        let dest = dir.path().join("dest");
-        assert!(
-            snapshot_cache_dir(&src, &dest),
-            "empty-cache fallback is still a usable cache dir"
-        );
-        assert!(
-            !dest.join("dir.sqlite3").exists(),
-            "never ships the broken copy as the snapshot DB"
-        );
-    }
-
-    #[test]
-    fn snapshot_copies_blobs_but_not_lock_or_sidecars() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let src = dir.path().join("src");
-        seed_source_db(&src, 5);
-        std::fs::create_dir_all(src.join("dir_blobs/a")).expect("mkdir blobs");
-        std::fs::write(src.join("dir_blobs/a/b.blob"), b"blob-a").expect("write blob");
-        std::fs::write(src.join("dir_blobs/c.blob"), b"blob-c").expect("write blob");
-        std::fs::write(src.join("dir.lock"), b"lock").expect("write lock");
-        std::fs::write(src.join("dir.sqlite3-wal"), b"stale wal").expect("write wal");
-
-        let dest = dir.path().join("dest");
-        assert!(snapshot_cache_dir(&src, &dest));
-
-        // Snapshot DB is openable (trivial query) and usable.
-        let snap = rusqlite::Connection::open(dest.join("dir.sqlite3")).expect("open snapshot db");
-        let n: i64 = snap
-            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
-            .expect("trivial query");
-        assert_eq!(n, 5);
-        drop(snap);
-
-        // dir_blobs copied recursively; lock and sidecars never travel.
-        assert_eq!(
-            std::fs::read(dest.join("dir_blobs/a/b.blob")).expect("read blob a"),
-            b"blob-a"
-        );
-        assert_eq!(
-            std::fs::read(dest.join("dir_blobs/c.blob")).expect("read blob c"),
-            b"blob-c"
-        );
-        assert!(!dest.join("dir.lock").exists(), "dir.lock must not travel");
-        assert!(
-            !dest.join("dir.sqlite3-wal").exists(),
-            "sidecars must not travel with a backup-API snapshot"
-        );
-    }
-
-    #[test]
-    fn snapshot_missing_source_yields_empty_cache() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let dest = dir.path().join("dest");
-        assert!(
-            snapshot_cache_dir(&dir.path().join("does-not-exist"), &dest),
-            "an empty cache dir is a valid fresh-client cache"
-        );
-        assert!(dest.is_dir(), "dest must exist");
-        assert!(
-            std::fs::read_dir(&dest)
-                .expect("list dest")
-                .next()
-                .is_none(),
-            "dest must be empty"
-        );
     }
 }

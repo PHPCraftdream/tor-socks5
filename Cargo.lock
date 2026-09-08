@@ -96,6 +96,7 @@ dependencies = [
  "bridge-fetcher",
  "bridge-probe",
  "bridge-store",
+ "bridge-verify-core",
  "jni 0.21.1",
  "libc",
  "proxy-config",
@@ -795,6 +796,15 @@ dependencies = [
  "ptrs-gesher-bridge-line",
  "tempfile",
  "time",
+]
+
+[[package]]
+name = "bridge-verify-core"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -5252,6 +5262,7 @@ dependencies = [
  "bridge-fetcher",
  "bridge-probe",
  "bridge-store",
+ "bridge-verify-core",
  "clap",
  "criterion",
  "daemonize",
