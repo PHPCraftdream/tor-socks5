@@ -113,14 +113,25 @@ impl BridgeStore {
         by_transport.into_values().collect()
     }
 
-    /// Number of bridges currently in a healthy TCP state (`fails == 0`)
-    /// per the last probe round. Surfaced for the stale-channel watchdog,
-    /// which must distinguish "all circuits fail but bridges are
-    /// reachable" (stale channels → rebuild the client) from "bridges are
-    /// genuinely unreachable" (the bridge maintenance loop's own job).
+    /// Number of bridges with proven reachability: they answered at least
+    /// one probe (`ok_count > 0`), have no failure since (`fails == 0`), and
+    /// are not retired — the same predicate [`healthiest_bridges`]
+    /// (Self::healthiest_bridges) filters by. Mere `fails == 0` was wrong for
+    /// this method's only consumer, the stale-channel watchdog: a
+    /// source-attributed entry is born with `fails == 0` without ever being
+    /// probed, and a retired bridge keeps a perfect TCP record, so either
+    /// would let the watchdog read "only unprobed candidates in the store"
+    /// as "a bridge is reachable" and withhold the client rebuild. Surfaced
+    /// for the stale-channel watchdog, which must distinguish "all circuits
+    /// fail but bridges are proven reachable" (stale channels → rebuild the
+    /// client) from "bridges are genuinely unreachable" (the bridge
+    /// maintenance loop's own job).
     #[must_use]
     pub fn alive_count(&self) -> usize {
-        self.entries.values().filter(|e| e.fails == 0).count()
+        self.entries
+            .values()
+            .filter(|e| e.is_proven_alive())
+            .count()
     }
 
     /// Cumulative successful-probe count for a bridge (0 if unknown). This
@@ -219,8 +230,7 @@ impl BridgeStore {
 
     /// Consecutive TCP-probe failure count for a bridge (0 if unknown, which
     /// also covers "never probed"). `0` means the last probe round saw this
-    /// bridge as reachable — the same condition [`Self::alive_count`] counts
-    /// bridges by. Used by the bridge-warmer to exclude TCP-unreachable
+    /// bridge as reachable. Used by the bridge-warmer to exclude TCP-unreachable
     /// bridges from the warming pool.
     #[must_use]
     pub fn tcp_fails(&self, bridge: &BridgeLine) -> u32 {
@@ -249,7 +259,7 @@ impl BridgeStore {
             // configured -- a stale fingerprint -- so it keeps a clean probe
             // record and an excellent latency, and any ranking that considers
             // only reachability promotes it straight back into the active pool.
-            .filter(|e| e.fails == 0 && e.ok_count > 0 && !e.is_retired())
+            .filter(|e| e.is_proven_alive())
             .collect();
         Self::rank_and_take(healthy, limit)
     }
@@ -274,9 +284,7 @@ impl BridgeStore {
         let healthy: Vec<&Entry> = self
             .entries
             .values()
-            .filter(|e| {
-                e.fails == 0 && e.ok_count > 0 && !e.is_retired() && allowed.contains(&e.key())
-            })
+            .filter(|e| e.is_proven_alive() && allowed.contains(&e.key()))
             .collect();
         Self::rank_and_take(healthy, limit)
     }

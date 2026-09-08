@@ -531,9 +531,10 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
             if new_attempts < MIN_ATTEMPTS_TO_TRIGGER {
                 continue;
             }
-            // Condition 3: at least one bridge is TCP-reachable per the last
-            // probe round, so this is a circuit/channel problem, not the
-            // bridge-maintenance loop's "bridges are genuinely down" case.
+            // Condition 3: at least one bridge is proven reachable per the last
+            // probe round (answered a probe, no failure since, not retired), so
+            // this is a circuit/channel problem, not the bridge-maintenance
+            // loop's "bridges are genuinely down" case.
             let alive = live_bridge_count(config_path.as_deref());
             if alive == 0 {
                 continue;
@@ -745,8 +746,9 @@ pub(super) async fn verify_usable(tor: &TorTunnel, target: Option<(String, u16)>
         .unwrap_or(false)
 }
 
-/// Number of bridges in a healthy TCP state (`fails == 0`) per the last
-/// probe round, read straight off the on-disk health store. Best-effort: a
+/// Number of bridges with proven reachability (`BridgeStore::alive_count`:
+/// answered a probe, no failure since, not retired), read straight off the
+/// on-disk health store. Best-effort: a
 /// missing/unreadable store yields 0 (the watchdog then declines to fire,
 /// leaving the bridge-maintenance loop to repopulate it).
 pub(super) fn live_bridge_count(config_path: Option<&Path>) -> usize {

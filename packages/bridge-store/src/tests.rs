@@ -593,6 +593,42 @@ fn healthiest_bridges_excludes_a_retired_bridge_despite_perfect_probes() {
 }
 
 #[test]
+fn alive_count_requires_probe_proof_and_excludes_retired_or_failed() {
+    let mut s = empty();
+    let fresh = bridge(OBFS4_A);
+    let good = bridge(OBFS4_B);
+    let t0 = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+
+    // 1. Source-attributed entry, never probed: `fails == 0` alone must not
+    //    count as alive.
+    s.note_source_at(&fresh, "source", t0);
+    assert_eq!(s.alive_count(), 0, "unprobed source entry is not alive");
+
+    // 2. A successful probe proves the bridge alive.
+    s.record_at(fresh.clone(), Duration::from_millis(5), t0);
+    assert_eq!(s.alive_count(), 1, "probed bridge counts as alive");
+
+    // 3a. Retirement despite a spotless probe record removes it.
+    s.note_permanent_failure_at(&fresh, t0);
+    assert_eq!(
+        s.alive_count(),
+        0,
+        "retired bridge with perfect TCP record is not alive"
+    );
+
+    // 3b. A failed probe after success un-proves reachability. `t0 + HOUR`
+    //     passes the failure rate-limit window, so `fails` becomes 1.
+    s.record_at(good.clone(), Duration::from_millis(5), t0);
+    assert_eq!(s.alive_count(), 1);
+    s.note_failure_at(&good, t0 + HOUR, HOUR);
+    assert_eq!(
+        s.alive_count(),
+        0,
+        "bridge with a failure since its last success is not alive"
+    );
+}
+
+#[test]
 fn transport_summary_separates_reachable_from_channel_proven() {
     let mut s = empty();
     let reachable_only = bridge(OBFS4_A);

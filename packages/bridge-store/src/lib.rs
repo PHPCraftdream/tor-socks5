@@ -152,6 +152,15 @@ impl Entry {
         self.circuit_fails == RETIRED_CIRCUIT_FAILS
     }
 
+    /// Proven alive: at least one successful probe ever (`ok_count > 0`),
+    /// no failure since (`fails == 0`), and not retired. The same filter
+    /// [`BridgeStore::healthiest_bridges`] applies: absence of failure alone
+    /// proves nothing — a source-attributed entry starts with `fails == 0`
+    /// and `ok_count == 0`, and a retired bridge keeps a spotless TCP record.
+    fn is_proven_alive(&self) -> bool {
+        self.fails == 0 && self.ok_count > 0 && !self.is_retired()
+    }
+
     fn key(&self) -> Key {
         key_of(&self.bridge)
     }
