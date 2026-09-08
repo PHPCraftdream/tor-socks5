@@ -161,7 +161,7 @@ fn key_of(b: &BridgeLine) -> Key {
     (b.transport.clone(), b.addr, b.fingerprint.clone())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BridgeStore {
     path: PathBuf,
     entries: BTreeMap<Key, Entry>,

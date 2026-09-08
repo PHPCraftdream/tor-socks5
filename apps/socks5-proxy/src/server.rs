@@ -250,6 +250,16 @@ pub(crate) async fn run_server(
         // Empirically this is enough for the state-dir lock to be released
         // before the next run starts.
         tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // The bridge store writer's producers (maintenance, watchdogs,
+        // warmer, verifier) all read the Tor client through the handle just
+        // drained above, so they stop generating new updates here. Wait for
+        // the writer last: flush any retained snapshot and join its actor
+        // task, so a publish that only recovered after the last mutation
+        // is not silently lost when the runtime tears down.
+        if let Some(Err(error)) = crate::bridge_store_writer::close_global().await {
+            warn!(error = %error, "bridge health store had unpublished updates at shutdown");
+        }
     }
     info!("bye");
     Ok(())
