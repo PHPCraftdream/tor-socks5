@@ -654,6 +654,7 @@ pub(super) async fn stall_watchdog(
                             url: s.url.clone(),
                             headers: s.headers.clone(),
                             cookies: s.cookies.clone(),
+                            allow_credentials_cross_origin: s.allow_credentials_cross_origin,
                         })
                         .collect();
                     let max_body_bytes = reprobe_health

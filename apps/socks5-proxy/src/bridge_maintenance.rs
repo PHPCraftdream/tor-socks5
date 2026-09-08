@@ -363,6 +363,7 @@ async fn live_route_works(
         4096,
         &[],
         &[],
+        false,
     )
     .await;
     if body

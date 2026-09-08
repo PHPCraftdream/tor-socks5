@@ -92,6 +92,7 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
                 url: s.url.clone(),
                 headers: s.headers.clone(),
                 cookies: s.cookies.clone(),
+                allow_credentials_cross_origin: s.allow_credentials_cross_origin,
             })
             .collect();
 

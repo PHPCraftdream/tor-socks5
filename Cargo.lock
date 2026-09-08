@@ -754,6 +754,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arti-wrapper",
+ "base64",
  "bridge-probe",
  "criterion",
  "futures",

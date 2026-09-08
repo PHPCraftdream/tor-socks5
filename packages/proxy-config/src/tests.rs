@@ -262,6 +262,24 @@ fn minimal_source_is_just_a_url() {
     assert!(cfg.bridges.sources[0].cookies.is_empty());
 }
 
+#[test]
+fn source_credentials_cross_origin_defaults_to_false() {
+    // Without the key, credentials stay pinned to the source's own origin.
+    let src =
+        "listen: 127.0.0.1:1080\nbridges.sources: [\n\t{\n\t\turl: https://x.example/a\n\t}\n]\n";
+    let cfg: Config = ktav::from_str(src).expect("minimal source parses");
+    assert_eq!(cfg.bridges.sources.len(), 1);
+    assert!(!cfg.bridges.sources[0].allow_credentials_cross_origin);
+}
+
+#[test]
+fn source_credentials_cross_origin_opt_in_parses() {
+    let src = "listen: 127.0.0.1:1080\nbridges.sources: [\n\t{\n\t\turl: https://x.example/a\n\t\tallow_credentials_cross_origin: true\n\t}\n]\n";
+    let cfg: Config = ktav::from_str(src).expect("opt-in source parses");
+    assert_eq!(cfg.bridges.sources.len(), 1);
+    assert!(cfg.bridges.sources[0].allow_credentials_cross_origin);
+}
+
 // -- Config extension tests ---
 
 #[test]
@@ -310,6 +328,7 @@ fn bridge_source_serde_roundtrip() {
         url: "https://example.com/bridges".into(),
         headers: vec!["Authorization: Bearer x".into()],
         cookies: vec!["sid=abc".into()],
+        allow_credentials_cross_origin: false,
     };
     let serialized = ktav::to_string(&src).expect("serialize");
     let deserialized: BridgeSource = ktav::from_str(&serialized).expect("deserialize");

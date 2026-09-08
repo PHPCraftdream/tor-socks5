@@ -24,6 +24,7 @@ use crate::parse::parse_bridges_from_body;
 ///     url: "https://example.com/bridges-obfs4".into(),
 ///     headers: vec!["Authorization: Bearer xyz".into()],
 ///     cookies: vec!["session=abc".into()],
+///     allow_credentials_cross_origin: false,
 /// };
 /// assert_eq!(src.label, "example");
 /// ```
@@ -35,6 +36,13 @@ pub struct Source {
     pub headers: Vec<String>,
     /// Cookies, each a `name=value` pair; folded into one `Cookie:` header.
     pub cookies: Vec<String>,
+    /// Send `headers`/`cookies` to redirect targets on other origins (different
+    /// host or port). Default `false`: caller-supplied headers/cookies are sent
+    /// only to the origin of `url`; a redirect to another origin is followed
+    /// with an otherwise-identical request that carries none of them (RFC 9110
+    /// §15.4). Set `true` only when the collector's cross-origin redirect chain
+    /// is known and trusted.
+    pub allow_credentials_cross_origin: bool,
 }
 
 #[derive(Debug)]
@@ -69,8 +77,18 @@ pub async fn fetch_all(
         let label = source.label.clone();
         let headers = source.headers.clone();
         let cookies = source.cookies.clone();
+        let allow_cross = source.allow_credentials_cross_origin;
         handles.push(tokio::spawn(async move {
-            let result = fetch_one(&tor, &url, timeout, max_body_bytes, &headers, &cookies).await;
+            let result = fetch_one(
+                &tor,
+                &url,
+                timeout,
+                max_body_bytes,
+                &headers,
+                &cookies,
+                allow_cross,
+            )
+            .await;
             (label, result)
         }));
     }
@@ -98,6 +116,7 @@ pub async fn fetch_all_direct(
         let label = source.label.clone();
         let headers = source.headers.clone();
         let cookies = source.cookies.clone();
+        let allow_cross = source.allow_credentials_cross_origin;
         handles.push(tokio::spawn(async move {
             let result = fetch_one_direct(
                 resolver_policy,
@@ -106,6 +125,7 @@ pub async fn fetch_all_direct(
                 max_body_bytes,
                 &headers,
                 &cookies,
+                allow_cross,
             )
             .await;
             (label, result)

@@ -88,6 +88,8 @@ bridges.lines: [
 ## Where to fetch fresh bridges from. A source is at minimum `{ url: ... }`;
 ## `label`, `headers` (full `Name: Value` lines) and `cookies` (`name=value`)
 ## are optional, for collectors that need an API token or session cookie.
+## `allow_credentials_cross_origin` (default `false`) opts in to sending
+## those headers/cookies to redirect targets on a different origin.
 bridges.sources: [
     { url: https://example.com/bridges-obfs4 }
     {

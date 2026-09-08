@@ -553,6 +553,7 @@ pub(crate) fn verify_bridges_sequential(
                         4096,
                         &[],
                         &[],
+                        false,
                     )
                     .await?;
                     anyhow::ensure!(

@@ -187,6 +187,11 @@ bridges.sources: [
 - `headers` — optional array of full `Name: Value` lines.
 - `cookies` — optional array of `name=value` pairs, folded into one
   `Cookie:` header.
+- `allow_credentials_cross_origin` — optional boolean, default `false`.
+  `headers`/`cookies` are sent only to the origin of `url`; a redirect to
+  another origin (different host or port) is followed without them. Set
+  `true` only when the collector's redirect chain to another origin is
+  known and trusted.
 
 Header/cookie values are stripped of CR/LF to prevent header injection.
 

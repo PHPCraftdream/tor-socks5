@@ -435,9 +435,9 @@ impl BridgesConfig {
 }
 
 /// An HTTPS endpoint to fetch a bridge list from. The minimal form is just
-/// `{ url: https://... }`; `label`, `headers`, and `cookies` are optional.
-/// `headers`/`cookies` let a source be hit in a custom way (an API token, a
-/// session cookie, etc.).
+/// `{ url: https://... }`; `label`, `headers`, `cookies`, and
+/// `allow_credentials_cross_origin` are optional. `headers`/`cookies` let a
+/// source be hit in a custom way (an API token, a session cookie, etc.).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BridgeSource {
@@ -452,6 +452,12 @@ pub struct BridgeSource {
     /// Cookies, each a `name=value` pair (folded into one `Cookie:` header). Optional.
     #[serde(default)]
     pub cookies: Vec<String>,
+    /// Send this source's `headers`/`cookies` to redirect targets on a different
+    /// origin (different host or port). Default `false` — they go only to the
+    /// origin of `url`; a redirect to another origin is followed without them.
+    /// Opt in only for a redirect chain you control or trust.
+    #[serde(default)]
+    pub allow_credentials_cross_origin: bool,
 }
 
 /// Bridge-list collectors shipped as defaults, as `(label, url)`.
@@ -532,6 +538,7 @@ impl Default for BridgesConfig {
                     url: (*url).into(),
                     headers: Vec::new(),
                     cookies: Vec::new(),
+                    allow_credentials_cross_origin: false,
                 })
                 .collect(),
             use_seeds: true,

@@ -99,6 +99,7 @@ async fn fetch_sources(
             url: current_source_url(&s.url).to_owned(),
             headers: s.headers.clone(),
             cookies: s.cookies.clone(),
+            allow_credentials_cross_origin: s.allow_credentials_cross_origin,
         })
         .collect();
     if sources.is_empty() {

@@ -325,6 +325,7 @@ pub(super) async fn cold_start_rescue_fetch(
             url: s.url.clone(),
             headers: s.headers.clone(),
             cookies: s.cookies.clone(),
+            allow_credentials_cross_origin: s.allow_credentials_cross_origin,
         })
         .collect();
     let max_body_bytes = bridge_health

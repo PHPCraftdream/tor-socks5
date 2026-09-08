@@ -35,6 +35,9 @@ enum Connector<'a> {
     /// the cold-start rescue fetch (see `fetch_one_direct`), when zero
     /// bridges are reachable and there is no tunnel to route through yet.
     Direct(ResolverPolicy),
+    /// TEST-ONLY in-memory TLS loopback server (see `redirect_loopback`).
+    #[cfg(test)]
+    Test(&'a redirect_loopback::TestServer),
 }
 
 impl Connector<'_> {
@@ -51,6 +54,8 @@ impl Connector<'_> {
                 let stream = connect_direct(host, port, *policy).await?;
                 Ok(Box::pin(stream))
             }
+            #[cfg(test)]
+            Connector::Test(srv) => srv.connect(host, port).await,
         }
     }
 }
@@ -155,6 +160,14 @@ fn tls_config() -> Arc<rustls::ClientConfig> {
 }
 
 /// cancel-safe: NO — partial TLS/HTTP state if cancelled mid-handshake.
+///
+/// `allow_credentials_cross_origin` controls whether `headers`/`cookies` are
+/// sent to redirect targets on a different origin than `url` (different host
+/// or port; both URLs go through `parse_https_url`, so the comparison is on
+/// normalized origin). Default `false`: a cross-origin redirect is followed
+/// with an otherwise-identical request that carries none of them — including
+/// subsequent relative redirects, until the chain returns to the original
+/// origin (RFC 9110 §15.4).
 pub async fn fetch_one(
     tor: &TorTunnel,
     url: &str,
@@ -162,6 +175,7 @@ pub async fn fetch_one(
     max_body_bytes: usize,
     headers: &[String],
     cookies: &[String],
+    allow_credentials_cross_origin: bool,
 ) -> Result<String, FetchError> {
     tokio::time::timeout(
         timeout,
@@ -172,6 +186,7 @@ pub async fn fetch_one(
             max_body_bytes,
             headers,
             cookies,
+            allow_credentials_cross_origin,
         ),
     )
     .await
@@ -183,6 +198,8 @@ pub async fn fetch_one(
 /// meant for the narrow case where zero bridges are reachable yet and there
 /// is no tunnel to route [`fetch_one`] through.
 ///
+/// `allow_credentials_cross_origin` has the same meaning as in [`fetch_one`].
+///
 /// cancel-safe: NO — same reason as `fetch_one`.
 pub async fn fetch_one_direct(
     resolver_policy: ResolverPolicy,
@@ -191,6 +208,7 @@ pub async fn fetch_one_direct(
     max_body_bytes: usize,
     headers: &[String],
     cookies: &[String],
+    allow_credentials_cross_origin: bool,
 ) -> Result<String, FetchError> {
     tokio::time::timeout(
         timeout,
@@ -201,6 +219,7 @@ pub async fn fetch_one_direct(
             max_body_bytes,
             headers,
             cookies,
+            allow_credentials_cross_origin,
         ),
     )
     .await
@@ -214,8 +233,14 @@ async fn fetch_one_inner(
     max_body_bytes: usize,
     headers: &[String],
     cookies: &[String],
+    allow_credentials_cross_origin: bool,
 ) -> Result<String, FetchError> {
     let mut current_url = url.to_string();
+    // Fixed credential boundary: the origin of the URL the caller asked for,
+    // not the previous hop. Both sides go through `parse_https_url` (the `url`
+    // crate), so host is lowercased and an omitted port folds to 443 — a
+    // plain tuple comparison is a normalized origin comparison.
+    let original_origin: (String, u16) = parse_https_url(url).map(|t| (t.host, t.port))?;
 
     for hop in 0..=MAX_REDIRECTS {
         if hop == MAX_REDIRECTS {
@@ -223,6 +248,25 @@ async fn fetch_one_inner(
         }
 
         let target = parse_https_url(&current_url)?;
+        // RFC 9110 §15.4: source credentials (API tokens, session cookies)
+        // must not leak to a different origin just because that origin sent a
+        // redirect. Withhold ALL caller-supplied headers/cookies together on
+        // cross-origin hops (opt-out via `allow_credentials_cross_origin`).
+        let same_origin = allow_credentials_cross_origin
+            || (target.host == original_origin.0 && target.port == original_origin.1);
+        let (hop_headers, hop_cookies): (&[String], &[String]) = if same_origin {
+            (headers, cookies)
+        } else {
+            (&[], &[])
+        };
+        if !same_origin {
+            debug!(
+                host = %target.host,
+                port = target.port,
+                hop,
+                "cross-origin redirect: withholding source credentials"
+            );
+        }
         debug!(
             host = %target.host,
             port = target.port,
@@ -242,7 +286,12 @@ async fn fetch_one_inner(
             .await
             .map_err(|e| FetchError::Tls(e.to_string()))?;
 
-        let req = build_get_request(&target.host, &target.path_and_query, headers, cookies);
+        let req = build_get_request(
+            &target.host,
+            &target.path_and_query,
+            hop_headers,
+            hop_cookies,
+        );
         tls.write_all(&req).await.map_err(|e| FetchError::Io {
             op: "write request",
             source: e,
@@ -595,3 +644,6 @@ mod proptests {
         }
     }
 }
+
+#[cfg(test)]
+mod redirect_loopback;
