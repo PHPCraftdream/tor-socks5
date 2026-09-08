@@ -24,6 +24,8 @@ const OBFS4_A_NEW_PARAMS: &str =
     "obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=YYY iat-mode=1";
 const OBFS4_B: &str =
     "obfs4 5.6.7.8:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=WWW iat-mode=0";
+const OBFS4_C: &str =
+    "obfs4 9.9.9.9:443 1111111111111111111111111111111111111111 cert=YYY iat-mode=0";
 
 const HOUR: Duration = Duration::from_secs(3600);
 const MAX_FAILS: u32 = 24;
@@ -871,4 +873,193 @@ fn concurrent_saves_do_not_share_a_temp_file() {
         .collect();
     assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// TS2-05 regression: the one-lookup snapshot must report exactly what the
+/// per-field getters report, for every degree of entry completeness, and
+/// `None` for an untracked bridge where the getters fall back to zero/None.
+#[test]
+fn health_snapshot_matches_the_individual_getters() {
+    let mut s = empty();
+    let t0 = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+
+    // Fully populated: probes, channel warm-up, verification, circuit failure.
+    let full = bridge(OBFS4_A);
+    s.record_at(full.clone(), Duration::from_millis(7), t0);
+    s.record_at(full.clone(), Duration::from_millis(11), t0 + HOUR);
+    s.note_channel_success_at(&full, t0 + HOUR);
+    s.note_circuit_verified_at(&full, t0 + HOUR);
+    s.note_circuit_failure_at(&full, t0 + 2 * HOUR, HOUR);
+
+    // Partial: probed only.
+    let probed_only = bridge(OBFS4_B);
+    s.record_at(probed_only.clone(), Duration::from_millis(3), t0);
+
+    // Bare: source-attributed, never probed.
+    let bare = bridge(
+        "webtunnel [2001:db8::1]:443 0123456789ABCDEF0123456789ABCDEF01234567 \
+         url=https://example.test/secret",
+    );
+    s.note_source_at(&bare, "test", t0);
+
+    for b in [&full, &probed_only, &bare] {
+        let snap = s.health_snapshot(b).expect("entry is tracked");
+        assert_eq!(snap.tcp_fails, s.tcp_fails(b), "tcp_fails mismatch");
+        assert_eq!(
+            snap.circuit_fails,
+            s.circuit_fails(b),
+            "circuit_fails mismatch"
+        );
+        assert_eq!(
+            snap.verified_count,
+            s.verified_count(b),
+            "verified_count mismatch"
+        );
+        assert_eq!(snap.ok_count, s.ok_count(b), "ok_count mismatch");
+        assert_eq!(
+            snap.last_circuit_observation,
+            s.last_circuit_observation(b),
+            "last_circuit_observation mismatch"
+        );
+    }
+
+    // The fully populated entry really did produce non-trivial values, so
+    // the per-field comparisons above are not vacuous zero == zero checks.
+    let snap = s.health_snapshot(&full).unwrap();
+    assert_eq!(snap.ok_count, 2);
+    assert_eq!(snap.verified_count, 1);
+    assert_eq!(snap.circuit_fails, 1);
+    assert_eq!(snap.tcp_fails, 0);
+    assert_eq!(snap.last_circuit_observation, Some(t0 + 2 * HOUR));
+
+    // Untracked bridge: the snapshot is None while the getters each report
+    // their zero/None fallback -- both shapes agree on "nothing recorded".
+    let unknown = bridge(OBFS4_C);
+    assert!(s.health_snapshot(&unknown).is_none());
+    assert_eq!(s.tcp_fails(&unknown), 0);
+    assert_eq!(s.circuit_fails(&unknown), 0);
+    assert_eq!(s.verified_count(&unknown), 0);
+    assert_eq!(s.ok_count(&unknown), 0);
+    assert_eq!(s.last_circuit_observation(&unknown), None);
+}
+
+/// TS2-06 regression: entries tied under the ranking keep the store's key
+/// order -- the order the previous stable sort gave them -- at every limit.
+#[test]
+fn healthiest_bridges_keeps_map_order_for_equal_scores() {
+    let mut s = empty();
+    // Identical ranking fields (same ok_count, latency, no channel or
+    // verification history); map keys order by address: A < B < C.
+    for line in [OBFS4_A, OBFS4_B, OBFS4_C] {
+        s.record(bridge(line), Duration::from_millis(10));
+    }
+    let a = bridge(OBFS4_A);
+    let b = bridge(OBFS4_B);
+    let c = bridge(OBFS4_C);
+
+    assert_eq!(s.healthiest_bridges(0), Vec::<BridgeLine>::new());
+    assert_eq!(
+        s.healthiest_bridges(1),
+        vec![a.clone()],
+        "k=1 takes the head"
+    );
+    assert_eq!(s.healthiest_bridges(2), vec![a.clone(), b.clone()]);
+    assert_eq!(
+        s.healthiest_bridges(3),
+        vec![a.clone(), b.clone(), c.clone()],
+        "k == N"
+    );
+    assert_eq!(
+        s.healthiest_bridges(50),
+        vec![a, b, c],
+        "k >= N returns everything"
+    );
+}
+
+/// TS2-06 regression: at every limit (0, 1, mid-boundary, N, k >= N) the
+/// selected prefix is the same the old full stable sort produced: the
+/// ranking tiers (verified > channel-proven > merely reachable) in full,
+/// ties inside a tier in store-key order, never-probed entries excluded.
+#[test]
+fn healthiest_bridges_top_k_matches_full_ranking_at_every_limit() {
+    let mut s = empty();
+    let t0 = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+
+    let v1 = bridge(OBFS4_A);
+    s.record_at(v1.clone(), Duration::from_millis(10), t0);
+    s.note_circuit_verified_at(&v1, t0 + 2 * HOUR); // verified most recently -> first
+    let v2 = bridge(OBFS4_B);
+    s.record_at(v2.clone(), Duration::from_millis(10), t0);
+    s.note_circuit_verified_at(&v2, t0 + HOUR);
+    // Channel-proven pair, fully tied: map key order is 2.2.2.2 then 9.9.9.9.
+    let c1 =
+        bridge("obfs4 2.2.2.2:443 3333333333333333333333333333333333333333 cert=CCC iat-mode=0");
+    let c2 = bridge(OBFS4_C);
+    for b in [&c1, &c2] {
+        s.record_at((*b).clone(), Duration::from_millis(10), t0);
+        s.note_channel_success_at(b, t0);
+    }
+    // Merely reachable, no channel history.
+    let r1 =
+        bridge("obfs4 3.3.3.3:443 4444444444444444444444444444444444444444 cert=DDD iat-mode=0");
+    s.record_at(r1.clone(), Duration::from_millis(10), t0);
+    // Never probed: excluded from the ranking entirely.
+    let unproven =
+        bridge("obfs4 4.4.4.4:443 5555555555555555555555555555555555555555 cert=EEE iat-mode=0");
+    s.note_source_at(&unproven, "test", t0);
+
+    assert_eq!(s.healthiest_bridges(0), Vec::<BridgeLine>::new());
+    assert_eq!(s.healthiest_bridges(1), vec![v1.clone()]);
+    assert_eq!(s.healthiest_bridges(2), vec![v1.clone(), v2.clone()]);
+    assert_eq!(
+        s.healthiest_bridges(3),
+        vec![v1.clone(), v2.clone(), c1.clone()],
+        "the tie inside the channel-proven tier resolves by store key order"
+    );
+    assert_eq!(
+        s.healthiest_bridges(4),
+        vec![v1.clone(), v2.clone(), c1.clone(), c2.clone()]
+    );
+    let expected = vec![v1, v2, c1, c2, r1];
+    assert_eq!(s.healthiest_bridges(5), expected, "k == N");
+    assert_eq!(s.healthiest_bridges(50), expected, "k >= N");
+}
+
+/// TS2-06 regression: the verification queue's order (never-attempted first
+/// in store-key order among ties, attempted-but-unverified last) survives
+/// the bounded-heap selection at limits 0, 1, k < N and k >= N.
+#[test]
+fn needing_circuit_verification_order_and_limits() {
+    let mut s = empty();
+    let t0 = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+    let a = bridge(OBFS4_A); // map key order: A (1.2.3.4) before B (5.6.7.8)
+    let b = bridge(OBFS4_B);
+    let c = bridge(OBFS4_C);
+    for bridge_ref in [&a, &b, &c] {
+        s.record((*bridge_ref).clone(), Duration::from_millis(10));
+        s.note_channel_success_at(bridge_ref, t0);
+    }
+    // An attempt is not a verification: `c` stays due, but sorts after the
+    // never-attempted pair (Some(t0) after None under the due key).
+    s.note_verification_attempt_at(&c, t0);
+
+    let now = t0 + HOUR;
+    assert_eq!(
+        s.needing_circuit_verification(now, HOUR, 0),
+        Vec::<BridgeLine>::new()
+    );
+    assert_eq!(
+        s.needing_circuit_verification(now, HOUR, 1),
+        vec![a.clone()],
+        "k=1 takes the head of the same order"
+    );
+    assert_eq!(
+        s.needing_circuit_verification(now, HOUR, 2),
+        vec![a.clone(), b.clone()]
+    );
+    assert_eq!(
+        s.needing_circuit_verification(now, HOUR, 10),
+        vec![a, b, c],
+        "k >= N: attempted-but-unverified still due, ranked last"
+    );
 }

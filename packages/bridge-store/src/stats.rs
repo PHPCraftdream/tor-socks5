@@ -3,6 +3,9 @@
 
 use super::*;
 
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+
 impl BridgeStore {
     /// Bridges that have actually carried a Tor channel, most recently first.
     ///
@@ -212,7 +215,7 @@ impl BridgeStore {
         max_age: Duration,
         limit: usize,
     ) -> Vec<BridgeLine> {
-        let mut due: Vec<&Entry> = self
+        let due: Vec<DueForVerification<'_>> = self
             .entries
             .values()
             .filter(|e| e.channel_ok_count > 0 && !e.is_retired())
@@ -220,11 +223,12 @@ impl BridgeStore {
                 None => true,
                 Some(t) => now - t >= max_age,
             })
+            .enumerate()
+            .map(|(position, entry)| DueForVerification { position, entry })
             .collect();
-        due.sort_by_key(|e| e.last_verification_attempt.or(e.last_verified));
-        due.into_iter()
-            .take(limit)
-            .map(|e| e.bridge.clone())
+        take_best(due, limit)
+            .into_iter()
+            .map(|due| due.entry.bridge.clone())
             .collect()
     }
 
@@ -235,6 +239,24 @@ impl BridgeStore {
     #[must_use]
     pub fn tcp_fails(&self, bridge: &BridgeLine) -> u32 {
         self.entries.get(&key_of(bridge)).map_or(0, |e| e.fails)
+    }
+
+    /// One-lookup snapshot of every health counter the bridge-warmer ranks
+    /// on. Reading several counters for one bridge through the individual
+    /// getters rebuilt the owning dedup key (cloning `transport` and
+    /// `fingerprint`) and searched the map once per counter; this pays for a
+    /// single lookup instead. `None` covers "not tracked here" — the same
+    /// fallback the getters apply one at a time (`0` counts, `None`
+    /// timestamp).
+    #[must_use]
+    pub fn health_snapshot(&self, bridge: &BridgeLine) -> Option<HealthSnapshot> {
+        self.entries.get(&key_of(bridge)).map(|e| HealthSnapshot {
+            tcp_fails: e.fails,
+            circuit_fails: e.circuit_fails,
+            verified_count: e.verified_count,
+            ok_count: e.ok_count,
+            last_circuit_observation: Some(e.last_circuit_observation),
+        })
     }
 
     /// Failure count for a bridge (0 if unknown). Test/diagnostic helper.
@@ -283,29 +305,132 @@ impl BridgeStore {
         let allowed: HashSet<Key> = candidates.iter().map(key_of).collect();
         let healthy: Vec<&Entry> = self
             .entries
-            .values()
-            .filter(|e| e.is_proven_alive() && allowed.contains(&e.key()))
+            .iter()
+            // Membership check against the key already stored in the map:
+            // rebuilding it from the entry would clone `transport` and
+            // `fingerprint` again for every record scanned.
+            .filter(|(key, e)| e.is_proven_alive() && allowed.contains(*key))
+            .map(|(_, e)| e)
             .collect();
         Self::rank_and_take(healthy, limit)
     }
 
-    fn rank_and_take(mut healthy: Vec<&Entry>, limit: usize) -> Vec<BridgeLine> {
-        healthy.sort_by(|a, b| {
-            // End-to-end verified (a real circuit reached the open internet) outranks
-            // merely channel-proven, which outranks merely TCP-reachable -- the same three
-            // tiers `docs/design/real-connectivity-bridge-verification.md` documents.
-            b.verified_count
-                .cmp(&a.verified_count)
-                .then_with(|| b.last_verified.cmp(&a.last_verified))
-                .then_with(|| b.channel_ok_count.cmp(&a.channel_ok_count))
-                .then_with(|| b.last_channel_ok.cmp(&a.last_channel_ok))
-                .then_with(|| b.ok_count.cmp(&a.ok_count))
-                .then(a.last_latency.cmp(&b.last_latency))
-        });
-        healthy
-            .into_iter()
-            .take(limit)
-            .map(|e| e.bridge.clone())
-            .collect()
+    fn rank_and_take(healthy: Vec<&Entry>, limit: usize) -> Vec<BridgeLine> {
+        take_best(
+            healthy
+                .into_iter()
+                .enumerate()
+                .map(|(position, entry)| Ranked { position, entry })
+                .collect(),
+            limit,
+        )
+        .into_iter()
+        .map(|ranked| ranked.entry.bridge.clone())
+        .collect()
     }
+}
+
+/// The health ranking behind `healthiest_bridges`/`healthiest_among`, best
+/// first: end-to-end verified (a real circuit reached the open internet)
+/// outranks merely channel-proven, which outranks merely TCP-reachable -- the
+/// same three tiers `docs/design/real-connectivity-bridge-verification.md`
+/// documents. Unchanged by the top-k rework: only the selection mechanism
+/// around it moved from a full stable sort to a bounded heap.
+fn rank_cmp(a: &Entry, b: &Entry) -> Ordering {
+    b.verified_count
+        .cmp(&a.verified_count)
+        .then_with(|| b.last_verified.cmp(&a.last_verified))
+        .then_with(|| b.channel_ok_count.cmp(&a.channel_ok_count))
+        .then_with(|| b.last_channel_ok.cmp(&a.last_channel_ok))
+        .then_with(|| b.ok_count.cmp(&a.ok_count))
+        .then(a.last_latency.cmp(&b.last_latency))
+}
+
+/// One candidate in `rank_and_take`'s bounded heap. `Ord` is the ranking of
+/// `rank_cmp` with the entry's position in the store map as the final
+/// tie-breaker -- the total order the previous stable sort implemented
+/// (entries equal under the ranking kept map order), made explicit so the
+/// heap selection reproduces it exactly.
+struct Ranked<'a> {
+    position: usize,
+    entry: &'a Entry,
+}
+
+impl PartialEq for Ranked<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for Ranked<'_> {}
+impl Ord for Ranked<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        rank_cmp(self.entry, other.entry).then(self.position.cmp(&other.position))
+    }
+}
+impl PartialOrd for Ranked<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// One channel-proven entry queued by `needing_circuit_verification`:
+/// oldest verification attempt first (`None` -- never attempted and never
+/// verified -- sorts before any attempted one), ties broken by the entry's
+/// position in the store map. Together the total order the previous stable
+/// `sort_by_key` produced, made explicit so the heap selection reproduces it
+/// exactly.
+struct DueForVerification<'a> {
+    position: usize,
+    entry: &'a Entry,
+}
+
+impl PartialEq for DueForVerification<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for DueForVerification<'_> {}
+impl Ord for DueForVerification<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let due = |d: &Self| d.entry.last_verification_attempt.or(d.entry.last_verified);
+        due(self)
+            .cmp(&due(other))
+            .then(self.position.cmp(&other.position))
+    }
+}
+impl PartialOrd for DueForVerification<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// The `limit` best items under the item type's own total `Ord`, ascending --
+/// exactly what a stable sort followed by `take(limit)` produced before,
+/// given the item's `Ord` breaks ties by the item's original position (as
+/// `Ranked` and `DueForVerification` do). Bounded heap instead of a full
+/// sort: O(N log limit) comparisons and O(limit) memory rather than
+/// O(N log N) / O(N); `limit == 0` and `limit >= N` short-circuit.
+fn take_best<I: Ord>(items: Vec<I>, limit: usize) -> Vec<I> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    if items.len() <= limit {
+        let mut items = items;
+        items.sort();
+        return items;
+    }
+    let mut kept: BinaryHeap<I> = BinaryHeap::with_capacity(limit);
+    for item in items {
+        // The heap root is the worst item kept; a strictly better candidate
+        // replaces it, so the heap always holds the `limit` best seen so far.
+        if kept.len() < limit {
+            kept.push(item);
+        } else if item < *kept.peek().expect("heap at capacity is non-empty") {
+            kept.pop();
+            kept.push(item);
+        }
+    }
+    let mut best = kept.into_vec();
+    best.sort();
+    best
 }

@@ -37,6 +37,7 @@
 //! stability-first ordering `tor_setup.rs` already applies when handing
 //! bridges to arti at bootstrap.
 
+use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -51,7 +52,7 @@ use bridge_store::BridgeStore;
 /// Per-candidate health snapshot used to rank bridges for warming. Pulled
 /// out of [`BridgeStore`] into a plain struct so the ranking logic
 /// ([`select_top_n`]) is unit-testable without any on-disk state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct Health {
     /// Consecutive TCP-probe failures per the last probe round. Non-zero
     /// excludes the bridge from the warming pool outright.
@@ -81,25 +82,99 @@ pub(crate) struct Health {
 /// live negative signal and must keep dominating), then by descending
 /// `verified_count` — a circuit-verified bridge must not lose to a
 /// never-verified one merely because both sit at `circuit_fails == 0` — and
-/// finally by descending `ok_count`. The input order
-/// otherwise has no bearing on the result — this is a full sort, not a
-/// stable "keep first N alive" filter.
+/// finally by descending `ok_count`. Candidates equal under that rank keep
+/// their input order — the tie-break the previous stable sort provided, now
+/// made explicit. The selection is a bounded heap over the rank rather than
+/// a full sort; `n == 0` returns nothing.
 pub(crate) fn select_top_n(candidates: &[(BridgeLine, Health)], n: usize) -> Vec<BridgeLine> {
-    let mut healthy: Vec<&(BridgeLine, Health)> = candidates
+    let ranked: Vec<RankedCandidate<'_>> = candidates
         .iter()
-        .filter(|(_, h)| h.tcp_fails == 0)
+        .enumerate()
+        .filter(|(_, (_, health))| health.tcp_fails == 0)
+        .map(|(position, (bridge, health))| RankedCandidate {
+            position,
+            bridge,
+            health,
+        })
         .collect();
-    healthy.sort_by(|(_, a), (_, b)| {
-        a.circuit_fails
-            .cmp(&b.circuit_fails)
-            .then_with(|| b.verified_count.cmp(&a.verified_count))
-            .then_with(|| b.ok_count.cmp(&a.ok_count))
-    });
-    healthy
+    take_best(ranked, n)
         .into_iter()
-        .take(n)
-        .map(|(bridge, _)| bridge.clone())
+        .map(|candidate| candidate.bridge.clone())
         .collect()
+}
+
+/// The warming rank, best first: ascending `circuit_fails` (the primary key:
+/// an arti-observed circuit failure is a live negative signal and must keep
+/// dominating), then descending `verified_count`, then descending
+/// `ok_count`. Unchanged by the top-k rework: only the selection mechanism
+/// moved from a full stable sort to a bounded heap.
+fn warming_rank(a: &Health, b: &Health) -> Ordering {
+    a.circuit_fails
+        .cmp(&b.circuit_fails)
+        .then_with(|| b.verified_count.cmp(&a.verified_count))
+        .then_with(|| b.ok_count.cmp(&a.ok_count))
+}
+
+/// One TCP-healthy candidate in [`select_top_n`]'s bounded heap. `Ord` is
+/// the warming rank of `warming_rank` with the candidate's original input
+/// position as the final tie-breaker — the total order the previous stable
+/// sort implemented (candidates equal under the rank kept input order), made
+/// explicit so the heap selection reproduces it exactly.
+struct RankedCandidate<'a> {
+    position: usize,
+    bridge: &'a BridgeLine,
+    health: &'a Health,
+}
+
+impl PartialEq for RankedCandidate<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for RankedCandidate<'_> {}
+impl Ord for RankedCandidate<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        warming_rank(self.health, other.health).then(self.position.cmp(&other.position))
+    }
+}
+impl PartialOrd for RankedCandidate<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// The `limit` best items under the item type's own total `Ord`, ascending —
+/// exactly what a stable sort followed by `take(limit)` produced before,
+/// given the item's `Ord` breaks ties by the item's original position (as
+/// `RankedCandidate` does). Bounded heap instead of a full sort: O(N log
+/// limit) comparisons and O(limit) memory rather than O(N log N) / O(N);
+/// `limit == 0` and `limit >= N` short-circuit. (Local to this module:
+/// `Health` is app-side, so the helper is a deliberate small duplicate of
+/// the one in bridge-store's stats module rather than new public API there.)
+fn take_best<I: Ord>(items: Vec<I>, limit: usize) -> Vec<I> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    if items.len() <= limit {
+        let mut items = items;
+        items.sort();
+        return items;
+    }
+    let mut kept: std::collections::BinaryHeap<I> =
+        std::collections::BinaryHeap::with_capacity(limit);
+    for item in items {
+        // The heap root is the worst item kept; a strictly better candidate
+        // replaces it, so the heap always holds the `limit` best seen so far.
+        if kept.len() < limit {
+            kept.push(item);
+        } else if item < *kept.peek().expect("heap at capacity is non-empty") {
+            kept.pop();
+            kept.push(item);
+        }
+    }
+    let mut best = kept.into_vec();
+    best.sort();
+    best
 }
 
 /// Read the configured bridges and pair each with its current health from
@@ -140,20 +215,17 @@ pub(crate) fn candidates_with_health(
         .into_iter()
         .map(|bridge| {
             let health = match &store {
-                Some(store) => Health {
-                    tcp_fails: store.tcp_fails(&bridge),
-                    circuit_fails: store.circuit_fails(&bridge),
-                    verified_count: store.verified_count(&bridge),
-                    ok_count: store.ok_count(&bridge),
-                    cobs: store.last_circuit_observation(&bridge),
+                Some(store) => match store.health_snapshot(&bridge) {
+                    Some(snapshot) => Health {
+                        tcp_fails: snapshot.tcp_fails,
+                        circuit_fails: snapshot.circuit_fails,
+                        verified_count: snapshot.verified_count,
+                        ok_count: snapshot.ok_count,
+                        cobs: snapshot.last_circuit_observation,
+                    },
+                    None => Health::default(),
                 },
-                None => Health {
-                    tcp_fails: 0,
-                    circuit_fails: 0,
-                    verified_count: 0,
-                    ok_count: 0,
-                    cobs: None,
-                },
+                None => Health::default(),
             };
             (bridge, health)
         })
@@ -467,6 +539,146 @@ mod tests {
         assert_eq!(select_top_n(&candidates, 5), Vec::<BridgeLine>::new());
     }
 
+    /// TS2-06 regression: candidates tied under the warming rank keep their
+    /// input order up to n — the tie order the previous stable sort
+    /// produced — at n = 0, 1, k < N and k >= N alike.
+    #[test]
+    fn equal_rank_keeps_input_order_at_every_n() {
+        let candidates = vec![
+            (bridge(OBFS4_A), h(0, 0, 0)),
+            (bridge(OBFS4_B), h(0, 0, 0)),
+            (bridge(OBFS4_C), h(0, 0, 0)),
+        ];
+        assert_eq!(select_top_n(&candidates, 0), Vec::<BridgeLine>::new());
+        assert_eq!(select_top_n(&candidates, 1), vec![bridge(OBFS4_A)]);
+        assert_eq!(
+            select_top_n(&candidates, 2),
+            vec![bridge(OBFS4_A), bridge(OBFS4_B)]
+        );
+        assert_eq!(
+            select_top_n(&candidates, 3),
+            vec![bridge(OBFS4_A), bridge(OBFS4_B), bridge(OBFS4_C)],
+            "k == N"
+        );
+        assert_eq!(
+            select_top_n(&candidates, 10),
+            vec![bridge(OBFS4_A), bridge(OBFS4_B), bridge(OBFS4_C)],
+            "k >= N"
+        );
+    }
+
+    /// TS2-06 regression: with mixed ranks and a tie, the selected prefix at
+    /// every n is the one the old full stable sort produced (ties keep input
+    /// order; here B and C tie fully, so B stays before C).
+    #[test]
+    fn full_ranked_order_survives_the_heap_selection() {
+        let candidates = vec![
+            (bridge(OBFS4_A), h(0, 2, 5)),             // circuit failures -> last
+            (bridge(OBFS4_B), h_verified(0, 0, 1, 7)), // verified -> first
+            (bridge(OBFS4_C), h_verified(0, 0, 1, 7)), // tied with B -> second
+        ];
+        assert_eq!(
+            select_top_n(&candidates, 1),
+            vec![bridge(OBFS4_B)],
+            "k=1 takes the head of the ranking"
+        );
+        assert_eq!(
+            select_top_n(&candidates, 2),
+            vec![bridge(OBFS4_B), bridge(OBFS4_C)]
+        );
+        assert_eq!(
+            select_top_n(&candidates, 3),
+            vec![bridge(OBFS4_B), bridge(OBFS4_C), bridge(OBFS4_A)]
+        );
+    }
+
+    /// TS2-05 regression: `candidates_with_health` must report exactly what
+    /// the store's individual getters report — the single-lookup snapshot it
+    /// now reads replaced five separate keyed lookups per bridge — and an
+    /// unseeded bridge must stay all-zero with `cobs: None`.
+    #[test]
+    fn candidates_with_health_matches_individual_getters() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("tor-socks5.ktav");
+        let mut cfg = Config::default();
+        cfg.bridges.lines = vec![OBFS4_A.to_string(), OBFS4_B.to_string()];
+        cfg.write(&config_path).expect("write config");
+
+        let seeded = bridge(OBFS4_A);
+        let t0 = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let mut store = BridgeStore::load(BridgeStore::resolve_path(Some(config_path.as_path())))
+            .expect("load fresh store");
+        store.note_probe_round(
+            std::slice::from_ref(&seeded),
+            &[(seeded.clone(), Duration::from_millis(7))],
+            t0,
+            Duration::from_secs(3600),
+            10,
+            10,
+        );
+        store.note_probe_round(
+            std::slice::from_ref(&seeded),
+            &[(seeded.clone(), Duration::from_millis(11))],
+            t0 + Duration::from_secs(60),
+            Duration::from_secs(3600),
+            10,
+            10,
+        );
+        store.note_channel_success_at(&seeded, t0 + Duration::from_secs(60));
+        store.note_circuit_verified_at(&seeded, t0 + Duration::from_secs(60));
+        store.note_circuit_failure_at(
+            &seeded,
+            t0 + Duration::from_secs(120),
+            Duration::from_secs(60),
+        );
+        store.save().expect("seed save");
+
+        let candidates = candidates_with_health(&cfg, Some(config_path.as_path()));
+        assert_eq!(candidates.len(), 2, "both configured bridges are listed");
+
+        let reloaded = BridgeStore::load(BridgeStore::resolve_path(Some(config_path.as_path())))
+            .expect("reload store");
+        for (b, health) in &candidates {
+            assert_eq!(health.tcp_fails, reloaded.tcp_fails(b), "tcp_fails for {b}");
+            assert_eq!(
+                health.circuit_fails,
+                reloaded.circuit_fails(b),
+                "circuit_fails for {b}"
+            );
+            assert_eq!(
+                health.verified_count,
+                reloaded.verified_count(b),
+                "verified_count for {b}"
+            );
+            assert_eq!(health.ok_count, reloaded.ok_count(b), "ok_count for {b}");
+            assert_eq!(
+                health.cobs,
+                reloaded.last_circuit_observation(b),
+                "cobs for {b}"
+            );
+        }
+
+        // The seeded entry really carries non-trivial values (so the
+        // per-field comparisons above are not vacuous zero == zero checks).
+        let first = &candidates[0].1;
+        assert_eq!(first.ok_count, 2);
+        assert_eq!(first.verified_count, 1);
+        assert_eq!(first.circuit_fails, 1);
+        assert_eq!(first.tcp_fails, 0);
+        assert!(first.cobs.is_some());
+        // OBFS4_B is configured but never seeded: maximally healthy defaults.
+        assert_eq!(
+            candidates[1].1,
+            Health {
+                tcp_fails: 0,
+                circuit_fails: 0,
+                verified_count: 0,
+                ok_count: 0,
+                cobs: None,
+            }
+        );
+    }
+
     /// Routing proof: 16 concurrent recorders must all land (16 = count),
     /// which only the single-writer path can guarantee — racing inline
     /// load→mutate→save cycles would lose updates.
@@ -496,13 +708,23 @@ mod tests {
             task.await.expect("task joins");
         }
 
-        let store = BridgeStore::load(BridgeStore::resolve_path(Some(config_path.as_path())))
-            .expect("reload store");
-        assert_eq!(
-            store.channel_ok_count(&warmed_bridge),
-            16,
-            "no lost update through the single writer"
-        );
+        // apply() acks as soon as a mutation is absorbed in memory, before
+        // the writer's (now offloaded, coalesced) disk publish runs — so the
+        // 16th ack landing does not mean the 16th write has hit disk yet.
+        // Poll for it, yielding every iteration so the writer's actor task
+        // (on this single-threaded test runtime) actually gets to run.
+        let mut count = 0;
+        for _ in 0..5000 {
+            count = BridgeStore::load(BridgeStore::resolve_path(Some(config_path.as_path())))
+                .expect("reload store")
+                .channel_ok_count(&warmed_bridge);
+            if count == 16 {
+                break;
+            }
+            tokio::task::yield_now().await;
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(count, 16, "no lost update through the single writer");
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .expect("read tempdir")
             .filter_map(|e| e.ok())

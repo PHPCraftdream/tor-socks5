@@ -147,6 +147,27 @@ impl SourceStats {
     }
 }
 
+/// One-lookup snapshot of a bridge's health counters, read through
+/// [`BridgeStore::health_snapshot`]. Each field is identical to the
+/// corresponding individual getter; only the number of key rebuilds and map
+/// lookups differs (one here, one per getter otherwise).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HealthSnapshot {
+    /// Consecutive TCP-probe failures per the last probe round
+    /// ([`BridgeStore::tcp_fails`]).
+    pub tcp_fails: u32,
+    /// Consecutive circuit-layer failure count ([`BridgeStore::circuit_fails`]).
+    pub circuit_fails: u32,
+    /// Successful end-to-end circuit verifications
+    /// ([`BridgeStore::verified_count`]).
+    pub verified_count: u32,
+    /// Cumulative successful-probe count ([`BridgeStore::ok_count`]).
+    pub ok_count: u32,
+    /// When the circuit-failure counter was last touched
+    /// ([`BridgeStore::last_circuit_observation`]).
+    pub last_circuit_observation: Option<OffsetDateTime>,
+}
+
 impl Entry {
     fn is_retired(&self) -> bool {
         self.circuit_fails == RETIRED_CIRCUIT_FAILS
