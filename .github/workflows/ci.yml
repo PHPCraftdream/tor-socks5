@@ -104,10 +104,15 @@ jobs:
       # (see docs/android-cross-compile.md, "Why no .cargo/config.toml").
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
-      - name: cargo ndk check (workspace, arm64-v8a)
+      # Scoped to the packages that actually ship on Android (matches the
+      # locally verified build), not --workspace: a workspace-wide check
+      # pulls in arti-client's own dev-dependency on itself, which resolves
+      # tor-rtcompat's native-tls/openssl-sys and has no NDK sysroot to
+      # cross-compile against.
+      - name: cargo ndk check (socks5-proxy + android-ffi, arm64-v8a)
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
-        run: cargo ndk -t arm64-v8a check --locked --workspace
+        run: cargo ndk -t arm64-v8a check --locked -p socks5-proxy -p android-ffi
       - name: cargo ndk build (android-ffi cdylib, arm64-v8a)
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}

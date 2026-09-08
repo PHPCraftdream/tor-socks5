@@ -439,6 +439,9 @@ mod pt_reap {
     use std::collections::HashSet;
     use std::path::Path;
 
+    /// Test-only: production code identifies ownership via
+    /// `create_kill_marker`/`kill_marked_children`.
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn own_child_pids() -> HashSet<u32> {
         HashSet::new()
     }
