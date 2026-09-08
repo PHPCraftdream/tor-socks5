@@ -66,10 +66,18 @@ trailing FQDN dot.
 ## Trust on first use (`--init`)
 
 An account whose stored `hash` is the literal `init` has **not chosen a password yet**. The
-**first non-empty password** presented for that account at login is accepted, hashed with
-Argon2id, and **written back to disk** as the real hash. The first connection to arrive wins;
-a concurrent connection offering a different password is then checked against the freshly set
-hash (and rejected if it differs).
+**first non-empty password** presented for that account at login is adopted, hashed with
+Argon2id, and **written back to disk** as the real hash — and the login is accepted only once
+that write-back is **confirmed** (fsync + atomic rename). If persisting fails, the login is
+refused, nothing is cached, and the account remains in `init`, so a later client (possibly with
+a different password) can still claim it. The first connection to arrive wins; a concurrent
+connection offering a different password is then checked against the freshly set hash (and
+rejected if it differs).
+
+Before each TOFU write the daemon **re-reads the registry from disk**, so edits made
+concurrently by `tor-socks5 users ...` CLI commands (a separate process doing an atomic
+whole-file read-modify-write) are preserved rather than clobbered. Temp files are unique per
+call, so concurrent saves never collide.
 
 This lets an operator provision accounts without handling plaintext passwords — hand out the
 username, and the user's client sets the password on first connect.

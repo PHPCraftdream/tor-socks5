@@ -14,11 +14,20 @@
 //! * **TOFU via the `init` sentinel.** A user whose stored hash is the
 //!   literal string [`INIT_SENTINEL`] (`"init"`) has not chosen a
 //!   password yet. The first non-empty password presented for that
-//!   account at login is accepted, hashed with Argon2id, written back
-//!   to the user registry on disk, and cached. The first connection to
-//!   arrive wins; any concurrent connection offering a different
-//!   password is then checked against the freshly set hash and
-//!   rejected.
+//!   account at login is accepted, hashed with Argon2id, and persisted
+//!   to the user registry on disk — and only then is the login
+//!   accepted and the credential cached. If the write-back fails, the
+//!   login is refused, nothing is cached, and the account stays in
+//!   `init`, still claimable by a later client. The registry write-lock
+//!   is held across the state transition **and** the save, so
+//!   concurrent resolutions of different `init` accounts cannot write
+//!   an older snapshot over a newer one; before each TOFU transition
+//!   the on-disk registry is re-read, so edits made concurrently by
+//!   CLI `tor-socks5 users ...` commands (separate process, atomic
+//!   whole-file read-modify-write) are incorporated rather than
+//!   clobbered. The first connection to arrive wins; any concurrent
+//!   connection offering a different password is then checked against
+//!   the freshly set hash and rejected.
 
 use std::path::PathBuf;
 use std::sync::RwLock;
@@ -55,6 +64,12 @@ pub struct AuthState {
     /// Where to persist the registry when an `init` account is
     /// resolved. `None` disables write-back (used in tests).
     users_path: Option<PathBuf>,
+    /// Test-only hook invoked just before the registry save inside
+    /// `resolve_init`, letting tests block a save or inject a save
+    /// failure to force deterministic interleavings and error paths.
+    /// Never present in production builds.
+    #[cfg(test)]
+    save_hook: std::sync::OnceLock<Box<dyn Fn() -> anyhow::Result<()> + Send + Sync>>,
 }
 
 impl AuthState {
@@ -79,7 +94,18 @@ impl AuthState {
             cache: DashMap::new(),
             server_secret,
             users_path,
+            #[cfg(test)]
+            save_hook: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Test-only hook: install a callback invoked just before the
+    /// registry save in `resolve_init` (inside the write-lock). The
+    /// callback may block a save or inject a save failure (by returning
+    /// `Err`), which is handled exactly like a real save error.
+    #[cfg(test)]
+    pub(crate) fn set_save_hook(&self, f: Box<dyn Fn() -> anyhow::Result<()> + Send + Sync>) {
+        let _ = self.save_hook.set(f);
     }
 
     /// Number of users known to this authenticator.
@@ -190,18 +216,30 @@ impl AuthState {
     }
 
     /// Trust-on-first-use: the stored hash was the `init` sentinel.
-    /// Adopt the first non-empty password, persist the real hash, and
-    /// populate the cache. Concurrency-safe: the write-lock holder that
-    /// finds the sentinel still set wins; a loser re-checks against the
-    /// now-real hash.
+    /// Adopt the first non-empty password, persist the real hash, and —
+    /// only once the save is confirmed — populate the cache and accept
+    /// the login.
+    ///
+    /// Concurrency contract: the write-lock is held across the state
+    /// transition **and** the disk save, so the transition+save pair is
+    /// one atomic operation. This makes concurrent resolutions of
+    /// different `init` accounts monotonic (a stale snapshot can never
+    /// overwrite a newer one) and lets us re-read the on-disk registry
+    /// before the transition, so concurrent CLI edits from a separate
+    /// process are incorporated instead of clobbered. If the save
+    /// fails, the login is refused, memory and cache are left untouched,
+    /// and the account remains in `init` and claimable by a later
+    /// client.
     fn resolve_init(&self, name: &str, password: &str) -> bool {
         if password.is_empty() {
             tracing::debug!(name = %name, "auth: init account rejected empty password");
             return false;
         }
-        // Compute the Argon2id hash BEFORE taking the write-lock so the
-        // expensive work (and the later fsync) never runs inside the
-        // critical section that every verify() read-locks.
+        // Compute the Argon2id hash before taking the write-lock. The
+        // fsync below DOES now run inside the critical section — that is
+        // intentional: init provisioning is a rare one-off event, and
+        // serializing transition+save is exactly what makes concurrent
+        // inits monotonic.
         let new_hash = match compute_hash(password) {
             Ok(h) => h,
             Err(e) => {
@@ -209,39 +247,72 @@ impl AuthState {
                 return false;
             }
         };
-        // Hold the write-lock only for the compare-and-set; clone a snapshot
-        // to persist after releasing it.
-        let snapshot = {
-            let mut guard = self.users.write().expect("auth users lock poisoned");
-            match guard.find(name) {
-                Some(u) if !u.is_enabled => return false,
-                Some(u) if u.hash != INIT_SENTINEL => {
-                    // Lost the race: another connection already provisioned
-                    // this account. Verify against whatever password won.
-                    let h = u.hash.clone();
-                    drop(guard);
-                    return self.verify_with_cache(name, password, &h);
-                }
-                Some(_) => {}
-                None => return false,
-            }
-            if let Some(u) = guard.find_mut(name) {
-                u.hash = new_hash;
-            }
-            guard.clone() // cheap relative to Argon2; persist without the lock
-        };
-        if let Some(path) = &self.users_path {
-            match snapshot.save(path) {
-                Ok(()) => {
-                    tracing::info!(name = %name, "auth: init password accepted and persisted")
-                }
+        let mut guard = self.users.write().expect("auth users lock poisoned");
+
+        // Build the authoritative "current" snapshot: the on-disk
+        // registry when we persist, otherwise the in-memory one. Re-reading
+        // picks up concurrent CLI edits made after this process started.
+        let mut current = match &self.users_path {
+            Some(path) => match UsersConfig::load(path) {
+                Ok(cfg) => cfg,
                 Err(e) => {
-                    tracing::warn!(name = %name, error = %e, "auth: init password set in memory but could NOT be persisted")
+                    // Never clobber a file we could not read.
+                    tracing::warn!(name = %name, error = %e, "auth: could not re-read users registry; refusing init login");
+                    return false;
+                }
+            },
+            None => guard.clone(),
+        };
+
+        // Checks on `current`, not on our possibly stale memory.
+        match current.find(name) {
+            None => {
+                tracing::debug!(name = %name, "auth: init user vanished from registry");
+                return false;
+            }
+            Some(u) if !u.is_enabled => {
+                tracing::debug!(name = %name, "auth: disabled user");
+                return false;
+            }
+            Some(u) if u.hash != INIT_SENTINEL => {
+                // Lost the race: another connection in this process
+                // provisioned the account, or a CLI `set-password` landed
+                // meanwhile. Sync memory to the newer disk state and
+                // verify against whatever credential won.
+                let h = u.hash.clone();
+                *guard = current;
+                drop(guard);
+                return self.verify_with_cache(name, password, &h);
+            }
+            Some(_) => {}
+        }
+
+        // Transition on the authoritative snapshot.
+        if let Some(u) = current.find_mut(name) {
+            u.hash = new_hash;
+        }
+
+        // Persist FIRST; commit to memory and cache only after the save
+        // is confirmed.
+        if let Some(path) = &self.users_path {
+            #[cfg(test)]
+            if let Some(hook) = self.save_hook.get() {
+                if let Err(e) = hook() {
+                    tracing::warn!(name = %name, error = %e, "auth: init password NOT persisted; rejecting login so the account stays claimable");
+                    return false;
                 }
             }
+            if let Err(e) = current.save(path) {
+                tracing::warn!(name = %name, error = %e, "auth: init password NOT persisted; rejecting login so the account stays claimable");
+                // guard drops without commit: memory keeps the old state.
+                return false;
+            }
+            tracing::info!(name = %name, "auth: init password accepted and persisted");
         } else {
             tracing::info!(name = %name, "auth: init password accepted (no persistence configured)");
         }
+        *guard = current;
+        drop(guard);
         self.cache
             .insert(name.to_string(), self.hmac(name, password));
         true
@@ -477,6 +548,201 @@ mod tests {
         assert_ne!(stored, INIT_SENTINEL);
         assert!(stored.starts_with("$argon2id$"));
         assert!(verify_hash(stored, "chosen-pw").unwrap());
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn save_failure_does_not_confirm_init() {
+        let path = tmp_path("savefail");
+        // Real registry on disk with alice still in init.
+        UsersConfig {
+            users: vec![init_user("alice")],
+        }
+        .save(&path)
+        .unwrap();
+        let s =
+            AuthState::build_persistent(&UsersConfig::load(&path).unwrap(), path.clone()).unwrap();
+
+        // Hook: the first TWO invocations inject a save failure (both
+        // pw1 attempts must be rejected), later ones pass through so
+        // pw2 can claim the account.
+        let fails = std::sync::atomic::AtomicU32::new(2);
+        s.set_save_hook(Box::new(move || {
+            if fails.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                Err(anyhow::anyhow!("injected save failure"))
+            } else {
+                Ok(())
+            }
+        }));
+
+        // TOFU path: injected save failure -> login refused, nothing cached.
+        assert!(!s.verify("alice", "pw1"));
+        assert_eq!(
+            s.cache_len(),
+            0,
+            "failed save must not populate success cache"
+        );
+        // Still in init: the second attempt takes the TOFU path again.
+        assert!(!s.verify("alice", "pw1"));
+        assert_eq!(s.cache_len(), 0);
+
+        // A DIFFERENT password now succeeds (hook passes through): this
+        // proves the account was still in init — had pw1 been committed
+        // despite the failure, this would be a lost-race verify against
+        // pw1's hash and would return false. Note resolve_init re-reads
+        // the disk file, which must STILL hold the init sentinel because
+        // the failed attempts never wrote anything — that is exactly why
+        // pw2 can claim the account.
+        assert!(s.verify("alice", "pw2"));
+
+        // Restart simulation: pw2 — never pw1 — is what landed on disk.
+        let reloaded = UsersConfig::load(&path).unwrap();
+        let hash = &reloaded.find("alice").unwrap().hash;
+        assert_ne!(*hash, INIT_SENTINEL);
+        assert!(verify_hash(hash, "pw2").unwrap());
+        assert!(!verify_hash(hash, "pw1").unwrap());
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn init_rejected_when_registry_unreadable_or_vanished() {
+        // Part A: registry vanished/unreadable — a plain FILE where the
+        // registry's parent directory should be, so load cannot see the
+        // account on disk.
+        let dir = tmp_path("vanished").parent().unwrap().to_path_buf();
+        let blocker = dir.join("blocker");
+        std::fs::File::create(&blocker).unwrap();
+        let users_path = blocker.join("users.ktav");
+
+        let s = AuthState::build_persistent(
+            &UsersConfig {
+                users: vec![init_user("alice")],
+            },
+            users_path.clone(),
+        )
+        .unwrap();
+        // The registry cannot be read as containing the account, so the
+        // login is refused (memory is not consulted for the transition).
+        assert!(!s.verify("alice", "pw1"));
+        assert_eq!(s.cache_len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Part B: registry present but corrupt — load() errors, so the
+        // init transition must refuse rather than clobber the file.
+        let path = tmp_path("corrupt");
+        std::fs::write(&path, "not a ktav file {{{").unwrap();
+        let s = AuthState::build_persistent(
+            &UsersConfig {
+                users: vec![init_user("alice")],
+            },
+            path.clone(),
+        )
+        .unwrap();
+        assert!(!s.verify("alice", "pw1"));
+        assert_eq!(s.cache_len(), 0);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn concurrent_inits_cannot_write_older_snapshot_over_newer() {
+        let path = tmp_path("conc");
+        let cfg = UsersConfig {
+            users: vec![init_user("alice"), init_user("bob")],
+        };
+        cfg.save(&path).unwrap();
+        let st = std::sync::Arc::new(
+            AuthState::build_persistent(&UsersConfig::load(&path).unwrap(), path.clone()).unwrap(),
+        );
+
+        // One-shot save hook: on its first invocation signal the main
+        // thread, then block until it releases us (or 5s pass — the
+        // timeout is a fail-safe so a regression degrades to a normal
+        // pass-through instead of a deadlock). Later invocations are
+        // no-ops.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let rx_hook = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        let rx_main = rx_hook.clone();
+        let fired = std::sync::atomic::AtomicBool::new(false);
+        st.set_save_hook(Box::new(move || {
+            if !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                tx.send(()).ok();
+                let _ = rx_hook
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5));
+            }
+            Ok(())
+        }));
+
+        // Thread A claims alice; it blocks inside save() while holding
+        // the write lock.
+        let st_a = st.clone();
+        let a = std::thread::spawn(move || st_a.verify("alice", "pwA"));
+        rx_main
+            .lock()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("hook fired: A is blocked in save under the write lock");
+
+        // Thread B claims bob. With the fix, B's transition+save can only
+        // run after A committed; the old code would let A's stale save
+        // later regress bob to the sentinel.
+        let st_b = st.clone();
+        let b = std::thread::spawn(move || st_b.verify("bob", "pwB"));
+
+        assert!(a.join().unwrap(), "alice's init accepted");
+        assert!(b.join().unwrap(), "bob's init accepted");
+
+        // Restart simulation: both passwords survived, neither hash is
+        // the sentinel.
+        let reloaded = UsersConfig::load(&path).unwrap();
+        let ha = &reloaded.find("alice").unwrap().hash;
+        let hb = &reloaded.find("bob").unwrap().hash;
+        assert_ne!(*ha, INIT_SENTINEL);
+        assert_ne!(*hb, INIT_SENTINEL);
+        assert!(verify_hash(ha, "pwA").unwrap());
+        assert!(verify_hash(hb, "pwB").unwrap());
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn init_transition_incorporates_cli_edits() {
+        let path = tmp_path("cli");
+        UsersConfig {
+            users: vec![init_user("alice")],
+        }
+        .save(&path)
+        .unwrap();
+        let st =
+            AuthState::build_persistent(&UsersConfig::load(&path).unwrap(), path.clone()).unwrap();
+
+        // Simulate a concurrent CLI process (users_cli does
+        // load -> mutate -> save in its own process): add "bob" with a
+        // real hash after the daemon built its in-memory snapshot.
+        let mut cli_cfg = UsersConfig::load(&path).unwrap();
+        cli_cfg.users.push(mk_user("bob", "bobpw", true));
+        cli_cfg.save(&path).unwrap();
+
+        // The daemon's TOFU transition for alice must re-read the disk
+        // registry and merge, not clobber.
+        assert!(st.verify("alice", "alipw"));
+
+        // Restart simulation: bob is intact, alice is resolved.
+        let reloaded = UsersConfig::load(&path).unwrap();
+        let bob = reloaded.find("bob").unwrap();
+        assert!(
+            verify_hash(&bob.hash, "bobpw").unwrap(),
+            "bob not clobbered"
+        );
+        let alice = reloaded.find("alice").unwrap();
+        assert_ne!(alice.hash, INIT_SENTINEL);
+        assert!(verify_hash(&alice.hash, "alipw").unwrap());
+        // Memory was refreshed to the merged disk state.
+        assert_eq!(st.len(), 2);
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

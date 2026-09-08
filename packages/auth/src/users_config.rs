@@ -20,6 +20,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,10 @@ use serde::{Deserialize, Serialize};
 use crate::user::User;
 
 const DEFAULT_FILE: &str = "tor-socks5.users.ktav";
+
+/// Monotonic counter giving every save() call a unique temp-file name, even
+/// when saves run concurrently within one process.
+static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -69,7 +74,10 @@ impl UsersConfig {
     }
 
     /// Atomic write via sibling temp file + rename, like our other
-    /// stores. Creates the parent directory if missing.
+    /// stores. The temp-file name is unique per call (pid + monotonic
+    /// sequence), so concurrent saves never collide; the final rename is
+    /// atomic, so readers see the old or the new full file, never a torn
+    /// one. Creates the parent directory if missing.
     pub fn save(&self, path: &Path) -> Result<()> {
         let body = ktav::to_string(self).context("serialise users config")?;
         if let Some(parent) = path.parent() {
@@ -82,18 +90,30 @@ impl UsersConfig {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| DEFAULT_FILE.to_string());
-        let tmp = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
-        {
-            let mut f =
-                fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-            f.write_all(body.as_bytes())
-                .with_context(|| format!("write {}", tmp.display()))?;
-            f.sync_all()
-                .with_context(|| format!("fsync {}", tmp.display()))?;
+        let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = dir.join(format!(".{file_name}.{}.{seq}.tmp", std::process::id()));
+        let write_out = || -> Result<()> {
+            {
+                let mut f =
+                    fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+                f.write_all(body.as_bytes())
+                    .with_context(|| format!("write {}", tmp.display()))?;
+                f.sync_all()
+                    .with_context(|| format!("fsync {}", tmp.display()))?;
+            }
+            fs::rename(&tmp, path)
+                .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))?;
+            Ok(())
+        };
+        match write_out() {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                // Best-effort cleanup of the failed temp file; never masks
+                // the original error.
+                let _ = fs::remove_file(&tmp);
+                Err(err)
+            }
         }
-        fs::rename(&tmp, path)
-            .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))?;
-        Ok(())
     }
 
     /// Locate a user by name. Returns `None` if no such record exists.
@@ -209,6 +229,40 @@ mod tests {
         let reloaded = UsersConfig::load(&path).unwrap();
         assert_eq!(reloaded.users.len(), 1);
         assert_eq!(reloaded.users[0].name, "bob");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_concurrent_calls_all_succeed_and_leave_no_temp_files() {
+        let dir = tmp_dir();
+        let path = dir.join("users.ktav");
+
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    UsersConfig {
+                        users: vec![user(&format!("t{i}"), true)],
+                    }
+                    .save(&path)
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap().expect("every concurrent save succeeds");
+        }
+
+        let loaded = UsersConfig::load(&path).unwrap();
+        assert_eq!(loaded.users.len(), 1, "last writer wins, file loads fine");
+
+        // No leftover temp files.
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+
         let _ = fs::remove_dir_all(&dir);
     }
 }
