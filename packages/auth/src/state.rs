@@ -6,8 +6,11 @@
 //!   password)` keyed by username. A constant-time match against a
 //!   cached value lets us skip the expensive Argon2id verify. A miss
 //!   falls through to the real verify; on success the cache is
-//!   populated, on failure nothing is cached (so brute-forcing gets no
-//!   per-account speed-up). `server_secret` is drawn from the OS RNG
+//!   populated, on failure nothing is cached. Entries are bound to the
+//!   PHC hash snapshot they were verified against: a snapshot mismatch
+//!   is a cache miss and forces the real Argon2id verify, so hash
+//!   rotation invalidates the cache structurally, and an in-flight
+//!   verification that publishes its result late is harmless. `server_secret` is drawn from the OS RNG
 //!   once per process — no persistence, so cache contents do not leak
 //!   past a restart.
 //!
@@ -48,6 +51,17 @@ type HmacSha256 = Hmac<Sha256>;
 /// module docs).
 pub const INIT_SENTINEL: &str = "init";
 
+/// A cached successful credential, bound to the exact PHC hash it was
+/// verified against. If the account's authoritative hash changes, old
+/// entries can never satisfy a new lookup (their snapshot differs), so
+/// rotation invalidates the cache structurally — including for a
+/// verification that was still in flight while the hash rotated and
+/// publishes its result afterwards.
+struct CacheEntry {
+    hash_snapshot: String,
+    hmac: [u8; 32],
+}
+
 /// Snapshot-style authenticator. Cheap to share between connections via
 /// `Arc<AuthState>`; cache writes are lock-free (`DashMap`) and the
 /// rarely-taken registry write-lock only fires when an `init` account
@@ -56,9 +70,10 @@ pub struct AuthState {
     /// Authoritative user list. Behind a lock because TOFU mutates a
     /// user's hash in place and we re-serialise the whole thing to disk.
     users: RwLock<UsersConfig>,
-    /// `name -> HMAC(server_secret, name || 0 || password)` of the last
-    /// accepted credential. Consulted before the real Argon2id verify.
-    cache: DashMap<String, [u8; 32]>,
+    /// `name -> (PHC hash snapshot, HMAC)` of the last accepted
+    /// credential. Consulted before the real Argon2id verify; a hit
+    /// requires both an HMAC match and an identical hash snapshot.
+    cache: DashMap<String, CacheEntry>,
     /// Per-process random key for the cache HMAC.
     server_secret: [u8; 32],
     /// Where to persist the registry when an `init` account is
@@ -70,6 +85,12 @@ pub struct AuthState {
     /// Never present in production builds.
     #[cfg(test)]
     save_hook: std::sync::OnceLock<Box<dyn Fn() -> anyhow::Result<()> + Send + Sync>>,
+    /// Test-only hook invoked immediately before the Argon2id
+    /// `verify_hash` call in `verify_with_cache`, letting tests park a
+    /// verification at a deterministic point. Never present in
+    /// production builds.
+    #[cfg(test)]
+    verify_hook: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl AuthState {
@@ -96,7 +117,17 @@ impl AuthState {
             users_path,
             #[cfg(test)]
             save_hook: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            verify_hook: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Test-only hook: install a callback invoked immediately before
+    /// the Argon2id `verify_hash` call in `verify_with_cache`. The
+    /// callback may block to force deterministic interleavings.
+    #[cfg(test)]
+    pub(crate) fn set_verify_hook(&self, f: Box<dyn Fn() + Send + Sync>) {
+        let _ = self.verify_hook.set(f);
     }
 
     /// Test-only hook: install a callback invoked just before the
@@ -180,24 +211,44 @@ impl AuthState {
     }
 
     /// HMAC-cache fast path followed by the real Argon2id verify against
-    /// `hash`. On success the cache is populated; failures are never
-    /// cached.
+    /// `hash`. Cache entries are bound to the exact PHC hash snapshot
+    /// they were verified against; a mismatching snapshot is a miss and
+    /// forces the real verify (so rotation invalidates the cache, and a
+    /// late-published in-flight verification is harmless). On success
+    /// the cache is populated; failures are never cached.
     fn verify_with_cache(&self, name: &str, password: &str, hash: &str) -> bool {
         // Cache value is a stable function of (server_secret, name,
         // password) — constant-time-compared against a freshly computed
         // candidate so timing does not distinguish hit vs near-miss.
         let candidate = self.hmac(name, password);
-        if let Some(cached) = self.cache.get(name) {
-            if bool::from(cached.value().ct_eq(&candidate)) {
-                tracing::trace!(name = %name, "auth: cache hit");
-                return true;
+        {
+            if let Some(cached) = self.cache.get(name) {
+                let entry = cached.value();
+                // Plain == on the snapshot: both sides are process-local
+                // registry strings, never attacker-chosen material.
+                let snapshot_ok = entry.hash_snapshot == hash;
+                if snapshot_ok && bool::from(entry.hmac.ct_eq(&candidate)) {
+                    tracing::trace!(name = %name, "auth: cache hit");
+                    return true;
+                }
+                tracing::trace!(name = %name, "auth: cache miss (mismatch)");
             }
-            tracing::trace!(name = %name, "auth: cache miss (mismatch)");
+        }
+
+        #[cfg(test)]
+        if let Some(hook) = self.verify_hook.get() {
+            hook();
         }
 
         match verify_hash(hash, password) {
             Ok(true) => {
-                self.cache.insert(name.to_string(), candidate);
+                self.cache.insert(
+                    name.to_string(),
+                    CacheEntry {
+                        hash_snapshot: hash.to_string(),
+                        hmac: candidate,
+                    },
+                );
                 tracing::trace!(name = %name, "auth: cache populated");
                 true
             }
@@ -289,7 +340,9 @@ impl AuthState {
 
         // Transition on the authoritative snapshot.
         if let Some(u) = current.find_mut(name) {
-            u.hash = new_hash;
+            // Clone: the same snapshot string must go into the cache
+            // entry below, bound to the hash committed to memory.
+            u.hash = new_hash.clone();
         }
 
         // Persist FIRST; commit to memory and cache only after the save
@@ -313,8 +366,13 @@ impl AuthState {
         }
         *guard = current;
         drop(guard);
-        self.cache
-            .insert(name.to_string(), self.hmac(name, password));
+        self.cache.insert(
+            name.to_string(),
+            CacheEntry {
+                hash_snapshot: new_hash,
+                hmac: self.hmac(name, password),
+            },
+        );
         true
     }
 
@@ -482,8 +540,8 @@ mod tests {
         let s2 = AuthState::build(&cfg).unwrap();
         assert!(s1.verify("alice", "secret"));
         assert!(s2.verify("alice", "secret"));
-        let v1 = *s1.cache.get("alice").unwrap();
-        let v2 = *s2.cache.get("alice").unwrap();
+        let v1 = s1.cache.get("alice").unwrap().hmac;
+        let v2 = s2.cache.get("alice").unwrap().hmac;
         assert_ne!(
             v1, v2,
             "server_secret should not be deterministic across builds"
@@ -799,5 +857,111 @@ mod tests {
             stored, INIT_SENTINEL,
             "disabled init account stays unprovisioned"
         );
+    }
+
+    // --------------------------- cache snapshot binding ---------------------------
+
+    #[test]
+    fn stale_cache_rejected_after_tofu_reload_brings_rotated_hash() {
+        let path = tmp_path("ts301-scenario");
+        UsersConfig {
+            users: vec![mk_user("alice", "oldpw", true), init_user("bob")],
+        }
+        .save(&path)
+        .unwrap();
+        let s = std::sync::Arc::new(
+            AuthState::build_persistent(&UsersConfig::load(&path).unwrap(), path.clone()).unwrap(),
+        );
+
+        // Prime the cache with alice's old credential.
+        assert!(s.verify("alice", "oldpw"));
+        assert_eq!(s.cache_len(), 1);
+
+        // Simulate the CLI process rotating alice's password on disk.
+        let mut cli_cfg = UsersConfig::load(&path).unwrap();
+        cli_cfg.find_mut("alice").unwrap().hash = compute_hash("newpw").unwrap();
+        cli_cfg.save(&path).unwrap();
+
+        // TOFU login of bob pulls the rotated registry into memory.
+        assert!(s.verify("bob", "bobpw"));
+
+        // The stale cache entry must not resurrect the old password.
+        assert!(
+            !s.verify("alice", "oldpw"),
+            "old password must be rejected after hash rotation"
+        );
+        assert!(s.verify("alice", "newpw"));
+
+        // Disk state matches: the rotated hash verifies newpw only.
+        let reloaded = UsersConfig::load(&path).unwrap();
+        let alice = &reloaded.find("alice").unwrap().hash;
+        assert!(verify_hash(alice, "newpw").unwrap());
+        assert!(!verify_hash(alice, "oldpw").unwrap());
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn late_in_flight_verify_cannot_reinstate_old_password_after_rotation() {
+        let path = tmp_path("ts301-inflight");
+        UsersConfig {
+            users: vec![mk_user("alice", "oldpw", true), init_user("bob")],
+        }
+        .save(&path)
+        .unwrap();
+        let s = std::sync::Arc::new(
+            AuthState::build_persistent(&UsersConfig::load(&path).unwrap(), path.clone()).unwrap(),
+        );
+
+        // One-shot verify hook: on its first invocation signal the main
+        // thread, then block until released (5s fail-safe timeout).
+        // Later invocations pass through.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Arc::new(std::sync::Mutex::new(release_rx));
+        let release_rx_hook = release_rx.clone();
+        let fired = std::sync::atomic::AtomicBool::new(false);
+        s.set_verify_hook(Box::new(move || {
+            if !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                tx.send(()).ok();
+                let _ = release_rx_hook
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5));
+            }
+        }));
+
+        // Thread A verifies against the OLD hash; it parks inside the
+        // hook before the Argon2id work, holding no registry lock.
+        let s_a = s.clone();
+        let a = std::thread::spawn(move || s_a.verify("alice", "oldpw"));
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("hook fired: A is parked in verify");
+
+        // While A is parked: CLI rotates alice on disk, then bob's TOFU
+        // pulls the new registry into memory (bob takes the write lock
+        // fine because A holds no lock).
+        let mut cli_cfg = UsersConfig::load(&path).unwrap();
+        cli_cfg.find_mut("alice").unwrap().hash = compute_hash("newpw").unwrap();
+        cli_cfg.save(&path).unwrap();
+        assert!(s.verify("bob", "bobpw"));
+
+        // Release A: its check against the OLD hash legitimately
+        // succeeds and publishes a cache entry with the OLD snapshot.
+        release_tx.send(()).ok();
+        assert!(
+            a.join().unwrap(),
+            "A's verification against the old hash snapshot succeeds"
+        );
+
+        // But the late-published entry must not accept the old password
+        // now that the authoritative hash has rotated.
+        assert!(
+            !s.verify("alice", "oldpw"),
+            "late-published cache entry must not accept the old password after rotation"
+        );
+        assert!(s.verify("alice", "newpw"));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
