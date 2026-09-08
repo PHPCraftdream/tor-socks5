@@ -34,3 +34,6 @@
 
 # Session checkpoints: personal working state, reference bridge IPs in prose.
 /docs/checkpoints/
+
+# /wrush task worktrees — always created here, in-tree
+/worktrees/

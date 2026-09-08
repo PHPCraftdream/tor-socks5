@@ -13,7 +13,10 @@
 //! * When the in-memory snapshot is clean, the actor re-reads the file
 //!   before applying the next mutation, so whole-file writes made by other
 //!   processes in the meantime (e.g. `tor-socks5 bridges fetch` running as a
-//!   separate CLI process) are seen and preserved.
+//!   separate CLI process) are seen and preserved. This is enforced by
+//!   dropping the snapshot as soon as a publish succeeds, so a clean state
+//!   is `store = None` and every op after a successful publish reloads the
+//!   file.
 //! * When a publish fails, the mutated snapshot is retained in memory and
 //!   retried with exponential backoff (1s doubling, 30s cap); each failure
 //!   is logged at warn with the attempt number, recovery at info. Absorbed
@@ -77,8 +80,9 @@ impl RetryState {
         }
     }
 
-    /// Publish once; on success reset the retry bookkeeping, on failure arm
-    /// the next retry. Returns the error on failure for logging by the caller.
+    /// Publish once; on success reset the retry bookkeeping (the caller then
+    /// drops the clean snapshot so the next op re-reads the file), on failure
+    /// arm the next retry. Returns the error on failure for logging by the caller.
     fn publish_once(&mut self, snapshot: &BridgeStore, publish: &Publisher) -> Result<()> {
         match publish(snapshot) {
             Ok(()) => {
@@ -180,13 +184,23 @@ impl StoreWriter {
                             retry.dirty = true;
                             // Publish immediately; on failure the snapshot is retained and retried.
                             let snapshot = store.as_ref().expect("store loaded above");
-                            let _ = publish_once_logged(snapshot, &publish, &mut retry);
+                            let published = publish_once_logged(snapshot, &publish, &mut retry);
+                            // Success: drop the snapshot so the next mutation
+                            // reloads the file and preserves whole-file writes
+                            // made by other processes in the meantime.
+                            if published.is_ok() {
+                                store = None;
+                            }
                             let _ = ack.send(Ok(()));
                         }
                     },
                     _ = tokio::time::sleep_until(retry_at.unwrap_or_else(tokio::time::Instant::now)), if retry.dirty && retry_at.is_some() => {
                         if let Some(snapshot) = &store {
-                            let _ = publish_once_logged(snapshot, &publish, &mut retry);
+                            if publish_once_logged(snapshot, &publish, &mut retry).is_ok() {
+                                // Same clean-state rule as the op branch: the
+                                // next mutation must re-read the file.
+                                store = None;
+                            }
                         }
                     }
                 }
@@ -457,6 +471,132 @@ mod tests {
         .await
         .expect("inline fallback write succeeds");
         assert_eq!(reload(&config_path).channel_ok_count(&b), 1);
+        assert!(
+            leftover_tmp_files(dir.path()).is_empty(),
+            "no leftover temp files"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_cli_write_between_daemon_mutations_survives() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = test_bridge();
+        let cli_bridge: BridgeLine =
+            "obfs4 5.6.7.8:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=BBB iat-mode=0"
+                .parse()
+                .expect("CLI bridge line parses");
+        let path = config_path(dir.path());
+        seed_store(&path, &b);
+
+        let writer = StoreWriter::spawn(
+            BridgeStore::resolve_path(Some(&path)),
+            Arc::new(|s| s.save()),
+            INITIAL_BACKOFF,
+        );
+
+        // Daemon mutation #1 publishes cleanly.
+        let b1 = b.clone();
+        writer
+            .apply(move |s| s.note_channel_success_at(&b1, OffsetDateTime::now_utc()))
+            .await
+            .expect("absorbed");
+        assert_eq!(reload(&path).channel_ok_count(&b), 1);
+
+        // A separate CLI process (sequential, not concurrent) loads, adds a
+        // new bridge and bumps the daemon bridge's counter, then saves.
+        let mut external = reload(&path);
+        external.note_source_at(&cli_bridge, "cli", OffsetDateTime::now_utc());
+        external.note_channel_success_at(&b, OffsetDateTime::now_utc());
+        external.save().expect("external save");
+
+        // Daemon mutation #2 must build on the CLI's version, not the
+        // daemon's stale pre-CLI snapshot.
+        let b2 = b.clone();
+        writer
+            .apply(move |s| s.note_channel_success_at(&b2, OffsetDateTime::now_utc()))
+            .await
+            .expect("absorbed");
+
+        let store = reload(&path);
+        assert_eq!(
+            store.channel_ok_count(&b),
+            3,
+            "daemon's second mutation must build on the CLI's counter (1 daemon + 1 CLI + 1 daemon)"
+        );
+        assert_eq!(
+            store.sources_of(&cli_bridge),
+            vec!["cli"],
+            "CLI's new bridge must survive the daemon's next publish"
+        );
+        assert!(
+            leftover_tmp_files(dir.path()).is_empty(),
+            "no leftover temp files"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn external_cli_write_after_successful_retry_survives() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = test_bridge();
+        let cli_bridge: BridgeLine =
+            "obfs4 5.6.7.8:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=BBB iat-mode=0"
+                .parse()
+                .expect("CLI bridge line parses");
+        let path = config_path(dir.path());
+        seed_store(&path, &b);
+
+        let calls = AtomicUsize::new(0);
+        let publisher: Publisher = Arc::new(move |s: &BridgeStore| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(anyhow!("injected publish failure"))
+            } else {
+                s.save()
+            }
+        });
+        let writer = StoreWriter::spawn(
+            BridgeStore::resolve_path(Some(&path)),
+            publisher,
+            Duration::from_secs(1),
+        );
+
+        // Daemon mutation #1: publish fails, snapshot retained, retry armed.
+        let b1 = b.clone();
+        writer
+            .apply(move |s| s.note_channel_success_at(&b1, OffsetDateTime::now_utc()))
+            .await
+            .expect("absorbed");
+        assert_eq!(reload(&path).channel_ok_count(&b), 0, "file still stale");
+
+        // Paused clock: sleep fast-forwards AND polls the runtime to
+        // quiescence, so the actor's retry fires and completes (see the
+        // comment in publish_failure_is_retried_by_the_backoff_timer).
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(reload(&path).channel_ok_count(&b), 1, "retry published");
+
+        // External CLI write lands after the successful retry.
+        let mut external = reload(&path);
+        external.note_source_at(&cli_bridge, "cli", OffsetDateTime::now_utc());
+        external.note_channel_success_at(&b, OffsetDateTime::now_utc());
+        external.save().expect("external save");
+
+        // Daemon mutation #2 must build on the CLI's version.
+        let b2 = b.clone();
+        writer
+            .apply(move |s| s.note_channel_success_at(&b2, OffsetDateTime::now_utc()))
+            .await
+            .expect("absorbed");
+
+        let store = reload(&path);
+        assert_eq!(
+            store.channel_ok_count(&b),
+            3,
+            "mutation after a successful retry must build on the CLI's counter (1 retry + 1 CLI + 1 daemon)"
+        );
+        assert_eq!(
+            store.sources_of(&cli_bridge),
+            vec!["cli"],
+            "CLI's new bridge must survive a post-retry daemon publish"
+        );
         assert!(
             leftover_tmp_files(dir.path()).is_empty(),
             "no leftover temp files"
