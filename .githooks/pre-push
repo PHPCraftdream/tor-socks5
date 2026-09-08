@@ -7,14 +7,20 @@
 # Bypass in an emergency with `git push --no-verify`.
 set -e
 
+# Bound compiler memory; callers can override these defaults.
+: "${CARGO_BUILD_JOBS:=2}"
+: "${CARGO_PROFILE_DEV_DEBUG:=0}"
+: "${CARGO_PROFILE_TEST_DEBUG:=0}"
+export CARGO_BUILD_JOBS CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG
+
 echo "pre-push: cargo fmt --all --check"
 cargo fmt --all -- --check
 
 echo "pre-push: cargo clippy --workspace --all-targets -- -D warnings"
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --locked --workspace --all-targets -- -D warnings
 
 echo "pre-push: cargo test --workspace"
-cargo test --workspace
+cargo test --locked --workspace
 
 echo "pre-push: OK"
 

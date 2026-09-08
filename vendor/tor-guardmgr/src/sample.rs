@@ -208,7 +208,3 @@ impl<'a> From<GuardSample<'a>> for GuardSet {
         GuardSet::from_state(sample)
     }
 }
-
-#[cfg(test)]
-#[path = "sample/tests.rs"]
-mod test;

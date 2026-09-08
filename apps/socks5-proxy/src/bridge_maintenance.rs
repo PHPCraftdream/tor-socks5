@@ -1,7 +1,9 @@
 //! One owner for startup, periodic, and connection-triggered bridge refreshes.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -16,7 +18,31 @@ use crate::arti_observability::ObservationSink;
 use crate::config::Config;
 use crate::tor_watchdog::TorHandle;
 
+mod channel_probe;
+
 const CONNECTION_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const RECOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+
+enum DiscoveryEvent<T> {
+    Finished(T),
+    Recheck,
+}
+
+/// cancel-safe: yes — pending discovery and queued signals remain caller-owned.
+async fn next_discovery_event<F: Future + ?Sized>(
+    discovery: Pin<&mut F>,
+    recovery: &tokio::sync::Notify,
+    next_recheck: Instant,
+) -> DiscoveryEvent<F::Output> {
+    tokio::select! {
+        biased;
+        result = discovery => DiscoveryEvent::Finished(result),
+        _ = async {
+            tokio::time::sleep_until(next_recheck).await;
+            recovery.notified().await;
+        } => DiscoveryEvent::Recheck,
+    }
+}
 
 pub(crate) fn preferred_missing(cfg: &Config, bridges: &[BridgeLine]) -> bool {
     cfg.bridges.preferred_transport().is_some_and(|transport| {
@@ -92,18 +118,32 @@ pub(crate) fn spawn(
         ticker.tick().await;
         let mut first = true;
         let mut next_allowed = Instant::now();
+        let mut next_recovery = Instant::now();
+        let mut channel_cursor = 0;
         loop {
             if !first {
                 tokio::select! {
+                    _ = async {
+                        tokio::time::sleep_until(next_recovery).await;
+                        handle.bridge_refresh().recovery().notified().await;
+                    } => {},
                     _ = ticker.tick(), if interval_mins != 0 => {},
-                    _ = handle.bridge_refresh().notified() => {},
+                    _ = async {
+                        tokio::time::sleep_until(next_allowed).await;
+                        handle.bridge_refresh().notified().await;
+                    } => {},
                 }
-                tokio::time::sleep_until(next_allowed).await;
             }
             first = false;
-            if let Err(error) =
-                refresh(&handle, config_path.as_deref(), &observations, &mut active).await
-            {
+            let cycle: futures::future::BoxFuture<'_, Result<()>> = Box::pin(refresh(
+                &handle,
+                config_path.as_deref(),
+                &observations,
+                &mut active,
+                &mut next_recovery,
+                &mut channel_cursor,
+            ));
+            if let Err(error) = cycle.await {
                 warn!(%error, "bridge refresh failed; keeping current routes");
             }
             next_allowed = Instant::now() + CONNECTION_REFRESH_INTERVAL;
@@ -116,42 +156,24 @@ async fn refresh(
     path: Option<&Path>,
     observations: &ObservationSink,
     active: &mut Settings,
+    next_recovery: &mut Instant,
+    channel_cursor: &mut usize,
 ) -> Result<()> {
     let cfg = Config::load_with_override(path)?.into_config();
     let Some(tor) = handle.tunnel().await else {
         return Ok(());
     };
-    let configured = cfg.bridges.parsed()?.bridges;
-    let mut store = BridgeStore::load(BridgeStore::resolve_path(path))?;
-    let (failures, successes, unmatched) = observations.drain_into_store(
-        &mut store,
-        &configured,
-        OffsetDateTime::now_utc(),
-        Duration::from_secs(
-            cfg.bridges
-                .circuit_observation_window_mins
-                .saturating_mul(60),
-        ),
-    );
-    if failures + successes + unmatched > 0 {
-        store.save()?;
-        info!(
-            failures,
-            successes, unmatched, "drained circuit-layer guard observations"
-        );
-    }
-
-    let usable = match crate::tor_setup::build_tor_settings(&cfg, path).await {
-        Ok(selected) => {
-            let count = preferred_count(&cfg, &selected.bridges);
-            activate(handle, active, selected, &tor)?;
-            count
-        }
-        Err(error) => {
-            warn!(%error, "no configured route passed the probe; trying discovery");
-            0
-        }
-    };
+    let mut usable = refresh_routes(
+        handle,
+        path,
+        observations,
+        active,
+        &cfg,
+        &tor,
+        channel_cursor,
+    )
+    .await?;
+    *next_recovery = Instant::now() + RECOVERY_REFRESH_INTERVAL;
     handle.bridge_refresh().set_needed(
         cfg.bridges.auto_fetch && (usable == 0 || preferred_missing(&cfg, &active.bridges)),
     );
@@ -164,27 +186,290 @@ async fn refresh(
 
     if cfg.bridges.auto_fetch && deficit > 0 {
         // Return to the preferred transport as soon as its first bridge is admitted.
-        let target = if preferred_missing(&cfg, &active.bridges) {
+        let target = if usable == 0 || preferred_missing(&cfg, &active.bridges) {
             1
         } else {
             deficit.min(3)
         };
-        let added = crate::fetch_merge::top_up_working(&tor, &cfg, path, target).await?;
+        let mut discovery: futures::future::BoxFuture<'_, Result<usize>> =
+            Box::pin(crate::fetch_merge::top_up_working(&tor, &cfg, path, target));
+        let added = loop {
+            match next_discovery_event(
+                discovery.as_mut(),
+                handle.bridge_refresh().recovery(),
+                *next_recovery,
+            )
+            .await
+            {
+                DiscoveryEvent::Finished(result) => break result?,
+                DiscoveryEvent::Recheck => {
+                    info!("rechecking active bridges after a Tor failure");
+                    match refresh_routes(
+                        handle,
+                        path,
+                        observations,
+                        active,
+                        &cfg,
+                        &tor,
+                        channel_cursor,
+                    )
+                    .await
+                    {
+                        Ok(count) => usable = count,
+                        Err(error) => {
+                            warn!(%error, "bridge recovery recheck failed; keeping current routes");
+                        }
+                    }
+                    handle.bridge_refresh().set_needed(
+                        cfg.bridges.auto_fetch
+                            && (usable == 0 || preferred_missing(&cfg, &active.bridges)),
+                    );
+                    *next_recovery = Instant::now() + RECOVERY_REFRESH_INTERVAL;
+                }
+            }
+        };
         if added > 0 {
             let latest = Config::load_with_override(path)?.into_config();
-            let selected = crate::tor_setup::build_tor_settings(&latest, path).await?;
-            activate(handle, active, selected, &tor)?;
+            usable = refresh_routes(
+                handle,
+                path,
+                observations,
+                active,
+                &latest,
+                &tor,
+                channel_cursor,
+            )
+            .await?;
         }
     }
-    handle
-        .bridge_refresh()
-        .set_needed(cfg.bridges.auto_fetch && preferred_missing(&cfg, &active.bridges));
+    handle.bridge_refresh().set_needed(
+        cfg.bridges.auto_fetch && (usable == 0 || preferred_missing(&cfg, &active.bridges)),
+    );
     Ok(())
+}
+
+fn refresh_routes<'a>(
+    handle: &'a TorHandle,
+    path: Option<&'a Path>,
+    observations: &'a ObservationSink,
+    active: &'a mut Settings,
+    cfg: &'a Config,
+    tor: &'a arti_wrapper::TorTunnel,
+    channel_cursor: &'a mut usize,
+) -> futures::future::BoxFuture<'a, Result<usize>> {
+    Box::pin(async move {
+        let configured = cfg.bridges.parsed()?.bridges;
+        let mut store = BridgeStore::load(BridgeStore::resolve_path(path))?;
+        let (failures, successes, unmatched) = observations.drain_into_store(
+            &mut store,
+            &configured,
+            OffsetDateTime::now_utc(),
+            Duration::from_secs(
+                cfg.bridges
+                    .circuit_observation_window_mins
+                    .saturating_mul(60),
+            ),
+        );
+        if failures + successes + unmatched > 0 {
+            store.save()?;
+            info!(
+                failures,
+                successes, unmatched, "drained circuit-layer guard observations"
+            );
+        }
+        let route_works = !active.bridges.is_empty()
+            && active
+                .bridges
+                .iter()
+                .all(|bridge| configured.contains(bridge))
+            && live_route_works(tor, handle.health()).await;
+        let keep_current = route_works && can_keep_current(cfg, &configured, &active.bridges);
+        let live = if keep_current {
+            active.bridges.as_slice()
+        } else {
+            &[]
+        };
+        match crate::tor_setup::build_tor_settings_preserving_live(cfg, path, live).await {
+            Ok(mut selected) => {
+                if keep_current {
+                    info!("keeping the preferred route that still carries Tor traffic");
+                    return Ok(preferred_count(cfg, &selected.bridges).max(1));
+                }
+                if !channel_probe::authenticate_fallback(
+                    tor,
+                    cfg,
+                    path,
+                    active,
+                    &mut selected,
+                    channel_cursor,
+                    route_works || handle.route_is_settling(),
+                )
+                .await?
+                {
+                    warn!("no obfs4 candidate completed an authenticated Tor channel");
+                    return Ok(0);
+                }
+                let count = preferred_count(cfg, &selected.bridges);
+                activate(handle, active, selected, tor)?;
+                Ok(count)
+            }
+            Err(error) => {
+                if keep_current {
+                    info!(%error, "keeping the working route despite failed new-connection probes");
+                    return Ok(1);
+                }
+                warn!(%error, "no configured route passed the probe; trying discovery");
+                Ok(0)
+            }
+        }
+    })
+}
+
+fn can_keep_current(cfg: &Config, configured: &[BridgeLine], active: &[BridgeLine]) -> bool {
+    !active.is_empty()
+        && cfg.bridges.preferred_transport().is_none_or(|preferred| {
+            active
+                .iter()
+                .all(|bridge| bridge.transport.as_deref() == Some(preferred))
+        })
+        && active.iter().all(|bridge| configured.contains(bridge))
+}
+
+async fn live_route_works(
+    tor: &arti_wrapper::TorTunnel,
+    health: &crate::tor_watchdog::TorHealth,
+) -> bool {
+    if health.successful_within(RECOVERY_REFRESH_INTERVAL) {
+        return true;
+    }
+    if !tor.raw().bootstrap_status().ready_for_traffic() {
+        return false;
+    }
+    let body = bridge_fetcher::fetch_one(
+        tor,
+        "https://check.torproject.org/api/ip",
+        RECOVERY_REFRESH_INTERVAL,
+        4096,
+        &[],
+        &[],
+    )
+    .await;
+    if body
+        .as_deref()
+        .is_ok_and(crate::bridge_verifier::confirms_tor)
+    {
+        health.record_success();
+        true
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_connect_requests_recovery_without_dropping_the_attempt() {
+        use futures::FutureExt;
+        let refresh = crate::tor_watchdog::BridgeRefresh::default();
+        let (finish, connection) = tokio::sync::oneshot::channel();
+        let tracked = refresh.track_connection(async { connection.await.unwrap() });
+        tokio::pin!(tracked);
+        assert!(tracked.as_mut().now_or_never().is_none());
+        tokio::time::advance(Duration::from_secs(15)).await;
+        assert!(tracked.as_mut().now_or_never().is_none());
+        assert!(refresh.recovery().notified().now_or_never().is_some());
+        assert!(!finish.is_closed());
+        finish.send(11).unwrap();
+        assert_eq!(tracked.await, 11);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recent_route_evidence_expires_on_the_monotonic_clock() {
+        let health = crate::tor_watchdog::TorHealth::default();
+        assert!(!health.successful_within(RECOVERY_REFRESH_INTERVAL));
+        health.record_success();
+        assert!(health.successful_within(RECOVERY_REFRESH_INTERVAL));
+        tokio::time::advance(RECOVERY_REFRESH_INTERVAL).await;
+        assert!(!health.successful_within(RECOVERY_REFRESH_INTERVAL));
+    }
+
+    #[test]
+    fn retaining_live_traffic_still_honors_transport_and_config_changes() {
+        let pool = bridges();
+        let mut cfg = Config::default();
+        cfg.bridges.transport = "webtunnel".into();
+        assert!(can_keep_current(&cfg, &pool, &pool[1..]));
+        assert!(!can_keep_current(&cfg, &pool, &pool));
+        assert!(!can_keep_current(&cfg, &pool[..1], &pool[1..]));
+        cfg.bridges.transport = "obfs4".into();
+        assert!(!can_keep_current(&cfg, &pool, &pool[1..]));
+    }
+
+    #[tokio::test]
+    async fn recovery_rechecks_without_cancelling_pending_discovery() {
+        use futures::FutureExt;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        struct OnDrop(Arc<AtomicBool>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = OnDrop(dropped.clone());
+        let (done, receive) = tokio::sync::oneshot::channel();
+        let discovery = async move {
+            let _guard = guard;
+            receive.await.unwrap()
+        };
+        tokio::pin!(discovery);
+        let recovery = tokio::sync::Notify::new();
+        let ready = Instant::now() - Duration::from_secs(1);
+        assert!(next_discovery_event(discovery.as_mut(), &recovery, ready)
+            .now_or_never()
+            .is_none());
+        for _ in 0..8 {
+            recovery.notify_one();
+        }
+        assert!(matches!(
+            next_discovery_event(discovery.as_mut(), &recovery, ready).now_or_never(),
+            Some(DiscoveryEvent::Recheck)
+        ));
+        assert!(!dropped.load(Ordering::SeqCst));
+        assert!(next_discovery_event(discovery.as_mut(), &recovery, ready)
+            .now_or_never()
+            .is_none());
+        done.send(7).unwrap();
+        assert!(matches!(
+            next_discovery_event(discovery.as_mut(), &recovery, ready).await,
+            DiscoveryEvent::Finished(7)
+        ));
+    }
+
+    #[tokio::test]
+    async fn recovery_cooldown_does_not_delay_discovery_or_consume_its_signal() {
+        use futures::FutureExt;
+        let (done, receive) = tokio::sync::oneshot::channel();
+        let discovery = async { receive.await.unwrap() };
+        tokio::pin!(discovery);
+        let recovery = tokio::sync::Notify::new();
+        recovery.notify_one();
+        let later = Instant::now() + Duration::from_secs(60);
+        assert!(next_discovery_event(discovery.as_mut(), &recovery, later)
+            .now_or_never()
+            .is_none());
+        done.send(9).unwrap();
+        assert!(matches!(
+            next_discovery_event(discovery.as_mut(), &recovery, later).now_or_never(),
+            Some(DiscoveryEvent::Finished(9))
+        ));
+        assert!(recovery.notified().now_or_never().is_some());
+    }
 
     fn bridges() -> Vec<BridgeLine> {
         [

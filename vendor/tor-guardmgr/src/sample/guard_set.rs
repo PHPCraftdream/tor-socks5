@@ -1,5 +1,9 @@
 use super::*;
 
+#[cfg(test)]
+#[path = "tests.rs"]
+mod test;
+
 impl GuardSet {
     /// Return the lengths of the different elements of the guard set.
     ///
@@ -339,8 +343,8 @@ impl GuardSet {
     }
 
     /// tor-socks5 local patch: return true iff at least one guard in this set is
-    /// `usable()` (listed and not disabled) and has complete directory
-    /// information (`has_complete_dir_info`) — i.e. we have at least one guard
+    /// listed, enabled, potentially reachable, permitted by the active filter,
+    /// and has complete directory information — i.e. we have at least one guard
     /// through which we can actually build multi-hop data circuits right now.
     ///
     /// This is the aggregate published via `GuardMgr::usable_guard_events` and
@@ -348,8 +352,12 @@ impl GuardSet {
     /// the client no longer reports "ready for traffic" once the directory is
     /// bootstrapped while every guard still lacks a usable descriptor.
     pub(crate) fn any_guard_usable_for_traffic(&self) -> bool {
-        self.preference_order()
-            .any(|(_, g)| g.usable() && g.has_complete_dir_info())
+        self.preference_order().any(|(_, g)| {
+            g.usable()
+                && g.reachable() != Reachable::Unreachable
+                && self.active_filter.permits(g)
+                && g.has_complete_dir_info()
+        })
     }
 
     /// tor-socks5 local patch: test-only helper that sets `dir_info_missing` on
@@ -575,6 +583,23 @@ impl GuardSet {
             .collect();
     }
 
+    /// Whether the known guard is disabled by guard security policy.
+    pub(crate) fn guard_is_disabled(&self, id: &GuardId) -> bool {
+        self.guards.by_all_ids(id).is_some_and(Guard::is_disabled)
+    }
+
+    /// Retry explicitly re-enabled bridges without clearing failure history.
+    #[cfg(feature = "bridge-client")]
+    pub(crate) fn retry_reenabled_bridges<'a>(
+        &mut self,
+        bridges: impl IntoIterator<Item = &'a crate::bridge::BridgeConfig>,
+    ) {
+        for bridge in bridges {
+            self.guards
+                .modify_by_all_ids(bridge, |guard| guard.mark_retriable());
+        }
+    }
+
     /// tor-socks5 local patch: re-enable every guard that is currently
     /// `disabled` (clearing its `disabled` state and resetting the
     /// indeterminate-failure history that led to the disable), returning the
@@ -585,7 +610,7 @@ impl GuardSet {
     /// and rationale.
     pub(crate) fn reset_disabled_guards(&mut self) -> usize {
         let old_guards = std::mem::take(&mut self.guards);
-        let mut n_reset = 0usize;
+        let mut n_reset = 0_usize;
         self.guards = old_guards
             .into_values()
             .map(|mut guard| {
@@ -859,7 +884,12 @@ impl GuardSet {
     /// (The output of this function is not reasonable unless this is a Bridge
     /// sample.)
     #[cfg(feature = "bridge-client")]
-    pub(crate) fn descriptors_to_request(&self, now: Instant, params: &GuardParams) -> Vec<&Guard> {
+    pub(crate) fn descriptors_to_request(
+        &self,
+        now: Instant,
+        params: &GuardParams,
+        is_configured: impl Fn(&Guard) -> bool,
+    ) -> Vec<&Guard> {
         /// This constant is here to improve our odds that we can get a working
         /// bridge if we have any per-circuit filters that would prevent us from
         /// using our preferred bridge.
@@ -868,52 +898,14 @@ impl GuardSet {
         let maximum = std::cmp::max(params.data_parallelism, MINIMUM);
         let data_usage = GuardUsage::default();
 
-        // tor-socks5 local patch: adaptive parallelism for guard-descriptor
-        // fetch.  Normally we request descriptors for only the top `maximum`
-        // guards in preference order.  But when *no* guard is currently usable
-        // for traffic (`any_guard_usable_for_traffic`), every guard in the
-        // sample is descriptor-naked — and in exactly that state this
-        // conservative top-N cap is itself the bottleneck: the eligible guards
-        // are still listed, reachable and not in backoff (a failed descriptor
-        // fetch is invisible to this layer — it never trips
-        // `record_failure`/`retry_at`), so they all pass the filter below and
-        // are then truncated by `take(maximum)`.  In bridge-only operation that
-        // left a client requesting descriptors for only its top 2 bridges
-        // while 20+ others that could have recovered it were never asked — the
-        // mechanism behind the 12-minute guard-exhaustion outage analyzed in
-        // docs/upstream/guard-exhaustion-watchdog-spiral.md §2.4.
-        //
-        // Widening to the whole eligible sample in that emergency lets a
-        // reachable bridge surface its descriptor (and become a usable Data
-        // guard) without waiting behind dead/slow bridges earlier in the
-        // preference order, then snaps back to the conservative cap the moment
-        // the first guard becomes usable.  This is safe against flooding
-        // because the lower layer (`tor-dirmgr`'s `BridgeDescMgr`)
-        // independently caps concurrent descriptor fetches
-        // (`BridgeDescDownloadConfig::parallelism`) and backs off per-bridge
-        // retries, so requesting more candidates here cannot exceed that
-        // budget — it only stops starving the manager's existing parallelism
-        // (which a separate `tor-dirmgr` patch raised to 12 but which was
-        // never reached while only 2 bridges were ever handed down here).
-        let take_n = if self.any_guard_usable_for_traffic() {
-            maximum
-        } else {
-            usize::MAX
-        };
-
-        // Here we duplicate some but not all of the restrictions above in
-        // pick_guard_id.  We skip those restrictions that are specific to only
-        // certain kinds of circuits, and those that are temporary restrictions
-        // encouraging us to try more guards.
-        //
-        // TODO: we may want to refactor this code and the code in pick_guard_id
-        // above to share a single function.  Before we do that, however, I want
-        // to experiment with this logic a bit to make sure that it works and
-        // doesn't give us surprising results.
+        // A re-enabled bridge can remain unlisted until its descriptor confirms
+        // previously learned identities. It still needs a descriptor request.
+        // Data selection remains subject to the stricter usable() check.
         let eligible: Vec<&Guard> = self
             .preference_order()
             .filter(|(_, g)| {
-                g.usable()
+                !g.is_disabled()
+                    && is_configured(g)
                     && g.reachable() != Reachable::Unreachable
                     && g.ready_for_usage(&data_usage, now)
                     && self.active_filter.permits(*g)
@@ -921,39 +913,31 @@ impl GuardSet {
             .map(|(_, g)| g)
             .collect();
 
+        // An inactive guard's cached descriptor cannot support recovery.
+        // BridgeDescMgr still bounds concurrent downloads and retry frequency.
+        let take_n = if eligible
+            .iter()
+            .any(|g| g.usable() && g.has_complete_dir_info())
+        {
+            maximum
+        } else {
+            usize::MAX
+        };
+
         if take_n >= eligible.len() {
             return eligible;
         }
         let mut selected = eligible[..take_n].to_vec();
 
-        // tor-socks5 local patch: descriptor-retention against the narrow-vs-
-        // wide oscillation the above widening can otherwise cause. Once
-        // `any_guard_usable_for_traffic()` flips true because some guard
-        // *outside* the top-`maximum` got its descriptor during the widened
-        // pass, `take_n` snaps back to `maximum` on the very next call — and
-        // a plain top-N cut would drop that guard from the requested set
-        // again. `tor_dirmgr::bridgedesc::set_bridges` treats "no longer in
-        // the requested set" as "forget this bridge", which deletes the
-        // descriptor we just fetched. That flips
-        // `any_guard_usable_for_traffic()` back to false, which widens the
-        // request again, re-downloads the same descriptor, flips it back to
-        // true — an unbounded livelock with no backoff (observed as tens of
-        // thousands of `bridgedesc` download/forget cycles per minute and
-        // the bootstrap never reaching a directory).
-        //
-        // Fix: only when *none* of the conservative top-`maximum` guards
-        // already has a complete descriptor, ride along the single
-        // best-ranked guard beyond the cutoff that does. That guard is the
-        // one keeping `any_guard_usable_for_traffic()` true, so it must
-        // never disappear from the requested set. This is narrower than
-        // "never drop any descriptor holder": once the top-`maximum` itself
-        // contains a descriptor holder (steady state, or full recovery),
-        // nothing extra is added and the cap is exactly `maximum`, same as
-        // before this patch.
-        if !selected.iter().any(|g| g.has_complete_dir_info()) {
+        // Retain a usable descriptor outside the cutoff, avoiding a repeated
+        // download/forget cycle when the request set narrows after recovery.
+        if !selected
+            .iter()
+            .any(|g| g.usable() && g.has_complete_dir_info())
+        {
             if let Some(extra) = eligible[take_n..]
                 .iter()
-                .find(|g| g.has_complete_dir_info())
+                .find(|g| g.usable() && g.has_complete_dir_info())
             {
                 selected.push(extra);
             }

@@ -37,6 +37,14 @@ pub(crate) async fn build_tor_settings(
     cfg: &Config,
     config_path: Option<&Path>,
 ) -> Result<Settings> {
+    build_tor_settings_preserving_live(cfg, config_path, &[]).await
+}
+
+pub(crate) async fn build_tor_settings_preserving_live(
+    cfg: &Config,
+    config_path: Option<&Path>,
+    live: &[BridgeLine],
+) -> Result<Settings> {
     let parsed = cfg
         .bridges
         .parsed()
@@ -105,7 +113,8 @@ pub(crate) async fn build_tor_settings(
         alive = fallback_alive;
     }
 
-    if alive.is_empty() && cfg.bridges.preferred_transport() == Some("webtunnel") {
+    if alive.is_empty() && live.is_empty() && cfg.bridges.preferred_transport() == Some("webtunnel")
+    {
         let fallback: Vec<_> = parsed_bridges
             .iter()
             .filter(|b| b.transport.as_deref() == Some("obfs4") && !probed.contains(b))
@@ -122,7 +131,7 @@ pub(crate) async fn build_tor_settings(
     // Chicken-and-egg fallback: if no configured bridge is reachable,
     // probe the binary's built-in seed bridges so a fresh or stale config
     // can still bootstrap. `auto_fetch` will then replenish the config.
-    if alive.is_empty() && cfg.bridges.use_seeds {
+    if alive.is_empty() && live.is_empty() && cfg.bridges.use_seeds {
         let seeds = crate::seed::seed_bridges(config_path);
         if !seeds.is_empty() {
             warn!(
@@ -140,6 +149,10 @@ pub(crate) async fn build_tor_settings(
     // and the config. Best-effort: never fails the bootstrap.
     // Bootstrap path: no observation sink yet — arti hasn't started
     // emitting per-guard usability events when build_tor_settings runs.
+    // Failure to open another transport connection does not invalidate live traffic.
+    probed.retain(|bridge| {
+        !live.contains(bridge) || alive.iter().any(|(available, _)| available == bridge)
+    });
     let store = update_health_and_prune(config_path, &probed, &alive, cfg, None);
 
     let allowed = preferred_transport_bridges(

@@ -8,6 +8,7 @@ members = [
     "vendor/saturating-time",
     "vendor/arti-client",
     "vendor/tor-circmgr",
+    "vendor/tor-guardmgr",
 ]
 
 # bridge-fetcher is in packages/* via glob
@@ -71,8 +72,8 @@ httparse = "1"
 base64 = "0.22"
 getrandom = "0.2"
 url = "2"
-bridge-line = { version = "0.5", package = "ptrs-gesher-bridge-line" }
-lyrebird = { version = "0.5", package = "ptrs-gesher-lyrebird" }
+bridge-line = { version = "0.5.3", package = "ptrs-gesher-bridge-line" }
+lyrebird = { version = "0.5.3", package = "ptrs-gesher-lyrebird" }
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 proptest = "1"
 
@@ -98,20 +99,11 @@ tor-dirmgr = { path = "vendor/tor-dirmgr" }
 ## descriptors), which left every bridge "unsuitable to purpose" so no circuit
 ## could be built. Vendored with a lazy unwrap + a find_limit termination guard.
 saturating-time = { path = "vendor/saturating-time" }
-## tor-chanmgr 0.43.0: vendored as a baseline ahead of an upcoming
-## terminate_all_channels() patch (to let the watchdog force-drop stale
-## channels after a network change) — no behavior change yet.
+## Force-close stale channels after a network change.
 tor-chanmgr = { path = "vendor/tor-chanmgr" }
-## tor-guardmgr 0.43.0: vendored as a baseline ahead of a guard-usable signal
-## patch (an aggregated "guards ready" event stream feeding BootstrapStatus) —
-## no behavior change yet.
+## Guard readiness, descriptor recovery, and bridge reconfiguration.
 tor-guardmgr = { path = "vendor/tor-guardmgr" }
-## arti-client 0.43.0: vendored as a baseline ahead of the guard-usable signal
-## patch (wiring the new GuardMgr stream into BootstrapStatus::ready_for_traffic)
-## — no behavior change yet. Vendored together with tor-guardmgr: the two
-## patches are a mandatory pair (see docs/upstream/arti-vendor-integration-plan.md
-## §2). Only this crate is overridden; its internal tor-* deps keep resolving
-## from crates.io / already-patched sources as before.
+## Wire guard readiness and recovery APIs into the client.
 arti-client = { path = "vendor/arti-client" }
 ## tor-circmgr 0.43.0: vendored for the circuit-speed tiers
 ## (docs/circuit-speed-plan.md): Tier 2 — an opt-in bandwidth floor for
@@ -121,9 +113,3 @@ arti-client = { path = "vendor/arti-client" }
 ## latency-over-anonymity trade acceptable only in this personal-use fork;
 ## the default keeps behaviour identical to upstream.
 tor-circmgr = { path = "vendor/tor-circmgr" }
-## Local transport development; keep versions aligned with Cargo.lock.
-ptrs-gesher-core = { path = "../ptrs-gesher/crates/core" }
-ptrs-gesher-obfs4 = { path = "../ptrs-gesher/crates/obfs4" }
-ptrs-gesher-webtunnel = { path = "../ptrs-gesher/crates/webtunnel" }
-ptrs-gesher-lyrebird = { path = "../ptrs-gesher/crates/lyrebird" }
-ptrs-gesher-bridge-line = { path = "../ptrs-gesher/crates/bridge-line" }

@@ -406,6 +406,23 @@ impl TorTunnel {
         Ok(())
     }
 
+    /// Query guard security policy without changing its failure history.
+    pub fn bridge_is_disabled(&self, bridge: &BridgeLine) -> Result<bool> {
+        let serialized = bridge.to_string();
+        let builder: BridgeConfigBuilder =
+            serialized
+                .parse()
+                .map_err(|e: arti_client::config::BridgeParseError| {
+                    TorError::InvalidBridge(format!("{serialized:?}: {e}"))
+                })?;
+        let target = builder
+            .build()
+            .map_err(|e| TorError::InvalidBridge(format!("{serialized:?}: {e}")))?;
+        self.inner
+            .guard_is_disabled(&target)
+            .map_err(TorError::ChanMgrUnavailable)
+    }
+
     /// Tell arti's guard manager that `bridge` has been observed (by this
     /// application, outside of arti's own circuit-build accounting) to be
     /// degrading, so it can factor that into its own primary/confirmed/

@@ -25,10 +25,10 @@ jobs:
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
-          - runner: macos-13
+          - runner: macos-15-intel
             target: x86_64-apple-darwin
             archive: tar.gz
-          - runner: macos-14
+          - runner: macos-15
             target: aarch64-apple-darwin
             archive: tar.gz
     steps:
@@ -43,7 +43,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release -p socks5-proxy --target ${{ matrix.target }}
+        run: cargo build --locked --release -p socks5-proxy --target ${{ matrix.target }}
 
       - name: Package (unix)
         if: matrix.archive != 'zip'

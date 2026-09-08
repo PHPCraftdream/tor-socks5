@@ -209,6 +209,23 @@ impl<R: Runtime> GuardMgr<R> {
         inner.guards.active_guards_mut().mark_all_guards_retriable();
     }
 
+    /// Whether this identity is disabled in any known guard sample.
+    pub fn guard_is_disabled<T: tor_linkspec::HasRelayIds + ?Sized>(&self, identity: &T) -> bool {
+        let inner = self.inner.lock().expect("Poisoned lock");
+        inner.lookup_ids(identity).iter().any(|hop| match &hop.0 {
+            FirstHopIdInner::Guard(sample, id) => {
+                let guards = match sample {
+                    GuardSetSelector::Default => &inner.guards.default,
+                    GuardSetSelector::Restricted => &inner.guards.restricted,
+                    #[cfg(feature = "bridge-client")]
+                    GuardSetSelector::Bridges => &inner.guards.bridges,
+                };
+                guards.guard_is_disabled(id)
+            }
+            FirstHopIdInner::Fallback(_) => false,
+        })
+    }
+
     /// tor-socks5 local patch: re-enable every guard that is currently disabled
     /// by `TooManyIndeterminateFailures` (clearing its `disabled` state and
     /// resetting the indeterminate-failure history that led to the disable),
@@ -435,7 +452,7 @@ impl<R: Runtime> GuardMgr<R> {
     /// Ensure that the message queue is flushed before proceeding to
     /// the next step.  Used for testing.
     #[cfg(test)]
-    async fn flush_msg_queue(&self) {
+    pub(super) async fn flush_msg_queue(&self) {
         let (snd, rcv) = oneshot::channel();
         let pingmsg = daemon::Msg::Ping(snd);
         {

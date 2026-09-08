@@ -150,12 +150,19 @@ pub struct GuardObservation {
 #[derive(Debug, Clone, Default)]
 pub struct ObservationSink {
     inner: Arc<Mutex<Vec<GuardObservation>>>,
+    recovery: Arc<Mutex<Option<std::sync::Weak<tokio::sync::Notify>>>>,
 }
 
 impl ObservationSink {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn set_recovery_notifier(&self, notifier: &Arc<tokio::sync::Notify>) {
+        if let Ok(mut recovery) = self.recovery.lock() {
+            *recovery = Some(Arc::downgrade(notifier));
+        }
     }
 
     /// Take every observation accumulated so far. The sink is empty
@@ -226,8 +233,19 @@ impl ObservationSink {
     }
 
     fn push(&self, obs: GuardObservation) {
+        let failed = !obs.usable;
         if let Ok(mut g) = self.inner.lock() {
             g.push(obs);
+        }
+        if failed {
+            let notifier = self
+                .recovery
+                .lock()
+                .ok()
+                .and_then(|guard| guard.as_ref().and_then(std::sync::Weak::upgrade));
+            if let Some(notifier) = notifier {
+                notifier.notify_one();
+            }
         }
     }
 }
@@ -382,6 +400,26 @@ mod tests {
     use tracing::Level;
     use tracing_subscriber::prelude::*;
 
+    #[tokio::test]
+    async fn live_guard_failure_requests_recovery_with_a_preferred_route_active() {
+        use futures::FutureExt;
+        let refresh = crate::tor_watchdog::BridgeRefresh::default();
+        refresh.set_needed(false);
+        let sink = ObservationSink::new();
+        sink.set_recovery_notifier(refresh.recovery());
+        sink.push(GuardObservation {
+            fingerprint: "1111111111111111111111111111111111111111".into(),
+            usable: true,
+        });
+        assert!(refresh.recovery().notified().now_or_never().is_none());
+        sink.push(GuardObservation {
+            fingerprint: "1111111111111111111111111111111111111111".into(),
+            usable: false,
+        });
+        assert!(refresh.recovery().notified().now_or_never().is_some());
+        assert!(refresh.recovery().notified().now_or_never().is_none());
+    }
+
     // -- Fingerprint extraction (pure parser) --------------------------------
 
     #[test]
@@ -450,7 +488,10 @@ mod tests {
 
     #[test]
     fn throwaway_runtime_cannot_change_live_guard_health() {
+        use futures::FutureExt;
         let sink = ObservationSink::new();
+        let recovery = Arc::new(tokio::sync::Notify::new());
+        sink.set_recovery_notifier(&recovery);
         let captured = sink.clone();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -472,6 +513,7 @@ mod tests {
                 })
             });
             assert!(captured.drain().is_empty());
+            assert!(recovery.notified().now_or_never().is_none());
             emit();
         });
         let events = captured.drain();
@@ -481,6 +523,7 @@ mod tests {
             "live observations must resume after verification"
         );
         assert!(!events[0].usable);
+        assert!(recovery.notified().now_or_never().is_some());
     }
 
     #[test]

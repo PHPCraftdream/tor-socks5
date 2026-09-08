@@ -205,6 +205,12 @@ impl GuardMgrInner {
                 return Ok(RetireCircuits::None); // nothing to do.
             }
             (_, true) => {
+                let previous = self.configured_bridges.as_deref();
+                let reenabled = new_config
+                    .bridges()
+                    .iter()
+                    .filter(|bridge| previous.is_none_or(|old| !old.contains(bridge)));
+                self.guards.bridges.retry_reenabled_bridges(reenabled);
                 self.configured_bridges = Some(new_config.bridges().into());
                 self.guards.active_set = GuardSetSelector::Bridges;
             }
@@ -345,7 +351,9 @@ impl GuardMgrInner {
             let desired: Vec<_> = self
                 .guards
                 .active_guards()
-                .descriptors_to_request(now, &self.params)
+                .descriptors_to_request(now, &self.params, |guard| {
+                    bridge_set.bridge_by_guard(guard).is_some()
+                })
                 .into_iter()
                 .flat_map(|guard| bridge_set.bridge_by_guard(guard))
                 .cloned()
@@ -612,10 +620,7 @@ impl GuardMgrInner {
     /// information) and publish the result. Called at the end of [`update`] so
     /// the signal tracks every refresh of guard directory information.
     fn update_guard_usability(&mut self) {
-        let usable = self
-            .guards
-            .active_guards()
-            .any_guard_usable_for_traffic();
+        let usable = self.guards.active_guards().any_guard_usable_for_traffic();
         *self.send_usable.borrow_mut() = usable;
     }
 

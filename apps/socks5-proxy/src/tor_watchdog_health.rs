@@ -1,15 +1,14 @@
 use super::runtime::unix_secs;
 use super::*;
 
-/// Shared, lock-free circuit-level health signal, updated from the SOCKS5
-/// hot path on every Tor `connect`. Cheap to clone (two atomics behind an
-/// `Arc`); there are no locks on the per-connection path.
+/// Shared connection health, including monotonic evidence of recent success.
 #[derive(Clone, Default)]
 pub struct TorHealth {
     /// Unix-seconds of the last successful `TorTunnel::connect`. `0` until
     /// the first success — the watchdog substitutes the start time in that
     /// case so the stale window still elapses from boot, not from the epoch.
     last_success: Arc<AtomicU64>,
+    last_success_instant: Arc<Mutex<Option<tokio::time::Instant>>>,
     /// Monotonic count of `TorTunnel::connect` calls (success or failure).
     /// The watchdog compares this between ticks to detect "attempts are
     /// still being made" — the difference between *no traffic* and
@@ -50,6 +49,17 @@ impl TorHealth {
     /// Stamp "now" as the last successful connect. Called only on success.
     pub fn record_success(&self) {
         self.last_success.store(unix_secs(), Ordering::Relaxed);
+        if let Ok(mut last) = self.last_success_instant.lock() {
+            *last = Some(tokio::time::Instant::now());
+        }
+    }
+
+    pub fn successful_within(&self, window: Duration) -> bool {
+        self.last_success_instant
+            .lock()
+            .ok()
+            .and_then(|last| *last)
+            .is_some_and(|last| last.elapsed() < window)
     }
 
     /// Remember the `(host, port)` of the most recent successful
@@ -168,14 +178,38 @@ pub struct TorHandle {
     /// and release the state-dir lock.
     slot: Arc<RwLock<Option<TorTunnel>>>,
     health: TorHealth,
-    active_bridges: Arc<Mutex<Vec<BridgeLine>>>,
+    active_bridges: Arc<Mutex<ActiveBridges>>,
     refresh: Arc<BridgeRefresh>,
 }
 
 #[derive(Default)]
+struct ActiveBridges {
+    bridges: Vec<BridgeLine>,
+    activated: Option<tokio::time::Instant>,
+}
+
+impl ActiveBridges {
+    fn update(&mut self, bridges: Vec<BridgeLine>) {
+        if self.bridges != bridges {
+            self.bridges = bridges;
+            self.activated = Some(tokio::time::Instant::now());
+        }
+    }
+
+    fn settling(&self, last_success: Option<tokio::time::Instant>) -> bool {
+        self.activated.is_some_and(|activated| {
+            !self.bridges.is_empty()
+                && activated.elapsed() < Duration::from_secs(45)
+                && last_success.is_none_or(|success| success < activated)
+        })
+    }
+}
+
+#[derive(Debug, Default)]
 pub(crate) struct BridgeRefresh {
     needed: AtomicBool,
     notify: Notify,
+    recovery: Arc<Notify>,
 }
 
 impl BridgeRefresh {
@@ -192,6 +226,40 @@ impl BridgeRefresh {
     pub async fn notified(&self) {
         self.notify.notified().await;
     }
+
+    pub fn recovery(&self) -> &Arc<Notify> {
+        &self.recovery
+    }
+
+    /// Request recovery while keeping the same connection attempt alive.
+    /// cancel-safe: NO — dropping this wrapper also drops the owned attempt.
+    pub async fn track_connection<F: std::future::Future>(&self, connection: F) -> F::Output {
+        tokio::pin!(connection);
+        let period = Duration::from_secs(15);
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                result = connection.as_mut() => return result,
+                _ = ticker.tick() => self.recovery.notify_one(),
+            }
+        }
+    }
+
+    pub fn request_after_failure(&self, error: &arti_wrapper::TorError) {
+        let arti_wrapper::TorError::Connect { source, .. } = error else {
+            return;
+        };
+        if matches!(
+            tor_error::HasKind::kind(source),
+            tor_error::ErrorKind::TorAccessFailed
+                | tor_error::ErrorKind::TorNetworkTimeout
+                | tor_error::ErrorKind::TorProtocolViolation
+        ) {
+            self.recovery.notify_one();
+        }
+    }
 }
 
 impl TorHandle {
@@ -200,7 +268,7 @@ impl TorHandle {
         Self {
             slot: Arc::new(RwLock::new(Some(tor))),
             health: TorHealth::default(),
-            active_bridges: Arc::new(Mutex::new(Vec::new())),
+            active_bridges: Arc::new(Mutex::new(ActiveBridges::default())),
             refresh: Arc::new(BridgeRefresh::default()),
         }
     }
@@ -222,14 +290,28 @@ impl TorHandle {
         self.active_bridges
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .bridges
             .clone()
     }
 
     pub fn set_active_bridges(&self, bridges: Vec<BridgeLine>) {
-        *self
-            .active_bridges
+        self.active_bridges
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = bridges;
+            .unwrap_or_else(|e| e.into_inner())
+            .update(bridges);
+    }
+
+    /// Give an authenticated channel time to fetch its descriptor and build a circuit.
+    pub fn route_is_settling(&self) -> bool {
+        let last_success = *self
+            .health
+            .last_success_instant
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.active_bridges
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .settling(last_success)
     }
 
     pub fn bridge_refresh(&self) -> &BridgeRefresh {
@@ -241,5 +323,34 @@ impl TorHandle {
     /// reactor/PT teardown follows once the remaining in-flight clones drain.
     pub async fn drain(self) -> Option<TorTunnel> {
         self.slot.write().await.take()
+    }
+}
+
+#[cfg(test)]
+mod activation_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_selection_does_not_extend_bootstrap_grace() {
+        let bridge: BridgeLine =
+            "obfs4 192.0.2.1:443 1111111111111111111111111111111111111111 cert=AAA"
+                .parse()
+                .unwrap();
+        let mut active = ActiveBridges::default();
+        assert!(!active.settling(None));
+        let old_success = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        active.update(vec![bridge.clone()]);
+        assert!(active.settling(Some(old_success)));
+        tokio::time::advance(Duration::from_secs(15)).await;
+        active.update(vec![bridge.clone()]);
+        assert!(active.settling(None));
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert!(!active.settling(None));
+        active.update(Vec::new());
+        assert!(!active.settling(None));
+        active.update(vec![bridge]);
+        assert!(active.settling(None));
+        assert!(!active.settling(Some(tokio::time::Instant::now())));
     }
 }

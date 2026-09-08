@@ -8,8 +8,8 @@ Why they live here: the build must be self-contained and must NOT depend on
 our fixes being accepted upstream. Everything needed to build is in git.
 
 > Note: the `ptrs-gesher-*` crates are **not** vendored here — they are our own
-> project, consumed from the sibling `../ptrs-gesher` checkout via
-> `[patch.crates-io]`. Only third-party / upstream crates we had to fix are
+> project, consumed from crates.io at version 0.5.3 or later.
+> Only third-party / upstream crates we had to fix are
 > vendored in this directory.
 
 ## What's here and why
@@ -150,13 +150,25 @@ this into a system-wide "do we have any usable guard at all" signal — so
 nothing downstream could tell "directory bootstrapped" apart from "directory
 bootstrapped, but every guard is still descriptor-naked". Added
 `GuardSet::any_guard_usable_for_traffic()` (true iff at least one guard in the
-active sample is `usable()` and has complete directory information) and
+active sample is usable, potentially reachable, permitted by the active filter,
+and has complete directory information) and
 `GuardMgr::usable_guard_events()`, a `postage::watch`-backed stream
 (mirroring the existing `skew_events()` plumbing) that republishes this
 aggregate every time the guard sample is refreshed. Consumed by the matching
 `arti-client` change below. Vendored and patched together with `arti-client`
 as a **mandatory pair** — see
 `docs/upstream/arti-vendor-integration-plan.md` §1.4/§2.
+
+Recovery corrections added on 2026-09-08: descriptor requests now consider only
+configured, security-enabled candidates when deciding whether to limit the set.
+A reintroduced bridge may fetch a descriptor to confirm a previously learned
+identity even while still unlisted; data circuits still require full identity
+confirmation. Re-enabling a removed bridge clears temporary retry state, while
+unchanged active bridges retain their backoff. The new read-only
+`guard_is_disabled()` query lets the application exclude security-disabled
+bridges. Automatic recovery never calls the manual reset hook described below.
+See [the recovery report](../docs/recovery-2026-09-08.md) for regressions and
+the real WebTunnel-to-obfs4 switch test.
 
 Second fix — the indeterminate-failure **permanent disable** with no recovery
 path. `record_indeterminate_result()` sets `Guard::disabled` once the guard's

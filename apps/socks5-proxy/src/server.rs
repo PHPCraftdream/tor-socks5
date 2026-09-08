@@ -136,19 +136,13 @@ pub(crate) async fn run_server(
                 .await
                 .context("failed to bootstrap Tor")?;
 
-            // Auto-fetch enrichment: when we bootstrapped on few bridges
-            // (or fell back to seeds), top up the working list in the
-            // background — drain the candidate pool first, fetching fresh
-            // candidates over the now-live Tor only if the pool is short.
-            // One-shot: takes a direct `TorTunnel` clone and runs to
-            // completion long before the watchdog could ever fire.
-
             // Single indirection point for the live `TorClient`: the accept
             // loop and the maintenance loop read the *current* tunnel
             // through this handle, so a watchdog rebuild becomes visible to
             // both without re-distribution. Cheap to clone (one
             // `Arc<RwLock<_>>` + two atomics).
             let handle = TorHandle::new(tor);
+            obs_sink.set_recovery_notifier(handle.bridge_refresh().recovery());
             handle.set_active_bridges(settings.bridges.clone());
             handle.bridge_refresh().set_needed(
                 cfg.bridges.auto_fetch
@@ -197,7 +191,7 @@ pub(crate) async fn run_server(
             // successes into the bridge store. This is the CLI counterpart of
             // android-ffi's background circuit-verify tick; it is self-paced
             // by store state (a tick with no due bridges is nearly free) and
-            // needs no TorHandle — it never touches the live tunnel.
+            // uses the active pool but verifies through separate clients.
             crate::bridge_verifier::spawn_bridge_circuit_verifier(
                 config_path.clone(),
                 handle.clone(),
@@ -454,7 +448,11 @@ async fn handle_client(
             // tell "no traffic" from "circuits failing"), a success stamps
             // the last-good time it compares against.
             handle.health().record_attempt();
-            let tor_stream = match tor.connect(&req.host, req.port).await {
+            let tor_stream = match handle
+                .bridge_refresh()
+                .track_connection(tor.connect(&req.host, req.port))
+                .await
+            {
                 Ok(s) => {
                     handle.health().record_success();
                     handle.health().record_success_target(&req.host, req.port);
@@ -467,6 +465,7 @@ async fn handle_client(
                     // watchdog cares about (see `classify_and_record`'s doc
                     // comment) — data collection only, no gating here.
                     crate::tor_watchdog::classify_and_record(&e, handle.health());
+                    handle.bridge_refresh().request_after_failure(&e);
                     // We don't try to map the underlying cause to a specific
                     // SOCKS5 code; GeneralFailure is enough to tell the client
                     // we refused.

@@ -525,7 +525,7 @@ impl FromStr for Inner {
                 Ok(RelayId::Ed25519(id)) => check_several(ed_id.replace(id).is_some())?,
                 Ok(RelayId::Rsa(id)) => check_several(rsa_id.replace(id).is_some())?,
                 Ok(_) => {
-                    return Err(BPE::UnsupportedIdentityType {
+                    Err(BPE::UnsupportedIdentityType {
                         word: word.to_string(),
                     })?;
                 }

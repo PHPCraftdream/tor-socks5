@@ -367,6 +367,11 @@ impl Guard {
         self.unlisted_since.is_none() && self.disabled.is_none()
     }
 
+    /// Whether guard security policy has disabled this identity.
+    pub(crate) fn is_disabled(&self) -> bool {
+        self.disabled.is_some()
+    }
+
     /// tor-socks5 local patch: return true if we have complete directory
     /// information (a microdescriptor) for this guard — i.e. its
     /// `dir_info_missing` flag is false, so it is eligible for multi-hop data

@@ -73,7 +73,7 @@ const VERIFY_RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const LIVE_PROBE_URL: &str = "https://check.torproject.org/api/ip";
 static VERIFY_LOCK: Mutex<()> = Mutex::new(());
 
-fn confirms_tor(body: &str) -> bool {
+pub(crate) fn confirms_tor(body: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|value| value.get("IsTor").and_then(serde_json::Value::as_bool))

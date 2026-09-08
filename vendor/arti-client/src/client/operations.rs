@@ -473,6 +473,17 @@ impl<R: Runtime> TorClient<R> {
         Ok(())
     }
 
+    /// Whether guard security policy has disabled this relay identity.
+    /// This method is available with `experimental-api`.
+    #[cfg(feature = "experimental-api")]
+    pub fn guard_is_disabled<T: tor_linkspec::HasRelayIds + ?Sized>(
+        &self,
+        identity: &T,
+    ) -> crate::Result<bool> {
+        let inner = self.client.running_inner("query guard policy")?;
+        Ok(inner.guardmgr.guard_is_disabled(identity))
+    }
+
     /// Return a reference to this client's circuit pool.
     ///
     /// This function is unstable. It is only enabled if the crate was
