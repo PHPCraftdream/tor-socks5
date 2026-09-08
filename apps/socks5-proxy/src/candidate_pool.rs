@@ -40,6 +40,13 @@ pub fn key_of(b: &BridgeLine) -> Key {
     (b.transport.clone(), b.addr, b.fingerprint.clone())
 }
 
+/// Borrowed variant of [`Key`] for ranking lookups without string clones.
+type RefKey<'a> = (Option<&'a str>, SocketAddr, Option<&'a str>);
+
+fn key_ref(b: &BridgeLine) -> RefKey<'_> {
+    (b.transport.as_deref(), b.addr, b.fingerprint.as_deref())
+}
+
 #[derive(Debug)]
 pub struct CandidatePool {
     path: PathBuf,
@@ -133,18 +140,29 @@ impl CandidatePool {
 
     /// Select across the whole pool; other transports keep their queue positions.
     pub fn take_transport(&mut self, n: usize, transport: Option<&str>) -> Vec<BridgeLine> {
-        if transport.is_none() {
+        let Some(transport) = transport else {
             return self.take(n);
+        };
+        if n == 0 || self.bridges.is_empty() {
+            return Vec::new();
         }
+        // One pass: move out the first `n` matches; the scan stops as soon
+        // as the batch is complete and the rest keeps its relative order.
         let mut taken = Vec::new();
-        self.bridges.retain(|bridge| {
-            if taken.len() < n && bridge.transport.as_deref() == transport {
-                taken.push(bridge.clone());
-                false
+        let mut kept = Vec::with_capacity(self.bridges.len().saturating_sub(n));
+        let mut rest = std::mem::take(&mut self.bridges).into_iter();
+        for bridge in rest.by_ref() {
+            if bridge.transport.as_deref() == Some(transport) {
+                taken.push(bridge);
+                if taken.len() == n {
+                    break;
+                }
             } else {
-                true
+                kept.push(bridge);
             }
-        });
+        }
+        kept.extend(rest);
+        self.bridges = kept;
         for bridge in &taken {
             self.keys.remove(&key_of(bridge));
         }
@@ -152,13 +170,13 @@ impl CandidatePool {
     }
 
     pub fn prioritize(&mut self, fresh: &[BridgeLine], transport: Option<&str>) {
-        let keys: HashSet<_> = fresh
+        let fresh_keys: HashSet<RefKey<'_>> = fresh
             .iter()
             .filter(|bridge| transport.is_none_or(|name| bridge.transport.as_deref() == Some(name)))
-            .map(key_of)
+            .map(key_ref)
             .collect();
         self.bridges
-            .sort_by_key(|bridge| !keys.contains(&key_of(bridge)));
+            .sort_by_cached_key(|bridge| !fresh_keys.contains(&key_ref(bridge)));
     }
 
     /// Put bridges back at the front of the pool (e.g. a taken batch that
@@ -303,6 +321,18 @@ mod tests {
         pool.merge([b(WT)], &HashSet::new());
         assert_eq!(pool.take_transport(1, Some("webtunnel")), vec![b(WT)]);
         assert_eq!(pool.take(100), obfs, "fallback candidates must stay queued");
+    }
+
+    #[test]
+    fn zero_batch_takes_nothing_even_with_transport_filter() {
+        let mut pool = empty(PathBuf::from("mem"));
+        pool.merge([b(WT), b(A)], &HashSet::new());
+        assert!(pool.take_transport(0, Some("webtunnel")).is_empty());
+        assert!(pool.take_transport(0, None).is_empty());
+        assert_eq!(pool.len(), 2, "zero-size batch must leave the pool intact");
+        let mut pool = empty(PathBuf::from("mem"));
+        assert!(pool.take_transport(3, Some("webtunnel")).is_empty());
+        assert!(pool.take_transport(3, None).is_empty());
     }
 
     #[test]
