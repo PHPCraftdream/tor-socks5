@@ -1,10 +1,11 @@
 //! The SOCKS5 listener runtime: egress selection, the accept loop, and
 //! the per-connection handler.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use arti_wrapper::TorTunnel;
 use auth::{AuthState, UsersConfig};
 use tokio::net::{TcpListener, TcpStream};
@@ -300,6 +301,9 @@ async fn accept_loop(
     conn_health: ConnHealthCounters,
     block_onion: bool,
 ) {
+    // Monotonic per-connection identifier for log correlation. Wraps only
+    // after 2^64 connections — never, in practice.
+    let next_conn_id = AtomicU64::new(1);
     loop {
         let (client, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -309,6 +313,7 @@ async fn accept_loop(
                 continue;
             }
         };
+        let conn_id = next_conn_id.fetch_add(1, Ordering::Relaxed);
         let egress = egress.clone();
         let auth = auth.clone();
         let conn_health = conn_health.clone();
@@ -318,20 +323,37 @@ async fn accept_loop(
             .await
             .expect("semaphore not closed");
         tokio::spawn(async move {
-            debug!(%peer, "new connection");
-            conn_health.record_attempt();
-            if let Err(e) =
-                handle_client(client, egress, auth, conn_health.clone(), block_onion).await
+            debug!(conn_id, %peer, "new connection");
+            // RAII gauge: moved into the task so `pending` is decremented
+            // wherever the task ends — error, success, or panic.
+            let pending_guard = conn_health.record_started();
+            if let Err(e) = handle_client(
+                client,
+                egress,
+                auth,
+                conn_health.clone(),
+                block_onion,
+                conn_id,
+            )
+            .await
             {
-                let kind = classify_conn_error(&e);
-                conn_health.record_error(kind);
+                let (stage, kind) = classify_conn_failure(&e);
+                conn_health.record_failure(stage, kind);
                 // `{:#}` (anyhow's alternate Display) prints the full cause
                 // chain ("top: cause1: cause2: ..."); plain `%e` would only
                 // print the outermost context tag (e.g. "SOCKS5 handshake")
                 // and silently swallow the real root cause.
-                warn!(%peer, error = format!("{:#}", e), kind = ?kind, "connection finished with error");
+                warn!(
+                    conn_id,
+                    %peer,
+                    stage = ?stage,
+                    kind = ?kind,
+                    error = format!("{:#}", e),
+                    "connection finished with error"
+                );
             }
             drop(permit);
+            drop(pending_guard);
         });
     }
 }
@@ -352,57 +374,122 @@ pub(crate) enum ConnErrorKind {
     /// already happens in [`crate::tor_watchdog::classify_and_record`]; this
     /// variant only answers "is this Tor's problem at all".
     Tor,
+    /// relay-stage I/O failure. Deliberately NOT Client:
+    /// `tokio::io::copy_bidirectional` does not expose WHICH end errored, so the
+    /// client-vs-Tor direction of a mid-relay reset is indeterminate; what is
+    /// determinate is the stage, and a relay-stage reset must not inflate the
+    /// client-misbehavior count. Per-direction byte counts exist only on
+    /// success.
+    Relay,
     /// Anything else: I/O errors unrelated to the SOCKS5 handshake, bugs,
-    /// or failures that don't fit either bucket above.
+    /// or failures that don't fit any bucket above.
     Other,
 }
 
-/// Classify a [`handle_client`] failure by the *type* of its root cause,
-/// never by string-matching the rendered error message (message text is
-/// not a stable classification key — see the module-level rationale for
-/// why this exists).
+/// Which protocol stage a connection failed at. Discriminating on stage (an
+/// internal, stable anyhow context tag — see the `STAGE_*` constants) rather
+/// than on error text lets the same I/O condition be attributed differently:
+/// a ConnectionReset during the handshake is the client's doing, while the
+/// identical reset mid-relay is reported as [`ConnStage::Relay`] so it does
+/// not inflate the client-misbehavior count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnStage {
+    /// SOCKS5 method negotiation / auth / CONNECT request.
+    Handshake,
+    /// Establishing the egress (Tor circuit or upstream proxy) connection.
+    Connect,
+    /// Bidirectional data transfer between client and egress.
+    Relay,
+    /// No stage context tag found in the error chain.
+    Other,
+}
+
+/// Internal, stable context tags `handle_client` attaches to each stage.
+/// Classification string-matches ONLY these — never arbitrary error message
+/// text (message text is not a stable classification key).
+const STAGE_HANDSHAKE: &str = "SOCKS5 handshake";
+const STAGE_CONNECT_TOR: &str = "tor connect";
+const STAGE_CONNECT_UPSTREAM: &str = "upstream connect";
+const STAGE_RELAY: &str = "relay";
+
+/// Classify a [`handle_client`] failure into a stage and an error kind, by
+/// the *type* of its root cause and the stage context tag in the chain,
+/// never by string-matching arbitrary rendered error message text (only the
+/// internal `STAGE_*` context tags above are matched — message text is not a
+/// stable classification key).
 ///
 /// Order of checks:
-/// 1. Any `arti_wrapper::TorError::Connect` in the chain → [`ConnErrorKind::Tor`].
-///    Checked first because a Tor connect failure is unambiguous and takes
-///    priority over any incidental I/O wrapping.
-/// 2. A `std::io::Error` in the chain whose kind indicates the client
-///    dropped/reset the connection (`ConnectionReset`, `ConnectionAborted`,
-///    `BrokenPipe`, `UnexpectedEof`), *or* any error in the chain carrying
-///    the `"SOCKS5 handshake"` context tag `handle_client` attaches to the
-///    handshake step → [`ConnErrorKind::Client`].
-/// 3. Otherwise → [`ConnErrorKind::Other`].
-pub(crate) fn classify_conn_error(err: &anyhow::Error) -> ConnErrorKind {
+/// 1. Stage: the first chain cause matching a `STAGE_*` tag wins (relay →
+///    handshake → connect → other).
+/// 2. Kind: any `arti_wrapper::TorError::Connect` in the chain →
+///    [`ConnErrorKind::Tor`], regardless of stage (a Tor connect failure is
+///    unambiguous and takes priority over any incidental I/O wrapping).
+/// 3. Otherwise by stage: handshake → Client (everything escaping the
+///    handshake phase is client-side, including the deadline); relay →
+///    Relay when a chain cause is a client-drop-ish `io::Error`
+///    (ConnectionReset/Aborted/BrokenPipe/UnexpectedEof), else Other;
+///    connect → Other (a non-Tor connect failure is not attributable to the
+///    SOCKS client — the `connect_failed` counter carries the stage signal);
+///    other stage → Client when a chain cause is a drop-ish `io::Error`
+///    (after the stage tags the only untagged I/O escape path is the SOCKS
+///    reply writes, which are client-side), else Other.
+pub(crate) fn classify_conn_failure(err: &anyhow::Error) -> (ConnStage, ConnErrorKind) {
+    let stage = if err.chain().any(|cause| cause.to_string() == STAGE_RELAY) {
+        ConnStage::Relay
+    } else if err
+        .chain()
+        .any(|cause| cause.to_string() == STAGE_HANDSHAKE)
+    {
+        ConnStage::Handshake
+    } else if err.chain().any(|cause| {
+        cause.to_string() == STAGE_CONNECT_TOR || cause.to_string() == STAGE_CONNECT_UPSTREAM
+    }) {
+        ConnStage::Connect
+    } else {
+        ConnStage::Other
+    };
+
+    let is_dropish_io = err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_err| {
+                matches!(
+                    io_err.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                )
+            })
+    });
+
     for cause in err.chain() {
         if let Some(tor_err) = cause.downcast_ref::<arti_wrapper::TorError>() {
             if matches!(tor_err, arti_wrapper::TorError::Connect { .. }) {
-                return ConnErrorKind::Tor;
+                return (stage, ConnErrorKind::Tor);
             }
         }
     }
 
-    for cause in err.chain() {
-        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
-            if matches!(
-                io_err.kind(),
-                std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::ConnectionAborted
-                    | std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::UnexpectedEof
-            ) {
-                return ConnErrorKind::Client;
+    let kind = match stage {
+        ConnStage::Handshake => ConnErrorKind::Client,
+        ConnStage::Relay => {
+            if is_dropish_io {
+                ConnErrorKind::Relay
+            } else {
+                ConnErrorKind::Other
             }
         }
-    }
-
-    if err
-        .chain()
-        .any(|cause| cause.to_string() == "SOCKS5 handshake")
-    {
-        return ConnErrorKind::Client;
-    }
-
-    ConnErrorKind::Other
+        ConnStage::Connect => ConnErrorKind::Other,
+        ConnStage::Other => {
+            if is_dropish_io {
+                ConnErrorKind::Client
+            } else {
+                ConnErrorKind::Other
+            }
+        }
+    };
+    (stage, kind)
 }
 
 async fn handle_client(
@@ -411,7 +498,9 @@ async fn handle_client(
     auth: Option<Arc<AuthState>>,
     conn_health: ConnHealthCounters,
     block_onion: bool,
+    conn_id: u64,
 ) -> Result<()> {
+    let started_at = std::time::Instant::now();
     // Absolute deadline for the whole handshake chain — armed once here and
     // never renewed per read.
     let handshake = tokio::time::timeout(
@@ -419,11 +508,18 @@ async fn handle_client(
         socks5::handshake(&mut client, auth.clone()),
     )
     .await;
+    // BOTH arms carry the stage tag: the classifier keys on it, and the
+    // deadline branch is just as much a handshake-stage failure as an I/O
+    // error inside `socks5::handshake`.
     let req = match handshake {
-        Ok(res) => res,
-        Err(_elapsed) => bail!("handshake deadline of {HANDSHAKE_DEADLINE:?} exceeded"),
-    }
-    .context("SOCKS5 handshake")?;
+        Ok(res) => res.context(STAGE_HANDSHAKE)?,
+        Err(_elapsed) => {
+            return Err(
+                anyhow!("handshake deadline of {HANDSHAKE_DEADLINE:?} exceeded")
+                    .context(STAGE_HANDSHAKE),
+            )
+        }
+    };
 
     // Global onion gate comes first. The per-account gate below remains
     // useful for CLI deployments that grant onion access selectively.
@@ -463,7 +559,9 @@ async fn handle_client(
                 Some(t) => t,
                 None => {
                     socks5::reply(&mut client, Reply::GeneralFailure).await.ok();
-                    bail!("tor tunnel unavailable (shutting down?)");
+                    conn_health.record_connect_failed();
+                    return Err(anyhow!("tor tunnel unavailable (shutting down?)")
+                        .context(STAGE_CONNECT_TOR));
                 }
             };
             // Feed the watchdog: every attempt bumps the counter (so it can
@@ -478,7 +576,7 @@ async fn handle_client(
                 Ok(s) => {
                     handle.health().record_success();
                     handle.health().record_success_target(&req.host, req.port);
-                    conn_health.record_established();
+                    conn_health.record_connect_ok();
                     info!(host = ?req.host, port = req.port, "tor connection established");
                     s
                 }
@@ -487,18 +585,42 @@ async fn handle_client(
                     // watchdog cares about (see `classify_and_record`'s doc
                     // comment) — data collection only, no gating here.
                     crate::tor_watchdog::classify_and_record(&e, handle.health());
+                    // The watchdog needs the RAW `TorError` type — pass the
+                    // un-wrapped error, not a context-wrapped one.
                     handle.bridge_refresh().request_after_failure(&e);
                     // We don't try to map the underlying cause to a specific
                     // SOCKS5 code; GeneralFailure is enough to tell the client
                     // we refused.
                     socks5::reply(&mut client, Reply::GeneralFailure).await.ok();
-                    return Err(e.into());
+                    conn_health.record_connect_failed();
+                    return Err(anyhow::Error::new(e).context(STAGE_CONNECT_TOR));
                 }
             };
             socks5::reply(&mut client, Reply::Success).await?;
             // `DataStream` implements `futures::AsyncRead/Write`; wrap it for tokio.
             let mut tor_compat = tor_stream.compat();
-            tokio::io::copy_bidirectional(&mut client, &mut tor_compat).await?;
+            // `copy_bidirectional` returns `(a_to_b, b_to_a)` where `a` is
+            // the client stream — hence the field names below. A success here
+            // (not merely a successful connect) is the real transfer
+            // outcome; `relay_errors` is bumped in `accept_loop` via
+            // classification of the STAGE_RELAY-tagged error below.
+            match tokio::io::copy_bidirectional(&mut client, &mut tor_compat).await {
+                Ok((sent, recv)) => {
+                    conn_health.record_relay_closed();
+                    info!(
+                        conn_id,
+                        host = ?req.host,
+                        port = req.port,
+                        elapsed = ?started_at.elapsed(),
+                        bytes_client_to_remote = sent,
+                        bytes_remote_to_client = recv,
+                        "relay finished"
+                    );
+                }
+                Err(e) => {
+                    return Err(anyhow::Error::new(e).context(STAGE_RELAY));
+                }
+            }
         }
         Egress::Upstream(up) => {
             info!(host = ?req.host, port = req.port, "forwarding through upstream SOCKS5");
@@ -506,11 +628,29 @@ async fn handle_client(
                 Ok(s) => s,
                 Err(e) => {
                     socks5::reply(&mut client, Reply::GeneralFailure).await.ok();
-                    return Err(e);
+                    conn_health.record_connect_failed();
+                    return Err(e.context(STAGE_CONNECT_UPSTREAM));
                 }
             };
             socks5::reply(&mut client, Reply::Success).await?;
-            tokio::io::copy_bidirectional(&mut client, &mut upstream_stream).await?;
+            // See the Tor branch for the field/counter semantics.
+            match tokio::io::copy_bidirectional(&mut client, &mut upstream_stream).await {
+                Ok((sent, recv)) => {
+                    conn_health.record_relay_closed();
+                    info!(
+                        conn_id,
+                        host = ?req.host,
+                        port = req.port,
+                        elapsed = ?started_at.elapsed(),
+                        bytes_client_to_remote = sent,
+                        bytes_remote_to_client = recv,
+                        "relay finished"
+                    );
+                }
+                Err(e) => {
+                    return Err(anyhow::Error::new(e).context(STAGE_RELAY));
+                }
+            }
         }
     }
     Ok(())
@@ -776,7 +916,7 @@ mod tests {
         assert_eq!(compute_deficit(8, 40, 40), 0);
     }
 
-    // -- classify_conn_error --------------------------------------------------
+    // -- classify_conn_failure -------------------------------------------------
 
     /// Install rustls's process-wide `CryptoProvider` exactly once for this
     /// test binary — mirrors the same helper in `tor_watchdog.rs` /
@@ -818,60 +958,158 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn classify_conn_error_tor_connect_is_tor() {
+    async fn classify_conn_failure_tor_connect_is_other_stage_tor_kind() {
         let tor_err = real_tor_connect_error().await;
         assert!(matches!(tor_err, arti_wrapper::TorError::Connect { .. }));
         let err = anyhow::Error::new(tor_err);
-        assert_eq!(classify_conn_error(&err), ConnErrorKind::Tor);
+        // Bare: no stage tag in the chain → Other stage; the kind is Tor.
+        assert_eq!(
+            classify_conn_failure(&err),
+            (ConnStage::Other, ConnErrorKind::Tor)
+        );
     }
 
     #[tokio::test]
-    async fn classify_conn_error_tor_connect_wrapped_in_context_is_still_tor() {
+    async fn classify_conn_failure_tor_connect_wrapped_in_context_is_still_tor() {
         // A `.context(...)` call anywhere above the real cause must not
-        // shadow the underlying Tor error — `classify_conn_error` walks the
-        // whole chain, not just the top frame.
+        // shadow the underlying Tor error — `classify_conn_failure` walks
+        // the whole chain, not just the top frame. "tunneling through Tor"
+        // is not a stage const, so the stage stays Other; the kind must stay
+        // Tor.
         let tor_err = real_tor_connect_error().await;
         let err = anyhow::Error::new(tor_err).context("tunneling through Tor");
-        assert_eq!(classify_conn_error(&err), ConnErrorKind::Tor);
+        assert_eq!(
+            classify_conn_failure(&err),
+            (ConnStage::Other, ConnErrorKind::Tor)
+        );
     }
 
     #[test]
-    fn classify_conn_error_io_reset_during_handshake_is_client() {
+    fn classify_conn_failure_io_reset_during_handshake_is_client() {
         let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "peer reset");
-        let err = anyhow::Error::new(io_err).context("SOCKS5 handshake");
-        assert_eq!(classify_conn_error(&err), ConnErrorKind::Client);
+        let err = anyhow::Error::new(io_err).context(STAGE_HANDSHAKE);
+        assert_eq!(
+            classify_conn_failure(&err),
+            (ConnStage::Handshake, ConnErrorKind::Client)
+        );
     }
 
     #[test]
-    fn classify_conn_error_unexpected_eof_during_handshake_is_client() {
+    fn classify_conn_failure_unexpected_eof_during_handshake_is_client() {
         let io_err = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof");
-        let err = anyhow::Error::new(io_err).context("SOCKS5 handshake");
-        assert_eq!(classify_conn_error(&err), ConnErrorKind::Client);
+        let err = anyhow::Error::new(io_err).context(STAGE_HANDSHAKE);
+        assert_eq!(
+            classify_conn_failure(&err),
+            (ConnStage::Handshake, ConnErrorKind::Client)
+        );
     }
 
     #[test]
-    fn classify_conn_error_broken_pipe_without_handshake_context_is_still_client() {
-        // The io::ErrorKind alone is enough — the "SOCKS5 handshake" context
-        // string is a secondary signal, not required.
+    fn classify_conn_failure_broken_pipe_without_stage_context_is_client() {
+        // After the stage tags, the only untagged I/O escape path is the
+        // SOCKS reply writes — which are client-side — so a bare drop-ish
+        // io::Error still classifies Client.
         let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe closed");
         let err = anyhow::Error::new(io_err);
-        assert_eq!(classify_conn_error(&err), ConnErrorKind::Client);
+        assert_eq!(
+            classify_conn_failure(&err),
+            (ConnStage::Other, ConnErrorKind::Client)
+        );
     }
 
     #[test]
-    fn classify_conn_error_other_io_kind_is_other() {
+    fn classify_conn_failure_other_io_kind_is_other() {
         // An I/O error whose kind is unrelated to a client disconnect (and
-        // with no "SOCKS5 handshake" context) must not be misclassified as
-        // Client.
+        // with no stage context) must not be misclassified as Client.
         let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
         let err = anyhow::Error::new(io_err);
-        assert_eq!(classify_conn_error(&err), ConnErrorKind::Other);
+        assert_eq!(
+            classify_conn_failure(&err),
+            (ConnStage::Other, ConnErrorKind::Other)
+        );
     }
 
     #[test]
-    fn classify_conn_error_arbitrary_other_is_other() {
+    fn classify_conn_failure_arbitrary_other_is_other() {
         let err = anyhow::anyhow!("some unrelated failure");
-        assert_eq!(classify_conn_error(&err), ConnErrorKind::Other);
+        assert_eq!(
+            classify_conn_failure(&err),
+            (ConnStage::Other, ConnErrorKind::Other)
+        );
+    }
+
+    #[test]
+    fn relay_stage_reset_is_relay_not_client() {
+        // The heart of the P2 fix: a Tor-side reset during data transfer is
+        // no longer counted as client misbehavior — it lands in relay_errors
+        // instead of client_errors.
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "peer reset");
+        let err = anyhow::Error::new(io_err).context(STAGE_RELAY);
+        assert_eq!(
+            classify_conn_failure(&err),
+            (ConnStage::Relay, ConnErrorKind::Relay)
+        );
+    }
+
+    #[test]
+    fn relay_stage_non_io_error_is_other() {
+        let err = anyhow::anyhow!("mid-relay failure").context(STAGE_RELAY);
+        assert_eq!(
+            classify_conn_failure(&err),
+            (ConnStage::Relay, ConnErrorKind::Other)
+        );
+    }
+
+    #[test]
+    fn connect_stage_upstream_reset_is_connect_other() {
+        // A reset during the upstream connect is not attributable to the
+        // SOCKS client; the connect_failed counter carries the stage signal.
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "peer reset");
+        let err = anyhow::Error::new(io_err).context(STAGE_CONNECT_UPSTREAM);
+        assert_eq!(
+            classify_conn_failure(&err),
+            (ConnStage::Connect, ConnErrorKind::Other)
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_stage_tor_error_is_connect_tor() {
+        let tor_err = real_tor_connect_error().await;
+        let err = anyhow::Error::new(tor_err).context(STAGE_CONNECT_TOR);
+        assert_eq!(
+            classify_conn_failure(&err),
+            (ConnStage::Connect, ConnErrorKind::Tor)
+        );
+    }
+
+    #[test]
+    fn same_reset_different_stage_classifies_differently() {
+        // The stage-discrimination regression test: the IDENTICAL
+        // io::ErrorKind::ConnectionReset classifies Client at the handshake
+        // stage and Relay mid-transfer. A client-end-vs-Tor-end
+        // discrimination test is deliberately NOT written here:
+        // `tokio::io::copy_bidirectional` does not report WHICH side of the
+        // relay errored, so that split is indeterminate by design (see
+        // `ConnErrorKind::Relay`'s doc).
+        let handshake_err = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "peer reset",
+        ))
+        .context(STAGE_HANDSHAKE);
+        assert_eq!(
+            classify_conn_failure(&handshake_err),
+            (ConnStage::Handshake, ConnErrorKind::Client)
+        );
+
+        let relay_err = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "peer reset",
+        ))
+        .context(STAGE_RELAY);
+        assert_eq!(
+            classify_conn_failure(&relay_err),
+            (ConnStage::Relay, ConnErrorKind::Relay)
+        );
     }
 
     // -- absolute handshake deadline ------------------------------------------
@@ -998,14 +1236,15 @@ mod tests {
 
     #[test]
     fn handshake_deadline_error_is_classified_as_client() {
-        // Mirrors the exact error shape produced by `handle_client`:
-        // `bail!("handshake deadline of ... exceeded")` wrapped in
-        // `.context("SOCKS5 handshake")`.
+        // Mirrors the exact error shape produced by `handle_client`: the
+        // deadline branch is now wrapped with the `STAGE_HANDSHAKE` context
+        // just like the Ok arm, so the test shape matches production
+        // exactly.
         let err = anyhow::anyhow!("handshake deadline of {HANDSHAKE_DEADLINE:?} exceeded")
-            .context("SOCKS5 handshake");
+            .context(STAGE_HANDSHAKE);
         assert_eq!(
-            classify_conn_error(&err),
-            ConnErrorKind::Client,
+            classify_conn_failure(&err),
+            (ConnStage::Handshake, ConnErrorKind::Client),
             "a deadline expiry is client-side misbehavior, not Other"
         );
     }
