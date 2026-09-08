@@ -24,6 +24,14 @@ use crate::{shutdown, upstream};
 /// exhaustion under connection floods.
 const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 
+/// Absolute deadline for the entire SOCKS5 handshake: method negotiation,
+/// RFC 1929 USER/PASS auth (including the Argon2 verify) and the CONNECT
+/// request. Armed once when the handshake starts and never renewed — a
+/// client trickling valid bytes one at a time still hits it. On expiry the
+/// client socket is dropped and the connection task exits, releasing its
+/// `MAX_CONCURRENT_CONNECTIONS` permit.
+const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
+
 /// Pause before retrying after a failed `accept()`. Any accept error is
 /// treated as transient: the loop logs it and retries instead of tearing
 /// down the whole server. The sleep also prevents a busy-spin (and a log
@@ -404,9 +412,18 @@ async fn handle_client(
     conn_health: ConnHealthCounters,
     block_onion: bool,
 ) -> Result<()> {
-    let req = socks5::handshake(&mut client, auth.clone())
-        .await
-        .context("SOCKS5 handshake")?;
+    // Absolute deadline for the whole handshake chain — armed once here and
+    // never renewed per read.
+    let handshake = tokio::time::timeout(
+        HANDSHAKE_DEADLINE,
+        socks5::handshake(&mut client, auth.clone()),
+    )
+    .await;
+    let req = match handshake {
+        Ok(res) => res,
+        Err(_elapsed) => bail!("handshake deadline of {HANDSHAKE_DEADLINE:?} exceeded"),
+    }
+    .context("SOCKS5 handshake")?;
 
     // Global onion gate comes first. The per-account gate below remains
     // useful for CLI deployments that grant onion access selectively.
@@ -855,5 +872,141 @@ mod tests {
     fn classify_conn_error_arbitrary_other_is_other() {
         let err = anyhow::anyhow!("some unrelated failure");
         assert_eq!(classify_conn_error(&err), ConnErrorKind::Other);
+    }
+
+    // -- absolute handshake deadline ------------------------------------------
+
+    /// Server-under-test driving the REAL `accept_loop` over a loopback
+    /// listener, with a one-permit semaphore so a single stuck handshake is
+    /// observable as `available_permits() == 0`.
+    async fn spawn_test_server() -> (
+        std::net::SocketAddr,
+        Arc<tokio::sync::Semaphore>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        // The egress never gets used: the deadline always fires first.
+        let egress = Egress::Upstream(Arc::new(upstream::Upstream::new(
+            "127.0.0.1:1".into(),
+            None,
+        )));
+        let handle = tokio::spawn(accept_loop(
+            listener,
+            egress,
+            None,
+            permits.clone(),
+            ConnHealthCounters::default(),
+            false,
+        ));
+        (addr, permits, handle)
+    }
+
+    /// Deterministic (clock-free) wait for the server task to take the
+    /// permit: the current-thread runtime only makes progress via yields.
+    async fn wait_for_permit_taken(permits: &Arc<tokio::sync::Semaphore>) {
+        for _ in 0..200 {
+            if permits.available_permits() == 0 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            permits.available_permits(),
+            0,
+            "server must hold the permit"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_client_permit_released_at_handshake_deadline() {
+        let (addr, permits, server) = spawn_test_server().await;
+        // Connects and then sends nothing at all, holding the stream open.
+        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        wait_for_permit_taken(&permits).await;
+        assert_eq!(
+            permits.available_permits(),
+            0,
+            "permit must be held before the deadline"
+        );
+
+        tokio::time::sleep(HANDSHAKE_DEADLINE + Duration::from_secs(5)).await;
+        let _permit = tokio::time::timeout(Duration::from_secs(10), permits.acquire())
+            .await
+            .expect("permit must be released by the absolute handshake deadline");
+        server.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_handshake_header_permit_released_at_deadline() {
+        use tokio::io::AsyncWriteExt;
+        let (addr, permits, server) = spawn_test_server().await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Only the VER byte — an incomplete method-negotiation header.
+        client.write_all(&[0x05]).await.unwrap();
+        wait_for_permit_taken(&permits).await;
+        assert_eq!(
+            permits.available_permits(),
+            0,
+            "permit must be held before the deadline"
+        );
+
+        tokio::time::sleep(HANDSHAKE_DEADLINE + Duration::from_secs(5)).await;
+        let _permit = tokio::time::timeout(Duration::from_secs(10), permits.acquire())
+            .await
+            .expect("permit must be released by the absolute handshake deadline");
+        server.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn trickling_client_permit_released_despite_valid_bytes() {
+        use tokio::io::AsyncWriteExt;
+        let (addr, permits, server) = spawn_test_server().await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // Trickle valid handshake bytes, each gap half the deadline, then
+        // hang forever — the client never finishes the handshake and never
+        // closes. Write errors are ignored: the server may drop the socket
+        // mid-trickle once the deadline fires.
+        let client_task = tokio::spawn(async move {
+            client.write_all(&[0x05]).await.ok();
+            tokio::time::sleep(HANDSHAKE_DEADLINE / 2).await;
+            client.write_all(&[0x01]).await.ok();
+            tokio::time::sleep(HANDSHAKE_DEADLINE / 2).await;
+            client.write_all(&[0x00]).await.ok();
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        });
+
+        wait_for_permit_taken(&permits).await;
+        tokio::time::sleep(HANDSHAKE_DEADLINE * 2 / 3).await;
+        assert_eq!(
+            permits.available_permits(),
+            0,
+            "permit must still be held mid-trickle, before the deadline"
+        );
+
+        // Now past the deadline while the client is still alive and
+        // mid-handshake — a per-read renewal would keep the permit held.
+        tokio::time::sleep(HANDSHAKE_DEADLINE * 2 / 3).await;
+        let _permit = tokio::time::timeout(Duration::from_secs(10), permits.acquire())
+            .await
+            .expect("permit must be released despite valid trickling bytes");
+        server.abort();
+        client_task.abort();
+    }
+
+    #[test]
+    fn handshake_deadline_error_is_classified_as_client() {
+        // Mirrors the exact error shape produced by `handle_client`:
+        // `bail!("handshake deadline of ... exceeded")` wrapped in
+        // `.context("SOCKS5 handshake")`.
+        let err = anyhow::anyhow!("handshake deadline of {HANDSHAKE_DEADLINE:?} exceeded")
+            .context("SOCKS5 handshake");
+        assert_eq!(
+            classify_conn_error(&err),
+            ConnErrorKind::Client,
+            "a deadline expiry is client-side misbehavior, not Other"
+        );
     }
 }

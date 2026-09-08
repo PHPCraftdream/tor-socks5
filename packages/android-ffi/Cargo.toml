@@ -39,3 +39,6 @@ jni = "0.21"
 # using libc's C type aliases. Not linked into host builds.
 [target.'cfg(target_os = "android")'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

@@ -1,5 +1,15 @@
 use super::*;
 
+use anyhow::bail;
+
+/// Absolute deadline for the entire SOCKS5 handshake: method negotiation,
+/// RFC 1929 USER/PASS auth (including the Argon2 verify) and the CONNECT
+/// request. Armed once when the handshake starts and never renewed — a
+/// client trickling valid bytes one at a time still hits it. On expiry the
+/// client socket is dropped and the connection task exits, releasing its
+/// `MAX_CONCURRENT_CONNECTIONS` permit.
+const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
+
 /// Narrow the startup pool to the user's preferred transport, if they set one.
 ///
 /// Blocking is transport-specific: a network that fingerprints obfs4 and kills
@@ -500,9 +510,7 @@ pub(super) async fn handle_connection(
     block_onion: bool,
 ) -> Result<()> {
     // SOCKS5 handshake: USER/PASS when `auth` is configured, NO_AUTH otherwise.
-    let req = socks5_proto::handshake(&mut client, auth)
-        .await
-        .context("SOCKS5 handshake")?;
+    let req = handshake_with_deadline(&mut client, auth).await?;
 
     if !onion_destination_allowed(&req, block_onion) {
         info!(host = %req.host, port = req.port, "rejecting onion destination by local policy");
@@ -534,6 +542,26 @@ pub(super) async fn handle_connection(
         .context("data relay failed")?;
 
     Ok(())
+}
+
+/// [`socks5_proto::handshake`] under one absolute deadline: a single
+/// `tokio::time::timeout` around the whole negotiation — NOT a per-read
+/// timeout, so slow byte-by-byte clients cannot extend it indefinitely.
+async fn handshake_with_deadline<S>(
+    stream: &mut S,
+    auth: Option<Arc<AuthState>>,
+) -> anyhow::Result<socks5_proto::ConnectRequest>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let handshake =
+        tokio::time::timeout(HANDSHAKE_DEADLINE, socks5_proto::handshake(stream, auth)).await;
+    let req = match handshake {
+        Ok(res) => res,
+        Err(_elapsed) => bail!("handshake deadline of {HANDSHAKE_DEADLINE:?} exceeded"),
+    }
+    .context("SOCKS5 handshake")?;
+    Ok(req)
 }
 
 /// Apply the Android listener's global destination policy after SOCKS5
@@ -633,4 +661,108 @@ pub(crate) fn take_auto_fetched_bridges() -> Vec<BridgeLine> {
         return Vec::new();
     };
     std::mem::take(&mut *lock.lock().unwrap_or_else(|p| p.into_inner()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use tokio::io::{duplex, AsyncWriteExt};
+    use tokio::time::sleep;
+
+    /// Assert that `handle` is still running, then that it fails with a
+    /// deadline error containing "handshake" and "deadline" after the given
+    /// additional wait.
+    async fn assert_deadline_error(
+        handle: &mut tokio::task::JoinHandle<anyhow::Result<socks5_proto::ConnectRequest>>,
+        wait_before_finish_check: Duration,
+    ) {
+        sleep(wait_before_finish_check).await;
+        assert!(!handle.is_finished(), "handshake must still be pending");
+
+        // Wait out the remainder of the deadline before polling completion.
+        sleep(HANDSHAKE_DEADLINE).await;
+        let result = tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("handshake task did not finish after the deadline")
+            .expect("handshake task panicked");
+        let err = result.expect_err("handshake must fail at the deadline");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("handshake"), "error text: {msg}");
+        assert!(msg.contains("deadline"), "error text: {msg}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_client_handshake_fails_at_deadline() {
+        let (client, server) = duplex(64);
+        let mut handle = tokio::spawn(async move {
+            let mut server = server;
+            handshake_with_deadline(&mut server, None).await
+        });
+
+        // Client sends nothing and keeps the stream open (never dropped).
+        drop(tokio::spawn(async move {
+            sleep(Duration::from_secs(3600)).await;
+            drop(client);
+        }));
+
+        assert_deadline_error(&mut handle, HANDSHAKE_DEADLINE / 2).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_handshake_header_fails_at_deadline() {
+        let (mut client, server) = duplex(64);
+        let mut handle = tokio::spawn(async move {
+            let mut server = server;
+            handshake_with_deadline(&mut server, None).await
+        });
+
+        // Client writes only the VER byte — an incomplete method-negotiation
+        // header — then holds the stream open.
+        tokio::spawn(async move {
+            client.write_all(&[0x05]).await.ok();
+            sleep(Duration::from_secs(3600)).await;
+        });
+
+        assert_deadline_error(&mut handle, HANDSHAKE_DEADLINE / 2).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn trickling_client_still_hits_absolute_deadline() {
+        let (mut client, server) = duplex(64);
+        let handle = tokio::spawn(async move {
+            let mut server = server;
+            handshake_with_deadline(&mut server, None).await
+        });
+
+        // Trickling client: one valid byte every 12 s (HANDSHAKE_DEADLINE *
+        // 2 / 5), then holds the stream forever. If the deadline were renewed
+        // per byte, the handshake would never expire.
+        let client_task = tokio::spawn(async move {
+            client.write_all(&[0x05]).await.ok();
+            sleep(HANDSHAKE_DEADLINE * 2 / 5).await;
+            client.write_all(&[0x01]).await.ok();
+            sleep(HANDSHAKE_DEADLINE * 2 / 5).await;
+            client.write_all(&[0x00]).await.ok();
+            sleep(Duration::from_secs(3600)).await;
+        });
+
+        // 20 s in: a renewal-per-read implementation would still be waiting
+        // for the CONNECT request (last byte arrived at 24 s).
+        sleep(HANDSHAKE_DEADLINE * 2 / 3).await;
+        assert!(!handle.is_finished(), "handshake must still be pending");
+
+        // Sleep past the absolute deadline (40 s total) before polling.
+        sleep(HANDSHAKE_DEADLINE * 2 / 3).await;
+        let result = tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("handshake task did not finish after the deadline")
+            .expect("handshake task panicked");
+        let err = result.expect_err("handshake must fail at the absolute deadline");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("handshake"), "error text: {msg}");
+        assert!(msg.contains("deadline"), "error text: {msg}");
+
+        client_task.abort();
+    }
 }
