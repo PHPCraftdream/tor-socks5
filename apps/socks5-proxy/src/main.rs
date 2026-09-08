@@ -1,5 +1,6 @@
 mod arti_observability;
 mod bridge_maintenance;
+mod bridge_store_writer;
 mod bridge_verifier;
 mod bridge_warmer;
 mod bridges_cmd;

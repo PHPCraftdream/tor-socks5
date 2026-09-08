@@ -132,6 +132,11 @@ pub(crate) async fn run_server(
             let alive = settings.bridges.len();
             info!(count = alive, "using bridges");
 
+            // One process-wide single writer for the bridge health store: the bootstrap
+            // probe below and every background task spawned after it (maintenance,
+            // warmer, circuit verifier) record store updates through it.
+            crate::bridge_store_writer::init_global(config_path.as_deref());
+
             let tor = TorTunnel::bootstrap_with(settings.clone())
                 .await
                 .context("failed to bootstrap Tor")?;

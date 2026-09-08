@@ -198,7 +198,7 @@ async fn run_circuit_verify_tick(config_path: Option<&Path>, active: &[BridgeLin
         checked = results.len(),
         verified, "circuit-verify: tick complete"
     );
-    persist_circuit_verify_results(&results, config_path);
+    persist_circuit_verify_results(&results, config_path).await;
 }
 
 /// Recursively copies every regular file under `src` into `dest` (creating
@@ -485,28 +485,30 @@ pub(crate) fn verify_bridges_sequential(
 /// this because its failover machinery differs.
 ///
 /// Failed attempts advance the queue without demoting the live bridge.
-fn persist_circuit_verify_results(results: &[(BridgeLine, bool)], config_path: Option<&Path>) {
+/// Routed through the single bridge-store writer: an unreadable on-disk
+/// store is logged (as before), while publish failures are the writer's
+/// retry problem.
+async fn persist_circuit_verify_results(
+    results: &[(BridgeLine, bool)],
+    config_path: Option<&Path>,
+) {
     if results.is_empty() {
         return;
     }
-    let path = BridgeStore::resolve_path(config_path);
-    let mut store = match BridgeStore::load(path) {
-        Ok(store) => store,
-        Err(error) => {
-            warn!(error = %error, "circuit-verify: could not load bridge health store");
-            return;
+    let results = results.to_vec();
+    if let Err(error) = crate::bridge_store_writer::apply(config_path, move |store| {
+        let now = OffsetDateTime::now_utc();
+        for (bridge, ok) in &results {
+            store.note_verification_attempt_at(bridge, now);
+            if *ok {
+                store.note_circuit_verified_at(bridge, now);
+                store.note_circuit_success_at(bridge, now);
+            }
         }
-    };
-    let now = OffsetDateTime::now_utc();
-    for (bridge, ok) in results {
-        store.note_verification_attempt_at(bridge, now);
-        if *ok {
-            store.note_circuit_verified_at(bridge, now);
-            store.note_circuit_success_at(bridge, now);
-        }
-    }
-    if let Err(error) = store.save() {
-        warn!(error = %error, "circuit-verify: could not persist results");
+    })
+    .await
+    {
+        warn!(error = %error, "circuit-verify: could not load bridge health store");
     }
 }
 
@@ -549,15 +551,15 @@ mod tests {
     /// record the verification stamp AND reset the circuit-failure counter
     /// (the double call in `persist_circuit_verify_results`), while leaving
     /// the channel-success signal untouched.
-    #[test]
-    fn verified_bridge_resets_circuit_fails_and_records_verification() {
+    #[tokio::test]
+    async fn verified_bridge_resets_circuit_fails_and_records_verification() {
         let dir = tempfile::tempdir().expect("tempdir");
         let bridge: BridgeLine = "1.2.3.4:9101 DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF"
             .parse()
             .expect("bridge line");
         let config_path = seed_failed_bridge(dir.path(), &bridge);
 
-        persist_circuit_verify_results(&[(bridge.clone(), true)], config_path.as_deref());
+        persist_circuit_verify_results(&[(bridge.clone(), true)], config_path.as_deref()).await;
 
         let store = BridgeStore::load(BridgeStore::resolve_path(config_path.as_deref()))
             .expect("reload store");
@@ -572,15 +574,15 @@ mod tests {
 
     /// Android parity: a failed check records nothing — the bridge simply
     /// stays due, with its failure counters exactly as they were.
-    #[test]
-    fn failed_verification_changes_nothing() {
+    #[tokio::test]
+    async fn failed_verification_changes_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let bridge: BridgeLine = "5.6.7.8:9103 FEEDFACEFEEDFACEFEEDFACEFEEDFACEFEEDFACE"
             .parse()
             .expect("bridge line");
         let config_path = seed_failed_bridge(dir.path(), &bridge);
 
-        persist_circuit_verify_results(&[(bridge.clone(), false)], config_path.as_deref());
+        persist_circuit_verify_results(&[(bridge.clone(), false)], config_path.as_deref()).await;
 
         let store = BridgeStore::load(BridgeStore::resolve_path(config_path.as_deref()))
             .expect("reload store");

@@ -764,3 +764,75 @@ fn circuit_metadata_persists_across_save_load() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn temp_path_is_unique_per_call() {
+    let dir = tmp_dir();
+    let path = dir.join("alive.log");
+    let store = BridgeStore::load(path.clone()).unwrap();
+    let t0 = store.temp_path(0);
+    let t1 = store.temp_path(1);
+    assert_ne!(t0, t1, "different seqs must yield different temp paths");
+    let pid = std::process::id().to_string();
+    for t in [&t0, &t1] {
+        let name = t.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.contains(&pid),
+            "temp file name {name} must embed the pid"
+        );
+        assert_eq!(t.parent(), Some(dir.as_path()), "sibling of the store file");
+        assert!(
+            name.starts_with(".alive.log."),
+            "temp file name {name} must keep the dot + original name prefix"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn concurrent_saves_do_not_share_a_temp_file() {
+    let dir = tmp_dir();
+    let path = dir.join("alive.log");
+    let b = bridge(OBFS4_A);
+    // Seed one entry so every thread can make its store dirty via
+    // `note_channel_success_at`, which needs an existing entry.
+    let mut seed = BridgeStore::load(path.clone()).unwrap();
+    seed.record(b.clone(), Duration::from_millis(10));
+    seed.save().unwrap();
+
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let path = &path;
+            let b = &b;
+            scope.spawn(move || {
+                let mut s = BridgeStore::load(path.clone()).unwrap();
+                for _ in 0..10 {
+                    s.note_channel_success_at(b, OffsetDateTime::now_utc());
+                    s.save().expect("concurrent save must succeed");
+                }
+            });
+        }
+    });
+
+    let loaded = BridgeStore::load(path).unwrap();
+    // Cross-writer accumulation is deliberately NOT asserted here: with
+    // whole-file atomic renames, concurrent read-modify-write writers are
+    // last-writer-wins per snapshot. What must hold is that every save
+    // succeeded above, the file still loads, the seeded probe record is
+    // intact, and some channel successes landed. Additive application of
+    // concurrent updates is the single-writer actor's contract (tested in
+    // apps/socks5-proxy).
+    assert_eq!(loaded.ok_count(&b), 1, "seeded probe record intact");
+    assert!(
+        loaded.channel_ok_count(&b) >= 2,
+        "at least the last-finishing thread's channel successes landed"
+    );
+    // No leftover temp files.
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

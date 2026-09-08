@@ -37,7 +37,7 @@
 //! stability-first ordering `tor_setup.rs` already applies when handing
 //! bridges to arti at bootstrap.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use bridge_line::BridgeLine;
@@ -226,12 +226,12 @@ pub fn spawn_bridge_warmer(handle: TorHandle, config_path: Option<PathBuf>, cfg:
                 count = selected.len(),
                 "warm-pool: warming channels to top candidate bridges"
             );
-            let mut warmed: Vec<&BridgeLine> = Vec::new();
+            let mut warmed: Vec<BridgeLine> = Vec::new();
             for bridge in &selected {
                 match tor.warm_bridge(bridge).await {
                     Ok(()) => {
                         info!(bridge = %bridge, "warm-pool: channel warmed");
-                        warmed.push(bridge);
+                        warmed.push(bridge.clone());
                     }
                     Err(e) => {
                         warn!(bridge = %bridge, error = %e, "warm-pool: failed to warm channel");
@@ -246,24 +246,26 @@ pub fn spawn_bridge_warmer(handle: TorHandle, config_path: Option<PathBuf>, cfg:
             // dead (same convention as android's `persist_warm_results`, which
             // records successes and retirements only).
             if !warmed.is_empty() {
-                let store_path = BridgeStore::resolve_path(config_path.as_deref());
-                match BridgeStore::load(store_path) {
-                    Ok(mut store) => {
-                        let now = OffsetDateTime::now_utc();
-                        for bridge in &warmed {
-                            store.note_channel_success_at(bridge, now);
-                        }
-                        if let Err(e) = store.save() {
-                            warn!(error = %e, "warm-pool: could not save bridge health store");
-                        }
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "warm-pool: could not load bridge health store");
-                    }
-                }
+                persist_warm_successes(config_path.as_deref(), warmed).await;
             }
         }
     });
+}
+
+/// Record channel-warm successes through the single writer (best-effort:
+/// a load failure is only logged; publish failures are the writer's
+/// retry problem).
+async fn persist_warm_successes(config_path: Option<&Path>, warmed: Vec<BridgeLine>) {
+    let result = crate::bridge_store_writer::apply(config_path, move |store| {
+        let now = OffsetDateTime::now_utc();
+        for bridge in &warmed {
+            store.note_channel_success_at(bridge, now);
+        }
+    })
+    .await;
+    if let Err(error) = result {
+        warn!(error = %error, "warm-pool: could not record channel-warm successes");
+    }
 }
 
 #[cfg(test)]
@@ -463,5 +465,49 @@ mod tests {
             (bridge(OBFS4_B), h(2, 0, 100)),
         ];
         assert_eq!(select_top_n(&candidates, 5), Vec::<BridgeLine>::new());
+    }
+
+    /// Routing proof: 16 concurrent recorders must all land (16 = count),
+    /// which only the single-writer path can guarantee — racing inline
+    /// load→mutate→save cycles would lose updates.
+    #[tokio::test]
+    async fn warm_successes_are_recorded_through_the_single_writer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("tor-socks5.ktav");
+        let warmed_bridge = bridge(OBFS4_A);
+
+        // Seed the store BEFORE initializing the global writer.
+        let mut store = BridgeStore::load(BridgeStore::resolve_path(Some(config_path.as_path())))
+            .expect("fresh store loads");
+        store.note_source_at(&warmed_bridge, "test", OffsetDateTime::now_utc());
+        store.save().expect("seed save");
+
+        let _writer = crate::bridge_store_writer::init_global(Some(config_path.as_path()));
+
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let config_path = config_path.clone();
+            let warmed = warmed_bridge.clone();
+            tasks.push(tokio::spawn(async move {
+                persist_warm_successes(Some(config_path.as_path()), vec![warmed]).await;
+            }));
+        }
+        for task in tasks {
+            task.await.expect("task joins");
+        }
+
+        let store = BridgeStore::load(BridgeStore::resolve_path(Some(config_path.as_path())))
+            .expect("reload store");
+        assert_eq!(
+            store.channel_ok_count(&warmed_bridge),
+            16,
+            "no lost update through the single writer"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read tempdir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no leftover temp files");
     }
 }

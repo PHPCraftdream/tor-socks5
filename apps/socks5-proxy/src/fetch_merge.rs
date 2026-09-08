@@ -29,7 +29,6 @@ use tracing::{info, warn};
 
 use crate::candidate_pool::{key_of, CandidatePool, Key};
 use crate::config::Config;
-use bridge_store::BridgeStore;
 
 /// Per-bridge timeout for the **lazy** pool drain. Shorter than the startup
 /// config probe ([`crate::tor_setup::BRIDGE_PROBE_TIMEOUT`]): a live bridge's
@@ -388,14 +387,18 @@ async fn drain_pool_with(
         return Ok(0);
     }
 
-    // Best-effort: record a channel success for every bridge admitted via a
-    // verified channel so health accounting sees the confirmation. A failed
-    // warm is never recorded — there is deliberately no channel-failure
-    // counter in the store, because a failed channel warm is not proof a
-    // bridge is dead.
+    // Best-effort record — routed through the single bridge-store writer.
+    // This site runs both inside the daemon (maintenance auto-fetch via
+    // `top_up_working`) and in the CLI `bridges fetch` subcommand, which is
+    // a separate process and therefore takes the writer's inline fallback.
+    // Only an unreadable on-disk store is logged here; publish failures are
+    // the writer's retry problem.
     if !channel_ok.is_empty() {
-        match BridgeStore::load(BridgeStore::resolve_path(config_path)) {
-            Ok(mut store) => {
+        if let Err(e) = crate::bridge_store_writer::apply(config_path, {
+            let promoted = promoted.clone();
+            let reachable = reachable.clone();
+            let channel_ok = channel_ok.clone();
+            move |store| {
                 let now = time::OffsetDateTime::now_utc();
                 store.note_probe_round(
                     &promoted,
@@ -412,11 +415,11 @@ async fn drain_pool_with(
                         store.note_circuit_success_at(b, now);
                     }
                 }
-                if let Err(e) = store.save() {
-                    warn!(error = %e, "could not persist channel successes after drain");
-                }
             }
-            Err(e) => warn!(error = %e, "could not load bridge store after drain"),
+        })
+        .await
+        {
+            warn!(error = %e, "could not record channel successes after drain");
         }
     }
 
@@ -471,6 +474,7 @@ pub(crate) async fn top_up_working(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bridge_store::BridgeStore;
 
     #[test]
     fn source_migration_only_changes_the_known_legacy_webtunnel_list() {

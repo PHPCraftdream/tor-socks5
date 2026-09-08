@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -153,8 +154,8 @@ pub(crate) async fn build_tor_settings_preserving_live(
     probed.retain(|bridge| {
         !live.contains(bridge) || alive.iter().any(|(available, _)| available == bridge)
     });
-    let store = update_health_and_prune(config_path, &probed, &alive, cfg, None);
-
+    // note_probe_round must see the original pre-retain probe results.
+    let probed_alive = alive.clone();
     let allowed = preferred_transport_bridges(
         &alive
             .iter()
@@ -163,11 +164,19 @@ pub(crate) async fn build_tor_settings_preserving_live(
         cfg,
     );
     alive.retain(|(bridge, _)| allowed.contains(bridge));
+    let candidates: Vec<_> = alive.iter().map(|(bridge, _)| bridge.clone()).collect();
 
-    // Full-circuit and channel evidence outrank repeated TCP probes.
-    if let Some(store) = &store {
-        let candidates: Vec<_> = alive.iter().map(|(bridge, _)| bridge.clone()).collect();
-        let ranked = store.healthiest_among(&candidates, MAX_ACTIVE_BRIDGES);
+    // Update bridge health (success resets, failure bumps once per window)
+    // and prune any bridge that reached `max_fails` — from both the store
+    // and the config. Routed through the single bridge-store writer.
+    // Best-effort: never fails the bootstrap.
+    // Bootstrap path: no observation sink yet — arti hasn't started
+    // emitting per-guard usability events when build_tor_settings runs.
+    // Failure to open another transport connection does not invalidate live traffic.
+    if let Some(ranked) =
+        update_health_and_prune(config_path, &probed, &probed_alive, cfg, None, &candidates).await
+    {
+        // Full-circuit and channel evidence outrank repeated TCP probes.
         alive.retain(|(bridge, _)| ranked.contains(bridge));
         alive.sort_by_key(|(bridge, _)| ranked.iter().position(|b| b == bridge));
     }
@@ -363,73 +372,85 @@ fn fallback_probe_pool(
     Some(preferred_bridges.to_vec())
 }
 
-/// Update the on-disk bridge health store with this probe round's outcome
-/// and prune bridges that have reached `max_fails` — both from the store
-/// and from the config file. Best-effort: logs and returns on any error,
-/// never propagating (bootstrap must not fail because health bookkeeping
-/// did).
-pub(crate) fn update_health_and_prune(
+/// Update the bridge health store (via the single writer) with this probe
+/// round's outcome, drain any observation sink, and prune bridges that have
+/// reached `max_fails` — both from the store and from the config file.
+/// Returns the ranked candidate list, or `None` when the on-disk store
+/// could not be read (publish failures are the writer's retry problem).
+/// Best-effort: never fails the bootstrap.
+pub(crate) async fn update_health_and_prune(
     config_path: Option<&Path>,
     probed: &[BridgeLine],
     alive: &[(BridgeLine, Duration)],
     cfg: &Config,
     observation_sink: Option<&crate::arti_observability::ObservationSink>,
-) -> Option<BridgeStore> {
-    let store_path = BridgeStore::resolve_path(config_path);
-    let mut store = match BridgeStore::load(store_path.clone()) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(path = %store_path.display(), error = %e, "could not load bridge health store");
-            return None;
-        }
-    };
-
-    let now = OffsetDateTime::now_utc();
+    candidates: &[BridgeLine],
+) -> Option<Vec<BridgeLine>> {
     let window = Duration::from_secs(cfg.bridges.fail_window_mins.saturating_mul(60));
     let circuit_window = Duration::from_secs(
         cfg.bridges
             .circuit_observation_window_mins
             .saturating_mul(60),
     );
+    let max_fails = cfg.bridges.max_fails;
+    let max_circuit_fails = cfg.bridges.max_circuit_fails;
 
-    // Phase 1: TCP-layer health (probe round). Bumps `fails` once per
-    // `fail_window`, resets on TCP success. Also handles circuit-layer
-    // pruning via `cfg.bridges.max_circuit_fails`.
-    let pruned = store.note_probe_round(
-        probed,
-        alive,
-        now,
-        window,
-        cfg.bridges.max_fails,
-        cfg.bridges.max_circuit_fails,
-    );
+    let probed = probed.to_vec();
+    let alive = alive.to_vec();
+    let candidates = candidates.to_vec();
+    let sink = observation_sink.cloned();
+    let pruned = Arc::new(Mutex::new(Vec::new()));
+    let ranked = Arc::new(Mutex::new(Vec::new()));
+    let total = Arc::new(Mutex::new(0usize));
+    let result = crate::bridge_store_writer::apply(config_path, {
+        let pruned = pruned.clone();
+        let ranked = ranked.clone();
+        let total = total.clone();
+        move |store| {
+            let now = OffsetDateTime::now_utc();
 
-    // Phase 2: circuit-layer observations from arti's tracing. Drain the
-    // sink into the store so accumulated per-guard usability events bump
-    // `circuit_fails` (rate-limited by `circuit_observation_window`) or
-    // reset it. The sink is best-effort: a maintenance loop without one
-    // (e.g. unit tests, the `bridges fetch` command) simply skips this
-    // step.
-    if let Some(sink) = observation_sink {
-        let (failures, successes, unmatched) =
-            sink.drain_into_store(&mut store, probed, now, circuit_window);
-        if failures + successes + unmatched > 0 {
-            info!(
-                failures,
-                successes, unmatched, "drained circuit-layer guard observations"
-            );
+            // Phase 1: TCP-layer health (probe round). Bumps `fails` once per
+            // `fail_window`, resets on TCP success. Also handles circuit-layer
+            // pruning via `max_circuit_fails`.
+            *pruned.lock().unwrap() =
+                store.note_probe_round(&probed, &alive, now, window, max_fails, max_circuit_fails);
+
+            // Phase 2: circuit-layer observations from arti's tracing. Drain the
+            // sink into the store so accumulated per-guard usability events bump
+            // `circuit_fails` (rate-limited by `circuit_observation_window`) or
+            // reset it. The sink is best-effort: a maintenance loop without one
+            // (e.g. unit tests, the `bridges fetch` command) simply skips this
+            // step.
+            if let Some(sink) = &sink {
+                let (failures, successes, unmatched) =
+                    sink.drain_into_store(store, &probed, now, circuit_window);
+                if failures + successes + unmatched > 0 {
+                    info!(
+                        failures,
+                        successes, unmatched, "drained circuit-layer guard observations"
+                    );
+                }
+            }
+
+            *ranked.lock().unwrap() = store.healthiest_among(&candidates, MAX_ACTIVE_BRIDGES);
+            *total.lock().unwrap() = store.len();
+        }
+    })
+    .await;
+    match result {
+        Ok(()) => info!(
+            total = *total.lock().unwrap(),
+            "bridge health store updated"
+        ),
+        Err(e) => {
+            warn!(error = %e, "could not update bridge health store");
+            return None;
         }
     }
 
-    match store.save() {
-        Ok(()) => info!(
-            path = %store.path().display(),
-            total = store.len(),
-            "bridge health store updated"
-        ),
-        Err(e) => warn!(error = %e, "could not persist bridge health store"),
-    }
-
+    let pruned = Arc::try_unwrap(pruned)
+        .map(|lock| lock.into_inner().unwrap())
+        .unwrap_or_default();
     if !pruned.is_empty() {
         if let Some(path) = config_path {
             match prune_bridges_from_config(path, &pruned) {
@@ -444,7 +465,10 @@ pub(crate) fn update_health_and_prune(
         }
     }
 
-    Some(store)
+    let ranked = Arc::try_unwrap(ranked)
+        .map(|lock| lock.into_inner().unwrap())
+        .unwrap_or_default();
+    Some(ranked)
 }
 
 /// Remove the given (dead) bridges from `bridges.lines` in the config file

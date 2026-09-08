@@ -135,15 +135,20 @@ pub(super) async fn authenticate_fallback(
     }
     let bridges: Vec<_> = found.iter().map(|(bridge, _)| bridge.clone()).collect();
     if !super::same_bridges(&active.bridges, &bridges) {
-        if let Ok(mut store) = BridgeStore::load(BridgeStore::resolve_path(path)) {
-            let now = time::OffsetDateTime::now_utc();
-            store.note_probe_round(&bridges, &found, now, Duration::ZERO, u32::MAX, u32::MAX);
-            for bridge in &bridges {
-                store.note_channel_success_at(bridge, now);
+        if let Err(error) = crate::bridge_store_writer::apply(path, {
+            let bridges = bridges.clone();
+            let found = found.clone();
+            move |store| {
+                let now = time::OffsetDateTime::now_utc();
+                store.note_probe_round(&bridges, &found, now, Duration::ZERO, u32::MAX, u32::MAX);
+                for bridge in &bridges {
+                    store.note_channel_success_at(bridge, now);
+                }
             }
-            if let Err(error) = store.save() {
-                warn!(%error, "could not persist authenticated fallback bridge");
-            }
+        })
+        .await
+        {
+            warn!(%error, "could not persist authenticated fallback bridge");
         }
         info!(
             count = bridges.len(),

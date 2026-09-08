@@ -9,7 +9,6 @@ use std::time::Duration;
 use anyhow::Result;
 use arti_wrapper::Settings;
 use bridge_line::BridgeLine;
-use bridge_store::BridgeStore;
 use time::OffsetDateTime;
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{info, warn};
@@ -259,23 +258,35 @@ fn refresh_routes<'a>(
 ) -> futures::future::BoxFuture<'a, Result<usize>> {
     Box::pin(async move {
         let configured = cfg.bridges.parsed()?.bridges;
-        let mut store = BridgeStore::load(BridgeStore::resolve_path(path))?;
-        let (failures, successes, unmatched) = observations.drain_into_store(
-            &mut store,
-            &configured,
-            OffsetDateTime::now_utc(),
-            Duration::from_secs(
-                cfg.bridges
-                    .circuit_observation_window_mins
-                    .saturating_mul(60),
-            ),
+        // Through the single writer: a publish failure no longer aborts the
+        // heal or loses the drained observations (they stay queued in the
+        // writer and are retried with backoff). Err only means the on-disk
+        // store was unreadable — the same surface today's `load(...)?` had.
+        let window = Duration::from_secs(
+            cfg.bridges
+                .circuit_observation_window_mins
+                .saturating_mul(60),
         );
-        if failures + successes + unmatched > 0 {
-            store.save()?;
-            info!(
-                failures,
-                successes, unmatched, "drained circuit-layer guard observations"
-            );
+        let observations = observations.clone();
+        let configured_clone = configured.clone();
+        let counts = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let counts_closure = counts.clone();
+        crate::bridge_store_writer::apply(path, move |store| {
+            *counts_closure.lock().unwrap() = Some(observations.drain_into_store(
+                store,
+                &configured_clone,
+                OffsetDateTime::now_utc(),
+                window,
+            ));
+        })
+        .await?;
+        if let Some((failures, successes, unmatched)) = *counts.lock().unwrap() {
+            if failures + successes + unmatched > 0 {
+                info!(
+                    failures,
+                    successes, unmatched, "drained circuit-layer guard observations"
+                );
+            }
         }
         let route_works = !active.bridges.is_empty()
             && active
