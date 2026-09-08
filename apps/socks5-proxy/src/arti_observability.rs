@@ -68,8 +68,11 @@
 //! We install a [`tracing_subscriber::Layer`] that listens for these
 //! events (and only these), extracts the RSA identity fingerprint from
 //! the Debug-formatted `guard_id`, and pushes a [`GuardObservation`]
-//! into a shared sink. The proxy's maintenance loop periodically drains
-//! the sink into [`BridgeStore`], where consecutive failures eventually
+//! into a shared sink. The sink is a bounded ring buffer: if the
+//! consumer stops draining (e.g. a persistent config load failure), the
+//! oldest observations are dropped in favor of the most recent ones
+//! rather than letting memory grow without bound. The proxy's
+//! maintenance loop periodically drains the sink into [`BridgeStore`], where consecutive failures eventually
 //! prune the bridge from the working config — exactly like TCP-probe
 //! failures, but observed from the cell layer instead of TCP.
 //!
@@ -141,15 +144,26 @@ pub struct GuardObservation {
     pub usable: bool,
 }
 
+/// Capacity of the observation queue. Guardmgr emits far fewer events
+/// between maintenance drains (drains happen every maintenance cycle),
+/// so reaching this cap means the consumer is stuck (e.g. persistent
+/// config load failure). On overflow we drop the OLDEST observations,
+/// preserving the most recent contiguous suffix of the event sequence;
+/// the queue is capped so memory cannot grow unboundedly.
+const OBSERVATION_QUEUE_CAP: usize = 1024;
+
 /// Shared, drainable sink of observations captured by the layer.
 ///
-/// Cheap to clone (`Arc<Mutex<Vec<...>>>`). Producer side: the tracing
-/// layer pushes into this. Consumer side: the maintenance loop calls
-/// [`Self::drain`] to take whatever has accumulated and feed it to the
-/// bridge store.
+/// Cheap to clone (`Arc<Mutex<VecDeque<...>>>`). Backed by a bounded
+/// ring buffer of [`OBSERVATION_QUEUE_CAP`] entries with drop-oldest
+/// eviction: when full, the oldest observation is discarded to make room
+/// for the newest, so memory stays bounded even if the consumer never
+/// drains. Producer side: the tracing layer pushes into this. Consumer
+/// side: the maintenance loop calls [`Self::drain`] to take whatever has
+/// accumulated and feed it to the bridge store.
 #[derive(Debug, Clone, Default)]
 pub struct ObservationSink {
-    inner: Arc<Mutex<Vec<GuardObservation>>>,
+    inner: Arc<Mutex<std::collections::VecDeque<GuardObservation>>>,
     recovery: Arc<Mutex<Option<std::sync::Weak<tokio::sync::Notify>>>>,
 }
 
@@ -170,27 +184,49 @@ impl ObservationSink {
     #[must_use]
     pub fn drain(&self) -> Vec<GuardObservation> {
         match self.inner.lock() {
-            Ok(mut g) => std::mem::take(&mut *g),
+            Ok(mut g) => std::mem::take(&mut *g).into(),
             // Poisoned lock — drop the contents (whoever poisoned us
             // was already in an unrecoverable spot). Observation is
             // best-effort; losing a batch is fine.
             Err(poisoned) => {
                 let mut g = poisoned.into_inner();
-                std::mem::take(&mut *g)
+                std::mem::take(&mut *g).into()
             }
         }
     }
 
     /// Drain accumulated observations into `store`, matching each one to
-    /// a `BridgeLine` from `known` by uppercase RSA fingerprint. Failures
+    /// `BridgeLine`s from `known` by uppercase RSA fingerprint. Failures
     /// bump `circuit_fails` (rate-limited by `window`); successes reset
     /// it. Observations whose fingerprint matches nothing in `known`
     /// (e.g. arti reporting on a public guard) are silently dropped —
     /// the store tracks only configured bridges.
     ///
+    /// **Shared-fate broadcast policy.** Guard-level observations are
+    /// keyed by RSA fingerprint, which identifies the GUARD, not any
+    /// specific endpoint: arti does not attribute them to a bridge line
+    /// (see the module docs — channel targets are scrubbed). When two or
+    /// more configured bridge lines share one fingerprint (same guard,
+    /// several addresses/URLs), an observation is applied to EVERY such
+    /// endpoint. This is deterministic and independent of config line
+    /// order — the previous last-line-wins behavior was order-dependent
+    /// and could credit or penalize the wrong endpoint. Per-endpoint
+    /// discrimination remains the TCP-probe layer's job
+    /// (`BridgeStore::note_probe_round`, keyed by full bridge identity),
+    /// so a dead address of a multi-address guard is still pruned by
+    /// probes even while guard-level successes keep resetting its circuit
+    /// counter. Each endpoint's counter is rate-limited independently, so
+    /// one failure observation bumps each matching endpoint at most once
+    /// per `window`.
+    ///
     /// Returns a `(failures_recorded, successes_recorded, unmatched)`
-    /// tuple for caller-side logging. Side effects on `store` are
-    /// committed in place; the caller decides when to `store.save()`.
+    /// tuple for caller-side logging: `failures` counts observations that
+    /// incremented at least one endpoint's `circuit_fails` (per-
+    /// observation, so an already-rate-limited observation does not
+    /// count); `successes` counts matched success observations; and
+    /// `unmatched` counts observations with no matching fingerprint.
+    /// Side effects on `store` are committed in place; the caller decides
+    /// when to `store.save()`.
     ///
     /// Pure w.r.t. `now` for unit testing.
     pub fn drain_into_store(
@@ -200,26 +236,36 @@ impl ObservationSink {
         now: OffsetDateTime,
         window: Duration,
     ) -> (usize, usize, usize) {
-        let mut by_fp: std::collections::HashMap<String, &BridgeLine> =
+        let mut by_fp: std::collections::HashMap<String, Vec<&BridgeLine>> =
             std::collections::HashMap::with_capacity(known.len());
         for b in known {
             if let Some(fp) = b.fingerprint.as_deref() {
-                by_fp.insert(fp.to_ascii_uppercase(), b);
+                by_fp.entry(fp.to_ascii_uppercase()).or_default().push(b);
             }
         }
         let mut failures = 0usize;
         let mut successes = 0usize;
         let mut unmatched = 0usize;
         for obs in self.drain() {
-            let Some(bridge) = by_fp.get(&obs.fingerprint).copied() else {
+            let Some(group) = by_fp.get(&obs.fingerprint) else {
                 unmatched += 1;
                 continue;
             };
             if obs.usable {
-                store.note_circuit_success_at(bridge, now);
+                for bridge in group {
+                    store.note_circuit_success_at(bridge, now);
+                }
                 successes += 1;
-            } else if store.note_circuit_failure_at(bridge, now, window) {
-                failures += 1;
+            } else {
+                let mut counted = false;
+                for bridge in group {
+                    if store.note_circuit_failure_at(bridge, now, window) {
+                        counted = true;
+                    }
+                }
+                if counted {
+                    failures += 1;
+                }
             }
         }
         (failures, successes, unmatched)
@@ -235,7 +281,15 @@ impl ObservationSink {
     fn push(&self, obs: GuardObservation) {
         let failed = !obs.usable;
         if let Ok(mut g) = self.inner.lock() {
-            g.push(obs);
+            // Drop-oldest eviction: push_back, then shed from the front
+            // until within cap. Retained events keep their relative
+            // order, so the consumer sees an order-preserving suffix of
+            // the true failure/success sequence — never reordered or
+            // interleaved.
+            g.push_back(obs);
+            while g.len() > OBSERVATION_QUEUE_CAP {
+                g.pop_front();
+            }
         }
         if failed {
             let notifier = self
@@ -844,5 +898,131 @@ mod tests {
         );
         assert_eq!(successes, 1);
         assert_eq!(unmatched, 0);
+    }
+
+    #[test]
+    fn drain_into_store_broadcasts_to_all_endpoints_sharing_a_fingerprint() {
+        // Same guard, two configured addresses: a guard-level observation
+        // is a signal about the GUARD, so it must reach BOTH endpoints —
+        // not just whichever line happens to come last in the config.
+        let ba = bridge_with_fp("1.2.3.4:80", FP_A);
+        let bb = bridge_with_fp("5.6.7.8:443", FP_A);
+        let now = OffsetDateTime::from_unix_timestamp(3_000_000).unwrap();
+        let window = Duration::from_secs(1800);
+
+        let sink = ObservationSink::new();
+        sink.push(GuardObservation {
+            fingerprint: FP_A.into(),
+            usable: false,
+        });
+        let mut store = empty_store();
+        let (failures, successes, unmatched) =
+            sink.drain_into_store(&mut store, &[ba.clone(), bb.clone()], now, window);
+        assert_eq!(failures, 1, "one observation counts once in the tuple");
+        assert_eq!(successes, 0);
+        assert_eq!(unmatched, 0);
+        assert_eq!(store.circuit_fails(&ba), 1);
+        assert_eq!(store.circuit_fails(&bb), 1);
+
+        // A subsequent success resets both endpoints.
+        sink.push(GuardObservation {
+            fingerprint: FP_A.into(),
+            usable: true,
+        });
+        let (failures, successes, unmatched) =
+            sink.drain_into_store(&mut store, &[ba.clone(), bb.clone()], now, window);
+        assert_eq!(failures, 0);
+        assert_eq!(successes, 1);
+        assert_eq!(unmatched, 0);
+        assert_eq!(store.circuit_fails(&ba), 0, "success reset cfails");
+        assert_eq!(store.circuit_fails(&bb), 0, "success reset cfails");
+    }
+
+    #[test]
+    fn drain_into_store_attribution_is_independent_of_config_line_order() {
+        // THE regression test for shared-fingerprint attribution: ba and
+        // bc share FP_A, bb has FP_B. Under the old last-wins map, which
+        // endpoint received each observation depended on config line
+        // order; under the broadcast policy it must not.
+        fn run_with_order(order: [&str; 3]) -> (u32, u32, u32) {
+            let ba = bridge_with_fp("1.2.3.4:80", FP_A);
+            let bb = bridge_with_fp("5.6.7.8:443", FP_B);
+            let bc = bridge_with_fp("9.10.11.12:80", FP_A);
+            let pick = |name: &str| match name {
+                "ba" => ba.clone(),
+                "bb" => bb.clone(),
+                _ => bc.clone(),
+            };
+            let lines: Vec<BridgeLine> = order.iter().map(|n| pick(n)).collect();
+
+            let sink = ObservationSink::new();
+            let mut store = empty_store();
+            let window = Duration::from_secs(1800);
+            let start = OffsetDateTime::from_unix_timestamp(3_000_000).unwrap();
+            // One observation per maintenance cycle, one `window` apart:
+            // the same-`now` rate limit must not swallow any step, so the
+            // failure/success sequence lands exactly as pushed — F(A), F(B),
+            // S(A), F(A) leaves each FP_A endpoint at 1 → 0 → 1.
+            let steps = [
+                (FP_A, false, 0u32),
+                (FP_B, false, 1),
+                (FP_A, true, 2),
+                (FP_A, false, 3),
+            ];
+            for (fp, usable, cycle) in steps {
+                sink.push(GuardObservation {
+                    fingerprint: fp.into(),
+                    usable,
+                });
+                sink.drain_into_store(&mut store, &lines, start + window * cycle, window);
+            }
+            (
+                store.circuit_fails(&ba),
+                store.circuit_fails(&bb),
+                store.circuit_fails(&bc),
+            )
+        }
+
+        let forward = run_with_order(["ba", "bb", "bc"]);
+        let reversed = run_with_order(["bc", "bb", "ba"]);
+        assert_eq!(
+            forward, reversed,
+            "attribution must not depend on config line order"
+        );
+        // Broadcast property: both FP_A endpoints share the identical
+        // counter, and the post-success failure still registers once the
+        // window has elapsed. Under the old last-wins map the FP_A bump
+        // would have landed on a single order-dependent endpoint instead
+        // (forward (0, 1, 1) vs reversed (1, 1, 0)).
+        let (fa, fb, fc) = forward;
+        assert_eq!(fa, fc, "shared-fingerprint endpoints share fate");
+        assert_eq!(fa, 1);
+        assert_eq!(fb, 1);
+    }
+
+    #[test]
+    fn observation_queue_is_bounded_and_keeps_the_most_recent_suffix() {
+        let sink = ObservationSink::new();
+        let total = OBSERVATION_QUEUE_CAP + 100;
+        for i in 0..total {
+            sink.push(GuardObservation {
+                fingerprint: format!("{:040X}", i),
+                usable: i % 2 == 0,
+            });
+            assert!(
+                sink.len() <= OBSERVATION_QUEUE_CAP,
+                "queue must never exceed the cap"
+            );
+        }
+        assert_eq!(sink.len(), OBSERVATION_QUEUE_CAP, "queue is bounded");
+        let drained = sink.drain();
+        assert_eq!(drained.len(), OBSERVATION_QUEUE_CAP);
+        // The retained suffix must be exactly the last CAP observations,
+        // in original order, with the usable/failure alternation intact —
+        // drop-oldest, never reordered or interleaved.
+        for (i, obs) in drained.iter().enumerate() {
+            assert_eq!(obs.fingerprint, format!("{:040X}", 100 + i));
+            assert_eq!(obs.usable, (100 + i) % 2 == 0);
+        }
     }
 }
