@@ -312,6 +312,30 @@ pub(super) fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// How far into the future a wall-clock stamp may sit and still be
+/// believed, enforced at both parse entry points
+/// ([`parse_persisted_line`], [`parse_dns_hint_line`]).
+///
+/// Stamps arrive from other devices and unsigned channels (a scanned QR
+/// hint), so they carry whatever the sender's clock said. A little skew is
+/// ordinary: NTP convergence after a cold boot, a sender a minute or two
+/// ahead. Anything further is a mis-set clock or a forged stamp -- and a
+/// future stamp is doubly toxic if accepted: age reads as
+/// `now.saturating_sub(stamp)`, i.e. zero while the stamp stays ahead of
+/// the clock, and the recency merge keeps the larger stamp, so it would
+/// beat every honestly-stamped entry forever. Five minutes comfortably
+/// covers real clock skew while making an abused stamp's leverage
+/// negligible next to the day-long [`DNS_STALE_FALLBACK_WINDOW`].
+pub(super) const DNS_TIMESTAMP_FUTURE_TOLERANCE: Duration = Duration::from_secs(5 * 60);
+
+/// Whether `resolved_at_unix` lies further ahead than clock-skew tolerance
+/// allows. Such a stamp is rejected at parse time, so it never enters the
+/// store, never wins the recency merge, and never reads as unexpiring in
+/// [`disk_fallback_answer`].
+pub(super) fn stamp_beyond_future_tolerance(resolved_at_unix: u64) -> bool {
+    resolved_at_unix.saturating_sub(now_unix()) > DNS_TIMESTAMP_FUTURE_TOLERANCE.as_secs()
+}
+
 /// One line per host: `host\tip1,ip2,...\tresolved_at_unix`. Plain text,
 /// matching this codebase's other file-based persistence (e.g. the
 /// active-bridges file) rather than pulling in a serialization dependency
@@ -326,6 +350,10 @@ pub(super) fn format_persisted_line(host: &str, entry: &PersistedAnswer) -> Stri
     format!("{host}\t{addrs}\t{}", entry.resolved_at_unix)
 }
 
+/// Inverse of [`format_persisted_line`]; `None` for any malformed line,
+/// including one whose `resolved_at_unix` sits further ahead than
+/// [`DNS_TIMESTAMP_FUTURE_TOLERANCE`] allows -- callers treat `None` as
+/// "skip line".
 pub(super) fn parse_persisted_line(line: &str) -> Option<(String, PersistedAnswer)> {
     let mut parts = line.splitn(3, '\t');
     let host = parts.next()?.to_owned();
@@ -336,7 +364,7 @@ pub(super) fn parse_persisted_line(line: &str) -> Option<(String, PersistedAnswe
         .filter_map(|s| s.parse().ok())
         .collect();
     let resolved_at_unix: u64 = parts.next()?.trim().parse().ok()?;
-    if addrs.is_empty() {
+    if addrs.is_empty() || stamp_beyond_future_tolerance(resolved_at_unix) {
         return None;
     }
     Some((
@@ -390,15 +418,29 @@ pub fn load_persisted_dns_cache(path: &std::path::Path) {
     tracing::debug!(loaded, path = %path.display(), "loaded persisted DNS fallback cache");
 }
 
-/// Persist every positive DNS answer currently in memory (fresh or still
-/// within the stale-fallback window) to `path`, so a future cold start has
-/// something to fall back to even before that run has resolved anything
-/// itself. Call periodically (e.g. from the watchdog loop), not per-lookup.
+/// Persist the DNS answers a future cold start may need to `path`.
+///
+/// The union of two sources, so a periodic save can never erase what it
+/// exists to protect:
+/// - every positive answer in the live DoH cache, stamped now -- those were
+///   observed in this very session;
+/// - every on-disk fallback entry that no live answer replaces and whose own
+///   age still fits in [`DNS_STALE_FALLBACK_WINDOW`], written with its
+///   ORIGINAL `resolved_at_unix`: re-stamping would keep an aging answer
+///   perpetually fresh, every periodic save resetting the very clock the
+///   next cold start measures it by.
+///
+/// A live cache entry wins for a host only when it is a positive answer: a
+/// remembered *failure* must not displace the persisted last-known-good,
+/// which is the lifeline of the next session rather than a fact about this
+/// one. Entries past the fallback window are left out and thereby expire
+/// for good. Call periodically (e.g. from the watchdog loop), not
+/// per-lookup.
 pub fn save_persisted_dns_cache(path: &std::path::Path) -> std::io::Result<()> {
     let now = now_unix();
     let lines: Vec<String> = {
         let cache = doh_cache().lock().unwrap_or_else(|p| p.into_inner());
-        cache
+        let mut lines: Vec<String> = cache
             .iter()
             .filter(|(_, entry)| !entry.addrs.is_empty())
             .map(|(host, entry)| {
@@ -410,7 +452,21 @@ pub fn save_persisted_dns_cache(path: &std::path::Path) -> std::io::Result<()> {
                     },
                 )
             })
-            .collect()
+            .collect();
+        let store = disk_fallback_store()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for (host, entry) in store.iter() {
+            if cache.get(host).is_some_and(|live| !live.addrs.is_empty()) {
+                continue; // a live positive answer replaces the persisted one
+            }
+            let age = now.saturating_sub(entry.resolved_at_unix);
+            if age > DNS_STALE_FALLBACK_WINDOW.as_secs() {
+                continue; // genuinely expired: let it disappear
+            }
+            lines.push(format_persisted_line(host, entry));
+        }
+        lines
     };
     std::fs::write(path, lines.join("\n"))
 }
@@ -471,7 +527,8 @@ pub fn format_dns_hint_line(hint: &DnsHint) -> String {
 /// Parse one directive line produced by [`format_dns_hint_line`]. `None` for
 /// anything that is not a well-formed hint line, including a plain bridge
 /// line or an unrelated comment -- callers should treat that the same as
-/// "not a hint", never as an error.
+/// "not a hint", never as an error. A `resolved_at_unix` further ahead than
+/// [`DNS_TIMESTAMP_FUTURE_TOLERANCE`] is likewise rejected as malformed.
 pub fn parse_dns_hint_line(line: &str) -> Option<DnsHint> {
     let rest = line.strip_prefix(DNS_HINT_PREFIX)?;
     let mut parts = rest.split_whitespace();
@@ -483,7 +540,7 @@ pub fn parse_dns_hint_line(line: &str) -> Option<DnsHint> {
         .filter_map(|s| s.parse().ok())
         .collect();
     let resolved_at_unix: u64 = parts.next()?.parse().ok()?;
-    if addrs.is_empty() {
+    if addrs.is_empty() || stamp_beyond_future_tolerance(resolved_at_unix) {
         return None;
     }
     Some(DnsHint {
