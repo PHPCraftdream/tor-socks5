@@ -540,3 +540,153 @@ async fn servername_override_sets_tls_sni_on_the_wire() {
         "servername override must be the on-the-wire SNI, not the URL host"
     );
 }
+
+// TS5-03: every webtunnel candidate gets its own slice of the budget for one
+// complete attempt (TCP + TLS + upgrade), so a first address that accepts and
+// then hangs cannot starve the remaining candidates.
+
+/// A listener that accepts and then never speaks again: the "hangs after
+/// accept" failure mode that used to eat the whole probe budget.
+async fn hanging_listener() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        // Bind the accepted socket in a named variable so the connection is
+        // HELD open without ever reading or writing: the probe's request is
+        // never answered.
+        if let Ok((held, _)) = listener.accept().await {
+            let _held = held;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    });
+    addr
+}
+
+fn webtunnel_plan(url: &str) -> PreparedTarget {
+    PreparedTarget::new(&webtunnel_bridge(url, "").params).expect("webtunnel plan parses")
+}
+
+#[tokio::test]
+async fn a_hanging_first_address_leaves_budget_for_the_second() {
+    let hanging = hanging_listener().await;
+    let good = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let good_addr = good.local_addr().unwrap();
+    let server = tokio::spawn(serve_one_upgrade(good));
+
+    let plan = webtunnel_plan("http://frontend.test/secret");
+    let budget = Duration::from_secs(6);
+    let started = std::time::Instant::now();
+    let outcome = webtunnel_upgrade_probe(&[hanging, good_addr], &plan, budget).await;
+    let elapsed = started.elapsed();
+
+    // Without the per-address budget this is exactly the bug: the hanging
+    // first address eats all 6 seconds, the outer timeout fires, and the
+    // outcome is Unreachable with the working second address never tried.
+    assert!(
+        matches!(outcome, Outcome::Reachable { .. }),
+        "the working second address must be reached past the hanging first one, got {outcome:?}"
+    );
+    assert!(
+        elapsed < budget,
+        "the first address must not consume more than its own share of the budget; took {elapsed:?}"
+    );
+    let request = server.await.expect("server task");
+    assert!(
+        !request.is_empty(),
+        "the second address must have received the upgrade request"
+    );
+}
+
+#[tokio::test]
+async fn a_hanging_ipv4_still_tries_the_ipv6_candidate() {
+    let hanging = hanging_listener().await;
+    assert!(hanging.is_ipv4());
+    let good = TcpListener::bind("[::1]:0").await.unwrap();
+    let good_addr = good.local_addr().unwrap();
+    assert!(good_addr.is_ipv6());
+    let server = tokio::spawn(serve_one_upgrade(good));
+
+    let plan = webtunnel_plan("http://frontend.test/secret");
+    let budget = Duration::from_secs(6);
+    let started = std::time::Instant::now();
+    let outcome = webtunnel_upgrade_probe(&[hanging, good_addr], &plan, budget).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(outcome, Outcome::Reachable { .. }),
+        "the working IPv6 candidate must be reached past the hanging IPv4 one, got {outcome:?}"
+    );
+    assert!(
+        elapsed < budget,
+        "the hanging IPv4 address must not eat the whole budget; took {elapsed:?}"
+    );
+    assert!(
+        !server.await.expect("server task").is_empty(),
+        "the IPv6 candidate must have received the upgrade request"
+    );
+}
+
+#[tokio::test]
+async fn a_hanging_ipv6_still_tries_the_ipv4_candidate() {
+    let good = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let good_addr = good.local_addr().unwrap();
+    assert!(good_addr.is_ipv4());
+    let server = tokio::spawn(serve_one_upgrade(good));
+
+    let hanging_listener = TcpListener::bind("[::1]:0").await.unwrap();
+    let hanging = hanging_listener.local_addr().unwrap();
+    assert!(hanging.is_ipv6());
+    tokio::spawn(async move {
+        if let Ok((held, _)) = hanging_listener.accept().await {
+            let _held = held;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    });
+
+    let plan = webtunnel_plan("http://frontend.test/secret");
+    let budget = Duration::from_secs(6);
+    let started = std::time::Instant::now();
+    let outcome = webtunnel_upgrade_probe(&[hanging, good_addr], &plan, budget).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(outcome, Outcome::Reachable { .. }),
+        "the working IPv4 candidate must be reached past the hanging IPv6 one, got {outcome:?}"
+    );
+    assert!(
+        elapsed < budget,
+        "the hanging IPv6 address must not eat the whole budget; took {elapsed:?}"
+    );
+    assert!(
+        !server.await.expect("server task").is_empty(),
+        "the IPv4 candidate must have received the upgrade request"
+    );
+}
+
+#[tokio::test]
+async fn all_candidates_hanging_is_unreachable_within_the_budget() {
+    let hanging1 = hanging_listener().await;
+    let hanging2 = hanging_listener().await;
+
+    let plan = webtunnel_plan("http://frontend.test/secret");
+    let budget = Duration::from_secs(6);
+    let started = std::time::Instant::now();
+    let outcome = webtunnel_upgrade_probe(&[hanging1, hanging2], &plan, budget).await;
+    let elapsed = started.elapsed();
+
+    match &outcome {
+        Outcome::Unreachable { reason } => {
+            assert!(
+                reason.contains("timed out"),
+                "both candidates hang, so the reason must be the per-address timeout: {reason}"
+            );
+        }
+        other => panic!("expected Unreachable, got {other:?}"),
+    }
+    // Per-address slices sum to the whole budget here (2 x 3s); the outer
+    // budget cap must keep the probe from running any longer than that.
+    assert!(
+        elapsed <= budget + Duration::from_millis(500),
+        "the probe must not run meaningfully past the overall budget; took {elapsed:?}"
+    );
+}

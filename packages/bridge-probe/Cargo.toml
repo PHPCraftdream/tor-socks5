@@ -16,6 +16,9 @@ rust-version.workspace = true
 bridge-line.workspace = true
 
 tokio = { workspace = true, features = ["net", "time", "macros", "rt", "io-util"] }
+# TS5-02: the DoH wave race owns an admission token that stops still-queued
+# attempts from starting once their owner stopped waiting.
+tokio-util.workspace = true
 futures.workspace = true
 hickory-resolver.workspace = true
 tracing.workspace = true

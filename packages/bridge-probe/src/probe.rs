@@ -1,4 +1,5 @@
 use rustls::pki_types::ServerName;
+use tokio_util::sync::CancellationToken;
 
 use super::dns::{
     cached_doh_answer, disk_fallback_answer, doh_order, doh_pool, doh_slots, forget_dns_answer,
@@ -382,15 +383,22 @@ pub(super) async fn webtunnel_upgrade_probe(
     budget: Duration,
 ) -> Outcome {
     let started = Instant::now();
-    // One budget for the whole candidate list, not one per candidate: a host
-    // with several addresses must not cost several times the wall clock of a
-    // host with one.
+    // TS5-03: every candidate gets its own slice of the budget for one COMPLETE
+    // attempt -- TCP connect, TLS handshake, and the upgrade round trip -- with
+    // the whole list still capped by `budget`. One shared timeout alone let a
+    // first address that accepted TCP and then hung eat the entire budget, so a
+    // working candidate behind it was never even tried and the bridge was filed
+    // as dead. `addrs` arrives capped at `MAX_PROBE_ADDRS` (3) by
+    // `order_candidates`, so a slice is never below a third of
+    // `MIN_WEBTUNNEL_TIMEOUT` -- room for one full round trip.
+    let per_addr_budget = budget / (addrs.len().max(1) as u32);
     let attempt = async {
         let mut last = "hostname resolved to no usable address".to_owned();
         for addr in addrs {
-            match webtunnel_upgrade_inner(*addr, plan).await {
-                Ok(()) => return Ok(()),
-                Err(reason) => last = format!("{addr}: {reason}"),
+            match timeout(per_addr_budget, webtunnel_upgrade_inner(*addr, plan)).await {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(reason)) => last = format!("{addr}: {reason}"),
+                Err(_) => last = format!("{addr}: timed out after {per_addr_budget:?}"),
             }
         }
         Err(last)
@@ -552,8 +560,9 @@ pub(super) fn order_candidates_with_limit(
 /// records' own TTL. `None` means "no usable answer" (failure or NODATA).
 pub(super) type DohAttemptOutcome = (usize, Duration, Option<(Vec<IpAddr>, Duration)>);
 
-/// Everything one DoH provider does for a wave: grab a semaphore permit,
-/// run the bounded lookup, record the provider's statistics, and map a
+/// Everything one DoH provider does for a wave: grab a semaphore permit (or
+/// give up when the race's admission token fires first -- TS5-02), run the
+/// bounded lookup, record the provider's statistics, and map a
 /// successful lookup into `(ips, ttl)` — or `None` when nothing usable came
 /// back (an empty answer is not a win; the wave keeps waiting).
 ///
@@ -565,8 +574,24 @@ async fn doh_provider_attempt(
     resolver: hickory_resolver::TokioResolver,
     query: String,
     slots: std::sync::Arc<tokio::sync::Semaphore>,
+    admission: CancellationToken,
 ) -> DohAttemptOutcome {
-    let _permit = slots.acquire_owned().await.ok();
+    // TS5-02: the permit wait is the one place a queued attempt can outlive its
+    // owner -- the race's tasks are detached, so an outer timeout does not stop
+    // them. Race the wait against the admission token: an attempt whose owner
+    // stopped waiting (outer DNS timeout, or a winner already delivered) gives
+    // up its place in the queue instead of starting a lookup for nobody.
+    let _permit = tokio::select! {
+        biased;
+        _ = admission.cancelled() => {
+            // Cancelled before it ever started: nothing was learned about this
+            // provider, so it must not be scored as a failure -- the same
+            // principle as the empty-answer comment below. Do not call
+            // `note_doh_result` for a lookup that never ran.
+            return (index, Duration::ZERO, None);
+        }
+        p = slots.acquire_owned() => p.ok(),
+    };
     let started = Instant::now();
     // Per-provider bound. Without it a blocked provider holds its
     // semaphore permit for the caller's whole budget, starving the
@@ -605,27 +630,49 @@ async fn doh_provider_attempt(
 /// while the losers finish detached in the background, still recording their
 /// statistics (that side effect lives inside each attempt future).
 ///
+/// Each attempt is built by a factory that receives this race's OWN admission
+/// token (TS5-02). The spawned tasks are detached -- dropping this future does
+/// not abort them -- but the token is cancelled on EVERY exit path, and an
+/// attempt still queued on a semaphore permit then gives up instead of
+/// starting a lookup nobody will consume. Attempts that already started
+/// (permit held) keep their detached, self-bounded behaviour unchanged.
+///
+/// The token fires on both exit kinds: a normal return (a winner, or the whole
+/// wave finishing without one) drops `_cancel_on_exit` at function end, and
+/// this future being dropped mid-race by the caller's `timeout` drops the very
+/// same guard, because dropping a future runs its locals' `Drop` impls.
+///
 /// Dropping the receiver's clones (and finally `rx`) detaches the remaining
 /// tasks: dropping a `JoinHandle` does not abort a tokio task. Each task is
-/// self-bounded — permit wait, then [`DOH_PROVIDER_TIMEOUT`] on the lookup —
-/// so detached tasks always terminate.
+/// self-bounded -- admission token, then [`DOH_PROVIDER_TIMEOUT`] on the
+/// lookup -- so detached tasks always terminate.
 ///
 /// Cancel-safety: this is called under the caller's outer
-/// `timeout(dns_timeout, ...)`; if THAT fires, the already-spawned wave tasks
-/// continue in the background and still record their stats, which is intended.
-pub(super) async fn race_first_answer<A>(
+/// `timeout(dns_timeout, ...)`; if THAT fires, started tasks continue in the
+/// background and still record their stats (intended), while queued ones are
+/// cancelled by the token instead of starting work for an owner that left.
+pub(super) async fn race_first_answer<A, F, I>(
     query: &str,
-    attempts: impl IntoIterator<Item = A>,
+    attempts: I,
 ) -> Option<(Vec<IpAddr>, Duration)>
 where
     A: std::future::Future<Output = DohAttemptOutcome> + Send + 'static,
+    F: FnOnce(CancellationToken) -> A,
+    I: IntoIterator<Item = F>,
 {
-    let attempts: Vec<A> = attempts.into_iter().collect();
+    let admission = CancellationToken::new();
+    // `let _cancel_on_exit`, NOT `let _`: a named binding lives to the end of
+    // the scope, so the guard is dropped -- and the token cancelled -- on every
+    // path out of this function, including the future being dropped mid-`await`.
+    let _cancel_on_exit = admission.clone().drop_guard();
+
+    let attempts: Vec<F> = attempts.into_iter().collect();
     // Capacity >= task count, so a task's single send never blocks while
     // its recording is still pending.
     let (tx, mut rx) = tokio::sync::mpsc::channel(attempts.len().max(1));
-    for attempt in attempts {
+    for build_attempt in attempts {
         let tx = tx.clone();
+        let attempt = build_attempt(admission.clone());
         // The send is best-effort: the receiver may already be gone once a
         // winner returned, so its error is ignored. Side effects such as
         // `note_doh_result` must live INSIDE the attempt future, not here.
@@ -657,14 +704,20 @@ where
 /// behaviour so [`doh_order`] can learn.
 pub(super) async fn race_doh_wave(wave: &[usize], query: &str) -> Option<(Vec<IpAddr>, Duration)> {
     let pool = doh_pool();
+    // Factories, not futures: the admission token (TS5-02) exists only for the
+    // duration of one `race_first_answer` call and only the race may create and
+    // cancel it, so attempts cannot be built before the race runs.
     let attempts = wave.iter().filter_map(|&index| {
         let resolver = pool.get(index).cloned()?;
-        Some(doh_provider_attempt(
-            index,
-            resolver,
-            query.to_owned(),
-            std::sync::Arc::clone(doh_slots()),
-        ))
+        Some(move |admission: CancellationToken| {
+            doh_provider_attempt(
+                index,
+                resolver,
+                query.to_owned(),
+                std::sync::Arc::clone(doh_slots()),
+                admission,
+            )
+        })
     });
     race_first_answer(query, attempts).await
 }
