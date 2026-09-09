@@ -55,7 +55,7 @@ fn needing_circuit_verification_excludes_fresh_and_unproven_and_retired() {
     s.note_circuit_verified_at(&stale_verified, now - 2 * HOUR);
     s.note_permanent_failure_at(&retired, now);
 
-    let due = s.needing_circuit_verification(now, HOUR, 10);
+    let due = s.needing_circuit_verification(now, HOUR, 10, |_| true);
     assert!(due.contains(&never_verified), "never verified is due");
     assert!(
         due.contains(&stale_verified),
@@ -82,11 +82,13 @@ fn failed_verification_rotates_the_queue_and_survives_reload() {
         store.record(bridge.clone(), Duration::from_millis(10));
         store.note_channel_success_at(bridge, now);
     }
-    let first = store.needing_circuit_verification(now, HOUR, 1).remove(0);
+    let first = store
+        .needing_circuit_verification(now, HOUR, 1, |_| true)
+        .remove(0);
     store.note_verification_attempt_at(&first, now);
     store.save().unwrap();
     let loaded = BridgeStore::load(path).unwrap();
-    let next = loaded.needing_circuit_verification(now + HOUR, HOUR, 1);
+    let next = loaded.needing_circuit_verification(now + HOUR, HOUR, 1, |_| true);
     assert_eq!(next.len(), 1);
     assert_ne!(
         next[0], first,
@@ -222,21 +224,84 @@ fn needing_circuit_verification_order_and_limits() {
 
     let now = t0 + HOUR;
     assert_eq!(
-        s.needing_circuit_verification(now, HOUR, 0),
+        s.needing_circuit_verification(now, HOUR, 0, |_| true),
         Vec::<BridgeLine>::new()
     );
     assert_eq!(
-        s.needing_circuit_verification(now, HOUR, 1),
+        s.needing_circuit_verification(now, HOUR, 1, |_| true),
         vec![a.clone()],
         "k=1 takes the head of the same order"
     );
     assert_eq!(
-        s.needing_circuit_verification(now, HOUR, 2),
+        s.needing_circuit_verification(now, HOUR, 2, |_| true),
         vec![a.clone(), b.clone()]
     );
     assert_eq!(
-        s.needing_circuit_verification(now, HOUR, 10),
+        s.needing_circuit_verification(now, HOUR, 10, |_| true),
         vec![a, b, c],
         "k >= N: attempted-but-unverified still due, ranked last"
     );
+}
+/// TS3-10 regression: the pre-ranking `filter` restricts the candidate pool
+/// BEFORE bounded selection. Ranking the whole due pool down to `limit` first
+/// and only then filtering (the old caller-side shape) lets unrelated
+/// higher-ranked entries fill the batch and starve the subset entirely.
+#[test]
+fn needing_circuit_verification_filters_before_bounded_selection() {
+    let mut s = empty();
+    let t0 = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+    let mk = |ip: &str| {
+        bridge(&format!(
+            "obfs4 {ip}:443 1111111111111111111111111111111111111111 cert=VVV iat-mode=0"
+        ))
+    };
+    // Five channel-proven, never-attempted bridges first: `None` due keys,
+    // and earlier store positions rank first among ties.
+    let inactive: Vec<BridgeLine> = ["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4", "10.0.0.5"]
+        .iter()
+        .map(|ip| mk(ip))
+        .collect();
+    // Two active bridges, attempted at t0: `Some(t0)` due keys rank strictly
+    // after all five inactives under the due ordering.
+    let active: Vec<BridgeLine> = ["10.0.0.6", "10.0.0.7"].iter().map(|ip| mk(ip)).collect();
+    for b in inactive.iter().chain(active.iter()) {
+        s.record(b.clone(), Duration::from_millis(10));
+        s.note_channel_success_at(b, t0);
+    }
+    for b in &active {
+        s.note_verification_attempt_at(b, t0);
+    }
+
+    let now = t0 + HOUR;
+    // Top-3 overall would be all inactive; the filter must run first so the
+    // actives survive bounded selection.
+    let due = s.needing_circuit_verification(now, HOUR, 3, |b| active.iter().any(|a| a == b));
+    assert_eq!(due, active, "actives must not be starved out of the batch");
+    assert_eq!(
+        s.needing_circuit_verification(now, HOUR, 1, |b| active.iter().any(|a| a == b)),
+        vec![active[0].clone()],
+        "limit 1 takes the first active in store-key order"
+    );
+}
+/// TS3-10: limit 0 must not even walk the candidate set. The old
+/// caller-side `.collect()` materialized every due entry before `take_best`
+/// even at limit 0; the Cell-captured counter proves the whole chain is
+/// skipped.
+#[test]
+fn needing_circuit_verification_zero_limit_never_walks_the_candidates() {
+    let mut s = empty();
+    let t0 = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+    let a = bridge(OBFS4_A);
+    let b = bridge(OBFS4_B);
+    for bridge_ref in [&a, &b] {
+        s.record((*bridge_ref).clone(), Duration::from_millis(10));
+        s.note_channel_success_at(bridge_ref, t0);
+    }
+    let calls = std::cell::Cell::new(0usize);
+    let due = s.needing_circuit_verification(t0 + HOUR, HOUR, 0, |_b| {
+        calls.set(calls.get() + 1);
+        true
+    });
+    assert!(due.is_empty());
+    assert_eq!(calls.get(), 0, "filter must never run at limit 0");
 }

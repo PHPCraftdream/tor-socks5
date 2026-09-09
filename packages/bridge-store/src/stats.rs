@@ -208,14 +208,19 @@ impl BridgeStore {
     /// Ranked oldest-verified (or never-verified) first, so the tick always makes progress
     /// through the whole channel-proven pool rather than repeatedly re-checking the same few
     /// bridges. Retired bridges are excluded.
+    ///
+    /// `filter` restricts the candidate pool before ranking/bounded selection, so a caller
+    /// can use a small `limit` against a subset (e.g. only currently-active bridges) without
+    /// unrelated higher-ranked entries crowding the subset out of the batch.
     #[must_use]
     pub fn needing_circuit_verification(
         &self,
         now: OffsetDateTime,
         max_age: Duration,
         limit: usize,
+        filter: impl Fn(&BridgeLine) -> bool,
     ) -> Vec<BridgeLine> {
-        let due: Vec<DueForVerification<'_>> = self
+        let due = self
             .entries
             .values()
             .filter(|e| e.channel_ok_count > 0 && !e.is_retired())
@@ -223,9 +228,9 @@ impl BridgeStore {
                 None => true,
                 Some(t) => now - t >= max_age,
             })
+            .filter(|e| filter(&e.bridge))
             .enumerate()
-            .map(|(position, entry)| DueForVerification { position, entry })
-            .collect();
+            .map(|(position, entry)| DueForVerification { position, entry });
         take_best(due, limit)
             .into_iter()
             .map(|due| due.entry.bridge.clone())
@@ -273,17 +278,12 @@ impl BridgeStore {
     /// evidence the bridge actually works.
     #[must_use]
     pub fn healthiest_bridges(&self, limit: usize) -> Vec<BridgeLine> {
-        let healthy: Vec<&Entry> = self
-            .entries
-            .values()
-            // Retired bridges must be excluded rather than merely ranked low. A
-            // retirement means the bridge answers but can never serve as
-            // configured -- a stale fingerprint -- so it keeps a clean probe
-            // record and an excellent latency, and any ranking that considers
-            // only reachability promotes it straight back into the active pool.
-            .filter(|e| e.is_proven_alive())
-            .collect();
-        Self::rank_and_take(healthy, limit)
+        // Retired bridges must be excluded rather than merely ranked low. A
+        // retirement means the bridge answers but can never serve as
+        // configured -- a stale fingerprint -- so it keeps a clean probe
+        // record and an excellent latency, and any ranking that considers
+        // only reachability promotes it straight back into the active pool.
+        Self::rank_and_take(self.entries.values().filter(|e| e.is_proven_alive()), limit)
     }
 
     /// Like [`healthiest_bridges`](Self::healthiest_bridges), but ranks only entries whose
@@ -303,25 +303,26 @@ impl BridgeStore {
     pub fn healthiest_among(&self, candidates: &[BridgeLine], limit: usize) -> Vec<BridgeLine> {
         use std::collections::HashSet;
         let allowed: HashSet<Key> = candidates.iter().map(key_of).collect();
-        let healthy: Vec<&Entry> = self
-            .entries
-            .iter()
-            // Membership check against the key already stored in the map:
-            // rebuilding it from the entry would clone `transport` and
-            // `fingerprint` again for every record scanned.
-            .filter(|(key, e)| e.is_proven_alive() && allowed.contains(*key))
-            .map(|(_, e)| e)
-            .collect();
-        Self::rank_and_take(healthy, limit)
+        // Membership check against the key already stored in the map:
+        // rebuilding it from the entry would clone `transport` and
+        // `fingerprint` again for every record scanned.
+        Self::rank_and_take(
+            self.entries
+                .iter()
+                .filter(|(key, e)| e.is_proven_alive() && allowed.contains(*key))
+                .map(|(_, e)| e),
+            limit,
+        )
     }
 
-    fn rank_and_take(healthy: Vec<&Entry>, limit: usize) -> Vec<BridgeLine> {
+    fn rank_and_take<'a>(
+        healthy: impl Iterator<Item = &'a Entry>,
+        limit: usize,
+    ) -> Vec<BridgeLine> {
         take_best(
             healthy
-                .into_iter()
                 .enumerate()
-                .map(|(position, entry)| Ranked { position, entry })
-                .collect(),
+                .map(|(position, entry)| Ranked { position, entry }),
             limit,
         )
         .into_iter()
@@ -404,22 +405,19 @@ impl PartialOrd for DueForVerification<'_> {
     }
 }
 
-/// The `limit` best items under the item type's own total `Ord`, ascending --
-/// exactly what a stable sort followed by `take(limit)` produced before,
-/// given the item's `Ord` breaks ties by the item's original position (as
-/// `Ranked` and `DueForVerification` do). Bounded heap instead of a full
-/// sort: O(N log limit) comparisons and O(limit) memory rather than
-/// O(N log N) / O(N); `limit == 0` and `limit >= N` short-circuit.
-fn take_best<I: Ord>(items: Vec<I>, limit: usize) -> Vec<I> {
+/// The `limit` best items under the item type's own total `Ord`, ascending.
+///
+/// Takes any iterator; `limit == 0` returns before the iterator is touched at all. The
+/// candidate buffer is bounded at `limit` items, so memory stays O(limit) regardless of N
+/// (the previous full-sort fast path for `len <= limit` is gone on purpose: it required
+/// knowing the length, i.e. prior materialization). Selection result is unchanged: identical
+/// to the old stable-sort+take given the item's `Ord` breaks ties by original position
+/// (as `Ranked` and `DueForVerification` do).
+pub(crate) fn take_best<I: Ord>(items: impl Iterator<Item = I>, limit: usize) -> Vec<I> {
     if limit == 0 {
         return Vec::new();
     }
-    if items.len() <= limit {
-        let mut items = items;
-        items.sort();
-        return items;
-    }
-    let mut kept: BinaryHeap<I> = BinaryHeap::with_capacity(limit);
+    let mut kept: BinaryHeap<I> = BinaryHeap::new();
     for item in items {
         // The heap root is the worst item kept; a strictly better candidate
         // replaces it, so the heap always holds the `limit` best seen so far.

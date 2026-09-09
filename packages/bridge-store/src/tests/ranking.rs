@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::stats::take_best;
+
 #[test]
 fn healthiest_bridges_prefers_channel_warm_history() {
     let mut s = empty();
@@ -349,4 +351,91 @@ fn healthiest_bridges_top_k_matches_full_ranking_at_every_limit() {
     let expected = vec![v1, v2, c1, c2, r1];
     assert_eq!(s.healthiest_bridges(5), expected, "k == N");
     assert_eq!(s.healthiest_bridges(50), expected, "k >= N");
+}
+/// TS3-10: `limit == 0` returns before the iterator is touched at all.
+#[test]
+fn take_best_zero_limit_never_touches_the_iterator() {
+    let items = (0..16).inspect(|_| panic!("take_best(limit=0) must not consume the iterator"));
+    assert!(take_best(items, 0).is_empty());
+}
+/// TS3-10: the bounded-heap selection matches a full stable sort + truncate
+/// at every limit (order oracle only, not a memory proof).
+#[test]
+fn take_best_matches_a_full_stable_sort_at_every_limit() {
+    let items = vec![5, -1, 5, 0, 5, 3, -7, 5, 12, 0]; // duplicates exercise equal-Ord handling
+    for limit in [0usize, 1, 2, 3, items.len(), items.len() + 5] {
+        let mut expected = items.clone();
+        expected.sort();
+        expected.truncate(limit);
+        assert_eq!(
+            take_best(items.iter().copied(), limit),
+            expected,
+            "limit {limit}"
+        );
+    }
+}
+/// TS3-10: proves bounded buffering, not just order. Materializing the whole
+/// 1000-entry set first -- as the old Vec-based signature forced -- would push
+/// the peak near 1000; a bound of ~limit proves the candidate buffer is
+/// O(limit).
+#[test]
+fn take_best_keeps_the_candidate_buffer_bounded_by_limit() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::sync::Arc;
+
+    struct DropCounted {
+        value: u32,
+        live: Arc<AtomicUsize>,
+        // Kept alongside `live` so the peak counter's lifetime mirrors it.
+        #[allow(dead_code)]
+        peak: Arc<AtomicUsize>,
+    }
+    impl DropCounted {
+        fn new(value: u32, live: &Arc<AtomicUsize>, peak: &Arc<AtomicUsize>) -> Self {
+            let now = live.fetch_add(1, SeqCst) + 1;
+            peak.fetch_max(now, SeqCst);
+            Self {
+                value,
+                live: Arc::clone(live),
+                peak: Arc::clone(peak),
+            }
+        }
+    }
+    impl Drop for DropCounted {
+        fn drop(&mut self) {
+            self.live.fetch_sub(1, SeqCst);
+        }
+    }
+    // Arc fields are not Ord; compare only the payload value.
+    impl PartialEq for DropCounted {
+        fn eq(&self, other: &Self) -> bool {
+            self.value == other.value
+        }
+    }
+    impl Eq for DropCounted {}
+    impl PartialOrd for DropCounted {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for DropCounted {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            self.value.cmp(&other.value)
+        }
+    }
+
+    let live = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let best = take_best((0..1000u32).map(|v| DropCounted::new(v, &live, &peak)), 8);
+    assert_eq!(
+        best.iter().map(|d| d.value).collect::<Vec<_>>(),
+        (0..8).collect::<Vec<_>>(),
+        "take_best returns the limit best items ascending"
+    );
+    // +2 covers the incoming item and the popped-during-replacement item.
+    assert!(
+        peak.load(SeqCst) <= 8 + 2,
+        "candidate buffer must be O(limit), peak was {}",
+        peak.load(SeqCst)
+    );
 }

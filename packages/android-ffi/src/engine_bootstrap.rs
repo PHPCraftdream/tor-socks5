@@ -538,6 +538,8 @@ pub(super) async fn stall_watchdog(
                     OffsetDateTime::now_utc(),
                     CIRCUIT_VERIFY_MAX_AGE,
                     CIRCUIT_VERIFY_BATCH,
+                    // android ranks the whole pool; no active-set restriction here
+                    |_| true,
                 ),
                 Err(error) => {
                     warn!(error = %error, "circuit-verify: failed to load bridge store");

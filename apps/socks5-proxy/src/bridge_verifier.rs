@@ -144,16 +144,15 @@ pub(crate) fn spawn_bridge_circuit_verifier(
 /// One tick: pick the due batch, verify it, persist the results.
 async fn run_circuit_verify_tick(config_path: Option<&Path>, active: &[BridgeLine]) {
     let due = match BridgeStore::load(BridgeStore::resolve_path(config_path)) {
-        Ok(store) => store
-            .needing_circuit_verification(
-                OffsetDateTime::now_utc(),
-                CIRCUIT_VERIFY_MAX_AGE,
-                usize::MAX,
-            )
-            .into_iter()
-            .filter(|bridge| active.contains(bridge))
-            .take(CIRCUIT_VERIFY_BATCH)
-            .collect::<Vec<_>>(),
+        Ok(store) => store.needing_circuit_verification(
+            OffsetDateTime::now_utc(),
+            CIRCUIT_VERIFY_MAX_AGE,
+            CIRCUIT_VERIFY_BATCH,
+            // Filter to the currently-active set BEFORE bounded selection: ranking
+            // the whole due pool down to the batch first could fill the batch with
+            // inactive bridges and starve the actives.
+            |bridge| active.contains(bridge),
+        ),
         Err(error) => {
             warn!(error = %error, "circuit-verify: failed to load bridge store");
             return;

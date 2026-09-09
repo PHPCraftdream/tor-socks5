@@ -16,6 +16,10 @@
 //!   publish (serialize + fsync + rename) run inside
 //!   `tokio::task::spawn_blocking`, so a slow disk cannot stall a Tokio
 //!   worker or the tasks queued behind it.
+//! * Publish snapshots are `Arc` clones taken in O(1) on the actor; the
+//!   actor mutates through `Arc::make_mut`, so the only deep copy happens
+//!   when a mutation lands while a publish is in flight — on the state
+//!   owner, never on the publish path or the blocking pool.
 //! * Publishes are coalesced: at most one publish is in flight at a time,
 //!   and mutations that arrive while it runs are absorbed into the same
 //!   in-memory snapshot and covered by one follow-up publish. K mutations
@@ -212,7 +216,7 @@ impl StoreWriter {
         let handle = tokio::spawn(async move {
             let path = actor_path;
             let mut retry = RetryState::new(initial_backoff);
-            let mut store: Option<BridgeStore> = None;
+            let mut store: Option<Arc<BridgeStore>> = None;
             let mut publishing = false;
             let mut mutations_since_publish: u32 = 0;
             let mut closing = false;
@@ -318,7 +322,7 @@ impl StoreWriter {
                                 })
                                 .await
                                 {
-                                    Ok(Ok(loaded)) => store = Some(loaded),
+                                    Ok(Ok(loaded)) => store = Some(Arc::new(loaded)),
                                     Ok(Err(error)) => {
                                         // Never apply to, or publish from, a
                                         // snapshot we failed to load.
@@ -335,7 +339,13 @@ impl StoreWriter {
                                     }
                                 }
                             }
-                            apply(store.as_mut().expect("store loaded above"));
+                            // make_mut deep-copies only when the Arc is
+                            // currently shared (a publish snapshot in
+                            // flight); the copy decision stays with the
+                            // state owner, not the publish path.
+                            apply(Arc::make_mut(
+                                store.as_mut().expect("store loaded above"),
+                            ));
                             // Acknowledge the absorption before publishing:
                             // the disk write is this actor's problem now.
                             let _ = ack.send(Ok(()));
@@ -411,7 +421,7 @@ impl StoreWriter {
 fn absorb_publish_result(
     res: Result<()>,
     retry: &mut RetryState,
-    store: &mut Option<BridgeStore>,
+    store: &mut Option<Arc<BridgeStore>>,
     mutations_since_publish: &mut u32,
 ) {
     match res {
@@ -441,7 +451,7 @@ fn absorb_publish_result(
 fn try_start_publish(
     publishing: &mut bool,
     retry: &mut RetryState,
-    store: &Option<BridgeStore>,
+    store: &Option<Arc<BridgeStore>>,
     mutations_since_publish: &mut u32,
     publish: &Publisher,
     done_tx: &mpsc::Sender<Result<()>>,
@@ -455,6 +465,7 @@ fn try_start_publish(
     {
         return;
     }
+    // O(1): just an Arc refcount bump, not a deep copy of the store.
     let snapshot = store.clone().expect("snapshot present above");
     let publish = publish.clone();
     let done_tx = done_tx.clone();

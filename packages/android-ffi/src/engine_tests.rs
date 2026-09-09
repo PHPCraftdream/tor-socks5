@@ -502,7 +502,7 @@ fn failed_circuit_verify_batch_advances_the_due_queue() {
     store.save().expect("seed store");
 
     let max_age = Duration::from_secs(24 * 60 * 60);
-    let batch1 = store.needing_circuit_verification(t0, max_age, 2);
+    let batch1 = store.needing_circuit_verification(t0, max_age, 2, |_| true);
     assert_eq!(
         batch1.len(),
         2,
@@ -517,7 +517,7 @@ fn failed_circuit_verify_batch_advances_the_due_queue() {
     // ahead of the never-attempted bridges, and a failed attempt is neither a
     // verification success nor a live outage.
     let reloaded = BridgeStore::load(store_path).expect("reload store");
-    let batch2 = reloaded.needing_circuit_verification(t0, max_age, 2);
+    let batch2 = reloaded.needing_circuit_verification(t0, max_age, 2, |_| true);
     assert_eq!(batch2.len(), 2, "the rest of the pool takes the next batch");
     for attempted in &batch1 {
         assert!(

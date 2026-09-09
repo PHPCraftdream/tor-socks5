@@ -256,6 +256,137 @@ async fn mutations_are_coalesced_while_a_publish_is_in_flight() {
     );
 }
 
+/// Copy-on-write regression: publish snapshots must be O(1) `Arc` clones,
+/// with the only deep copy happening inside `Arc::make_mut` on the actor —
+/// and only when a mutation lands while a publish is in flight.
+///
+/// Proof is by pointer identity between the actor's mutation target and the
+/// allocation the publisher observes:
+/// 1. With no publish in flight, the publisher must see the SAME allocation
+///    the actor mutated — the old code deep-cloned on the publish path, so
+///    the publisher saw a different allocation there.
+/// 2. A mutation while a publish is in flight must land on a fresh
+///    allocation (`make_mut` cloned the shared Arc; both allocations are
+///    simultaneously live, so the addresses cannot coincide).
+/// 3. The coalesced follow-up must publish that same new allocation — no
+///    second copy.
+/// 4. A quiet mutation (no publish in flight) must again cost zero clones.
+///    (We do not assert its address differs from the previous one: after a
+///    clean publish the actor drops its Arc, so the allocator may legally
+///    reuse the address.)
+#[tokio::test]
+async fn publish_snapshots_are_copy_on_write() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let b = test_bridge();
+    let path = config_path(dir.path());
+    seed_store(&path, &b);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let snapshots: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+    let addrs: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+    let (gate_tx, gate_rx) = oneshot::channel::<()>();
+    // The gate receiver is consumed once (blocking_recv takes self), so
+    // wrap it for the `Fn` publisher bound.
+    let gate = Mutex::new(Some(gate_rx));
+    let counter = calls.clone();
+    let snapshot_addrs = snapshots.clone();
+    let publisher: Publisher = Arc::new(move |s: &BridgeStore| {
+        // Record the snapshot allocation BEFORE bumping the counter, so an
+        // entry always exists by the time the counter shows the call.
+        snapshot_addrs
+            .lock()
+            .unwrap()
+            .push(s as *const BridgeStore as usize);
+        let n = counter.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            // Hold publish #1 in-flight until the test releases it.
+            let held = gate.lock().unwrap().take().expect("gate used once");
+            let _ = held.blocking_recv();
+        }
+        s.save()
+    });
+    let writer = StoreWriter::spawn(
+        BridgeStore::resolve_path(Some(&path)),
+        publisher,
+        INITIAL_BACKOFF,
+    );
+
+    // Mutation A: no publish in flight, so no copy anywhere — the publisher
+    // must observe the same allocation the actor mutated.
+    let b_a = b.clone();
+    let addrs_a = addrs.clone();
+    writer
+        .apply(move |s| {
+            addrs_a.store(s as *mut BridgeStore as usize, Ordering::SeqCst);
+            s.note_channel_success_at(&b_a, OffsetDateTime::now_utc());
+        })
+        .await
+        .expect("mutation A absorbed");
+    let addr_a = addrs.load(Ordering::SeqCst);
+    wait_for_calls(&calls, 1, "publish #1 started and is blocked on the gate").await;
+    assert_eq!(
+        snapshots.lock().unwrap()[0],
+        addr_a,
+        "publisher saw the same allocation the actor mutated: no deep copy on the publish path"
+    );
+
+    // Mutation B: publish #1 is in flight, the Arc is shared, so make_mut
+    // deep-copies exactly once and B lands on a fresh allocation.
+    let b_b = b.clone();
+    let addrs_b = addrs.clone();
+    writer
+        .apply(move |s| {
+            addrs_b.store(s as *mut BridgeStore as usize, Ordering::SeqCst);
+            s.note_channel_success_at(&b_b, OffsetDateTime::now_utc());
+        })
+        .await
+        .expect("mutation B absorbed");
+    let addr_b = addrs.load(Ordering::SeqCst);
+    assert_ne!(
+        addr_b, addr_a,
+        "make_mut cloned the shared Arc: the mutation got a fresh allocation"
+    );
+
+    // Release publish #1; the coalesced follow-up must publish B's
+    // allocation with no second copy.
+    gate_tx.send(()).expect("release the publish gate");
+    wait_for_calls(&calls, 2, "coalesced follow-up publish fired").await;
+    assert_eq!(
+        snapshots.lock().unwrap()[1],
+        addr_b,
+        "follow-up published B's allocation unchanged"
+    );
+
+    // Mutation C: quiet state (publish done, Arc unshared) — zero clones
+    // again. We deliberately do NOT assert addr_c != addr_b: after the
+    // clean publish the actor dropped its Arc, so the allocator may
+    // legally reuse that address.
+    let b_c = b.clone();
+    let addrs_c = addrs.clone();
+    writer
+        .apply(move |s| {
+            addrs_c.store(s as *mut BridgeStore as usize, Ordering::SeqCst);
+            s.note_channel_success_at(&b_c, OffsetDateTime::now_utc());
+        })
+        .await
+        .expect("mutation C absorbed");
+    let addr_c = addrs.load(Ordering::SeqCst);
+    wait_for_calls(&calls, 3, "quiet mutation triggered its own publish").await;
+    assert_eq!(
+        snapshots.lock().unwrap()[2],
+        addr_c,
+        "quiet publish again shares the actor's allocation"
+    );
+
+    wait_for_file_count(&path, &b, 3, "all three publishes persisted").await;
+    let closed = writer.close().await;
+    assert!(closed.is_ok(), "close after clean publishes: {closed:?}");
+    assert!(
+        leftover_tmp_files(dir.path()).is_empty(),
+        "no leftover temp files"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn backoff_gates_publish_attempts_under_a_continuous_mutation_stream() {
     let dir = tempfile::tempdir().expect("tempdir");
