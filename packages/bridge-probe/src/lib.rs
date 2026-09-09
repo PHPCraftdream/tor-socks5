@@ -13,16 +13,21 @@
 //! `resolve_probe_target` computes the correct `(host, port)` pair per
 //! transport before the TCP handshake.
 
+#[allow(unused_imports)]
 use std::collections::{BTreeMap, HashMap};
+#[allow(unused_imports)]
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use bridge_line::BridgeLine;
+#[allow(unused_imports)]
 use futures::stream::{self, StreamExt};
+#[allow(unused_imports)]
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
+#[allow(unused_imports)]
 use tokio::time::timeout;
 
 mod dns;

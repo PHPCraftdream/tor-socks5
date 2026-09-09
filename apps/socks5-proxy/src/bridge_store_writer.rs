@@ -583,5 +583,5 @@ pub(crate) async fn apply(
 }
 
 #[cfg(test)]
-#[path = "bridge_store_writer_tests.rs"]
+#[path = "bridge_store_writer_tests/mod.rs"]
 mod tests;
