@@ -12,8 +12,9 @@ const MAX_TRAILER_LINE: usize = 8192;
 const MAX_TRAILERS_TOTAL: usize = 64 * 1024;
 
 /// Incremental reader over `stream`, first consuming `pre` (bytes that
-/// arrived together with the response headers). Tolerates reads returning
-/// fewer bytes than requested (partial TCP reads).
+/// arrived together with the response headers). `pre` doubles as the
+/// read_line refill buffer. Tolerates reads returning fewer bytes than
+/// requested (partial TCP reads).
 struct ChunkedReader<'a, S: AsyncReadExt + Unpin> {
     stream: &'a mut S,
     pre: Vec<u8>,
@@ -38,6 +39,11 @@ impl<'a, S: AsyncReadExt + Unpin> ChunkedReader<'a, S> {
             self.pre_pos += avail;
             return Ok(avail);
         }
+        self.read_stream_block(out).await
+    }
+
+    /// One raw read from the underlying stream.
+    async fn read_stream_block(&mut self, out: &mut [u8]) -> Result<usize, FetchError> {
         self.stream.read(out).await.map_err(|e| FetchError::Io {
             op: "read chunked body",
             source: e,
@@ -59,27 +65,40 @@ impl<'a, S: AsyncReadExt + Unpin> ChunkedReader<'a, S> {
         Ok(())
     }
 
-    /// Read one CRLF-terminated line, byte at a time, bounded by `max`.
+    /// Read one CRLF-terminated line, bounded by `max`, scanning for `\n`
+    /// in the shared `pre` buffer and refilling it in blocks (not byte at
+    /// a time). Compacts `pre` once it is fully drained.
     async fn read_line(&mut self, max: usize, what: &str) -> Result<Vec<u8>, FetchError> {
-        let mut line = Vec::new();
-        let mut byte = [0u8; 1];
+        if self.pre_pos >= self.pre.len() {
+            self.pre.clear();
+            self.pre_pos = 0;
+        }
+        let mut scratch = [0u8; 4096];
+        let mut scan_from = self.pre_pos;
         loop {
-            let n = self.read_some(&mut byte).await?;
+            if let Some(off) = self.pre[scan_from..].iter().position(|&b| b == b'\n') {
+                let nl = scan_from + off;
+                if nl - self.pre_pos > max {
+                    return Err(FetchError::ChunkedEncoding(format!("{what} too long")));
+                }
+                let mut line = self.pre[self.pre_pos..nl].to_vec();
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                self.pre_pos = nl + 1;
+                return Ok(line);
+            }
+            if self.pre.len() - self.pre_pos > max {
+                return Err(FetchError::ChunkedEncoding(format!("{what} too long")));
+            }
+            scan_from = self.pre.len();
+            let n = self.read_stream_block(&mut scratch).await?;
             if n == 0 {
                 return Err(FetchError::ChunkedEncoding(format!(
                     "connection closed while reading {what}"
                 )));
             }
-            if byte[0] == b'\n' {
-                if line.last() == Some(&b'\r') {
-                    line.pop();
-                }
-                return Ok(line);
-            }
-            line.push(byte[0]);
-            if line.len() > max {
-                return Err(FetchError::ChunkedEncoding(format!("{what} too long")));
-            }
+            self.pre.extend_from_slice(&scratch[..n]);
         }
     }
 }
@@ -317,6 +336,115 @@ mod tests {
         // No newline at all.
         let err = decode(&data).await.unwrap_err();
         assert!(err.to_string().contains("too long"), "{err}");
+    }
+
+    /// Wraps a reader and counts how many `poll_read` calls it receives.
+    struct CountingReader<R> {
+        inner: R,
+        reads: usize,
+    }
+
+    impl<R: AsyncRead + Unpin> AsyncRead for CountingReader<R> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.reads += 1;
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    #[tokio::test]
+    async fn many_small_chunks_read_in_blocks() {
+        // Mixed, realistic (TLS-record-like) layout, NOT aligned to lines:
+        // 20 whole chunks as single 13-byte pieces, 17 chunks split across
+        // two pieces on a metadata boundary, and one 39-byte piece holding
+        // 3 chunks. Old byte-at-a-time code polls once per byte (~525+);
+        // block-read code polls ~once per piece (~55), so the threshold
+        // `reads * 3 < 525` fails it while passing the new one.
+        let mut dq = VecDeque::new();
+        let (whole, split, grouped) = (20, 17, 3);
+        for _ in 0..whole {
+            dq.push_back(b"8\r\n12345678\r\n".to_vec());
+        }
+        for _ in 0..split {
+            dq.push_back(b"8\r".to_vec());
+            dq.push_back(b"\n12345678\r\n".to_vec());
+        }
+        let mut big = Vec::new();
+        for _ in 0..grouped {
+            big.extend_from_slice(b"8\r\n12345678\r\n");
+        }
+        dq.push_back(big);
+        dq.push_back(b"0\r\n\r\n".to_vec());
+        let total_wire: usize = dq.iter().map(|p| p.len()).sum();
+        assert_eq!(total_wire, 40 * 13 + 5);
+
+        let mut r = CountingReader {
+            inner: PieceReader(dq),
+            reads: 0,
+        };
+        let out = decode_chunked_body(&mut r, &[], usize::MAX).await.unwrap();
+        assert_eq!(out, vec![b"12345678".as_slice(); 40].concat());
+        assert!(
+            r.reads * 3 < total_wire,
+            "reads={} for {total_wire} wire bytes: not block-read",
+            r.reads
+        );
+    }
+
+    #[tokio::test]
+    async fn large_trailer_section_read_in_blocks() {
+        let mut wire = b"0\r\nX-Big: ".to_vec();
+        wire.extend(std::iter::repeat_n(b'a', 6000));
+        wire.extend_from_slice(b"\r\n\r\n");
+        let mut r = CountingReader {
+            inner: PieceReader(pieces(&[&wire])),
+            reads: 0,
+        };
+        let out = decode_chunked_body(&mut r, &[], usize::MAX).await.unwrap();
+        assert!(out.is_empty());
+        // New code: ~2-3 4096-block polls; old byte-at-a-time: ~6014.
+        assert!(r.reads < 100, "reads={}: not block-read", r.reads);
+    }
+
+    #[tokio::test]
+    async fn pre_buffer_stays_bounded_over_many_chunks() {
+        let mut dq: VecDeque<Vec<u8>> = (0..40).map(|_| b"8\r\n12345678\r\n".to_vec()).collect();
+        dq.push_back(b"0\r\n\r\n".to_vec());
+        let mut counting = CountingReader {
+            inner: PieceReader(dq),
+            reads: 0,
+        };
+        let mut rdr = ChunkedReader::new(&mut counting, b"");
+        for _ in 0..40 {
+            assert_eq!(
+                rdr.read_line(MAX_SIZE_LINE, "chunk size line")
+                    .await
+                    .unwrap(),
+                b"8"
+            );
+            let mut body = [0u8; 8];
+            rdr.read_exact_into(&mut body).await.unwrap();
+            assert_eq!(&body, b"12345678");
+            let mut sep = [0u8; 2];
+            rdr.read_exact_into(&mut sep).await.unwrap();
+            assert_eq!(&sep, b"\r\n");
+        }
+        assert_eq!(
+            rdr.read_line(MAX_SIZE_LINE, "chunk size line")
+                .await
+                .unwrap(),
+            b"0"
+        );
+        assert!(rdr
+            .read_line(MAX_SIZE_LINE, "trailer line")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(rdr.pre.capacity() < 4096);
+        assert!(rdr.pre_pos <= rdr.pre.len());
     }
 
     #[tokio::test]
