@@ -134,6 +134,10 @@ impl std::fmt::Display for EngineStatus {
 /// - A `watch::Sender` to signal shutdown.
 /// - A `mpsc::Receiver` to wait for thread termination.
 /// - A `JoinHandle` to join the thread (if needed).
+///
+/// `Debug` is derived because `EngineSlot` (lib.rs) derives it and needs this
+/// type to be `Debug` too; all fields implement it.
+#[derive(Debug)]
 pub(crate) struct EngineHandle {
     pub stop_tx: tokio::sync::watch::Sender<bool>,
     pub done_rx: std::sync::mpsc::Receiver<()>,
@@ -167,6 +171,45 @@ pub(crate) struct ConnectionPolicy {
     pub block_onion: bool,
 }
 
+/// Final status publication at the end of `engine_main`. Skipped when this
+/// thread's generation is no longer current: a newer engine owns the global
+/// status. `done_tx.send(())` stays unconditional — the receiver always
+/// lives in the ENGINE slot's handle or in an in-flight nativeStop's parker,
+/// so it is never orphaned while a consumer could still need it.
+fn publish_final_status(generation: u64, status: EngineStatus) {
+    if crate::current_engine_generation() != generation {
+        info!(
+            generation,
+            current = crate::current_engine_generation(),
+            "stale engine generation: skipping final status publication for a newer engine"
+        );
+        return;
+    }
+    set_final_status(status);
+}
+
+/// `engine_async`'s teardown side effects (clear CURRENT_TUNNEL + the
+/// active-bridges file). Skipped as a unit when the generation is stale, so
+/// a late old engine can never wipe a newer engine's state. The early
+/// JVM-attach-failure path in `engine_main` and the mid-flight writes
+/// (`Starting(pct)` progress, `On(addr)`, startup `set_active_bridges`,
+/// `set_current_tunnel(Some(..))`) stay unguarded on purpose: the ENGINE
+/// slot only returns to `Idle` after the old thread was joined (see
+/// `EngineSlot`'s invariant doc), so no newer engine can exist while this
+/// thread is between those points.
+fn clear_shared_state(generation: u64, config_path: Option<&std::path::Path>) {
+    if crate::current_engine_generation() != generation {
+        info!(
+            generation,
+            current = crate::current_engine_generation(),
+            "stale engine generation: skipping teardown of shared state for a newer engine"
+        );
+        return;
+    }
+    set_current_tunnel(None);
+    crate::set_active_bridges(config_path, &[]);
+}
+
 /// Entry point for the dedicated engine thread.
 ///
 /// This function:
@@ -181,6 +224,10 @@ pub(crate) struct ConnectionPolicy {
 ///
 /// All errors are caught and translated to an `Error` status; panics are
 /// caught with `catch_unwind` and also translated to an error.
+// 8 parameters including `generation` — lifecycle bookkeeping that
+// belongs to neither existing struct (same rationale as
+// `BridgeHealthContext`'s bundling, which doesn't fit here).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn engine_main(
     settings: arti_wrapper::Settings,
     listen_addr: SocketAddr,
@@ -189,6 +236,7 @@ pub(crate) fn engine_main(
     done_tx: std::sync::mpsc::Sender<()>,
     java_callback: Arc<JavaCallback>,
     bridge_health: BridgeHealthContext,
+    generation: u64,
 ) {
     // Attach to the JVM for the entire lifetime of this thread. The guard
     // detaches on drop — `_attach` (and the `vm` it borrows) are the FIRST
@@ -253,6 +301,7 @@ pub(crate) fn engine_main(
                 java_callback,
                 failed_already_emitted,
                 bridge_health,
+                generation,
             )
             .await
         })
@@ -287,13 +336,17 @@ pub(crate) fn engine_main(
         }
     };
 
-    set_final_status(final_status);
+    publish_final_status(generation, final_status);
 
     // Notify the JNI side that we're done
     let _ = done_tx.send(());
 }
 
 /// Async engine body, runs inside a Tokio runtime.
+// 8 parameters including `generation` — lifecycle bookkeeping that
+// belongs to neither existing struct (same rationale as
+// `BridgeHealthContext`'s bundling, which doesn't fit here).
+#[allow(clippy::too_many_arguments)]
 async fn engine_async(
     mut settings: arti_wrapper::Settings,
     listen_addr: SocketAddr,
@@ -302,6 +355,7 @@ async fn engine_async(
     java_callback: Arc<JavaCallback>,
     failed_already_emitted: Arc<AtomicBool>,
     bridge_health: BridgeHealthContext,
+    generation: u64,
 ) -> Result<()> {
     // A start is the one moment we know nothing about the current network:
     // the user may have switched carriers, moved to Wi-Fi, or simply be
@@ -661,8 +715,7 @@ async fn engine_async(
     // Clearing the shared handle *before* dropping the local one matters: a
     // clone left behind in CURRENT_TUNNEL would keep the tunnel alive and
     // could let a concurrent nativeRefreshBridges call reach it mid-teardown.
-    set_current_tunnel(None);
-    crate::set_active_bridges(bridge_health.config_path.as_deref(), &[]);
+    clear_shared_state(generation, bridge_health.config_path.as_deref());
     info!("shutting down Tor client");
     drop(tunnel);
     tokio::time::sleep(Duration::from_millis(500)).await;

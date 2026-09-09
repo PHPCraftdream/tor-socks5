@@ -1,5 +1,96 @@
 use super::*;
 
+/// How long `nativeStop` waits for the engine thread (unchanged 10s contract).
+const STOP_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// First phase of `nativeStop`, run under the ENGINE lock. Pure state
+/// transition — no status writes, no waiting (side-effect-free so it is
+/// directly unit-testable).
+pub(crate) fn begin_engine_stop(slot: &mut EngineSlot) -> StopHandoff {
+    if matches!(slot, EngineSlot::Stopping(None)) {
+        return StopHandoff::InProgress;
+    }
+    let owned = std::mem::replace(slot, EngineSlot::Stopping(None));
+    match owned {
+        EngineSlot::Idle => {
+            *slot = EngineSlot::Idle;
+            StopHandoff::Idle
+        }
+        EngineSlot::Running(handle) | EngineSlot::Stopping(Some(handle)) => {
+            StopHandoff::Checkout(handle)
+        }
+        EngineSlot::Stopping(None) => {
+            unreachable!("Stopping(None) handled above: another nativeStop already owns the handle")
+        }
+    }
+}
+
+/// Second phase of `nativeStart`'s slot check, run under the ENGINE lock.
+/// Pure state transition (the join of a finished thread is the only effect,
+/// and it cannot block: the thread is already dead). `Err` carries the exact
+/// `IllegalStateException` message for the JNI caller.
+pub(crate) fn acquire_engine_slot_for_start(slot: &mut EngineSlot) -> Result<(), &'static str> {
+    match slot {
+        EngineSlot::Idle => Ok(()),
+        EngineSlot::Running(handle) => {
+            if handle.thread.is_finished() {
+                // Clean up the finished thread before reusing the slot.
+                let handle = std::mem::replace(slot, EngineSlot::Idle);
+                if let EngineSlot::Running(handle) = handle {
+                    let _ = handle.thread.join();
+                }
+                Ok(())
+            } else {
+                Err("torsocks5 engine already running; call nativeStop first")
+            }
+        }
+        EngineSlot::Stopping(_) => {
+            Err("torsocks5 engine is still stopping; call nativeStop again or wait")
+        }
+    }
+}
+
+/// While a checked-out engine handle is parked here, a `Drop` (normal or
+/// unwind) returns it to the slot as `Stopping(Some(_))` so the handle is
+/// never lost.
+struct StoppingParker(Option<EngineHandle>);
+
+impl Drop for StoppingParker {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            let engine_guard = get_engine().lock().unwrap_or_else(|p| p.into_inner());
+            let mut engine_guard = engine_guard;
+            if matches!(*engine_guard, EngineSlot::Stopping(None)) {
+                *engine_guard = EngineSlot::Stopping(Some(handle));
+            } else {
+                // Defensive: unreachable — only the `nativeStop` that checked
+                // the handle out can move the slot out of `Stopping(None)`.
+                let _ = handle.thread.join();
+            }
+        }
+    }
+}
+
+impl StoppingParker {
+    /// Take the handle out so `Drop` becomes a no-op for the normal paths.
+    fn release(mut self) -> Option<EngineHandle> {
+        self.0.take()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum StopHandoff {
+    /// Slot was `Idle`: nothing to stop.
+    Idle,
+    /// Slot was `Stopping(None)`: another `nativeStop` is already waiting on
+    /// the checked-out handle. Caller returns quietly (status is already
+    /// owned by that waiter).
+    InProgress,
+    /// The handle was checked out of the slot (slot is now
+    /// `Stopping(None)`); caller owns it until it parks it back or drops it.
+    Checkout(EngineHandle),
+}
+
 /// JNI entry point: `nativeStart(String configPath, BootstrapCallback callback)`
 ///
 /// See the crate-level documentation for the contract and error semantics.
@@ -25,22 +116,12 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
             })?
             .into();
 
-        // 2. Lock ENGINE and check if already running
+        // 2. Lock ENGINE and check the slot: refuse while a previous engine
+        // is still live or a stop is still in flight.
         let mut engine_guard = get_engine().lock().unwrap_or_else(|p| p.into_inner());
-
-        // If a previous handle exists and its thread is finished, clean it up
-        if let Some(handle) = engine_guard.as_ref() {
-            if handle.thread.is_finished() {
-                let old = engine_guard.take().unwrap();
-                let _ = old.thread.join();
-            } else {
-                // Engine still running
-                let _ = env.throw_new(
-                    "java/lang/IllegalStateException",
-                    "torsocks5 engine already running; call nativeStop first",
-                );
-                return Err(anyhow::anyhow!("engine already running"));
-            }
+        if let Err(msg) = acquire_engine_slot_for_start(&mut engine_guard) {
+            let _ = env.throw_new("java/lang/IllegalStateException", msg);
+            return Err(anyhow::anyhow!("{msg}"));
         }
 
         // 3. Load config synchronously
@@ -238,7 +319,13 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
         // 12. Set status to Starting
         set_status(EngineStatus::Starting(0));
 
-        // 13. Spawn engine thread
+        // 13. Spawn engine thread. The generation is bumped strictly BEFORE
+        // the spawn: bumping after would leave a window where the fresh
+        // thread's early teardown sees a stale global generation and wrongly
+        // skips its own error status. If the spawn fails the bump is simply
+        // unused — harmless (the slot is `Idle`, no live engine exists to be
+        // affected).
+        let generation = crate::next_engine_generation();
         let thread = match std::thread::Builder::new()
             .name("torsocks5-engine".into())
             .spawn(move || {
@@ -257,6 +344,7 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
                         bridges_cfg,
                         resolver_policy,
                     },
+                    generation,
                 )
             }) {
             Ok(thread) => thread,
@@ -273,7 +361,7 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
         };
 
         // 14. Store handle
-        *engine_guard = Some(EngineHandle {
+        *engine_guard = EngineSlot::Running(EngineHandle {
             stop_tx,
             done_rx,
             thread,
@@ -310,35 +398,55 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
 ) {
     // SAFETY: Wrapped in catch_unwind to prevent panic unwinding across FFI.
     let _ = panic::catch_unwind(AssertUnwindSafe(|| {
-        // Take the handle out of the global lock (if present)
-        let handle = {
+        // Phase 1 (under the lock): pure slot transition.
+        let handoff = {
             let mut guard = get_engine().lock().unwrap_or_else(|p| p.into_inner());
-            guard.take()
+            begin_engine_stop(&mut guard)
         };
 
-        if handle.is_none() {
-            // Idempotent: already stopped or never started
-            set_status(EngineStatus::Off);
-            return;
-        }
+        let parker = match handoff {
+            StopHandoff::Idle => {
+                // Idempotent: already stopped or never started
+                set_status(EngineStatus::Off);
+                return;
+            }
+            StopHandoff::InProgress => {
+                // Another nativeStop already owns the handle and the status.
+                return;
+            }
+            StopHandoff::Checkout(handle) => {
+                // Set status to Stopping
+                set_status(EngineStatus::Stopping);
 
-        let handle = handle.unwrap();
+                // Signal the engine thread to stop (ignore errors if already
+                // exited; re-sending on a re-attempt is harmless — same
+                // watch-channel value).
+                let _ = handle.stop_tx.send(true);
+                StoppingParker(Some(handle))
+            }
+        };
 
-        // Set status to Stopping
-        set_status(EngineStatus::Stopping);
-
-        // Signal the engine thread to stop (ignore errors if already exited)
-        let _ = handle.stop_tx.send(true);
-
-        // Wait for the engine thread to finish (with timeout)
-        match handle.done_rx.recv_timeout(Duration::from_secs(10)) {
+        // Wait for the engine thread to finish (with timeout), outside the lock.
+        let outcome = parker
+            .0
+            .as_ref()
+            .expect("parked above")
+            .done_rx
+            .recv_timeout(STOP_JOIN_TIMEOUT);
+        match outcome {
             Ok(()) => {
                 // Thread exited normally
+                let handle = parker.release().expect("parked above");
                 let _ = handle.thread.join();
+                let mut engine_guard = get_engine().lock().unwrap_or_else(|p| p.into_inner());
+                *engine_guard = EngineSlot::Idle;
                 set_status(EngineStatus::Off);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // Thread is wedged
+                // Thread is wedged. Dropping the parker returns the handle to
+                // the slot as `Stopping(Some(_))` — it is NOT lost; a repeated
+                // `nativeStop` re-waits on it and `nativeStart` stays refused.
+                drop(parker);
                 error!("nativeStop timed out waiting for engine thread to exit");
                 set_status(EngineStatus::Error(
                     "nativeStop timed out waiting for the engine thread".into(),
@@ -350,7 +458,10 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 // Thread panicked or was terminated abnormally
+                let handle = parker.release().expect("parked above");
                 let _ = handle.thread.join();
+                let mut engine_guard = get_engine().lock().unwrap_or_else(|p| p.into_inner());
+                *engine_guard = EngineSlot::Idle;
                 set_status(EngineStatus::Error(
                     "engine thread terminated abnormally".into(),
                 ));

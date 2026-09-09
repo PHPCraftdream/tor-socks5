@@ -537,3 +537,198 @@ fn failed_circuit_verify_batch_advances_the_due_queue() {
     }
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Serializes the generation-guard tests below: they touch the process-global
+/// `STATUS` and `ENGINE_GENERATION` statics, so they must not interleave with
+/// each other.
+static GENERATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// TS3-05 regression -- "поздний статус не затрагивает новое поколение": a
+/// stale engine generation's teardown (`clear_shared_state` +
+/// `publish_final_status`) must be silently skipped once a newer generation
+/// has been issued, so the NEW engine's live state (active-bridges file,
+/// final status) is never wiped by the OLD engine exiting late.
+///
+/// HOW the counterfactual fails: without the `current_engine_generation()
+/// != generation` guard, step 6 would clear the active-bridges file the new
+/// engine wrote in step 4 and overwrite its `On(..)` status with `Off` --
+/// both assertions in step 7 fail.
+#[test]
+fn stale_generation_teardown_does_not_touch_new_engine_state() {
+    use super::BridgeLine;
+    use crate::EngineStatus;
+
+    let _serial = GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+
+    fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "engine-stale-generation-test-{}-{}-{}-{tag}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir temp dir");
+        dir
+    }
+
+    let dir = unique_temp_dir("stale-teardown");
+    let cfg_path = dir.join("cfg.ktav");
+    let bridges_file = crate::active_bridges_path(Some(cfg_path.as_path()));
+
+    // `stale` becomes a genuinely superseded generation the moment the next
+    // one is issued; `_current` is the live generation that stands in for the
+    // "new engine" in this choreography.
+    let stale = crate::next_engine_generation();
+    let _current = crate::next_engine_generation();
+
+    let parse = |ip: &str, fp: &str, url: &str| {
+        format!("webtunnel {ip}:443 {fp} url={url}")
+            .parse::<BridgeLine>()
+            .expect("well-formed bridge line")
+    };
+    let bridge = parse(
+        "192.0.2.20",
+        "DDDD3333DDDD3333DDDD3333DDDD3333DDDD3333",
+        "https://stale-gen.example.test/x",
+    );
+
+    // Play the NEW engine: publish its state under the current generation.
+    crate::set_active_bridges(Some(cfg_path.as_path()), &[bridge]);
+    let on_status = EngineStatus::On("127.0.0.1:1080".parse().unwrap());
+    super::set_final_status(on_status.clone());
+
+    // Sanity: the preconditions the stale teardown must not disturb.
+    let before = std::fs::read_to_string(&bridges_file).expect("read bridges file");
+    assert!(!before.is_empty(), "active-bridges file must be non-empty");
+    let observed = crate::get_status()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    assert_eq!(
+        observed, on_status,
+        "status must be On before the stale teardown"
+    );
+
+    // The OLD generation's thread finally exits late: its teardown must be
+    // a no-op against the new engine's state.
+    super::clear_shared_state(stale, Some(cfg_path.as_path()));
+    super::publish_final_status(stale, EngineStatus::Off);
+
+    // Nothing changed: the file still carries the new engine's bridges and
+    // the status is still On.
+    let after = std::fs::read_to_string(&bridges_file).expect("read bridges file");
+    assert!(
+        !after.is_empty(),
+        "stale teardown wiped the active-bridges file"
+    );
+    assert_eq!(
+        after, before,
+        "stale teardown modified the active-bridges file"
+    );
+    let observed = crate::get_status()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    assert_eq!(
+        observed, on_status,
+        "stale teardown overwrote the new engine's status"
+    );
+
+    // `CURRENT_TUNNEL` sits behind the same single generation check inside
+    // `clear_shared_state`, but `TorTunnel` cannot be constructed without a
+    // live bootstrap, so the file + status observables stand in for it.
+
+    // Tidy: restore the status via the CURRENT generation so the test does
+    // not leave `On` behind for the rest of the suite.
+    super::publish_final_status(_current, EngineStatus::Off);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The generation guard must not swallow the NORMAL teardown path: when the
+/// generation still matches, `clear_shared_state` + `publish_final_status`
+/// really do clear the shared state (active-bridges file, status, tunnel).
+///
+/// Counterfactual: an over-broad guard (e.g. comparing against the wrong
+/// generation source, or skipping unconditionally after a refactor) would
+/// leave the active-bridges file non-empty and the status stale -- the file
+/// emptiness and `Off` assertions below fail. (The file is the real
+/// observable here: the tunnel slot was `None` before the call, so its
+/// clearing is only checked for absence of panic.)
+#[test]
+fn current_generation_teardown_still_clears_shared_state() {
+    use super::BridgeLine;
+    use crate::EngineStatus;
+
+    let _serial = GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+
+    fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "engine-current-generation-test-{}-{}-{}-{tag}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir temp dir");
+        dir
+    }
+
+    let dir = unique_temp_dir("current-teardown");
+    let cfg_path = dir.join("cfg.ktav");
+    let bridges_file = crate::active_bridges_path(Some(cfg_path.as_path()));
+
+    let parse = |ip: &str, fp: &str, url: &str| {
+        format!("webtunnel {ip}:443 {fp} url={url}")
+            .parse::<BridgeLine>()
+            .expect("well-formed bridge line")
+    };
+    let bridge = parse(
+        "192.0.2.21",
+        "EEEE4444EEEE4444EEEE4444EEEE4444EEEE4444",
+        "https://current-gen.example.test/x",
+    );
+
+    crate::set_active_bridges(Some(cfg_path.as_path()), &[bridge]);
+    let before = std::fs::read_to_string(&bridges_file).expect("read bridges file");
+    assert!(!before.is_empty(), "active-bridges file must be non-empty");
+
+    // The live generation; the teardown below must recognise it as current.
+    let gen = crate::current_engine_generation();
+
+    super::clear_shared_state(gen, Some(cfg_path.as_path()));
+    let after = std::fs::read_to_string(&bridges_file).expect("read bridges file");
+    assert_eq!(
+        after, "",
+        "current-generation teardown must clear the active-bridges file"
+    );
+
+    super::publish_final_status(gen, EngineStatus::Off);
+    let observed = crate::get_status()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    assert_eq!(
+        observed,
+        EngineStatus::Off,
+        "status must be Off after teardown"
+    );
+
+    // The cleared `set_current_tunnel(None)` ran without panic; it was
+    // `None` before, so the file above is the real observable.
+    assert!(
+        super::get_current_tunnel().is_none(),
+        "tunnel slot must be None after teardown"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

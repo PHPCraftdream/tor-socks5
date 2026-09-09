@@ -25,7 +25,8 @@
 //! - **Error Signaling:** Throws:
 //!   - `java.lang.IllegalArgumentException` — if `configPath` is null or unreadable as a string.
 //!   - `java.lang.IllegalStateException` — if the engine is already running (call `nativeStop` first),
-//!     or if bridges require a pluggable transport but `TOR_PT_BINARY` env var is not set.
+//!     the engine is still shutting down after a previous `nativeStop` (call `nativeStop` again or
+//!     wait), or if bridges require a pluggable transport but `TOR_PT_BINARY` env var is not set.
 //!   - `java.lang.RuntimeException` — if the config file is missing/malformed/unparseable, or the
 //!     engine thread could not be spawned, or a panic occurs.
 //!
@@ -37,6 +38,9 @@
 //!
 //! - **Threading:** May be called from any thread.
 //! - **Behavior:** Stops the engine gracefully. Idempotent — safe to call when already stopped.
+//!   On the 10s timeout the engine handle stays parked in the slot: status becomes `Error:<message>`,
+//!   a repeated `nativeStop` re-waits on the same handle, and `nativeStart` is refused until the
+//!   stop resolves.
 //! - **Error Signaling:** Throws `java.lang.RuntimeException` if the engine thread did not
 //!   exit within the 10s shutdown timeout (the engine stays wedged, holding the Tor state
 //!   directory; the process usually needs to be restarted at that point). Never throws
@@ -151,6 +155,7 @@ mod callback;
 mod engine;
 
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -166,9 +171,40 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use tracing::{error, info, warn};
 
-/// Global engine handle. Accessed via `OnceLock::get_or_init` for lazy initialization.
+/// Global engine slot. Accessed via `OnceLock::get_or_init` for lazy initialization.
 /// Uses `std::sync::Mutex` (not Tokio's) because JNI entry points are synchronous.
-static ENGINE: OnceLock<Mutex<Option<EngineHandle>>> = OnceLock::new();
+static ENGINE: OnceLock<Mutex<EngineSlot>> = OnceLock::new();
+
+/// State of the single engine slot. The invariant: the slot may only leave
+/// `Running`/`Stopping` for `Idle` after the engine thread has been joined
+/// (proven dead), so a live old thread and a newer engine can never coexist.
+#[derive(Debug)]
+pub(crate) enum EngineSlot {
+    /// No engine. A start may proceed.
+    Idle,
+    /// An engine thread is running.
+    Running(EngineHandle),
+    /// A stop has been signalled but the thread is not yet proven finished.
+    /// `Some(handle)`: the wait ended in a timeout (or no wait ran yet) and
+    /// the handle is parked for a follow-up `nativeStop` to re-wait on.
+    /// `None`: a `nativeStop` is *right now* waiting on the checked-out
+    /// handle (`mpsc::Receiver` is not `Clone`, so the wait needs ownership);
+    /// starts and further stops are refused either way.
+    Stopping(Option<EngineHandle>),
+}
+
+static ENGINE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Issue the generation id for a new engine start. MUST be called before the
+/// engine thread is spawned so the fresh thread can never observe a stale
+/// global generation and wrongly skip its own side effects.
+pub(crate) fn next_engine_generation() -> u64 {
+    ENGINE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+pub(crate) fn current_engine_generation() -> u64 {
+    ENGINE_GENERATION.load(Ordering::SeqCst)
+}
 
 /// Global engine status. This is what `nativeGetStatus` reads.
 static STATUS: OnceLock<Mutex<EngineStatus>> = OnceLock::new();
@@ -182,9 +218,9 @@ fn get_status() -> &'static Mutex<EngineStatus> {
     STATUS.get_or_init(|| Mutex::new(EngineStatus::Off))
 }
 
-/// Get or initialize the global engine handle, defaulting to `None`.
-fn get_engine() -> &'static Mutex<Option<EngineHandle>> {
-    ENGINE.get_or_init(|| Mutex::new(None))
+/// Get or initialize the global engine slot, defaulting to `EngineSlot::Idle`.
+fn get_engine() -> &'static Mutex<EngineSlot> {
+    ENGINE.get_or_init(|| Mutex::new(EngineSlot::Idle))
 }
 
 /// Path to the small file that carries "bridges known to be carrying traffic right now"

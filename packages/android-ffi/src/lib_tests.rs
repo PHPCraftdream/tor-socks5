@@ -106,3 +106,149 @@ fn test_progress_to_percent() {
         assert_eq!(percent, expected, "fraction={}", fraction);
     }
 }
+
+/// TS3-05 regression -- the core state-machine choreography: an engine that
+/// is wedged on teardown (its worker thread is still parked, `done_rx` never
+/// fires) must keep the slot in `Stopping`, so a parallel `nativeStart` is
+/// refused both mid-stop and after the 10s join timeout, while the parked
+/// handle stays available for a follow-up `nativeStop` to finish the job.
+///
+/// HOW the counterfactual fails: the old code's stop guard did
+/// `slot.take()` -> `None` as soon as the stop began, i.e. the slot went back
+/// to `Idle` (or a fresh start saw `Idle`) while the engine thread was still
+/// alive -- a parallel start would then win the slot and two engines would
+/// run concurrently. Here the mid-stop slot must be `Stopping(None)` and
+/// every `acquire_engine_slot_for_start` until the join completes must fail.
+///
+/// The tests deliberately use LOCAL `EngineSlot` values, not the global
+/// `ENGINE` static, so they can run in parallel with everything else.
+#[test]
+fn start_is_refused_until_a_parked_stop_resolves() {
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::Duration;
+
+    /// A live `EngineHandle` wired to channels the test controls: the
+    /// "engine" thread parks on `release_rx` until `release_tx` is dropped,
+    /// and `done_rx` only fires when the test sends on `done_tx`. No Tor,
+    /// no JVM -- exactly the shape `nativeStart` builds, minus the Tor work.
+    fn fake_engine_handle() -> (
+        EngineHandle,
+        std::sync::mpsc::Sender<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::Builder::new()
+            .name("ts3-05-test-engine".into())
+            .spawn(move || {
+                let _ = release_rx.recv();
+            })
+            .expect("spawn test engine thread");
+        (
+            EngineHandle {
+                stop_tx,
+                done_rx,
+                thread,
+            },
+            release_tx,
+            done_tx,
+        )
+    }
+
+    // 1. A live engine owns the slot.
+    let (handle, _release_tx, done_tx) = fake_engine_handle();
+    let mut slot = EngineSlot::Running(handle);
+
+    // 2. A parallel start on the live engine is refused.
+    match acquire_engine_slot_for_start(&mut slot) {
+        Err(msg) => assert!(
+            msg.contains("already running"),
+            "expected 'already running' refusal, got: {msg:?}"
+        ),
+        Ok(()) => panic!("start must be refused while an engine is running"),
+    }
+
+    // 3. First nativeStop: the handle is checked out for teardown, and the
+    //    slot does NOT return to Idle while the thread is still alive --
+    //    this is the old bug's exact failure (`guard.take()` -> `None`).
+    let handle = match begin_engine_stop(&mut slot) {
+        StopHandoff::Checkout(h) => h,
+        other => panic!("expected Checkout, got: {other:?}"),
+    };
+    assert!(
+        matches!(slot, EngineSlot::Stopping(None)),
+        "mid-stop slot must be Stopping(None), not Idle"
+    );
+
+    // 4. Parallel-start analogue on the mid-stop slot: refused.
+    match acquire_engine_slot_for_start(&mut slot) {
+        Err(msg) => assert!(
+            msg.contains("still stopping"),
+            "expected 'still stopping' refusal mid-stop, got: {msg:?}"
+        ),
+        Ok(()) => panic!("start must be refused while stopping"),
+    }
+
+    // 5. Simulate the wedged join wait without the production 10s: the
+    //    engine thread has not signalled done, so the wait times out.
+    match handle.done_rx.recv_timeout(Duration::from_millis(1)) {
+        Err(RecvTimeoutError::Timeout) => {}
+        other => panic!("expected RecvTimeoutError::Timeout, got: {other:?}"),
+    }
+
+    // 6. Post-timeout park -- what `StoppingParker`'s Drop does in
+    //    production: the checked-out handle goes back into the slot.
+    slot = EngineSlot::Stopping(Some(handle));
+
+    // 7. Start is STILL refused on the parked slot.
+    match acquire_engine_slot_for_start(&mut slot) {
+        Err(msg) => assert!(
+            msg.contains("still stopping"),
+            "expected 'still stopping' refusal on parked stop, got: {msg:?}"
+        ),
+        Ok(()) => panic!("start must be refused while a stop is parked"),
+    }
+
+    // 8. Follow-up nativeStop re-acquires the SAME handle: nothing was
+    //    lost or replaced, and the thread is still the live one.
+    let handle = match begin_engine_stop(&mut slot) {
+        StopHandoff::Checkout(h) => h,
+        other => panic!("expected Checkout again, got: {other:?}"),
+    };
+    assert!(
+        !handle.thread.is_finished(),
+        "the re-acquired handle must still be the live engine thread"
+    );
+
+    // 9. Resolve the stop: the engine signals done and exits. The fake
+    //    thread body only returns once `_release_tx` is dropped -- release
+    //    it here, before joining, or the join below hangs forever.
+    done_tx.send(()).expect("send done");
+    assert_eq!(handle.done_rx.recv(), Ok(()), "done must fire");
+    drop(_release_tx);
+    handle.thread.join().expect("engine thread exits cleanly");
+
+    // 10. Complete the stop as production does; now start succeeds.
+    slot = EngineSlot::Idle;
+    acquire_engine_slot_for_start(&mut slot).expect("start must succeed once the slot is Idle");
+}
+
+/// `begin_engine_stop` on an `EngineSlot::Idle` slot must be a no-op: it
+/// reports `StopHandoff::Idle` (nothing to tear down) and leaves the slot
+/// `Idle` -- counterfactually, an early `return` that overwrote the slot or
+/// returned `InProgress` would make the caller wait forever for a teardown
+/// that never started.
+#[test]
+fn begin_engine_stop_on_idle_slot_is_a_noop() {
+    let mut slot = EngineSlot::Idle;
+    let handoff = begin_engine_stop(&mut slot);
+    assert!(
+        matches!(handoff, StopHandoff::Idle),
+        "stop on Idle must report Idle, got: {handoff:?}"
+    );
+    assert!(
+        matches!(slot, EngineSlot::Idle),
+        "stop on Idle must leave the slot Idle"
+    );
+}
