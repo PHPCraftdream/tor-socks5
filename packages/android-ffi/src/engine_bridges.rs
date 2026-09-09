@@ -406,11 +406,13 @@ pub(super) fn persist_warm_results(pool: &WarmPool, bridge_health: &BridgeHealth
     }
 }
 
-/// Persist the background circuit-verify tick's results. Only successes are recorded
-/// (`BridgeStore::note_circuit_verified_at`) -- a failed end-to-end check does not demote the
-/// bridge or bump any failure counter, it simply stays due for the next tick, since a single
-/// timeout is routine (see `verify_bridges_sequential`'s doc) rather than proof the bridge is
-/// actually bad.
+/// Persist the background circuit-verify tick's results. Every completed attempt stamps
+/// `last_verification_attempt` (`BridgeStore::note_verification_attempt_at`) so a failed
+/// end-to-end check still advances the due queue instead of starving the rest of the pool;
+/// only successes additionally record a verification (`BridgeStore::note_circuit_verified_at`),
+/// mirroring the CLI side (`apps/socks5-proxy/src/bridge_verifier.rs`). A failed check does
+/// not demote the bridge or bump any failure counter -- a single timeout is routine (see
+/// `verify_bridges_sequential`'s doc) rather than proof the bridge is actually bad.
 pub(super) fn persist_circuit_verify_results(
     results: &[(BridgeLine, bool)],
     bridge_health: &BridgeHealthContext,
@@ -429,6 +431,16 @@ pub(super) fn persist_circuit_verify_results(
     };
     let now = OffsetDateTime::now_utc();
     for (bridge, ok) in results {
+        // Every entry in `results` is a completed check: `verify_bridges_sequential`'s
+        // collector runs only after `check_one_bridge` returns, never for a bridge whose
+        // attempt was skipped or cancelled. Stamping the attempt on failures too is what
+        // advances `needing_circuit_verification`'s due ranking (`last_verification_attempt`
+        // first, `last_verified` fallback) -- without it the first B channel-proven bridges
+        // with persistently failing checks stay the first B candidates on every watchdog
+        // tick, starving the rest of the pool. A failed attempt neither demotes the bridge
+        // nor bumps any failure counter: a single timeout is routine (see
+        // `verify_bridges_sequential`'s doc), not proof the bridge is actually bad.
+        store.note_verification_attempt_at(bridge, now);
         if *ok {
             store.note_circuit_verified_at(bridge, now);
         }

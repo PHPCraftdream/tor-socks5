@@ -429,3 +429,111 @@ fn concurrent_store_writers_do_not_lose_each_others_updates() {
         "writer A's warm result was lost to writer B's save"
     );
 }
+
+/// TS3-06 regression: a failed background circuit-verify batch must still advance the
+/// verification queue. Before the fix, `persist_circuit_verify_results` recorded only
+/// successes (`note_circuit_verified_at`), so the first B channel-proven, never-verified
+/// bridges with persistently failing checks stayed the first B candidates on every
+/// watchdog tick, starving the rest of the pool. The re-load from disk before the second
+/// selection covers the review's "survives re-reading the store" requirement.
+///
+/// Counterfactual: with the `note_verification_attempt_at` call in
+/// `persist_circuit_verify_results` removed (the pre-fix behaviour), batch 2 is batch 1
+/// again and the disjointness assertion below fails.
+#[test]
+fn failed_circuit_verify_batch_advances_the_due_queue() {
+    use super::bridges::persist_circuit_verify_results;
+    use super::{BridgeHealthContext, BridgeLine, BridgeStore, BridgesConfig};
+
+    fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "engine-circuit-verify-test-{}-{}-{}-{tag}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir temp dir");
+        dir
+    }
+
+    let dir = unique_temp_dir("failed-batch-advances");
+    let cfg_path = dir.join("cfg.ktav");
+    let ctx = BridgeHealthContext {
+        config_path: Some(cfg_path.clone()),
+        bridges_cfg: BridgesConfig::default(),
+        resolver_policy: bridge_probe::ResolverPolicy::default(),
+    };
+    let store_path = BridgeStore::resolve_path(Some(cfg_path.as_path()));
+
+    let parse = |ip: &str, fp: &str, url: &str| {
+        format!("webtunnel {ip}:443 {fp} url={url}")
+            .parse::<BridgeLine>()
+            .expect("well-formed bridge line")
+    };
+    let fingerprints = [
+        "1111111111111111111111111111111111111111",
+        "2222222222222222222222222222222222222222",
+        "3333333333333333333333333333333333333333",
+        "4444444444444444444444444444444444444444",
+    ];
+    let bridges: Vec<BridgeLine> = fingerprints
+        .iter()
+        .enumerate()
+        .map(|(i, fp)| {
+            parse(
+                &format!("192.0.2.2{i}"),
+                fp,
+                &format!("https://bridge-{i}.example.test/x"),
+            )
+        })
+        .collect();
+
+    // Seed four channel-proven, never-verified bridges: every one of them is due.
+    let t0 = time::OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+    let mut store = BridgeStore::load(store_path.clone()).expect("load empty store");
+    for bridge in &bridges {
+        store.note_source_at(bridge, "seed", t0);
+        store.note_channel_success_at(bridge, t0);
+    }
+    store.save().expect("seed store");
+
+    let max_age = Duration::from_secs(24 * 60 * 60);
+    let batch1 = store.needing_circuit_verification(t0, max_age, 2);
+    assert_eq!(
+        batch1.len(),
+        2,
+        "batch limit selects two of the four due bridges"
+    );
+
+    // The tick runs the batch, every check fails: persist all-false results.
+    let results: Vec<(BridgeLine, bool)> = batch1.iter().map(|b| (b.clone(), false)).collect();
+    persist_circuit_verify_results(&results, &ctx);
+
+    // Next tick re-reads the store from disk: the failed batch must no longer be
+    // ahead of the never-attempted bridges, and a failed attempt is neither a
+    // verification success nor a live outage.
+    let reloaded = BridgeStore::load(store_path).expect("reload store");
+    let batch2 = reloaded.needing_circuit_verification(t0, max_age, 2);
+    assert_eq!(batch2.len(), 2, "the rest of the pool takes the next batch");
+    for attempted in &batch1 {
+        assert!(
+            !batch2.contains(attempted),
+            "a failed check must not stay ahead of never-attempted bridges"
+        );
+        assert_eq!(
+            reloaded.verified_count(attempted),
+            0,
+            "an attempt is not a verification success"
+        );
+        assert_eq!(
+            reloaded.circuit_fails(attempted),
+            0,
+            "an isolated check failure is not a live outage"
+        );
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
