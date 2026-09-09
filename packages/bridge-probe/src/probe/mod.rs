@@ -24,8 +24,15 @@ pub use batch::{
 pub use dns_resolution::resolve_addrs;
 #[allow(unused_imports)]
 pub(crate) use dns_resolution::{
-    order_candidates, order_candidates_with_limit, race_doh_wave, race_first_answer, tcp_probe,
-    DohAttemptOutcome, MAX_PROBE_ADDRS,
+    coalesced_doh_lookup, order_candidates, order_candidates_with_limit, race_doh_wave,
+    race_first_answer, tcp_probe, DohAttemptOutcome, MAX_PROBE_ADDRS,
+};
+
+// TS6-05: test-only seam for the coalescing tests (counting wave searches
+// without network access); does not exist in non-test builds.
+#[cfg(test)]
+pub(crate) use dns_resolution::{
+    clear_fake_doh_wave_search, install_fake_doh_wave_search, FakeDohWaveSearch,
 };
 // `#[allow(unused_imports)]`: these re-exports keep the moved items
 // crate-visible exactly as their pre-split `pub(super)` did, even where only

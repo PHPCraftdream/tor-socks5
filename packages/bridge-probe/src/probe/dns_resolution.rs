@@ -233,6 +233,126 @@ pub(crate) async fn race_doh_wave(wave: &[usize], query: &str) -> Option<(Vec<Ip
     race_first_answer(query, attempts).await
 }
 
+/// Coalesced result of a wave-search across the configured DoH providers
+/// for one hostname: the resolved IPs with their TTL, or the failure
+/// reason if every provider (and every wave, up to [`DOH_MAX_WAVES`]) failed.
+pub(crate) type DohWaveResult = Result<(Vec<IpAddr>, Duration), String>;
+
+/// Registry of in-flight DoH wave lookups, keyed by hostname (TS6-05): two
+/// concurrent `resolve_addrs` calls for the SAME still-uncached host share
+/// ONE set of provider waves instead of each launching its own. Weak
+/// entries: once every waiter's `Arc` clone is dropped (the lookup finished
+/// and all callers consumed it), a later call for the same host either hits
+/// the long-term `cached_doh_answer` cache (already updated by
+/// `remember_doh_answer` inside the coalesced lookup below) or starts a
+/// fresh coalesced lookup. This naturally bounds the registry to the number
+/// of DISTINCT hostnames currently being actively resolved concurrently,
+/// itself bounded elsewhere (MAX_INFLIGHT_PROBES).
+static INFLIGHT_DOH: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Weak<tokio::sync::OnceCell<DohWaveResult>>>,
+    >,
+> = std::sync::OnceLock::new();
+
+/// Run (or join) the coalesced wave-search for `query`. Multiple concurrent
+/// callers for the same still-uncached hostname share ONE set of provider
+/// waves (TS6-05): only the "owner" (first to reach `get_or_init`) actually
+/// runs the wave loop and calls `remember_doh_answer`; every other waiter
+/// just receives a clone of the same result. Each caller applies its OWN
+/// port to the returned IPs afterward — this function never sees a port.
+///
+/// `tokio::sync::OnceCell::get_or_init` is cancel-safe by contract: when the
+/// owner's init future is dropped (an outer timeout, a cancelled probe), a
+/// waiter takes over the initialization instead of being left waiting, so
+/// one cancelled caller cannot forfeit a lookup the others still need.
+/// Failure is deliberately NOT remembered here: `resolve_addrs` only calls
+/// `remember_doh_failure` after its stale and persisted fallbacks also
+/// missed, because a negative entry would overwrite the very
+/// expired-but-fallback-eligible answer those fallbacks serve.
+pub(crate) async fn coalesced_doh_lookup(query: &str) -> DohWaveResult {
+    let registry =
+        INFLIGHT_DOH.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let cell: std::sync::Arc<tokio::sync::OnceCell<DohWaveResult>> = {
+        let mut map = registry.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(existing) = map.get(query).and_then(std::sync::Weak::upgrade) {
+            existing
+        } else {
+            let fresh = std::sync::Arc::new(tokio::sync::OnceCell::new());
+            map.insert(query.to_owned(), std::sync::Arc::downgrade(&fresh));
+            fresh
+        }
+    };
+    cell.get_or_init(|| async {
+        match doh_wave_search(query).await {
+            Some((ips, ttl)) => {
+                remember_doh_answer(query, &ips, ttl);
+                Ok((ips, ttl))
+            }
+            None => Err("all DoH providers failed".to_owned()),
+        }
+    })
+    .await
+    .clone()
+}
+
+/// The wave search one coalesced lookup runs per hostname: chunks of
+/// [`DOH_FANOUT`] providers, at most [`DOH_MAX_WAVES`] of them, stopping at
+/// the first wave with a non-empty answer. Factored out of `resolve_addrs`
+/// verbatim so the TS6-05 coalescing tests can count wave sets through the
+/// test seam below without touching the network.
+async fn doh_wave_search(query: &str) -> Option<(Vec<IpAddr>, Duration)> {
+    #[cfg(test)]
+    {
+        let fake = FAKE_DOH_WAVE_SEARCH
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(fake) = fake {
+            return fake(query).await;
+        }
+    }
+    let order = doh_order();
+    let mut resolved = None;
+    for wave in order.chunks(DOH_FANOUT).take(DOH_MAX_WAVES) {
+        if let Some(answer) = race_doh_wave(wave, query).await {
+            resolved = Some(answer);
+            break;
+        }
+    }
+    resolved
+}
+
+/// TS6-05 test seam: a stand-in for [`doh_wave_search`], so the coalescing
+/// tests can count how many wave sets the production lookup launches with
+/// zero network access. Never set outside test builds.
+#[cfg(test)]
+pub(crate) type FakeDohWaveSearch = std::sync::Arc<
+    dyn Fn(
+            &str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Option<(Vec<IpAddr>, Duration)>> + Send>,
+        > + Send
+        + Sync,
+>;
+
+#[cfg(test)]
+static FAKE_DOH_WAVE_SEARCH: std::sync::Mutex<Option<FakeDohWaveSearch>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn install_fake_doh_wave_search(fake: FakeDohWaveSearch) {
+    *FAKE_DOH_WAVE_SEARCH
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(fake);
+}
+
+#[cfg(test)]
+pub(crate) fn clear_fake_doh_wave_search() {
+    *FAKE_DOH_WAVE_SEARCH
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = None;
+}
+
 /// Resolve a `(host, port)` pair to the addresses worth trying, best first.
 ///
 /// Public so other crates that need to resolve a hostname without going
@@ -252,20 +372,19 @@ pub async fn resolve_addrs(
             // resolver below have its turn if policy allows one.
             Some(CacheHit::Unresolvable) => {}
             None => {
-                let order = doh_order();
-                let mut resolved = None;
-                for wave in order.chunks(DOH_FANOUT).take(DOH_MAX_WAVES) {
-                    if let Some(answer) = race_doh_wave(wave, query).await {
-                        resolved = Some(answer);
-                        break;
-                    }
-                }
-                match resolved {
-                    Some((ips, ttl)) => {
-                        remember_doh_answer(query, &ips, ttl);
-                        return Ok(order_candidates(&ips, port));
-                    }
-                    None => {
+                // TS6-05: several bridge lines of one fronting host are probed
+                // in parallel, and before coalescing each caller raced the
+                // providers on its own while the answer was still uncached.
+                // Join (or start) the ONE shared wave search instead. The
+                // winning answer is cached inside the coalesced lookup; on
+                // failure the fallback chain below runs exactly as before,
+                // and the failure is still remembered only after BOTH
+                // fallbacks missed -- remembering earlier would overwrite the
+                // expired-but-fallback-eligible entry `stale_fallback_answer`
+                // exists to serve.
+                match coalesced_doh_lookup(query).await {
+                    Ok((ips, _ttl)) => return Ok(order_candidates(&ips, port)),
+                    Err(_) => {
                         if let Some(stale) = stale_fallback_answer(query) {
                             tracing::warn!(
                                 host = %query,

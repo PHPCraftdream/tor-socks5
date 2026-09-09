@@ -3,6 +3,7 @@ use crate::*;
 use crate::{dns::*, probe::*};
 use bridge_line::BridgeLine;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
@@ -601,6 +602,217 @@ async fn race_doh_wave_with_no_valid_pool_indices_is_none() {
         elapsed < Duration::from_secs(2),
         "filtering everything out must return promptly; took {elapsed:?}"
     );
+}
+
+// TS6-05: concurrent resolutions of one still-uncached hostname must
+// coalesce into ONE DoH wave search. The `race_first_answer` mocks above stop
+// at the race boundary; these tests need the seam ABOVE the wave loop, so
+// `install_fake_doh_wave_search` stands in for the whole provider wave set
+// and counts how many wave sets the production lookup launches -- with zero
+// network access. The seam is process-wide and cargo runs tests in parallel
+// threads, so every fake-using test holds FAKE_WAVE_LOCK for its whole body.
+
+static FAKE_WAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A wave-search stand-in that counts how often it is started, optionally
+/// flags that start (for "the owner is now mid-lookup" coordination), waits
+/// `delay`, and then answers with `ips` (`win`) or fails (`!win`).
+fn counting_wave_fake(
+    counter: std::sync::Arc<AtomicUsize>,
+    ips: Vec<IpAddr>,
+    started: Option<std::sync::Arc<AtomicBool>>,
+    delay: Duration,
+    win: bool,
+) -> FakeDohWaveSearch {
+    std::sync::Arc::new(move |_query: &str| {
+        let counter = std::sync::Arc::clone(&counter);
+        let ips = ips.clone();
+        let started = started.clone();
+        Box::pin(async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            if let Some(flag) = &started {
+                flag.store(true, Ordering::SeqCst);
+            }
+            tokio::time::sleep(delay).await;
+            win.then(|| (ips, Duration::from_secs(300)))
+        })
+            as std::pin::Pin<
+                Box<dyn std::future::Future<Output = Option<(Vec<IpAddr>, Duration)>> + Send>,
+            >
+    })
+}
+
+#[tokio::test]
+async fn concurrent_resolves_of_one_host_share_one_doh_wave_search() {
+    let _serial = FAKE_WAVE_LOCK.lock().await;
+    let host = "coalesce-one-wave.test.invalid";
+    forget_dns_answer(host);
+
+    let searches = std::sync::Arc::new(AtomicUsize::new(0));
+    let answer_ips: Vec<IpAddr> = vec![
+        "203.0.113.10".parse().unwrap(),
+        "2001:db8::10".parse().unwrap(),
+    ];
+    install_fake_doh_wave_search(counting_wave_fake(
+        std::sync::Arc::clone(&searches),
+        answer_ips.clone(),
+        None,
+        Duration::from_millis(100),
+        true,
+    ));
+
+    // Both callers join BEFORE any answer exists: the fake's delay keeps the
+    // shared lookup in flight while the second caller reaches the registry.
+    let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            resolve_addrs(host, 443, ResolverPolicy::default()),
+            resolve_addrs(host, 8443, ResolverPolicy::default())
+        )
+    })
+    .await
+    .expect("both coalesced callers finish");
+
+    assert_eq!(
+        searches.load(Ordering::SeqCst),
+        1,
+        "two concurrent resolves of one host must run ONE wave search, not two"
+    );
+    assert_eq!(
+        first.expect("first caller resolves"),
+        order_candidates(&answer_ips, 443)
+    );
+    assert_eq!(
+        second.expect("second caller resolves"),
+        order_candidates(&answer_ips, 8443)
+    );
+
+    clear_fake_doh_wave_search();
+    forget_dns_answer(host);
+}
+
+#[tokio::test]
+async fn coalesced_waiters_each_apply_their_own_port() {
+    let _serial = FAKE_WAVE_LOCK.lock().await;
+    let host = "coalesce-ports.test.invalid";
+    forget_dns_answer(host);
+
+    let searches = std::sync::Arc::new(AtomicUsize::new(0));
+    let answer_ips: Vec<IpAddr> = vec![
+        "203.0.113.21".parse().unwrap(),
+        "2001:db8::21".parse().unwrap(),
+    ];
+    install_fake_doh_wave_search(counting_wave_fake(
+        std::sync::Arc::clone(&searches),
+        answer_ips.clone(),
+        None,
+        Duration::from_millis(100),
+        true,
+    ));
+
+    let results = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            resolve_addrs(host, 443, ResolverPolicy::default()),
+            resolve_addrs(host, 8443, ResolverPolicy::default()),
+            resolve_addrs(host, 9050, ResolverPolicy::default())
+        )
+    })
+    .await
+    .expect("all three coalesced callers finish");
+
+    assert_eq!(searches.load(Ordering::SeqCst), 1, "one shared wave search");
+    for (result, port) in [(results.0, 443), (results.1, 8443), (results.2, 9050)] {
+        assert_eq!(
+            result.expect("caller resolves"),
+            order_candidates(&answer_ips, port),
+            "each caller must get the shared IPs at its OWN port"
+        );
+    }
+
+    clear_fake_doh_wave_search();
+    forget_dns_answer(host);
+}
+
+#[tokio::test]
+async fn cancelling_the_lookup_owner_does_not_abandon_its_waiter() {
+    let _serial = FAKE_WAVE_LOCK.lock().await;
+    let host = "coalesce-cancel.test.invalid";
+    forget_dns_answer(host);
+
+    let searches = std::sync::Arc::new(AtomicUsize::new(0));
+    let owner_started = std::sync::Arc::new(AtomicBool::new(false));
+    let answer_ips: Vec<IpAddr> = vec!["203.0.113.22".parse().unwrap()];
+    install_fake_doh_wave_search(counting_wave_fake(
+        std::sync::Arc::clone(&searches),
+        answer_ips.clone(),
+        Some(std::sync::Arc::clone(&owner_started)),
+        Duration::from_millis(300),
+        true,
+    ));
+
+    let owner = tokio::spawn(resolve_addrs(host, 443, ResolverPolicy::default()));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !owner_started.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the owner must reach the fake wave search"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // The waiter parks on the shared cell while the owner is mid-lookup.
+    let waiter = tokio::spawn(resolve_addrs(host, 8443, ResolverPolicy::default()));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    owner.abort();
+
+    // tokio::sync::OnceCell::get_or_init is cancel-safe: dropping the owner's
+    // init future hands the initialization to the parked waiter instead of
+    // stranding it, so the surviving caller still gets its resolution.
+    let addrs = tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("the surviving waiter must still finish")
+        .expect("waiter task joins")
+        .expect("waiter gets the resolution");
+    assert_eq!(addrs, order_candidates(&answer_ips, 8443));
+    assert!(
+        searches.load(Ordering::SeqCst) >= 1,
+        "the lookup ran under whichever caller owned it"
+    );
+
+    clear_fake_doh_wave_search();
+    forget_dns_answer(host);
+}
+
+#[tokio::test]
+async fn a_finished_failed_coalesced_lookup_can_be_retried() {
+    let _serial = FAKE_WAVE_LOCK.lock().await;
+    let host = "coalesce-retry.test.invalid";
+    forget_dns_answer(host);
+
+    let searches = std::sync::Arc::new(AtomicUsize::new(0));
+    install_fake_doh_wave_search(counting_wave_fake(
+        std::sync::Arc::clone(&searches),
+        Vec::new(),
+        None,
+        Duration::ZERO,
+        false,
+    ));
+
+    let first = coalesced_doh_lookup(host).await;
+    assert!(first.is_err(), "all providers failing must surface as Err");
+    assert_eq!(searches.load(Ordering::SeqCst), 1);
+
+    // The first lookup finished and its cell is gone (only a Weak remains in
+    // the registry), so the failure must NOT stick: a later caller starts a
+    // fresh search instead of replaying the finished one.
+    let second = coalesced_doh_lookup(host).await;
+    assert!(second.is_err());
+    assert_eq!(
+        searches.load(Ordering::SeqCst),
+        2,
+        "a finished failed lookup must not stick in the registry"
+    );
+
+    clear_fake_doh_wave_search();
+    forget_dns_answer(host);
 }
 
 #[test]
