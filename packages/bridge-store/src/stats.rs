@@ -16,22 +16,23 @@ impl BridgeStore {
     /// whatever is passed on has to be already known good rather than merely
     /// plausible. A webtunnel bridge in particular can answer probes forever
     /// while the relay behind its website is long gone.
+    ///
+    /// Selection uses the bounded heap [`take_best`] instead of a full stable
+    /// sort: at every limit the result is identical to the previous stable
+    /// sort + take (entries tied under the ranking keep store map order), at
+    /// O(N log k) time and O(k) memory beyond the map's own references.
     pub fn channel_proven_bridges(&self, limit: usize) -> Vec<BridgeLine> {
-        let mut proven: Vec<&Entry> = self
-            .entries
-            .values()
-            .filter(|e| e.channel_ok_count > 0 && !e.is_retired())
-            .collect();
-        proven.sort_by(|a, b| {
-            b.last_channel_ok
-                .cmp(&a.last_channel_ok)
-                .then_with(|| b.channel_ok_count.cmp(&a.channel_ok_count))
-        });
-        proven
-            .into_iter()
-            .take(limit)
-            .map(|e| e.bridge.clone())
-            .collect()
+        take_best(
+            self.entries
+                .values()
+                .filter(|e| e.channel_ok_count > 0 && !e.is_retired())
+                .enumerate()
+                .map(|(position, entry)| ChannelProven { position, entry }),
+            limit,
+        )
+        .into_iter()
+        .map(|ranked| ranked.entry.bridge.clone())
+        .collect()
     }
 
     /// What each source has actually yielded, keyed by its label.
@@ -400,6 +401,41 @@ impl Ord for DueForVerification<'_> {
     }
 }
 impl PartialOrd for DueForVerification<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// The channel-proven ranking behind `channel_proven_bridges`, best first:
+/// most recent proven channel, then more proven channels.
+fn channel_proven_cmp(a: &Entry, b: &Entry) -> Ordering {
+    b.last_channel_ok
+        .cmp(&a.last_channel_ok)
+        .then_with(|| b.channel_ok_count.cmp(&a.channel_ok_count))
+}
+
+/// One candidate in `channel_proven_bridges`'s bounded heap. `Ord` is the
+/// ranking of `channel_proven_cmp` with the entry's position in the store map
+/// as the final tie-breaker -- the total order the previous stable sort
+/// implemented (entries equal under the ranking kept map order), made
+/// explicit so the heap selection reproduces it exactly.
+struct ChannelProven<'a> {
+    position: usize,
+    entry: &'a Entry,
+}
+
+impl PartialEq for ChannelProven<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for ChannelProven<'_> {}
+impl Ord for ChannelProven<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        channel_proven_cmp(self.entry, other.entry).then(self.position.cmp(&other.position))
+    }
+}
+impl PartialOrd for ChannelProven<'_> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }

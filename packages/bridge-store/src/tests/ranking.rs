@@ -439,3 +439,97 @@ fn take_best_keeps_the_candidate_buffer_bounded_by_limit() {
         peak.load(SeqCst)
     );
 }
+/// TS5-08 regression: entries tied under the channel-proven ranking keep the
+/// store's key order -- the order the previous stable sort gave them -- at
+/// every limit.
+#[test]
+fn channel_proven_bridges_keeps_map_order_for_equal_scores() {
+    let mut s = empty();
+    let t0 = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+    // Identical ranking fields (one proven channel at the same instant);
+    // map keys order by address: A < B < C.
+    for line in [OBFS4_A, OBFS4_B, OBFS4_C] {
+        let b = bridge(line);
+        s.record_at(b.clone(), Duration::from_millis(10), t0);
+        s.note_channel_success_at(&b, t0);
+    }
+    let a = bridge(OBFS4_A);
+    let b = bridge(OBFS4_B);
+    let c = bridge(OBFS4_C);
+
+    assert_eq!(s.channel_proven_bridges(0), Vec::<BridgeLine>::new());
+    assert_eq!(
+        s.channel_proven_bridges(1),
+        vec![a.clone()],
+        "k=1 takes the head"
+    );
+    assert_eq!(s.channel_proven_bridges(2), vec![a.clone(), b.clone()]);
+    assert_eq!(
+        s.channel_proven_bridges(3),
+        vec![a.clone(), b.clone(), c.clone()],
+        "k == N"
+    );
+    assert_eq!(
+        s.channel_proven_bridges(50),
+        vec![a, b, c],
+        "k >= N returns everything"
+    );
+}
+/// TS5-08 regression: at every limit (0, 1, mid-boundary, N, k >= N) the
+/// selected prefix is the same the old full stable sort produced: newest
+/// proven channel first, then more proven channels at equal recency, ties
+/// inside one (last_channel_ok, channel_ok_count) tier in store-key order;
+/// merely reachable (channel_ok_count == 0), retired, and never-probed
+/// entries are excluded.
+#[test]
+fn channel_proven_bridges_top_k_matches_full_ranking_at_every_limit() {
+    let mut s = empty();
+    let t0 = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+
+    let p1 = bridge(OBFS4_A);
+    s.record_at(p1.clone(), Duration::from_millis(10), t0);
+    s.note_channel_success_at(&p1, t0 + 3 * HOUR); // newest proven channel -> first
+    let p2 = bridge(OBFS4_B);
+    s.record_at(p2.clone(), Duration::from_millis(10), t0);
+    s.note_channel_success_at(&p2, t0 + 2 * HOUR);
+    // Proved at t0 + HOUR twice: same recency as the tied pair below, but a
+    // higher channel_ok_count ranks it above them.
+    let c_hi =
+        bridge("obfs4 2.2.2.2:443 3333333333333333333333333333333333333333 cert=CCC iat-mode=0");
+    s.record_at(c_hi.clone(), Duration::from_millis(10), t0);
+    s.note_channel_success_at(&c_hi, t0 + HOUR);
+    s.note_channel_success_at(&c_hi, t0 + HOUR);
+    // Fully tied pair (one proven channel at t0 + HOUR): key order 3.3.3.3 < 9.9.9.9.
+    let c_tie1 =
+        bridge("obfs4 3.3.3.3:443 4444444444444444444444444444444444444444 cert=DDD iat-mode=0");
+    let c_tie2 = bridge(OBFS4_C);
+    for b in [&c_tie1, &c_tie2] {
+        s.record_at((*b).clone(), Duration::from_millis(10), t0);
+        s.note_channel_success_at(b, t0 + HOUR);
+    }
+    // Merely reachable, channel_ok_count == 0: excluded.
+    let reachable =
+        bridge("obfs4 4.4.4.4:443 5555555555555555555555555555555555555555 cert=EEE iat-mode=0");
+    s.record_at(reachable.clone(), Duration::from_millis(10), t0);
+    // Channel-proven but retired: excluded despite the channel history.
+    let retired =
+        bridge("obfs4 5.5.5.5:443 6666666666666666666666666666666666666666 cert=FFF iat-mode=0");
+    s.record_at(retired.clone(), Duration::from_millis(10), t0);
+    s.note_channel_success_at(&retired, t0 + HOUR);
+    s.note_permanent_failure_at(&retired, t0 + HOUR);
+    // Never probed: excluded.
+    let unproven =
+        bridge("obfs4 6.6.6.6:443 7777777777777777777777777777777777777777 cert=GGG iat-mode=0");
+    s.note_source_at(&unproven, "test", t0);
+
+    let expected = vec![p1, p2, c_hi, c_tie1, c_tie2];
+    for limit in 0..=expected.len() {
+        assert_eq!(
+            s.channel_proven_bridges(limit),
+            expected[..limit],
+            "limit {limit}"
+        );
+    }
+    assert_eq!(s.channel_proven_bridges(0), Vec::<BridgeLine>::new());
+    assert_eq!(s.channel_proven_bridges(50), expected, "k >= N");
+}
