@@ -27,6 +27,11 @@
 //!   copy is destroyed; the actor's snapshot — including all previously
 //!   acknowledged and unpublished mutations — is retained, and the op's
 //!   ack resolves `Err`.
+//! * Retired snapshots are deallocated off the async worker as well: when
+//!   the actor swaps in a new snapshot after a mutation, or a clean publish
+//!   retires the retained one, the old `Arc` is handed to the blocking pool
+//!   for its drop (fire-and-forget `spawn_blocking`), so freeing a large
+//!   store never runs inline in the `select!` loop (TS6-04).
 //! * Publishes are coalesced: at most one publish is in flight at a time,
 //!   and mutations that arrive while it runs are absorbed into the same
 //!   in-memory snapshot and covered by one follow-up publish. K mutations
@@ -90,6 +95,12 @@ enum Op {
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
+/// TS6-04 test hook: per-writer log of the threads on which retired
+/// snapshot `Arc`s were actually dropped. Kept per `StoreWriter` (not
+/// process-global) so parallel tests in one binary never observe each
+/// other's retirements. In non-test builds nothing is ever pushed.
+type RetirementLog = Arc<Mutex<Vec<std::thread::ThreadId>>>;
+
 #[derive(Clone)]
 pub(crate) struct StoreWriter {
     tx: mpsc::Sender<Op>,
@@ -97,6 +108,12 @@ pub(crate) struct StoreWriter {
     /// The actor task's join handle; `close` takes it once (never double-
     /// awaited) and later close callers see `None`, meaning already joined.
     actor: Arc<Mutex<Option<JoinHandle<Result<()>>>>>,
+    /// TS6-04: where `drop_off_worker` records the thread each retirement
+    /// drop ran on. Test-only: `retirement_tests.rs` asserts every
+    /// retirement lands on a blocking-pool thread, never on the actor's
+    /// async worker.
+    #[cfg(test)]
+    retirements: RetirementLog,
 }
 
 /// Backoff bookkeeping for the retained, unpublished snapshot. Does not
@@ -223,8 +240,13 @@ impl StoreWriter {
     pub(crate) fn spawn(path: PathBuf, publish: Publisher, initial_backoff: Duration) -> Self {
         let (tx, mut rx) = mpsc::channel::<Op>(64);
         let actor_path = path.clone();
+        let retirements: RetirementLog = Arc::default();
+        #[cfg(test)]
+        let actor_retirements = Arc::clone(&retirements);
         let handle = tokio::spawn(async move {
             let path = actor_path;
+            #[cfg(test)]
+            let retirements = actor_retirements;
             let mut retry = RetryState::new(initial_backoff);
             let mut store: Option<Arc<BridgeStore>> = None;
             let mut publishing = false;
@@ -251,6 +273,7 @@ impl StoreWriter {
                                     &mut retry,
                                     &mut store,
                                     &mut mutations_since_publish,
+                                    &retirements,
                                 );
                                 try_start_publish(
                                     &mut publishing,
@@ -370,7 +393,15 @@ impl StoreWriter {
                             .await
                             {
                                 Ok(owned) => {
-                                    store = Some(owned);
+                                    // TS6-04: swap the new snapshot in; retire
+                                    // the OLD Arc on the blocking pool instead
+                                    // of dropping it inline here. If no publish
+                                    // job holds a clone right now (e.g. during
+                                    // retry backoff), this actor's `store` was
+                                    // the last strong reference and an inline
+                                    // drop would deallocate the whole
+                                    // BridgeStore map on this async worker.
+                                    drop_off_worker(store.replace(owned), Arc::clone(&retirements));
                                     // Acknowledge the absorption before
                                     // publishing: the disk write is this
                                     // actor's problem now.
@@ -431,6 +462,7 @@ impl StoreWriter {
                             &mut retry,
                             &mut store,
                             &mut mutations_since_publish,
+                            &retirements,
                         );
                         // A tail absorbed during the save gets its own
                         // coalesced publish immediately (backoff was reset).
@@ -462,6 +494,8 @@ impl StoreWriter {
             tx,
             path,
             actor: Arc::new(Mutex::new(Some(handle))),
+            #[cfg(test)]
+            retirements,
         }
     }
 }
@@ -476,6 +510,7 @@ fn absorb_publish_result(
     retry: &mut RetryState,
     store: &mut Option<Arc<BridgeStore>>,
     mutations_since_publish: &mut u32,
+    retirements: &RetirementLog,
 ) {
     match res {
         Ok(()) => {
@@ -483,10 +518,13 @@ fn absorb_publish_result(
             retry.record_success();
             if routine {
                 debug_assert!(!retry.dirty);
-                // Success with no tail: drop the snapshot so the next
+                // Success with no tail: retire the snapshot so the next
                 // mutation reloads the file and preserves whole-file writes
-                // made by other processes in the meantime.
-                *store = None;
+                // made by other processes in the meantime. Same pattern as
+                // the mutation-apply site: the Arc's drop runs on the
+                // blocking pool, not inline on this async worker (this
+                // function is called from the actor's select! loop).
+                drop_off_worker(store.take(), Arc::clone(retirements));
             } else {
                 // Mutations absorbed while the save ran stay dirty; the
                 // caller starts the coalesced follow-up publish.
@@ -496,6 +534,35 @@ fn absorb_publish_result(
         Err(error) => retry.record_failure(&error),
     }
     *mutations_since_publish = 0;
+}
+
+/// Retire an old snapshot's `Arc` on the blocking pool instead of dropping
+/// it inline in the actor's `select!` loop: when the actor's handle is the
+/// last strong reference (no mutation job or publish job holds a clone at
+/// that moment), the drop deallocates the whole `BridgeStore` map, and that
+/// free() must not run synchronously on an async worker. Fire-and-forget on
+/// purpose: there is nothing to observe about a plain deallocation and
+/// `Drop` cannot meaningfully fail here, so nobody awaits the handle — the
+/// `JoinHandle` is discarded explicitly because it is `#[must_use]`.
+///
+/// The per-writer [`RetirementLog`] lets `retirement_tests.rs` assert that
+/// each retirement actually runs on a blocking-pool thread, not on the
+/// actor's async worker thread.
+fn drop_off_worker(old: Option<Arc<BridgeStore>>, retirements: RetirementLog) {
+    if let Some(old) = old {
+        drop(tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            {
+                retirements
+                    .lock()
+                    .expect("retirement recorder poisoned")
+                    .push(std::thread::current().id());
+            }
+            #[cfg(not(test))]
+            let _ = &retirements;
+            drop(old);
+        }));
+    }
 }
 
 /// Start one publish on the blocking pool, unless one is already in flight,

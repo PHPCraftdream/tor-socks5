@@ -2,6 +2,7 @@ mod backoff_tests;
 mod coalescing_tests;
 mod external_cli_tests;
 mod panic_tests;
+mod retirement_tests;
 
 use super::*;
 use bridge_line::BridgeLine;
