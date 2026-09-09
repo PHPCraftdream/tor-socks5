@@ -251,6 +251,21 @@ impl PreparedTarget {
     }
 }
 
+/// Canonical WebTunnel network identity for dedup/pool keys: the same
+/// (host, port, path+query) triple the probe itself dials, computed via
+/// [`PreparedTarget`] so dedup and probing can never disagree about what
+/// counts as "the same endpoint". `None` for non-webtunnel bridges or when
+/// the params don't parse — the caller should then fall back to the plain
+/// (transport, addr, fingerprint) key, not drop the bridge.
+pub fn webtunnel_endpoint_identity(bridge: &BridgeLine) -> Option<(String, u16, String)> {
+    if bridge.transport.as_deref() != Some("webtunnel") {
+        return None;
+    }
+    PreparedTarget::new(&bridge.params)
+        .ok()
+        .map(|t| (t.dial_host, t.dial_port, t.request_target))
+}
+
 pub(super) fn resolve_probe_target(bridge: &BridgeLine) -> Result<(String, u16), String> {
     match bridge.transport.as_deref() {
         None | Some("obfs4") => Ok((bridge.addr.ip().to_string(), bridge.addr.port())),

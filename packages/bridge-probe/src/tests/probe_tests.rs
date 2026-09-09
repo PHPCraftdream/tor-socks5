@@ -602,3 +602,48 @@ async fn race_doh_wave_with_no_valid_pool_indices_is_none() {
         "filtering everything out must return promptly; took {elapsed:?}"
     );
 }
+
+#[test]
+fn webtunnel_identity_from_url() {
+    let bridge: BridgeLine = "webtunnel 9.9.9.9:443 1111111111111111111111111111111111111111 \
+         url=https://e.com/x ver=0.0.3"
+        .parse()
+        .unwrap();
+    assert_eq!(
+        webtunnel_endpoint_identity(&bridge),
+        Some(("e.com".to_string(), 443, "/x".to_string()))
+    );
+}
+
+#[test]
+fn webtunnel_identity_distinguishes_paths() {
+    let old: BridgeLine = "webtunnel 9.9.9.9:443 1111111111111111111111111111111111111111 \
+         url=https://e.com/old ver=0.0.3"
+        .parse()
+        .unwrap();
+    let new: BridgeLine = "webtunnel 9.9.9.9:443 1111111111111111111111111111111111111111 \
+         url=https://e.com/new ver=0.0.3"
+        .parse()
+        .unwrap();
+    let old_id = webtunnel_endpoint_identity(&old).unwrap();
+    let new_id = webtunnel_endpoint_identity(&new).unwrap();
+    assert_ne!(old_id, new_id, "different url paths must differ");
+}
+
+#[test]
+fn non_webtunnel_has_no_identity() {
+    let bridge: BridgeLine =
+        "obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA iat-mode=0"
+            .parse()
+            .unwrap();
+    assert_eq!(webtunnel_endpoint_identity(&bridge), None);
+}
+
+#[test]
+fn webtunnel_without_url_has_no_identity() {
+    let bridge: BridgeLine =
+        "webtunnel 9.9.9.9:443 1111111111111111111111111111111111111111 ver=0.0.3"
+            .parse()
+            .unwrap();
+    assert_eq!(webtunnel_endpoint_identity(&bridge), None);
+}

@@ -3,8 +3,12 @@
 use std::collections::HashSet;
 
 use bridge_line::BridgeLine;
+use bridge_probe::webtunnel_endpoint_identity;
 
-/// Dedup bridge lines by (transport, addr, fingerprint), keeping the first
+/// Dedup bridge lines by (transport, addr, fingerprint) plus, for webtunnel
+/// bridges, the canonical endpoint identity `(dial_host, dial_port,
+/// path+query)` from `bridge_probe::webtunnel_endpoint_identity` (non-webtunnel
+/// bridges get `None` there, so their dedup is unchanged). Keeps the first
 /// occurrence. Returns (unique, duplicates_count).
 #[must_use]
 pub fn dedup_bridges(bridges: Vec<BridgeLine>) -> (Vec<BridgeLine>, usize) {
@@ -12,7 +16,12 @@ pub fn dedup_bridges(bridges: Vec<BridgeLine>) -> (Vec<BridgeLine>, usize) {
     let mut unique = Vec::with_capacity(bridges.len());
     let mut dups = 0usize;
     for b in bridges {
-        let key = (b.transport.clone(), b.addr, b.fingerprint.clone());
+        let key = (
+            b.transport.clone(),
+            b.addr,
+            b.fingerprint.clone(),
+            webtunnel_endpoint_identity(&b),
+        );
         if seen.insert(key) {
             unique.push(b);
         } else {
@@ -45,6 +54,30 @@ obfs4 5.6.7.8:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=CCC iat-mode=0
         let (unique, dups) = dedup_bridges(vec![]);
         assert!(unique.is_empty());
         assert_eq!(dups, 0);
+    }
+
+    #[test]
+    fn dedup_keeps_webtunnel_bridges_with_different_urls() {
+        let body = "\
+webtunnel 9.9.9.9:443 1111111111111111111111111111111111111111 url=https://e.com/old ver=0.0.3
+webtunnel 9.9.9.9:443 1111111111111111111111111111111111111111 url=https://e.com/new ver=0.0.3
+";
+        let bridges = parse_bridges_from_body(body);
+        let (unique, dups) = dedup_bridges(bridges);
+        assert_eq!(unique.len(), 2);
+        assert_eq!(dups, 0);
+    }
+
+    #[test]
+    fn dedup_removes_webtunnel_exact_duplicates() {
+        let body = "\
+webtunnel 9.9.9.9:443 1111111111111111111111111111111111111111 url=https://e.com/x ver=0.0.3
+webtunnel 9.9.9.9:443 1111111111111111111111111111111111111111 url=https://e.com/x ver=0.0.3
+";
+        let bridges = parse_bridges_from_body(body);
+        let (unique, dups) = dedup_bridges(bridges);
+        assert_eq!(unique.len(), 1);
+        assert_eq!(dups, 1);
     }
 
     #[test]
