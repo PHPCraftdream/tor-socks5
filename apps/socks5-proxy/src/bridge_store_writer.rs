@@ -16,15 +16,17 @@
 //!   publish (serialize + fsync + rename) run inside
 //!   `tokio::task::spawn_blocking`, so a slow disk cannot stall a Tokio
 //!   worker or the tasks queued behind it.
-//! * The mutate step runs on the blocking pool too. Publish snapshots are
-//!   `Arc` clones taken in O(1) on the actor, but when a mutation lands
-//!   while a publish is in flight the shared snapshot forces `Arc::make_mut`
-//!   into a deep O(S) copy — that copy (and the mutation closure itself)
-//!   executes inside `spawn_blocking`, never on an async worker. The actor
-//!   waits for the mutation job before its next `select!` iteration, so
-//!   mutation order, acks and retry bookkeeping are unchanged. If the
-//!   mutation closure panics, the possibly half-mutated snapshot is dropped
-//!   (the next op reloads from disk) and the op's ack resolves `Err`.
+//! * The mutate step runs on the blocking pool too. Every mutation job
+//!   runs on a private deep copy inside `spawn_blocking`: the actor hands
+//!   the job a cheap `Arc` clone but keeps its own handle, so
+//!   `Arc::make_mut` inside the job is an unconditional O(S) deep copy —
+//!   an accepted per-mutation cost paid on the blocking pool, never on an
+//!   async worker. The actor waits for the mutation job before its next
+//!   `select!` iteration, so mutation order, acks and retry bookkeeping
+//!   are unchanged. If the mutation closure panics, only the job's private
+//!   copy is destroyed; the actor's snapshot — including all previously
+//!   acknowledged and unpublished mutations — is retained, and the op's
+//!   ack resolves `Err`.
 //! * Publishes are coalesced: at most one publish is in flight at a time,
 //!   and mutations that arrive while it runs are absorbed into the same
 //!   in-memory snapshot and covered by one follow-up publish. K mutations
@@ -347,17 +349,21 @@ impl StoreWriter {
                                     }
                                 }
                             }
-                            // Move the "maybe deep-clone, then mutate" step
-                            // off the async worker: with a publish snapshot
-                            // in flight the Arc is shared, so make_mut
-                            // deep-copies the whole store (O(S)) — that copy
-                            // must not stall this worker thread. Take
-                            // temporary ownership: the actor is the sole
-                            // owner of `store` outside this window and waits
-                            // for the job before the next select! iteration,
-                            // so ops stay strictly sequential.
-                            let mut owned = store.take().expect("store loaded above");
+                            // Move the "deep-clone, then mutate" step off
+                            // the async worker: the actor keeps its own
+                            // handle to the snapshot, so `Arc::make_mut`
+                            // inside the job always deep-copies the whole
+                            // store (O(S)) — that copy must not stall this
+                            // worker thread. Keep the actor's own Arc alive
+                            // while the job runs: the closure gets a cheap
+                            // Arc clone, so a panicking closure destroys
+                            // only its private copy. The actor's `store` is
+                            // never moved out, so a panic cannot discard
+                            // earlier acknowledged mutations riding in the
+                            // retained snapshot (TS5-06 regression guard).
+                            let cloned = store.clone().expect("store loaded above");
                             match tokio::task::spawn_blocking(move || {
+                                let mut owned = cloned;
                                 apply(Arc::make_mut(&mut owned));
                                 owned
                             })
@@ -385,20 +391,23 @@ impl StoreWriter {
                                     );
                                 }
                                 Err(join_error) => {
-                                    // The closure may have panicked
-                                    // mid-apply, leaving the snapshot's state
-                                    // unknown: treat it like an unreadable
-                                    // store (the load-failure branches above)
-                                    // — drop it so the NEXT op reloads fresh
-                                    // from disk, and report the failure
-                                    // instead of silently confirming an
-                                    // absorption that may not have happened
-                                    // (retry.dirty / try_start_publish are
-                                    // skipped, as on those branches).
+                                    // The closure panicked mid-apply and its
+                                    // private deep copy is gone, but the
+                                    // actor never handed over its own Arc:
+                                    // `store` still holds the last good
+                                    // snapshot, including all earlier
+                                    // acknowledged mutations and any
+                                    // retained-but-unpublished ones. Nothing
+                                    // to restore. This op's ack reports only
+                                    // that THIS mutation did not land;
+                                    // retry/dirty/publish bookkeeping is
+                                    // untouched, so the pending backoff
+                                    // retry still publishes the retained
+                                    // snapshot.
                                     warn!(
                                         error = %join_error,
                                         path = %path.display(),
-                                        "bridge health store mutation task panicked; store will reload on next op"
+                                        "bridge health store mutation task panicked",
                                     );
                                     let _ = ack.send(Err(anyhow!(
                                         "bridge health store mutation task panicked: {join_error}"
