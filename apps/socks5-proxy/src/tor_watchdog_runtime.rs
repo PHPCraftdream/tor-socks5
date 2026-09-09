@@ -228,7 +228,7 @@ pub(super) fn signal_budget_available(signals_sent: u32) -> bool {
     signals_sent < MAX_SIGNALS_PER_BRIDGE
 }
 
-/// Spawn the soft-failover watchdog as a detached tokio task.
+/// Spawn the soft-failover watchdog, returning its join handle for the shutdown join.
 ///
 /// There is no public arti API to ask "which bridge is currently the
 /// primary guard" (an architectural limitation of `arti-client`/
@@ -269,14 +269,19 @@ pub(super) fn signal_budget_available(signals_sent: u32) -> bool {
 /// this the same way it disables [`spawn_tor_watchdog`] — the two share one
 /// `[watchdog]` config section and one interval, since both read the same
 /// health data on the same cadence.
+///
+/// Shutdown: the `token` is selected against before every tick, so no new check
+/// starts after cancellation; the check already in flight runs to completion
+/// and the caller joins the handle before closing the bridge-store writer.
 pub fn spawn_bridge_failover_watchdog(
     handle: TorHandle,
     config_path: Option<PathBuf>,
     cfg: WatchdogConfig,
-) {
+    token: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
     if !cfg.enabled || cfg.check_interval_secs == 0 {
         info!("bridge soft-failover watchdog disabled");
-        return;
+        return None;
     }
 
     let interval = Duration::from_secs(cfg.check_interval_secs);
@@ -290,7 +295,7 @@ pub fn spawn_bridge_failover_watchdog(
         "bridge soft-failover watchdog armed"
     );
 
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticker.tick().await; // consume the immediate first tick
@@ -309,7 +314,11 @@ pub fn spawn_bridge_failover_watchdog(
         let task_start = OffsetDateTime::now_utc();
 
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => break,
+                _ = ticker.tick() => {},
+            }
 
             let Some(tor) = handle.tunnel().await else {
                 // Slot drained (shutdown in progress) — nothing to signal.
@@ -404,7 +413,7 @@ pub fn spawn_bridge_failover_watchdog(
                 }
             }
         }
-    });
+    }))
 }
 
 /// The healthiest single candidate among `candidates`, per the same
@@ -425,7 +434,7 @@ pub(super) fn healthiest(candidates: &[(BridgeLine, Health)]) -> Option<Health> 
         })
 }
 
-/// Spawn the stale-channel watchdog as a detached tokio task.
+/// Spawn the stale-channel watchdog, returning its join handle for the shutdown join.
 ///
 /// Every `check_interval` the task evaluates four trigger conditions (stale
 /// success, fresh attempts, alive bridges, and a failure-signature gate —
@@ -435,12 +444,22 @@ pub(super) fn healthiest(candidates: &[(BridgeLine, Health)]) -> Option<Health> 
 /// `enabled == false`) config disables it.
 ///
 /// Mirrors the shape of `spawn_bridge_maintenance` so the two background
-/// loops share a house style (detached, gentle, interval-based, logs-only
-/// on failure).
-pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: WatchdogConfig) {
+/// loops share a house style (gentle, interval-based, logs-only
+/// on failure; each returns its join handle so shutdown can join it after
+/// cancellation).
+///
+/// Shutdown: the `token` is selected against before every tick, so no new check
+/// starts after cancellation; the check already in flight runs to completion
+/// and the caller joins the handle before closing the bridge-store writer.
+pub fn spawn_tor_watchdog(
+    handle: TorHandle,
+    config_path: Option<PathBuf>,
+    cfg: WatchdogConfig,
+    token: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
     if !cfg.enabled || cfg.check_interval_secs == 0 {
         info!("tor stale-channel watchdog disabled");
-        return;
+        return None;
     }
 
     let interval = Duration::from_secs(cfg.check_interval_secs);
@@ -455,7 +474,7 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
         "tor stale-channel watchdog armed"
     );
 
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticker.tick().await; // consume the immediate first tick
@@ -481,7 +500,11 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
         let mut consecutive_failures: u32 = 0;
 
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => break,
+                _ = ticker.tick() => {},
+            }
 
             let health = handle.health();
             let now_secs = unix_secs();
@@ -678,7 +701,7 @@ pub fn spawn_tor_watchdog(handle: TorHandle, config_path: Option<PathBuf>, cfg: 
             // machinery's job, not this counter's.
             gated_ticks = 0;
         }
-    });
+    }))
 }
 
 /// Outcome of one [`heal`] attempt.

@@ -1,6 +1,13 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use std::path::Path;
+use std::sync::atomic::AtomicBool;
+
+use bridge_line::BridgeLine;
+use bridge_store::BridgeStore;
+use time::OffsetDateTime;
+
 fn disabled_cfg() -> UpstreamConfig {
     UpstreamConfig::default()
 }
@@ -552,5 +559,177 @@ fn handshake_deadline_error_is_classified_as_client() {
         classify_conn_failure(&err),
         (ConnStage::Handshake, ConnErrorKind::Client),
         "a deadline expiry is client-side misbehavior, not Other"
+    );
+}
+
+// -- shutdown_producers choreography ----------------------------------------
+
+/// Reload the on-disk bridge store for a test config path.
+fn reload_store(config_path: &Path) -> BridgeStore {
+    BridgeStore::load(BridgeStore::resolve_path(Some(config_path))).expect("reload store")
+}
+
+fn test_bridge_line() -> BridgeLine {
+    "obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA iat-mode=0"
+        .parse()
+        .expect("test bridge line parses")
+}
+
+fn wait_for_file_count(config_path: &Path, bridge: &BridgeLine, expected: u32) {
+    for _ in 0..5000 {
+        if reload_store(config_path).channel_ok_count(bridge) == expected {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    panic!("store never reached count {expected}");
+}
+
+/// TS3-04 regression: a producer caught mid-operation by a barrier when
+/// cancellation arrives must finish its operation AND its store write must
+/// land through the still-open writer BEFORE the writer closes. Emulates
+/// run_server()'s sequence: shutdown_producers (cancel → no-op drain →
+/// join), then writer close — the close_global equivalent.
+#[tokio::test]
+async fn shutdown_producers_delayed_write_lands_before_close() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bridge = test_bridge_line();
+    let config_path = dir.path().join("tor-socks5.ktav");
+    let mut store = reload_store(&config_path);
+    store.note_source_at(&bridge, "test", OffsetDateTime::now_utc());
+    store.save().expect("seed save");
+
+    // A real writer (the same actor the daemon's producers write through),
+    // locally spawned: the process-global OnceLock would leak this test's
+    // path into every other test in the binary.
+    let writer = crate::bridge_store_writer::StoreWriter::spawn(
+        BridgeStore::resolve_path(Some(&config_path)),
+        Arc::new(|s| s.save()),
+        Duration::from_secs(1),
+    );
+
+    let token = CancellationToken::new();
+    // Producer #1 is caught mid-operation ("warm_bridge" held by the
+    // barrier) when cancellation arrives; #2 finished long before. Both
+    // must be joined before the caller may close the writer.
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let iterations = Arc::new(AtomicUsize::new(0));
+    let apply_ok = Arc::new(AtomicBool::new(false));
+
+    let producer = {
+        let barrier = barrier.clone();
+        let iterations = iterations.clone();
+        let apply_ok = apply_ok.clone();
+        let bridge = bridge.clone();
+        let writer = writer.clone();
+        tokio::spawn(async move {
+            // The in-flight network operation, held by the barrier.
+            barrier.wait().await;
+            let result = writer
+                .apply(move |s| {
+                    s.note_channel_success_at(&bridge, OffsetDateTime::now_utc());
+                })
+                .await;
+            apply_ok.store(result.is_ok(), Ordering::SeqCst);
+            iterations.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    let quick = tokio::spawn(async {});
+
+    let all_joined = {
+        let token = token.clone();
+        let producers = vec![producer, quick];
+        tokio::spawn(async move {
+            shutdown_producers(token, producers, async {}, Duration::from_secs(60)).await
+        })
+    };
+    // The choreography always cancels first; hold the barrier until it has,
+    // so the producer's operation provably spans the cancellation.
+    while !token.is_cancelled() {
+        tokio::task::yield_now().await;
+    }
+    barrier.wait().await;
+
+    assert!(
+        all_joined.await.expect("choreography task joins"),
+        "both producers must finish within the join budget"
+    );
+    assert!(
+        apply_ok.load(Ordering::SeqCst),
+        "the delayed write must be accepted by the still-open writer"
+    );
+    assert_eq!(iterations.load(Ordering::SeqCst), 1);
+    // The result must already be persisted BEFORE the writer closes — the
+    // exact pre-fix loss: this write used to race close_global and vanish.
+    wait_for_file_count(&config_path, &bridge, 1);
+
+    // Only now does run()'s next step close the writer.
+    let closed = writer.close().await;
+    assert!(closed.is_ok(), "close after the joined write: {closed:?}");
+    assert_eq!(reload_store(&config_path).channel_ok_count(&bridge), 1);
+}
+
+/// TS3-04 regression: after cancellation a producer must not start another
+/// work iteration (its loop selects `cancelled()` before each tick).
+#[tokio::test(start_paused = true)]
+async fn shutdown_producers_no_new_iteration_after_cancel() {
+    let token = CancellationToken::new();
+    let iterations = Arc::new(AtomicUsize::new(0));
+    let producer = {
+        let token = token.clone();
+        let iterations = iterations.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await; // consume the immediate first tick
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => break,
+                    _ = ticker.tick() => {
+                        iterations.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }
+        })
+    };
+
+    // Let a few iterations run on the paused clock.
+    while iterations.load(Ordering::SeqCst) < 3 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    token.cancel();
+    let before = iterations.load(Ordering::SeqCst);
+    // The loop must break at its next cancellation check — immediately,
+    // since the token is already cancelled — instead of ticking on.
+    tokio::time::timeout(Duration::from_secs(5), producer)
+        .await
+        .expect("producer must stop after cancellation")
+        .expect("producer joins cleanly");
+    // No further iteration, even with the ticker long overdue.
+    tokio::time::sleep(Duration::from_secs(3600)).await;
+    assert_eq!(
+        iterations.load(Ordering::SeqCst),
+        before,
+        "no iteration may start after cancellation"
+    );
+}
+
+/// TS3-04 regression: a producer that never finishes (the shape of a stuck,
+/// uncancellable blocking job) must hit the bounded join budget and let
+/// shutdown continue — not hang the process forever.
+#[tokio::test(start_paused = true)]
+async fn shutdown_producers_hung_producer_hits_join_budget() {
+    let token = CancellationToken::new();
+    let observed = token.clone();
+    let hung = tokio::spawn(async {
+        std::future::pending::<()>().await;
+    });
+    let all_joined =
+        shutdown_producers(token, vec![hung], async {}, Duration::from_secs(100)).await;
+    assert!(!all_joined, "the hung producer must hit the join budget");
+    assert!(
+        observed.is_cancelled(),
+        "cancellation must have fired before the join wait"
     );
 }

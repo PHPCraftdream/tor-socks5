@@ -11,6 +11,7 @@ use arti_wrapper::Settings;
 use bridge_line::BridgeLine;
 use time::OffsetDateTime;
 use tokio::time::{Instant, MissedTickBehavior};
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::arti_observability::ObservationSink;
@@ -108,8 +109,9 @@ pub(crate) fn spawn(
     interval_mins: u64,
     observations: ObservationSink,
     mut active: Settings,
-) {
-    // Detached by design; the server runtime owns this single maintenance worker.
+    token: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    // The server runtime joins this handle at shutdown, so an in-flight refresh finishes and its store writes land before the bridge-store writer closes.
     tokio::spawn(async move {
         let mut ticker =
             tokio::time::interval(Duration::from_secs(interval_mins.saturating_mul(60).max(1)));
@@ -122,6 +124,8 @@ pub(crate) fn spawn(
         loop {
             if !first {
                 tokio::select! {
+                    biased;
+                    _ = token.cancelled() => break,
                     _ = async {
                         tokio::time::sleep_until(next_recovery).await;
                         handle.bridge_refresh().recovery().notified().await;
@@ -147,7 +151,7 @@ pub(crate) fn spawn(
             }
             next_allowed = Instant::now() + CONNECTION_REFRESH_INTERVAL;
         }
-    });
+    })
 }
 
 async fn refresh(

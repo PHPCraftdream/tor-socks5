@@ -43,6 +43,7 @@ use std::time::Duration;
 
 use bridge_line::BridgeLine;
 use time::OffsetDateTime;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::config::{Config, WarmPoolConfig};
@@ -241,14 +242,24 @@ pub(crate) fn candidates_with_health(
 /// attempt is logged at `warn!` and does not stop the remaining candidates
 /// from being warmed this tick. `cfg.enabled == false` (the default)
 /// disables the task entirely.
-pub fn spawn_bridge_warmer(handle: TorHandle, config_path: Option<PathBuf>, cfg: WarmPoolConfig) {
+///
+/// Shutdown: the `token` is selected against before every tick, so no new warm
+/// batch starts after cancellation; a `warm_bridge` handshake already in flight
+/// runs to completion and its successes are persisted before the caller joins
+/// the handle and closes the bridge-store writer.
+pub fn spawn_bridge_warmer(
+    handle: TorHandle,
+    config_path: Option<PathBuf>,
+    cfg: WarmPoolConfig,
+    token: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
     if !cfg.enabled {
         info!("bridge warm-pool disabled");
-        return;
+        return None;
     }
     if cfg.pool_size == 0 || cfg.refresh_interval_secs == 0 {
         info!("bridge warm-pool disabled (pool_size or refresh_interval_secs is 0)");
-        return;
+        return None;
     }
 
     let interval = Duration::from_secs(cfg.refresh_interval_secs);
@@ -260,13 +271,17 @@ pub fn spawn_bridge_warmer(handle: TorHandle, config_path: Option<PathBuf>, cfg:
         "bridge warm-pool armed"
     );
 
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticker.tick().await; // consume the immediate first tick
 
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => break,
+                _ = ticker.tick() => {},
+            }
 
             let Some(tor) = handle.tunnel().await else {
                 // Slot drained (shutdown in progress) — nothing to warm.
@@ -321,7 +336,7 @@ pub fn spawn_bridge_warmer(handle: TorHandle, config_path: Option<PathBuf>, cfg:
                 persist_warm_successes(config_path.as_deref(), warmed).await;
             }
         }
-    });
+    }))
 }
 
 /// Record channel-warm successes through the single writer (best-effort:

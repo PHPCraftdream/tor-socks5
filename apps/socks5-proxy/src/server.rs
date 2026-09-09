@@ -10,6 +10,7 @@ use arti_wrapper::TorTunnel;
 use auth::{AuthState, UsersConfig};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, Loaded, UpstreamConfig};
@@ -38,6 +39,16 @@ const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
 /// down the whole server. The sleep also prevents a busy-spin (and a log
 /// flood) if the error is persistent.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Upper bound on waiting for the background bridge-store producers
+/// (maintenance, watchdogs, warmer, circuit verifier) to finish their
+/// in-flight operation after cancellation. Must comfortably cover one
+/// in-flight verifier batch over a slow network, yet keep a stuck
+/// shutdown bounded: a producer still running past this budget is
+/// abandoned with a warning, and its racing store write is then rejected
+/// by the already-closed writer (logged there) rather than blocking
+/// shutdown forever.
+const PRODUCER_JOIN_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Where accepted connections egress. An enabled upstream SOCKS5 proxy
 /// replaces Tor entirely.
@@ -109,6 +120,14 @@ pub(crate) async fn run_server(
         Some(Arc::new(state))
     };
 
+    // Cancellation + join plumbing for the Tor-side background producers.
+    // Only the Tor egress spawns producers; the token and the collected
+    // join handles stay unused (and empty) on the upstream path. Created
+    // here so they outlive the egress match and are reachable from the
+    // shutdown path below.
+    let producer_token = CancellationToken::new();
+    let mut producers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
     // Resolve the egress. An enabled upstream SOCKS5 proxy (config or
     // CLI) takes over entirely and the Tor bootstrap is skipped;
     // otherwise we bootstrap Tor with the configured bridges as before.
@@ -168,18 +187,24 @@ pub(crate) async fn run_server(
             // health store so descriptor-mismatch / unsuitable bridges are
             // pruned alongside the TCP-dead ones. Reads the tunnel through
             // the handle so pool refreshes follow a watchdog rebuild.
-            crate::bridge_maintenance::spawn(
+            producers.push(crate::bridge_maintenance::spawn(
                 handle.clone(),
                 config_path.clone(),
                 cfg.bridges.recheck_interval_mins,
                 obs_sink.clone(),
                 settings,
-            );
+                producer_token.clone(),
+            ));
 
             // Stale-channel watchdog: rebuilds the `TorClient` when circuits
             // keep failing against TCP-reachable bridges (the half-open
-            // channel scenario). Detached; disabled by config when unwanted.
-            spawn_tor_watchdog(handle.clone(), config_path.clone(), cfg.watchdog);
+            // channel scenario). Joined at shutdown; disabled by config when unwanted.
+            producers.extend(spawn_tor_watchdog(
+                handle.clone(),
+                config_path.clone(),
+                cfg.watchdog,
+                producer_token.clone(),
+            ));
 
             // Soft-failover watchdog: nudges arti's guard manager away from
             // a specific bridge whose own circuit-layer health has degraded
@@ -187,17 +212,23 @@ pub(crate) async fn run_server(
             // alternative exists. Shares the `[watchdog]` config section and
             // check cadence with the stale-channel watchdog above; disabled
             // by the same `enabled`/`check_interval_secs` switches.
-            spawn_bridge_failover_watchdog(handle.clone(), config_path.clone(), cfg.watchdog);
+            producers.extend(spawn_bridge_failover_watchdog(
+                handle.clone(),
+                config_path.clone(),
+                cfg.watchdog,
+                producer_token.clone(),
+            ));
 
             // Bridge-channel warm-pool: keeps channels to the healthiest
             // candidate bridges open in the background, so a future
             // switch-over (not built here) does not pay for a cold
             // obfs4/webtunnel handshake. Opt-in; disabled by default.
-            crate::bridge_warmer::spawn_bridge_warmer(
+            producers.extend(crate::bridge_warmer::spawn_bridge_warmer(
                 handle.clone(),
                 config_path.clone(),
                 cfg.warm_pool,
-            );
+                producer_token.clone(),
+            ));
 
             // Periodic circuit-level bridge verification: every 30 min, checks
             // a small batch of channel-proven bridges for real end-to-end
@@ -206,10 +237,11 @@ pub(crate) async fn run_server(
             // android-ffi's background circuit-verify tick; it is self-paced
             // by store state (a tick with no due bridges is nearly free) and
             // uses the active pool but verifies through separate clients.
-            crate::bridge_verifier::spawn_bridge_circuit_verifier(
+            producers.push(crate::bridge_verifier::spawn_bridge_circuit_verifier(
                 config_path.clone(),
                 handle.clone(),
-            );
+                producer_token.clone(),
+            ));
 
             Egress::Tor(handle)
         }
@@ -245,24 +277,82 @@ pub(crate) async fn run_server(
     // leaks past this point. The upstream egress holds no such resources.
     if let Egress::Tor(handle) = egress {
         info!("stopping Tor client and pluggable transports");
-        drop(handle.drain().await);
+        // Order matters: cancel first (no producer starts a new work
+        // iteration), then drain the slot (in-flight tunnel reads see
+        // `None`), then wait — bounded — for the producers to finish their
+        // current operations, so their final store writes land before the
+        // writer closes below.
+        shutdown_producers(
+            producer_token,
+            producers,
+            async {
+                drop(handle.drain().await);
+            },
+            PRODUCER_JOIN_TIMEOUT,
+        )
+        .await;
         // Give arti's reactor a brief moment to flush the shutdown.
         // Empirically this is enough for the state-dir lock to be released
-        // before the next run starts.
+        // before the next run starts. No longer needed for writer ordering
+        // (the join above now guarantees the producers finished), but kept
+        // for the arti/PT teardown it was introduced for.
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // The bridge store writer's producers (maintenance, watchdogs,
-        // warmer, verifier) all read the Tor client through the handle just
-        // drained above, so they stop generating new updates here. Wait for
-        // the writer last: flush any retained snapshot and join its actor
-        // task, so a publish that only recovered after the last mutation
-        // is not silently lost when the runtime tears down.
+        // Wait for the writer last: flush any retained snapshot and join
+        // its actor task, so a publish that only recovered after the last
+        // mutation is not silently lost when the runtime tears down. With
+        // the producers joined above, nobody can write after this close.
         if let Some(Err(error)) = crate::bridge_store_writer::close_global().await {
             warn!(error = %error, "bridge health store had unpublished updates at shutdown");
         }
     }
     info!("bye");
     Ok(())
+}
+
+/// Shutdown choreography for the Tor-side background producers (bridge
+/// maintenance, both watchdogs, the warmer, the circuit verifier), in the
+/// order the bridge-store writer's contract requires:
+///
+/// 1. `token.cancel()` — every producer selects against `cancelled()`
+///    before its next tick, so no NEW work iteration starts after this.
+/// 2. `drain` runs — production passes the step that takes the tunnel out
+///    of the shared `TorHandle` slot, so late tunnel reads see `None`.
+/// 3. every producer task is joined, bounded by `join_timeout`. A producer
+///    caught mid-operation (a `warm_bridge` handshake, the verifier's
+///    non-cancellable `spawn_blocking` probe) finishes it and its final
+///    store write lands BEFORE the caller closes the writer. A producer
+///    still running past the budget is abandoned with a warning instead of
+///    blocking shutdown forever.
+///
+/// Returns `true` when every producer finished within the budget.
+async fn shutdown_producers(
+    token: CancellationToken,
+    producers: Vec<tokio::task::JoinHandle<()>>,
+    drain: impl std::future::Future<Output = ()>,
+    join_timeout: Duration,
+) -> bool {
+    token.cancel();
+    drain.await;
+    let joined = tokio::time::timeout(join_timeout, futures::future::join_all(producers)).await;
+    match joined {
+        Ok(results) => {
+            for result in results {
+                if let Err(error) = result {
+                    warn!(%error, "bridge-store producer task ended with a join error at shutdown");
+                }
+            }
+            true
+        }
+        Err(_elapsed) => {
+            warn!(
+                timeout = ?join_timeout,
+                "background bridge tasks did not finish in time; continuing shutdown — \
+                 their final store updates may be lost"
+            );
+            false
+        }
+    }
 }
 
 /// Decide whether to use an upstream SOCKS5 egress, applying the rule

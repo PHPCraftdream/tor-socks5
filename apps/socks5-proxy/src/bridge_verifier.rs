@@ -32,6 +32,7 @@ use bridge_line::BridgeLine;
 use bridge_store::BridgeStore;
 use time::OffsetDateTime;
 use tokio::time::MissedTickBehavior;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 /// Cadence of the background circuit-verify tick. Matches android's
@@ -106,27 +107,38 @@ pub(crate) async fn verify_for_admission(
     .await?
 }
 
-/// Spawn the detached background circuit-verify task.
+/// Spawn the background circuit-verify task, returning its join handle for the shutdown join.
 ///
 /// Deliberately differs from android's engine on the *first* tick: android's
 /// tick is due immediately, but at CLI boot the main client is still
 /// bootstrapping and the channel-proven pool is empty anyway, so the first
 /// interval is consumed (same pattern as `spawn_bridge_warmer` /
 /// `spawn_bridge_maintenance`) and checks only start one interval in.
+///
+/// Shutdown: the `token` is selected against before every tick, so no new
+/// verification batch starts after cancellation; a batch already in flight (a
+/// non-cancellable `spawn_blocking` job) runs to completion and its results are
+/// persisted before the caller joins the handle and closes the bridge-store
+/// writer.
 pub(crate) fn spawn_bridge_circuit_verifier(
     config_path: Option<PathBuf>,
     handle: crate::tor_watchdog::TorHandle,
-) {
+    token: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(CIRCUIT_VERIFY_INTERVAL);
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         tick.tick().await; // consume the immediate first tick (see doc above)
 
         loop {
-            tick.tick().await;
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => break,
+                _ = tick.tick() => {},
+            }
             run_circuit_verify_tick(config_path.as_deref(), &handle.active_bridges()).await;
         }
-    });
+    })
 }
 
 /// One tick: pick the due batch, verify it, persist the results.
