@@ -469,11 +469,28 @@ pub fn load_persisted_dns_cache(path: &std::path::Path) {
 /// Snapshots are taken under short-lived locks; the formatting and the
 /// file write run on tokio's blocking pool, so awaiting this from an async
 /// worker never blocks the runtime on formatting or disk I/O.
+///
+/// Concurrent or delayed saves to one path never interleave bytes and
+/// never publish a snapshot older than an already-published newer one:
+/// each call takes a per-path generation number, writes a temp file in
+/// the destination's directory, and publishes via an atomic rename only
+/// after a generation check under a per-path publication lock. A job
+/// superseded by a newer call skips publication (returning `Ok` --
+/// skipping is success, the newer snapshot is on disk) and removes its
+/// temp file. A cancelled caller cannot stop its already-dispatched
+/// blocking job, but that job is self-sufficient: the generation check
+/// makes it harmless. Residual limitation: the registry is keyed by the
+/// literal `path` spelling, so two different spellings of the same file
+/// are not mutually protected.
 pub async fn save_persisted_dns_cache(path: &std::path::Path) -> std::io::Result<()> {
     save_persisted_dns_cache_with_writer(path, |path, contents| std::fs::write(path, contents))
         .await
 }
 
+/// Like [`save_persisted_dns_cache`], but the write itself goes through
+/// `write`, which receives the TEMP file path (not the final one): the
+/// shared publication code performs the generation check and the atomic
+/// rename from temp to final after `write` returns.
 pub(super) async fn save_persisted_dns_cache_with_writer(
     path: &std::path::Path,
     write: impl FnOnce(&std::path::Path, &str) -> std::io::Result<()> + Send + 'static,
@@ -515,6 +532,20 @@ pub(super) async fn save_persisted_dns_cache_with_writer(
     }; // disk_fallback_store() lock released -- no locks held from here on
 
     let path = path.to_owned();
+    // Allocate this call's generation: the counter lives behind a per-path
+    // mutex, so a job that later reads `latest == gen` truly was the newest
+    // call at check time. The registry lock is released before the job's
+    // inner locks are ever taken (outer registry first, never nested with
+    // inner locks).
+    let gen = {
+        let state = persist_path_generation_slot(&path);
+        let mut generation = state.generation.lock().unwrap_or_else(|p| p.into_inner());
+        *generation += 1;
+        *generation
+    };
+    // The spawned job is self-sufficient: even if this caller's future is
+    // cancelled and the JoinHandle detaches, the generation check below
+    // keeps a superseded job from publishing stale data.
     tokio::task::spawn_blocking(move || {
         let lines: Vec<String> = live_snapshot
             .into_iter()
@@ -529,7 +560,45 @@ pub(super) async fn save_persisted_dns_cache_with_writer(
                 )
             })
             .collect();
-        write(&path, &lines.join("\n"))
+        let contents = lines.join("\n");
+        let Some(file_name) = path.file_name() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("persist path has no file name: {}", path.display()),
+            ));
+        };
+        // Same directory as the final path, so the rename stays on one
+        // filesystem and is atomic.
+        let temp_path = path.with_file_name(format!(
+            "{}.{}.{}.tmp",
+            file_name.to_string_lossy(),
+            std::process::id(),
+            gen
+        ));
+        if let Err(error) = write(&temp_path, &contents) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(error);
+        }
+        // Publication critical section: check-then-rename under the per-path
+        // publish lock, so publications to one path are serialized and no
+        // stale job can rename after a newer call's job. Lock order: the
+        // state mutex is only taken inside this section (while the publish
+        // lock is held), never the other way around, and no lock spans an
+        // await (all of this is inside spawn_blocking).
+        let state = persist_path_generation_slot(&path);
+        let publish_guard = state.publish_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let latest = *state.generation.lock().unwrap_or_else(|p| p.into_inner());
+        if gen != latest {
+            // A newer save call has started; this job's snapshot is stale.
+            // Skipping publication is success -- the newer snapshot wins.
+            let _ = std::fs::remove_file(&temp_path);
+            return Ok(());
+        }
+        // MoveFileEx(MOVEFILE_REPLACE_EXISTING) on Windows, rename(2) on
+        // Unix: both atomically replace the destination.
+        let result = std::fs::rename(&temp_path, &path);
+        drop(publish_guard);
+        result
     })
     .await
     .unwrap_or_else(|join_error| {
@@ -537,6 +606,40 @@ pub(super) async fn save_persisted_dns_cache_with_writer(
             "bridge-probe DNS persist task panicked: {join_error}"
         )))
     })
+}
+
+/// Per-path save state: the latest allocated generation number plus the
+/// publication lock serializing check-then-rename for this path. Two
+/// separate mutexes so the publish lock can be taken without the state
+/// mutex held (lock order: publish_lock, then the generation mutex).
+struct PersistPathState {
+    generation: std::sync::Mutex<u64>,
+    publish_lock: std::sync::Mutex<()>,
+}
+
+impl Default for PersistPathState {
+    fn default() -> Self {
+        Self {
+            generation: std::sync::Mutex::new(0),
+            publish_lock: std::sync::Mutex::new(()),
+        }
+    }
+}
+
+/// Registry of per-path save state, keyed by the caller-provided path. The
+/// key space is closed (the config-provided persist path; one in
+/// production), so the map cannot grow unboundedly.
+static PERSIST_PATH_STATES: OnceLock<
+    std::sync::Mutex<HashMap<std::path::PathBuf, std::sync::Arc<PersistPathState>>>,
+> = OnceLock::new();
+
+/// The state slot for `path`: lock the outer registry map, insert-or-get the
+/// Arc, clone it, and drop the registry guard -- the outer mutex is never
+/// held while an inner lock is taken.
+fn persist_path_generation_slot(path: &std::path::Path) -> std::sync::Arc<PersistPathState> {
+    let registry = PERSIST_PATH_STATES.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut map = registry.lock().unwrap_or_else(|p| p.into_inner());
+    map.entry(path.to_owned()).or_default().clone()
 }
 
 /// Raw data for one persisted line, cloned out from under a mutex so

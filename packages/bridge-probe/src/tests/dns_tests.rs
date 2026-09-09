@@ -654,6 +654,202 @@ async fn save_persisted_dns_cache_does_not_block_the_async_worker() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A save whose job is still mid-flight when a newer save completes must
+/// skip publication entirely: the newer snapshot stays on disk, nothing is
+/// interleaved, and no temp file is left behind.
+#[tokio::test]
+async fn superseded_save_must_not_publish_stale_snapshot() {
+    let host_b = "superseded-b.test.invalid";
+    let host_extra = "superseded-extra.test.invalid";
+    let ip1: IpAddr = "203.0.113.91".parse().unwrap();
+    let extra_ip: IpAddr = "203.0.113.92".parse().unwrap();
+    let ip2: IpAddr = "203.0.113.93".parse().unwrap();
+
+    // A's snapshot: long (two entries), seeded with an older stamp.
+    remember_doh_answer(host_b, &[ip1], Duration::from_secs(3000));
+    remember_doh_answer(host_extra, &[extra_ip], Duration::from_secs(3000));
+
+    let dir = std::env::temp_dir().join(format!(
+        "superseded-save-{}-{}",
+        std::process::id(),
+        now_unix()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("dns-cache.txt");
+
+    // Save A: held mid-write by the writer until we release it.
+    let executor_thread = std::thread::current().id();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let save_a = {
+        let path = path.clone();
+        tokio::spawn(async move {
+            save_persisted_dns_cache_with_writer(&path, move |path, contents| {
+                assert_ne!(std::thread::current().id(), executor_thread);
+                let _ = entered_tx.send(());
+                release_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .map_err(std::io::Error::other)?;
+                std::fs::write(path, contents)?;
+                Ok(())
+            })
+            .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(10), entered_rx)
+        .await
+        .expect("save A reaches its blocking phase")
+        .expect("writer A signals entry");
+
+    // Now the state changes under A: B's snapshot is short and different.
+    forget_dns_answer(host_extra);
+    remember_doh_answer(host_b, &[ip2], Duration::from_secs(3000));
+    save_persisted_dns_cache(&path)
+        .await
+        .expect("save B must succeed");
+
+    // Release A: it must detect it was superseded and skip publication.
+    release_tx.send(()).expect("release writer A");
+    let result_a = tokio::time::timeout(Duration::from_secs(10), save_a)
+        .await
+        .expect("released save A completes")
+        .expect("save A task joins");
+    assert!(
+        result_a.is_ok(),
+        "a superseded save skips publication and returns Ok, got: {result_a:?}"
+    );
+
+    let file_text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        file_text.contains(&format!("{host_b}	{ip2}")),
+        "the newer snapshot must be published, got: {file_text}"
+    );
+    assert!(
+        !file_text.contains(&ip1.to_string()),
+        "the stale IP must not survive, got: {file_text}"
+    );
+    assert!(
+        !file_text.contains(host_extra),
+        "the dropped host must not survive, got: {file_text}"
+    );
+    // Other tests running in parallel share the process-wide disk fallback
+    // store, so foreign hosts may legitimately appear in the snapshot; every
+    // line for OUR hosts must parse (no mixture/tail residue).
+    let our_hosts = [host_b, host_extra];
+    for line in file_text.lines() {
+        let foreign = !our_hosts.iter().any(|host| line.starts_with(host));
+        assert!(
+            foreign || parse_persisted_line(line).is_some(),
+            "every own line must parse, got: {line}"
+        );
+    }
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "superseded saves must remove their temp files, found: {leftovers:?}"
+    );
+
+    forget_dns_answer(host_b);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A cancelled caller cannot stop its already-dispatched blocking job; the
+/// generation check must keep that detached job from clobbering the newer
+/// snapshot a subsequent save published.
+#[tokio::test]
+async fn cancelled_caller_leaves_latest_snapshot_intact() {
+    let host_b = "cancel-b.test.invalid";
+    let host_extra = "cancel-extra.test.invalid";
+    let ip1: IpAddr = "203.0.113.94".parse().unwrap();
+    let extra_ip: IpAddr = "203.0.113.95".parse().unwrap();
+    let ip2: IpAddr = "203.0.113.96".parse().unwrap();
+
+    remember_doh_answer(host_b, &[ip1], Duration::from_secs(3000));
+    remember_doh_answer(host_extra, &[extra_ip], Duration::from_secs(3000));
+
+    let dir = std::env::temp_dir().join(format!(
+        "cancelled-save-{}-{}",
+        std::process::id(),
+        now_unix()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("dns-cache.txt");
+
+    // Save A: held mid-write, and its caller is aborted while it waits.
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (written_tx, written_rx) = tokio::sync::oneshot::channel();
+    let save_a = {
+        let path = path.clone();
+        tokio::spawn(async move {
+            save_persisted_dns_cache_with_writer(&path, move |path, contents| {
+                let _ = entered_tx.send(());
+                release_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .map_err(std::io::Error::other)?;
+                std::fs::write(path, contents)?;
+                let _ = written_tx.send(());
+                Ok(())
+            })
+            .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(10), entered_rx)
+        .await
+        .expect("save A reaches its blocking phase")
+        .expect("writer A signals entry");
+    save_a.abort(); // caller future cancelled while job A runs detached
+
+    // B wins the race and publishes the fresh, short snapshot.
+    forget_dns_answer(host_extra);
+    remember_doh_answer(host_b, &[ip2], Duration::from_secs(3000));
+    save_persisted_dns_cache(&path)
+        .await
+        .expect("save B must succeed");
+
+    // Release A: its job still finishes the temp write (the point of the
+    // test), then must skip publication.
+    release_tx.send(()).expect("release writer A");
+    tokio::time::timeout(Duration::from_secs(10), written_rx)
+        .await
+        .expect("detached job A resumes after release")
+        .expect("writer A signals the temp write");
+
+    let file_text = std::fs::read_to_string(&path).unwrap();
+    // Other tests running in parallel share the process-wide disk fallback
+    // store, so foreign hosts may legitimately appear; OUR host must appear
+    // exactly once, fully parsed, with nothing stale alongside it.
+    for line in file_text.lines() {
+        assert!(
+            !line.starts_with(host_b) || parse_persisted_line(line).is_some(),
+            "every own line must parse, got: {line}"
+        );
+    }
+    assert_eq!(
+        file_text
+            .lines()
+            .filter(|line| line.starts_with(host_b))
+            .count(),
+        1,
+        "exactly B's snapshot line must survive for the host, got: {file_text}"
+    );
+    assert!(
+        file_text.contains(&format!("{host_b}	{ip2}")),
+        "the newer snapshot must be published, got: {file_text}"
+    );
+    assert!(
+        !file_text.contains(&ip1.to_string()) && !file_text.contains(host_extra),
+        "the stale snapshot must not survive, got: {file_text}"
+    );
+    forget_dns_answer(host_b);
+    forget_dns_answer(host_extra);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn parse_dns_hint_line_rejects_future_timestamps() {
     let host = "hint-future.test.invalid";
