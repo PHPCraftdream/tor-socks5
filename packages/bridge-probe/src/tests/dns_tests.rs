@@ -1,4 +1,3 @@
-use crate::dns::persist_write_gate;
 use crate::dns::*;
 use crate::*;
 use bridge_line::BridgeLine;
@@ -597,13 +596,7 @@ async fn save_keeps_a_valid_disk_answer_when_the_live_answer_is_past_the_stale_w
     disk_fallback_store().lock().unwrap().remove(host);
 }
 
-/// TS5-07 regression: while `save_persisted_dns_cache`'s blocking-pool phase
-/// (formatting + file write) is held in flight, an INDEPENDENT async task on
-/// the same runtime must still run its timer to completion. Under the old
-/// synchronous placement the whole save ran on the calling worker, so no
-/// timer could fire while it was in progress. The gate lives behind
-/// `#[cfg(test)]` in `dns.rs`; it stays closed well past the watchdog's
-/// deadline, so the ordering below is deterministic, not a timing race.
+/// A blocked save must leave the executor and cache available.
 #[tokio::test]
 async fn save_persisted_dns_cache_does_not_block_the_async_worker() {
     let host = "save-off-worker.test.invalid";
@@ -614,47 +607,41 @@ async fn save_persisted_dns_cache_does_not_block_the_async_worker() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("dns-cache.txt");
 
-    persist_write_gate::reset();
+    let executor_thread = std::thread::current().id();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
     let save = {
         let path = path.clone();
         tokio::spawn(async move {
-            save_persisted_dns_cache(&path)
-                .await
-                .expect("save must succeed");
-            tokio::time::Instant::now()
+            save_persisted_dns_cache_with_writer(&path, move |path, contents| {
+                assert_ne!(std::thread::current().id(), executor_thread);
+                let _ = entered_tx.send(());
+                release_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .map_err(std::io::Error::other)?;
+                std::fs::write(path, contents)
+            })
+            .await
         })
     };
 
-    // Bounded wait until the save has actually reached its blocking-pool
-    // phase (its snapshot phase under the mutex has completed by then).
-    let mut waited = Duration::ZERO;
-    while !persist_write_gate::entered() {
-        tokio::time::sleep(Duration::from_millis(1)).await;
-        waited += Duration::from_millis(1);
-        assert!(
-            waited < Duration::from_secs(10),
-            "save never reached its blocking-pool phase"
-        );
-    }
-
-    // The watchdog fires 50ms in; the gate is only released at 100ms, so the
-    // timer MUST complete while the save is still in flight.
-    let watchdog = tokio::spawn(async {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        tokio::time::Instant::now()
-    });
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    persist_write_gate::release();
-
-    let (save_done_at, watchdog_at) = tokio::join!(save, watchdog);
-    let save_done_at = save_done_at.expect("save task joins");
-    let watchdog_at = watchdog_at.expect("watchdog task joins");
-    assert!(
-        watchdog_at < save_done_at,
-        "an independent async task must make progress while the save's \
-         blocking phase is in flight (watchdog fired at {watchdog_at:?}, \
-         save finished at {save_done_at:?})"
-    );
+    tokio::time::timeout(Duration::from_secs(10), entered_rx)
+        .await
+        .expect("save reaches its blocking phase")
+        .expect("writer signals entry");
+    let lookup = tokio::spawn(async move { cached_doh_answer(host) });
+    let hit = tokio::time::timeout(Duration::from_secs(10), lookup)
+        .await
+        .expect("cache lookup progresses during save")
+        .expect("lookup task joins");
+    assert!(matches!(hit, Some(CacheHit::Addrs(addrs)) if addrs == vec![ip]));
+    assert!(!save.is_finished(), "writer still awaits release");
+    release_tx.send(()).expect("release this writer");
+    tokio::time::timeout(Duration::from_secs(10), save)
+        .await
+        .expect("released save completes")
+        .expect("save task joins")
+        .expect("save succeeds");
 
     // Semantics unchanged: the held save still landed everything it should.
     let file_text = std::fs::read_to_string(&path).unwrap();

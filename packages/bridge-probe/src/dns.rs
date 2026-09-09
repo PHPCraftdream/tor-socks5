@@ -470,6 +470,14 @@ pub fn load_persisted_dns_cache(path: &std::path::Path) {
 /// file write run on tokio's blocking pool, so awaiting this from an async
 /// worker never blocks the runtime on formatting or disk I/O.
 pub async fn save_persisted_dns_cache(path: &std::path::Path) -> std::io::Result<()> {
+    save_persisted_dns_cache_with_writer(path, |path, contents| std::fs::write(path, contents))
+        .await
+}
+
+pub(super) async fn save_persisted_dns_cache_with_writer(
+    path: &std::path::Path,
+    write: impl FnOnce(&std::path::Path, &str) -> std::io::Result<()> + Send + 'static,
+) -> std::io::Result<()> {
     let now_instant = Instant::now();
     let live_snapshot: Vec<PersistSnapshot> = {
         let cache = doh_cache().lock().unwrap_or_else(|p| p.into_inner());
@@ -508,8 +516,6 @@ pub async fn save_persisted_dns_cache(path: &std::path::Path) -> std::io::Result
 
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || {
-        #[cfg(test)]
-        persist_write_gate::hold_until_released();
         let lines: Vec<String> = live_snapshot
             .into_iter()
             .chain(disk_snapshot)
@@ -523,7 +529,7 @@ pub async fn save_persisted_dns_cache(path: &std::path::Path) -> std::io::Result
                 )
             })
             .collect();
-        std::fs::write(&path, lines.join("\n"))
+        write(&path, &lines.join("\n"))
     })
     .await
     .unwrap_or_else(|join_error| {
@@ -539,41 +545,6 @@ struct PersistSnapshot {
     host: String,
     addrs: Vec<IpAddr>,
     resolved_at_unix: u64,
-}
-
-/// Test-only gate for `dns_tests.rs`' "does not block the async worker"
-/// regression: holds `save_persisted_dns_cache`'s blocking-pool phase in
-/// flight while the test proves an independent timer still runs. Compiled
-/// out of every non-test build.
-#[cfg(test)]
-pub(crate) mod persist_write_gate {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
-
-    static ENTERED: AtomicBool = AtomicBool::new(false);
-    static RELEASE: AtomicBool = AtomicBool::new(false);
-
-    pub(crate) fn reset() {
-        RELEASE.store(false, Ordering::SeqCst);
-        ENTERED.store(false, Ordering::SeqCst);
-    }
-
-    /// Called on the blocking pool; parks the persist task until the test
-    /// releases it.
-    pub(super) fn hold_until_released() {
-        ENTERED.store(true, Ordering::SeqCst);
-        while !RELEASE.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-
-    pub(crate) fn entered() -> bool {
-        ENTERED.load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn release() {
-        RELEASE.store(true, Ordering::SeqCst);
-    }
 }
 
 /// Last-resort answer for `host` sourced from a previous run, once every DoH
