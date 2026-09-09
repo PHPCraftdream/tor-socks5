@@ -435,14 +435,22 @@ async fn spawn_test_server() -> (
     Arc<tokio::sync::Semaphore>,
     tokio::task::JoinHandle<()>,
 ) {
+    spawn_test_server_with_upstream("127.0.0.1:1".to_string()).await
+}
+
+/// Like `spawn_test_server`, but with a caller-chosen egress upstream.
+async fn spawn_test_server_with_upstream(
+    upstream_addr: String,
+) -> (
+    std::net::SocketAddr,
+    Arc<tokio::sync::Semaphore>,
+    tokio::task::JoinHandle<()>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let permits = Arc::new(tokio::sync::Semaphore::new(1));
     // The egress never gets used: the deadline always fires first.
-    let egress = Egress::Upstream(Arc::new(upstream::Upstream::new(
-        "127.0.0.1:1".into(),
-        None,
-    )));
+    let egress = Egress::Upstream(Arc::new(upstream::Upstream::new(upstream_addr, None)));
     let handle = tokio::spawn(accept_loop(
         listener,
         egress,
@@ -468,6 +476,56 @@ async fn wait_for_permit_taken(permits: &Arc<tokio::sync::Semaphore>) {
         0,
         "server must hold the permit"
     );
+}
+
+// -- upstream setup deadline ----------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn upstream_setup_stall_releases_permit_at_deadline() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Stalling upstream: answers the greeting with NO_AUTH, then parks
+    // forever before any CONNECT reply.
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap().to_string();
+    let upstream = tokio::spawn(async move {
+        let (mut s, _) = upstream_listener.accept().await.unwrap();
+        let mut head = [0u8; 2];
+        s.read_exact(&mut head).await.unwrap();
+        let mut methods = vec![0u8; head[1] as usize];
+        s.read_exact(&mut methods).await.unwrap();
+        s.write_all(&[0x05, 0x00]).await.unwrap();
+        std::future::pending::<()>().await;
+    });
+
+    let (addr, permits, server) = spawn_test_server_with_upstream(upstream_addr).await;
+
+    // Drive a real client through a complete SOCKS5 handshake; the
+    // server then parks in the upstream setup, holding the permit.
+    let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+    client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut sel = [0u8; 2];
+    client.read_exact(&mut sel).await.unwrap();
+    assert_eq!(sel, [0x05, 0x00]);
+    // CONNECT 93.184.216.34:443 (example.com, IP literal — no DNS).
+    client
+        .write_all(&[0x05, 0x01, 0x00, 0x01, 93, 184, 216, 34, 0x01, 0xBB])
+        .await
+        .unwrap();
+
+    wait_for_permit_taken(&permits).await;
+    assert_eq!(
+        permits.available_permits(),
+        0,
+        "permit must be held while the upstream setup stalls"
+    );
+
+    tokio::time::sleep(upstream::UPSTREAM_SETUP_DEADLINE + Duration::from_secs(5)).await;
+    let _permit = tokio::time::timeout(Duration::from_secs(10), permits.acquire())
+        .await
+        .expect("permit must be released by the upstream setup deadline");
+    server.abort();
+    upstream.abort();
 }
 
 #[tokio::test(start_paused = true)]

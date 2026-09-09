@@ -7,6 +7,7 @@
 //! to drive a standard SOCKS5 proxy.
 
 use std::net::IpAddr;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -22,6 +23,18 @@ const ATYP_V4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_V6: u8 = 0x04;
 const REP_SUCCESS: u8 = 0x00;
+
+/// Whole-budget deadline for one upstream setup attempt: TCP connect
+/// (including DNS), method negotiation, RFC 1929 auth and the CONNECT
+/// reply. Armed once per `connect` call and never renewed. On expiry the
+/// partially set-up stream is dropped (closing the socket) and an error
+/// is returned; an established relay is NOT bound by this budget — once
+/// `connect` returns `Ok`, the deadline no longer applies to the
+/// returned stream.
+///
+/// cancel-safe: yes — cancelling/dropping the future mid-setup simply
+/// closes the in-progress socket via RAII; no shared state is mutated.
+pub(crate) const UPSTREAM_SETUP_DEADLINE: Duration = Duration::from_secs(30);
 
 /// A configured upstream SOCKS5 proxy used as the egress.
 #[derive(Clone)]
@@ -62,13 +75,19 @@ impl Upstream {
     /// On success the returned stream is positioned at the start of the
     /// tunnelled data and can be relayed directly to the client.
     pub async fn connect(&self, host: &str, port: u16) -> Result<TcpStream> {
-        let mut s = TcpStream::connect(&self.address)
-            .await
-            .with_context(|| format!("connecting to upstream SOCKS5 {}", self.address))?;
-        self.negotiate_method(&mut s).await?;
-        send_connect(&mut s, host, port).await?;
-        read_reply(&mut s).await?;
-        Ok(s)
+        tokio::time::timeout(UPSTREAM_SETUP_DEADLINE, async {
+            let mut s = TcpStream::connect(&self.address)
+                .await
+                .with_context(|| format!("connecting to upstream SOCKS5 {}", self.address))?;
+            self.negotiate_method(&mut s).await?;
+            send_connect(&mut s, host, port).await?;
+            read_reply(&mut s).await?;
+            Ok(s)
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("upstream setup deadline of {UPSTREAM_SETUP_DEADLINE:?} exceeded")
+        })?
     }
 
     async fn negotiate_method(&self, s: &mut TcpStream) -> Result<()> {
@@ -91,10 +110,19 @@ impl Upstream {
             bail!("upstream replied with non-SOCKS5 version {:#x}", sel[0]);
         }
         match sel[1] {
-            M_NO_AUTH => Ok(()),
-            M_USER_PASS => self.authenticate(s).await,
+            // We offered exactly one method; RFC 1928 §3 says the server
+            // must choose one of the offered METHODS, so anything else —
+            // including NO_AUTH when we offered USER/PASS, and vice versa
+            // — is a protocol violation, not a usable selection.
+            m if m == method => {
+                if m == M_USER_PASS {
+                    self.authenticate(s).await
+                } else {
+                    Ok(())
+                }
+            }
             M_NONE => bail!("upstream rejected all offered auth methods"),
-            other => bail!("upstream selected unsupported method {other:#x}"),
+            other => bail!("upstream selected method {other:#x} which was not offered"),
         }
     }
 
@@ -353,5 +381,253 @@ mod tests {
             "unexpected error: {err}"
         );
         let _ = handle.await;
+    }
+
+    // -- upstream setup deadline -------------------------------------------
+
+    /// Where the stalling upstream stops responding.
+    #[derive(Clone, Copy)]
+    enum Stall {
+        /// Accept TCP, then never reply to the greeting.
+        Accept,
+        /// Reply `05 02`, then never reply to the credentials.
+        MethodSelection,
+        /// Complete the full auth exchange, then never reply to CONNECT.
+        Auth,
+    }
+
+    /// An upstream that accepts and then stalls forever at `stall`
+    /// (parked via `pending()`, which never resolves — under paused time
+    /// a `sleep` would auto-advance). With `require_auth` it selects
+    /// USER/PASS, otherwise NO_AUTH (only relevant for `AfterAccept`,
+    /// the only point reached before a selection is sent).
+    async fn stalling_upstream(
+        stall: Stall,
+        require_auth: bool,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncRead, AsyncWrite};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handle = tokio::spawn(async move {
+            async fn park<T: AsyncRead + AsyncWrite + Unpin>(mut s: T) {
+                let _ = s.read(&mut [0u8; 1]).await; // ignore any EOF
+                std::future::pending::<()>().await;
+            }
+            let (mut s, _) = listener.accept().await.unwrap();
+            match stall {
+                Stall::Accept => park(s).await,
+                Stall::MethodSelection => {
+                    let mut head = [0u8; 2];
+                    s.read_exact(&mut head).await.unwrap();
+                    let mut methods = vec![0u8; head[1] as usize];
+                    s.read_exact(&mut methods).await.unwrap();
+                    let want = if require_auth { M_USER_PASS } else { M_NO_AUTH };
+                    s.write_all(&[VER, want]).await.unwrap();
+                    park(s).await
+                }
+                Stall::Auth => {
+                    let mut head = [0u8; 2];
+                    s.read_exact(&mut head).await.unwrap();
+                    let mut methods = vec![0u8; head[1] as usize];
+                    s.read_exact(&mut methods).await.unwrap();
+                    s.write_all(&[VER, M_USER_PASS]).await.unwrap();
+                    let mut h = [0u8; 2];
+                    s.read_exact(&mut h).await.unwrap();
+                    let mut user = vec![0u8; h[1] as usize];
+                    s.read_exact(&mut user).await.unwrap();
+                    let mut pl = [0u8; 1];
+                    s.read_exact(&mut pl).await.unwrap();
+                    let mut pass = vec![0u8; pl[0] as usize];
+                    s.read_exact(&mut pass).await.unwrap();
+                    s.write_all(&[RFC1929_VER, 0x00]).await.unwrap();
+                    park(s).await
+                }
+            }
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stall_after_accept_hits_setup_deadline() {
+        // With credentials configured (exercises the longest path).
+        let (addr, handle) = stalling_upstream(Stall::Accept, true).await;
+        let up = Upstream::new(addr, Some(("alice".into(), "secret".into())));
+        let err = up
+            .connect("example.com", 80)
+            .await
+            .expect_err("must time out");
+        assert!(
+            format!("{err}").contains("upstream setup deadline"),
+            "unexpected error: {err}"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stall_after_method_selection_hits_setup_deadline() {
+        let (addr, handle) = stalling_upstream(Stall::MethodSelection, true).await;
+        let up = Upstream::new(addr, Some(("alice".into(), "secret".into())));
+        let err = up
+            .connect("example.com", 80)
+            .await
+            .expect_err("must time out");
+        assert!(
+            format!("{err}").contains("upstream setup deadline"),
+            "unexpected error: {err}"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stall_after_auth_hits_setup_deadline() {
+        let (addr, handle) = stalling_upstream(Stall::Auth, true).await;
+        let up = Upstream::new(addr, Some(("alice".into(), "secret".into())));
+        let err = up
+            .connect("example.com", 80)
+            .await
+            .expect_err("must time out");
+        assert!(
+            format!("{err}").contains("upstream setup deadline"),
+            "unexpected error: {err}"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stall_after_accept_no_auth_hits_setup_deadline() {
+        let (addr, handle) = stalling_upstream(Stall::Accept, false).await;
+        let up = Upstream::new(addr, None);
+        let err = up
+            .connect("example.com", 80)
+            .await
+            .expect_err("must time out");
+        assert!(
+            format!("{err}").contains("upstream setup deadline"),
+            "unexpected error: {err}"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn established_relay_survives_setup_deadline() {
+        // Real time (not `start_paused`) for the handshake below: it is
+        // several real-socket round trips between this task and the
+        // spawned server task, and under a paused clock the time driver
+        // can fast-forward past a pending deadline before those loopback
+        // bytes are actually delivered, failing the setup spuriously.
+        // Only the "prove the elapsed deadline is irrelevant" step needs
+        // simulated time, so the clock is paused (and jumped forward via
+        // `advance`) AFTER the real handshake has genuinely completed.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            // Greeting + CONNECT reply, then echo until the peer goes away.
+            let mut head = [0u8; 2];
+            s.read_exact(&mut head).await.unwrap();
+            let mut methods = vec![0u8; head[1] as usize];
+            s.read_exact(&mut methods).await.unwrap();
+            s.write_all(&[VER, M_NO_AUTH]).await.unwrap();
+            let mut req = [0u8; 4];
+            s.read_exact(&mut req).await.unwrap();
+            let mut tail = vec![0u8; 6];
+            s.read_exact(&mut tail).await.unwrap();
+            s.write_all(&[VER, REP_SUCCESS, 0x00, ATYP_V4, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            let mut buf = [0u8; 64];
+            loop {
+                match s.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if s.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let up = Upstream::new(addr, None);
+        // An IPv4 literal, not a domain: the fake server above drains a
+        // fixed 6-byte tail (BND.ADDR + BND.PORT-shaped), which only
+        // matches ATYP_V4's wire size (4 + 2 bytes). A domain name would
+        // leave its own trailing bytes (LEN + name + port) unread in the
+        // server's receive buffer, which the echo loop below would then
+        // read and reflect back before ever seeing "ping".
+        let mut s = up.connect("93.184.216.34", 80).await.expect("connect ok");
+        // Let the setup deadline elapse; the relay must not be affected.
+        // `pause` + `advance` (not `sleep` under a pre-paused runtime)
+        // jumps the clock instantly without racing the handshake above.
+        tokio::time::pause();
+        tokio::time::advance(UPSTREAM_SETUP_DEADLINE + Duration::from_secs(1)).await;
+        tokio::time::resume();
+        s.write_all(b"ping").await.unwrap();
+        let mut echo = [0u8; 4];
+        s.read_exact(&mut echo).await.unwrap();
+        assert_eq!(&echo, b"ping");
+        server.abort();
+    }
+
+    // -- unoffered method selection -----------------------------------------
+
+    #[tokio::test]
+    async fn unoffered_no_auth_rejected_and_no_connect_sent() {
+        // Client offers USER/PASS; server wrongly selects NO_AUTH and
+        // then waits for a CONNECT that must never arrive.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut head = [0u8; 2];
+            s.read_exact(&mut head).await.unwrap();
+            let mut methods = vec![0u8; head[1] as usize];
+            s.read_exact(&mut methods).await.unwrap();
+            s.write_all(&[VER, M_NO_AUTH]).await.unwrap();
+            // Wait for a CONNECT that must NOT be sent; resolve via EOF.
+            let mut buf = [0u8; 64];
+            let n = s.read(&mut buf).await.unwrap_or(0);
+            n
+        });
+
+        let up = Upstream::new(addr, Some(("alice".into(), "secret".into())));
+        let err = up.connect("example.com", 80).await.expect_err("must fail");
+        assert!(
+            format!("{err}").contains("not offered"),
+            "unexpected error: {err}"
+        );
+        // The client socket is dropped, so the fake's read hits EOF: 0
+        // bytes received means no CONNECT reached the upstream.
+        let n = server.await.unwrap();
+        assert_eq!(n, 0, "no CONNECT bytes must reach the upstream");
+    }
+
+    #[tokio::test]
+    async fn unoffered_user_pass_rejected_without_auth() {
+        // Client offers NO_AUTH; server wrongly selects USER/PASS — the
+        // client must fail instead of running an unoffered auth exchange.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut head = [0u8; 2];
+            s.read_exact(&mut head).await.unwrap();
+            let mut methods = vec![0u8; head[1] as usize];
+            s.read_exact(&mut methods).await.unwrap();
+            s.write_all(&[VER, M_USER_PASS]).await.unwrap();
+            // No RFC 1929 credentials may follow; resolve via EOF.
+            let mut buf = [0u8; 64];
+            s.read(&mut buf).await.unwrap_or(0)
+        });
+
+        let up = Upstream::new(addr, None);
+        let err = up.connect("example.com", 80).await.expect_err("must fail");
+        assert!(
+            format!("{err}").contains("not offered"),
+            "unexpected error: {err}"
+        );
+        let n = server.await.unwrap();
+        assert_eq!(n, 0, "no credential bytes must reach the upstream");
     }
 }
