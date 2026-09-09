@@ -753,3 +753,154 @@ async fn wait_a_real_moment() {
         std::thread::sleep(Duration::from_millis(2));
     }
 }
+
+/// TS4-09 regression: the "maybe deep-clone, then mutate" step must run on
+/// the blocking pool, not on the actor's async worker. Proof on the default
+/// single-threaded test runtime: while a mutation whose closure sleeps
+/// synchronously for 400ms is in flight, an INDEPENDENT async task on the
+/// same runtime must get to run. Under the old synchronous placement the
+/// actor's closure block stopped the whole runtime — timers included — so
+/// the ack necessarily preceded the watchdog; with `spawn_blocking` the
+/// watchdog (armed only after the closure demonstrably started) fires long
+/// before the ack. The publisher is held in flight on a gate, so the Arc is
+/// shared and `Arc::make_mut` really deep-copies — the heavy sleep stands
+/// in for that O(S) copy.
+#[tokio::test]
+async fn mutation_during_in_flight_publish_does_not_block_the_async_worker() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let b = test_bridge();
+    let path = config_path(dir.path());
+    seed_store(&path, &b);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (gate_tx, gate_rx) = oneshot::channel::<()>();
+    // The gate receiver is consumed once (blocking_recv takes self), so
+    // wrap it for the `Fn` publisher bound (same trick as
+    // publish_snapshots_are_copy_on_write).
+    let gate = Mutex::new(Some(gate_rx));
+    let counter = calls.clone();
+    let publisher: Publisher = Arc::new(move |s: &BridgeStore| {
+        if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+            // Hold publish #1 in-flight until the test releases it.
+            let held = gate.lock().unwrap().take().expect("gate used once");
+            let _ = held.blocking_recv();
+        }
+        s.save()
+    });
+    let writer = StoreWriter::spawn(
+        BridgeStore::resolve_path(Some(&path)),
+        publisher,
+        INITIAL_BACKOFF,
+    );
+
+    // Mutation A triggers publish #1 and leaves it blocked on the gate, so
+    // the actor's snapshot Arc is shared once mutation B lands — the only
+    // situation in which make_mut deep-copies.
+    let b_a = b.clone();
+    writer
+        .apply(move |s| s.note_channel_success_at(&b_a, OffsetDateTime::now_utc()))
+        .await
+        .expect("mutation A absorbed");
+    wait_for_calls(&calls, 1, "publish #1 started and is blocked on the gate").await;
+
+    // Mutation B: heavy closure (a synchronous 400ms sleep stands in for
+    // the O(S) deep copy), announces "started" before sleeping.
+    let writer_b = writer.clone();
+    let b_b = b.clone();
+    let (started_tx, started_rx) = oneshot::channel::<()>();
+    let mutation = tokio::spawn(async move {
+        writer_b
+            .apply(move |s| {
+                let _ = started_tx.send(());
+                std::thread::sleep(Duration::from_millis(400));
+                s.note_channel_success_at(&b_b, OffsetDateTime::now_utc());
+            })
+            .await
+            .expect("mutation B absorbed");
+        tokio::time::Instant::now()
+    });
+
+    // Arm the watchdog only after the closure demonstrably started, then
+    // wait a time far shorter than the closure's sleep on an independent
+    // async task.
+    let _ = started_rx.await;
+    let watchdog = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::Instant::now()
+    });
+
+    let (mutation_res, watchdog_res) = tokio::join!(mutation, watchdog);
+    let ack_at = mutation_res.expect("mutation task joins");
+    let watchdog_at = watchdog_res.expect("watchdog task joins");
+    assert!(
+        watchdog_at < ack_at,
+        "the independent async task must run while the heavy mutation is in \
+         flight (watchdog fired at {watchdog_at:?}, ack at {ack_at:?})"
+    );
+    assert!(
+        ack_at - watchdog_at >= Duration::from_millis(100),
+        "the ack must come well after the watchdog: the closure must have run \
+         to completion off the worker (gap {:?})",
+        ack_at - watchdog_at
+    );
+
+    // Semantics unchanged: B was absorbed (ack above) and rides along in
+    // the coalesced follow-up once the gated publish completes.
+    gate_tx.send(()).expect("release the publish gate");
+    wait_for_file_count(&path, &b, 2, "both mutations reached disk").await;
+    let closed = writer.close().await;
+    assert!(closed.is_ok(), "close after clean publishes: {closed:?}");
+    assert!(
+        leftover_tmp_files(dir.path()).is_empty(),
+        "no leftover temp files"
+    );
+}
+
+/// TS4-09 panic branch: a mutation closure that panics must not kill the
+/// actor. The panicked op's ack resolves `Err` (the caller cannot assume
+/// the absorption happened), nothing is published for it, the possibly
+/// half-mutated in-memory snapshot is dropped, and the NEXT mutation
+/// reloads from disk and succeeds.
+#[tokio::test]
+async fn mutation_panic_rejects_the_ack_and_reloads_on_the_next_mutation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let b = test_bridge();
+    let path = config_path(dir.path());
+    seed_store(&path, &b);
+
+    let writer = StoreWriter::spawn(
+        BridgeStore::resolve_path(Some(&path)),
+        Arc::new(|s| s.save()),
+        INITIAL_BACKOFF,
+    );
+
+    let result = writer
+        .apply(|_s: &mut BridgeStore| panic!("injected mutation panic"))
+        .await;
+    let error = result.expect_err("a panicking closure must reject its ack");
+    assert!(
+        error.to_string().contains("panicked"),
+        "the ack error must report the panic: {error:#}"
+    );
+    assert_eq!(
+        reload(&path).channel_ok_count(&b),
+        0,
+        "the panicked mutation must not have published anything"
+    );
+
+    // The actor survived the panic; the next mutation reloads the store
+    // from disk, applies cleanly, and publishes.
+    let b1 = b.clone();
+    writer
+        .apply(move |s| s.note_channel_success_at(&b1, OffsetDateTime::now_utc()))
+        .await
+        .expect("actor still alive: next mutation is absorbed after a reload");
+    wait_for_file_count(&path, &b, 1, "post-panic mutation published").await;
+
+    let closed = writer.close().await;
+    assert!(closed.is_ok(), "close after recovery: {closed:?}");
+    assert!(
+        leftover_tmp_files(dir.path()).is_empty(),
+        "no leftover temp files"
+    );
+}

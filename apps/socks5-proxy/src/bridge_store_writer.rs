@@ -16,10 +16,15 @@
 //!   publish (serialize + fsync + rename) run inside
 //!   `tokio::task::spawn_blocking`, so a slow disk cannot stall a Tokio
 //!   worker or the tasks queued behind it.
-//! * Publish snapshots are `Arc` clones taken in O(1) on the actor; the
-//!   actor mutates through `Arc::make_mut`, so the only deep copy happens
-//!   when a mutation lands while a publish is in flight — on the state
-//!   owner, never on the publish path or the blocking pool.
+//! * The mutate step runs on the blocking pool too. Publish snapshots are
+//!   `Arc` clones taken in O(1) on the actor, but when a mutation lands
+//!   while a publish is in flight the shared snapshot forces `Arc::make_mut`
+//!   into a deep O(S) copy — that copy (and the mutation closure itself)
+//!   executes inside `spawn_blocking`, never on an async worker. The actor
+//!   waits for the mutation job before its next `select!` iteration, so
+//!   mutation order, acks and retry bookkeeping are unchanged. If the
+//!   mutation closure panics, the possibly half-mutated snapshot is dropped
+//!   (the next op reloads from disk) and the op's ack resolves `Err`.
 //! * Publishes are coalesced: at most one publish is in flight at a time,
 //!   and mutations that arrive while it runs are absorbed into the same
 //!   in-memory snapshot and covered by one follow-up publish. K mutations
@@ -157,7 +162,10 @@ impl StoreWriter {
     /// a failed disk publish is the writer's retry problem, not the
     /// caller's. Resolves `Err` when the on-disk snapshot could not be
     /// loaded, in which case the closure was NOT run (a caller draining a
-    /// queue keeps its items).
+    /// queue keeps its items), or when the closure panicked mid-apply; on
+    /// a panic the snapshot's state is unknown, so it is dropped (the next
+    /// op reloads from disk) and the caller must assume the mutation did
+    /// not land.
     pub(crate) async fn apply(
         &self,
         apply: impl FnOnce(&mut BridgeStore) + Send + 'static,
@@ -339,29 +347,65 @@ impl StoreWriter {
                                     }
                                 }
                             }
-                            // make_mut deep-copies only when the Arc is
-                            // currently shared (a publish snapshot in
-                            // flight); the copy decision stays with the
-                            // state owner, not the publish path.
-                            apply(Arc::make_mut(
-                                store.as_mut().expect("store loaded above"),
-                            ));
-                            // Acknowledge the absorption before publishing:
-                            // the disk write is this actor's problem now.
-                            let _ = ack.send(Ok(()));
-                            retry.dirty = true;
-                            mutations_since_publish += 1;
-                            // Publish now, unless a publish is already in
-                            // flight (the tail rides along) or a backoff
-                            // retry is pending (the timer governs retries).
-                            try_start_publish(
-                                &mut publishing,
-                                &mut retry,
-                                &store,
-                                &mut mutations_since_publish,
-                                &publish,
-                                &done_tx,
-                            );
+                            // Move the "maybe deep-clone, then mutate" step
+                            // off the async worker: with a publish snapshot
+                            // in flight the Arc is shared, so make_mut
+                            // deep-copies the whole store (O(S)) — that copy
+                            // must not stall this worker thread. Take
+                            // temporary ownership: the actor is the sole
+                            // owner of `store` outside this window and waits
+                            // for the job before the next select! iteration,
+                            // so ops stay strictly sequential.
+                            let mut owned = store.take().expect("store loaded above");
+                            match tokio::task::spawn_blocking(move || {
+                                apply(Arc::make_mut(&mut owned));
+                                owned
+                            })
+                            .await
+                            {
+                                Ok(owned) => {
+                                    store = Some(owned);
+                                    // Acknowledge the absorption before
+                                    // publishing: the disk write is this
+                                    // actor's problem now.
+                                    let _ = ack.send(Ok(()));
+                                    retry.dirty = true;
+                                    mutations_since_publish += 1;
+                                    // Publish now, unless a publish is already
+                                    // in flight (the tail rides along) or a
+                                    // backoff retry is pending (the timer
+                                    // governs retries).
+                                    try_start_publish(
+                                        &mut publishing,
+                                        &mut retry,
+                                        &store,
+                                        &mut mutations_since_publish,
+                                        &publish,
+                                        &done_tx,
+                                    );
+                                }
+                                Err(join_error) => {
+                                    // The closure may have panicked
+                                    // mid-apply, leaving the snapshot's state
+                                    // unknown: treat it like an unreadable
+                                    // store (the load-failure branches above)
+                                    // — drop it so the NEXT op reloads fresh
+                                    // from disk, and report the failure
+                                    // instead of silently confirming an
+                                    // absorption that may not have happened
+                                    // (retry.dirty / try_start_publish are
+                                    // skipped, as on those branches).
+                                    warn!(
+                                        error = %join_error,
+                                        path = %path.display(),
+                                        "bridge health store mutation task panicked; store will reload on next op"
+                                    );
+                                    let _ = ack.send(Err(anyhow!(
+                                        "bridge health store mutation task panicked: {join_error}"
+                                    )));
+                                    continue;
+                                }
+                            }
                         }
                         Some(Op::Close { reply }) => {
                             close_replies.push(reply);
