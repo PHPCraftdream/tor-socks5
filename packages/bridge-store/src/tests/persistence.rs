@@ -101,6 +101,126 @@ fn circuit_metadata_persists_across_save_load() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 #[test]
+fn source_labels_round_trip_through_save_load() {
+    let dir = tmp_dir();
+    let path = dir.join("src.log");
+    let mut s = BridgeStore::load(path.clone()).unwrap();
+    let b = bridge(OBFS4_A);
+    let t0 = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+    s.record_at(b.clone(), Duration::from_millis(10), t0);
+    let labels = [
+        "Tor Project",
+        "A,B",
+        "раздача 5, зеркало №2",
+        "line1\nline2",
+        "cr\r\nlf",
+        "tab\there",
+        "feed cfails=42",
+        "100%",
+    ];
+    for (i, label) in labels.iter().enumerate() {
+        s.note_source_at(&b, label, t0 + Duration::from_secs(i as u64));
+    }
+    s.save().unwrap();
+
+    let loaded = BridgeStore::load(path).unwrap();
+    let mut expected: Vec<String> = labels.iter().map(|s| s.to_string()).collect();
+    expected.sort();
+    assert_eq!(
+        loaded.sources_of(&b),
+        expected,
+        "labels must survive save/load byte-identical"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+#[test]
+fn source_label_cannot_forge_health_metadata() {
+    let dir = tmp_dir();
+    let path = dir.join("forge.log");
+    let mut s = BridgeStore::load(path.clone()).unwrap();
+    let b = bridge(OBFS4_A);
+    let t0 = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+    s.record_at(b.clone(), Duration::from_millis(10), t0);
+    // Rate-limited to one bump per window, so space the bumps just past
+    // HALF_HOUR apart (see circuit_metadata test).
+    for i in 0..7 {
+        s.note_circuit_failure_at(
+            &b,
+            t0 + (i as u32 + 1) * HALF_HOUR + Duration::from_secs(i as u64 + 1),
+            HALF_HOUR,
+        );
+    }
+    assert_eq!(s.circuit_fails(&b), 7);
+    s.note_source_at(&b, "feed cfails=42", t0);
+    s.save().unwrap();
+
+    let loaded = BridgeStore::load(path).unwrap();
+    assert_eq!(
+        loaded.circuit_fails(&b),
+        7,
+        "label must not overwrite cfails"
+    );
+    assert_eq!(loaded.sources_of(&b), vec!["feed cfails=42".to_string()]);
+    assert_eq!(loaded.ok_count(&b), 1);
+    assert_eq!(loaded.fails_of(&b), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+#[test]
+fn legacy_plain_sources_round_trip_unescaped() {
+    let dir = tmp_dir();
+    let path = dir.join("legacy-src.log");
+    std::fs::write(
+        &path,
+        format!(
+            "# fails=1 seen=3 attempt=2026-05-18T12:00:00Z ok=2026-05-18T12:00:00Z \
+             latency=42ms chseen=0 chok=- evseen=0 evok=- cfails=2 \
+             cobs=2026-05-18T12:00:00Z src=delta,onionhop\n{OBFS4_A}\n"
+        ),
+    )
+    .unwrap();
+    let loaded = BridgeStore::load(path.clone()).unwrap();
+    assert_eq!(
+        loaded.sources_of(&bridge(OBFS4_A)),
+        vec!["delta".to_string(), "onionhop".to_string()]
+    );
+    loaded.save().unwrap();
+    let reloaded = BridgeStore::load(path).unwrap();
+    assert_eq!(
+        reloaded.sources_of(&bridge(OBFS4_A)),
+        vec!["delta".to_string(), "onionhop".to_string()],
+        "plain legacy labels must survive the new writer unchanged"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+#[test]
+fn legacy_literal_percent_loads_without_panicking() {
+    let dir = tmp_dir();
+    let path = dir.join("legacy-pct.log");
+    std::fs::write(
+        &path,
+        format!(
+            "# fails=0 seen=1 attempt=2026-05-18T12:00:00Z ok=2026-05-18T12:00:00Z \
+             latency=10ms chseen=0 chok=- evseen=0 evok=- cfails=0 \
+             cobs=2026-05-18T12:00:00Z src=100%,c2\n{OBFS4_A}\n"
+        ),
+    )
+    .unwrap();
+    let loaded = BridgeStore::load(path.clone()).unwrap();
+    assert_eq!(
+        loaded.sources_of(&bridge(OBFS4_A)),
+        vec!["100%".to_string(), "c2".to_string()],
+        "trailing lone % must be kept literally"
+    );
+    loaded.save().unwrap();
+    let reloaded = BridgeStore::load(path).unwrap();
+    assert_eq!(
+        reloaded.sources_of(&bridge(OBFS4_A)),
+        vec!["100%".to_string(), "c2".to_string()],
+        "labels must stay stable after re-encode/decode"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+#[test]
 fn temp_path_is_unique_per_call() {
     let dir = tmp_dir();
     let path = dir.join("alive.log");

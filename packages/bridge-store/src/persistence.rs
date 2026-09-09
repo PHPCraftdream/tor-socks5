@@ -62,6 +62,56 @@ impl Default for Meta {
     }
 }
 
+/// Percent-encode the delimiter characters (`%`, `,`, whitespace) of a
+/// source label so it survives the whitespace-tokenised meta-comment format
+/// and the comma-separated `src=` list. Single pass: `%` is escaped as it
+/// is visited, never via sequential replaces on already-escaped output.
+fn encode_source(label: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(label.len());
+    for c in label.chars() {
+        if c == '%' {
+            out.push_str("%25");
+        } else if c == ',' {
+            out.push_str("%2C");
+        } else if c.is_whitespace() {
+            let mut buf = [0u8; 4];
+            for b in c.encode_utf8(&mut buf).as_bytes() {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0xF) as usize] as char);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Percent-decode a `src=` token. Total and byte-based: on `%`, two ASCII
+/// hex digits are consumed as one byte, otherwise the `%` is kept literally
+/// (old files stored `%` unescaped). Invalid UTF-8 (possible from legacy
+/// files) becomes replacement characters via `from_utf8_lossy`.
+fn decode_source(token: &str) -> String {
+    let bytes = token.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 pub(super) fn parse_meta_comment(s: &str) -> Option<Meta> {
     // New format: `fails=N seen=M attempt=<iso> ok=<iso|-> latency=NNms`
     // plus optional `cfails=N cobs=<iso>` (active health observation).
@@ -108,10 +158,12 @@ pub(super) fn parse_meta_comment(s: &str) -> Option<Meta> {
             } else if let Some(v) = tok.strip_prefix("cobs=") {
                 meta.last_circuit_observation = OffsetDateTime::parse(v, &Iso8601::DEFAULT).ok()?;
             } else if let Some(v) = tok.strip_prefix("src=") {
+                // Split the still-encoded value on ',', then decode each
+                // kept token — encoded commas (`%2C`) must not split labels.
                 meta.sources = v
                     .split(',')
                     .filter(|s| !s.is_empty())
-                    .map(str::to_owned)
+                    .map(decode_source)
                     .collect();
             }
         }
@@ -297,7 +349,13 @@ impl BridgeStore {
             // existed round-trip unchanged.
             if !e.sources.is_empty() {
                 out.push_str(" src=");
-                out.push_str(&e.sources.iter().cloned().collect::<Vec<_>>().join(","));
+                out.push_str(
+                    &e.sources
+                        .iter()
+                        .map(|s| encode_source(s))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
             }
             out.push('\n');
             out.push_str(&e.bridge.to_string());
