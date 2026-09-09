@@ -67,16 +67,22 @@ pub(crate) async fn connect_direct(
 ) -> Result<TcpStream, FetchError> {
     let mut candidates = pinned_addrs(host, port);
 
-    // Pins are a shortcut, not a substitute: always also resolve via DoH so a
-    // stale/incomplete pin table degrades to the same reliability as having
-    // no pins at all, rather than to a hard failure.
-    match bridge_probe::resolve_addrs(host, port, resolver_policy).await {
-        Ok(resolved) => candidates.extend(resolved),
-        Err(e) if candidates.is_empty() => {
-            return Err(FetchError::Resolve(format!("{host}: {e}")));
-        }
-        Err(_) => {
-            // Pins exist; a DoH failure alone is not fatal, try them anyway.
+    // An IP-literal host needs no name resolution at all: it must connect even
+    // with every resolver disabled, same shortcut `resolve_and_probe` takes.
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        candidates.push(SocketAddr::new(ip, port));
+    } else {
+        // Pins are a shortcut, not a substitute: always also resolve via DoH so a
+        // stale/incomplete pin table degrades to the same reliability as having
+        // no pins at all, rather than to a hard failure.
+        match bridge_probe::resolve_addrs(host, port, resolver_policy).await {
+            Ok(resolved) => candidates.extend(resolved),
+            Err(e) if candidates.is_empty() => {
+                return Err(FetchError::Resolve(format!("{host}: {e}")));
+            }
+            Err(_) => {
+                // Pins exist; a DoH failure alone is not fatal, try them anyway.
+            }
         }
     }
 
@@ -103,6 +109,12 @@ pub(crate) async fn connect_direct(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
+
+    const NO_RESOLVERS: ResolverPolicy = ResolverPolicy {
+        doh_enabled: false,
+        system_fallback: false,
+    };
 
     #[test]
     fn known_pins_cover_the_default_source_hosts() {
@@ -123,13 +135,45 @@ mod tests {
     async fn connect_direct_fails_cleanly_for_an_unroutable_host_with_no_dns() {
         // A host with no pins and no real DNS record must produce a Resolve
         // error, not a panic or a hang past the connect-attempt timeout.
-        let policy = ResolverPolicy {
-            doh_enabled: false,
-            system_fallback: false,
-        };
+        let policy = NO_RESOLVERS;
         let err = connect_direct("nonexistent.invalid", 443, policy)
             .await
             .unwrap_err();
         assert!(matches!(err, FetchError::Resolve(_)));
+    }
+
+    #[tokio::test]
+    async fn connect_direct_connects_to_ipv4_literal_with_no_dns() {
+        // An IP literal needs no name resolution: it must connect even with
+        // every resolver disabled.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let stream = connect_direct("127.0.0.1", port, NO_RESOLVERS)
+            .await
+            .unwrap();
+        assert_eq!(stream.peer_addr().unwrap().port(), port);
+
+        // The accept proves a real TCP connect happened, not just "no error".
+        let (_sock, peer) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("connection arrives within timeout")
+            .expect("accept succeeds");
+        assert_eq!(peer.port(), stream.local_addr().unwrap().port());
+    }
+
+    #[tokio::test]
+    async fn connect_direct_connects_to_ipv6_literal_with_no_dns() {
+        let listener = TcpListener::bind("[::1]:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let stream = connect_direct("::1", port, NO_RESOLVERS).await.unwrap();
+        assert_eq!(stream.peer_addr().unwrap().port(), port);
+
+        let (_sock, peer) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("connection arrives within timeout")
+            .expect("accept succeeds");
+        assert_eq!(peer.port(), stream.local_addr().unwrap().port());
     }
 }

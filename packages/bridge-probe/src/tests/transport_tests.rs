@@ -49,6 +49,41 @@ async fn disabled_resolvers_fail_hostname_explicitly() {
     assert!(error.contains("no DNS resolver available"));
 }
 
+#[tokio::test]
+async fn ipv6_literal_resolves_through_system_fallback_without_host_port_string_join() {
+    let listener = TcpListener::bind("[::1]:0")
+        .await
+        .expect("bind v6 loopback listener");
+    let port = listener.local_addr().expect("local addr").port();
+
+    let addrs = resolve_addrs(
+        "::1",
+        port,
+        ResolverPolicy {
+            doh_enabled: false,
+            system_fallback: true,
+        },
+    )
+    .await
+    .expect("an IPv6 literal needs no DNS");
+
+    assert_eq!(
+        addrs,
+        vec![SocketAddr::new(
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            port
+        )]
+    );
+
+    tokio::net::TcpStream::connect(addrs[0])
+        .await
+        .expect("resolved literal addr must be connectable");
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+        .await
+        .expect("accept")
+        .expect("connection arrives");
+}
+
 #[test]
 fn plain_bridge_probes_bridge_addr() {
     let bridge: BridgeLine = "10.0.0.1:9001 ABCDEF0123456789ABCDEF0123456789ABCDEF01"

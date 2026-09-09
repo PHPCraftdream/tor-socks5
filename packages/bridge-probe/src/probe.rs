@@ -781,14 +781,15 @@ pub async fn resolve_addrs(
     }
 
     if resolver_policy.system_fallback {
-        let host_port = format!("{host}:{port}");
-        let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&host_port)
+        // Tuple form, not a "{host}:{port}" string: correct for IPv4/IPv6
+        // literals and hostnames alike, without splicing and re-parsing.
+        let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
             .await
-            .map_err(|e| format!("system DNS lookup failed for {host_port}: {e}"))?
+            .map_err(|e| format!("system DNS lookup failed for {host}:{port}: {e}"))?
             .collect();
         if addrs.is_empty() {
             return Err(format!(
-                "system DNS lookup returned no addresses for {host_port}"
+                "system DNS lookup returned no addresses for {host}:{port}"
             ));
         }
         let ips: Vec<IpAddr> = addrs.iter().map(|a| a.ip()).collect();
