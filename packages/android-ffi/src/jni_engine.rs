@@ -635,6 +635,7 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
         if bridges.is_empty() {
             return;
         }
+        let _store_write = crate::engine::bridge_store_write_lock();
         let store_path =
             BridgeStore::resolve_path(config_path_str.as_ref().map(std::path::Path::new));
         let Ok(mut store) = BridgeStore::load(store_path) else {

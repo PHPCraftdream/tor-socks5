@@ -152,6 +152,8 @@ pub(crate) fn persist_and_rank_probe(
         );
     }
 
+    let _store_write = bridge_store_write_lock();
+
     let store_path = BridgeStore::resolve_path(bridge_health.config_path.as_deref());
     match BridgeStore::load(store_path.clone()) {
         Ok(mut store) => {
@@ -259,6 +261,7 @@ pub(super) fn persist_bridge_sources(
     if outcomes.iter().all(|o| o.bridges.is_empty()) {
         return;
     }
+    let _store_write = bridge_store_write_lock();
     let path = BridgeStore::resolve_path(bridge_health.config_path.as_deref());
     let mut store = match BridgeStore::load(path) {
         Ok(store) => store,
@@ -267,12 +270,16 @@ pub(super) fn persist_bridge_sources(
             return;
         }
     };
+    #[cfg(test)]
+    run_store_test_hook("persist_bridge_sources:after_load");
     let now = OffsetDateTime::now_utc();
     for outcome in outcomes {
         for bridge in &outcome.bridges {
             store.note_source_at(bridge, &outcome.label, now);
         }
     }
+    #[cfg(test)]
+    run_store_test_hook("persist_bridge_sources:before_save");
     if let Err(error) = store.save() {
         warn!(error = %error, "could not persist bridge source attribution");
     }
@@ -373,6 +380,7 @@ pub(super) fn persist_warm_results(pool: &WarmPool, bridge_health: &BridgeHealth
     if pool.warmed.is_empty() && pool.retired.is_empty() {
         return;
     }
+    let _store_write = bridge_store_write_lock();
     let path = BridgeStore::resolve_path(bridge_health.config_path.as_deref());
     let mut store = match BridgeStore::load(path) {
         Ok(store) => store,
@@ -381,6 +389,8 @@ pub(super) fn persist_warm_results(pool: &WarmPool, bridge_health: &BridgeHealth
             return;
         }
     };
+    #[cfg(test)]
+    run_store_test_hook("persist_warm_results:after_load");
     let now = OffsetDateTime::now_utc();
     for (bridge, _) in &pool.warmed {
         store.note_channel_success_at(bridge, now);
@@ -408,6 +418,7 @@ pub(super) fn persist_circuit_verify_results(
     if results.is_empty() {
         return;
     }
+    let _store_write = bridge_store_write_lock();
     let path = BridgeStore::resolve_path(bridge_health.config_path.as_deref());
     let mut store = match BridgeStore::load(path) {
         Ok(store) => store,
@@ -591,6 +602,56 @@ pub(super) fn set_final_status(status: EngineStatus) {
 /// isn't in that state (not started yet, still bootstrapping, or tearing
 /// down -- see the `set_current_tunnel(None)` call just before teardown in
 /// `engine_async`).
+/// Serializes the whole load→mutate→save cycle on the shared bridge-health
+/// store across every writer. Each writer used to work on its own
+/// `BridgeStore::load` snapshot, so the last `save()` silently dropped every
+/// observation the other writers had made in the meantime — probe rounds,
+/// source attribution, warm-pool results, circuit verifications, and JNI
+/// `nativeNoteBridgeSource` attributions can all overlap: the watchdog's
+/// circuit-verify tick persists from a separate spawned task, and
+/// `nativeNoteBridgeSource` is called on arbitrary Kotlin threads. One
+/// process = one Android engine = one store path, so a single process-wide
+/// critical section is deliberate, not laziness. The guard must not be held
+/// across an `.await` — every current writer is a plain sync fn.
+pub(super) static BRIDGE_STORE_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Acquire the store's critical section: hold from before `BridgeStore::load`
+/// until after `save()` returns.
+pub(crate) fn bridge_store_write_lock() -> std::sync::MutexGuard<'static, ()> {
+    BRIDGE_STORE_WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+/// Test-only hook letting a test freeze a writer mid-critical-section
+/// (deterministic, channel-driven regression coverage for the shared store
+/// lock). Compiles away in non-test builds.
+#[cfg(test)]
+type StoreHook = std::sync::Arc<dyn Fn(&'static str) + Send + Sync>;
+
+#[cfg(test)]
+static STORE_TEST_HOOK: Mutex<Option<StoreHook>> = Mutex::new(None);
+
+#[cfg(test)]
+pub(super) fn set_store_test_hook(hook: Option<StoreHook>) {
+    *STORE_TEST_HOOK.lock().unwrap_or_else(|p| p.into_inner()) = hook;
+}
+
+#[cfg(test)]
+fn run_store_test_hook(site: &'static str) {
+    // Clone the Arc out and call it WITHOUT holding the registry lock:
+    // the hook itself blocks on a channel while a writer's critical
+    // section is frozen; another writer must still be able to run_hook.
+    let hook = STORE_TEST_HOOK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    if let Some(hook) = hook {
+        hook(site);
+    }
+}
+
 pub(super) static CURRENT_TUNNEL: OnceLock<Mutex<Option<TorTunnel>>> = OnceLock::new();
 
 pub(super) fn set_current_tunnel(tunnel: Option<TorTunnel>) {
