@@ -22,6 +22,10 @@ pub enum FetchError {
     Non200(String),
     #[error("response body exceeds {max_bytes} bytes")]
     TooLarge { max_bytes: usize },
+    #[error("incomplete response body: expected {expected} bytes, got {got}")]
+    IncompleteBody { expected: usize, got: usize },
+    #[error("invalid chunked encoding: {0}")]
+    ChunkedEncoding(String),
     #[error("too many redirects (>{MAX_REDIRECTS})")]
     TooManyRedirects,
     #[error("timeout after {0:?}")]

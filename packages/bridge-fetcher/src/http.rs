@@ -16,6 +16,8 @@ use crate::direct::connect_direct;
 use crate::error::FetchError;
 use crate::url_parse::parse_https_url;
 
+mod framing;
+
 /// A connected-but-not-yet-TLS-wrapped byte stream, boxed so the redirect
 /// loop below does not need to be generic over which connection strategy
 /// produced it.
@@ -110,6 +112,7 @@ pub struct HttpResponse {
     pub status: u16,
     pub location: Option<String>,
     pub content_length: Option<usize>,
+    pub chunked: bool,
     pub header_len: usize,
 }
 
@@ -123,6 +126,7 @@ pub fn parse_response_headers(buf: &[u8]) -> Result<Option<HttpResponse>, FetchE
                 .ok_or_else(|| FetchError::Http("no status code".into()))?;
             let mut location = None;
             let mut content_length = None;
+            let mut chunked = false;
             for h in resp.headers.iter() {
                 if h.name.eq_ignore_ascii_case("location") {
                     location = Some(String::from_utf8_lossy(h.value).to_string());
@@ -132,11 +136,25 @@ pub fn parse_response_headers(buf: &[u8]) -> Result<Option<HttpResponse>, FetchE
                         content_length = s.trim().parse().ok();
                     }
                 }
+                if h.name.eq_ignore_ascii_case("transfer-encoding") {
+                    if let Ok(s) = std::str::from_utf8(h.value) {
+                        if s.split(',').any(|c| {
+                            c.split(';')
+                                .next()
+                                .unwrap_or("")
+                                .trim()
+                                .eq_ignore_ascii_case("chunked")
+                        }) {
+                            chunked = true;
+                        }
+                    }
+                }
             }
             Ok(Some(HttpResponse {
                 status,
                 location,
                 content_length,
+                chunked,
                 header_len,
             }))
         }
@@ -380,46 +398,55 @@ where
     }
 
     let body_start = resp_info.header_len;
-    let mut body = Vec::from(&header_buf[body_start..total]);
-
-    if let Some(cl) = resp_info.content_length {
-        if cl > max_body_bytes {
-            return Err(FetchError::TooLarge {
-                max_bytes: max_body_bytes,
-            });
-        }
-        if body.len() > cl {
-            body.truncate(cl);
-        }
-        while body.len() < cl {
-            let mut chunk = vec![0u8; READ_BUF_SIZE.min(cl - body.len())];
-            let n = stream.read(&mut chunk).await.map_err(|e| FetchError::Io {
-                op: "read body (content-length)",
-                source: e,
-            })?;
-            if n == 0 {
-                break;
-            }
-            body.extend_from_slice(&chunk[..n]);
-        }
+    let body = if resp_info.chunked {
+        // Chunked wins over Content-Length (RFC 9112: TE overrides CL);
+        // Content-Length is ignored in that case.
+        framing::decode_chunked_body(stream, &header_buf[body_start..total], max_body_bytes).await?
     } else {
-        loop {
-            let mut chunk = vec![0u8; READ_BUF_SIZE];
-            let n = stream.read(&mut chunk).await.map_err(|e| FetchError::Io {
-                op: "read body (eof)",
-                source: e,
-            })?;
-            if n == 0 {
-                break;
-            }
-            body.extend_from_slice(&chunk[..n]);
-            if body.len() > max_body_bytes {
+        let mut body = Vec::from(&header_buf[body_start..total]);
+        if let Some(cl) = resp_info.content_length {
+            if cl > max_body_bytes {
                 return Err(FetchError::TooLarge {
                     max_bytes: max_body_bytes,
                 });
             }
+            if body.len() > cl {
+                body.truncate(cl);
+            }
+            while body.len() < cl {
+                let mut chunk = vec![0u8; READ_BUF_SIZE.min(cl - body.len())];
+                let n = stream.read(&mut chunk).await.map_err(|e| FetchError::Io {
+                    op: "read body (content-length)",
+                    source: e,
+                })?;
+                if n == 0 {
+                    return Err(FetchError::IncompleteBody {
+                        expected: cl,
+                        got: body.len(),
+                    });
+                }
+                body.extend_from_slice(&chunk[..n]);
+            }
+        } else {
+            loop {
+                let mut chunk = vec![0u8; READ_BUF_SIZE];
+                let n = stream.read(&mut chunk).await.map_err(|e| FetchError::Io {
+                    op: "read body (eof)",
+                    source: e,
+                })?;
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&chunk[..n]);
+                if body.len() > max_body_bytes {
+                    return Err(FetchError::TooLarge {
+                        max_bytes: max_body_bytes,
+                    });
+                }
+            }
         }
-    }
+        body
+    };
 
     String::from_utf8(body)
         .map(ResponseBody::Ok)
@@ -617,6 +644,177 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Location"));
+    }
+
+    #[tokio::test]
+    async fn read_response_content_length_short_body_is_error() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello";
+        let mut cursor = tokio::io::BufReader::new(&response[..]);
+        let err = read_http_response(&mut cursor, TEST_MAX_BODY)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("incomplete response body"), "{msg}");
+        assert!(msg.contains("expected 11"), "{msg}");
+        assert!(msg.contains("got 5"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn read_response_content_length_one_byte_short_mid_line() {
+        let line =
+            b"obfs4 192.0.2.1:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=aaaa iat-mode=0\n";
+        let body = &line[..line.len() - 1];
+        let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: ".to_vec();
+        response.extend_from_slice((body.len() + 1).to_string().as_bytes());
+        response.extend_from_slice(b"\r\n\r\n");
+        response.extend_from_slice(body);
+        let mut cursor = tokio::io::BufReader::new(&response[..]);
+        let err = read_http_response(&mut cursor, TEST_MAX_BODY)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("incomplete response body"));
+    }
+
+    #[tokio::test]
+    async fn read_response_content_length_one_byte_short_after_full_line() {
+        let body: &[u8] =
+            b"obfs4 192.0.2.1:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=aaaa iat-mode=0\n\
+            obfs4 192.0.2.2:443 7A3CDE9876ABCDEF0123456789ABCDEF01234567 cert=bbbb iat-mode=0\n";
+        let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: ".to_vec();
+        response.extend_from_slice((body.len() + 1).to_string().as_bytes());
+        response.extend_from_slice(b"\r\n\r\n");
+        response.extend_from_slice(body);
+        let mut cursor = tokio::io::BufReader::new(&response[..]);
+        let err = read_http_response(&mut cursor, TEST_MAX_BODY)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("incomplete response body"));
+    }
+
+    #[test]
+    fn parse_response_chunked_flag() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let info = parse_response_headers(raw).unwrap().unwrap();
+        assert!(info.chunked);
+        assert!(info.content_length.is_none());
+    }
+
+    #[test]
+    fn parse_response_chunked_case_insensitive() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: CHUNKED\r\n\r\n";
+        let info = parse_response_headers(raw).unwrap().unwrap();
+        assert!(info.chunked);
+    }
+
+    #[test]
+    fn parse_response_chunked_in_coding_list() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
+        let info = parse_response_headers(raw).unwrap().unwrap();
+        assert!(info.chunked);
+    }
+
+    #[test]
+    fn parse_response_transfer_encoding_non_chunked() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n";
+        let info = parse_response_headers(raw).unwrap().unwrap();
+        assert!(!info.chunked);
+    }
+
+    #[tokio::test]
+    async fn read_response_chunked_decodes() {
+        let mut response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        response.extend_from_slice(b"2\r\nhe\r\n3\r\nllo\r\n0\r\n\r\n");
+        let mut cursor = tokio::io::BufReader::new(&response[..]);
+        let result = read_http_response(&mut cursor, TEST_MAX_BODY)
+            .await
+            .unwrap();
+        match result {
+            ResponseBody::Ok(body) => assert_eq!(body, "hello"),
+            ResponseBody::Redirect(_) => panic!("expected Ok"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_response_chunked_truncated_is_error() {
+        let mut response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        response.extend_from_slice(b"5\r\nhel");
+        let mut cursor = tokio::io::BufReader::new(&response[..]);
+        let err = read_http_response(&mut cursor, TEST_MAX_BODY)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("chunked") || msg.contains("closed"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn read_response_chunked_takes_priority_over_content_length() {
+        let mut response =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        response.extend_from_slice(b"5\r\nhello\r\n0\r\n\r\n");
+        let mut cursor = tokio::io::BufReader::new(&response[..]);
+        let result = read_http_response(&mut cursor, TEST_MAX_BODY)
+            .await
+            .unwrap();
+        match result {
+            ResponseBody::Ok(body) => assert_eq!(body, "hello"),
+            ResponseBody::Redirect(_) => panic!("expected Ok"),
+        }
+    }
+
+    /// Yields at most `drip` bytes per `read()` to force arbitrary read
+    /// boundaries.
+    struct DripReader<'a> {
+        data: &'a [u8],
+        pos: usize,
+        drip: usize,
+    }
+
+    impl tokio::io::AsyncRead for DripReader<'_> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let remaining = self.data.len() - self.pos;
+            let n = remaining.min(self.drip).min(buf.remaining());
+            buf.put_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn read_response_chunked_bridge_line_split_inside_fingerprint() {
+        let line =
+            b"obfs4 192.0.2.1:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=aaaa/bbbb iat-mode=0\n";
+        // Cut offsets land inside transport bytes and mid-fingerprint.
+        let cuts = [10usize, 15, 36, 50, 60];
+        let mut framed = Vec::new();
+        let mut prev = 0usize;
+        for &c in cuts.iter().chain(std::iter::once(&line.len())) {
+            let piece = &line[prev..c];
+            framed.extend_from_slice(format!("{:x}\r\n", piece.len()).as_bytes());
+            framed.extend_from_slice(piece);
+            framed.extend_from_slice(b"\r\n");
+            prev = c;
+        }
+        framed.extend_from_slice(b"0\r\n\r\n");
+
+        let mut response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        response.extend_from_slice(&framed);
+
+        let mut cursor = DripReader {
+            data: &response,
+            pos: 0,
+            drip: 3,
+        };
+        let result = read_http_response(&mut cursor, TEST_MAX_BODY)
+            .await
+            .unwrap();
+        match result {
+            ResponseBody::Ok(body) => assert_eq!(body, String::from_utf8_lossy(line)),
+            ResponseBody::Redirect(_) => panic!("expected Ok"),
+        }
     }
 }
 
