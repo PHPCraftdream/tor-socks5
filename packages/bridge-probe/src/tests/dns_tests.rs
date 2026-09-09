@@ -1,3 +1,4 @@
+use crate::dns::persist_write_gate;
 use crate::dns::*;
 use crate::*;
 use bridge_line::BridgeLine;
@@ -29,6 +30,7 @@ fn expired_answer_is_not_served_by_the_normal_path() {
         CachedAnswer {
             addrs: vec!["203.0.113.8".parse().unwrap()],
             expires_at: Instant::now() - Duration::from_secs(1),
+            resolved_at_unix: now_unix() - 61,
         },
     );
     assert!(cached_doh_answer(host).is_none());
@@ -51,6 +53,7 @@ fn stale_fallback_serves_a_recently_expired_positive_answer() {
         CachedAnswer {
             addrs: vec![ip],
             expires_at: Instant::now() - Duration::from_secs(60),
+            resolved_at_unix: now_unix() - 121,
         },
     );
     assert_eq!(stale_fallback_answer(host), Some(vec![ip]));
@@ -65,6 +68,7 @@ fn stale_fallback_refuses_an_answer_past_the_fallback_window() {
         CachedAnswer {
             addrs: vec!["203.0.113.21".parse().unwrap()],
             expires_at: Instant::now() - DNS_STALE_FALLBACK_WINDOW - Duration::from_secs(1),
+            resolved_at_unix: now_unix() - DNS_STALE_FALLBACK_WINDOW.as_secs() - 61,
         },
     );
     assert!(stale_fallback_answer(host).is_none());
@@ -123,8 +127,8 @@ fn parse_persisted_line_rejects_garbage() {
     assert!(parse_persisted_line("host\tnotanip\t123").is_none());
 }
 
-#[test]
-fn save_and_load_persisted_cache_round_trips_through_disk_fallback() {
+#[tokio::test]
+async fn save_and_load_persisted_cache_round_trips_through_disk_fallback() {
     let host = "cache-disk-roundtrip.test.invalid";
     let ip: IpAddr = "203.0.113.40".parse().unwrap();
     remember_doh_answer(host, &[ip], Duration::from_secs(300));
@@ -132,7 +136,9 @@ fn save_and_load_persisted_cache_round_trips_through_disk_fallback() {
     let dir = std::env::temp_dir().join(format!("bridge-probe-dns-cache-test-{}", now_unix()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("dns-cache.txt");
-    save_persisted_dns_cache(&path).expect("save must succeed");
+    save_persisted_dns_cache(&path)
+        .await
+        .expect("save must succeed");
     forget_dns_answer(host); // wipe the in-memory entry entirely
 
     load_persisted_dns_cache(&path);
@@ -314,8 +320,8 @@ fn ttl_is_clamped_into_the_useful_range() {
     forget_dns_answer(host);
 }
 
-#[test]
-fn save_preserves_an_unexpired_disk_fallback_entry() {
+#[tokio::test]
+async fn save_preserves_an_unexpired_disk_fallback_entry() {
     let host = "save-keeps-disk.test.invalid";
     let ip: IpAddr = "203.0.113.70".parse().unwrap();
     let stamp = now_unix() - 3600;
@@ -332,7 +338,9 @@ fn save_preserves_an_unexpired_disk_fallback_entry() {
     let dir = std::env::temp_dir().join(format!("save-keeps-disk-{}-{}", host, now_unix()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("dns-cache.txt");
-    save_persisted_dns_cache(&path).expect("save must succeed");
+    save_persisted_dns_cache(&path)
+        .await
+        .expect("save must succeed");
     let file_text = std::fs::read_to_string(&path).unwrap();
     assert!(
         file_text.contains(&stamp.to_string()),
@@ -362,8 +370,8 @@ fn save_preserves_an_unexpired_disk_fallback_entry() {
     disk_fallback_store().lock().unwrap().remove(host);
 }
 
-#[test]
-fn save_drops_a_genuinely_expired_disk_fallback_entry() {
+#[tokio::test]
+async fn save_drops_a_genuinely_expired_disk_fallback_entry() {
     let host = "save-drops-expired.test.invalid";
     let ip: IpAddr = "203.0.113.71".parse().unwrap();
     {
@@ -379,7 +387,9 @@ fn save_drops_a_genuinely_expired_disk_fallback_entry() {
     let dir = std::env::temp_dir().join(format!("save-drops-expired-{}-{}", host, now_unix()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("dns-cache.txt");
-    save_persisted_dns_cache(&path).expect("save must succeed");
+    save_persisted_dns_cache(&path)
+        .await
+        .expect("save must succeed");
     let file_text = std::fs::read_to_string(&path).unwrap();
     assert!(
         !file_text.contains(host),
@@ -399,8 +409,8 @@ fn save_drops_a_genuinely_expired_disk_fallback_entry() {
     disk_fallback_store().lock().unwrap().remove(host);
 }
 
-#[test]
-fn save_prefers_the_live_answer_for_a_host() {
+#[tokio::test]
+async fn save_prefers_the_live_answer_for_a_host() {
     let host = "save-live-wins.test.invalid";
     let live_ip: IpAddr = "203.0.113.72".parse().unwrap();
     let disk_ip: IpAddr = "203.0.113.73".parse().unwrap();
@@ -418,7 +428,9 @@ fn save_prefers_the_live_answer_for_a_host() {
     let dir = std::env::temp_dir().join(format!("save-live-wins-{}-{}", host, now_unix()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("dns-cache.txt");
-    save_persisted_dns_cache(&path).expect("save must succeed");
+    save_persisted_dns_cache(&path)
+        .await
+        .expect("save must succeed");
     let file_text = std::fs::read_to_string(&path).unwrap();
     assert!(
         file_text.contains(&live_ip.to_string()),
@@ -442,8 +454,8 @@ fn save_prefers_the_live_answer_for_a_host() {
     disk_fallback_store().lock().unwrap().remove(host);
 }
 
-#[test]
-fn save_keeps_the_fallback_when_the_live_cache_only_remembers_a_failure() {
+#[tokio::test]
+async fn save_keeps_the_fallback_when_the_live_cache_only_remembers_a_failure() {
     let host = "save-failure-keeps-disk.test.invalid";
     let ip: IpAddr = "203.0.113.74".parse().unwrap();
     remember_doh_failure(host);
@@ -460,7 +472,9 @@ fn save_keeps_the_fallback_when_the_live_cache_only_remembers_a_failure() {
     let dir = std::env::temp_dir().join(format!("save-failure-keeps-disk-{}-{}", host, now_unix()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("dns-cache.txt");
-    save_persisted_dns_cache(&path).expect("save must succeed");
+    save_persisted_dns_cache(&path)
+        .await
+        .expect("save must succeed");
     let file_text = std::fs::read_to_string(&path).unwrap();
     assert!(
         file_text.contains(&ip.to_string()),
@@ -478,6 +492,179 @@ fn save_keeps_the_fallback_when_the_live_cache_only_remembers_a_failure() {
 
     let _ = std::fs::remove_dir_all(&dir);
     disk_fallback_store().lock().unwrap().remove(host);
+}
+
+/// TS5-04 regression: a resident live answer that expired beyond the
+/// stale-fallback window must not be exported by a periodic save. Under the
+/// old filter (`!addrs.is_empty()` only) it was written with
+/// `resolved_at_unix = now`, so the next cold start accepted a day-stale
+/// address as freshly resolved.
+#[tokio::test]
+async fn save_drops_a_resident_live_answer_past_the_stale_window() {
+    let host = "save-drops-stale-live.test.invalid";
+    let ip: IpAddr = "203.0.113.80".parse().unwrap();
+    // Straight into the map with an expiry past the stale-fallback window --
+    // `remember_doh_answer` clamps TTLs, so it cannot express this. The
+    // stamp is consistent with that expiry: the answer was resolved even
+    // earlier than it expired.
+    store_cached(
+        host,
+        CachedAnswer {
+            addrs: vec![ip],
+            expires_at: Instant::now() - DNS_STALE_FALLBACK_WINDOW - Duration::from_secs(1),
+            resolved_at_unix: now_unix() - DNS_STALE_FALLBACK_WINDOW.as_secs() - 61,
+        },
+    );
+    let dir = std::env::temp_dir().join(format!("save-drops-stale-live-{}-{}", host, now_unix()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("dns-cache.txt");
+    save_persisted_dns_cache(&path)
+        .await
+        .expect("save must succeed");
+    let file_text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !file_text.contains(host),
+        "a resident answer past the stale-fallback window must not be \
+         persisted as freshly resolved, got: {file_text}"
+    );
+
+    forget_dns_answer(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// TS5-04 regression, priority half: the same unusable live answer must not
+/// win the save's live-over-disk priority check either -- a valid, fresh
+/// disk entry for the same host survives with its ORIGINAL stamp instead of
+/// being dropped in favour of a day-stale resident answer.
+#[tokio::test]
+async fn save_keeps_a_valid_disk_answer_when_the_live_answer_is_past_the_stale_window() {
+    let host = "save-disk-beats-stale-live.test.invalid";
+    let stale_live_ip: IpAddr = "203.0.113.81".parse().unwrap();
+    let disk_ip: IpAddr = "203.0.113.82".parse().unwrap();
+    let disk_stamp = now_unix() - 3600;
+    store_cached(
+        host,
+        CachedAnswer {
+            addrs: vec![stale_live_ip],
+            expires_at: Instant::now() - DNS_STALE_FALLBACK_WINDOW - Duration::from_secs(1),
+            resolved_at_unix: now_unix() - DNS_STALE_FALLBACK_WINDOW.as_secs() - 61,
+        },
+    );
+    {
+        let mut store = disk_fallback_store().lock().unwrap();
+        store.insert(
+            host.to_owned(),
+            PersistedAnswer {
+                addrs: vec![disk_ip],
+                resolved_at_unix: disk_stamp,
+            },
+        );
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "save-disk-beats-stale-live-{}-{}",
+        host,
+        now_unix()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("dns-cache.txt");
+    save_persisted_dns_cache(&path)
+        .await
+        .expect("save must succeed");
+    let file_text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !file_text.contains(&stale_live_ip.to_string()),
+        "the unusable live answer must not be persisted, got: {file_text}"
+    );
+    assert!(
+        file_text.contains(&disk_ip.to_string()),
+        "the valid disk answer must survive the stale live one, got: {file_text}"
+    );
+    assert!(
+        file_text.contains(&disk_stamp.to_string()),
+        "the disk answer must keep its ORIGINAL stamp, got: {file_text}"
+    );
+
+    // Simulate the next cold start: wipe only this test's own keys (the
+    // stores are process-wide and shared by other tests running
+    // concurrently), then reload.
+    forget_dns_answer(host);
+    disk_fallback_store().lock().unwrap().remove(host);
+    load_persisted_dns_cache(&path);
+
+    assert_eq!(disk_fallback_answer(host), Some(vec![disk_ip]));
+
+    let _ = std::fs::remove_dir_all(&dir);
+    disk_fallback_store().lock().unwrap().remove(host);
+}
+
+/// TS5-07 regression: while `save_persisted_dns_cache`'s blocking-pool phase
+/// (formatting + file write) is held in flight, an INDEPENDENT async task on
+/// the same runtime must still run its timer to completion. Under the old
+/// synchronous placement the whole save ran on the calling worker, so no
+/// timer could fire while it was in progress. The gate lives behind
+/// `#[cfg(test)]` in `dns.rs`; it stays closed well past the watchdog's
+/// deadline, so the ordering below is deterministic, not a timing race.
+#[tokio::test]
+async fn save_persisted_dns_cache_does_not_block_the_async_worker() {
+    let host = "save-off-worker.test.invalid";
+    let ip: IpAddr = "203.0.113.83".parse().unwrap();
+    remember_doh_answer(host, &[ip], Duration::from_secs(300));
+
+    let dir = std::env::temp_dir().join(format!("save-off-worker-{}-{}", host, now_unix()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("dns-cache.txt");
+
+    persist_write_gate::reset();
+    let save = {
+        let path = path.clone();
+        tokio::spawn(async move {
+            save_persisted_dns_cache(&path)
+                .await
+                .expect("save must succeed");
+            tokio::time::Instant::now()
+        })
+    };
+
+    // Bounded wait until the save has actually reached its blocking-pool
+    // phase (its snapshot phase under the mutex has completed by then).
+    let mut waited = Duration::ZERO;
+    while !persist_write_gate::entered() {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        waited += Duration::from_millis(1);
+        assert!(
+            waited < Duration::from_secs(10),
+            "save never reached its blocking-pool phase"
+        );
+    }
+
+    // The watchdog fires 50ms in; the gate is only released at 100ms, so the
+    // timer MUST complete while the save is still in flight.
+    let watchdog = tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::Instant::now()
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    persist_write_gate::release();
+
+    let (save_done_at, watchdog_at) = tokio::join!(save, watchdog);
+    let save_done_at = save_done_at.expect("save task joins");
+    let watchdog_at = watchdog_at.expect("watchdog task joins");
+    assert!(
+        watchdog_at < save_done_at,
+        "an independent async task must make progress while the save's \
+         blocking phase is in flight (watchdog fired at {watchdog_at:?}, \
+         save finished at {save_done_at:?})"
+    );
+
+    // Semantics unchanged: the held save still landed everything it should.
+    let file_text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        file_text.contains(host),
+        "the saved file must contain the host, got: {file_text}"
+    );
+
+    forget_dns_answer(host);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

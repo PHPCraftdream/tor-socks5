@@ -423,10 +423,13 @@ pub(super) async fn stall_watchdog(
         // Cheap, unconditional per-tick housekeeping: keep the on-disk DNS fallback
         // fresh so a future cold start (possibly with DNS fully blocked from the
         // first moment) has something recent to fall back to, not just whatever
-        // was known the last time this file happened to get written.
+        // was known the last time this file happened to get written. The save
+        // itself runs on tokio's blocking pool.
         if let Err(error) = bridge_probe::save_persisted_dns_cache(&dns_cache_path(
             bridge_health.config_path.as_deref(),
-        )) {
+        ))
+        .await
+        {
             warn!(error = %error, "could not persist DNS fallback cache");
         }
 

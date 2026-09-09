@@ -116,6 +116,12 @@ pub(super) const DOH_PROVIDER_TIMEOUT: Duration = Duration::from_secs(4);
 pub(super) struct CachedAnswer {
     pub(super) addrs: Vec<IpAddr>,
     pub(super) expires_at: Instant,
+    /// Wall-clock time the answer was actually obtained (or the failure
+    /// recorded), set once at insert. `expires_at` is monotonic and cannot
+    /// survive a save; persistence needs the ORIGINAL resolution moment so a
+    /// periodic save cannot re-stamp a long-expired entry into looking
+    /// freshly resolved (TS5-04).
+    pub(super) resolved_at_unix: u64,
 }
 
 /// Floor on how long an answer is kept.
@@ -212,6 +218,15 @@ pub(super) fn stale_fallback_answer(host: &str) -> Option<Vec<IpAddr>> {
     Some(entry.addrs.clone())
 }
 
+/// Whether a live cache entry is still fresh (within TTL) or at least
+/// recent enough (within the stale-fallback window) to be trusted -- the
+/// SAME predicate `cached_doh_answer`/`stale_fallback_answer` effectively
+/// apply, reused here so export/priority decisions cannot disagree with
+/// what would actually be served live (TS5-04).
+fn live_entry_is_usable(entry: &CachedAnswer, now: Instant) -> bool {
+    entry.expires_at > now || now.duration_since(entry.expires_at) <= DNS_STALE_FALLBACK_WINDOW
+}
+
 pub(super) fn remember_doh_answer(host: &str, ips: &[IpAddr], valid_for: Duration) {
     let ttl = valid_for.clamp(DNS_MIN_TTL, DNS_MAX_TTL);
     store_cached(
@@ -219,6 +234,7 @@ pub(super) fn remember_doh_answer(host: &str, ips: &[IpAddr], valid_for: Duratio
         CachedAnswer {
             addrs: ips.to_vec(),
             expires_at: Instant::now() + ttl,
+            resolved_at_unix: now_unix(),
         },
     );
 }
@@ -229,6 +245,7 @@ pub(super) fn remember_doh_failure(host: &str) {
         CachedAnswer {
             addrs: Vec::new(),
             expires_at: Instant::now() + DNS_NEGATIVE_TTL,
+            resolved_at_unix: now_unix(),
         },
     );
 }
@@ -341,13 +358,22 @@ pub(super) fn stamp_beyond_future_tolerance(resolved_at_unix: u64) -> bool {
 /// active-bridges file) rather than pulling in a serialization dependency
 /// for a handful of fields.
 pub(super) fn format_persisted_line(host: &str, entry: &PersistedAnswer) -> String {
-    let addrs = entry
-        .addrs
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{host}\t{addrs}\t{}", entry.resolved_at_unix)
+    use std::fmt::Write as _;
+
+    // One growing String instead of a Vec<String> per address list: the
+    // persist path formats every exported entry on every save.
+    let mut line = String::with_capacity(host.len() + 24 + entry.addrs.len() * 16);
+    line.push_str(host);
+    line.push('\t');
+    for (index, addr) in entry.addrs.iter().enumerate() {
+        if index > 0 {
+            line.push(',');
+        }
+        let _ = write!(line, "{addr}");
+    }
+    line.push('\t');
+    let _ = write!(line, "{}", entry.resolved_at_unix);
+    line
 }
 
 /// Inverse of [`format_persisted_line`]; `None` for any malformed line,
@@ -422,53 +448,132 @@ pub fn load_persisted_dns_cache(path: &std::path::Path) {
 ///
 /// The union of two sources, so a periodic save can never erase what it
 /// exists to protect:
-/// - every positive answer in the live DoH cache, stamped now -- those were
-///   observed in this very session;
-/// - every on-disk fallback entry that no live answer replaces and whose own
-///   age still fits in [`DNS_STALE_FALLBACK_WINDOW`], written with its
-///   ORIGINAL `resolved_at_unix`: re-stamping would keep an aging answer
-///   perpetually fresh, every periodic save resetting the very clock the
-///   next cold start measures it by.
+/// - every positive answer in the live DoH cache that is still usable --
+///   inside its TTL, or within [`DNS_STALE_FALLBACK_WINDOW`] past it, the
+///   same predicate `cached_doh_answer`/`stale_fallback_answer` apply when
+///   serving -- written with its ORIGINAL `resolved_at_unix`: re-stamping
+///   would keep an aging answer perpetually fresh, every periodic save
+///   resetting the very clock the next cold start measures it by;
+/// - every on-disk fallback entry that no usable live answer replaces and
+///   whose own age still fits in [`DNS_STALE_FALLBACK_WINDOW`], also with
+///   its original stamp.
 ///
-/// A live cache entry wins for a host only when it is a positive answer: a
-/// remembered *failure* must not displace the persisted last-known-good,
+/// A live cache entry wins for a host only when it is a positive answer
+/// that is still usable: a remembered *failure*, or an answer past the
+/// fallback window, must not displace the persisted last-known-good,
 /// which is the lifeline of the next session rather than a fact about this
 /// one. Entries past the fallback window are left out and thereby expire
 /// for good. Call periodically (e.g. from the watchdog loop), not
 /// per-lookup.
-pub fn save_persisted_dns_cache(path: &std::path::Path) -> std::io::Result<()> {
-    let now = now_unix();
-    let lines: Vec<String> = {
+///
+/// Snapshots are taken under short-lived locks; the formatting and the
+/// file write run on tokio's blocking pool, so awaiting this from an async
+/// worker never blocks the runtime on formatting or disk I/O.
+pub async fn save_persisted_dns_cache(path: &std::path::Path) -> std::io::Result<()> {
+    let now_instant = Instant::now();
+    let live_snapshot: Vec<PersistSnapshot> = {
         let cache = doh_cache().lock().unwrap_or_else(|p| p.into_inner());
-        let mut lines: Vec<String> = cache
+        cache
             .iter()
-            .filter(|(_, entry)| !entry.addrs.is_empty())
-            .map(|(host, entry)| {
+            .filter(|(_, entry)| {
+                !entry.addrs.is_empty() && live_entry_is_usable(entry, now_instant)
+            })
+            .map(|(host, entry)| PersistSnapshot {
+                host: host.clone(),
+                addrs: entry.addrs.clone(),
+                resolved_at_unix: entry.resolved_at_unix,
+            })
+            .collect()
+    }; // doh_cache() lock released -- only the raw snapshot is held from here on
+    let live_hosts: std::collections::HashSet<&str> =
+        live_snapshot.iter().map(|s| s.host.as_str()).collect();
+    let now = now_unix();
+    let disk_snapshot: Vec<PersistSnapshot> = {
+        let store = disk_fallback_store()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        store
+            .iter()
+            .filter(|(host, _)| !live_hosts.contains(host.as_str()))
+            .filter(|(_, entry)| {
+                now.saturating_sub(entry.resolved_at_unix) <= DNS_STALE_FALLBACK_WINDOW.as_secs()
+            })
+            .map(|(host, entry)| PersistSnapshot {
+                host: host.clone(),
+                addrs: entry.addrs.clone(),
+                resolved_at_unix: entry.resolved_at_unix,
+            })
+            .collect()
+    }; // disk_fallback_store() lock released -- no locks held from here on
+
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        persist_write_gate::hold_until_released();
+        let lines: Vec<String> = live_snapshot
+            .into_iter()
+            .chain(disk_snapshot)
+            .map(|snapshot| {
                 format_persisted_line(
-                    host,
+                    &snapshot.host,
                     &PersistedAnswer {
-                        addrs: entry.addrs.clone(),
-                        resolved_at_unix: now,
+                        addrs: snapshot.addrs,
+                        resolved_at_unix: snapshot.resolved_at_unix,
                     },
                 )
             })
             .collect();
-        let store = disk_fallback_store()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        for (host, entry) in store.iter() {
-            if cache.get(host).is_some_and(|live| !live.addrs.is_empty()) {
-                continue; // a live positive answer replaces the persisted one
-            }
-            let age = now.saturating_sub(entry.resolved_at_unix);
-            if age > DNS_STALE_FALLBACK_WINDOW.as_secs() {
-                continue; // genuinely expired: let it disappear
-            }
-            lines.push(format_persisted_line(host, entry));
+        std::fs::write(&path, lines.join("\n"))
+    })
+    .await
+    .unwrap_or_else(|join_error| {
+        Err(std::io::Error::other(format!(
+            "bridge-probe DNS persist task panicked: {join_error}"
+        )))
+    })
+}
+
+/// Raw data for one persisted line, cloned out from under a mutex so
+/// formatting never runs while a lock is held.
+struct PersistSnapshot {
+    host: String,
+    addrs: Vec<IpAddr>,
+    resolved_at_unix: u64,
+}
+
+/// Test-only gate for `dns_tests.rs`' "does not block the async worker"
+/// regression: holds `save_persisted_dns_cache`'s blocking-pool phase in
+/// flight while the test proves an independent timer still runs. Compiled
+/// out of every non-test build.
+#[cfg(test)]
+pub(crate) mod persist_write_gate {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    static ENTERED: AtomicBool = AtomicBool::new(false);
+    static RELEASE: AtomicBool = AtomicBool::new(false);
+
+    pub(crate) fn reset() {
+        RELEASE.store(false, Ordering::SeqCst);
+        ENTERED.store(false, Ordering::SeqCst);
+    }
+
+    /// Called on the blocking pool; parks the persist task until the test
+    /// releases it.
+    pub(super) fn hold_until_released() {
+        ENTERED.store(true, Ordering::SeqCst);
+        while !RELEASE.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
         }
-        lines
-    };
-    std::fs::write(path, lines.join("\n"))
+    }
+
+    pub(crate) fn entered() -> bool {
+        ENTERED.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn release() {
+        RELEASE.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Last-resort answer for `host` sourced from a previous run, once every DoH
@@ -576,17 +681,12 @@ pub fn best_known_answer(host: &str) -> Option<DnsHint> {
     {
         let cache = doh_cache().lock().unwrap_or_else(|p| p.into_inner());
         if let Some(entry) = cache.get(host) {
-            if !entry.addrs.is_empty() {
-                let now = Instant::now();
-                let fresh_or_recent = entry.expires_at > now
-                    || now.duration_since(entry.expires_at) <= DNS_STALE_FALLBACK_WINDOW;
-                if fresh_or_recent {
-                    return Some(DnsHint {
-                        host: host.to_owned(),
-                        addrs: entry.addrs.clone(),
-                        resolved_at_unix: now_unix(),
-                    });
-                }
+            if !entry.addrs.is_empty() && live_entry_is_usable(entry, Instant::now()) {
+                return Some(DnsHint {
+                    host: host.to_owned(),
+                    addrs: entry.addrs.clone(),
+                    resolved_at_unix: entry.resolved_at_unix,
+                });
             }
         }
     }
