@@ -255,11 +255,78 @@ async fn redirect_same_host_other_port_drops_credentials() {
     assert!(log[0].2.contains("Authorization: Bearer tok\r\n"));
     assert!(log[0].2.contains("Cookie: sid=abc\r\n"));
     assert!(log[1].2.contains("GET /x "));
-    // Host header carries just the hostname (no port) — the fetch loop's
-    // request builder uses the URL host.
-    assert!(log[1].2.contains("Host: a.test\r\n"));
+    // Host header carries the explicit port — the fetch loop's request
+    // builder uses the preformatted host_header from the parsed URL.
+    assert!(log[1].2.contains("Host: a.test:8443\r\n"));
+    assert!(!log[1].2.contains("Host: a.test\r\n"));
     assert!(!log[1].2.contains("Authorization:"));
     assert!(!log[1].2.contains("Cookie:"));
+}
+
+#[tokio::test]
+async fn direct_fetch_explicit_port_host_header() {
+    let mut srv = TestServer::new();
+    srv.add_origin("a.test", 8443, vec![ok("bridges")]);
+
+    let body = run_fetch(&srv, "https://a.test:8443/bridges", false)
+        .await
+        .expect("fetch succeeds");
+    assert_eq!(body, "bridges");
+
+    let log = srv.requests();
+    assert_eq!(log.len(), 1);
+    assert_eq!((log[0].0.as_str(), log[0].1), ("a.test", 8443));
+    assert!(log[0].2.contains("Host: a.test:8443\r\n"));
+    assert!(!log[0].2.contains("Host: a.test\r\n"));
+}
+
+#[tokio::test]
+async fn ipv6_explicit_port_dial_and_host_header() {
+    let mut srv = TestServer::new();
+    srv.add_origin("::1", 8443, vec![redirect("/next"), ok("bridges")]);
+
+    let body = run_fetch(&srv, "https://[::1]:8443/bridges", false)
+        .await
+        .expect("fetch succeeds");
+    assert_eq!(body, "bridges");
+
+    let log = srv.requests();
+    assert_eq!(log.len(), 2);
+    // Dial host has NO brackets — a bracketed form would miss the origin
+    // lookup and the fetch would fail with "unexpected test origin".
+    assert_eq!(log[0].0, "::1");
+    assert_eq!(log[0].1, 8443);
+    assert!(log[0].2.contains("Host: [::1]:8443\r\n"));
+    // Each logged entry exists only after a successful TLS handshake, so
+    // these prove ServerName accepted the unbracketed dial host.
+    assert_eq!(log[1].0, "::1");
+    assert_eq!(log[1].1, 8443);
+    // Relative-redirect reconstruction rebuilt a valid bracketed authority
+    // with the explicit port.
+    assert!(log[1].2.contains("Host: [::1]:8443\r\n"));
+    // Same origin per dial_host+port: credentials survive both hops.
+    assert!(log[0].2.contains("Authorization: Bearer tok\r\n"));
+    assert!(log[0].2.contains("Cookie: sid=abc\r\n"));
+    assert!(log[1].2.contains("Authorization: Bearer tok\r\n"));
+    assert!(log[1].2.contains("Cookie: sid=abc\r\n"));
+}
+
+#[tokio::test]
+async fn ipv6_default_port_host_header_has_no_port() {
+    let mut srv = TestServer::new();
+    srv.add_origin("::1", 443, vec![ok("bridges")]);
+
+    let body = run_fetch(&srv, "https://[::1]/bridges", false)
+        .await
+        .expect("fetch succeeds");
+    assert_eq!(body, "bridges");
+
+    let log = srv.requests();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].0, "::1");
+    assert_eq!(log[0].1, 443);
+    assert!(log[0].2.contains("Host: [::1]\r\n"));
+    assert!(!log[0].2.contains("Host: [::1]:443"));
 }
 
 #[tokio::test]

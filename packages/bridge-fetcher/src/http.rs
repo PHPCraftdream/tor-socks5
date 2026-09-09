@@ -256,9 +256,10 @@ async fn fetch_one_inner(
     let mut current_url = url.to_string();
     // Fixed credential boundary: the origin of the URL the caller asked for,
     // not the previous hop. Both sides go through `parse_https_url` (the `url`
-    // crate), so host is lowercased and an omitted port folds to 443 — a
-    // plain tuple comparison is a normalized origin comparison.
-    let original_origin: (String, u16) = parse_https_url(url).map(|t| (t.host, t.port))?;
+    // crate), so host is lowercased and brackets stripped, and an omitted
+    // port folds to 443 — a plain tuple comparison is a normalized origin
+    // comparison.
+    let original_origin: (String, u16) = parse_https_url(url).map(|t| (t.dial_host, t.port))?;
 
     for hop in 0..=MAX_REDIRECTS {
         if hop == MAX_REDIRECTS {
@@ -271,7 +272,7 @@ async fn fetch_one_inner(
         // redirect. Withhold ALL caller-supplied headers/cookies together on
         // cross-origin hops (opt-out via `allow_credentials_cross_origin`).
         let same_origin = allow_credentials_cross_origin
-            || (target.host == original_origin.0 && target.port == original_origin.1);
+            || (target.dial_host == original_origin.0 && target.port == original_origin.1);
         let (hop_headers, hop_cookies): (&[String], &[String]) = if same_origin {
             (headers, cookies)
         } else {
@@ -279,23 +280,23 @@ async fn fetch_one_inner(
         };
         if !same_origin {
             debug!(
-                host = %target.host,
+                host = %target.dial_host,
                 port = target.port,
                 hop,
                 "cross-origin redirect: withholding source credentials"
             );
         }
         debug!(
-            host = %target.host,
+            host = %target.dial_host,
             port = target.port,
             path = %target.path_and_query,
             hop,
             "fetching"
         );
 
-        let raw = connector.connect(&target.host, target.port).await?;
+        let raw = connector.connect(&target.dial_host, target.port).await?;
 
-        let server_name = rustls::pki_types::ServerName::try_from(target.host.clone())
+        let server_name = rustls::pki_types::ServerName::try_from(target.dial_host.clone())
             .map_err(|e| FetchError::Tls(format!("invalid SNI: {e}")))?;
 
         let tls_connector = tokio_rustls::TlsConnector::from(tls_cfg.clone());
@@ -305,7 +306,7 @@ async fn fetch_one_inner(
             .map_err(|e| FetchError::Tls(e.to_string()))?;
 
         let req = build_get_request(
-            &target.host,
+            &target.host_header,
             &target.path_and_query,
             hop_headers,
             hop_cookies,
@@ -327,7 +328,7 @@ async fn fetch_one_inner(
                 let next = if loc.starts_with("https://") {
                     loc
                 } else if loc.starts_with('/') {
-                    format!("https://{}:{}{}", target.host, target.port, loc)
+                    format!("https://{}:{}{}", target.bracketed_host(), target.port, loc)
                 } else {
                     return Err(FetchError::Http(format!(
                         "unsupported redirect location: {loc}"
