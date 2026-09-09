@@ -67,7 +67,9 @@ impl<'a, S: AsyncReadExt + Unpin> ChunkedReader<'a, S> {
 
     /// Read one CRLF-terminated line, bounded by `max`, scanning for `\n`
     /// in the shared `pre` buffer and refilling it in blocks (not byte at
-    /// a time). Compacts `pre` once it is fully drained.
+    /// a time). Compacts the consumed prefix before every refill, so `pre`
+    /// stays bounded by the unconsumed tail plus one block even when the
+    /// next line's tail is already buffered.
     async fn read_line(&mut self, max: usize, what: &str) -> Result<Vec<u8>, FetchError> {
         if self.pre_pos >= self.pre.len() {
             self.pre.clear();
@@ -97,6 +99,19 @@ impl<'a, S: AsyncReadExt + Unpin> ChunkedReader<'a, S> {
                 return Err(FetchError::ChunkedEncoding(format!(
                     "connection closed while reading {what}"
                 )));
+            }
+            // Compact before refilling, not only at full drain: when the
+            // next line's tail is already buffered (typical for many small
+            // chunks), `pre_pos` never reaches `pre.len()`, and the consumed
+            // prefix would be retained until the buffer happened to drain
+            // completely — `pre` would grow with the whole wire stream.
+            if self.pre_pos > 0 {
+                self.pre.drain(..self.pre_pos);
+                // `scan_from` was the pre-drain `pre.len()`; the retained
+                // bytes and the new block shifted left by the same amount,
+                // so subtract it to keep pointing at the first unread byte.
+                scan_from -= self.pre_pos;
+                self.pre_pos = 0;
             }
             self.pre.extend_from_slice(&scratch[..n]);
         }
@@ -445,6 +460,112 @@ mod tests {
             .is_empty());
         assert!(rdr.pre.capacity() < 4096);
         assert!(rdr.pre_pos <= rdr.pre.len());
+    }
+
+    #[tokio::test]
+    async fn pre_buffer_stays_bounded_when_next_size_line_tail_arrives_early() {
+        // Wire layout from the round-5 review: the first segment carries
+        // `1\r\na\r\n1` (size line, payload, CRLF and the START of the next
+        // size line), every following one carries `\r\na\r\n1` (rest of a
+        // size line, payload, CRLF, next size line start). After each chunk
+        // a one-byte tail of the NEXT line is already buffered, so
+        // `pre_pos < pre.len()` at every read_line entry and the old
+        // compact-only-at-full-drain logic never fired: `pre` retained the
+        // whole consumed wire (~6 bytes per chunk, O(K)). K=2000 puts
+        // old-code retention (~12 KB) past the 8192 assert; a few dozen
+        // repeats would stay under it and pass even with the bug present.
+        const CHUNKS: usize = 2000;
+        let mut dq = VecDeque::new();
+        dq.push_back(b"1\r\na\r\n1".to_vec());
+        for _ in 1..CHUNKS - 1 {
+            dq.push_back(b"\r\na\r\n1".to_vec());
+        }
+        dq.push_back(b"\r\na\r\n0\r\n\r\n".to_vec());
+        let mut pr = PieceReader(dq);
+        let mut rdr = ChunkedReader::new(&mut pr, b"");
+        let mut body = Vec::new();
+        for i in 0..CHUNKS {
+            assert_eq!(
+                rdr.read_line(MAX_SIZE_LINE, "chunk size line")
+                    .await
+                    .unwrap(),
+                b"1"
+            );
+            let mut payload = [0u8; 1];
+            rdr.read_exact_into(&mut payload).await.unwrap();
+            body.extend_from_slice(&payload);
+            let mut sep = [0u8; 2];
+            rdr.read_exact_into(&mut sep).await.unwrap();
+            assert_eq!(&sep, b"\r\n");
+            assert!(
+                rdr.pre.len() < 8192,
+                "chunk {i}: pre.len()={} grows with the wire stream",
+                rdr.pre.len()
+            );
+            assert!(rdr.pre_pos <= rdr.pre.len());
+        }
+        assert_eq!(body, vec![b'a'; CHUNKS]);
+        assert_eq!(
+            rdr.read_line(MAX_SIZE_LINE, "chunk size line")
+                .await
+                .unwrap(),
+            b"0"
+        );
+        assert!(rdr
+            .read_line(MAX_SIZE_LINE, "trailer line")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(rdr.pre.capacity() < 8192);
+    }
+
+    #[tokio::test]
+    async fn pre_buffer_stays_bounded_with_block_sized_refills() {
+        // Same report layout, but the whole wire arrives as one stream so
+        // each refill appends a full (up to 4096-byte) block onto the
+        // drained tail: compaction must keep `pre` bounded in that shape
+        // too. Capacity-based asserts are sensitive to Vec amortized
+        // growth, so this variant pins `pre.len()` only.
+        const CHUNKS: usize = 2000;
+        let mut wire = b"1\r\na\r\n1".to_vec();
+        for _ in 1..CHUNKS - 1 {
+            wire.extend_from_slice(b"\r\na\r\n1");
+        }
+        wire.extend_from_slice(b"\r\na\r\n0\r\n\r\n");
+        let mut pr = PieceReader(pieces(&[wire.as_slice()]));
+        let mut rdr = ChunkedReader::new(&mut pr, b"");
+        let mut body = Vec::new();
+        for i in 0..CHUNKS {
+            assert_eq!(
+                rdr.read_line(MAX_SIZE_LINE, "chunk size line")
+                    .await
+                    .unwrap(),
+                b"1"
+            );
+            let mut payload = [0u8; 1];
+            rdr.read_exact_into(&mut payload).await.unwrap();
+            body.extend_from_slice(&payload);
+            let mut sep = [0u8; 2];
+            rdr.read_exact_into(&mut sep).await.unwrap();
+            assert_eq!(&sep, b"\r\n");
+            assert!(
+                rdr.pre.len() < 8192,
+                "chunk {i}: pre.len()={} grows with the wire stream",
+                rdr.pre.len()
+            );
+        }
+        assert_eq!(body, vec![b'a'; CHUNKS]);
+        assert_eq!(
+            rdr.read_line(MAX_SIZE_LINE, "chunk size line")
+                .await
+                .unwrap(),
+            b"0"
+        );
+        assert!(rdr
+            .read_line(MAX_SIZE_LINE, "trailer line")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
