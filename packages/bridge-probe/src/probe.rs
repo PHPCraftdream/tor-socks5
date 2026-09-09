@@ -1,3 +1,5 @@
+use rustls::pki_types::ServerName;
+
 use super::dns::{
     cached_doh_answer, disk_fallback_answer, doh_order, doh_pool, doh_slots, forget_dns_answer,
     note_doh_result, remember_doh_answer, remember_doh_failure, stale_fallback_answer, CacheHit,
@@ -83,6 +85,142 @@ impl Report {
 ///   the `url=` param (defaulting port to 443 for `https://`, 80 for
 ///   `http://`).
 /// - Any other unrecognised transport → fall back to `bridge.addr`.
+///
+/// Everything the webtunnel upgrade probe needs from the bridge params,
+/// derived from a single parse of `url=`.
+///
+/// This mirrors the transport's `PreparedTarget` in ptrs-gesher's webtunnel
+/// crate (`crates/webtunnel/src/target.rs`) field for field: TS4-03 exists
+/// because the probe and the transport disagreed about which host went in
+/// the SNI, which name went in the Host header, and whether the connection
+/// was TLS at all. Keeping the same names and the same construction order
+/// makes a side-by-side review of the two trivial, so a future divergence
+/// is a review failure rather than a silent one.
+#[derive(Debug)]
+pub(super) struct PreparedTarget {
+    /// Dial host (`addr=` override wins, else URL host, brackets stripped).
+    pub(super) dial_host: String,
+    /// Dial port (`addr=` override wins, else explicit or scheme-default port).
+    pub(super) dial_port: u16,
+    /// TLS SNI / Host-header name (`servername=` override wins, else URL host).
+    pub(super) sni: String,
+    /// Preformatted HTTP Host header value: bracketed if `sni` is an IPv6
+    /// literal, plus ":port" ONLY if the URL carried an explicit port
+    /// (`url::Url::port()`, not the scheme default — parity with the
+    /// transport).
+    pub(super) host_header: String,
+    /// HTTP request-target: URL path (or "/") plus "?query" when the query
+    /// is present and non-empty.
+    pub(super) request_target: String,
+    /// True for `https://`, false for `http://`.
+    pub(super) use_tls: bool,
+}
+
+impl PreparedTarget {
+    /// Build the plan, following the transport's checks in the same order
+    /// and with the same errors: url parse, scheme check, SNI selection +
+    /// `ServerName` validation, then dial host/port extraction.
+    pub(super) fn new(params: &BTreeMap<String, String>) -> Result<Self, String> {
+        let url_str = params
+            .get("url")
+            .ok_or_else(|| "webtunnel bridge missing both url= and addr=".to_string())?;
+        let parsed = parse_webtunnel_url(url_str)?;
+        if !parsed.scheme().eq_ignore_ascii_case("http")
+            && !parsed.scheme().eq_ignore_ascii_case("https")
+        {
+            return Err(format!(
+                "unsupported url scheme {} in url={url_str:?} (expected http or https)",
+                parsed.scheme()
+            ));
+        }
+
+        // SNI follows the `servername=` override or the URL's own host, which
+        // is not always the probe target: an addr= override redirects the
+        // connection while the certificate, and the bridge's identity, still
+        // belong to the URL host. The ServerName check rejects e.g. CRLF
+        // injection before it can reach the wire, as the transport does.
+        let sni = match params.get("servername") {
+            Some(s) => s.trim_start_matches('[').trim_end_matches(']').to_string(),
+            None => parsed
+                .host_str()
+                .map(|host| {
+                    host.trim_start_matches('[')
+                        .trim_end_matches(']')
+                        .to_string()
+                })
+                .ok_or_else(|| format!("url={url_str:?} has no host"))?,
+        };
+        rustls::pki_types::ServerName::try_from(sni.as_str())
+            .map_err(|e| format!("invalid servername {sni:?}: {e}"))?;
+
+        // Dial target: addr= wins over the URL, and unlike a SocketAddr parse
+        // it may be a bare `host:port` — collectors publish hostname addr=
+        // values, and rejecting them here used to unprobe those bridges.
+        let (dial_host, dial_port) = match params.get("addr") {
+            Some(addr) => {
+                if let Ok(socket) = addr.parse::<SocketAddr>() {
+                    (socket.ip().to_string(), socket.port())
+                } else {
+                    let (host, port) = addr.rsplit_once(':').ok_or_else(|| {
+                        format!("invalid addr={addr:?}: missing ':' (expected host:port)")
+                    })?;
+                    if host.is_empty() || host.contains([':', '[', ']']) {
+                        return Err(format!("invalid addr={addr:?}: bad host {host:?}"));
+                    }
+                    let port: u16 = port
+                        .parse()
+                        .map_err(|e| format!("invalid addr={addr:?}: bad port {port:?}: {e}"))?;
+                    (host.to_string(), port)
+                }
+            }
+            None => {
+                let host = parsed
+                    .host_str()
+                    .map(|host| {
+                        host.trim_start_matches('[')
+                            .trim_end_matches(']')
+                            .to_string()
+                    })
+                    .ok_or_else(|| format!("url={url_str:?} has no host"))?;
+                let port = parsed.port_or_known_default().ok_or_else(|| {
+                    format!("url={url_str:?} has no port and an unrecognised scheme")
+                })?;
+                (host, port)
+            }
+        };
+
+        // Path and query exactly as configured: the secret path is what
+        // identifies the bridge, and a wrong one is answered by the site
+        // rather than the bridge.
+        let path = parsed.path();
+        let path = if path.is_empty() { "/" } else { path };
+        let request_target = match parsed.query() {
+            Some(q) if !q.is_empty() => format!("{path}?{q}"),
+            _ => path.to_string(),
+        };
+
+        // An explicit URL port goes on the wire (parity with the transport);
+        // a scheme-default port does not.
+        let mut host_header = if sni.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("[{sni}]")
+        } else {
+            sni.clone()
+        };
+        if let Some(explicit_port) = parsed.port() {
+            host_header = format!("{host_header}:{explicit_port}");
+        }
+
+        Ok(Self {
+            dial_host,
+            dial_port,
+            sni,
+            host_header,
+            request_target,
+            use_tls: parsed.scheme().eq_ignore_ascii_case("https"),
+        })
+    }
+}
+
 pub(super) fn resolve_probe_target(bridge: &BridgeLine) -> Result<(String, u16), String> {
     match bridge.transport.as_deref() {
         None | Some("obfs4") => Ok((bridge.addr.ip().to_string(), bridge.addr.port())),
@@ -93,36 +231,16 @@ pub(super) fn resolve_probe_target(bridge: &BridgeLine) -> Result<(String, u16),
 
 /// Extract the probe target from webtunnel bridge-line params.
 ///
+/// Thin delegate over [`PreparedTarget`]: the plan and the (host, port)
+/// pair are the same computation, so they cannot drift apart again.
 /// Priority: `addr=` param wins over URL host:port. The URL's port
 /// defaults to 443 for `https://` and 80 for `http://`.
 ///
-/// Keep in sync with `vendor/ptrs/crates/webtunnel/src/lib.rs`
-/// (`WebTunnelConfig::connect_host_port`).
+/// Keep in sync with ptrs-gesher `crates/webtunnel/src/target.rs`.
 pub(super) fn webtunnel_probe_target(
     params: &BTreeMap<String, String>,
 ) -> Result<(String, u16), String> {
-    if let Some(addr) = params.get("addr") {
-        let socket: SocketAddr = addr
-            .parse()
-            .map_err(|e| format!("invalid addr={addr:?}: {e}"))?;
-        return Ok((socket.ip().to_string(), socket.port()));
-    }
-
-    let url_str = params
-        .get("url")
-        .ok_or_else(|| "webtunnel bridge missing both url= and addr=".to_string())?;
-
-    let parsed = parse_webtunnel_url(url_str)?;
-
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| format!("url={url_str:?} has no host"))?;
-
-    let port = parsed
-        .port_or_known_default()
-        .ok_or_else(|| format!("url={url_str:?} has no port and an unrecognised scheme"))?;
-
-    Ok((host.to_string(), port))
+    PreparedTarget::new(params).map(|t| (t.dial_host, t.dial_port))
 }
 
 /// Parse a webtunnel `url=` value, tolerating a missing scheme.
@@ -154,6 +272,10 @@ pub(super) const MIN_DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Resolve the probe target for `bridge`, then perform a TCP handshake.
 /// DNS resolution (when needed) gets its own budget — at least
 /// [`MIN_DNS_RESOLVE_TIMEOUT`] — on top of the TCP probe's.
+///
+/// For webtunnel the whole probe runs from a single [`PreparedTarget`]
+/// built here, so DNS, SNI, Host header and scheme cannot disagree with
+/// each other or with the real transport.
 pub(super) async fn resolve_and_probe(
     bridge: &BridgeLine,
     per_bridge_timeout: Duration,
@@ -164,9 +286,24 @@ pub(super) async fn resolve_and_probe(
             reason: "documentation or local-only bridge address".to_owned(),
         };
     }
-    let (host, port) = match resolve_probe_target(bridge) {
-        Ok(v) => v,
-        Err(reason) => return Outcome::Unreachable { reason },
+
+    let plan = if bridge.transport.as_deref() == Some("webtunnel") {
+        // The TCP target for webtunnel is the fronting web server, which answers
+        // whether or not a bridge lives behind it, so a bare connect proves
+        // nothing. Ask the endpoint to upgrade instead -- only a real bridge can.
+        match PreparedTarget::new(&bridge.params) {
+            Ok(plan) => Some(plan),
+            Err(reason) => return Outcome::Unreachable { reason },
+        }
+    } else {
+        None
+    };
+    let (host, port) = match &plan {
+        Some(plan) => (plan.dial_host.clone(), plan.dial_port),
+        None => match resolve_probe_target(bridge) {
+            Ok(v) => v,
+            Err(reason) => return Outcome::Unreachable { reason },
+        },
     };
 
     let resolved_by_dns = host.parse::<IpAddr>().is_err();
@@ -185,22 +322,8 @@ pub(super) async fn resolve_and_probe(
         }
     };
 
-    let outcome = if bridge.transport.as_deref() == Some("webtunnel") {
-        // The TCP target for webtunnel is the fronting web server, which answers
-        // whether or not a bridge lives behind it, so a bare connect proves
-        // nothing. Ask the endpoint to upgrade instead -- only a real bridge can.
-        let Some(url) = bridge.params.get("url") else {
-            return Outcome::Unreachable {
-                reason: "webtunnel bridge has no url= to upgrade against".to_owned(),
-            };
-        };
-        webtunnel_upgrade_probe(
-            &addrs,
-            &host,
-            url,
-            per_bridge_timeout.max(MIN_WEBTUNNEL_TIMEOUT),
-        )
-        .await
+    let outcome = if let Some(plan) = &plan {
+        webtunnel_upgrade_probe(&addrs, plan, per_bridge_timeout.max(MIN_WEBTUNNEL_TIMEOUT)).await
     } else {
         tcp_probe(&addrs, per_bridge_timeout).await
     };
@@ -255,8 +378,7 @@ pub(super) fn webtunnel_tls_config() -> std::sync::Arc<rustls::ClientConfig> {
 /// is fine because the connection is dropped either way.
 pub(super) async fn webtunnel_upgrade_probe(
     addrs: &[SocketAddr],
-    host: &str,
-    url: &str,
+    plan: &PreparedTarget,
     budget: Duration,
 ) -> Outcome {
     let started = Instant::now();
@@ -266,7 +388,7 @@ pub(super) async fn webtunnel_upgrade_probe(
     let attempt = async {
         let mut last = "hostname resolved to no usable address".to_owned();
         for addr in addrs {
-            match webtunnel_upgrade_inner(*addr, host, url).await {
+            match webtunnel_upgrade_inner(*addr, plan).await {
                 Ok(()) => return Ok(()),
                 Err(reason) => last = format!("{addr}: {reason}"),
             }
@@ -286,59 +408,62 @@ pub(super) async fn webtunnel_upgrade_probe(
 
 pub(super) async fn webtunnel_upgrade_inner(
     addr: SocketAddr,
-    host: &str,
-    url: &str,
+    plan: &PreparedTarget,
 ) -> Result<(), String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let parsed = parse_webtunnel_url(url)?;
-    // Path and query exactly as configured: the secret path is what identifies
-    // the bridge, and a wrong one is answered by the site rather than the bridge.
-    let mut path = parsed.path().to_owned();
-    if path.is_empty() {
-        path.push('/');
-    }
-    if let Some(query) = parsed.query() {
-        path.push('?');
-        path.push_str(query);
-    }
-    // SNI follows the URL's own host, which is not always the probe target: an
-    // addr= override redirects the connection while the certificate, and the
-    // bridge's identity, still belong to the URL host.
-    let sni_host = parsed.host_str().unwrap_or(host).to_owned();
-
-    let tcp = TcpStream::connect(addr)
-        .await
-        .map_err(|e| format!("tcp connect: {e}"))?;
-    let server_name = rustls::pki_types::ServerName::try_from(sni_host.clone())
-        .map_err(|e| format!("invalid SNI {sni_host:?}: {e}"))?;
-    let connector = tokio_rustls::TlsConnector::from(webtunnel_tls_config());
-    let mut tls = connector
-        .connect(server_name, tcp)
-        .await
-        .map_err(|e| format!("tls: {e}"))?;
-
     // A fixed key is fine: nothing here verifies the server's accept hash, and
-    // the probe carries no data.
+    // the probe carries no data. Host header and request-target come straight
+    // from the shared plan, so the wire format matches the transport's.
     let request = format!(
-        "GET {path} HTTP/1.1\r\n\
-         Host: {sni_host}\r\n\
+        "GET {} HTTP/1.1\r\n\
+         Host: {}\r\n\
          Connection: Upgrade\r\n\
          Upgrade: websocket\r\n\
          Sec-WebSocket-Version: 13\r\n\
          Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
          User-Agent: Mozilla/5.0\r\n\
-         \r\n"
+         \r\n",
+        plan.request_target, plan.host_header
     );
-    tls.write_all(request.as_bytes())
+
+    let tcp = TcpStream::connect(addr)
+        .await
+        .map_err(|e| format!("tcp connect: {e}"))?;
+    if plan.use_tls {
+        let server_name = ServerName::try_from(plan.sni.clone())
+            .map_err(|e| format!("invalid SNI {:?}: {e}", plan.sni))?;
+        let connector = tokio_rustls::TlsConnector::from(webtunnel_tls_config());
+        let tls = connector
+            .connect(server_name, tcp)
+            .await
+            .map_err(|e| format!("tls: {e}"))?;
+        send_upgrade_request(tls, &request).await
+    } else {
+        // Plain http:// : the transport speaks cleartext too, so the probe
+        // must not demand a certificate the bridge never offers.
+        send_upgrade_request(tcp, &request).await
+    }
+}
+
+/// Write the upgrade request and look for `101 Switching Protocols`.
+///
+/// Generic over the stream so the TLS and plain-http paths share this
+/// verbatim without boxing or an enum wrapper.
+async fn send_upgrade_request<S>(mut stream: S, request: &str) -> Result<(), String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    stream
+        .write_all(request.as_bytes())
         .await
         .map_err(|e| format!("write request: {e}"))?;
-    tls.flush().await.map_err(|e| format!("flush: {e}"))?;
+    stream.flush().await.map_err(|e| format!("flush: {e}"))?;
 
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     loop {
-        let n = tls
+        let n = stream
             .read(&mut chunk)
             .await
             .map_err(|e| format!("read response: {e}"))?;
@@ -383,73 +508,165 @@ pub(super) const MAX_PROBE_ADDRS: usize = 3;
 /// first because it is the family that is nearly always routable, but both are
 /// tried: an unroutable address fails instantly, so the ordering costs a
 /// dual-stack host nothing and rescues a single-stack one.
+///
+/// The limit is shared between the families that are actually present: when
+/// both an A and an AAAA answer arrive and the limit allows it (>= 2), each
+/// family keeps at least one attempt, and any leftover capacity goes to IPv4.
+/// A blanket `take(limit)` would otherwise let a long A-only RR set evict the
+/// IPv6 candidate of a dual-stack host entirely.
 pub(super) fn order_candidates(ips: &[IpAddr], port: u16) -> Vec<SocketAddr> {
+    order_candidates_with_limit(ips, port, MAX_PROBE_ADDRS)
+}
+
+pub(super) fn order_candidates_with_limit(
+    ips: &[IpAddr],
+    port: u16,
+    limit: usize,
+) -> Vec<SocketAddr> {
     let mut seen = std::collections::HashSet::new();
     let mut sorted: Vec<IpAddr> = ips.iter().copied().filter(|ip| seen.insert(*ip)).collect();
     // Stable, so the resolver's own ordering survives within each family.
     sorted.sort_by_key(|ip| u8::from(ip.is_ipv6()));
-    sorted
-        .into_iter()
-        .take(MAX_PROBE_ADDRS)
-        .map(|ip| SocketAddr::new(ip, port))
+    let v4_count = sorted.iter().filter(|ip| ip.is_ipv4()).count();
+    let v6_count = sorted.len() - v4_count;
+    if limit < 2 || v4_count == 0 || v6_count == 0 {
+        return sorted
+            .into_iter()
+            .take(limit)
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect();
+    }
+    // Both families present: reserve one slot for IPv6, give the remainder
+    // to IPv4 (capped by what exists), and hand any slack back to IPv6.
+    let v4_take = (limit - 1).min(v4_count);
+    let v6_take = (limit - v4_take).min(v6_count);
+    sorted[..v4_take]
+        .iter()
+        .chain(sorted[v4_count..v4_count + v6_take].iter())
+        .map(|ip| SocketAddr::new(*ip, port))
         .collect()
 }
 
-/// Race one wave of DoH providers for `query`, returning the first non-empty
-/// answer together with how long the records claim to be good for. Records
-/// each provider's behaviour so [`doh_order`] can learn.
-pub(super) async fn race_doh_wave(wave: &[usize], query: &str) -> Option<(Vec<IpAddr>, Duration)> {
-    let pool = doh_pool();
-    let mut attempts = futures::stream::FuturesUnordered::new();
-    for &index in wave {
-        let Some(resolver) = pool.get(index).cloned() else {
-            continue;
-        };
-        let query = query.to_owned();
-        let slots = std::sync::Arc::clone(doh_slots());
-        attempts.push(async move {
-            let _permit = slots.acquire_owned().await.ok();
-            let started = Instant::now();
-            // Per-provider bound. Without it a blocked provider holds its
-            // semaphore permit for the caller's whole budget, starving the
-            // providers that would have answered.
-            let response = timeout(
-                DOH_PROVIDER_TIMEOUT,
-                resolver.lookup_ip(format!("{query}.")),
-            )
-            .await
-            .ok()
-            .and_then(Result::ok);
-            (index, started.elapsed(), response)
+/// What one DoH provider attempt reports back: its wave index, how long the
+/// lookup took, and — if it produced one — the non-empty answer with the
+/// records' own TTL. `None` means "no usable answer" (failure or NODATA).
+pub(super) type DohAttemptOutcome = (usize, Duration, Option<(Vec<IpAddr>, Duration)>);
+
+/// Everything one DoH provider does for a wave: grab a semaphore permit,
+/// run the bounded lookup, record the provider's statistics, and map a
+/// successful lookup into `(ips, ttl)` — or `None` when nothing usable came
+/// back (an empty answer is not a win; the wave keeps waiting).
+///
+/// Recording happens inside this future (not in the race's spawn wrapper),
+/// so a caller that stopped waiting on the wave after a winner still
+/// receives this provider's verdict.
+async fn doh_provider_attempt(
+    index: usize,
+    resolver: hickory_resolver::TokioResolver,
+    query: String,
+    slots: std::sync::Arc<tokio::sync::Semaphore>,
+) -> DohAttemptOutcome {
+    let _permit = slots.acquire_owned().await.ok();
+    let started = Instant::now();
+    // Per-provider bound. Without it a blocked provider holds its
+    // semaphore permit for the caller's whole budget, starving the
+    // providers that would have answered.
+    let response = timeout(
+        DOH_PROVIDER_TIMEOUT,
+        resolver.lookup_ip(format!("{query}.")),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok);
+    let latency = started.elapsed();
+    // An empty answer still proves the provider is usable here — the name
+    // simply does not exist — so it must not be scored as a failure.
+    // Recorded inside the attempt itself, so a caller that stopped waiting
+    // on this wave after a winner still receives this provider's verdict.
+    note_doh_result(index, response.is_some());
+    let answer = response.and_then(|lookup| {
+        let ips: Vec<IpAddr> = lookup.iter().collect();
+        if ips.is_empty() {
+            return None; // NODATA: not a win, keep waiting.
+        }
+        // The record's own TTL, so a short-lived CDN answer is not
+        // held as long as a stable one. Clamped by the caller.
+        let ttl = lookup
+            .valid_until()
+            .saturating_duration_since(Instant::now());
+        Some((ips, ttl))
+    });
+    (index, latency, answer)
+}
+
+/// Race a set of provider attempts and return at the FIRST non-empty answer
+/// (TS4-04), instead of draining the whole wave. Every attempt is spawned as
+/// its own task reporting through a channel; the winner returns immediately
+/// while the losers finish detached in the background, still recording their
+/// statistics (that side effect lives inside each attempt future).
+///
+/// Dropping the receiver's clones (and finally `rx`) detaches the remaining
+/// tasks: dropping a `JoinHandle` does not abort a tokio task. Each task is
+/// self-bounded — permit wait, then [`DOH_PROVIDER_TIMEOUT`] on the lookup —
+/// so detached tasks always terminate.
+///
+/// Cancel-safety: this is called under the caller's outer
+/// `timeout(dns_timeout, ...)`; if THAT fires, the already-spawned wave tasks
+/// continue in the background and still record their stats, which is intended.
+pub(super) async fn race_first_answer<A>(
+    query: &str,
+    attempts: impl IntoIterator<Item = A>,
+) -> Option<(Vec<IpAddr>, Duration)>
+where
+    A: std::future::Future<Output = DohAttemptOutcome> + Send + 'static,
+{
+    let attempts: Vec<A> = attempts.into_iter().collect();
+    // Capacity >= task count, so a task's single send never blocks while
+    // its recording is still pending.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(attempts.len().max(1));
+    for attempt in attempts {
+        let tx = tx.clone();
+        // The send is best-effort: the receiver may already be gone once a
+        // winner returned, so its error is ignored. Side effects such as
+        // `note_doh_result` must live INSIDE the attempt future, not here.
+        tokio::spawn(async move {
+            let outcome = attempt.await;
+            let _ = tx.send(outcome).await;
         });
     }
+    drop(tx); // `rx.recv()` ends once every task finished without a winner.
 
-    let mut answer = None;
-    while let Some((index, latency, response)) = attempts.next().await {
-        // An empty answer still proves the provider is usable here — the name
-        // simply does not exist — so it must not be scored as a failure.
-        note_doh_result(index, response.is_some());
-        if answer.is_some() {
-            continue;
-        }
-        if let Some(lookup) = response {
-            let ips: Vec<IpAddr> = lookup.iter().collect();
-            if !ips.is_empty() {
-                tracing::debug!(
-                    provider_latency_ms = latency.as_millis() as u64,
-                    host = %query,
-                    "DoH provider won the resolution race"
-                );
-                // The record's own TTL, so a short-lived CDN answer is not
-                // held as long as a stable one. Clamped by the caller.
-                let ttl = lookup
-                    .valid_until()
-                    .saturating_duration_since(Instant::now());
-                answer = Some((ips, ttl));
-            }
-        }
+    while let Some((_index, latency, result)) = rx.recv().await {
+        let Some((ips, ttl)) = result else {
+            continue; // Failed or empty answer: not a win, keep waiting.
+        };
+        tracing::debug!(
+            provider_latency_ms = latency.as_millis() as u64,
+            host = %query,
+            "DoH provider won the resolution race"
+        );
+        return Some((ips, ttl));
     }
-    answer
+    None
+}
+
+/// Race one wave of DoH providers for `query`, returning the first non-empty
+/// answer together with how long the records claim to be good for — and
+/// returning it immediately rather than waiting for the whole wave (TS4-04).
+/// The losing providers finish in the background and still record their
+/// behaviour so [`doh_order`] can learn.
+pub(super) async fn race_doh_wave(wave: &[usize], query: &str) -> Option<(Vec<IpAddr>, Duration)> {
+    let pool = doh_pool();
+    let attempts = wave.iter().filter_map(|&index| {
+        let resolver = pool.get(index).cloned()?;
+        Some(doh_provider_attempt(
+            index,
+            resolver,
+            query.to_owned(),
+            std::sync::Arc::clone(doh_slots()),
+        ))
+    });
+    race_first_answer(query, attempts).await
 }
 
 /// Resolve a `(host, port)` pair to the addresses worth trying, best first.
