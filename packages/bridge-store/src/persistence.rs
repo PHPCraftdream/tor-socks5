@@ -64,7 +64,7 @@ impl Default for Meta {
 
 /// Percent-encode the delimiter characters (`%`, `,`, whitespace) of a
 /// source label so it survives the whitespace-tokenised meta-comment format
-/// and the comma-separated `src=` list. Single pass: `%` is escaped as it
+/// and the comma-separated `srcenc=` list. Single pass: `%` is escaped as it
 /// is visited, never via sequential replaces on already-escaped output.
 fn encode_source(label: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
@@ -88,10 +88,10 @@ fn encode_source(label: &str) -> String {
     out
 }
 
-/// Percent-decode a `src=` token. Total and byte-based: on `%`, two ASCII
-/// hex digits are consumed as one byte, otherwise the `%` is kept literally
-/// (old files stored `%` unescaped). Invalid UTF-8 (possible from legacy
-/// files) becomes replacement characters via `from_utf8_lossy`.
+/// Percent-decode a `srcenc=` token (TS7-07: the marked, percent-encoded
+/// field -- `src=`, the old unmarked field, is never decoded, see
+/// `parse_meta_comment`). Total and byte-based: on `%`, two ASCII hex
+/// digits are consumed as one byte, otherwise the `%` is kept literally.
 fn decode_source(token: &str) -> String {
     let bytes = token.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
@@ -157,13 +157,29 @@ pub(super) fn parse_meta_comment(s: &str) -> Option<Meta> {
                 meta.circuit_fails = v.parse().ok()?;
             } else if let Some(v) = tok.strip_prefix("cobs=") {
                 meta.last_circuit_observation = OffsetDateTime::parse(v, &Iso8601::DEFAULT).ok()?;
-            } else if let Some(v) = tok.strip_prefix("src=") {
-                // Split the still-encoded value on ',', then decode each
-                // kept token — encoded commas (`%2C`) must not split labels.
+            } else if let Some(v) = tok.strip_prefix("srcenc=") {
+                // TS7-07: `srcenc=` is written ONLY by this fixed writer, so
+                // any file that has it is guaranteed post-fix -- decoding is
+                // safe. Split the still-encoded value on ',', then decode
+                // each kept token — encoded commas (`%2C`) must not split
+                // labels.
                 meta.sources = v
                     .split(',')
                     .filter(|s| !s.is_empty())
                     .map(decode_source)
+                    .collect();
+            } else if let Some(v) = tok.strip_prefix("src=") {
+                // TS7-07: `src=` (without the `enc` marker) is the OLD,
+                // pre-fix field name, written by a writer that never
+                // percent-encoded anything. A `%HH` sequence inside such a
+                // label is literal old data, not an escape -- decoding it
+                // would silently corrupt the label (e.g. a literal
+                // `feed%2Cbackup` would misread as `feed,backup`). Split on
+                // ',' and keep every token exactly as stored.
+                meta.sources = v
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
                     .collect();
             }
         }
@@ -346,9 +362,11 @@ impl BridgeStore {
             out.push_str(" cobs=");
             out.push_str(&format_iso(e.last_circuit_observation));
             // Omitted when unknown, so entries written before attribution
-            // existed round-trip unchanged.
+            // existed round-trip unchanged. TS7-07: field name is
+            // `srcenc=` (not `src=`) so a reader can tell a percent-encoded
+            // value apart from the old unmarked literal `src=` format.
             if !e.sources.is_empty() {
-                out.push_str(" src=");
+                out.push_str(" srcenc=");
                 out.push_str(
                     &e.sources
                         .iter()

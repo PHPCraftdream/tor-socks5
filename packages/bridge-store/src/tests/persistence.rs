@@ -221,6 +221,78 @@ fn legacy_literal_percent_loads_without_panicking() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 #[test]
+fn legacy_unmarked_percent_sequences_are_never_decoded() {
+    // TS7-07: `src=` (the old, unmarked field) must be read byte-for-byte
+    // literal -- a `%HH` sequence in an old file is old data, not an
+    // escape. Before the fix, `decode_source` ran unconditionally and
+    // silently rewrote these into a comma, a space, a bare `%`, and a
+    // UTF-8 replacement character respectively.
+    let dir = tmp_dir();
+    let path = dir.join("legacy-ambiguous.log");
+    std::fs::write(
+        &path,
+        format!(
+            "# fails=0 seen=1 attempt=2026-05-18T12:00:00Z ok=2026-05-18T12:00:00Z \
+             latency=10ms chseen=0 chok=- evseen=0 evok=- cfails=0 \
+             cobs=2026-05-18T12:00:00Z src=feed%2Cbackup,feed%20one,%25,%FF\n{OBFS4_A}\n"
+        ),
+    )
+    .unwrap();
+    let loaded = BridgeStore::load(path).unwrap();
+    let mut got = loaded.sources_of(&bridge(OBFS4_A));
+    got.sort();
+    let mut expected = vec![
+        "%25".to_string(),
+        "%FF".to_string(),
+        "feed%20one".to_string(),
+        "feed%2Cbackup".to_string(),
+    ];
+    expected.sort();
+    assert_eq!(
+        got, expected,
+        "every %HH sequence in an old unmarked src= file must survive \
+         literally, not be percent-decoded"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+#[test]
+fn marked_format_round_trips_delimiters_and_unicode() {
+    // TS7-07: the NEW, marked (`srcenc=`) format must still correctly
+    // restore every delimiter character and Unicode content -- only the
+    // OLD unmarked `src=` field skips decoding.
+    let dir = tmp_dir();
+    let path = dir.join("marked.log");
+    let mut s = BridgeStore::load(path.clone()).unwrap();
+    let b = bridge(OBFS4_A);
+    let t0 = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+    s.record_at(b.clone(), Duration::from_millis(10), t0);
+    let labels = ["feed,backup", "feed one", "100%", "раздача №2"];
+    for (i, label) in labels.iter().enumerate() {
+        s.note_source_at(&b, label, t0 + Duration::from_secs(i as u64));
+    }
+    s.save().unwrap();
+
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        raw.contains("srcenc="),
+        "the writer must emit the marked field name, not the legacy src="
+    );
+    assert!(
+        !raw.contains(" src="),
+        "the writer must never emit the unmarked legacy field"
+    );
+
+    let loaded = BridgeStore::load(path).unwrap();
+    let mut expected: Vec<String> = labels.iter().map(|s| s.to_string()).collect();
+    expected.sort();
+    assert_eq!(
+        loaded.sources_of(&b),
+        expected,
+        "comma, space, percent and Unicode must all round-trip through srcenc="
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+#[test]
 fn temp_path_is_unique_per_call() {
     let dir = tmp_dir();
     let path = dir.join("alive.log");
