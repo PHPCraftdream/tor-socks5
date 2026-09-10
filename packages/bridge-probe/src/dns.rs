@@ -472,16 +472,21 @@ pub fn load_persisted_dns_cache(path: &std::path::Path) {
 ///
 /// Concurrent or delayed saves to one path never interleave bytes and
 /// never publish a snapshot older than an already-published newer one:
-/// each call takes a per-path generation number, writes a temp file in
-/// the destination's directory, and publishes via an atomic rename only
-/// after a generation check under a per-path publication lock. A job
-/// superseded by a newer call skips publication (returning `Ok` --
-/// skipping is success, the newer snapshot is on disk) and removes its
-/// temp file. A cancelled caller cannot stop its already-dispatched
-/// blocking job, but that job is self-sufficient: the generation check
-/// makes it harmless. Residual limitation: the registry is keyed by the
-/// literal `path` spelling, so two different spellings of the same file
-/// are not mutually protected.
+/// each call captures its snapshots AND takes its generation number in
+/// one per-path critical section, so the number always reflects the
+/// snapshot's age. Publication happens under the per-path publish lock
+/// only when the call's generation is strictly newer than the last
+/// generation actually renamed onto the path; a superseded job skips
+/// publication and returns `Ok` precisely because a snapshot at least as
+/// fresh is verifiably on disk, and removes its temp file. A job whose
+/// write or rename fails returns `Err` and does NOT prevent an older
+/// in-flight job from publishing, so a caller's `Ok` always means its own
+/// data or a strictly fresher snapshot is on disk. A cancelled caller
+/// cannot stop its already-dispatched blocking job, but that job is
+/// self-sufficient: the published-generation check makes it harmless.
+/// Residual limitation: the registry is keyed by the literal `path`
+/// spelling, so two different spellings of the same file are not mutually
+/// protected.
 pub async fn save_persisted_dns_cache(path: &std::path::Path) -> std::io::Result<()> {
     save_persisted_dns_cache_with_writer(path, |path, contents| std::fs::write(path, contents))
         .await
@@ -489,60 +494,15 @@ pub async fn save_persisted_dns_cache(path: &std::path::Path) -> std::io::Result
 
 /// Like [`save_persisted_dns_cache`], but the write itself goes through
 /// `write`, which receives the TEMP file path (not the final one): the
-/// shared publication code performs the generation check and the atomic
-/// rename from temp to final after `write` returns.
+/// shared publication code publishes only when this call's generation is
+/// strictly newer than the last generation actually renamed onto the
+/// path, then performs the atomic rename from temp to final.
 pub(super) async fn save_persisted_dns_cache_with_writer(
     path: &std::path::Path,
     write: impl FnOnce(&std::path::Path, &str) -> std::io::Result<()> + Send + 'static,
 ) -> std::io::Result<()> {
-    let now_instant = Instant::now();
-    let live_snapshot: Vec<PersistSnapshot> = {
-        let cache = doh_cache().lock().unwrap_or_else(|p| p.into_inner());
-        cache
-            .iter()
-            .filter(|(_, entry)| {
-                !entry.addrs.is_empty() && live_entry_is_usable(entry, now_instant)
-            })
-            .map(|(host, entry)| PersistSnapshot {
-                host: host.clone(),
-                addrs: entry.addrs.clone(),
-                resolved_at_unix: entry.resolved_at_unix,
-            })
-            .collect()
-    }; // doh_cache() lock released -- only the raw snapshot is held from here on
-    let live_hosts: std::collections::HashSet<&str> =
-        live_snapshot.iter().map(|s| s.host.as_str()).collect();
-    let now = now_unix();
-    let disk_snapshot: Vec<PersistSnapshot> = {
-        let store = disk_fallback_store()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        store
-            .iter()
-            .filter(|(host, _)| !live_hosts.contains(host.as_str()))
-            .filter(|(_, entry)| {
-                now.saturating_sub(entry.resolved_at_unix) <= DNS_STALE_FALLBACK_WINDOW.as_secs()
-            })
-            .map(|(host, entry)| PersistSnapshot {
-                host: host.clone(),
-                addrs: entry.addrs.clone(),
-                resolved_at_unix: entry.resolved_at_unix,
-            })
-            .collect()
-    }; // disk_fallback_store() lock released -- no locks held from here on
-
     let path = path.to_owned();
-    // Allocate this call's generation: the counter lives behind a per-path
-    // mutex, so a job that later reads `latest == gen` truly was the newest
-    // call at check time. The registry lock is released before the job's
-    // inner locks are ever taken (outer registry first, never nested with
-    // inner locks).
-    let gen = {
-        let state = persist_path_generation_slot(&path);
-        let mut generation = state.generation.lock().unwrap_or_else(|p| p.into_inner());
-        *generation += 1;
-        *generation
-    };
+    let (live_snapshot, disk_snapshot, gen) = capture_persist_snapshots_with_generation(&path);
     // The spawned job is self-sufficient: even if this caller's future is
     // cancelled and the JoinHandle detaches, the generation check below
     // keeps a superseded job from publishing stale data.
@@ -579,24 +539,35 @@ pub(super) async fn save_persisted_dns_cache_with_writer(
             let _ = std::fs::remove_file(&temp_path);
             return Err(error);
         }
-        // Publication critical section: check-then-rename under the per-path
-        // publish lock, so publications to one path are serialized and no
-        // stale job can rename after a newer call's job. Lock order: the
-        // state mutex is only taken inside this section (while the publish
-        // lock is held), never the other way around, and no lock spans an
-        // await (all of this is inside spawn_blocking).
+        // Publication critical section: check-and-rename under the per-path
+        // publish lock, so publications to one path are serialized. The
+        // comparison is against the last ACTUALLY PUBLISHED generation, not
+        // the last allocated one (TS7-02): a failed newer save must not
+        // veto an older in-flight one, and skipping is only a success
+        // because something at least as fresh as this snapshot genuinely
+        // reached the disk.
         let state = persist_path_generation_slot(&path);
         let publish_guard = state.publish_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let latest = *state.generation.lock().unwrap_or_else(|p| p.into_inner());
-        if gen != latest {
-            // A newer save call has started; this job's snapshot is stale.
-            // Skipping publication is success -- the newer snapshot wins.
+        if gen
+            <= *state
+                .published_generation
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+        {
+            // A snapshot at least as new as this one is already on disk;
+            // publishing this (older or equal) one would be a rollback.
             let _ = std::fs::remove_file(&temp_path);
             return Ok(());
         }
         // MoveFileEx(MOVEFILE_REPLACE_EXISTING) on Windows, rename(2) on
         // Unix: both atomically replace the destination.
         let result = std::fs::rename(&temp_path, &path);
+        if result.is_ok() {
+            *state
+                .published_generation
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = gen;
+        }
         drop(publish_guard);
         result
     })
@@ -608,21 +579,91 @@ pub(super) async fn save_persisted_dns_cache_with_writer(
     })
 }
 
-/// Per-path save state: the latest allocated generation number plus the
-/// publication lock serializing check-then-rename for this path. Two
-/// separate mutexes so the publish lock can be taken without the state
-/// mutex held (lock order: publish_lock, then the generation mutex).
-struct PersistPathState {
-    generation: std::sync::Mutex<u64>,
-    publish_lock: std::sync::Mutex<()>,
+/// The snapshot phase of a DNS-cache save, in ONE critical section: the
+/// per-path snapshot gate is held across both store snapshots and the
+/// generation allocation, so the returned number always reflects the age
+/// of the captured data -- two overlapping saves to one path strictly
+/// order their (snapshot, generation) pairs (TS7-01). The store locks
+/// are leaf locks taken only inside this section.
+pub(super) fn capture_persist_snapshots_with_generation(
+    path: &std::path::Path,
+) -> (Vec<PersistSnapshot>, Vec<PersistSnapshot>, u64) {
+    let state = persist_path_generation_slot(path);
+    let _snapshot_guard = state
+        .snapshot_lock
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let now_instant = Instant::now();
+    let live_snapshot: Vec<PersistSnapshot> = {
+        let cache = doh_cache().lock().unwrap_or_else(|p| p.into_inner());
+        cache
+            .iter()
+            .filter(|(_, entry)| {
+                !entry.addrs.is_empty() && live_entry_is_usable(entry, now_instant)
+            })
+            .map(|(host, entry)| PersistSnapshot {
+                host: host.clone(),
+                addrs: entry.addrs.clone(),
+                resolved_at_unix: entry.resolved_at_unix,
+            })
+            .collect()
+    }; // doh_cache() lock released -- only the raw snapshot is held from here on
+    let live_hosts: std::collections::HashSet<&str> =
+        live_snapshot.iter().map(|s| s.host.as_str()).collect();
+    let now = now_unix();
+    let disk_snapshot: Vec<PersistSnapshot> = {
+        let store = disk_fallback_store()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        store
+            .iter()
+            .filter(|(host, _)| !live_hosts.contains(host.as_str()))
+            .filter(|(_, entry)| {
+                now.saturating_sub(entry.resolved_at_unix) <= DNS_STALE_FALLBACK_WINDOW.as_secs()
+            })
+            .map(|(host, entry)| PersistSnapshot {
+                host: host.clone(),
+                addrs: entry.addrs.clone(),
+                resolved_at_unix: entry.resolved_at_unix,
+            })
+            .collect()
+    }; // disk_fallback_store() lock released -- no store locks held from here on
+    let mut allocated = state
+        .next_generation
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    *allocated += 1;
+    let gen = *allocated;
+    (live_snapshot, disk_snapshot, gen)
 }
 
-impl Default for PersistPathState {
-    fn default() -> Self {
-        Self {
-            generation: std::sync::Mutex::new(0),
-            publish_lock: std::sync::Mutex::new(()),
-        }
+/// Per-path save state. `snapshot_lock` gates ONE critical section that
+/// captures both snapshots AND allocates the generation number, so the
+/// number always orders captures by the age of their data (a call can
+/// never hold an older snapshot under a newer number). `publish_lock`
+/// gates the check-and-rename publication section and guards
+/// `published_generation` -- the last generation ACTUALLY renamed onto
+/// the final path, not merely allocated. Both counters are mutex-guarded
+/// because the state is shared as an `Arc`; each counter mutex is only
+/// ever locked while its own gate (`snapshot_lock` / `publish_lock`) is
+/// held -- never the other way around -- and the two gates are never
+/// held together: capture finishes before any job exists, and a job only
+/// ever takes `publish_lock`. The global store locks are only ever
+/// taken inside the `snapshot_lock` section.
+#[derive(Default)]
+pub(super) struct PersistPathState {
+    pub(super) snapshot_lock: std::sync::Mutex<()>,
+    next_generation: std::sync::Mutex<u64>, // locked only under snapshot_lock
+    published_generation: std::sync::Mutex<u64>, // locked only under publish_lock
+    pub(super) publish_lock: std::sync::Mutex<()>,
+}
+
+impl PersistPathState {
+    /// Test-only handle to the capture gate, so tests can hold it and
+    /// prove a concurrent capture blocks behind it.
+    #[cfg(test)]
+    pub(super) fn lock_snapshot_gate(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.snapshot_lock.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
 
@@ -636,7 +677,9 @@ static PERSIST_PATH_STATES: OnceLock<
 /// The state slot for `path`: lock the outer registry map, insert-or-get the
 /// Arc, clone it, and drop the registry guard -- the outer mutex is never
 /// held while an inner lock is taken.
-fn persist_path_generation_slot(path: &std::path::Path) -> std::sync::Arc<PersistPathState> {
+pub(super) fn persist_path_generation_slot(
+    path: &std::path::Path,
+) -> std::sync::Arc<PersistPathState> {
     let registry = PERSIST_PATH_STATES.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let mut map = registry.lock().unwrap_or_else(|p| p.into_inner());
     map.entry(path.to_owned()).or_default().clone()
@@ -644,10 +687,11 @@ fn persist_path_generation_slot(path: &std::path::Path) -> std::sync::Arc<Persis
 
 /// Raw data for one persisted line, cloned out from under a mutex so
 /// formatting never runs while a lock is held.
-struct PersistSnapshot {
-    host: String,
-    addrs: Vec<IpAddr>,
-    resolved_at_unix: u64,
+#[derive(Debug)]
+pub(super) struct PersistSnapshot {
+    pub(super) host: String,
+    pub(super) addrs: Vec<IpAddr>,
+    pub(super) resolved_at_unix: u64,
 }
 
 /// Last-resort answer for `host` sourced from a previous run, once every DoH

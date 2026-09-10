@@ -729,7 +729,12 @@ async fn superseded_save_must_not_publish_stale_snapshot() {
         "the stale IP must not survive, got: {file_text}"
     );
     assert!(
-        !file_text.contains(host_extra),
+        // Exact-line match: a substring check would false-positive on
+        // another test's host whose name merely contains ours (tests run
+        // in parallel and share the process-global stores).
+        !file_text
+            .lines()
+            .any(|line| line.starts_with(&format!("{host_extra}	"))),
         "the dropped host must not survive, got: {file_text}"
     );
     // Other tests running in parallel share the process-wide disk fallback
@@ -754,6 +759,317 @@ async fn superseded_save_must_not_publish_stale_snapshot() {
     );
 
     forget_dns_answer(host_b);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Snapshot capture and generation allocation must happen in ONE
+/// per-path critical section: a second capture started while the first
+/// one's data is still live must block behind the snapshot gate, and its
+/// generation must strictly order after the first (TS7-01).
+#[test]
+fn snapshot_capture_and_generation_allocation_are_serialized_per_path() {
+    let host = "ts701-gate.test.invalid";
+    let ip1: IpAddr = "203.0.113.101".parse().unwrap();
+    let ip2: IpAddr = "203.0.113.102".parse().unwrap();
+
+    remember_doh_answer(host, &[ip1], Duration::from_secs(300));
+
+    let dir =
+        std::env::temp_dir().join(format!("ts701-gate-{}-{}", std::process::id(), now_unix()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("dns-cache.txt");
+
+    let (live1, _disk1, gen1) = capture_persist_snapshots_with_generation(&path);
+    assert!(
+        live1.iter().any(|s| s.host == host && s.addrs == vec![ip1]),
+        "first capture must see ip1, got: {live1:?}"
+    );
+
+    // Hold the capture gate while mutating the store: the second capture
+    // must not be able to snapshot under the gate.
+    let state = persist_path_generation_slot(&path);
+    let gate = state.lock_snapshot_gate();
+    remember_doh_answer(host, &[ip2], Duration::from_secs(300));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = capture_persist_snapshots_with_generation(&path);
+        tx.send(result).expect("send captured snapshot");
+    });
+    assert!(
+        rx.recv_timeout(Duration::from_millis(150)).is_err(),
+        "a concurrent capture must block behind the snapshot gate"
+    );
+
+    drop(gate);
+    let (live2, _disk2, gen2) = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("capture completes after the gate is released");
+    assert!(
+        live2.iter().any(|s| s.host == host && s.addrs == vec![ip2]),
+        "the gated capture must see the mutated data, got: {live2:?}"
+    );
+    assert!(
+        !live2
+            .iter()
+            .any(|s| s.host == host && s.addrs.contains(&ip1)),
+        "the gated capture must not see the pre-gate data, got: {live2:?}"
+    );
+    assert!(
+        gen2 > gen1,
+        "the later capture must get a strictly greater generation, got {gen2} vs {gen1}"
+    );
+
+    forget_dns_answer(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A save whose snapshot was captured EARLIER but which publishes LATER
+/// (after a full newer save has landed) must not roll the file back to
+/// its older data: its lower generation loses against the already
+/// published newer one (TS7-01 end-to-end).
+#[tokio::test]
+async fn older_snapshot_paused_behind_full_newer_publish_keeps_newer_state() {
+    let host = "ts701-superseded.test.invalid";
+    let host_extra = "ts701-superseded-extra.test.invalid";
+    let ip1: IpAddr = "203.0.113.103".parse().unwrap();
+    let ip2: IpAddr = "203.0.113.104".parse().unwrap();
+    let extra_ip: IpAddr = "203.0.113.108".parse().unwrap();
+
+    remember_doh_answer(host, &[ip1], Duration::from_secs(3000));
+    remember_doh_answer(host_extra, &[extra_ip], Duration::from_secs(3000));
+
+    let dir = std::env::temp_dir().join(format!(
+        "ts701-superseded-{}-{}",
+        std::process::id(),
+        now_unix()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("dns-cache.txt");
+
+    // Save A: captured first, held mid-write until released.
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let save_a = {
+        let path = path.clone();
+        tokio::spawn(async move {
+            save_persisted_dns_cache_with_writer(&path, move |path, contents| {
+                let _ = entered_tx.send(());
+                release_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .map_err(std::io::Error::other)?;
+                std::fs::write(path, contents)?;
+                Ok(())
+            })
+            .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(10), entered_rx)
+        .await
+        .expect("save A reaches its blocking phase")
+        .expect("writer A signals entry");
+
+    // Mutate, then let B capture a fresher snapshot and publish fully.
+    forget_dns_answer(host_extra);
+    remember_doh_answer(host, &[ip2], Duration::from_secs(3000));
+    save_persisted_dns_cache(&path)
+        .await
+        .expect("save B must succeed");
+
+    // Release A: its older generation must lose the publication race.
+    release_tx.send(()).expect("release writer A");
+    let result_a = tokio::time::timeout(Duration::from_secs(10), save_a)
+        .await
+        .expect("released save A completes")
+        .expect("save A task joins");
+    assert!(
+        result_a.is_ok(),
+        "a superseded save skips publication and returns Ok, got: {result_a:?}"
+    );
+
+    let file_text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        file_text.contains(&format!("{host}\t{ip2}")),
+        "the newer snapshot must stay on disk, got: {file_text}"
+    );
+    assert!(
+        !file_text.contains(&ip1.to_string()),
+        "A's stale IP must not roll the file back, got: {file_text}"
+    );
+    assert!(
+        // Exact-line match: a substring check would false-positive on
+        // another test's host whose name merely contains ours (tests run
+        // in parallel and share the process-global stores).
+        !file_text
+            .lines()
+            .any(|line| line.starts_with(&format!("{host_extra}	"))),
+        "the dropped host must not survive, got: {file_text}"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "superseded saves must remove their temp files, found: {leftovers:?}"
+    );
+
+    forget_dns_answer(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A NEWER save that fails at the temp write must not veto an older
+/// in-flight save's publication: the older save must publish its own data
+/// and return Ok, so Ok never means "nothing is on disk" (TS7-02).
+#[tokio::test]
+async fn failed_newer_write_lets_older_save_publish_and_report_ok() {
+    let host = "ts702-write-fail.test.invalid";
+    let ip1: IpAddr = "203.0.113.105".parse().unwrap();
+    let ip2: IpAddr = "203.0.113.106".parse().unwrap();
+
+    remember_doh_answer(host, &[ip1], Duration::from_secs(300));
+
+    let dir = std::env::temp_dir().join(format!(
+        "ts702-write-fail-{}-{}",
+        std::process::id(),
+        now_unix()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("dns-cache.txt");
+
+    // Save A: captured first, held mid-write until released.
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let save_a = {
+        let path = path.clone();
+        tokio::spawn(async move {
+            save_persisted_dns_cache_with_writer(&path, move |path, contents| {
+                let _ = entered_tx.send(());
+                release_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .map_err(std::io::Error::other)?;
+                std::fs::write(path, contents)
+            })
+            .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(10), entered_rx)
+        .await
+        .expect("save A reaches its blocking phase")
+        .expect("writer A signals entry");
+
+    // Mutate, then run a NEWER save whose write fails.
+    remember_doh_answer(host, &[ip2], Duration::from_secs(300));
+    let result_b = save_persisted_dns_cache_with_writer(&path, |_path, _contents| {
+        Err(std::io::Error::other("injected write failure"))
+    })
+    .await;
+    assert!(result_b.is_err(), "save B's write failure must surface");
+
+    // Nothing published yet -- which must NOT stop A from publishing.
+    assert!(!path.exists(), "no file may be published before A runs");
+
+    release_tx.send(()).expect("release writer A");
+    let result_a = tokio::time::timeout(Duration::from_secs(10), save_a)
+        .await
+        .expect("released save A completes")
+        .expect("save A task joins");
+    assert!(
+        result_a.is_ok(),
+        "the older save must publish despite B's failure, got: {result_a:?}"
+    );
+    let file_text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        file_text.contains(&format!("{host}\t{ip1}")),
+        "A's data must reach the disk, got: {file_text}"
+    );
+    assert!(
+        !file_text.contains(&ip2.to_string()),
+        "B's mutated data must not appear (its write failed), got: {file_text}"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "failed writes must remove their temp files, found: {leftovers:?}"
+    );
+
+    forget_dns_answer(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A NEWER save that fails at the RENAME must not make an older save
+/// return a FALSE Ok: with nothing ever published, the older save must
+/// attempt publication and surface its own rename failure as Err (TS7-02).
+#[tokio::test]
+async fn failed_newer_rename_makes_older_save_err_not_false_ok() {
+    let host = "ts702-rename-fail.test.invalid";
+    let ip1: IpAddr = "203.0.113.107".parse().unwrap();
+    let ip2: IpAddr = "203.0.113.109".parse().unwrap();
+
+    remember_doh_answer(host, &[ip1], Duration::from_secs(300));
+
+    let dir = std::env::temp_dir().join(format!(
+        "ts702-rename-fail-{}-{}",
+        std::process::id(),
+        now_unix()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    // The FINAL path is itself a directory: temp writes succeed, but every
+    // rename onto the final path fails (MoveFileEx on Windows, EISDIR on
+    // Unix).
+    let path = dir.join("dns-cache.txt");
+    std::fs::create_dir_all(&path).unwrap();
+
+    // Save A: captured first, held mid-write until released.
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let save_a = {
+        let path = path.clone();
+        tokio::spawn(async move {
+            save_persisted_dns_cache_with_writer(&path, move |path, contents| {
+                let _ = entered_tx.send(());
+                release_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .map_err(std::io::Error::other)?;
+                std::fs::write(path, contents)
+            })
+            .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(10), entered_rx)
+        .await
+        .expect("save A reaches its blocking phase")
+        .expect("writer A signals entry");
+
+    // Mutate, then run a NEWER save whose rename fails.
+    remember_doh_answer(host, &[ip2], Duration::from_secs(300));
+    let result_b = save_persisted_dns_cache(&path).await;
+    assert!(result_b.is_err(), "save B's rename failure must surface");
+
+    // Nothing was ever published, so A is strictly newer than anything on
+    // disk: it must attempt publication, and its rename must fail too.
+    release_tx.send(()).expect("release writer A");
+    let result_a = tokio::time::timeout(Duration::from_secs(10), save_a)
+        .await
+        .expect("released save A completes")
+        .expect("save A task joins");
+    assert!(
+        result_a.is_err(),
+        "A must surface its rename failure, not a false Ok, got: {result_a:?}"
+    );
+    assert!(
+        path.is_dir(),
+        "no regular file may have been published over the directory"
+    );
+    // Temp files legitimately remain on rename failure (pre-existing
+    // behavior, out of scope here): no tmp-cleanliness assertion.
+
+    forget_dns_answer(host);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
