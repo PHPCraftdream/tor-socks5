@@ -1,5 +1,10 @@
-mod dns_tests;
-mod probe_tests;
+mod dns_cache_tests;
+mod dns_save_tests;
+mod dns_timestamp_tests;
+mod probe_coalesce_tests;
+mod probe_identity_tests;
+mod probe_ordering_tests;
+mod probe_race_tests;
 mod transport_tests;
 
 use bridge_line::BridgeLine;
