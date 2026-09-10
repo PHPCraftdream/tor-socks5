@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use super::{Outcome, ResolverPolicy};
 use crate::dns::{
     cached_doh_answer, disk_fallback_answer, doh_order, doh_pool, doh_slots, note_doh_result,
-    remember_doh_answer, remember_doh_failure, stale_fallback_answer, CacheHit, DOH_FANOUT,
-    DOH_MAX_WAVES, DOH_PROVIDER_TIMEOUT,
+    remember_doh_answer, remember_doh_failure, stale_fallback_answer, CacheHit,
+    DNS_NETWORK_GENERATION, DOH_FANOUT, DOH_MAX_WAVES, DOH_PROVIDER_TIMEOUT,
 };
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -255,11 +255,14 @@ pub(crate) type DohWaveResult = Result<(Vec<IpAddr>, Duration), String>;
 /// concurrently (itself bounded elsewhere, MAX_INFLIGHT_PROBES) plus the
 /// entries that died since the last insertion, instead of growing with
 /// every hostname ever resolved across the whole process lifetime.
-static INFLIGHT_DOH: std::sync::OnceLock<
-    std::sync::Mutex<
-        std::collections::HashMap<String, std::sync::Weak<tokio::sync::OnceCell<DohWaveResult>>>,
-    >,
-> = std::sync::OnceLock::new();
+/// TS7-06: keys are `(hostname, network generation)`, so a lookup started
+/// before a `flush_dns_cache` can never be joined by (or publish into) the
+/// post-flush world. The TS7-05 lazy sweep is unaffected: it never inspects
+/// the key shape.
+type InflightDohRegistry =
+    std::collections::HashMap<(String, u64), std::sync::Weak<tokio::sync::OnceCell<DohWaveResult>>>;
+static INFLIGHT_DOH: std::sync::OnceLock<std::sync::Mutex<InflightDohRegistry>> =
+    std::sync::OnceLock::new();
 
 /// Run (or join) the coalesced wave-search for `query`. Multiple concurrent
 /// callers for the same still-uncached hostname share ONE set of provider
@@ -276,12 +279,22 @@ static INFLIGHT_DOH: std::sync::OnceLock<
 /// `remember_doh_failure` after its stale and persisted fallbacks also
 /// missed, because a negative entry would overwrite the very
 /// expired-but-fallback-eligible answer those fallbacks serve.
+///
+/// TS7-06: the registry key is `(hostname, network generation)` and the
+/// owner skips `remember_doh_answer` when the generation changed under the
+/// lookup (a `flush_dns_cache` while the wave search was in flight) -- the
+/// answer belongs to the old network and must not be cached for the new one.
 pub(crate) async fn coalesced_doh_lookup(query: &str) -> DohWaveResult {
+    // TS7-06: capture the network generation BEFORE touching the registry.
+    // A lookup is identified by the generation it started in; see the
+    // registry docs above.
+    let gen = DNS_NETWORK_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
     let registry =
         INFLIGHT_DOH.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let cell: std::sync::Arc<tokio::sync::OnceCell<DohWaveResult>> = {
         let mut map = registry.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(existing) = map.get(query).and_then(std::sync::Weak::upgrade) {
+        let key = (query.to_owned(), gen);
+        if let Some(existing) = map.get(&key).and_then(std::sync::Weak::upgrade) {
             existing
         } else {
             // TS7-05: a dead Weak (and its key) is not removed automatically
@@ -296,14 +309,25 @@ pub(crate) async fn coalesced_doh_lookup(query: &str) -> DohWaveResult {
             // across the whole process lifetime.
             map.retain(|_, w| w.strong_count() > 0);
             let fresh = std::sync::Arc::new(tokio::sync::OnceCell::new());
-            map.insert(query.to_owned(), std::sync::Arc::downgrade(&fresh));
+            map.insert(key, std::sync::Arc::downgrade(&fresh));
             fresh
         }
     };
     cell.get_or_init(|| async {
         match doh_wave_search(query).await {
             Some((ips, ttl)) => {
-                remember_doh_answer(query, &ips, ttl);
+                // TS7-06: publish only into the generation this lookup
+                // started in. If a flush happened while the wave search was
+                // in flight, the cache now belongs to the NEW network --
+                // re-caching this answer would hand it out as fresh. The
+                // callers of THIS cell (all in generation `gen`) still get
+                // the answer; it is simply not cached for later lookups.
+                // Residual race: a flush landing between this check and the
+                // cache write is accepted -- closing it would need a lock
+                // held across the await.
+                if DNS_NETWORK_GENERATION.load(std::sync::atomic::Ordering::SeqCst) == gen {
+                    remember_doh_answer(query, &ips, ttl);
+                }
                 Ok((ips, ttl))
             }
             None => Err("all DoH providers failed".to_owned()),
@@ -412,6 +436,11 @@ pub async fn resolve_addrs(
                 // fallbacks missed -- remembering earlier would overwrite the
                 // expired-but-fallback-eligible entry `stale_fallback_answer`
                 // exists to serve.
+                // TS7-06: a failure observed entirely inside one network
+                // generation must not poison the cache of the next one --
+                // after a flush, the name may resolve fine in the new
+                // network. Same residual race as the answer-publish gate.
+                let gen = DNS_NETWORK_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
                 match coalesced_doh_lookup(query).await {
                     Ok((ips, _ttl)) => return Ok(order_candidates(&ips, port)),
                     Err(_) => {
@@ -432,7 +461,11 @@ pub async fn resolve_addrs(
                             );
                             return Ok(order_candidates(&persisted, port));
                         }
-                        remember_doh_failure(query);
+                        // TS7-06: only remember the failure if the network
+                        // generation did not change under the lookup.
+                        if DNS_NETWORK_GENERATION.load(std::sync::atomic::Ordering::SeqCst) == gen {
+                            remember_doh_failure(query);
+                        }
                         tracing::warn!(host = %query, "all DoH providers failed");
                     }
                 }

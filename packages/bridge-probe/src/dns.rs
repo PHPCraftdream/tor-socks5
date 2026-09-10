@@ -288,6 +288,14 @@ pub(super) fn store_cached(host: &str, answer: CachedAnswer) {
     cache.insert(host.to_owned(), answer);
 }
 
+/// TS7-06: bumped by [`flush_dns_cache`] BEFORE it clears anything, so a
+/// lookup that started before a network change can neither share its
+/// in-flight work with (or publish into) the post-flush world. In-flight
+/// lookups key the registry with the generation they captured; the owner
+/// re-checks the counter before caching its answer.
+pub(super) static DNS_NETWORK_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Forget every cached answer and every provider score.
 ///
 /// Both describe the network the device is attached to, not the bridges:
@@ -297,6 +305,18 @@ pub(super) fn store_cached(host: &str, answer: CachedAnswer) {
 /// module exists to avoid — a live bridge dialled at an address that is no
 /// longer right, and recorded as dead for it.
 pub fn flush_dns_cache() {
+    // TS7-06: bump the generation BEFORE clearing, so a caller starting
+    // concurrently with this flush sees either the old generation with the
+    // old cache still alive, or the new generation with the cache already
+    // empty -- never the new generation still holding old answers. SeqCst:
+    // the counter is a cross-thread publish signal participating in a
+    // three-way interleaving (flush bump / lookup capture / publish-time
+    // re-check); a total order keeps that reasoning simple and flushes are
+    // rare (once per network change), so the fence costs nothing that
+    // matters. (Relaxed would also be defensible -- no payload is
+    // synchronised through the atomic itself, the cache has its own mutex
+    // -- but SeqCst is the conservative default.)
+    DNS_NETWORK_GENERATION.fetch_add(1, AtomicOrdering::SeqCst);
     doh_cache()
         .lock()
         .unwrap_or_else(|p| p.into_inner())

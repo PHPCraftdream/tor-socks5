@@ -956,6 +956,192 @@ async fn sweeping_dead_entries_never_drops_a_still_inflight_lookup() {
     forget_dns_answer(live_host);
 }
 
+// TS7-06: a lookup parked in flight when `flush_dns_cache` runs must be
+// invisible to the post-flush world: a caller arriving AFTER the flush must
+// start its OWN wave search (the registry key carries the network
+// generation), and the pre-flush owner must NOT republish its stale answer
+// into the freshly-cleared cache. Without the generation key + publish gate,
+// B would join A (one wave search) and A's old-network answer would
+// overwrite B's new-network answer.
+#[tokio::test]
+async fn flush_separates_an_inflight_lookup_of_the_previous_network() {
+    let _serial = FAKE_WAVE_LOCK.lock().await;
+    let host = "flush-inflight.test.invalid";
+    forget_dns_answer(host);
+
+    let searches = std::sync::Arc::new(AtomicUsize::new(0));
+    let started = std::sync::Arc::new(AtomicBool::new(false));
+    let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+    let ips_a: Vec<IpAddr> = vec!["203.0.113.30".parse().unwrap()];
+    let ips_b: Vec<IpAddr> = vec!["203.0.113.31".parse().unwrap()];
+    install_fake_doh_wave_search({
+        let searches = std::sync::Arc::clone(&searches);
+        let started = std::sync::Arc::clone(&started);
+        let gate = std::sync::Arc::clone(&gate);
+        let ips_a = ips_a.clone();
+        let ips_b = ips_b.clone();
+        std::sync::Arc::new(move |query: &str| {
+            let searches = std::sync::Arc::clone(&searches);
+            let started = std::sync::Arc::clone(&started);
+            let gate = std::sync::Arc::clone(&gate);
+            let ips_a = ips_a.clone();
+            let ips_b = ips_b.clone();
+            let query = query.to_owned();
+            Box::pin(async move {
+                assert_eq!(query, host);
+                let call = searches.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    started.store(true, Ordering::SeqCst);
+                    gate.notified().await;
+                    return Some((ips_a, Duration::from_secs(300)));
+                }
+                Some((ips_b, Duration::from_secs(300)))
+            })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Option<(Vec<IpAddr>, Duration)>> + Send>,
+                >
+        })
+    });
+
+    // Lookup A starts and parks inside the fake (pre-flush generation).
+    let owner_a = tokio::spawn(resolve_addrs(host, 443, ResolverPolicy::default()));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !started.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "lookup A must reach the fake wave search"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // The network changes while A is parked.
+    flush_dns_cache();
+
+    // Lookup B, same host, post-flush generation: must NOT join A.
+    let owner_b = tokio::spawn(resolve_addrs(host, 443, ResolverPolicy::default()));
+    let b_result = tokio::time::timeout(Duration::from_secs(5), owner_b)
+        .await
+        .expect("B finishes")
+        .expect("B task joins")
+        .expect("B lookup succeeds");
+    assert_eq!(
+        searches.load(Ordering::SeqCst),
+        2,
+        "post-flush lookup B must start its OWN wave search, not join the \
+         pre-flush lookup A"
+    );
+    assert_eq!(b_result, order_candidates(&ips_b, 443));
+    // B's own answer (same generation as itself) may be cached.
+    match cached_doh_answer(host) {
+        Some(CacheHit::Addrs(got)) => {
+            assert_eq!(got, ips_b, "B's own post-flush answer must be cached");
+        }
+        _ => panic!("B's own post-flush answer must be cached"),
+    }
+
+    // Release A: it completes with its pre-flush answer, but must NOT
+    // republish it into the new generation's cache.
+    gate.notify_one();
+    let a_result = tokio::time::timeout(Duration::from_secs(5), owner_a)
+        .await
+        .expect("A finishes")
+        .expect("A task joins")
+        .expect("A lookup succeeds");
+    assert_eq!(a_result, order_candidates(&ips_a, 443));
+    assert_eq!(
+        searches.load(Ordering::SeqCst),
+        2,
+        "A must not trigger any further wave searches"
+    );
+    match cached_doh_answer(host) {
+        Some(CacheHit::Addrs(got)) => {
+            assert_eq!(
+                got, ips_b,
+                "A must NOT republish its pre-flush answer \
+                 over B's -- without the generation key + publish gate, B would \
+                 have joined A and A's stale answer would overwrite B's"
+            );
+        }
+        _ => panic!(
+            "A must NOT republish its pre-flush answer over B's -- \
+             without the generation key + publish gate, B would have joined A \
+             and A's stale answer would overwrite B's"
+        ),
+    }
+
+    clear_fake_doh_wave_search();
+    forget_dns_answer(host);
+}
+
+// TS7-06 failure path: a lookup that fails entirely inside the pre-flush
+// generation must not be remembered as a negative entry of the NEW
+// generation -- a remembered failure would make `resolve_addrs` skip DoH
+// entirely for DNS_NEGATIVE_TTL, even though the name may resolve fine
+// after the network change.
+#[tokio::test]
+async fn flush_prevents_a_pre_flush_failure_from_poisoning_the_new_generation() {
+    let _serial = FAKE_WAVE_LOCK.lock().await;
+    let host = "flush-failure.test.invalid";
+    forget_dns_answer(host);
+
+    let searches = std::sync::Arc::new(AtomicUsize::new(0));
+    let started = std::sync::Arc::new(AtomicBool::new(false));
+    let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+    install_fake_doh_wave_search({
+        let searches = std::sync::Arc::clone(&searches);
+        let started = std::sync::Arc::clone(&started);
+        let gate = std::sync::Arc::clone(&gate);
+        std::sync::Arc::new(move |query: &str| {
+            let searches = std::sync::Arc::clone(&searches);
+            let started = std::sync::Arc::clone(&started);
+            let gate = std::sync::Arc::clone(&gate);
+            let query = query.to_owned();
+            Box::pin(async move {
+                assert_eq!(query, host);
+                searches.fetch_add(1, Ordering::SeqCst);
+                started.store(true, Ordering::SeqCst);
+                gate.notified().await;
+                None
+            })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Option<(Vec<IpAddr>, Duration)>> + Send>,
+                >
+        })
+    });
+
+    let owner = tokio::spawn(resolve_addrs(host, 443, ResolverPolicy::default()));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !started.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the lookup must reach the fake wave search"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // The network changes while the failing lookup is parked.
+    flush_dns_cache();
+    gate.notify_one();
+
+    let result = tokio::time::timeout(Duration::from_secs(5), owner)
+        .await
+        .expect("lookup finishes")
+        .expect("task joins");
+    assert!(
+        result.is_err(),
+        "with the cache cleared and the fallback chain missing, the lookup must fail"
+    );
+    assert_eq!(searches.load(Ordering::SeqCst), 1);
+    assert!(
+        cached_doh_answer(host).is_none(),
+        "the pre-flush failure must not be remembered as a negative entry of \
+         the new generation"
+    );
+
+    clear_fake_doh_wave_search();
+    forget_dns_answer(host);
+}
+
 #[test]
 fn webtunnel_identity_from_url() {
     let bridge: BridgeLine = "webtunnel 9.9.9.9:443 1111111111111111111111111111111111111111 \
