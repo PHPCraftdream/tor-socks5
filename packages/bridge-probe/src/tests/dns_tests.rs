@@ -1066,8 +1066,80 @@ async fn failed_newer_rename_makes_older_save_err_not_false_ok() {
         path.is_dir(),
         "no regular file may have been published over the directory"
     );
-    // Temp files legitimately remain on rename failure (pre-existing
-    // behavior, out of scope here): no tmp-cleanliness assertion.
+    // TS7-08: a failed rename must clean up its own temp file, for A and
+    // B alike.
+    let leftover_tmp = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+        .count();
+    assert_eq!(
+        leftover_tmp, 0,
+        "a failed rename must not leave its temp file behind"
+    );
+
+    forget_dns_answer(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// TS7-08: repeated rename failures must not leak one temp file per
+/// attempt -- the cleanup guard disarms only after a successful rename,
+/// so every failed attempt removes its own temp file. Once the
+/// destination obstruction is cleared, the next attempt must succeed
+/// normally and the original rename error must have been the one
+/// surfaced by every failed attempt in between.
+#[tokio::test]
+async fn repeated_rename_failures_leave_no_orphaned_temp_files() {
+    let host = "ts708-rename-leak.test.invalid";
+    let ip: IpAddr = "203.0.113.201".parse().unwrap();
+    remember_doh_answer(host, &[ip], Duration::from_secs(300));
+
+    let dir = std::env::temp_dir().join(format!(
+        "ts708-rename-leak-{}-{}",
+        std::process::id(),
+        now_unix()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("dns-cache.txt");
+    // The FINAL path is itself a directory: every rename onto it fails
+    // (MoveFileEx on Windows, EISDIR on Unix), while the temp write next
+    // to it still succeeds.
+    std::fs::create_dir_all(&path).unwrap();
+
+    let count_tmp_files = || -> usize {
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .count()
+    };
+
+    for attempt in 0..3 {
+        let result = save_persisted_dns_cache(&path).await;
+        assert!(
+            result.is_err(),
+            "attempt {attempt}: rename onto a directory must fail"
+        );
+        assert_eq!(
+            count_tmp_files(),
+            0,
+            "attempt {attempt}: a failed rename must not leave its temp file behind"
+        );
+    }
+
+    // Clear the obstruction: the destination is no longer a directory.
+    std::fs::remove_dir(&path).unwrap();
+    let result = save_persisted_dns_cache(&path).await;
+    assert!(
+        result.is_ok(),
+        "once unblocked, the next attempt must succeed: {result:?}"
+    );
+    assert!(path.is_file(), "the destination must now be a regular file");
+    assert_eq!(
+        count_tmp_files(),
+        0,
+        "a successful publish leaves no temp file behind either"
+    );
 
     forget_dns_answer(host);
     let _ = std::fs::remove_dir_all(&dir);

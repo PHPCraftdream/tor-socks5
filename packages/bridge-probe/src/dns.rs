@@ -582,11 +582,23 @@ pub(super) async fn save_persisted_dns_cache_with_writer(
         // MoveFileEx(MOVEFILE_REPLACE_EXISTING) on Windows, rename(2) on
         // Unix: both atomically replace the destination.
         let result = std::fs::rename(&temp_path, &path);
-        if result.is_ok() {
-            *state
-                .published_generation
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()) = gen;
+        match &result {
+            Ok(()) => {
+                *state
+                    .published_generation
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = gen;
+            }
+            Err(_) => {
+                // TS7-08: rename failed (destination held open incompatibly
+                // on Windows, replaced by a directory, etc.) -- the temp
+                // file is otherwise ownerless from here on, since no other
+                // branch of this function will ever touch this exact
+                // (pid, gen) name again. Remove it so a long publication
+                // outage does not leak one full snapshot per failed
+                // attempt; the original rename error is still returned.
+                let _ = std::fs::remove_file(&temp_path);
+            }
         }
         drop(publish_guard);
         result
