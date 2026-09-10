@@ -6,8 +6,9 @@ use bridge_line::BridgeLine;
 use bridge_probe::webtunnel_endpoint_identity;
 
 /// Dedup bridge lines by (transport, addr, fingerprint) plus, for webtunnel
-/// bridges, the canonical endpoint identity `(dial_host, dial_port,
-/// path+query)` from `bridge_probe::webtunnel_endpoint_identity` (non-webtunnel
+/// bridges, the full canonical carrier identity `WebtunnelEndpointIdentity`
+/// (dial host/port, TLS SNI, HTTP Host authority, TLS-vs-plain, path+query)
+/// from `bridge_probe::webtunnel_endpoint_identity` (non-webtunnel
 /// bridges get `None` there, so their dedup is unchanged). Keeps the first
 /// occurrence. Returns (unique, duplicates_count).
 #[must_use]
@@ -77,6 +78,61 @@ webtunnel 9.9.9.9:443 1111111111111111111111111111111111111111 url=https://e.com
         let bridges = parse_bridges_from_body(body);
         let (unique, dups) = dedup_bridges(bridges);
         assert_eq!(unique.len(), 1);
+        assert_eq!(dups, 1);
+    }
+
+    #[test]
+    fn dedup_keeps_webtunnel_bridges_with_different_servernames() {
+        let body = "\
+webtunnel 9.9.9.9:443 1111111111111111111111111111111111111111 url=https://edge.example/x servername=old.example ver=0.0.3
+webtunnel 9.9.9.9:443 1111111111111111111111111111111111111111 url=https://edge.example/x servername=new.example ver=0.0.3
+";
+        let bridges = parse_bridges_from_body(body);
+        let (unique, dups) = dedup_bridges(bridges);
+        assert_eq!(unique.len(), 2, "different servername= must stay distinct");
+        assert_eq!(dups, 0);
+    }
+
+    #[test]
+    fn dedup_keeps_plain_http_and_tls_variants() {
+        let body = "\
+webtunnel 9.9.9.9:443 1111111111111111111111111111111111111111 url=http://edge.example:443/x ver=0.0.3
+webtunnel 9.9.9.9:443 1111111111111111111111111111111111111111 url=https://edge.example/x ver=0.0.3
+";
+        let bridges = parse_bridges_from_body(body);
+        let (unique, dups) = dedup_bridges(bridges);
+        assert_eq!(
+            unique.len(),
+            2,
+            "plain HTTP and TLS on one dial address must stay distinct"
+        );
+        assert_eq!(dups, 0);
+    }
+
+    #[test]
+    fn dedup_keeps_virtual_hosts_on_one_addr() {
+        let body = "\
+webtunnel 9.9.9.9:443 1111111111111111111111111111111111111111 url=https://a.example/x addr=9.9.9.9:443 ver=0.0.3
+webtunnel 9.9.9.9:443 1111111111111111111111111111111111111111 url=https://b.example/x addr=9.9.9.9:443 ver=0.0.3
+";
+        let bridges = parse_bridges_from_body(body);
+        let (unique, dups) = dedup_bridges(bridges);
+        assert_eq!(
+            unique.len(),
+            2,
+            "distinct virtual hosts behind one addr= must stay distinct"
+        );
+        assert_eq!(dups, 0);
+    }
+
+    #[test]
+    fn dedup_removes_webtunnel_duplicates_with_servername_and_addr() {
+        let line = "webtunnel 9.9.9.9:443 1111111111111111111111111111111111111111 \
+url=https://edge.example/x servername=edge.example addr=9.9.9.9:443 ver=0.0.3";
+        let body = format!("{line}\n{line}\n");
+        let bridges = parse_bridges_from_body(&body);
+        let (unique, dups) = dedup_bridges(bridges);
+        assert_eq!(unique.len(), 1, "literally identical configs still dedup");
         assert_eq!(dups, 1);
     }
 

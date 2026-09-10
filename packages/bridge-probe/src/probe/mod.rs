@@ -258,19 +258,48 @@ impl PreparedTarget {
     }
 }
 
-/// Canonical WebTunnel network identity for dedup/pool keys: the same
-/// (host, port, path+query) triple the probe itself dials, computed via
+/// Canonical WebTunnel carrier identity for dedup/pool keys: every field of
+/// [`PreparedTarget`] that shapes the actual connection — dial address, TLS
+/// SNI, HTTP Host authority, TLS-vs-plain, and path+query. Two bridge lines
+/// collapse into one dedup/pool candidate only when the probe would dial them
+/// identically, so first-wins dedup can no longer discard a distinct,
+/// possibly working, configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WebtunnelEndpointIdentity {
+    /// Dial host (`addr=` override wins, else URL host, brackets stripped).
+    pub dial_host: String,
+    /// Dial port (`addr=` override wins, else explicit or scheme-default port).
+    pub dial_port: u16,
+    /// TLS SNI / Host-header name (`servername=` override wins, else URL host).
+    pub sni: String,
+    /// Preformatted HTTP Host header value (see [`PreparedTarget::host_header`]).
+    pub host_header: String,
+    /// HTTP request-target: URL path (or "/") plus "?query" when present.
+    pub request_target: String,
+    /// True for `https://`, false for `http://`.
+    pub use_tls: bool,
+}
+
+/// Canonical WebTunnel carrier identity for dedup/pool keys, computed via
 /// [`PreparedTarget`] so dedup and probing can never disagree about what
-/// counts as "the same endpoint". `None` for non-webtunnel bridges or when
-/// the params don't parse — the caller should then fall back to the plain
-/// (transport, addr, fingerprint) key, not drop the bridge.
-pub fn webtunnel_endpoint_identity(bridge: &BridgeLine) -> Option<(String, u16, String)> {
+/// counts as "the same connection". See [`WebtunnelEndpointIdentity`].
+/// `None` for non-webtunnel bridges or when the params don't parse — the
+/// caller should then fall back to the plain (transport, addr, fingerprint)
+/// key, not drop the bridge.
+pub fn webtunnel_endpoint_identity(bridge: &BridgeLine) -> Option<WebtunnelEndpointIdentity> {
     if bridge.transport.as_deref() != Some("webtunnel") {
         return None;
     }
     PreparedTarget::new(&bridge.params)
         .ok()
-        .map(|t| (t.dial_host, t.dial_port, t.request_target))
+        .map(|t| WebtunnelEndpointIdentity {
+            dial_host: t.dial_host,
+            dial_port: t.dial_port,
+            sni: t.sni,
+            host_header: t.host_header,
+            request_target: t.request_target,
+            use_tls: t.use_tls,
+        })
 }
 
 pub(super) fn resolve_probe_target(bridge: &BridgeLine) -> Result<(String, u16), String> {
