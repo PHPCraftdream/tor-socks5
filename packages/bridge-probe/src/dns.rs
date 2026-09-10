@@ -227,6 +227,10 @@ fn live_entry_is_usable(entry: &CachedAnswer, now: Instant) -> bool {
     entry.expires_at > now || now.duration_since(entry.expires_at) <= DNS_STALE_FALLBACK_WINDOW
 }
 
+/// TS8-01: unconditional (non-generation-gated) publish. Production callers
+/// now go through [`remember_doh_answer_if_generation`] instead; this stays
+/// only as the direct-seeding primitive tests use.
+#[cfg(test)]
 pub(super) fn remember_doh_answer(host: &str, ips: &[IpAddr], valid_for: Duration) {
     let ttl = valid_for.clamp(DNS_MIN_TTL, DNS_MAX_TTL);
     store_cached(
@@ -239,6 +243,10 @@ pub(super) fn remember_doh_answer(host: &str, ips: &[IpAddr], valid_for: Duratio
     );
 }
 
+/// TS8-01: unconditional (non-generation-gated) publish. Production callers
+/// now go through [`remember_doh_failure_if_generation`] instead; this stays
+/// only as the direct-seeding primitive tests use.
+#[cfg(test)]
 pub(super) fn remember_doh_failure(host: &str) {
     store_cached(
         host,
@@ -248,6 +256,43 @@ pub(super) fn remember_doh_failure(host: &str) {
             resolved_at_unix: now_unix(),
         },
     );
+}
+
+/// TS8-01: generation-gated twin of [`remember_doh_answer`] for publishers
+/// that captured the network generation before their lookup started.
+/// Returns false (and writes nothing) when the generation changed under
+/// the lookup.
+pub(super) fn remember_doh_answer_if_generation(
+    host: &str,
+    ips: &[IpAddr],
+    valid_for: Duration,
+    expected_gen: u64,
+) -> bool {
+    let ttl = valid_for.clamp(DNS_MIN_TTL, DNS_MAX_TTL);
+    store_cached_if_generation(
+        host,
+        CachedAnswer {
+            addrs: ips.to_vec(),
+            expires_at: Instant::now() + ttl,
+            resolved_at_unix: now_unix(),
+        },
+        expected_gen,
+    )
+}
+
+/// TS8-01: generation-gated twin of [`remember_doh_failure`]. Returns
+/// false (and writes nothing) when the generation changed under the
+/// lookup.
+pub(super) fn remember_doh_failure_if_generation(host: &str, expected_gen: u64) -> bool {
+    store_cached_if_generation(
+        host,
+        CachedAnswer {
+            addrs: Vec::new(),
+            expires_at: Instant::now() + DNS_NEGATIVE_TTL,
+            resolved_at_unix: now_unix(),
+        },
+        expected_gen,
+    )
 }
 
 /// Drop what we remember about `host`.
@@ -264,8 +309,19 @@ pub(super) fn forget_dns_answer(host: &str) {
         .remove(host);
 }
 
+/// TS8-01: unconditional (non-generation-gated) insert. Production callers
+/// now go through [`store_cached_if_generation`] instead; this stays only
+/// as the direct-seeding primitive tests use.
+#[cfg(test)]
 pub(super) fn store_cached(host: &str, answer: CachedAnswer) {
     let mut cache = doh_cache().lock().unwrap_or_else(|p| p.into_inner());
+    insert_capped(&mut cache, host, answer);
+}
+
+/// Shared tail of [`store_cached`] and [`store_cached_if_generation`]:
+/// cap-check + eviction + insert, run under the caller's already-held
+/// `doh_cache()` guard. Never locks on its own.
+fn insert_capped(cache: &mut HashMap<String, CachedAnswer>, host: &str, answer: CachedAnswer) {
     if cache.len() >= DNS_CACHE_CAP {
         let now = Instant::now();
         // Sweep by the fallback window, not the TTL itself -- an expired-but-
@@ -288,11 +344,34 @@ pub(super) fn store_cached(host: &str, answer: CachedAnswer) {
     cache.insert(host.to_owned(), answer);
 }
 
+/// TS8-01: [`store_cached`] with a generation gate, for publishers that
+/// captured [`DNS_NETWORK_GENERATION`] before their lookup started. The
+/// re-check and the insert happen under ONE acquisition of the `doh_cache()`
+/// mutex -- the SAME mutex [`flush_dns_cache`] holds for its bump+clear --
+/// so a flush can no longer interleave between the check passing and the
+/// insert landing. Returns false (and writes nothing) when the generation
+/// changed under the caller.
+pub(super) fn store_cached_if_generation(
+    host: &str,
+    answer: CachedAnswer,
+    expected_gen: u64,
+) -> bool {
+    let mut cache = doh_cache().lock().unwrap_or_else(|p| p.into_inner());
+    if DNS_NETWORK_GENERATION.load(AtomicOrdering::SeqCst) != expected_gen {
+        return false;
+    }
+    insert_capped(&mut cache, host, answer);
+    true
+}
+
 /// TS7-06: bumped by [`flush_dns_cache`] BEFORE it clears anything, so a
 /// lookup that started before a network change can neither share its
 /// in-flight work with (or publish into) the post-flush world. In-flight
 /// lookups key the registry with the generation they captured; the owner
-/// re-checks the counter before caching its answer.
+/// re-checks the counter before caching its answer. TS8-01: that re-check
+/// runs under the `doh_cache()` mutex -- the same lock `flush_dns_cache`
+/// holds for bump+clear -- making the check and the insert atomic against a
+/// flush.
 pub(super) static DNS_NETWORK_GENERATION: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -308,19 +387,25 @@ pub fn flush_dns_cache() {
     // TS7-06: bump the generation BEFORE clearing, so a caller starting
     // concurrently with this flush sees either the old generation with the
     // old cache still alive, or the new generation with the cache already
-    // empty -- never the new generation still holding old answers. SeqCst:
-    // the counter is a cross-thread publish signal participating in a
-    // three-way interleaving (flush bump / lookup capture / publish-time
-    // re-check); a total order keeps that reasoning simple and flushes are
-    // rare (once per network change), so the fence costs nothing that
-    // matters. (Relaxed would also be defensible -- no payload is
-    // synchronised through the atomic itself, the cache has its own mutex
-    // -- but SeqCst is the conservative default.)
-    DNS_NETWORK_GENERATION.fetch_add(1, AtomicOrdering::SeqCst);
-    doh_cache()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clear();
+    // empty -- never the new generation still holding old answers.
+    // TS8-01: the bump and the clear now happen under ONE holding of the
+    // doh_cache() mutex -- the same mutex a generation-gated publish
+    // (`store_cached_if_generation`) holds for its re-check+insert -- so the
+    // old residual race (a flush completing between a publish's check and
+    // its insert) is closed: whichever critical section grabs the lock
+    // first finishes before the other starts, and the clear wipes anything
+    // an earlier publish managed to insert. SeqCst: the counter is a
+    // cross-thread publish signal participating in a three-way interleaving
+    // (flush bump / lookup capture / publish-time re-check); a total order
+    // keeps that reasoning simple and flushes are rare (once per network
+    // change), so the fence costs nothing that matters. (Relaxed would also
+    // be defensible -- the cache has its own mutex -- but SeqCst is the
+    // conservative default.)
+    {
+        let mut cache = doh_cache().lock().unwrap_or_else(|p| p.into_inner());
+        DNS_NETWORK_GENERATION.fetch_add(1, AtomicOrdering::SeqCst);
+        cache.clear();
+    }
     for slot in doh_scores() {
         slot.store(0, AtomicOrdering::Relaxed);
     }

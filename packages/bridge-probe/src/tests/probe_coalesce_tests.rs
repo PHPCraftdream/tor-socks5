@@ -540,3 +540,130 @@ async fn flush_prevents_a_pre_flush_failure_from_poisoning_the_new_generation() 
     clear_fake_doh_wave_search();
     forget_dns_answer(host);
 }
+
+// TS8-01: closes the residual race left by TS7-06's generation check.
+// A's generation-check-and-insert now run as ONE atomic critical section
+// (`remember_doh_answer_if_generation`, under the `doh_cache()` mutex), so
+// parking A right before that call and landing a flush while it is parked
+// must still block A's write -- there is no longer a window where "the
+// check already passed" and "the write hasn't happened yet" can straddle
+// a flush. Before the TS8-01 fix, `DNS_NETWORK_GENERATION == gen` was
+// checked BEFORE `remember_doh_answer` took its own separate lock, so a
+// flush landing in exactly this window let A's stale answer through.
+#[tokio::test]
+async fn flush_landing_after_the_generation_check_still_blocks_the_write() {
+    let _serial = FAKE_WAVE_LOCK.lock().await;
+    let host = "flush-after-check.test.invalid";
+    forget_dns_answer(host);
+    disarm_pre_publish_pause();
+
+    let ips_a: Vec<IpAddr> = vec!["203.0.113.40".parse().unwrap()];
+    install_fake_doh_wave_search({
+        let ips_a = ips_a.clone();
+        std::sync::Arc::new(move |_query: &str| {
+            let ips_a = ips_a.clone();
+            Box::pin(async move { Some((ips_a, Duration::from_secs(300))) })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Option<(Vec<IpAddr>, Duration)>> + Send>,
+                >
+        })
+    });
+
+    // Arm the one-shot pause: the next publish inside `coalesced_doh_lookup`
+    // parks right before its generation-gated write.
+    let gate = arm_pre_publish_pause();
+
+    let owner_a = tokio::spawn(resolve_addrs(host, 443, ResolverPolicy::default()));
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !pre_publish_pause_parked() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "A must reach the pre-publish pause"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // The network changes while A is parked, strictly between the wave
+    // search returning and A's write.
+    flush_dns_cache();
+
+    // Release A: its write must be vetoed by the now-changed generation.
+    gate.notify_one();
+    let a_result = tokio::time::timeout(Duration::from_secs(5), owner_a)
+        .await
+        .expect("A finishes")
+        .expect("A task joins")
+        .expect("A lookup succeeds");
+    assert_eq!(a_result, order_candidates(&ips_a, 443));
+
+    assert!(
+        cached_doh_answer(host).is_none(),
+        "a flush landing after A's wave search returned but before its \
+         write must still block the write (TS8-01) -- without the fix, A's \
+         pre-flush answer would have been cached into the new generation"
+    );
+
+    disarm_pre_publish_pause();
+    clear_fake_doh_wave_search();
+    forget_dns_answer(host);
+}
+
+// TS8-01 negative-path counterpart: a failure observed by A must also be
+// blocked if a flush lands between the generation check and the write --
+// `remember_doh_failure_if_generation` closes the same window as the
+// positive path.
+#[tokio::test]
+async fn flush_landing_after_the_generation_check_still_blocks_the_failure_write() {
+    let _serial = FAKE_WAVE_LOCK.lock().await;
+    let host = "flush-after-check-fail.test.invalid";
+    forget_dns_answer(host);
+    disarm_pre_publish_pause();
+
+    install_fake_doh_wave_search(std::sync::Arc::new(move |_query: &str| {
+        Box::pin(async move { None })
+            as std::pin::Pin<
+                Box<dyn std::future::Future<Output = Option<(Vec<IpAddr>, Duration)>> + Send>,
+            >
+    }));
+
+    // Arm the one-shot pause: the next publish inside `resolve_addrs`'s
+    // failure path parks right before its generation-gated write.
+    let gate = arm_pre_publish_pause();
+
+    let owner_a = tokio::spawn(resolve_addrs(host, 443, ResolverPolicy::default()));
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !pre_publish_pause_parked() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "A must reach the pre-publish pause"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // The network changes while A is parked, strictly between the wave
+    // search failing and A's negative-entry write.
+    flush_dns_cache();
+
+    gate.notify_one();
+    let a_result = tokio::time::timeout(Duration::from_secs(5), owner_a)
+        .await
+        .expect("A finishes")
+        .expect("A task joins");
+    assert!(
+        a_result.is_err(),
+        "with the cache cleared and no fallback, the lookup must fail"
+    );
+
+    assert!(
+        cached_doh_answer(host).is_none(),
+        "a flush landing after A's failure check but before its write must \
+         still block the write (TS8-01) -- without the fix, A's stale \
+         failure could have poisoned the new generation's cache"
+    );
+
+    disarm_pre_publish_pause();
+    clear_fake_doh_wave_search();
+    forget_dns_answer(host);
+}

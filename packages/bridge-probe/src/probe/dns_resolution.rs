@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use super::{Outcome, ResolverPolicy};
 use crate::dns::{
     cached_doh_answer, disk_fallback_answer, doh_order, doh_pool, doh_slots, note_doh_result,
-    remember_doh_answer, remember_doh_failure, stale_fallback_answer, CacheHit,
-    DNS_NETWORK_GENERATION, DOH_FANOUT, DOH_MAX_WAVES, DOH_PROVIDER_TIMEOUT,
+    remember_doh_answer_if_generation, remember_doh_failure_if_generation, stale_fallback_answer,
+    CacheHit, DNS_NETWORK_GENERATION, DOH_FANOUT, DOH_MAX_WAVES, DOH_PROVIDER_TIMEOUT,
 };
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -317,17 +317,14 @@ pub(crate) async fn coalesced_doh_lookup(query: &str) -> DohWaveResult {
         match doh_wave_search(query).await {
             Some((ips, ttl)) => {
                 // TS7-06: publish only into the generation this lookup
-                // started in. If a flush happened while the wave search was
-                // in flight, the cache now belongs to the NEW network --
-                // re-caching this answer would hand it out as fresh. The
-                // callers of THIS cell (all in generation `gen`) still get
-                // the answer; it is simply not cached for later lookups.
-                // Residual race: a flush landing between this check and the
-                // cache write is accepted -- closing it would need a lock
-                // held across the await.
-                if DNS_NETWORK_GENERATION.load(std::sync::atomic::Ordering::SeqCst) == gen {
-                    remember_doh_answer(query, &ips, ttl);
-                }
+                // started in; TS8-01: the generation re-check now runs
+                // INSIDE `remember_doh_answer_if_generation`, under the same
+                // `doh_cache()` mutex `flush_dns_cache` holds for its
+                // bump+clear, so a flush can no longer land between the
+                // check and the insert (the old "residual race").
+                #[cfg(test)]
+                pre_publish_pause().await;
+                remember_doh_answer_if_generation(query, &ips, ttl, gen);
                 Ok((ips, ttl))
             }
             None => Err("all DoH providers failed".to_owned()),
@@ -393,6 +390,64 @@ pub(crate) fn clear_fake_doh_wave_search() {
     *FAKE_DOH_WAVE_SEARCH
         .lock()
         .unwrap_or_else(|p| p.into_inner()) = None;
+}
+
+// TS8-01 test seam: parks the publishing task BETWEEN the wave search
+// returning (or the failure fallback chain exhausting) and the
+// generation-gated cache write -- the exact window TS8-01 closes. One-shot:
+// the first task to reach the armed seam consumes it and parks; everyone
+// after it sails through, so a post-flush lookup B never stops here. The
+// parked task resumes when the test notifies the gate returned by
+// `arm_pre_publish_pause`. Never set outside test builds.
+#[cfg(test)]
+static PRE_PUBLISH_PAUSE: std::sync::Mutex<Option<std::sync::Arc<tokio::sync::Notify>>> =
+    std::sync::Mutex::new(None);
+
+// TS8-01: kept SEPARATE from `PRE_PUBLISH_PAUSE` on purpose -- `pre_publish_pause`
+// `take()`s the gate out of `PRE_PUBLISH_PAUSE` before parking (so a second
+// caller sails through instead of also pausing), which would make a
+// "parked" bit stored INSIDE that same Option unobservable to the test the
+// instant it is set (the static would already read back `None`). This flag
+// survives the take.
+#[cfg(test)]
+static PRE_PUBLISH_PAUSE_PARKED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn arm_pre_publish_pause() -> std::sync::Arc<tokio::sync::Notify> {
+    let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+    PRE_PUBLISH_PAUSE_PARKED.store(false, std::sync::atomic::Ordering::SeqCst);
+    *PRE_PUBLISH_PAUSE.lock().unwrap_or_else(|p| p.into_inner()) =
+        Some(std::sync::Arc::clone(&gate));
+    gate
+}
+
+#[cfg(test)]
+pub(crate) fn disarm_pre_publish_pause() {
+    *PRE_PUBLISH_PAUSE.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    PRE_PUBLISH_PAUSE_PARKED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn pre_publish_pause_parked() -> bool {
+    PRE_PUBLISH_PAUSE_PARKED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(test)]
+async fn pre_publish_pause() {
+    // Take the slot and drop the std lock BEFORE awaiting -- never hold a
+    // std::sync::Mutex across an await point.
+    let gate = PRE_PUBLISH_PAUSE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take();
+    if let Some(gate) = gate {
+        PRE_PUBLISH_PAUSE_PARKED.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Safe to arm the flag before awaiting: `Notify::notify_one` stores
+        // a permit when no waiter is registered yet, so a notify that races
+        // this registration is consumed immediately, not lost.
+        gate.notified().await;
+    }
 }
 
 /// TS7-05 test seam: current number of entries in the [`INFLIGHT_DOH`]
@@ -461,11 +516,14 @@ pub async fn resolve_addrs(
                             );
                             return Ok(order_candidates(&persisted, port));
                         }
-                        // TS7-06: only remember the failure if the network
-                        // generation did not change under the lookup.
-                        if DNS_NETWORK_GENERATION.load(std::sync::atomic::Ordering::SeqCst) == gen {
-                            remember_doh_failure(query);
-                        }
+                        // TS7-06/TS8-01: only remember the failure if the
+                        // network generation did not change under the
+                        // lookup; the re-check runs under the cache mutex,
+                        // so a flush landing after the check can no longer
+                        // be overtaken by the insert.
+                        #[cfg(test)]
+                        pre_publish_pause().await;
+                        remember_doh_failure_if_generation(query, gen);
                         tracing::warn!(host = %query, "all DoH providers failed");
                     }
                 }
