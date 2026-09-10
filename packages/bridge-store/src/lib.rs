@@ -22,7 +22,10 @@
 //! obfs4 1.2.3.4:80 ABCDEF... cert=... iat-mode=0
 //! ```
 //!
-//! Dedup key: `(transport, addr, fingerprint)`.
+//! Dedup key: `(transport, addr, fingerprint, carrier-identity)` — the last
+//! component is [`bridge_probe::webtunnel_endpoint_identity`], so two
+//! webtunnel carriers behind one relay (different `url=`/`servername=`) keep
+//! separate health records. `None` for non-webtunnel lines.
 //!
 //! Shared by the CLI daemon (`apps/socks5-proxy`) and the Android JNI
 //! engine (`packages/android-ffi`) — both processes probe bridges and want
@@ -40,7 +43,12 @@ mod observe;
 mod persistence;
 mod stats;
 
-type Key = (Option<String>, SocketAddr, Option<String>);
+type Key = (
+    Option<String>,
+    SocketAddr,
+    Option<String>,
+    Option<bridge_probe::WebtunnelEndpointIdentity>,
+);
 
 #[derive(Debug, Clone)]
 struct Entry {
@@ -188,7 +196,12 @@ impl Entry {
 }
 
 fn key_of(b: &BridgeLine) -> Key {
-    (b.transport.clone(), b.addr, b.fingerprint.clone())
+    (
+        b.transport.clone(),
+        b.addr,
+        b.fingerprint.clone(),
+        bridge_probe::webtunnel_endpoint_identity(b),
+    )
 }
 
 #[derive(Debug, Clone)]

@@ -264,7 +264,7 @@ impl PreparedTarget {
 /// collapse into one dedup/pool candidate only when the probe would dial them
 /// identically, so first-wins dedup can no longer discard a distinct,
 /// possibly working, configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WebtunnelEndpointIdentity {
     /// Dial host (`addr=` override wins, else URL host, brackets stripped).
     pub dial_host: String,

@@ -42,6 +42,9 @@ fn empty() -> BridgeStore {
 const HALF_HOUR: Duration = Duration::from_secs(30 * 60);
 const MAX_CIRCUIT_FAILS: u32 = 5;
 
+#[path = "tests/carrier_identity.rs"]
+mod carrier_identity;
+
 #[path = "tests/circuit.rs"]
 mod circuit;
 #[path = "tests/persistence.rs"]
