@@ -240,14 +240,21 @@ pub(crate) type DohWaveResult = Result<(Vec<IpAddr>, Duration), String>;
 
 /// Registry of in-flight DoH wave lookups, keyed by hostname (TS6-05): two
 /// concurrent `resolve_addrs` calls for the SAME still-uncached host share
-/// ONE set of provider waves instead of each launching its own. Weak
-/// entries: once every waiter's `Arc` clone is dropped (the lookup finished
-/// and all callers consumed it), a later call for the same host either hits
-/// the long-term `cached_doh_answer` cache (already updated by
-/// `remember_doh_answer` inside the coalesced lookup below) or starts a
-/// fresh coalesced lookup. This naturally bounds the registry to the number
-/// of DISTINCT hostnames currently being actively resolved concurrently,
-/// itself bounded elsewhere (MAX_INFLIGHT_PROBES).
+/// ONE set of provider waves instead of each launching its own. Entries hold
+/// only a `Weak` cell: once every caller's `Arc` clone is dropped (the
+/// lookup finished and all callers consumed it), `upgrade()` returns `None`,
+/// so a later call for the same host either hits the long-term
+/// `cached_doh_answer` cache (already updated by `remember_doh_answer`
+/// inside the coalesced lookup below) or starts a fresh coalesced lookup.
+/// TS7-05: a dead `Weak` does NOT disappear on its own -- `upgrade()`
+/// failing leaves the key and the `Weak` allocation in the map forever
+/// until something removes them explicitly. The map is therefore swept
+/// LAZILY at insertion time: every fresh insert first drops all dead
+/// entries, under the same lock (see `coalesced_doh_lookup`). That bounds
+/// the registry to the DISTINCT hostnames actively being resolved
+/// concurrently (itself bounded elsewhere, MAX_INFLIGHT_PROBES) plus the
+/// entries that died since the last insertion, instead of growing with
+/// every hostname ever resolved across the whole process lifetime.
 static INFLIGHT_DOH: std::sync::OnceLock<
     std::sync::Mutex<
         std::collections::HashMap<String, std::sync::Weak<tokio::sync::OnceCell<DohWaveResult>>>,
@@ -277,6 +284,17 @@ pub(crate) async fn coalesced_doh_lookup(query: &str) -> DohWaveResult {
         if let Some(existing) = map.get(query).and_then(std::sync::Weak::upgrade) {
             existing
         } else {
+            // TS7-05: a dead Weak (and its key) is not removed automatically
+            // just because upgrade() would fail -- only an explicit removal
+            // does. Sweep dead entries HERE, right before inserting a new
+            // one, under the SAME lock as the insert (race-free: a live
+            // entry always has strong_count > 0 at this exact moment, so
+            // retain can never remove something a concurrent caller is
+            // still using or just started). This bounds the registry to
+            // "currently active lookups + entries that died between the
+            // last two distinct-hostname insertions" instead of growing
+            // across the whole process lifetime.
+            map.retain(|_, w| w.strong_count() > 0);
             let fresh = std::sync::Arc::new(tokio::sync::OnceCell::new());
             map.insert(query.to_owned(), std::sync::Arc::downgrade(&fresh));
             fresh
@@ -351,6 +369,18 @@ pub(crate) fn clear_fake_doh_wave_search() {
     *FAKE_DOH_WAVE_SEARCH
         .lock()
         .unwrap_or_else(|p| p.into_inner()) = None;
+}
+
+/// TS7-05 test seam: current number of entries in the [`INFLIGHT_DOH`]
+/// registry -- live cells and dead `Weak`s alike -- so tests can observe
+/// the lazy sweep actually bounding the map. Never exists in non-test
+/// builds.
+#[cfg(test)]
+pub(crate) fn inflight_doh_registry_len() -> usize {
+    INFLIGHT_DOH
+        .get()
+        .map(|registry| registry.lock().unwrap_or_else(|p| p.into_inner()).len())
+        .unwrap_or(0)
 }
 
 /// Resolve a `(host, port)` pair to the addresses worth trying, best first.

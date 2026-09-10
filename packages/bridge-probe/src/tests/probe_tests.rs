@@ -815,6 +815,147 @@ async fn a_finished_failed_coalesced_lookup_can_be_retried() {
     forget_dns_answer(host);
 }
 
+// TS7-05: a dead `Weak` entry does not leave the registry on its own --
+// only an explicit removal does. The lazy sweep at insertion time must
+// bound the map: sequential lookups of DISTINCT hosts (each fully finished
+// before the next starts, so no concurrency at all) used to leave one
+// permanently dead entry behind per lookup, growing the registry linearly
+// with every hostname ever resolved. FAKE_WAVE_LOCK makes every
+// registry-writing test mutually exclusive, so the observed length is
+// deterministic: each distinct-host insertion sweeps the previous lookup's
+// dead entry, and nothing sweeps the LAST one -- hence at most 1 entry.
+#[tokio::test]
+async fn sequential_distinct_host_lookups_do_not_grow_the_inflight_registry() {
+    let _serial = FAKE_WAVE_LOCK.lock().await;
+
+    const DISTINCT_HOSTS: usize = 20;
+    let searches = std::sync::Arc::new(AtomicUsize::new(0));
+    install_fake_doh_wave_search(counting_wave_fake(
+        std::sync::Arc::clone(&searches),
+        Vec::new(),
+        None,
+        Duration::ZERO,
+        false,
+    ));
+
+    for i in 0..DISTINCT_HOSTS {
+        let host = format!("registry-sweep-{i}.test.invalid");
+        assert!(
+            coalesced_doh_lookup(&host).await.is_err(),
+            "the fake fails on purpose; only the registry mechanics are under test"
+        );
+    }
+
+    assert_eq!(
+        searches.load(Ordering::SeqCst),
+        DISTINCT_HOSTS,
+        "every distinct host must have run its own (failing) wave search"
+    );
+    let len = inflight_doh_registry_len();
+    assert!(
+        len <= 1,
+        "sequential distinct-host lookups must not grow the registry \
+         linearly: {len} entries left after {DISTINCT_HOSTS} finished lookups"
+    );
+
+    clear_fake_doh_wave_search();
+}
+
+// TS7-05: the lazy sweep must never drop a STILL-INFLIGHT lookup of a
+// different host. A live entry always has strong_count > 0 (every caller
+// holds its Arc across get_or_init), so retain keeps it. If that broke, a
+// caller joining a parked lookup after a sweep would silently start a
+// SECOND wave search for the same host instead of sharing the first --
+// exactly what the live-host search counter observes here.
+#[tokio::test]
+async fn sweeping_dead_entries_never_drops_a_still_inflight_lookup() {
+    let _serial = FAKE_WAVE_LOCK.lock().await;
+    let dead_host = "sweep-dead.test.invalid";
+    let live_host = "sweep-live.test.invalid";
+    forget_dns_answer(live_host);
+
+    let live_searches = std::sync::Arc::new(AtomicUsize::new(0));
+    let live_started = std::sync::Arc::new(AtomicBool::new(false));
+    let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+    let answer_ips: Vec<IpAddr> = vec!["203.0.113.23".parse().unwrap()];
+    install_fake_doh_wave_search({
+        let live_searches = std::sync::Arc::clone(&live_searches);
+        let live_started = std::sync::Arc::clone(&live_started);
+        let gate = std::sync::Arc::clone(&gate);
+        let ips = answer_ips.clone();
+        std::sync::Arc::new(move |query: &str| {
+            let live_searches = std::sync::Arc::clone(&live_searches);
+            let live_started = std::sync::Arc::clone(&live_started);
+            let gate = std::sync::Arc::clone(&gate);
+            let ips = ips.clone();
+            let query = query.to_owned();
+            Box::pin(async move {
+                if query == live_host {
+                    live_searches.fetch_add(1, Ordering::SeqCst);
+                    live_started.store(true, Ordering::SeqCst);
+                    gate.notified().await;
+                    return Some((ips, Duration::from_secs(300)));
+                }
+                None
+            })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Option<(Vec<IpAddr>, Duration)>> + Send>,
+                >
+        })
+    });
+
+    // A finished (failed) lookup for another host leaves a dead entry behind.
+    assert!(coalesced_doh_lookup(dead_host).await.is_err());
+
+    // Start the live lookup and wait until its owner is parked inside the
+    // fake: the registry entry is LIVE (strong_count > 0) at this point.
+    let owner = tokio::spawn(coalesced_doh_lookup(live_host));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !live_started.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the owner must reach the fake wave search"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // A third, distinct hostname inserts a fresh entry -- and thereby runs
+    // the sweep over the live entry and the dead one.
+    assert!(coalesced_doh_lookup("sweep-trigger.test.invalid")
+        .await
+        .is_err());
+
+    // A second caller must still JOIN the parked live lookup (its registry
+    // entry must have survived the sweep), not start a second wave search.
+    let joiner = tokio::spawn(coalesced_doh_lookup(live_host));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    gate.notify_one();
+
+    let owner_result = tokio::time::timeout(Duration::from_secs(5), owner)
+        .await
+        .expect("owner finishes")
+        .expect("owner task joins")
+        .expect("owner lookup succeeds");
+    let joiner_result = tokio::time::timeout(Duration::from_secs(5), joiner)
+        .await
+        .expect("joiner finishes")
+        .expect("joiner task joins")
+        .expect("joiner lookup succeeds");
+    assert_eq!(
+        owner_result, joiner_result,
+        "both callers must share one lookup result"
+    );
+    assert_eq!(
+        live_searches.load(Ordering::SeqCst),
+        1,
+        "the sweep must keep the in-flight lookup: the joiner must share its \
+         wave search, not start a second one"
+    );
+
+    clear_fake_doh_wave_search();
+    forget_dns_answer(live_host);
+}
+
 #[test]
 fn webtunnel_identity_from_url() {
     let bridge: BridgeLine = "webtunnel 9.9.9.9:443 1111111111111111111111111111111111111111 \

@@ -32,7 +32,8 @@ pub(crate) use dns_resolution::{
 // without network access); does not exist in non-test builds.
 #[cfg(test)]
 pub(crate) use dns_resolution::{
-    clear_fake_doh_wave_search, install_fake_doh_wave_search, FakeDohWaveSearch,
+    clear_fake_doh_wave_search, inflight_doh_registry_len, install_fake_doh_wave_search,
+    FakeDohWaveSearch,
 };
 // `#[allow(unused_imports)]`: these re-exports keep the moved items
 // crate-visible exactly as their pre-split `pub(super)` did, even where only
