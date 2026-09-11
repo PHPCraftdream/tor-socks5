@@ -190,7 +190,19 @@ pub(super) async fn warm_bridge_pool(tunnel: TorTunnel, bridges: Vec<BridgeLine>
         tasks.spawn(async move {
             let started = Instant::now();
             match tokio::time::timeout(WARM_BRIDGE_TIMEOUT, tunnel.warm_bridge(&bridge)).await {
-                Ok(Ok(())) => WarmOutcome::Warm(bridge, started.elapsed()),
+                Ok(Ok(true)) => WarmOutcome::Warm(bridge, started.elapsed()),
+                // The channel manager served a channel opened through a
+                // different carrier with the same relay identities; that is
+                // not proof this bridge line works, so treat it like a
+                // transient non-failure (the bridge keeps its place in the
+                // pool, no retirement, no success recorded).
+                Ok(Ok(false)) => {
+                    debug!(
+                        bridge = %bridge.addr,
+                        "bridge warm-up reused a channel from another endpoint; no proof"
+                    );
+                    WarmOutcome::Failed
+                }
                 Ok(Err(error)) => {
                     let rendered = format!("{error:#}");
                     if is_permanent_bridge_failure(&rendered) {
@@ -257,7 +269,7 @@ pub(super) async fn warm_bridge_pool(tunnel: TorTunnel, bridges: Vec<BridgeLine>
 
 /// What one bridge's warm-up attempt established.
 pub(super) enum WarmOutcome {
-    /// A channel opened; the bridge is proven usable and timed.
+    /// A channel proven to reach this bridge's own endpoint; timed.
     Warm(BridgeLine, Duration),
     /// The bridge answered but can never work as configured — retire it.
     Retired(BridgeLine),

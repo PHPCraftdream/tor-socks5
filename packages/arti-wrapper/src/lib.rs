@@ -14,6 +14,7 @@ use arti_client::config::pt::TransportConfigBuilder;
 use arti_client::config::{BridgeConfigBuilder, CfgPath, Reconfigure, TorClientConfigBuilder};
 use arti_client::{DataStream, TorClient, TorClientConfig};
 use bridge_line::BridgeLine;
+use tor_linkspec::{ChannelMethod, HasChanMethod};
 use tor_rtcompat::PreferredRuntime;
 
 #[derive(Debug, thiserror::Error)]
@@ -381,10 +382,21 @@ impl TorTunnel {
     /// channel is not treated as disposable by any usage-based bookkeeping
     /// `ChanMgr` may apply.
     ///
+    /// Return value: `Ok(true)` means the returned channel actually reaches
+    /// `bridge`'s endpoint (freshly launched for it, or an already-open
+    /// channel whose handshake used the same transport/address), so a
+    /// successful warm-up is proof of this bridge line. `Ok(false)` means
+    /// `get_or_launch` reused a channel opened through a *different* carrier
+    /// (same relay identities, different endpoint — `ChanMgr` selects open
+    /// channels by relay identities only, see
+    /// `vendor/tor-chanmgr/src/mgr/select.rs`); that is not evidence about
+    /// this bridge's own configuration, so callers must not record a
+    /// channel-level success, but the check itself did not fail.
+    ///
     /// Requires `TorClient::chanmgr()` (the `experimental-api` feature,
     /// already enabled workspace-wide), same as
     /// [`terminate_all_channels`](Self::terminate_all_channels).
-    pub async fn warm_bridge(&self, bridge: &BridgeLine) -> Result<()> {
+    pub async fn warm_bridge(&self, bridge: &BridgeLine) -> Result<bool> {
         let chanmgr = self.inner.chanmgr().map_err(TorError::ChanMgrUnavailable)?;
         let serialized = bridge.to_string();
         let builder: BridgeConfigBuilder =
@@ -396,14 +408,21 @@ impl TorTunnel {
         let target = builder
             .build()
             .map_err(|e| TorError::InvalidBridge(format!("{serialized:?}: {e}")))?;
-        chanmgr
+        let (chan, _provenance) = chanmgr
             .get_or_launch(&target, tor_chanmgr::ChannelUsage::UserTraffic)
             .await
             .map_err(|source| TorError::Warm {
                 bridge: serialized,
                 source: Box::new(source),
             })?;
-        Ok(())
+        // `Channel::target()` is the actual handshake peer, so this is the
+        // only reliable carrier check: the `check_match` inside
+        // `get_or_launch` compares relay identities, which different bridge
+        // lines (e.g. two webtunnel endpoints of one relay) can share.
+        Ok(channel_proves_endpoint(
+            &chan.target().chan_method(),
+            &target.chan_method(),
+        ))
     }
 
     /// Query guard security policy without changing its failure history.
@@ -767,6 +786,31 @@ fn build_config(settings: &Settings) -> Result<TorClientConfig> {
     builder
         .build()
         .map_err(|e| TorError::BuildConfig(e.to_string()))
+}
+
+/// Whether a channel's actual connection method proves it reaches a target
+/// requested with `requested`.
+///
+/// Pure decision function for [`TorTunnel::warm_bridge`]: a direct channel
+/// counts when its handshake actually used one of the requested addresses
+/// (`Channel::target()` is filtered down to the address really used, so this
+/// is an intersection, mirroring `PeerInfo::matches_chan_method` in
+/// tor-proto); a pluggable-transport channel counts only on an exact
+/// transport/address/settings match. Anything else — different endpoint,
+/// different transport class — is not proof.
+pub(crate) fn channel_proves_endpoint(
+    actual: &tor_linkspec::ChannelMethod,
+    requested: &tor_linkspec::ChannelMethod,
+) -> bool {
+    match (actual, requested) {
+        (ChannelMethod::Direct(actual_addrs), ChannelMethod::Direct(requested_addrs)) => {
+            actual_addrs.iter().any(|a| requested_addrs.contains(a))
+        }
+        (ChannelMethod::Pluggable(actual), ChannelMethod::Pluggable(requested)) => {
+            actual == requested
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]

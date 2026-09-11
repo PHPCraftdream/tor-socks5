@@ -291,6 +291,7 @@ dependencies = [
  "tokio",
  "tor-chanmgr",
  "tor-guardmgr",
+ "tor-linkspec",
  "tor-rtcompat",
  "tracing",
 ]

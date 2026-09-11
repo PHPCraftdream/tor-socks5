@@ -17,6 +17,7 @@ arti-client.workspace = true
 tor-rtcompat.workspace = true
 tor-chanmgr.workspace = true
 tor-guardmgr.workspace = true
+tor-linkspec.workspace = true
 tokio.workspace = true
 futures.workspace = true
 anyhow.workspace = true

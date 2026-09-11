@@ -376,3 +376,72 @@ async fn verify_bridge_reachable_reports_bootstrap_timeout_for_an_unreachable_br
         "expected BridgeCheckBootstrapTimeout, got: {err}"
     );
 }
+
+mod endpoint_proof {
+    use super::*;
+    use std::net::SocketAddr;
+    use tor_linkspec::{PtTarget, PtTargetAddr, PtTransportName};
+
+    fn direct(addrs: &[&str]) -> ChannelMethod {
+        ChannelMethod::Direct(
+            addrs
+                .iter()
+                .map(|a| a.parse::<SocketAddr>().unwrap())
+                .collect(),
+        )
+    }
+
+    fn pluggable(transport: &str, addr: &str) -> ChannelMethod {
+        ChannelMethod::Pluggable(PtTarget::new(
+            transport.parse::<PtTransportName>().unwrap(),
+            addr.parse::<PtTargetAddr>().unwrap(),
+        ))
+    }
+
+    #[test]
+    fn direct_match_on_the_actually_used_address_proves() {
+        // Channel::target() reports only the address the handshake used; it
+        // counts as proof when that address is among the requested ones.
+        assert!(channel_proves_endpoint(
+            &direct(&["192.0.2.1:443"]),
+            &direct(&["192.0.2.1:443", "192.0.2.2:443"])
+        ));
+    }
+
+    #[test]
+    fn direct_reuse_of_a_different_address_is_not_proof() {
+        assert!(!channel_proves_endpoint(
+            &direct(&["192.0.2.9:443"]),
+            &direct(&["192.0.2.1:443"])
+        ));
+    }
+
+    #[test]
+    fn pluggable_same_endpoint_proves() {
+        assert!(channel_proves_endpoint(
+            &pluggable("webtunnel", "192.0.2.1:443"),
+            &pluggable("webtunnel", "192.0.2.1:443")
+        ));
+    }
+
+    #[test]
+    fn pluggable_different_endpoint_is_not_proof() {
+        // TS8-02: same relay identities, different webtunnel endpoint.
+        assert!(!channel_proves_endpoint(
+            &pluggable("webtunnel", "192.0.2.1:443"),
+            &pluggable("webtunnel", "203.0.113.7:443")
+        ));
+        assert!(!channel_proves_endpoint(
+            &pluggable("webtunnel", "192.0.2.1:443"),
+            &pluggable("obfs4", "192.0.2.1:443")
+        ));
+    }
+
+    #[test]
+    fn transport_class_mismatch_is_not_proof() {
+        assert!(!channel_proves_endpoint(
+            &direct(&["192.0.2.1:443"]),
+            &pluggable("webtunnel", "192.0.2.1:443")
+        ));
+    }
+}

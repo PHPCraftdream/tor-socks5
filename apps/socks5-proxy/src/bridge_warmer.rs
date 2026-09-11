@@ -44,7 +44,7 @@ use std::time::Duration;
 use bridge_line::BridgeLine;
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::{Config, WarmPoolConfig};
 use crate::tor_watchdog::TorHandle;
@@ -316,9 +316,17 @@ pub fn spawn_bridge_warmer(
             let mut warmed: Vec<BridgeLine> = Vec::new();
             for bridge in &selected {
                 match tor.warm_bridge(bridge).await {
-                    Ok(()) => {
+                    Ok(true) => {
                         info!(bridge = %bridge, "warm-pool: channel warmed");
                         warmed.push(bridge.clone());
+                    }
+                    // `warm_bridge` reused a channel opened through a
+                    // different carrier sharing this bridge's relay
+                    // identities; that proves nothing about this bridge
+                    // line's own endpoint, so record nothing (and record no
+                    // failure either — the check simply did not happen).
+                    Ok(false) => {
+                        debug!(bridge = %bridge, "warm-pool: channel reused from another endpoint; no channel proof");
                     }
                     Err(e) => {
                         warn!(bridge = %bridge, error = %e, "warm-pool: failed to warm channel");

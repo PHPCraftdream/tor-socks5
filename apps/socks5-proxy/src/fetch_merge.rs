@@ -274,7 +274,7 @@ pub(crate) async fn drain_pool(
                     }
                     matches!(
                         tokio::time::timeout(CHANNEL_CHECK_TIMEOUT, tor.warm_bridge(bridge)).await,
-                        Ok(Ok(()))
+                        Ok(Ok(true))
                     )
                 })
             });

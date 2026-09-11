@@ -30,6 +30,9 @@ tor-rtcompat = { version = "0.43", default-features = false, features = ["tokio"
 tor-error = "0.43"
 tor-chanmgr = { version = "0.43", default-features = false, features = ["pt-client"] }
 tor-guardmgr = { version = "0.43", default-features = false, features = ["bridge-client", "pt-client"] }
+# Already in the dependency graph (arti pulls it); declared directly so
+# arti-wrapper can compare a channel's actual ChanMethod with the requested one.
+tor-linkspec = { version = "0.43", default-features = false, features = ["pt-client"] }
 
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 
