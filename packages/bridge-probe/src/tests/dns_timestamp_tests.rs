@@ -52,6 +52,12 @@ fn parse_persisted_line_rejects_future_timestamps() {
 
 #[test]
 fn load_rejects_future_stamps_and_expired_stamps_but_keeps_fresh_ones() {
+    // Sync test: no ambient runtime, so acquire the async store lock
+    // through a throwaway one (see DNS_GLOBAL_STORE_LOCK in tests/mod.rs).
+    let _dns_serial = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("test runtime builds")
+        .block_on(super::DNS_GLOBAL_STORE_LOCK.lock());
     let fresh_host = "load-fresh.test.invalid";
     let expired_host = "load-expired.test.invalid";
     let future_host = "load-future.test.invalid";

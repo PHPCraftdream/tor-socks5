@@ -128,6 +128,7 @@ fn parse_persisted_line_rejects_garbage() {
 
 #[tokio::test]
 async fn save_and_load_persisted_cache_round_trips_through_disk_fallback() {
+    let _dns_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
     let host = "cache-disk-roundtrip.test.invalid";
     let ip: IpAddr = "203.0.113.40".parse().unwrap();
     remember_doh_answer(host, &[ip], Duration::from_secs(300));
@@ -148,6 +149,12 @@ async fn save_and_load_persisted_cache_round_trips_through_disk_fallback() {
 
 #[test]
 fn disk_fallback_refuses_an_answer_past_the_fallback_window() {
+    // Sync test: no ambient runtime, so acquire the async store lock
+    // through a throwaway one (see DNS_GLOBAL_STORE_LOCK in tests/mod.rs).
+    let _dns_serial = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("test runtime builds")
+        .block_on(super::DNS_GLOBAL_STORE_LOCK.lock());
     let host = "cache-disk-too-stale.test.invalid";
     {
         let mut store = disk_fallback_store().lock().unwrap();
@@ -221,6 +228,12 @@ fn dns_hostname_of_finds_the_webtunnel_url_host() {
 
 #[test]
 fn best_known_answer_prefers_live_cache_over_disk() {
+    // Sync test: acquires the store lock via a throwaway runtime (see
+    // DNS_GLOBAL_STORE_LOCK in tests/mod.rs).
+    let _dns_serial = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("test runtime builds")
+        .block_on(super::DNS_GLOBAL_STORE_LOCK.lock());
     let host = "best-answer-live.test.invalid";
     let live_ip: IpAddr = "203.0.113.50".parse().unwrap();
     remember_doh_answer(host, &[live_ip], Duration::from_secs(300));
@@ -241,6 +254,12 @@ fn best_known_answer_prefers_live_cache_over_disk() {
 
 #[test]
 fn best_known_answer_falls_back_to_disk_when_live_cache_is_empty() {
+    // Sync test: acquires the store lock via a throwaway runtime (see
+    // DNS_GLOBAL_STORE_LOCK in tests/mod.rs).
+    let _dns_serial = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("test runtime builds")
+        .block_on(super::DNS_GLOBAL_STORE_LOCK.lock());
     let host = "best-answer-disk.test.invalid";
     let ip: IpAddr = "203.0.113.52".parse().unwrap();
     {
@@ -264,6 +283,12 @@ fn best_known_answer_is_none_when_nothing_is_known() {
 
 #[test]
 fn seed_disk_fallback_respects_last_write_wins() {
+    // Sync test: acquires the store lock via a throwaway runtime (see
+    // DNS_GLOBAL_STORE_LOCK in tests/mod.rs).
+    let _dns_serial = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("test runtime builds")
+        .block_on(super::DNS_GLOBAL_STORE_LOCK.lock());
     let host = "seed-lww.test.invalid";
     let older: IpAddr = "203.0.113.60".parse().unwrap();
     let newer: IpAddr = "203.0.113.61".parse().unwrap();
