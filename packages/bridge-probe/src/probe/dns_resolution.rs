@@ -248,21 +248,37 @@ pub(crate) type DohWaveResult = Result<(Vec<IpAddr>, Duration), String>;
 /// inside the coalesced lookup below) or starts a fresh coalesced lookup.
 /// TS7-05: a dead `Weak` does NOT disappear on its own -- `upgrade()`
 /// failing leaves the key and the `Weak` allocation in the map forever
-/// until something removes them explicitly. The map is therefore swept
-/// LAZILY at insertion time: every fresh insert first drops all dead
-/// entries, under the same lock (see `coalesced_doh_lookup`). That bounds
-/// the registry to the DISTINCT hostnames actively being resolved
-/// concurrently (itself bounded elsewhere, MAX_INFLIGHT_PROBES) plus the
-/// entries that died since the last insertion, instead of growing with
-/// every hostname ever resolved across the whole process lifetime.
+/// until something removes them explicitly. Removal is therefore POINTWISE
+/// (TS8-04): a caller whose lookup has finished deletes its own key right
+/// after the result is published (`remove_finished_inflight_entry`), with a
+/// cell-identity check so a newer cell under the same key is never touched.
+/// A registry-wide sweep of entries that died elsewhere still exists, but it
+/// runs only every [`INFLIGHT_SWEEP_INTERVAL`]-th fresh insertion (an
+/// amortized counter) instead of on EVERY insert -- sweeping on every insert
+/// made H concurrent cold hostnames cost O(H^2) lock-held work, and the
+/// sweep walks capacity (including buckets emptied by past deletions), so a
+/// large past peak also slowed every later insert. That bounds the registry
+/// to the DISTINCT hostnames actively being resolved concurrently (itself
+/// bounded elsewhere, MAX_INFLIGHT_PROBES) plus entries that died since the
+/// last sweep, instead of growing with every hostname ever resolved across
+/// the whole process lifetime.
 /// TS7-06: keys are `(hostname, network generation)`, so a lookup started
 /// before a `flush_dns_cache` can never be joined by (or publish into) the
-/// post-flush world. The TS7-05 lazy sweep is unaffected: it never inspects
-/// the key shape.
+/// post-flush world.
 type InflightDohRegistry =
     std::collections::HashMap<(String, u64), std::sync::Weak<tokio::sync::OnceCell<DohWaveResult>>>;
 static INFLIGHT_DOH: std::sync::OnceLock<std::sync::Mutex<InflightDohRegistry>> =
     std::sync::OnceLock::new();
+
+/// Fresh insertions between amortized sweeps of dead entries elsewhere in
+/// the registry (TS8-04). With concurrent cold lookups bounded by
+/// MAX_INFLIGHT_PROBES, this keeps the total sweep work per batch O(H)
+/// instead of O(H^2), while dead entries still cannot accumulate past this
+/// many further insertions. Exact timing is irrelevant (the counter is
+/// process-global and racy by design), so plain `AtomicUsize` suffices.
+const INFLIGHT_SWEEP_INTERVAL: usize = 64;
+static INFLIGHT_SWEEP_COUNTER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Run (or join) the coalesced wave-search for `query`. Multiple concurrent
 /// callers for the same still-uncached hostname share ONE set of provider
@@ -298,40 +314,77 @@ pub(crate) async fn coalesced_doh_lookup(query: &str) -> DohWaveResult {
             existing
         } else {
             // TS7-05: a dead Weak (and its key) is not removed automatically
-            // just because upgrade() would fail -- only an explicit removal
-            // does. Sweep dead entries HERE, right before inserting a new
-            // one, under the SAME lock as the insert (race-free: a live
-            // entry always has strong_count > 0 at this exact moment, so
-            // retain can never remove something a concurrent caller is
-            // still using or just started). This bounds the registry to
-            // "currently active lookups + entries that died between the
-            // last two distinct-hostname insertions" instead of growing
-            // across the whole process lifetime.
-            map.retain(|_, w| w.strong_count() > 0);
+            // just because upgrade() would fail -- the `insert` below simply
+            // replaces THIS key's dead Weak in O(1), with no registry-wide
+            // scan on the insertion path. Entries that died elsewhere in the
+            // map are swept only every INFLIGHT_SWEEP_INTERVAL-th fresh
+            // insert (TS8-04), still under this same lock and still
+            // race-free: a live entry always has strong_count > 0 at this
+            // exact moment, so the retain can never remove something a
+            // concurrent caller is still using or just started.
+            if INFLIGHT_SWEEP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                % INFLIGHT_SWEEP_INTERVAL
+                == INFLIGHT_SWEEP_INTERVAL - 1
+            {
+                map.retain(|_, w| w.strong_count() > 0);
+            }
             let fresh = std::sync::Arc::new(tokio::sync::OnceCell::new());
-            map.insert(key, std::sync::Arc::downgrade(&fresh));
+            map.insert(key.clone(), std::sync::Arc::downgrade(&fresh));
             fresh
         }
     };
-    cell.get_or_init(|| async {
-        match doh_wave_search(query).await {
-            Some((ips, ttl)) => {
-                // TS7-06: publish only into the generation this lookup
-                // started in; TS8-01: the generation re-check now runs
-                // INSIDE `remember_doh_answer_if_generation`, under the same
-                // `doh_cache()` mutex `flush_dns_cache` holds for its
-                // bump+clear, so a flush can no longer land between the
-                // check and the insert (the old "residual race").
-                #[cfg(test)]
-                pre_publish_pause().await;
-                remember_doh_answer_if_generation(query, &ips, ttl, gen);
-                Ok((ips, ttl))
+    let result = cell
+        .get_or_init(|| async {
+            match doh_wave_search(query).await {
+                Some((ips, ttl)) => {
+                    // TS7-06: publish only into the generation this lookup
+                    // started in; TS8-01: the generation re-check now runs
+                    // INSIDE `remember_doh_answer_if_generation`, under the same
+                    // `doh_cache()` mutex `flush_dns_cache` holds for its
+                    // bump+clear, so a flush can no longer land between the
+                    // check and the insert (the old "residual race").
+                    remember_doh_answer_if_generation(query, &ips, ttl, gen);
+                    Ok((ips, ttl))
+                }
+                None => Err("all DoH providers failed".to_owned()),
             }
-            None => Err("all DoH providers failed".to_owned()),
+        })
+        .await
+        .clone();
+    remove_finished_inflight_entry(registry, query, gen, &cell);
+    result
+}
+
+/// TS8-04: after a caller's lookup has finished, delete its registry entry
+/// by key, but only if the stored `Weak` is still THIS call's cell
+/// (`Weak::as_ptr` identity): if a newer cell was inserted under the same
+/// key meanwhile, that newer lookup stays joined by later callers.
+/// Deleting only after `get_or_init` returned means the value is already
+/// published (success into `remember_doh_answer`'s cache, failure into the
+/// cell itself) AND the init can no longer be cancelled -- a cancelled owner
+/// must not delete a cell a waiter took over, or late joiners would start a
+/// duplicate search. Entries whose owners were cancelled stay as dead
+/// `Weak`s and are removed by the amortized sweep instead.
+fn remove_finished_inflight_entry(
+    registry: &std::sync::Mutex<InflightDohRegistry>,
+    query: &str,
+    gen: u64,
+    cell: &std::sync::Arc<tokio::sync::OnceCell<DohWaveResult>>,
+) {
+    let mut map = registry.lock().unwrap_or_else(|p| p.into_inner());
+    let key = (query.to_owned(), gen);
+    if map
+        .get(&key)
+        .is_some_and(|w| w.as_ptr() == std::sync::Arc::as_ptr(cell))
+    {
+        map.remove(&key);
+        // Capacity from a past peak (deletions never shrink it) is only
+        // reclaimed here, when the registry drained completely -- rarely,
+        // and never on the per-insert path (TS8-04).
+        if map.is_empty() {
+            map.shrink_to_fit();
         }
-    })
-    .await
-    .clone()
+    }
 }
 
 /// The wave search one coalesced lookup runs per hostname: chunks of
@@ -390,64 +443,6 @@ pub(crate) fn clear_fake_doh_wave_search() {
     *FAKE_DOH_WAVE_SEARCH
         .lock()
         .unwrap_or_else(|p| p.into_inner()) = None;
-}
-
-// TS8-01 test seam: parks the publishing task BETWEEN the wave search
-// returning (or the failure fallback chain exhausting) and the
-// generation-gated cache write -- the exact window TS8-01 closes. One-shot:
-// the first task to reach the armed seam consumes it and parks; everyone
-// after it sails through, so a post-flush lookup B never stops here. The
-// parked task resumes when the test notifies the gate returned by
-// `arm_pre_publish_pause`. Never set outside test builds.
-#[cfg(test)]
-static PRE_PUBLISH_PAUSE: std::sync::Mutex<Option<std::sync::Arc<tokio::sync::Notify>>> =
-    std::sync::Mutex::new(None);
-
-// TS8-01: kept SEPARATE from `PRE_PUBLISH_PAUSE` on purpose -- `pre_publish_pause`
-// `take()`s the gate out of `PRE_PUBLISH_PAUSE` before parking (so a second
-// caller sails through instead of also pausing), which would make a
-// "parked" bit stored INSIDE that same Option unobservable to the test the
-// instant it is set (the static would already read back `None`). This flag
-// survives the take.
-#[cfg(test)]
-static PRE_PUBLISH_PAUSE_PARKED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-#[cfg(test)]
-pub(crate) fn arm_pre_publish_pause() -> std::sync::Arc<tokio::sync::Notify> {
-    let gate = std::sync::Arc::new(tokio::sync::Notify::new());
-    PRE_PUBLISH_PAUSE_PARKED.store(false, std::sync::atomic::Ordering::SeqCst);
-    *PRE_PUBLISH_PAUSE.lock().unwrap_or_else(|p| p.into_inner()) =
-        Some(std::sync::Arc::clone(&gate));
-    gate
-}
-
-#[cfg(test)]
-pub(crate) fn disarm_pre_publish_pause() {
-    *PRE_PUBLISH_PAUSE.lock().unwrap_or_else(|p| p.into_inner()) = None;
-    PRE_PUBLISH_PAUSE_PARKED.store(false, std::sync::atomic::Ordering::SeqCst);
-}
-
-#[cfg(test)]
-pub(crate) fn pre_publish_pause_parked() -> bool {
-    PRE_PUBLISH_PAUSE_PARKED.load(std::sync::atomic::Ordering::SeqCst)
-}
-
-#[cfg(test)]
-async fn pre_publish_pause() {
-    // Take the slot and drop the std lock BEFORE awaiting -- never hold a
-    // std::sync::Mutex across an await point.
-    let gate = PRE_PUBLISH_PAUSE
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .take();
-    if let Some(gate) = gate {
-        PRE_PUBLISH_PAUSE_PARKED.store(true, std::sync::atomic::Ordering::SeqCst);
-        // Safe to arm the flag before awaiting: `Notify::notify_one` stores
-        // a permit when no waiter is registered yet, so a notify that races
-        // this registration is consumed immediately, not lost.
-        gate.notified().await;
-    }
 }
 
 /// TS7-05 test seam: current number of entries in the [`INFLIGHT_DOH`]
@@ -521,8 +516,6 @@ pub async fn resolve_addrs(
                         // lookup; the re-check runs under the cache mutex,
                         // so a flush landing after the check can no longer
                         // be overtaken by the insert.
-                        #[cfg(test)]
-                        pre_publish_pause().await;
                         remember_doh_failure_if_generation(query, gen);
                         tracing::warn!(host = %query, "all DoH providers failed");
                     }

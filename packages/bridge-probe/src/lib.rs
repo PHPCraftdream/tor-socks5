@@ -46,4 +46,6 @@ pub use probe::{
 };
 
 #[cfg(test)]
+mod dns_publish_pause;
+#[cfg(test)]
 mod tests;

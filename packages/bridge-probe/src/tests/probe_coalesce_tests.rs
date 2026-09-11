@@ -1,4 +1,6 @@
 use crate::*;
+// TS9-01: the pre-publish pause seam lives in its own test-only module.
+use crate::dns_publish_pause::*;
 use crate::{dns::*, probe::*};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -365,6 +367,9 @@ async fn sweeping_dead_entries_never_drops_a_still_inflight_lookup() {
 #[tokio::test]
 async fn flush_separates_an_inflight_lookup_of_the_previous_network() {
     let _serial = FAKE_WAVE_LOCK.lock().await;
+    // flush_dns_cache clears the SHARED live cache: serialize against the
+    // dns_*_tests that snapshot it (see DNS_GLOBAL_STORE_LOCK in mod.rs).
+    let _store_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
     let host = "flush-inflight.test.invalid";
     forget_dns_answer(host);
 
@@ -480,6 +485,9 @@ async fn flush_separates_an_inflight_lookup_of_the_previous_network() {
 #[tokio::test]
 async fn flush_prevents_a_pre_flush_failure_from_poisoning_the_new_generation() {
     let _serial = FAKE_WAVE_LOCK.lock().await;
+    // flush_dns_cache clears the SHARED live cache: serialize against the
+    // dns_*_tests that snapshot it (see DNS_GLOBAL_STORE_LOCK in mod.rs).
+    let _store_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
     let host = "flush-failure.test.invalid";
     forget_dns_answer(host);
 
@@ -541,18 +549,22 @@ async fn flush_prevents_a_pre_flush_failure_from_poisoning_the_new_generation() 
     forget_dns_answer(host);
 }
 
-// TS8-01: closes the residual race left by TS7-06's generation check.
-// A's generation-check-and-insert now run as ONE atomic critical section
-// (`remember_doh_answer_if_generation`, under the `doh_cache()` mutex), so
-// parking A right before that call and landing a flush while it is parked
-// must still block A's write -- there is no longer a window where "the
-// check already passed" and "the write hasn't happened yet" can straddle
-// a flush. Before the TS8-01 fix, `DNS_NETWORK_GENERATION == gen` was
-// checked BEFORE `remember_doh_answer` took its own separate lock, so a
-// flush landing in exactly this window let A's stale answer through.
+// TS9-01: the pre-publish pause now lives INSIDE
+// `store_cached_if_generation`, parked around the `doh_cache()` mutex
+// acquisition itself (the old seam sat in the callers, BEFORE the gated
+// write was even entered, so the generation check was never actually
+// straddled). The gate is a std Condvar, so the publishing lookup runs on
+// its OWN OS thread (with a private current-thread runtime) instead of a
+// `tokio::spawn` on this test's worker. A flush lands while A is parked;
+// after that, a FRESH record B is published into the new generation and
+// must survive A's release: A's write must be vetoed entirely, not merely
+// reordered, and in particular must not overwrite (or evict) B.
 #[tokio::test]
 async fn flush_landing_after_the_generation_check_still_blocks_the_write() {
     let _serial = FAKE_WAVE_LOCK.lock().await;
+    // flush_dns_cache clears the SHARED live cache: serialize against the
+    // dns_*_tests that snapshot it (see DNS_GLOBAL_STORE_LOCK in mod.rs).
+    let _store_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
     let host = "flush-after-check.test.invalid";
     forget_dns_answer(host);
     disarm_pre_publish_pause();
@@ -569,53 +581,71 @@ async fn flush_landing_after_the_generation_check_still_blocks_the_write() {
         })
     });
 
-    // Arm the one-shot pause: the next publish inside `coalesced_doh_lookup`
-    // parks right before its generation-gated write.
+    // Arm the in-function pause: the next generation-gated write parks
+    // around its mutex acquisition.
     let gate = arm_pre_publish_pause();
 
-    let owner_a = tokio::spawn(resolve_addrs(host, 443, ResolverPolicy::default()));
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let host_owned = host.to_owned();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("publisher runtime builds");
+        let result = runtime.block_on(resolve_addrs(&host_owned, 443, ResolverPolicy::default()));
+        let _ = result_tx.send(result);
+    });
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while !pre_publish_pause_parked() {
         assert!(
             std::time::Instant::now() < deadline,
-            "A must reach the pre-publish pause"
+            "A must reach the in-function pre-publish pause"
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
-    // The network changes while A is parked, strictly between the wave
-    // search returning and A's write.
+    // The network changes while A holds the publication window open.
     flush_dns_cache();
 
+    // A fresh answer B is published into the NEW generation before A
+    // resumes: the assertion below proves A's vetoed write neither
+    // overwrites nor removes it.
+    let ips_b: Vec<IpAddr> = vec!["203.0.113.99".parse().unwrap()];
+    remember_doh_answer(host, &ips_b, Duration::from_secs(300));
+
     // Release A: its write must be vetoed by the now-changed generation.
-    gate.notify_one();
-    let a_result = tokio::time::timeout(Duration::from_secs(5), owner_a)
-        .await
+    gate.release();
+    let a_result = result_rx
+        .recv_timeout(Duration::from_secs(5))
         .expect("A finishes")
-        .expect("A task joins")
         .expect("A lookup succeeds");
     assert_eq!(a_result, order_candidates(&ips_a, 443));
 
-    assert!(
-        cached_doh_answer(host).is_none(),
-        "a flush landing after A's wave search returned but before its \
-         write must still block the write (TS8-01) -- without the fix, A's \
-         pre-flush answer would have been cached into the new generation"
-    );
+    match cached_doh_answer(host) {
+        Some(CacheHit::Addrs(served)) => assert_eq!(
+            served, ips_b,
+            "A's pre-flush answer must stay vetoed (TS8-01): a flush landing              inside the parked window must still block the write, and the              fresh post-flush record B must survive untouched"
+        ),
+        _ => panic!("the fresh post-flush record B must remain in the cache"),
+    }
 
     disarm_pre_publish_pause();
     clear_fake_doh_wave_search();
     forget_dns_answer(host);
 }
 
-// TS8-01 negative-path counterpart: a failure observed by A must also be
-// blocked if a flush lands between the generation check and the write --
-// `remember_doh_failure_if_generation` closes the same window as the
-// positive path.
+// TS9-01 negative-path counterpart: `remember_doh_failure_if_generation`
+// funnels through the SAME gated write, so the same in-function park must
+// block a stale failure from poisoning the new generation -- and the fresh
+// positive record B published after the flush must not be overwritten by
+// A's negative entry.
 #[tokio::test]
 async fn flush_landing_after_the_generation_check_still_blocks_the_failure_write() {
     let _serial = FAKE_WAVE_LOCK.lock().await;
+    // flush_dns_cache clears the SHARED live cache: serialize against the
+    // dns_*_tests that snapshot it (see DNS_GLOBAL_STORE_LOCK in mod.rs).
+    let _store_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
     let host = "flush-after-check-fail.test.invalid";
     forget_dns_answer(host);
     disarm_pre_publish_pause();
@@ -627,43 +657,241 @@ async fn flush_landing_after_the_generation_check_still_blocks_the_failure_write
             >
     }));
 
-    // Arm the one-shot pause: the next publish inside `resolve_addrs`'s
-    // failure path parks right before its generation-gated write.
     let gate = arm_pre_publish_pause();
 
-    let owner_a = tokio::spawn(resolve_addrs(host, 443, ResolverPolicy::default()));
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let host_owned = host.to_owned();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("publisher runtime builds");
+        let result = runtime.block_on(resolve_addrs(&host_owned, 443, ResolverPolicy::default()));
+        let _ = result_tx.send(result);
+    });
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while !pre_publish_pause_parked() {
         assert!(
             std::time::Instant::now() < deadline,
-            "A must reach the pre-publish pause"
+            "A must reach the in-function pre-publish pause"
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
-    // The network changes while A is parked, strictly between the wave
-    // search failing and A's negative-entry write.
     flush_dns_cache();
 
-    gate.notify_one();
-    let a_result = tokio::time::timeout(Duration::from_secs(5), owner_a)
-        .await
-        .expect("A finishes")
-        .expect("A task joins");
+    let ips_b: Vec<IpAddr> = vec!["203.0.113.98".parse().unwrap()];
+    remember_doh_answer(host, &ips_b, Duration::from_secs(300));
+
+    gate.release();
+    let a_result = result_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("A finishes");
     assert!(
         a_result.is_err(),
         "with the cache cleared and no fallback, the lookup must fail"
     );
 
-    assert!(
-        cached_doh_answer(host).is_none(),
-        "a flush landing after A's failure check but before its write must \
-         still block the write (TS8-01) -- without the fix, A's stale \
-         failure could have poisoned the new generation's cache"
-    );
+    match cached_doh_answer(host) {
+        Some(CacheHit::Addrs(served)) => assert_eq!(
+            served, ips_b,
+            "A's stale failure must stay vetoed (TS8-01): the negative write              must not replace the fresh post-flush record B"
+        ),
+        _ => panic!(
+            "the fresh post-flush record B must remain servable -- A's              failure write must not have replaced or masked it"
+        ),
+    }
 
     disarm_pre_publish_pause();
+    clear_fake_doh_wave_search();
+    forget_dns_answer(host);
+}
+
+// TS8-04: a lookup whose owner finished must remove its OWN registry entry
+// pointwise, right after the result is published -- not leave a dead `Weak`
+// for the next insertion's registry-wide sweep to trip over. After a burst
+// of finished lookups the registry must be back to EMPTY, which also means
+// the sweep no longer needs to run on the insertion path at all.
+#[tokio::test]
+async fn a_finished_lookup_removes_its_own_registry_entry_pointwise() {
+    let _serial = FAKE_WAVE_LOCK.lock().await;
+    let host = "ts804-point-remove.test.invalid";
+    forget_dns_answer(host);
+
+    let searches = std::sync::Arc::new(AtomicUsize::new(0));
+    install_fake_doh_wave_search(counting_wave_fake(
+        std::sync::Arc::clone(&searches),
+        Vec::new(),
+        None,
+        Duration::ZERO,
+        false,
+    ));
+
+    assert!(coalesced_doh_lookup(host).await.is_err());
+
+    assert_eq!(
+        inflight_doh_registry_len(),
+        0,
+        "a finished lookup must delete its own entry by key; no dead Weak may \
+         linger in the registry"
+    );
+
+    clear_fake_doh_wave_search();
+    forget_dns_answer(host);
+}
+
+// TS8-04: a lookup abandoned by its owner (cancelled probe, outer timeout)
+// leaves a dead `Weak` behind. Later callers must NOT join that dead cell --
+// a fresh wave search must run -- and once that fresh lookup finishes, its
+// pointwise removal must bring the registry back to empty, so cancelled
+// entries cannot accumulate without bound.
+#[tokio::test]
+async fn an_abandoned_lookup_does_not_stick_in_the_registry() {
+    let _serial = FAKE_WAVE_LOCK.lock().await;
+    let host = "ts804-abandoned.test.invalid";
+    forget_dns_answer(host);
+
+    let searches = std::sync::Arc::new(AtomicUsize::new(0));
+    let owner_started = std::sync::Arc::new(AtomicBool::new(false));
+    let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+    let answer_ips: Vec<IpAddr> = vec!["203.0.113.31".parse().unwrap()];
+    install_fake_doh_wave_search({
+        let searches = std::sync::Arc::clone(&searches);
+        let owner_started = std::sync::Arc::clone(&owner_started);
+        let gate = std::sync::Arc::clone(&gate);
+        let ips = answer_ips.clone();
+        std::sync::Arc::new(move |_query: &str| {
+            let searches = std::sync::Arc::clone(&searches);
+            let owner_started = std::sync::Arc::clone(&owner_started);
+            let gate = std::sync::Arc::clone(&gate);
+            let ips = ips.clone();
+            Box::pin(async move {
+                searches.fetch_add(1, Ordering::SeqCst);
+                owner_started.store(true, Ordering::SeqCst);
+                // First (owner) call parks forever; nobody else reaches the
+                // gate, so the fresh second search below runs to completion.
+                if searches.load(Ordering::SeqCst) == 1 {
+                    gate.notified().await;
+                }
+                Some((ips, Duration::from_secs(300)))
+            })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Option<(Vec<IpAddr>, Duration)>> + Send>,
+                >
+        })
+    });
+
+    let owner = tokio::spawn(coalesced_doh_lookup(host));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !owner_started.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the owner must reach the fake wave search"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    owner.abort();
+    // Dropping the aborted owner's future drops its Arc, so the registry now
+    // holds a dead Weak for this key.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let retry = coalesced_doh_lookup(host).await;
+    let ips = retry.expect("a fresh lookup after abandonment must run and win");
+    assert_eq!(
+        searches.load(Ordering::SeqCst),
+        2,
+        "a caller after an abandoned lookup must start a FRESH wave search, \
+         not join the dead cell"
+    );
+    assert_eq!(ips, (answer_ips.clone(), Duration::from_secs(300)));
+    assert_eq!(
+        inflight_doh_registry_len(),
+        0,
+        "the fresh lookup's pointwise removal must leave the registry empty"
+    );
+
+    clear_fake_doh_wave_search();
+    forget_dns_answer(host);
+}
+
+// TS8-04: the pointwise removal must never fire while other callers still
+// hold the cell waiting for the result. The entry stays in the registry for
+// the whole in-flight window (so late joiners coalesce), and disappears only
+// after the value is published to every waiter.
+#[tokio::test]
+async fn the_registry_entry_survives_while_waiters_hold_the_cell() {
+    let _serial = FAKE_WAVE_LOCK.lock().await;
+    let host = "ts804-inflight-entry.test.invalid";
+    forget_dns_answer(host);
+
+    let searches = std::sync::Arc::new(AtomicUsize::new(0));
+    let owner_started = std::sync::Arc::new(AtomicBool::new(false));
+    let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+    let answer_ips: Vec<IpAddr> = vec!["203.0.113.32".parse().unwrap()];
+    install_fake_doh_wave_search({
+        let searches = std::sync::Arc::clone(&searches);
+        let owner_started = std::sync::Arc::clone(&owner_started);
+        let gate = std::sync::Arc::clone(&gate);
+        let ips = answer_ips.clone();
+        std::sync::Arc::new(move |_query: &str| {
+            let searches = std::sync::Arc::clone(&searches);
+            let owner_started = std::sync::Arc::clone(&owner_started);
+            let gate = std::sync::Arc::clone(&gate);
+            let ips = ips.clone();
+            Box::pin(async move {
+                searches.fetch_add(1, Ordering::SeqCst);
+                owner_started.store(true, Ordering::SeqCst);
+                gate.notified().await;
+                Some((ips, Duration::from_secs(300)))
+            })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Option<(Vec<IpAddr>, Duration)>> + Send>,
+                >
+        })
+    });
+
+    let owner = tokio::spawn(coalesced_doh_lookup(host));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !owner_started.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the owner must reach the fake wave search"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let joiner = tokio::spawn(coalesced_doh_lookup(host));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        inflight_doh_registry_len(),
+        1,
+        "the entry must stay while callers still hold the in-flight cell"
+    );
+
+    gate.notify_one();
+    let owner_ips = tokio::time::timeout(Duration::from_secs(5), owner)
+        .await
+        .expect("owner finishes")
+        .expect("owner task joins")
+        .expect("owner lookup succeeds");
+    let joiner_ips = tokio::time::timeout(Duration::from_secs(5), joiner)
+        .await
+        .expect("joiner finishes")
+        .expect("joiner task joins")
+        .expect("joiner lookup succeeds");
+    assert_eq!(owner_ips, joiner_ips, "both callers share one cell");
+    assert_eq!(
+        searches.load(Ordering::SeqCst),
+        1,
+        "the joiner must coalesce onto the owner's cell, not start a second search"
+    );
+    assert_eq!(
+        inflight_doh_registry_len(),
+        0,
+        "only after the result is published to every waiter may the entry go"
+    );
+
     clear_fake_doh_wave_search();
     forget_dns_answer(host);
 }

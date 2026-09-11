@@ -348,14 +348,16 @@ fn insert_capped(cache: &mut HashMap<String, CachedAnswer>, host: &str, answer: 
 /// captured [`DNS_NETWORK_GENERATION`] before their lookup started. The
 /// re-check and the insert happen under ONE acquisition of the `doh_cache()`
 /// mutex -- the SAME mutex [`flush_dns_cache`] holds for its bump+clear --
-/// so a flush can no longer interleave between the check passing and the
-/// insert landing. Returns false (and writes nothing) when the generation
-/// changed under the caller.
+/// so a flush can no longer interleave between the check passing and the insert.
+/// Returns false (and writes nothing) when the generation changed under the caller.
 pub(super) fn store_cached_if_generation(
     host: &str,
     answer: CachedAnswer,
     expected_gen: u64,
 ) -> bool {
+    // TS9-01 seam: parked window = the mutex acquisition itself.
+    #[cfg(test)]
+    super::dns_publish_pause::pre_publish_pause();
     let mut cache = doh_cache().lock().unwrap_or_else(|p| p.into_inner());
     if DNS_NETWORK_GENERATION.load(AtomicOrdering::SeqCst) != expected_gen {
         return false;

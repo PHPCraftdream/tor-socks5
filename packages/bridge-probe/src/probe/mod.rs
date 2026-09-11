@@ -29,11 +29,13 @@ pub(crate) use dns_resolution::{
 };
 
 // TS6-05: test-only seam for the coalescing tests (counting wave searches
-// without network access); does not exist in non-test builds.
+// without network access); does not exist in non-test builds. TS9-01: the
+// pre-publish pause seam itself moved into `dns` (inside
+// `store_cached_if_generation`), so only the wave-search machinery is
+// re-exported from here.
 #[cfg(test)]
 pub(crate) use dns_resolution::{
-    arm_pre_publish_pause, clear_fake_doh_wave_search, disarm_pre_publish_pause,
-    inflight_doh_registry_len, install_fake_doh_wave_search, pre_publish_pause_parked,
+    clear_fake_doh_wave_search, inflight_doh_registry_len, install_fake_doh_wave_search,
     FakeDohWaveSearch,
 };
 // `#[allow(unused_imports)]`: these re-exports keep the moved items
