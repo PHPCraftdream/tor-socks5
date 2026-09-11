@@ -58,13 +58,6 @@ pub fn key_of(b: &BridgeLine) -> Key {
     )
 }
 
-/// Borrowed variant of [`Key`] for ranking lookups without string clones.
-type RefKey<'a> = (Option<&'a str>, SocketAddr, Option<&'a str>);
-
-fn key_ref(b: &BridgeLine) -> RefKey<'_> {
-    (b.transport.as_deref(), b.addr, b.fingerprint.as_deref())
-}
-
 #[derive(Debug)]
 pub struct CandidatePool {
     path: PathBuf,
@@ -188,13 +181,18 @@ impl CandidatePool {
     }
 
     pub fn prioritize(&mut self, fresh: &[BridgeLine], transport: Option<&str>) {
-        let fresh_keys: HashSet<RefKey<'_>> = fresh
+        // The full dedup key ([`key_of`]) must match merge/exclude: a
+        // shortened key would mark a stale variant of a relay as fresh
+        // alongside the actual tested-list entry. Keys for `fresh` are built
+        // once up front; sort_by_cached_key computes each pool key once and
+        // keeps the sort stable.
+        let fresh_keys: HashSet<Key> = fresh
             .iter()
             .filter(|bridge| transport.is_none_or(|name| bridge.transport.as_deref() == Some(name)))
-            .map(key_ref)
+            .map(key_of)
             .collect();
         self.bridges
-            .sort_by_cached_key(|bridge| !fresh_keys.contains(&key_ref(bridge)));
+            .sort_by_cached_key(|bridge| !fresh_keys.contains(&key_of(bridge)));
     }
 
     /// Put bridges back at the front of the pool (e.g. a taken batch that
@@ -466,6 +464,96 @@ url=https://edge.example/x servername=edge.example addr=9.9.9.9:443 ver=0.0.3";
             "identical url/servername/addr dedups to one"
         );
         assert_eq!(p.len(), 1);
+    }
+
+    #[test]
+    fn prioritized_fresh_variant_bumps_only_its_own_identity() {
+        // A stale variant of the same relay (/old) must not be ranked fresh
+        // by a migrated tested list that only carries the new one (/new).
+        let wt_old = b(
+            "webtunnel 9.9.9.9:443 1111111111111111111111111111111111111111 url=https://e.com/old ver=0.0.3",
+        );
+        let wt_new = b(WT_NEW);
+        let mut pool = empty(PathBuf::from("mem"));
+        pool.merge([wt_old.clone(), wt_new.clone()], &HashSet::new());
+        pool.prioritize([wt_new.clone()].as_slice(), Some("webtunnel"));
+        assert_eq!(
+            pool.take(1),
+            vec![wt_new],
+            "the fresh variant must come before the stale one of the same relay"
+        );
+        assert_eq!(pool.take(1), vec![wt_old]);
+    }
+
+    #[test]
+    fn prioritize_distinguishes_carrier_identity_differences() {
+        let fp = |n: u8| format!("{:038x}{:02x}", 0x1111, n);
+        let urls = ["https://e.com/x", "https://f.com/x", "https://g.com/x"];
+        // Stale variants differing only in servername / TLS-vs-plain / addr=.
+        let stale = [
+            b(&format!(
+                "webtunnel 9.9.9.9:443 {} url={}/o servername=old.example ver=0.0.3",
+                fp(1),
+                urls[0]
+            )),
+            b(&format!(
+                "webtunnel 9.9.9.9:443 {} url=http://f.com:443/x ver=0.0.3",
+                fp(2)
+            )),
+            b(&format!(
+                "webtunnel 9.9.9.9:443 {} url={}/o addr=8.8.8.8:443 ver=0.0.3",
+                fp(3),
+                urls[2]
+            )),
+        ];
+        let fresh = [
+            b(&format!(
+                "webtunnel 9.9.9.9:443 {} url={}/x servername=new.example ver=0.0.3",
+                fp(1),
+                urls[0]
+            )),
+            b(&format!(
+                "webtunnel 9.9.9.9:443 {} url=https://f.com/x ver=0.0.3",
+                fp(2)
+            )),
+            b(&format!(
+                "webtunnel 9.9.9.9:443 {} url={}/x addr=9.9.9.9:443 ver=0.0.3",
+                fp(3),
+                urls[2]
+            )),
+        ];
+        let mut pool = empty(PathBuf::from("mem"));
+        // Interleave stale and fresh so only correct keying yields the
+        // fresh ones first.
+        let mut all = Vec::new();
+        for i in 0..3 {
+            all.push(stale[i].clone());
+            all.push(fresh[i].clone());
+        }
+        pool.merge(all, &HashSet::new());
+        pool.prioritize(fresh.as_slice(), Some("webtunnel"));
+        let taken = pool.take(3);
+        for (i, fresh_bridge) in fresh.iter().enumerate() {
+            assert_eq!(
+                key_of(&taken[i]),
+                key_of(fresh_bridge),
+                "each fresh variant must outrank its stale twin (case {i})"
+            );
+        }
+    }
+
+    #[test]
+    fn prioritize_keeps_stable_order_for_equivalent_carriers() {
+        let mut pool = empty(PathBuf::from("mem"));
+        let order = [b(A), b(B), b(WT)];
+        pool.merge(order.clone(), &HashSet::new());
+        // Nothing in `fresh` matches; relative order must be unchanged.
+        pool.prioritize([b(WT_NEW)].as_slice(), Some("webtunnel"));
+        assert_eq!(pool.take(3), order);
+        // Same for an empty fresh list with no transport filter.
+        pool.merge(order.clone(), &HashSet::new());
+        pool.prioritize(&[], None);
+        assert_eq!(pool.take(3), order);
     }
 
     #[test]
