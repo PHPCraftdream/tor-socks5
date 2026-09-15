@@ -252,16 +252,20 @@ pub(crate) type DohWaveResult = Result<(Vec<IpAddr>, Duration), String>;
 /// (TS8-04): a caller whose lookup has finished deletes its own key right
 /// after the result is published (`remove_finished_inflight_entry`), with a
 /// cell-identity check so a newer cell under the same key is never touched.
-/// A registry-wide sweep of entries that died elsewhere still exists, but it
-/// runs only every [`INFLIGHT_SWEEP_INTERVAL`]-th fresh insertion (an
-/// amortized counter) instead of on EVERY insert -- sweeping on every insert
-/// made H concurrent cold hostnames cost O(H^2) lock-held work, and the
-/// sweep walks capacity (including buckets emptied by past deletions), so a
-/// large past peak also slowed every later insert. That bounds the registry
-/// to the DISTINCT hostnames actively being resolved concurrently (itself
-/// bounded elsewhere, MAX_INFLIGHT_PROBES) plus entries that died since the
-/// last sweep, instead of growing with every hostname ever resolved across
-/// the whole process lifetime.
+/// A sweep of entries that died elsewhere still exists, but it runs only
+/// every [`INFLIGHT_SWEEP_INTERVAL`]-th fresh insertion (an amortized
+/// counter) instead of on EVERY insert -- sweeping on every insert made H
+/// concurrent cold hostnames cost O(H^2) lock-held work -- and it visits at
+/// most [`INFLIGHT_SWEEP_BUDGET`] entries per run (TS10-02), so the work of
+/// any single insertion is bounded by a CONSTANT regardless of how large the
+/// registry has grown; entries beyond the budget are picked up by later
+/// sweeps (HashMap's iteration order is arbitrary, so under churn the whole
+/// map is covered amortized). The registry therefore holds the DISTINCT
+/// hostnames actively being resolved concurrently plus entries that died
+/// since the last sweep -- NOT a permanently fixed size: MAX_INFLIGHT_PROBES
+/// bounds ONE `probe_all` batch, not all concurrent resolve calls registry-
+/// wide, so no global size bound is claimed here; the bounded sweep is what
+/// keeps per-insert cost constant instead.
 /// TS7-06: keys are `(hostname, network generation)`, so a lookup started
 /// before a `flush_dns_cache` can never be joined by (or publish into) the
 /// post-flush world.
@@ -271,14 +275,23 @@ static INFLIGHT_DOH: std::sync::OnceLock<std::sync::Mutex<InflightDohRegistry>> 
     std::sync::OnceLock::new();
 
 /// Fresh insertions between amortized sweeps of dead entries elsewhere in
-/// the registry (TS8-04). With concurrent cold lookups bounded by
-/// MAX_INFLIGHT_PROBES, this keeps the total sweep work per batch O(H)
-/// instead of O(H^2), while dead entries still cannot accumulate past this
-/// many further insertions. Exact timing is irrelevant (the counter is
-/// process-global and racy by design), so plain `AtomicUsize` suffices.
+/// the registry (TS8-04), so dead entries cannot accumulate past this many
+/// further insertions without a cleanup attempt. Exact timing is irrelevant
+/// (the counter is process-global and racy by design), so plain
+/// `AtomicUsize` suffices.
 const INFLIGHT_SWEEP_INTERVAL: usize = 64;
 static INFLIGHT_SWEEP_COUNTER: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+/// Upper bound on registry entries one sweep may VISIT (TS10-02). Why 128:
+/// it is 2x the sweep interval, so while the registry holds up to ~2
+/// intervals' worth of entries every sweep still covers the WHOLE map (and
+/// a dead entry is cleaned within at most `len / 128` further sweeps);
+/// beyond that, per-insert work stays O(128) instead of O(len). Entries
+/// missed by one sweep are found by a later one because HashMap's iteration
+/// order is arbitrary and the counter keeps firing -- amortized completeness
+/// under churn, constant work per insertion always.
+const INFLIGHT_SWEEP_BUDGET: usize = 128;
 
 /// Run (or join) the coalesced wave-search for `query`. Multiple concurrent
 /// callers for the same still-uncached hostname share ONE set of provider
@@ -313,20 +326,19 @@ pub(crate) async fn coalesced_doh_lookup(query: &str) -> DohWaveResult {
         if let Some(existing) = map.get(&key).and_then(std::sync::Weak::upgrade) {
             existing
         } else {
-            // TS7-05: a dead Weak (and its key) is not removed automatically
-            // just because upgrade() would fail -- the `insert` below simply
-            // replaces THIS key's dead Weak in O(1), with no registry-wide
-            // scan on the insertion path. Entries that died elsewhere in the
-            // map are swept only every INFLIGHT_SWEEP_INTERVAL-th fresh
-            // insert (TS8-04), still under this same lock and still
-            // race-free: a live entry always has strong_count > 0 at this
-            // exact moment, so the retain can never remove something a
-            // concurrent caller is still using or just started.
+            // TS10-02: BOUNDED sweep, not `retain` -- retain cannot exit
+            // early, so it scans the WHOLE map and a large registry would
+            // make every 64th insertion O(len) under the shared lock. Here
+            // at most INFLIGHT_SWEEP_BUDGET entries are visited; dead ones
+            // among them are removed pointwise. A live entry always has
+            // strong_count > 0 at this exact moment (the registry mutex is
+            // held), so the sweep can never remove something a concurrent
+            // caller is still using or just started.
             if INFLIGHT_SWEEP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 % INFLIGHT_SWEEP_INTERVAL
                 == INFLIGHT_SWEEP_INTERVAL - 1
             {
-                map.retain(|_, w| w.strong_count() > 0);
+                sweep_inflight_dead_entries(&mut map);
             }
             let fresh = std::sync::Arc::new(tokio::sync::OnceCell::new());
             map.insert(key.clone(), std::sync::Arc::downgrade(&fresh));
@@ -384,6 +396,37 @@ fn remove_finished_inflight_entry(
         if map.is_empty() {
             map.shrink_to_fit();
         }
+    }
+}
+
+/// TS10-02: visit at most [`INFLIGHT_SWEEP_BUDGET`] entries, collect the
+/// DEAD `Weak`s among them and remove those keys pointwise. `HashMap::retain`
+/// cannot exit early, so this replaces the old full-map retain; live entries
+/// are never touched (the collect only reads `strong_count`, and any entry a
+/// caller holds has strong_count > 0 under this same mutex). Keys missed
+/// because they fall outside the budget are visited by later sweeps: the
+/// iteration order is arbitrary and the sweep counter keeps firing, so the
+/// map is covered amortized while every single call stays O(BUDGET).
+///
+/// Capacity: full-drain `shrink_to_fit` after pointwise removal stays in
+/// `remove_finished_inflight_entry`. Additionally, on this RARE path only
+/// (once per INFLIGHT_SWEEP_INTERVAL insertions, never per insert), a big
+/// past peak is released once the live set is a small fraction of capacity --
+/// the threshold (capacity >= 512, live <= 1/4 of capacity) is coarse on
+/// purpose: shrinking would re-grow on the next burst anyway, so earlier or
+/// tighter triggers would only churn allocations.
+fn sweep_inflight_dead_entries(map: &mut InflightDohRegistry) {
+    let dead: Vec<(String, u64)> = map
+        .iter()
+        .take(INFLIGHT_SWEEP_BUDGET)
+        .filter(|(_, weak)| weak.strong_count() == 0)
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in dead {
+        map.remove(&key);
+    }
+    if map.is_empty() || (map.capacity() >= 512 && map.len() * 4 < map.capacity()) {
+        map.shrink_to_fit();
     }
 }
 
@@ -455,6 +498,36 @@ pub(crate) fn inflight_doh_registry_len() -> usize {
         .get()
         .map(|registry| registry.lock().unwrap_or_else(|p| p.into_inner()).len())
         .unwrap_or(0)
+}
+
+/// TS10-02 test seam: current value of the sweep counter, so the bounded-
+/// sweep test can insert deterministically UNTIL the next sweep boundary
+/// (the sweep fires on the insertion that makes the counter a multiple of
+/// [`INFLIGHT_SWEEP_INTERVAL`]) instead of guessing at counts. Never exists
+/// in non-test builds.
+#[cfg(test)]
+pub(crate) fn inflight_sweep_counter_value() -> usize {
+    INFLIGHT_SWEEP_COUNTER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// TS10-02 test seam: whether ANY registry entry for `host` (in any network
+/// generation) is currently present, dead or live. Lets the bounded-sweep
+/// test assert per-key removal without asserting an exact GLOBAL length --
+/// unrelated concurrent lookups (e.g. probe tests resolving IP literals
+/// through the default policy) legitimately appear in the shared registry
+/// and must not break the assertions. Never exists in non-test builds.
+#[cfg(test)]
+pub(crate) fn inflight_doh_contains_host(host: &str) -> bool {
+    INFLIGHT_DOH
+        .get()
+        .map(|registry| {
+            registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .keys()
+                .any(|(h, _)| h == host)
+        })
+        .unwrap_or(false)
 }
 
 /// Resolve a `(host, port)` pair to the addresses worth trying, best first.

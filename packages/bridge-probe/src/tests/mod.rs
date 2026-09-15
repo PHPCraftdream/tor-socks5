@@ -1,4 +1,5 @@
 mod dns_cache_tests;
+mod dns_registry_tests;
 mod dns_save_tests;
 mod dns_timestamp_tests;
 mod probe_coalesce_tests;

@@ -35,8 +35,8 @@ pub(crate) use dns_resolution::{
 // re-exported from here.
 #[cfg(test)]
 pub(crate) use dns_resolution::{
-    clear_fake_doh_wave_search, inflight_doh_registry_len, install_fake_doh_wave_search,
-    FakeDohWaveSearch,
+    clear_fake_doh_wave_search, inflight_doh_contains_host, inflight_doh_registry_len,
+    inflight_sweep_counter_value, install_fake_doh_wave_search, FakeDohWaveSearch,
 };
 // `#[allow(unused_imports)]`: these re-exports keep the moved items
 // crate-visible exactly as their pre-split `pub(super)` did, even where only
