@@ -260,17 +260,8 @@ async fn publish_snapshots_are_copy_on_write() {
     );
 }
 
-/// TS4-09 regression: the "maybe deep-clone, then mutate" step must run on
-/// the blocking pool, not on the actor's async worker. Proof on the default
-/// single-threaded test runtime: while a mutation whose closure sleeps
-/// synchronously for 400ms is in flight, an INDEPENDENT async task on the
-/// same runtime must get to run. Under the old synchronous placement the
-/// actor's closure block stopped the whole runtime — timers included — so
-/// the ack necessarily preceded the watchdog; with `spawn_blocking` the
-/// watchdog (armed only after the closure demonstrably started) fires long
-/// before the ack. The publisher is held in flight on a gate, so the Arc is
-/// shared and `Arc::make_mut` really deep-copies — the heavy sleep stands
-/// in for that O(S) copy.
+/// A gated mutation on the blocking pool must leave the async worker free
+/// to release it, without assumptions about wall-clock scheduling.
 #[tokio::test]
 async fn mutation_during_in_flight_publish_does_not_block_the_async_worker() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -309,46 +300,32 @@ async fn mutation_during_in_flight_publish_does_not_block_the_async_worker() {
         .expect("mutation A absorbed");
     wait_for_calls(&calls, 1, "publish #1 started and is blocked on the gate").await;
 
-    // Mutation B: heavy closure (a synchronous 400ms sleep stands in for
-    // the O(S) deep copy), announces "started" before sleeping.
+    // Mutation B waits for an independent async task to release it.
     let writer_b = writer.clone();
     let b_b = b.clone();
     let (started_tx, started_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
     let mutation = tokio::spawn(async move {
         writer_b
             .apply(move |s| {
-                let _ = started_tx.send(());
-                std::thread::sleep(Duration::from_millis(400));
+                started_tx.send(()).expect("announce mutation start");
+                release_rx
+                    .blocking_recv()
+                    .expect("async worker released mutation");
                 s.note_channel_success_at(&b_b, OffsetDateTime::now_utc());
             })
             .await
             .expect("mutation B absorbed");
-        tokio::time::Instant::now()
     });
 
-    // Arm the watchdog only after the closure demonstrably started, then
-    // wait a time far shorter than the closure's sleep on an independent
-    // async task.
-    let _ = started_rx.await;
+    started_rx.await.expect("mutation started");
     let watchdog = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        tokio::time::Instant::now()
+        release_tx.send(()).expect("mutation is still waiting");
     });
 
     let (mutation_res, watchdog_res) = tokio::join!(mutation, watchdog);
-    let ack_at = mutation_res.expect("mutation task joins");
-    let watchdog_at = watchdog_res.expect("watchdog task joins");
-    assert!(
-        watchdog_at < ack_at,
-        "the independent async task must run while the heavy mutation is in \
-         flight (watchdog fired at {watchdog_at:?}, ack at {ack_at:?})"
-    );
-    assert!(
-        ack_at - watchdog_at >= Duration::from_millis(100),
-        "the ack must come well after the watchdog: the closure must have run \
-         to completion off the worker (gap {:?})",
-        ack_at - watchdog_at
-    );
+    mutation_res.expect("mutation task joins");
+    watchdog_res.expect("watchdog task joins");
 
     // Semantics unchanged: B was absorbed (ack above) and rides along in
     // the coalesced follow-up once the gated publish completes.
