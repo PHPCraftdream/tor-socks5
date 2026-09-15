@@ -1,7 +1,7 @@
 use super::*;
 
-const CERT_OLD: &str = "EREREREREREREREREREREREREiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIg";
-const CERT_NEW: &str = "EREREREREREREREREREREREREzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMw";
+const CERT_OLD: &str = "EREREREREREREREREREREREREREiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIg";
+const CERT_NEW: &str = "EREREREREREREREREREREREREREzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMw";
 
 #[test]
 fn default_listen_address_is_loopback_1080() {

@@ -1,8 +1,8 @@
 use crate::probe::*;
 use bridge_line::BridgeLine;
 
-const CERT_OLD: &str = "EREREREREREREREREREREREREiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIg";
-const CERT_NEW: &str = "EREREREREREREREREREREREREzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMw";
+const CERT_OLD: &str = "EREREREREREREREREREREREREREiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIg";
+const CERT_NEW: &str = "EREREREREREREREREREREREREREzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMw";
 
 #[test]
 fn webtunnel_identity_from_url() {

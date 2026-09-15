@@ -7,6 +7,15 @@ const WEBTUNNEL_OLD: &str =
 const WEBTUNNEL_NEW: &str =
     "webtunnel 9.9.9.9:443 1111111111111111111111111111111111111111 url=https://e.com/new ver=0.0.3";
 
+const CERT_OLD: &str = "EREREREREREREREREREREREREREiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIg";
+const CERT_NEW: &str = "EREREREREREREREREREREREREREzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMw";
+
+fn obfs4_rotation(cert: &str) -> BridgeLine {
+    bridge(&format!(
+        "obfs4 9.9.9.9:443 1111111111111111111111111111111111111111 cert={cert} iat-mode=0"
+    ))
+}
+
 #[test]
 fn channel_success_on_one_carrier_does_not_prove_the_other() {
     let mut s = empty();
@@ -111,5 +120,70 @@ fn carrier_separation_survives_save_load() {
         "/new stays channel-unproven after reload"
     );
     assert!(!loaded.is_retired(&new), "/new is not retired after reload");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn obfs4_rotation_separates_source_health_and_persistence() {
+    let dir = tmp_dir();
+    let path = dir.join("obfs4-rotation.log");
+    let mut s = BridgeStore::load(path.clone()).unwrap();
+    let old = obfs4_rotation(CERT_OLD);
+    let fresh = obfs4_rotation(CERT_NEW);
+    let t0 = OffsetDateTime::from_unix_timestamp(5_000_000).unwrap();
+
+    s.record_at(old.clone(), Duration::from_millis(50), t0);
+    s.note_source_at(&old, "old-source", t0);
+    s.note_channel_success_at(&old, t0);
+    s.note_circuit_verified_at(&old, t0);
+    s.note_failure_at(&old, t0 + HOUR, HOUR);
+
+    // The fresh source creates a second row even though addr and fingerprint
+    // are unchanged; it must not inherit the old row's state.
+    s.note_source_at(&fresh, "fresh-source", t0 + HOUR);
+    assert_eq!(s.len(), 2);
+    assert_eq!(s.channel_ok_count(&fresh), 0);
+    assert_eq!(s.verified_count(&fresh), 0);
+    assert_eq!(s.fails_of(&fresh), 0);
+
+    let fresh_summary = s
+        .source_summary()
+        .into_iter()
+        .find(|summary| summary.label == "fresh-source")
+        .expect("fresh source row");
+    assert_eq!(fresh_summary.offered, 1);
+    assert_eq!(fresh_summary.alive, 0);
+    assert_eq!(fresh_summary.channel_proven, 0);
+
+    // A TCP success and channel warm-up prove only the fresh certificate.
+    s.record_at(fresh.clone(), Duration::from_millis(40), t0 + 2 * HOUR);
+    s.note_channel_success_at(&fresh, t0 + 2 * HOUR);
+    assert_eq!(s.channel_ok_count(&fresh), 1);
+    assert_eq!(s.verified_count(&fresh), 0);
+    assert_eq!(s.fails_of(&fresh), 0);
+    assert_eq!(s.channel_ok_count(&old), 1);
+    assert_eq!(s.verified_count(&old), 1);
+    assert_eq!(s.fails_of(&old), 1);
+
+    s.note_permanent_failure_at(&old, t0 + 3 * HOUR);
+    assert!(s.is_retired(&old));
+    assert!(!s.is_retired(&fresh));
+    assert_eq!(
+        s.channel_proven_bridges(10),
+        vec![fresh.clone()],
+        "retiring old certificate must not remove fresh channel proof"
+    );
+
+    s.save().unwrap();
+    let loaded = BridgeStore::load(path).unwrap();
+    assert_eq!(loaded.len(), 2);
+    assert_eq!(loaded.channel_ok_count(&old), 1);
+    assert_eq!(loaded.verified_count(&old), 1);
+    assert_eq!(loaded.fails_of(&old), 1);
+    assert!(loaded.is_retired(&old));
+    assert_eq!(loaded.channel_ok_count(&fresh), 1);
+    assert_eq!(loaded.verified_count(&fresh), 0);
+    assert_eq!(loaded.fails_of(&fresh), 0);
+    assert!(!loaded.is_retired(&fresh));
     let _ = std::fs::remove_dir_all(&dir);
 }

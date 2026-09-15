@@ -22,11 +22,11 @@ fn ok_count_accumulates_and_persists() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 #[test]
-fn dedup_key_is_transport_addr_fingerprint() {
+fn dedup_key_includes_obfs4_certificate() {
     let mut s = empty();
     s.record(bridge(OBFS4_A), Duration::from_millis(100));
     s.record(bridge(OBFS4_A_NEW_PARAMS), Duration::from_millis(50));
-    assert_eq!(s.len(), 1, "same key upserts");
+    assert_eq!(s.len(), 2, "rotated certificate is a distinct endpoint");
 }
 #[test]
 fn tcp_fails_mirrors_fails_of_and_defaults_to_zero() {

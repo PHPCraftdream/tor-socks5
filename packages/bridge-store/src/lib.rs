@@ -22,17 +22,14 @@
 //! obfs4 1.2.3.4:80 ABCDEF... cert=... iat-mode=0
 //! ```
 //!
-//! Dedup key: `(transport, addr, fingerprint, carrier-identity)` — the last
-//! component is [`bridge_probe::webtunnel_endpoint_identity`], so two
-//! webtunnel carriers behind one relay (different `url=`/`servername=`) keep
-//! separate health records. `None` for non-webtunnel lines.
+//! Dedup key: [`bridge_probe::BridgeIdentity`] includes transport, address,
+//! fingerprint, carrier identity, and the obfs4 certificate.
 //!
 //! Shared by the CLI daemon (`apps/socks5-proxy`) and the Android JNI
 //! engine (`packages/android-ffi`) — both processes probe bridges and want
 //! to remember which ones tend to work across restarts.
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -43,12 +40,7 @@ mod observe;
 mod persistence;
 mod stats;
 
-type Key = (
-    Option<String>,
-    SocketAddr,
-    Option<String>,
-    Option<bridge_probe::WebtunnelEndpointIdentity>,
-);
+type Key = bridge_probe::BridgeIdentity;
 
 #[derive(Debug, Clone)]
 struct Entry {
@@ -196,12 +188,7 @@ impl Entry {
 }
 
 fn key_of(b: &BridgeLine) -> Key {
-    (
-        b.transport.clone(),
-        b.addr,
-        b.fingerprint.clone(),
-        bridge_probe::webtunnel_endpoint_identity(b),
-    )
+    bridge_probe::bridge_identity(b)
 }
 
 #[derive(Debug, Clone)]

@@ -21,7 +21,7 @@ fn bridge(line: &str) -> BridgeLine {
 const OBFS4_A: &str =
     "obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=ZZZ iat-mode=0";
 const OBFS4_A_NEW_PARAMS: &str =
-    "obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=YYY iat-mode=1";
+    "obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=YYY iat-mode=0";
 const OBFS4_B: &str =
     "obfs4 5.6.7.8:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=WWW iat-mode=0";
 const OBFS4_C: &str =
