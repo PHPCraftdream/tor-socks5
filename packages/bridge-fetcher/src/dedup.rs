@@ -8,9 +8,11 @@ use bridge_probe::webtunnel_endpoint_identity;
 /// Dedup bridge lines by (transport, addr, fingerprint) plus, for webtunnel
 /// bridges, the full canonical carrier identity `WebtunnelEndpointIdentity`
 /// (dial host/port, TLS SNI, HTTP Host authority, TLS-vs-plain, path+query)
-/// from `bridge_probe::webtunnel_endpoint_identity` (non-webtunnel
-/// bridges get `None` there, so their dedup is unchanged). Keeps the first
-/// occurrence. Returns (unique, duplicates_count).
+/// from `bridge_probe::webtunnel_endpoint_identity` (non-webtunnel bridges
+/// get `None` there), plus the obfs4 `cert=` parameter: a different cert on
+/// the same relay is a different cryptographic endpoint (obfs4 key rotation
+/// keeps addr + fingerprint), not a duplicate. Keeps the first occurrence.
+/// Returns (unique, duplicates_count).
 #[must_use]
 pub fn dedup_bridges(bridges: Vec<BridgeLine>) -> (Vec<BridgeLine>, usize) {
     let mut seen = HashSet::new();
@@ -22,6 +24,7 @@ pub fn dedup_bridges(bridges: Vec<BridgeLine>) -> (Vec<BridgeLine>, usize) {
             b.addr,
             b.fingerprint.clone(),
             webtunnel_endpoint_identity(&b),
+            b.params.get("cert").cloned(),
         );
         if seen.insert(key) {
             unique.push(b);
@@ -38,16 +41,39 @@ mod tests {
     use crate::parse::parse_bridges_from_body;
 
     #[test]
-    fn dedup_removes_exact_duplicates() {
+    fn dedup_removes_exact_duplicates_keeps_differing_certs() {
         let body = "\
 obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA iat-mode=0
 obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=BBB iat-mode=1
 obfs4 5.6.7.8:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=CCC iat-mode=0
+obfs4 5.6.7.8:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=CCC iat-mode=0
 ";
         let bridges = parse_bridges_from_body(body);
         let (unique, dups) = dedup_bridges(bridges);
-        assert_eq!(unique.len(), 2);
+        // cert=AAA and cert=BBB on one relay are distinct obfs4 endpoints
+        // (key rotation); only the literally repeated line collapses.
+        assert_eq!(unique.len(), 3);
         assert_eq!(dups, 1);
+    }
+
+    #[test]
+    fn dedup_keeps_differing_certs_on_one_relay() {
+        let body = "\
+obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=OLD iat-mode=0
+obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=NEW iat-mode=0
+";
+        let bridges = parse_bridges_from_body(body);
+        let (unique, dups) = dedup_bridges(bridges);
+        assert_eq!(unique.len(), 2, "rotated obfs4 cert must survive dedup");
+        assert_eq!(dups, 0);
+        assert_eq!(
+            unique[0].params.get("cert").map(String::as_str),
+            Some("OLD")
+        );
+        assert_eq!(
+            unique[1].params.get("cert").map(String::as_str),
+            Some("NEW")
+        );
     }
 
     #[test]

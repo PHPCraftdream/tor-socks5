@@ -518,6 +518,35 @@ mod tests {
         })
     }
 
+    #[test]
+    fn working_set_with_stale_cert_does_not_exclude_fresh_cert() {
+        // The server rotated its obfs4 key: the working config holds the old
+        // cert, the source brings the fresh one. working_keys is built with
+        // candidate_pool::key_of, which includes the cert, so the fresh
+        // candidate must not be excluded — a pool merge keeps it.
+        let stale: BridgeLine =
+            "obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=ZZZ iat-mode=0"
+                .parse()
+                .unwrap();
+        let fresh: BridgeLine =
+            "obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=YYY iat-mode=0"
+                .parse()
+                .unwrap();
+        let mut cfg = Config::default();
+        cfg.bridges.lines = vec![stale.to_string()];
+        let exclude = working_keys(&cfg);
+        assert!(exclude.contains(&key_of(&stale)));
+        assert!(
+            !exclude.contains(&key_of(&fresh)),
+            "fresh cert on the same relay must not be excluded by the stale one"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool =
+            CandidatePool::load(CandidatePool::resolve_path(Some(&dir.path().join("c.log"))))
+                .unwrap();
+        assert_eq!(pool.merge([fresh], &exclude), 1);
+    }
+
     #[tokio::test]
     async fn discovery_promotes_webtunnel_and_records_channel_evidence() {
         let (_dir, path, wt) = discovery_fixture();

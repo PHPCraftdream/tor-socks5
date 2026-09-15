@@ -22,7 +22,11 @@
 //! Dedup key: `(transport, addr, fingerprint)` plus, for webtunnel bridges,
 //! the full canonical carrier identity [`WebtunnelEndpointIdentity`] (dial
 //! host/port, TLS SNI, HTTP Host authority, TLS-vs-plain, path+query); `None`
-//! for non-webtunnel — consistent with the fetcher's dedup key.
+//! for non-webtunnel. The obfs4 `cert=` parameter is part of the key too: two
+//! certs on one relay are cryptographically distinct endpoints (a server can
+//! rotate its obfs4 key while keeping addr + fingerprint), so a stale-cert and
+//! a fresh-cert line must both survive — consistent with the fetcher's dedup
+//! key.
 
 use std::collections::HashSet;
 use std::fs;
@@ -40,13 +44,16 @@ const DEFAULT_FILE: &str = "tor-socks5.candidates.log";
 /// Dedup key shared with the config / health store: `(transport, addr,
 /// fingerprint)` plus the full canonical carrier identity
 /// [`WebtunnelEndpointIdentity`] (dial host/port, TLS SNI, HTTP Host
-/// authority, TLS-vs-plain, path+query), or `None` for non-webtunnel —
-/// consistent with the fetcher's dedup key.
+/// authority, TLS-vs-plain, path+query), or `None` for non-webtunnel, plus
+/// the obfs4 `cert=` parameter: a different cert on the same relay is a
+/// different cryptographic endpoint (obfs4 key rotation keeps addr +
+/// fingerprint), not a duplicate — consistent with the fetcher's dedup key.
 pub type Key = (
     Option<String>,
     SocketAddr,
     Option<String>,
     Option<WebtunnelEndpointIdentity>,
+    Option<String>,
 );
 
 pub fn key_of(b: &BridgeLine) -> Key {
@@ -55,6 +62,7 @@ pub fn key_of(b: &BridgeLine) -> Key {
         b.addr,
         b.fingerprint.clone(),
         webtunnel_endpoint_identity(b),
+        b.params.get("cert").cloned(),
     )
 }
 
@@ -308,11 +316,38 @@ mod tests {
     fn merge_dedups_and_excludes_working() {
         let mut p = empty(PathBuf::from("mem"));
         let working: HashSet<Key> = [key_of(&b(B))].into_iter().collect();
-        // A and WT are new; B is excluded (already working); A_OTHER_PARAMS
-        // is the same key as A → dedup.
+        // A, WT and A_OTHER_PARAMS are new: A_OTHER_PARAMS carries a different
+        // obfs4 cert, so it is a distinct endpoint, not a duplicate of A. B is
+        // excluded (already working, same cert).
         let added = p.merge(vec![b(A), b(B), b(WT), b(A_OTHER_PARAMS)], &working);
-        assert_eq!(added, 2, "only A and WT are added");
+        assert_eq!(added, 3, "only B is excluded");
+        assert_eq!(p.len(), 3);
+    }
+
+    #[test]
+    fn merge_keeps_fresh_cert_when_stale_cert_is_already_pooled() {
+        // The server rotated its obfs4 key: same relay, new cert. The fresh
+        // line must be pooled alongside the stale one instead of being
+        // dropped as a "duplicate".
+        let mut p = empty(PathBuf::from("mem"));
+        assert_eq!(p.merge([b(A)], &HashSet::new()), 1);
+        let added = p.merge([b(A_OTHER_PARAMS)], &HashSet::new());
+        assert_eq!(added, 1, "fresh cert on the same relay must not be dropped");
         assert_eq!(p.len(), 2);
+        // An exact duplicate (same cert) still dedups.
+        assert_eq!(p.merge([b(A)], &HashSet::new()), 0);
+        assert_eq!(p.len(), 2);
+    }
+
+    #[test]
+    fn working_set_with_stale_cert_does_not_exclude_fresh_cert() {
+        // Mirror of fetch_merge::working_keys: the exclude set is built with
+        // key_of, so a working line with the old cert must not swallow a
+        // fresh-cert candidate from a source.
+        let working: HashSet<Key> = [key_of(&b(A))].into_iter().collect();
+        assert!(!working.contains(&key_of(&b(A_OTHER_PARAMS))));
+        let mut p = empty(PathBuf::from("mem"));
+        assert_eq!(p.merge([b(A_OTHER_PARAMS)], &working), 1);
     }
 
     #[test]
