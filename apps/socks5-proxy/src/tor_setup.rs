@@ -4,7 +4,6 @@
 //! the `bridges fetch` command ([`crate::bridges_cmd::cmd_bridges`]).
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,6 +11,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use arti_wrapper::Settings;
 use bridge_line::BridgeLine;
+use bridge_probe::bridge_identity;
 use time::OffsetDateTime;
 use tracing::{info, warn};
 
@@ -472,14 +472,11 @@ pub(crate) async fn update_health_and_prune(
 }
 
 /// Remove the given (dead) bridges from `bridges.lines` in the config file
-/// on disk, matched by `(transport, addr, fingerprint)`. Unparseable lines
-/// are left untouched. Returns the number of lines removed.
+/// on disk, matched by the full shared bridge identity. Unparseable lines are
+/// left untouched. Returns the number of lines removed.
 fn prune_bridges_from_config(path: &Path, dead: &[BridgeLine]) -> Result<usize> {
     use std::collections::HashSet;
-    let dead_keys: HashSet<(Option<String>, SocketAddr, Option<String>)> = dead
-        .iter()
-        .map(|b| (b.transport.clone(), b.addr, b.fingerprint.clone()))
-        .collect();
+    let dead_keys: HashSet<_> = dead.iter().map(bridge_identity).collect();
 
     let mut cfg = Config::load_with_override(Some(path))
         .context("reloading config to prune dead bridges")?
@@ -488,7 +485,7 @@ fn prune_bridges_from_config(path: &Path, dead: &[BridgeLine]) -> Result<usize> 
     cfg.bridges
         .lines
         .retain(|line| match line.parse::<BridgeLine>() {
-            Ok(b) => !dead_keys.contains(&(b.transport.clone(), b.addr, b.fingerprint.clone())),
+            Ok(b) => !dead_keys.contains(&bridge_identity(&b)),
             Err(_) => true,
         });
     let removed = before - cfg.bridges.lines.len();
@@ -572,6 +569,79 @@ mod tests {
         )
         .parse()
         .expect("valid webtunnel bridge line")
+    }
+
+    const CERT_OLD: &str = "EREREREREREREREREREREREREREiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIg";
+    const CERT_NEW: &str = "EREREREREREREREREREREREREREzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMw";
+
+    fn prune_test_config_path() -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("tor-socks5-prune-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create prune test directory");
+        dir.join("config.ktav")
+    }
+
+    fn webtunnel_variant(path: &str) -> BridgeLine {
+        format!(
+            "webtunnel 192.0.2.10:443 1111111111111111111111111111111111111111 url=https://edge.example{path}"
+        )
+        .parse()
+        .expect("valid WebTunnel bridge line")
+    }
+
+    fn obfs4_variant(cert: &str) -> BridgeLine {
+        format!(
+            "obfs4 192.0.2.20:443 2222222222222222222222222222222222222222 cert={cert} iat-mode=0"
+        )
+        .parse()
+        .expect("valid obfs4 bridge line")
+    }
+
+    #[test]
+    fn prune_removes_only_dead_full_identity_and_preserves_neighbors() {
+        let path = prune_test_config_path();
+        let old_webtunnel = webtunnel_variant("/old");
+        let new_webtunnel = webtunnel_variant("/new");
+        let old_obfs4 = obfs4_variant(CERT_OLD);
+        let new_obfs4 = obfs4_variant(CERT_NEW);
+        let other_transport: BridgeLine = "192.0.2.20:443 2222222222222222222222222222222222222222"
+            .parse()
+            .expect("valid plain bridge line");
+        let invalid = "this is not a bridge";
+
+        let mut cfg = Config::default();
+        cfg.bridges.lines = vec![
+            old_webtunnel.to_string(),
+            new_webtunnel.to_string(),
+            old_obfs4.to_string(),
+            new_obfs4.to_string(),
+            other_transport.to_string(),
+            invalid.to_owned(),
+        ];
+        cfg.write(&path).expect("save prune test config");
+
+        let removed = prune_bridges_from_config(&path, &[old_webtunnel, old_obfs4])
+            .expect("prune dead bridges");
+        assert_eq!(removed, 2);
+
+        let loaded = Config::load_with_override(Some(&path))
+            .expect("reload pruned config")
+            .into_config();
+        assert_eq!(loaded.bridges.lines.len(), 4);
+        assert!(loaded.bridges.lines.iter().any(|line| line == invalid));
+        let parsed: Vec<BridgeLine> = loaded
+            .bridges
+            .lines
+            .iter()
+            .filter_map(|line| line.parse().ok())
+            .collect();
+        assert!(parsed.contains(&new_webtunnel));
+        assert!(parsed.contains(&new_obfs4));
+        assert!(parsed.contains(&other_transport));
+        assert!(!parsed.contains(&webtunnel_variant("/old")));
+        assert!(!parsed.contains(&obfs4_variant(CERT_OLD)));
+        let _ = std::fs::remove_dir_all(path.parent().expect("test config parent"));
     }
 
     #[test]
