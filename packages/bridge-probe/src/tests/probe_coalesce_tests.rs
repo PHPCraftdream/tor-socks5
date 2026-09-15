@@ -13,7 +13,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 // cargo runs tests in parallel threads, so every fake-using test holds
 // FAKE_WAVE_LOCK for its whole body.
 
-static FAKE_WAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+// pub(crate): the TS10-02 registry test in dns_registry_tests.rs also
+// mutates the shared INFLIGHT_DOH registry and the fake seam, so it must
+// serialize against these tests too.
+pub(crate) static FAKE_WAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A wave-search stand-in that counts how often it is started, optionally
 /// flags that start (for "the owner is now mid-lookup" coordination), waits
@@ -706,6 +709,101 @@ async fn flush_landing_after_the_generation_check_still_blocks_the_failure_write
     disarm_pre_publish_pause();
     clear_fake_doh_wave_search();
     forget_dns_answer(host);
+}
+
+// TS10-01: the pre-publish seam parks BEFORE the mutex, so it can only
+// prove that a flush landing before the write is survived; it is blind to
+// the check-vs-lock ORDER inside `store_cached_if_generation` (the exact
+// TS8-01 guarantee). This test arms the SECOND seam -- parked after the
+// `doh_cache()` lock, before the re-check -- and bumps
+// `DNS_NETWORK_GENERATION` directly (an atomic fetch_add needs no mutex,
+// which is exactly what makes the ordering observable) while the publisher
+// sits inside the critical section. With the correct order (lock -> check)
+// the re-check runs AFTER the bump inside the same section -> veto. If the
+// check is hoisted before the lock (m1) or above the first hook (m2), it
+// already passed with the old generation while the publisher was parked,
+// and the insert lands unconditionally -> hostA appears -> this fails.
+#[tokio::test]
+async fn critical_section_park_with_generation_bump_vetoes_the_write() {
+    // The bump changes the process-global generation and the direct write
+    // below shifts the INFLIGHT_DOH registry keys mid-flight (keys are
+    // (host, generation)), which would leave another test's dead Weak under
+    // the old generation unreachable by its own pointwise removal and break
+    // its exact registry length assert -- so this test must hold the same
+    // registry lock first.
+    let _registry_serial = FAKE_WAVE_LOCK.lock().await;
+    // The assertions read the shared live cache: serialize against the
+    // global store lock. Lock ORDER is the suite-wide FAKE -> GLOBAL (see
+    // flush_landing_* tests) -- taking GLOBAL first here deadlocks under a
+    // parallel run.
+    let _store_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
+    let host = "critical-section-veto.test.invalid";
+    forget_dns_answer(host);
+    disarm_pre_publish_pause();
+    disarm_critical_section_pause();
+
+    let expected_gen = DNS_NETWORK_GENERATION.load(Ordering::SeqCst);
+    let gate = arm_critical_section_pause();
+
+    let ips_a: Vec<IpAddr> = vec!["203.0.113.77".parse().unwrap()];
+    let (veto_tx, veto_rx) = std::sync::mpsc::channel();
+    let host_owned = host.to_owned();
+    let ips_owned = ips_a.clone();
+    std::thread::spawn(move || {
+        veto_tx
+            .send(remember_doh_answer_if_generation(
+                &host_owned,
+                &ips_owned,
+                Duration::from_secs(300),
+                expected_gen,
+            ))
+            .ok()
+    });
+
+    // The publisher now holds the doh_cache mutex, parked between the lock
+    // and the generation re-check.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !critical_section_pause_parked() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "A must reach the in-critical-section pause"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // The network changes while A is INSIDE the critical section.
+    DNS_NETWORK_GENERATION.fetch_add(1, Ordering::SeqCst);
+
+    gate.release();
+    let vetoed = veto_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("A finishes while the test holds no dns locks");
+    assert!(
+        !vetoed,
+        "the write must be vetoed: the generation changed while A held the          cache lock, between its lock acquisition and its re-check"
+    );
+    assert!(
+        cached_doh_answer(host).is_none(),
+        "the vetoed pre-bump answer must NOT be in the cache -- its presence          means the check ran before the lock (the TS10-01 regression)"
+    );
+
+    // The check itself must not have been lost: a fresh record B published
+    // after the vetoed attempt is served normally.
+    let host_b = "critical-section-veto-fresh.test.invalid";
+    let ips_b: Vec<IpAddr> = vec!["203.0.113.78".parse().unwrap()];
+    forget_dns_answer(host_b);
+    remember_doh_answer(host_b, &ips_b, Duration::from_secs(300));
+    match cached_doh_answer(host_b) {
+        Some(CacheHit::Addrs(served)) => {
+            assert_eq!(served, ips_b, "the fresh post-bump record B must serve")
+        }
+        _ => panic!("the fresh post-bump record B must remain in the cache"),
+    }
+
+    disarm_critical_section_pause();
+    disarm_pre_publish_pause();
+    forget_dns_answer(host);
+    forget_dns_answer(host_b);
 }
 
 // TS8-04: a lookup whose owner finished must remove its OWN registry entry

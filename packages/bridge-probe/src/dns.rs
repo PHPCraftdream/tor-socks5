@@ -344,12 +344,9 @@ fn insert_capped(cache: &mut HashMap<String, CachedAnswer>, host: &str, answer: 
     cache.insert(host.to_owned(), answer);
 }
 
-/// TS8-01: [`store_cached`] with a generation gate, for publishers that
-/// captured [`DNS_NETWORK_GENERATION`] before their lookup started. The
-/// re-check and the insert happen under ONE acquisition of the `doh_cache()`
-/// mutex -- the SAME mutex [`flush_dns_cache`] holds for its bump+clear --
-/// so a flush can no longer interleave between the check passing and the insert.
-/// Returns false (and writes nothing) when the generation changed under the caller.
+/// TS8-01: generation gate: the re-check and the insert happen under ONE
+/// `doh_cache()` acquisition (the same mutex [`flush_dns_cache`] holds for
+/// bump+clear); returns false when the generation changed under the caller.
 pub(super) fn store_cached_if_generation(
     host: &str,
     answer: CachedAnswer,
@@ -359,6 +356,9 @@ pub(super) fn store_cached_if_generation(
     #[cfg(test)]
     super::dns_publish_pause::pre_publish_pause();
     let mut cache = doh_cache().lock().unwrap_or_else(|p| p.into_inner());
+    // TS10-01 seam (why: dns_publish_pause.rs): parks inside the critical section.
+    #[cfg(test)]
+    super::dns_publish_pause::critical_section_pause();
     if DNS_NETWORK_GENERATION.load(AtomicOrdering::SeqCst) != expected_gen {
         return false;
     }
