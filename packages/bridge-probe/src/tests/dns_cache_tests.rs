@@ -30,6 +30,8 @@ fn expired_answer_is_not_served_by_the_normal_path() {
             addrs: vec!["203.0.113.8".parse().unwrap()],
             expires_at: Instant::now() - Duration::from_secs(1),
             resolved_at_unix: now_unix() - 61,
+            generation: 0,
+            version: 0,
         },
     );
     assert!(cached_doh_answer(host).is_none());
@@ -53,6 +55,8 @@ fn stale_fallback_serves_a_recently_expired_positive_answer() {
             addrs: vec![ip],
             expires_at: Instant::now() - Duration::from_secs(60),
             resolved_at_unix: now_unix() - 121,
+            generation: 0,
+            version: 0,
         },
     );
     assert_eq!(stale_fallback_answer(host), Some(vec![ip]));
@@ -68,6 +72,8 @@ fn stale_fallback_refuses_an_answer_past_the_fallback_window() {
             addrs: vec!["203.0.113.21".parse().unwrap()],
             expires_at: Instant::now() - DNS_STALE_FALLBACK_WINDOW - Duration::from_secs(1),
             resolved_at_unix: now_unix() - DNS_STALE_FALLBACK_WINDOW.as_secs() - 61,
+            generation: 0,
+            version: 0,
         },
     );
     assert!(stale_fallback_answer(host).is_none());

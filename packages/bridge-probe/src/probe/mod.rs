@@ -8,11 +8,12 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
-use crate::dns::forget_dns_answer;
 use crate::ResolverPolicy;
 use bridge_line::BridgeLine;
+use dns_invalidation::invalidate_if_current;
 use tokio::time::timeout;
 mod batch;
+pub(crate) mod dns_invalidation;
 mod dns_resolution;
 mod webtunnel_upgrade;
 
@@ -24,8 +25,8 @@ pub use batch::{
 pub use dns_resolution::resolve_addrs;
 #[allow(unused_imports)]
 pub(crate) use dns_resolution::{
-    coalesced_doh_lookup, order_candidates, order_candidates_with_limit, race_doh_wave,
-    race_first_answer, tcp_probe, DohAttemptOutcome, MAX_PROBE_ADDRS,
+    order_candidates, order_candidates_with_limit, race_doh_wave, race_first_answer,
+    resolve_addrs_observed, tcp_probe_observed, DohAttemptOutcome, ResolvedAddrs, MAX_PROBE_ADDRS,
 };
 
 // TS6-05: test-only seam for the coalescing tests (counting wave searches
@@ -35,8 +36,9 @@ pub(crate) use dns_resolution::{
 // re-exported from here.
 #[cfg(test)]
 pub(crate) use dns_resolution::{
-    clear_fake_doh_wave_search, inflight_doh_contains_host, inflight_doh_registry_len,
-    inflight_sweep_counter_value, install_fake_doh_wave_search, FakeDohWaveSearch,
+    clear_fake_doh_wave_search, coalesced_doh_lookup, inflight_doh_contains_host,
+    inflight_doh_registry_len, inflight_sweep_counter_value, install_fake_doh_wave_search,
+    tcp_probe, FakeDohWaveSearch,
 };
 // `#[allow(unused_imports)]`: these re-exports keep the moved items
 // crate-visible exactly as their pre-split `pub(super)` did, even where only
@@ -45,8 +47,11 @@ pub(crate) use dns_resolution::{
 pub(crate) use batch::{summarise, MAX_INFLIGHT_PROBES};
 #[allow(unused_imports)]
 pub(crate) use webtunnel_upgrade::{
-    webtunnel_upgrade_probe, MIN_WEBTUNNEL_TIMEOUT, WEBTUNNEL_HEAD_LIMIT,
+    webtunnel_upgrade_probe_observed, MIN_WEBTUNNEL_TIMEOUT, WEBTUNNEL_HEAD_LIMIT,
 };
+
+#[cfg(test)]
+pub(crate) use webtunnel_upgrade::webtunnel_upgrade_probe;
 
 /// Return whether a bridge address is a real network endpoint rather than a
 /// documentation/test placeholder.  The public webtunnel collector currently
@@ -427,11 +432,19 @@ pub(super) async fn resolve_and_probe(
     };
 
     let resolved_by_dns = host.parse::<IpAddr>().is_err();
-    let addrs = if let Ok(ip) = host.parse::<IpAddr>() {
-        vec![SocketAddr::new(ip, port)]
+    let resolved = if let Ok(ip) = host.parse::<IpAddr>() {
+        ResolvedAddrs {
+            addrs: vec![SocketAddr::new(ip, port)],
+            cache_identity: None,
+        }
     } else {
         let dns_timeout = per_bridge_timeout.max(MIN_DNS_RESOLVE_TIMEOUT);
-        match timeout(dns_timeout, resolve_addrs(&host, port, resolver_policy)).await {
+        match timeout(
+            dns_timeout,
+            resolve_addrs_observed(&host, port, resolver_policy),
+        )
+        .await
+        {
             Ok(Ok(a)) => a,
             Ok(Err(reason)) => return Outcome::Unmeasured { reason },
             Err(_) => {
@@ -442,17 +455,25 @@ pub(super) async fn resolve_and_probe(
         }
     };
 
-    let outcome = if let Some(plan) = &plan {
-        webtunnel_upgrade_probe(&addrs, plan, per_bridge_timeout.max(MIN_WEBTUNNEL_TIMEOUT)).await
+    let (outcome, failed_addrs) = if let Some(plan) = &plan {
+        webtunnel_upgrade_probe_observed(
+            &resolved.addrs,
+            plan,
+            per_bridge_timeout.max(MIN_WEBTUNNEL_TIMEOUT),
+        )
+        .await
     } else {
-        tcp_probe(&addrs, per_bridge_timeout).await
+        tcp_probe_observed(&resolved.addrs, per_bridge_timeout).await
     };
 
-    // Every address we were given failed. The name may simply have moved, and
-    // holding the answer for the rest of its TTL would keep the bridge dead in
-    // the store for no better reason than a stale cache line.
-    if resolved_by_dns && matches!(outcome, Outcome::Unreachable { .. }) {
-        forget_dns_answer(host.trim_end_matches('.'));
+    // Invalidate only the exact DNS answer that supplied every failed address.
+    // A newer answer, a different network generation, or a protocol-level
+    // WebTunnel failure must remain cached for other bridge variants.
+    if resolved_by_dns {
+        if let Some(identity) = resolved.cache_identity {
+            let failed_ips: Vec<IpAddr> = failed_addrs.iter().map(SocketAddr::ip).collect();
+            invalidate_if_current(host.trim_end_matches('.'), identity, &failed_ips);
+        }
     }
 
     outcome

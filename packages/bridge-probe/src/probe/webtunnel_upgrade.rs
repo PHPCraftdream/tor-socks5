@@ -15,6 +15,12 @@ pub(crate) const MIN_WEBTUNNEL_TIMEOUT: Duration = Duration::from_secs(12);
 /// Largest response head we will read while looking for the status line.
 pub(crate) const WEBTUNNEL_HEAD_LIMIT: usize = 8 * 1024;
 
+#[derive(Debug)]
+enum UpgradeFailure {
+    Connection(String),
+    Protocol(String),
+}
+
 pub(crate) fn webtunnel_tls_config() -> std::sync::Arc<rustls::ClientConfig> {
     static CFG: OnceLock<std::sync::Arc<rustls::ClientConfig>> = OnceLock::new();
     CFG.get_or_init(|| {
@@ -46,11 +52,22 @@ pub(crate) fn webtunnel_tls_config() -> std::sync::Arc<rustls::ClientConfig> {
 ///
 /// cancel-safe: NO — cancelling mid-handshake leaves partial TLS state, which
 /// is fine because the connection is dropped either way.
+#[cfg(test)]
 pub(crate) async fn webtunnel_upgrade_probe(
     addrs: &[SocketAddr],
     plan: &PreparedTarget,
     budget: Duration,
 ) -> Outcome {
+    webtunnel_upgrade_probe_observed(addrs, plan, budget)
+        .await
+        .0
+}
+
+pub(crate) async fn webtunnel_upgrade_probe_observed(
+    addrs: &[SocketAddr],
+    plan: &PreparedTarget,
+    budget: Duration,
+) -> (Outcome, Vec<SocketAddr>) {
     let started = Instant::now();
     // TS5-03: every candidate gets its own slice of the budget for one COMPLETE
     // attempt -- TCP connect, TLS handshake, and the upgrade round trip -- with
@@ -63,30 +80,63 @@ pub(crate) async fn webtunnel_upgrade_probe(
     let per_addr_budget = budget / (addrs.len().max(1) as u32);
     let attempt = async {
         let mut last = "hostname resolved to no usable address".to_owned();
+        let mut failed = Vec::with_capacity(addrs.len());
+        let mut saw_protocol_failure = false;
         for addr in addrs {
-            match timeout(per_addr_budget, webtunnel_upgrade_inner(*addr, plan)).await {
-                Ok(Ok(())) => return Ok(()),
-                Ok(Err(reason)) => last = format!("{addr}: {reason}"),
-                Err(_) => last = format!("{addr}: timed out after {per_addr_budget:?}"),
+            match webtunnel_upgrade_attempt(*addr, plan, per_addr_budget).await {
+                Ok(()) => return Ok(()),
+                Err(UpgradeFailure::Connection(reason)) => {
+                    failed.push(*addr);
+                    last = format!("{addr}: {reason}");
+                }
+                Err(UpgradeFailure::Protocol(reason)) => {
+                    saw_protocol_failure = true;
+                    last = format!("{addr}: {reason}");
+                }
             }
         }
-        Err(last)
+        if saw_protocol_failure {
+            Err((last, Vec::new()))
+        } else {
+            Err((last, failed))
+        }
     };
     match timeout(budget, attempt).await {
-        Ok(Ok(())) => Outcome::Reachable {
-            latency: started.elapsed(),
-        },
-        Ok(Err(reason)) => Outcome::Unreachable { reason },
-        Err(_) => Outcome::Unreachable {
-            reason: format!("webtunnel upgrade timed out after {budget:?}"),
-        },
+        Ok(Ok(())) => (
+            Outcome::Reachable {
+                latency: started.elapsed(),
+            },
+            Vec::new(),
+        ),
+        Ok(Err((reason, failed))) => (Outcome::Unreachable { reason }, failed),
+        Err(_) => (
+            Outcome::Unreachable {
+                reason: format!("webtunnel upgrade timed out after {budget:?}"),
+            },
+            Vec::new(),
+        ),
     }
 }
 
-pub(crate) async fn webtunnel_upgrade_inner(
+async fn webtunnel_upgrade_attempt(
     addr: SocketAddr,
     plan: &PreparedTarget,
-) -> Result<(), String> {
+    budget: Duration,
+) -> Result<(), UpgradeFailure> {
+    let deadline = tokio::time::Instant::now() + budget;
+    let tcp = tokio::time::timeout_at(deadline, TcpStream::connect(addr))
+        .await
+        .map_err(|_| UpgradeFailure::Connection(format!("tcp connect timed out after {budget:?}")))?
+        .map_err(|e| UpgradeFailure::Connection(format!("tcp connect: {e}")))?;
+    tokio::time::timeout_at(deadline, upgrade_after_connect(tcp, plan))
+        .await
+        .map_err(|_| UpgradeFailure::Protocol(format!("upgrade timed out after {budget:?}")))?
+}
+
+async fn upgrade_after_connect(
+    tcp: TcpStream,
+    plan: &PreparedTarget,
+) -> Result<(), UpgradeFailure> {
     // A fixed key is fine: nothing here verifies the server's accept hash, and
     // the probe carries no data. Host header and request-target come straight
     // from the shared plan, so the wire format matches the transport's.
@@ -102,22 +152,23 @@ pub(crate) async fn webtunnel_upgrade_inner(
         plan.request_target, plan.host_header
     );
 
-    let tcp = TcpStream::connect(addr)
-        .await
-        .map_err(|e| format!("tcp connect: {e}"))?;
     if plan.use_tls {
         let server_name = ServerName::try_from(plan.sni.clone())
-            .map_err(|e| format!("invalid SNI {:?}: {e}", plan.sni))?;
+            .map_err(|e| UpgradeFailure::Protocol(format!("invalid SNI {:?}: {e}", plan.sni)))?;
         let connector = tokio_rustls::TlsConnector::from(webtunnel_tls_config());
         let tls = connector
             .connect(server_name, tcp)
             .await
-            .map_err(|e| format!("tls: {e}"))?;
-        send_upgrade_request(tls, &request).await
+            .map_err(|e| UpgradeFailure::Protocol(format!("tls: {e}")))?;
+        send_upgrade_request(tls, &request)
+            .await
+            .map_err(UpgradeFailure::Protocol)
     } else {
         // Plain http:// : the transport speaks cleartext too, so the probe
         // must not demand a certificate the bridge never offers.
-        send_upgrade_request(tcp, &request).await
+        send_upgrade_request(tcp, &request)
+            .await
+            .map_err(UpgradeFailure::Protocol)
     }
 }
 

@@ -1,11 +1,13 @@
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
+use super::dns_invalidation::CacheIdentity;
 use super::{Outcome, ResolverPolicy};
 use crate::dns::{
-    cached_doh_answer, disk_fallback_answer, doh_order, doh_pool, doh_slots, note_doh_result,
-    remember_doh_answer_if_generation, remember_doh_failure_if_generation, stale_fallback_answer,
-    CacheHit, DNS_NETWORK_GENERATION, DOH_FANOUT, DOH_MAX_WAVES, DOH_PROVIDER_TIMEOUT,
+    cached_doh_answer_observed, disk_fallback_answer, doh_order, doh_pool, doh_slots,
+    note_doh_result, remember_doh_answer_if_generation_observed,
+    remember_doh_failure_if_generation, stale_fallback_answer_observed, DNS_NETWORK_GENERATION,
+    DOH_FANOUT, DOH_MAX_WAVES, DOH_PROVIDER_TIMEOUT,
 };
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -236,7 +238,9 @@ pub(crate) async fn race_doh_wave(wave: &[usize], query: &str) -> Option<(Vec<Ip
 /// Coalesced result of a wave-search across the configured DoH providers
 /// for one hostname: the resolved IPs with their TTL, or the failure
 /// reason if every provider (and every wave, up to [`DOH_MAX_WAVES`]) failed.
+#[cfg(test)]
 pub(crate) type DohWaveResult = Result<(Vec<IpAddr>, Duration), String>;
+type ObservedDohWaveResult = Result<(Vec<IpAddr>, Duration, Option<CacheIdentity>), String>;
 
 /// Registry of in-flight DoH wave lookups, keyed by hostname (TS6-05): two
 /// concurrent `resolve_addrs` calls for the SAME still-uncached host share
@@ -269,7 +273,7 @@ pub(crate) type DohWaveResult = Result<(Vec<IpAddr>, Duration), String>;
 /// before a `flush_dns_cache` can never be joined by (or publish into) the
 /// post-flush world.
 type InflightKey = (String, u64);
-type InflightCell = tokio::sync::OnceCell<DohWaveResult>;
+type InflightCell = tokio::sync::OnceCell<ObservedDohWaveResult>;
 
 struct InflightDohRegistry {
     entries: std::collections::HashMap<InflightKey, std::sync::Weak<InflightCell>>,
@@ -341,13 +345,20 @@ const INFLIGHT_SWEEP_BUDGET: usize = 128;
 /// owner skips `remember_doh_answer` when the generation changed under the
 /// lookup (a `flush_dns_cache` while the wave search was in flight) -- the
 /// answer belongs to the old network and must not be cached for the new one.
+#[cfg(test)]
 pub(crate) async fn coalesced_doh_lookup(query: &str) -> DohWaveResult {
+    coalesced_doh_lookup_observed(query)
+        .await
+        .map(|(ips, ttl, _)| (ips, ttl))
+}
+
+async fn coalesced_doh_lookup_observed(query: &str) -> ObservedDohWaveResult {
     // TS7-06: capture the network generation BEFORE touching the registry.
     // A lookup is identified by the generation it started in; see the
     // registry docs above.
     let gen = DNS_NETWORK_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
     let registry = INFLIGHT_DOH.get_or_init(|| std::sync::Mutex::new(InflightDohRegistry::new()));
-    let cell: std::sync::Arc<tokio::sync::OnceCell<DohWaveResult>> = {
+    let cell: std::sync::Arc<tokio::sync::OnceCell<ObservedDohWaveResult>> = {
         let mut map = registry.lock().unwrap_or_else(|p| p.into_inner());
         let key = (query.to_owned(), gen);
         if let Some(existing) = map.entries.get(&key).and_then(std::sync::Weak::upgrade) {
@@ -379,8 +390,9 @@ pub(crate) async fn coalesced_doh_lookup(query: &str) -> DohWaveResult {
                     // `doh_cache()` mutex `flush_dns_cache` holds for its
                     // bump+clear, so a flush can no longer land between the
                     // check and the insert (the old "residual race").
-                    remember_doh_answer_if_generation(query, &ips, ttl, gen);
-                    Ok((ips, ttl))
+                    let identity =
+                        remember_doh_answer_if_generation_observed(query, &ips, ttl, gen);
+                    Ok((ips, ttl, identity))
                 }
                 None => Err("all DoH providers failed".to_owned()),
             }
@@ -405,7 +417,7 @@ fn remove_finished_inflight_entry(
     registry: &std::sync::Mutex<InflightDohRegistry>,
     query: &str,
     gen: u64,
-    cell: &std::sync::Arc<tokio::sync::OnceCell<DohWaveResult>>,
+    cell: &std::sync::Arc<tokio::sync::OnceCell<ObservedDohWaveResult>>,
 ) {
     let mut map = registry.lock().unwrap_or_else(|p| p.into_inner());
     let key = (query.to_owned(), gen);
@@ -565,13 +577,34 @@ pub async fn resolve_addrs(
     port: u16,
     resolver_policy: ResolverPolicy,
 ) -> Result<Vec<SocketAddr>, String> {
+    resolve_addrs_observed(host, port, resolver_policy)
+        .await
+        .map(|resolved| resolved.addrs)
+}
+
+pub(crate) struct ResolvedAddrs {
+    pub(crate) addrs: Vec<SocketAddr>,
+    pub(crate) cache_identity: Option<CacheIdentity>,
+}
+
+pub(crate) async fn resolve_addrs_observed(
+    host: &str,
+    port: u16,
+    resolver_policy: ResolverPolicy,
+) -> Result<ResolvedAddrs, String> {
     let query = host.trim_end_matches('.');
+    let generation = DNS_NETWORK_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
     if resolver_policy.doh_enabled {
-        match cached_doh_answer(query) {
-            Some(CacheHit::Addrs(ips)) => return Ok(order_candidates(&ips, port)),
+        match cached_doh_answer_observed(query) {
+            Some((ips, cache_identity)) if !ips.is_empty() => {
+                return Ok(ResolvedAddrs {
+                    addrs: order_candidates(&ips, port),
+                    cache_identity: Some(cache_identity),
+                });
+            }
             // Remembered failure: skip the providers, but still let the system
             // resolver below have its turn if policy allows one.
-            Some(CacheHit::Unresolvable) => {}
+            Some((_empty, _identity)) => {}
             None => {
                 // TS6-05: several bridge lines of one fronting host are probed
                 // in parallel, and before coalescing each caller raced the
@@ -587,17 +620,25 @@ pub async fn resolve_addrs(
                 // generation must not poison the cache of the next one --
                 // after a flush, the name may resolve fine in the new
                 // network. Same residual race as the answer-publish gate.
-                let gen = DNS_NETWORK_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
-                match coalesced_doh_lookup(query).await {
-                    Ok((ips, _ttl)) => return Ok(order_candidates(&ips, port)),
+                match coalesced_doh_lookup_observed(query).await {
+                    Ok((ips, _ttl, cache_identity)) => {
+                        return Ok(ResolvedAddrs {
+                            addrs: order_candidates(&ips, port),
+                            cache_identity,
+                        });
+                    }
                     Err(_) => {
-                        if let Some(stale) = stale_fallback_answer(query) {
+                        if let Some((stale, cache_identity)) = stale_fallback_answer_observed(query)
+                        {
                             tracing::warn!(
                                 host = %query,
                                 addrs = stale.len(),
                                 "all DoH providers failed; falling back to a stale cached answer"
                             );
-                            return Ok(order_candidates(&stale, port));
+                            return Ok(ResolvedAddrs {
+                                addrs: order_candidates(&stale, port),
+                                cache_identity: Some(cache_identity),
+                            });
                         }
                         if let Some(persisted) = disk_fallback_answer(query) {
                             tracing::warn!(
@@ -606,14 +647,17 @@ pub async fn resolve_addrs(
                                 "all DoH providers failed and no in-memory answer remains; \
                                  falling back to a previous run's persisted answer"
                             );
-                            return Ok(order_candidates(&persisted, port));
+                            return Ok(ResolvedAddrs {
+                                addrs: order_candidates(&persisted, port),
+                                cache_identity: None,
+                            });
                         }
                         // TS7-06/TS8-01: only remember the failure if the
                         // network generation did not change under the
                         // lookup; the re-check runs under the cache mutex,
                         // so a flush landing after the check can no longer
                         // be overtaken by the insert.
-                        remember_doh_failure_if_generation(query, gen);
+                        remember_doh_failure_if_generation(query, generation);
                         tracing::warn!(host = %query, "all DoH providers failed");
                     }
                 }
@@ -634,7 +678,10 @@ pub async fn resolve_addrs(
             ));
         }
         let ips: Vec<IpAddr> = addrs.iter().map(|a| a.ip()).collect();
-        return Ok(order_candidates(&ips, port));
+        return Ok(ResolvedAddrs {
+            addrs: order_candidates(&ips, port),
+            cache_identity: None,
+        });
     }
 
     Err(format!(
@@ -644,21 +691,39 @@ pub async fn resolve_addrs(
 
 /// Perform a TCP reachability probe against the resolved candidates, within
 /// the per-bridge timeout budget per candidate.
+#[cfg(test)]
 pub(crate) async fn tcp_probe(addrs: &[SocketAddr], per_bridge_timeout: Duration) -> Outcome {
+    tcp_probe_observed(addrs, per_bridge_timeout).await.0
+}
+
+pub(crate) async fn tcp_probe_observed(
+    addrs: &[SocketAddr],
+    per_bridge_timeout: Duration,
+) -> (Outcome, Vec<SocketAddr>) {
     let started = Instant::now();
     let mut last = "hostname resolved to no usable address".to_owned();
+    let mut failed = Vec::with_capacity(addrs.len());
     for addr in addrs {
         match timeout(per_bridge_timeout, TcpStream::connect(*addr)).await {
             Ok(Ok(_)) => {
-                return Outcome::Reachable {
-                    latency: started.elapsed(),
-                }
+                return (
+                    Outcome::Reachable {
+                        latency: started.elapsed(),
+                    },
+                    failed,
+                );
             }
-            Ok(Err(e)) => last = format!("{addr}: {e}"),
-            Err(_) => last = format!("{addr}: timed out after {per_bridge_timeout:?}"),
+            Ok(Err(e)) => {
+                failed.push(*addr);
+                last = format!("{addr}: {e}");
+            }
+            Err(_) => {
+                failed.push(*addr);
+                last = format!("{addr}: timed out after {per_bridge_timeout:?}");
+            }
         }
     }
-    Outcome::Unreachable { reason: last }
+    (Outcome::Unreachable { reason: last }, failed)
 }
 
 #[cfg(test)]

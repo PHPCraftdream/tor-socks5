@@ -9,7 +9,7 @@
 | TS11-01 | P2 | Закрыта | Общий BridgeIdentity; config сохраняет cert и WebTunnel variants после save/load; 168 тестов bridge-probe/proxy-config прошли |
 | TS11-02 | P2 | Закрыта | BridgeStore использует общий BridgeIdentity; channel/verified/fails/retirement и save/load независимы; 65 тестов прошли |
 | TS11-03 | P2 | Закрыта | Prune использует общий BridgeIdentity; реальный temp-config тест сохраняет рабочие endpoints, другой transport и неразбираемые строки |
-| TS11-04 | P2 | Запланирована | Старая проба не удаляет новый DNS-ответ; ошибки протокола не сбрасывают DNS |
+| TS11-04 | P2 | Закрыта | Атомарный generation/version ответа; refresh с теми же IP защищён; HTTP/TLS ошибки сохраняют DNS; 125 тестов и clippy/fmt прошли |
 | TS11-05 | P3 | Закрыта | Индексы полной identity для membership/rank; первый rank дубликата и стабильный порядок сохранены; тесты tor_setup, clippy/fmt прошли |
 | TS11-06 | P3 | Запланирована | Ротация живого ключа не клонирует hostname; FIFO и бюджет сохранены |
 

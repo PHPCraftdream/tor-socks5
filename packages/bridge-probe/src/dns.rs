@@ -1,5 +1,14 @@
+use super::probe::dns_invalidation::{cache_identity, next_cache_version};
 use super::probe::resolve_probe_target;
 use super::*;
+
+#[cfg(test)]
+pub(super) use super::probe::dns_invalidation::{
+    cached_doh_answer, forget_dns_answer, stale_fallback_answer,
+};
+pub(super) use super::probe::dns_invalidation::{
+    cached_doh_answer_observed, stale_fallback_answer_observed,
+};
 
 /// Controls how hostname-based bridge targets are resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +131,8 @@ pub(super) struct CachedAnswer {
     /// periodic save cannot re-stamp a long-expired entry into looking
     /// freshly resolved (TS5-04).
     pub(super) resolved_at_unix: u64,
+    pub(super) generation: u64,
+    pub(super) version: u64,
 }
 
 /// Floor on how long an answer is kept.
@@ -170,52 +181,12 @@ pub(super) fn doh_cache() -> &'static std::sync::Mutex<HashMap<String, CachedAns
 }
 
 /// What the cache knows about a hostname right now.
+#[cfg(test)]
 pub(super) enum CacheHit {
     /// Addresses still inside their TTL.
     Addrs(Vec<IpAddr>),
     /// Resolution failed recently; skip the providers and move on.
     Unresolvable,
-}
-
-pub(super) fn cached_doh_answer(host: &str) -> Option<CacheHit> {
-    let cache = doh_cache().lock().unwrap_or_else(|p| p.into_inner());
-    let entry = cache.get(host)?;
-    // Expired entries are no longer served here -- but are deliberately not
-    // deleted either; they stay put for `stale_fallback_answer` until the
-    // fallback window itself elapses (see `store_cached`'s retain criterion).
-    if entry.expires_at <= Instant::now() {
-        return None;
-    }
-    if entry.addrs.is_empty() {
-        Some(CacheHit::Unresolvable)
-    } else {
-        Some(CacheHit::Addrs(entry.addrs.clone()))
-    }
-}
-
-/// Last-resort answer for `host` when every DoH provider in this round's
-/// wave(s) has failed: an expired-but-not-yet-stale-expired positive answer,
-/// if one exists.
-///
-/// Never a substitute for a fresh lookup -- callers must attempt DoH first
-/// (see `resolve_addrs`) and only reach for this once every provider failed.
-/// Deliberately does not touch the cache: leaving the entry as-is lets it
-/// keep serving as a fallback on a later attempt too, rather than being
-/// clobbered by a negative marker the moment DoH has one bad round.
-pub(super) fn stale_fallback_answer(host: &str) -> Option<Vec<IpAddr>> {
-    let cache = doh_cache().lock().unwrap_or_else(|p| p.into_inner());
-    let entry = cache.get(host)?;
-    if entry.addrs.is_empty() {
-        return None; // a remembered failure has nothing to fall back to
-    }
-    let now = Instant::now();
-    if entry.expires_at > now {
-        return None; // still fresh -- cached_doh_answer already serves this
-    }
-    if now.duration_since(entry.expires_at) > DNS_STALE_FALLBACK_WINDOW {
-        return None; // too old to trust
-    }
-    Some(entry.addrs.clone())
 }
 
 /// Whether a live cache entry is still fresh (within TTL) or at least
@@ -239,6 +210,8 @@ pub(super) fn remember_doh_answer(host: &str, ips: &[IpAddr], valid_for: Duratio
             addrs: ips.to_vec(),
             expires_at: Instant::now() + ttl,
             resolved_at_unix: now_unix(),
+            generation: 0,
+            version: 0,
         },
     );
 }
@@ -254,6 +227,8 @@ pub(super) fn remember_doh_failure(host: &str) {
             addrs: Vec::new(),
             expires_at: Instant::now() + DNS_NEGATIVE_TTL,
             resolved_at_unix: now_unix(),
+            generation: 0,
+            version: 0,
         },
     );
 }
@@ -262,19 +237,31 @@ pub(super) fn remember_doh_failure(host: &str) {
 /// that captured the network generation before their lookup started.
 /// Returns false (and writes nothing) when the generation changed under
 /// the lookup.
+#[cfg(test)]
 pub(super) fn remember_doh_answer_if_generation(
     host: &str,
     ips: &[IpAddr],
     valid_for: Duration,
     expected_gen: u64,
 ) -> bool {
+    remember_doh_answer_if_generation_observed(host, ips, valid_for, expected_gen).is_some()
+}
+
+pub(super) fn remember_doh_answer_if_generation_observed(
+    host: &str,
+    ips: &[IpAddr],
+    valid_for: Duration,
+    expected_gen: u64,
+) -> Option<super::probe::dns_invalidation::CacheIdentity> {
     let ttl = valid_for.clamp(DNS_MIN_TTL, DNS_MAX_TTL);
-    store_cached_if_generation(
+    store_cached_if_generation_observed(
         host,
         CachedAnswer {
             addrs: ips.to_vec(),
             expires_at: Instant::now() + ttl,
             resolved_at_unix: now_unix(),
+            generation: 0,
+            version: 0,
         },
         expected_gen,
     )
@@ -290,23 +277,11 @@ pub(super) fn remember_doh_failure_if_generation(host: &str, expected_gen: u64) 
             addrs: Vec::new(),
             expires_at: Instant::now() + DNS_NEGATIVE_TTL,
             resolved_at_unix: now_unix(),
+            generation: 0,
+            version: 0,
         },
         expected_gen,
     )
-}
-
-/// Drop what we remember about `host`.
-///
-/// Called when every address we handed out failed to connect. A cached answer
-/// that no longer works is worse than no answer: without eviction the probe
-/// would keep dialling the stale address for the rest of the TTL and keep
-/// filing the bridge as dead. Re-resolving a host that is genuinely blocked
-/// costs one lookup per round, which is what it cost before there was a cache.
-pub(super) fn forget_dns_answer(host: &str) {
-    doh_cache()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .remove(host);
 }
 
 /// TS8-01: unconditional (non-generation-gated) insert. Production callers
@@ -322,6 +297,9 @@ pub(super) fn store_cached(host: &str, answer: CachedAnswer) {
 /// cap-check + eviction + insert, run under the caller's already-held
 /// `doh_cache()` guard. Never locks on its own.
 fn insert_capped(cache: &mut HashMap<String, CachedAnswer>, host: &str, answer: CachedAnswer) {
+    let mut answer = answer;
+    answer.generation = DNS_NETWORK_GENERATION.load(AtomicOrdering::SeqCst);
+    answer.version = next_cache_version();
     if cache.len() >= DNS_CACHE_CAP {
         let now = Instant::now();
         // Sweep by the fallback window, not the TTL itself -- an expired-but-
@@ -352,6 +330,14 @@ pub(super) fn store_cached_if_generation(
     answer: CachedAnswer,
     expected_gen: u64,
 ) -> bool {
+    store_cached_if_generation_observed(host, answer, expected_gen).is_some()
+}
+
+pub(super) fn store_cached_if_generation_observed(
+    host: &str,
+    answer: CachedAnswer,
+    expected_gen: u64,
+) -> Option<super::probe::dns_invalidation::CacheIdentity> {
     // TS9-01 seam: parked window = the mutex acquisition itself.
     #[cfg(test)]
     super::dns_publish_pause::pre_publish_pause();
@@ -360,10 +346,12 @@ pub(super) fn store_cached_if_generation(
     #[cfg(test)]
     super::dns_publish_pause::critical_section_pause();
     if DNS_NETWORK_GENERATION.load(AtomicOrdering::SeqCst) != expected_gen {
-        return false;
+        return None;
     }
     insert_capped(&mut cache, host, answer);
-    true
+    Some(cache_identity(
+        cache.get(host).expect("just inserted cache entry"),
+    ))
 }
 
 /// TS7-06: bumped by [`flush_dns_cache`] BEFORE it clears anything, so a

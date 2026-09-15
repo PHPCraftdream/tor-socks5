@@ -228,6 +228,8 @@ async fn save_drops_a_resident_live_answer_past_the_stale_window() {
             addrs: vec![ip],
             expires_at: Instant::now() - DNS_STALE_FALLBACK_WINDOW - Duration::from_secs(1),
             resolved_at_unix: now_unix() - DNS_STALE_FALLBACK_WINDOW.as_secs() - 61,
+            generation: 0,
+            version: 0,
         },
     );
     let dir = std::env::temp_dir().join(format!(
@@ -269,6 +271,8 @@ async fn save_keeps_a_valid_disk_answer_when_the_live_answer_is_past_the_stale_w
             addrs: vec![stale_live_ip],
             expires_at: Instant::now() - DNS_STALE_FALLBACK_WINDOW - Duration::from_secs(1),
             resolved_at_unix: now_unix() - DNS_STALE_FALLBACK_WINDOW.as_secs() - 61,
+            generation: 0,
+            version: 0,
         },
     );
     {
