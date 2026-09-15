@@ -256,11 +256,10 @@ pub(crate) type DohWaveResult = Result<(Vec<IpAddr>, Duration), String>;
 /// every [`INFLIGHT_SWEEP_INTERVAL`]-th fresh insertion (an amortized
 /// counter) instead of on EVERY insert -- sweeping on every insert made H
 /// concurrent cold hostnames cost O(H^2) lock-held work -- and it visits at
-/// most [`INFLIGHT_SWEEP_BUDGET`] entries per run (TS10-02), so the work of
-/// any single insertion is bounded by a CONSTANT regardless of how large the
-/// registry has grown; entries beyond the budget are picked up by later
-/// sweeps (HashMap's iteration order is arbitrary, so under churn the whole
-/// map is covered amortized). The registry therefore holds the DISTINCT
+/// most [`INFLIGHT_SWEEP_BUDGET`] queued keys per run (TS10-02). The FIFO
+/// cursor rotates live keys to its back, so a stable live prefix cannot starve
+/// dead entries behind it; stale cursor keys are discarded. Cleanup visits a
+/// bounded number of keys regardless of map size or capacity. The registry holds the DISTINCT
 /// hostnames actively being resolved concurrently plus entries that died
 /// since the last sweep -- NOT a permanently fixed size: MAX_INFLIGHT_PROBES
 /// bounds ONE `probe_all` batch, not all concurrent resolve calls registry-
@@ -269,8 +268,43 @@ pub(crate) type DohWaveResult = Result<(Vec<IpAddr>, Duration), String>;
 /// TS7-06: keys are `(hostname, network generation)`, so a lookup started
 /// before a `flush_dns_cache` can never be joined by (or publish into) the
 /// post-flush world.
-type InflightDohRegistry =
-    std::collections::HashMap<(String, u64), std::sync::Weak<tokio::sync::OnceCell<DohWaveResult>>>;
+type InflightKey = (String, u64);
+type InflightCell = tokio::sync::OnceCell<DohWaveResult>;
+
+struct InflightDohRegistry {
+    entries: std::collections::HashMap<InflightKey, std::sync::Weak<InflightCell>>,
+    /// Each key has at most one queued cursor entry. A key removed from
+    /// `entries` remains queued until its turn, so reinsertion cannot starve
+    /// behind a duplicate marker or require an O(n) queue search.
+    sweep_queue: std::collections::VecDeque<InflightKey>,
+    queued_keys: std::collections::HashSet<InflightKey>,
+}
+
+impl InflightDohRegistry {
+    fn new() -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            sweep_queue: std::collections::VecDeque::new(),
+            queued_keys: std::collections::HashSet::new(),
+        }
+    }
+
+    fn queue_key(&mut self, key: InflightKey) {
+        if self.queued_keys.insert(key.clone()) {
+            self.sweep_queue.push_back(key);
+        }
+    }
+
+    fn clear_if_empty(&mut self) {
+        if self.entries.is_empty() {
+            self.sweep_queue.clear();
+            self.queued_keys.clear();
+            self.entries.shrink_to_fit();
+            self.sweep_queue.shrink_to_fit();
+            self.queued_keys.shrink_to_fit();
+        }
+    }
+}
 static INFLIGHT_DOH: std::sync::OnceLock<std::sync::Mutex<InflightDohRegistry>> =
     std::sync::OnceLock::new();
 
@@ -283,14 +317,8 @@ const INFLIGHT_SWEEP_INTERVAL: usize = 64;
 static INFLIGHT_SWEEP_COUNTER: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Upper bound on registry entries one sweep may VISIT (TS10-02). Why 128:
-/// it is 2x the sweep interval, so while the registry holds up to ~2
-/// intervals' worth of entries every sweep still covers the WHOLE map (and
-/// a dead entry is cleaned within at most `len / 128` further sweeps);
-/// beyond that, per-insert work stays O(128) instead of O(len). Entries
-/// missed by one sweep are found by a later one because HashMap's iteration
-/// order is arbitrary and the counter keeps firing -- amortized completeness
-/// under churn, constant work per insertion always.
+/// Upper bound on cursor keys visited by one sweep. FIFO rotation gives later
+/// sweeps access to entries beyond this bound without scanning hash buckets.
 const INFLIGHT_SWEEP_BUDGET: usize = 128;
 
 /// Run (or join) the coalesced wave-search for `query`. Multiple concurrent
@@ -318,22 +346,16 @@ pub(crate) async fn coalesced_doh_lookup(query: &str) -> DohWaveResult {
     // A lookup is identified by the generation it started in; see the
     // registry docs above.
     let gen = DNS_NETWORK_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
-    let registry =
-        INFLIGHT_DOH.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let registry = INFLIGHT_DOH.get_or_init(|| std::sync::Mutex::new(InflightDohRegistry::new()));
     let cell: std::sync::Arc<tokio::sync::OnceCell<DohWaveResult>> = {
         let mut map = registry.lock().unwrap_or_else(|p| p.into_inner());
         let key = (query.to_owned(), gen);
-        if let Some(existing) = map.get(&key).and_then(std::sync::Weak::upgrade) {
+        if let Some(existing) = map.entries.get(&key).and_then(std::sync::Weak::upgrade) {
             existing
         } else {
-            // TS10-02: BOUNDED sweep, not `retain` -- retain cannot exit
-            // early, so it scans the WHOLE map and a large registry would
-            // make every 64th insertion O(len) under the shared lock. Here
-            // at most INFLIGHT_SWEEP_BUDGET entries are visited; dead ones
-            // among them are removed pointwise. A live entry always has
-            // strong_count > 0 at this exact moment (the registry mutex is
-            // held), so the sweep can never remove something a concurrent
-            // caller is still using or just started.
+            // TS10-02: BOUNDED sweep, not `retain` or a bounded HashMap
+            // iterator. The FIFO cursor visits at most the fixed budget and
+            // rotates live keys, so later dead keys are eventually reached.
             if INFLIGHT_SWEEP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 % INFLIGHT_SWEEP_INTERVAL
                 == INFLIGHT_SWEEP_INTERVAL - 1
@@ -341,7 +363,9 @@ pub(crate) async fn coalesced_doh_lookup(query: &str) -> DohWaveResult {
                 sweep_inflight_dead_entries(&mut map);
             }
             let fresh = std::sync::Arc::new(tokio::sync::OnceCell::new());
-            map.insert(key.clone(), std::sync::Arc::downgrade(&fresh));
+            map.entries
+                .insert(key.clone(), std::sync::Arc::downgrade(&fresh));
+            map.queue_key(key);
             fresh
         }
     };
@@ -386,48 +410,41 @@ fn remove_finished_inflight_entry(
     let mut map = registry.lock().unwrap_or_else(|p| p.into_inner());
     let key = (query.to_owned(), gen);
     if map
+        .entries
         .get(&key)
         .is_some_and(|w| w.as_ptr() == std::sync::Arc::as_ptr(cell))
     {
-        map.remove(&key);
-        // Capacity from a past peak (deletions never shrink it) is only
-        // reclaimed here, when the registry drained completely -- rarely,
-        // and never on the per-insert path (TS8-04).
-        if map.is_empty() {
-            map.shrink_to_fit();
-        }
+        map.entries.remove(&key);
+        // The cursor marker is discarded lazily in the bounded sweep. If the
+        // registry drained completely, reclaim all three containers together.
+        map.clear_if_empty();
     }
 }
 
-/// TS10-02: visit at most [`INFLIGHT_SWEEP_BUDGET`] entries, collect the
-/// DEAD `Weak`s among them and remove those keys pointwise. `HashMap::retain`
-/// cannot exit early, so this replaces the old full-map retain; live entries
-/// are never touched (the collect only reads `strong_count`, and any entry a
-/// caller holds has strong_count > 0 under this same mutex). Keys missed
-/// because they fall outside the budget are visited by later sweeps: the
-/// iteration order is arbitrary and the sweep counter keeps firing, so the
-/// map is covered amortized while every single call stays O(BUDGET).
-///
-/// Capacity: full-drain `shrink_to_fit` after pointwise removal stays in
-/// `remove_finished_inflight_entry`. Additionally, on this RARE path only
-/// (once per INFLIGHT_SWEEP_INTERVAL insertions, never per insert), a big
-/// past peak is released once the live set is a small fraction of capacity --
-/// the threshold (capacity >= 512, live <= 1/4 of capacity) is coarse on
-/// purpose: shrinking would re-grow on the next burst anyway, so earlier or
-/// tighter triggers would only churn allocations.
-fn sweep_inflight_dead_entries(map: &mut InflightDohRegistry) {
-    let dead: Vec<(String, u64)> = map
-        .iter()
-        .take(INFLIGHT_SWEEP_BUDGET)
-        .filter(|(_, weak)| weak.strong_count() == 0)
-        .map(|(key, _)| key.clone())
-        .collect();
-    for key in dead {
-        map.remove(&key);
+/// TS10-02: visit at most [`INFLIGHT_SWEEP_BUDGET`] cursor keys. Live entries
+/// are rotated to the back, dead entries are removed, and stale markers from
+/// pointwise removals or key replacement are discarded. The cursor is FIFO,
+/// so a finite live prefix cannot starve dead entries behind it, while the
+/// number of hash map operations is independent of map size and capacity.
+fn sweep_inflight_dead_entries(registry: &mut InflightDohRegistry) -> usize {
+    let mut visited = 0;
+    for _ in 0..INFLIGHT_SWEEP_BUDGET {
+        let Some(key) = registry.sweep_queue.pop_front() else {
+            break;
+        };
+        visited += 1;
+        registry.queued_keys.remove(&key);
+
+        let Some(weak) = registry.entries.get(&key) else {
+            continue;
+        };
+        if weak.strong_count() == 0 {
+            registry.entries.remove(&key);
+            continue;
+        }
+        registry.queue_key(key);
     }
-    if map.is_empty() || (map.capacity() >= 512 && map.len() * 4 < map.capacity()) {
-        map.shrink_to_fit();
-    }
+    visited
 }
 
 /// The wave search one coalesced lookup runs per hostname: chunks of
@@ -496,7 +513,13 @@ pub(crate) fn clear_fake_doh_wave_search() {
 pub(crate) fn inflight_doh_registry_len() -> usize {
     INFLIGHT_DOH
         .get()
-        .map(|registry| registry.lock().unwrap_or_else(|p| p.into_inner()).len())
+        .map(|registry| {
+            registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entries
+                .len()
+        })
         .unwrap_or(0)
 }
 
@@ -524,6 +547,7 @@ pub(crate) fn inflight_doh_contains_host(host: &str) -> bool {
             registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
+                .entries
                 .keys()
                 .any(|(h, _)| h == host)
         })
@@ -635,4 +659,64 @@ pub(crate) async fn tcp_probe(addrs: &[SocketAddr], per_bridge_timeout: Duration
         }
     }
     Outcome::Unreachable { reason: last }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    fn add_entry(
+        registry: &mut InflightDohRegistry,
+        key: InflightKey,
+        live: bool,
+    ) -> Option<std::sync::Arc<InflightCell>> {
+        let cell = std::sync::Arc::new(InflightCell::new());
+        registry
+            .entries
+            .insert(key.clone(), std::sync::Arc::downgrade(&cell));
+        registry.queue_key(key);
+        live.then_some(cell)
+    }
+
+    #[test]
+    fn fifo_sweep_visits_bound_and_reaches_dead_entries_behind_live_prefix() {
+        let mut registry = InflightDohRegistry::new();
+        let mut live_cells = Vec::new();
+        for i in 0..=INFLIGHT_SWEEP_BUDGET {
+            live_cells.push(
+                add_entry(&mut registry, (format!("live-{i}"), 0), true)
+                    .expect("live cell is retained"),
+            );
+        }
+        for i in 0..3 {
+            let _ = add_entry(&mut registry, (format!("dead-{i}"), 0), false);
+        }
+
+        assert_eq!(
+            sweep_inflight_dead_entries(&mut registry),
+            INFLIGHT_SWEEP_BUDGET
+        );
+        assert_eq!(registry.entries.len(), INFLIGHT_SWEEP_BUDGET + 4);
+        assert!(registry.entries.keys().any(|(host, _)| host == "dead-0"));
+        assert_eq!(registry.sweep_queue.len(), registry.queued_keys.len());
+
+        assert_eq!(
+            sweep_inflight_dead_entries(&mut registry),
+            INFLIGHT_SWEEP_BUDGET
+        );
+        assert!(!registry
+            .entries
+            .keys()
+            .any(|(host, _)| host.starts_with("dead-")));
+        assert_eq!(registry.entries.len(), INFLIGHT_SWEEP_BUDGET + 1);
+
+        let replacement_key = ("live-0".to_owned(), 0);
+        registry.entries.remove(&replacement_key);
+        let replacement = add_entry(&mut registry, replacement_key.clone(), true)
+            .expect("replacement cell is retained");
+        assert_eq!(registry.sweep_queue.len(), registry.queued_keys.len());
+        assert!(registry.entries[&replacement_key].strong_count() > 0);
+        drop(replacement);
+        drop(live_cells);
+    }
 }
