@@ -3,7 +3,7 @@
 //! Shared by the server startup path ([`crate::server::run_server`]) and
 //! the `bridges fetch` command ([`crate::bridges_cmd::cmd_bridges`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use arti_wrapper::Settings;
 use bridge_line::BridgeLine;
-use bridge_probe::bridge_identity;
+use bridge_probe::{bridge_identity, BridgeIdentity};
 use time::OffsetDateTime;
 use tracing::{info, warn};
 
@@ -116,9 +116,13 @@ pub(crate) async fn build_tor_settings_preserving_live(
 
     if alive.is_empty() && live.is_empty() && cfg.bridges.preferred_transport() == Some("webtunnel")
     {
+        let probed_keys: HashSet<BridgeIdentity> = probed.iter().map(bridge_identity).collect();
         let fallback: Vec<_> = parsed_bridges
             .iter()
-            .filter(|b| b.transport.as_deref() == Some("obfs4") && !probed.contains(b))
+            .filter(|b| {
+                b.transport.as_deref() == Some("obfs4")
+                    && !probed_keys.contains(&bridge_identity(b))
+            })
             .cloned()
             .collect();
         if !fallback.is_empty() {
@@ -151,9 +155,7 @@ pub(crate) async fn build_tor_settings_preserving_live(
     // Bootstrap path: no observation sink yet — arti hasn't started
     // emitting per-guard usability events when build_tor_settings runs.
     // Failure to open another transport connection does not invalidate live traffic.
-    probed.retain(|bridge| {
-        !live.contains(bridge) || alive.iter().any(|(available, _)| available == bridge)
-    });
+    retain_probe_observations(&mut probed, live, &alive);
     // note_probe_round must see the original pre-retain probe results.
     let probed_alive = alive.clone();
     let allowed = preferred_transport_bridges(
@@ -163,7 +165,7 @@ pub(crate) async fn build_tor_settings_preserving_live(
             .collect::<Vec<_>>(),
         cfg,
     );
-    alive.retain(|(bridge, _)| allowed.contains(bridge));
+    retain_allowed_alive(&mut alive, &allowed);
     let candidates: Vec<_> = alive.iter().map(|(bridge, _)| bridge.clone()).collect();
 
     // Update bridge health (success resets, failure bumps once per window)
@@ -177,8 +179,7 @@ pub(crate) async fn build_tor_settings_preserving_live(
         update_health_and_prune(config_path, &probed, &probed_alive, cfg, None, &candidates).await
     {
         // Full-circuit and channel evidence outrank repeated TCP probes.
-        alive.retain(|(bridge, _)| ranked.contains(bridge));
-        alive.sort_by_key(|(bridge, _)| ranked.iter().position(|b| b == bridge));
+        retain_and_rank_alive(&mut alive, &ranked);
     }
 
     if alive.is_empty() {
@@ -300,11 +301,53 @@ pub(crate) async fn probe_measured(
         },
     )
     .await;
-    let measured = bridges
-        .into_iter()
-        .filter(|bridge| !round.unmeasured.contains(bridge))
-        .collect();
+    let measured = filter_measured(bridges, &round.unmeasured);
     (measured, round.alive)
+}
+
+fn filter_measured(bridges: Vec<BridgeLine>, unmeasured: &[BridgeLine]) -> Vec<BridgeLine> {
+    let unmeasured_keys: HashSet<BridgeIdentity> = unmeasured.iter().map(bridge_identity).collect();
+    bridges
+        .into_iter()
+        .filter(|bridge| !unmeasured_keys.contains(&bridge_identity(bridge)))
+        .collect()
+}
+
+fn retain_probe_observations(
+    probed: &mut Vec<BridgeLine>,
+    live: &[BridgeLine],
+    alive: &[(BridgeLine, Duration)],
+) {
+    let live_keys: HashSet<BridgeIdentity> = live.iter().map(bridge_identity).collect();
+    let alive_keys: HashSet<BridgeIdentity> = alive
+        .iter()
+        .map(|(bridge, _)| bridge_identity(bridge))
+        .collect();
+    probed.retain(|bridge| {
+        let key = bridge_identity(bridge);
+        !live_keys.contains(&key) || alive_keys.contains(&key)
+    });
+}
+
+fn retain_allowed_alive(alive: &mut Vec<(BridgeLine, Duration)>, allowed: &[BridgeLine]) {
+    let allowed_keys: HashSet<BridgeIdentity> = allowed.iter().map(bridge_identity).collect();
+    alive.retain(|(bridge, _)| allowed_keys.contains(&bridge_identity(bridge)));
+}
+
+fn retain_and_rank_alive(alive: &mut Vec<(BridgeLine, Duration)>, ranked: &[BridgeLine]) {
+    let mut rank_by_identity = HashMap::with_capacity(ranked.len());
+    for (rank, bridge) in ranked.iter().enumerate() {
+        rank_by_identity
+            .entry(bridge_identity(bridge))
+            .or_insert(rank);
+    }
+    alive.retain(|(bridge, _)| rank_by_identity.contains_key(&bridge_identity(bridge)));
+    alive.sort_by_cached_key(|(bridge, _)| {
+        rank_by_identity
+            .get(&bridge_identity(bridge))
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
 }
 
 /// Choose the small, latency-sensitive startup pool from the persisted
@@ -745,5 +788,66 @@ mod tests {
         assert_eq!(fallback_probe_pool(true, &preferred, true), None);
         // A still-live active slice never triggers the fallback.
         assert_eq!(fallback_probe_pool(false, &preferred, false), None);
+    }
+
+    #[test]
+    fn probe_indexes_keep_full_endpoint_identity_and_rank_order() {
+        let old_webtunnel = webtunnel_variant("/old");
+        let new_webtunnel = webtunnel_variant("/new");
+        let old_obfs4 = obfs4_variant(CERT_OLD);
+        let new_obfs4 = obfs4_variant(CERT_NEW);
+
+        let measured = filter_measured(
+            vec![
+                old_webtunnel.clone(),
+                new_webtunnel.clone(),
+                old_obfs4.clone(),
+                new_obfs4.clone(),
+            ],
+            &[old_webtunnel.clone(), old_obfs4.clone()],
+        );
+        assert_eq!(measured, vec![new_webtunnel.clone(), new_obfs4.clone()]);
+
+        let mut probed = vec![old_webtunnel.clone(), new_webtunnel.clone()];
+        retain_probe_observations(
+            &mut probed,
+            std::slice::from_ref(&old_webtunnel),
+            &[(new_webtunnel.clone(), Duration::from_millis(1))],
+        );
+        assert_eq!(probed, vec![new_webtunnel.clone()]);
+
+        let mut allowed = vec![
+            (old_webtunnel.clone(), Duration::from_millis(4)),
+            (new_webtunnel.clone(), Duration::from_millis(4)),
+        ];
+        retain_allowed_alive(&mut allowed, std::slice::from_ref(&new_webtunnel));
+        assert_eq!(allowed.len(), 1);
+        assert_eq!(allowed[0].0, new_webtunnel);
+
+        let mut ranked = vec![
+            (old_obfs4.clone(), Duration::from_millis(2)),
+            (new_obfs4.clone(), Duration::from_millis(2)),
+        ];
+        retain_and_rank_alive(&mut ranked, &[new_obfs4.clone(), old_obfs4.clone()]);
+        assert_eq!(ranked[0].0, new_obfs4);
+        assert_eq!(ranked[1].0, old_obfs4);
+
+        let mut duplicate = vec![
+            (new_obfs4.clone(), Duration::from_millis(1)),
+            (old_obfs4.clone(), Duration::from_millis(9)),
+            (old_obfs4.clone(), Duration::from_millis(3)),
+        ];
+        retain_and_rank_alive(&mut duplicate, &[old_obfs4.clone(), new_obfs4, old_obfs4]);
+        assert_eq!(
+            duplicate
+                .iter()
+                .map(|(_, latency)| *latency)
+                .collect::<Vec<_>>(),
+            vec![
+                Duration::from_millis(9),
+                Duration::from_millis(3),
+                Duration::from_millis(1)
+            ]
+        );
     }
 }
