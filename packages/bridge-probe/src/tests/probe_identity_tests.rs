@@ -1,6 +1,9 @@
 use crate::probe::*;
 use bridge_line::BridgeLine;
 
+const CERT_OLD: &str = "EREREREREREREREREREREREREiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIg";
+const CERT_NEW: &str = "EREREREREREREREREREREREREzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMw";
+
 #[test]
 fn webtunnel_identity_from_url() {
     let bridge: BridgeLine = "webtunnel 9.9.9.9:443 1111111111111111111111111111111111111111 \
@@ -116,6 +119,21 @@ fn non_webtunnel_has_no_identity() {
             .parse()
             .unwrap();
     assert_eq!(webtunnel_endpoint_identity(&bridge), None);
+}
+
+#[test]
+fn bridge_identity_distinguishes_obfs4_cert_rotation() {
+    let old: BridgeLine = format!(
+        "obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert={CERT_OLD} iat-mode=0"
+    )
+    .parse()
+    .unwrap();
+    let new: BridgeLine = format!(
+        "obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert={CERT_NEW} iat-mode=0"
+    )
+    .parse()
+    .unwrap();
+    assert_ne!(bridge_identity(&old), bridge_identity(&new));
 }
 
 #[test]

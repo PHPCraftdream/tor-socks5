@@ -1,5 +1,8 @@
 use super::*;
 
+const CERT_OLD: &str = "EREREREREREREREREREREREREiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIg";
+const CERT_NEW: &str = "EREREREREREREREREREREREREzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMw";
+
 #[test]
 fn default_listen_address_is_loopback_1080() {
     let cfg = Config::default();
@@ -98,21 +101,86 @@ log.targets.other: warn
 }
 
 #[test]
-fn bridges_parsed_dedupes_by_transport_addr_fingerprint() {
+fn bridges_parsed_keeps_rotated_certs_and_first_order() {
     let cfg = BridgesConfig {
         lines: vec![
-            "obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA iat-mode=0".into(),
-            // Same key, different params — counts as a duplicate.
-            "obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=BBB iat-mode=1".into(),
-            // Different addr — distinct.
-            "obfs4 5.6.7.8:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=CCC iat-mode=0".into(),
+            format!("obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert={CERT_OLD} iat-mode=0"),
+            // A rotated obfs4 certificate is a distinct endpoint.
+            format!("obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert={CERT_NEW} iat-mode=0"),
+            // An exact repeat is still a duplicate.
+            format!("obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert={CERT_OLD} iat-mode=0"),
+            format!("obfs4 5.6.7.8:443 0123456789ABCDEF0123456789ABCDEF01234567 cert={CERT_OLD} iat-mode=0"),
         ],
         sources: Vec::new(),
         ..Default::default()
     };
     let parsed = cfg.parsed().expect("parses");
-    assert_eq!(parsed.bridges.len(), 2);
+    assert_eq!(parsed.bridges.len(), 3);
     assert_eq!(parsed.duplicates, 1);
+    assert_eq!(
+        parsed.bridges[0].params.get("cert").map(String::as_str),
+        Some(CERT_OLD)
+    );
+    assert_eq!(
+        parsed.bridges[1].params.get("cert").map(String::as_str),
+        Some(CERT_NEW)
+    );
+    assert_eq!(parsed.bridges[2].addr.to_string(), "5.6.7.8:443");
+}
+
+#[test]
+fn bridges_parsed_keeps_webtunnel_carrier_variants() {
+    let cfg = BridgesConfig {
+        lines: vec![
+            "webtunnel 192.0.2.3:443 1111111111111111111111111111111111111111 url=https://edge.example/old addr=198.51.100.10:443 servername=old.example ver=0.0.3".into(),
+            "webtunnel 192.0.2.3:443 1111111111111111111111111111111111111111 url=https://edge.example/new addr=198.51.100.10:443 servername=old.example ver=0.0.3".into(),
+            "webtunnel 192.0.2.3:443 1111111111111111111111111111111111111111 url=https://edge.example/new addr=198.51.100.11:443 servername=new.example ver=0.0.3".into(),
+            // Only the exact first line is a duplicate.
+            "webtunnel 192.0.2.3:443 1111111111111111111111111111111111111111 url=https://edge.example/old addr=198.51.100.10:443 servername=old.example ver=0.0.3".into(),
+        ],
+        sources: Vec::new(),
+        ..Default::default()
+    };
+    let parsed = cfg.parsed().expect("parses");
+    assert_eq!(parsed.bridges.len(), 3);
+    assert_eq!(parsed.duplicates, 1);
+    assert!(parsed.bridges[0].to_string().contains("/old"));
+    assert!(parsed.bridges[1].to_string().contains("/new"));
+    assert!(parsed.bridges[2].to_string().contains("198.51.100.11:443"));
+}
+
+#[test]
+fn bridge_identity_survives_save_load_and_parsed() {
+    let mut cfg = Config::default();
+    cfg.bridges.lines = vec![
+        format!("obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert={CERT_OLD} iat-mode=0"),
+        format!("obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert={CERT_NEW} iat-mode=0"),
+        "webtunnel 192.0.2.3:443 1111111111111111111111111111111111111111 url=https://edge.example/old servername=old.example ver=0.0.3".into(),
+        "webtunnel 192.0.2.3:443 1111111111111111111111111111111111111111 url=https://edge.example/new servername=old.example ver=0.0.3".into(),
+    ];
+    let path = std::env::temp_dir().join(format!(
+        "tor-socks5-proxy-config-{}-identity.ktav",
+        std::process::id()
+    ));
+    cfg.write(&path).expect("save config");
+    let loaded = Config::load_with_override(Some(&path))
+        .expect("load config")
+        .into_config();
+    let _ = std::fs::remove_file(&path);
+
+    let parsed = loaded.bridges.parsed().expect("parse loaded config");
+    assert_eq!(parsed.bridges.len(), 4);
+    assert_eq!(parsed.duplicates, 0);
+    assert_eq!(
+        parsed.bridges[0].params.get("cert").map(String::as_str),
+        Some(CERT_OLD)
+    );
+    assert_eq!(
+        parsed.bridges[1].params.get("cert").map(String::as_str),
+        Some(CERT_NEW)
+    );
+    assert!(parsed.bridges[2].to_string().contains("/old"));
+    assert!(parsed.bridges[3].to_string().contains("/new"));
 }
 
 #[test]

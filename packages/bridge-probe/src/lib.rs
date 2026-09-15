@@ -39,10 +39,10 @@ pub use dns::{
     DnsHint, ResolverPolicy, DNS_HINT_PREFIX,
 };
 pub use probe::{
-    probe_all, probe_all_with_policy, probe_and_sort, probe_and_sort_with_policy, probe_one,
-    probe_one_with_policy, probe_round_with_policy, probe_until, probe_until_with_policy,
-    resolve_addrs, usable_for_tor, webtunnel_endpoint_identity, Outcome, ProbeRound, Report,
-    WebtunnelEndpointIdentity,
+    bridge_identity, probe_all, probe_all_with_policy, probe_and_sort, probe_and_sort_with_policy,
+    probe_one, probe_one_with_policy, probe_round_with_policy, probe_until,
+    probe_until_with_policy, resolve_addrs, usable_for_tor, webtunnel_endpoint_identity,
+    BridgeIdentity, Outcome, ProbeRound, Report, WebtunnelEndpointIdentity,
 };
 
 #[cfg(test)]

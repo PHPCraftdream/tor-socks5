@@ -284,6 +284,41 @@ pub struct WebtunnelEndpointIdentity {
     pub use_tls: bool,
 }
 
+/// Full identity used when bridge lines are deduplicated or keyed in a
+/// persistent store. The obfs4 certificate is part of the endpoint identity:
+/// certificate rotation keeps the relay address and fingerprint unchanged but
+/// changes the credential needed to complete the transport handshake.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BridgeIdentity {
+    /// Pluggable transport name, if present.
+    pub transport: Option<String>,
+    /// Bridge-line relay address.
+    pub addr: SocketAddr,
+    /// Relay fingerprint, if present.
+    pub fingerprint: Option<String>,
+    /// Canonical WebTunnel carrier identity, if this is a valid WebTunnel line.
+    pub webtunnel: Option<WebtunnelEndpointIdentity>,
+    /// `cert=` transport credential, if present.
+    pub cert: Option<String>,
+}
+
+/// Build the canonical identity shared by bridge-list consumers.
+///
+/// The first three fields retain the ordinary bridge-line identity. WebTunnel
+/// lines add the complete carrier target, while `cert=` distinguishes obfs4
+/// key rotations. Invalid WebTunnel parameters deliberately retain the base
+/// identity and certificate, matching the fallback behavior of the existing
+/// WebTunnel helper instead of silently dropping a line.
+pub fn bridge_identity(bridge: &BridgeLine) -> BridgeIdentity {
+    BridgeIdentity {
+        transport: bridge.transport.clone(),
+        addr: bridge.addr,
+        fingerprint: bridge.fingerprint.clone(),
+        webtunnel: webtunnel_endpoint_identity(bridge),
+        cert: bridge.params.get("cert").cloned(),
+    }
+}
+
 /// Canonical WebTunnel carrier identity for dedup/pool keys, computed via
 /// [`PreparedTarget`] so dedup and probing can never disagree about what
 /// counts as "the same connection". See [`WebtunnelEndpointIdentity`].

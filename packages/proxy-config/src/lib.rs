@@ -9,13 +9,12 @@
 
 use std::collections::HashSet;
 use std::io::Write;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 use anyhow::{Context, Result};
 use bridge_line::BridgeLine;
-use bridge_probe::usable_for_tor;
+use bridge_probe::{bridge_identity, usable_for_tor, BridgeIdentity};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
@@ -576,8 +575,8 @@ pub struct ParsedBridges {
 
 impl BridgesConfig {
     /// Parse the raw config strings into `BridgeLine`s, dropping any
-    /// duplicates by `(transport, addr, fingerprint)`. The first
-    /// occurrence wins; subsequent ones contribute to `duplicates`.
+    /// duplicates by the full [`BridgeIdentity`]. The first occurrence wins;
+    /// subsequent ones contribute to `duplicates`.
     ///
     /// `lines` may also contain DNS-hint directives (see
     /// [`bridge_probe::DNS_HINT_PREFIX`]) interleaved with bridge lines --
@@ -586,7 +585,7 @@ impl BridgesConfig {
     pub fn parsed(&self) -> Result<ParsedBridges> {
         let mut bridges = Vec::with_capacity(self.lines.len());
         let mut hint_lines: Vec<&str> = Vec::new();
-        let mut seen: HashSet<(Option<String>, SocketAddr, Option<String>)> = HashSet::new();
+        let mut seen: HashSet<BridgeIdentity> = HashSet::new();
         let mut duplicates = 0usize;
         let mut rejected = 0usize;
         for (idx, line) in self.lines.iter().enumerate() {
@@ -601,11 +600,7 @@ impl BridgesConfig {
                 rejected += 1;
                 continue;
             }
-            let key = (
-                parsed.transport.clone(),
-                parsed.addr,
-                parsed.fingerprint.clone(),
-            );
+            let key = bridge_identity(&parsed);
             if seen.insert(key) {
                 bridges.push(parsed);
             } else {
