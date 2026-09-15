@@ -1,4 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::dns_invalidation::CacheIdentity;
@@ -272,8 +273,12 @@ type ObservedDohWaveResult = Result<(Vec<IpAddr>, Duration, Option<CacheIdentity
 /// TS7-06: keys are `(hostname, network generation)`, so a lookup started
 /// before a `flush_dns_cache` can never be joined by (or publish into) the
 /// post-flush world.
-type InflightKey = (String, u64);
+type InflightKey = (Arc<str>, u64);
 type InflightCell = tokio::sync::OnceCell<ObservedDohWaveResult>;
+
+fn inflight_key(host: &str, generation: u64) -> InflightKey {
+    (Arc::<str>::from(host), generation)
+}
 
 struct InflightDohRegistry {
     entries: std::collections::HashMap<InflightKey, std::sync::Weak<InflightCell>>,
@@ -360,7 +365,7 @@ async fn coalesced_doh_lookup_observed(query: &str) -> ObservedDohWaveResult {
     let registry = INFLIGHT_DOH.get_or_init(|| std::sync::Mutex::new(InflightDohRegistry::new()));
     let cell: std::sync::Arc<tokio::sync::OnceCell<ObservedDohWaveResult>> = {
         let mut map = registry.lock().unwrap_or_else(|p| p.into_inner());
-        let key = (query.to_owned(), gen);
+        let key = inflight_key(query, gen);
         if let Some(existing) = map.entries.get(&key).and_then(std::sync::Weak::upgrade) {
             existing
         } else {
@@ -420,7 +425,7 @@ fn remove_finished_inflight_entry(
     cell: &std::sync::Arc<tokio::sync::OnceCell<ObservedDohWaveResult>>,
 ) {
     let mut map = registry.lock().unwrap_or_else(|p| p.into_inner());
-    let key = (query.to_owned(), gen);
+    let key = inflight_key(query, gen);
     if map
         .entries
         .get(&key)
@@ -561,7 +566,7 @@ pub(crate) fn inflight_doh_contains_host(host: &str) -> bool {
                 .unwrap_or_else(|p| p.into_inner())
                 .entries
                 .keys()
-                .any(|(h, _)| h == host)
+                .any(|(h, _)| h.as_ref() == host)
         })
         .unwrap_or(false)
 }
@@ -744,17 +749,49 @@ mod registry_tests {
     }
 
     #[test]
+    fn live_sweep_reuses_shared_hostname_allocation() {
+        let mut registry = InflightDohRegistry::new();
+        let key = (Arc::<str>::from("live-identity.test.invalid"), 0);
+        let _cell = add_entry(&mut registry, key.clone(), true).expect("live cell is retained");
+        assert_eq!(
+            sweep_inflight_dead_entries(&mut registry),
+            INFLIGHT_SWEEP_BUDGET
+        );
+        assert!(Arc::ptr_eq(
+            &key.0,
+            &registry.sweep_queue.front().unwrap().0
+        ));
+        assert!(Arc::ptr_eq(
+            &key.0,
+            &registry.queued_keys.get(&key).unwrap().0
+        ));
+        assert!(Arc::ptr_eq(
+            &key.0,
+            &registry.entries.get_key_value(&key).unwrap().0 .0
+        ));
+        assert_eq!(registry.sweep_queue.len(), registry.queued_keys.len());
+    }
+
+    #[test]
     fn fifo_sweep_visits_bound_and_reaches_dead_entries_behind_live_prefix() {
         let mut registry = InflightDohRegistry::new();
         let mut live_cells = Vec::new();
         for i in 0..=INFLIGHT_SWEEP_BUDGET {
             live_cells.push(
-                add_entry(&mut registry, (format!("live-{i}"), 0), true)
-                    .expect("live cell is retained"),
+                add_entry(
+                    &mut registry,
+                    (Arc::<str>::from(format!("live-{i}")), 0),
+                    true,
+                )
+                .expect("live cell is retained"),
             );
         }
         for i in 0..3 {
-            let _ = add_entry(&mut registry, (format!("dead-{i}"), 0), false);
+            let _ = add_entry(
+                &mut registry,
+                (Arc::<str>::from(format!("dead-{i}")), 0),
+                false,
+            );
         }
 
         assert_eq!(
@@ -762,7 +799,10 @@ mod registry_tests {
             INFLIGHT_SWEEP_BUDGET
         );
         assert_eq!(registry.entries.len(), INFLIGHT_SWEEP_BUDGET + 4);
-        assert!(registry.entries.keys().any(|(host, _)| host == "dead-0"));
+        assert!(registry
+            .entries
+            .keys()
+            .any(|(host, _)| host.as_ref() == "dead-0"));
         assert_eq!(registry.sweep_queue.len(), registry.queued_keys.len());
 
         assert_eq!(
@@ -775,7 +815,7 @@ mod registry_tests {
             .any(|(host, _)| host.starts_with("dead-")));
         assert_eq!(registry.entries.len(), INFLIGHT_SWEEP_BUDGET + 1);
 
-        let replacement_key = ("live-0".to_owned(), 0);
+        let replacement_key = (Arc::<str>::from("live-0"), 0);
         registry.entries.remove(&replacement_key);
         let replacement = add_entry(&mut registry, replacement_key.clone(), true)
             .expect("replacement cell is retained");
