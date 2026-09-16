@@ -116,6 +116,54 @@ pub(crate) fn scratch_dir(config_path: &std::path::Path, name: &str) -> std::pat
         .join(name)
 }
 
+/// Per-process monotonic sequence for scratch directory names.
+static SCRATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Guaranteed-fresh per-call scratch dir: `<base>/<kind>-<pid>-<seq>` created
+/// EXCLUSIVELY. The pid disambiguates live processes; a stale dir left by a
+/// previous run of the same pid collides with an early sequence value and is
+/// skipped because `create_dir` refuses to share — each retry advances the
+/// monotonic counter, so any finite set of stale names is exhausted and two
+/// calls can never share a directory. Real setup errors surface as `Err`.
+pub(crate) fn batch_scratch_dir(
+    config_path: Option<&std::path::Path>,
+    kind: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    let base = match config_path {
+        Some(config_path) => scratch_dir(config_path, kind),
+        None => std::path::Path::new("verify-scratch").join(kind),
+    };
+    create_exclusive_scratch(&base, kind, &SCRATCH_SEQ)
+}
+
+/// Core allocator with an injectable counter for deterministic tests.
+pub(crate) fn create_exclusive_scratch(
+    base: &std::path::Path,
+    kind: &str,
+    counter: &std::sync::atomic::AtomicU64,
+) -> std::io::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(base)?;
+    loop {
+        let seq = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let candidate = base.join(format!("{kind}-{}-{seq}", std::process::id()));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            // Exclusive creation: an existing dir OR file at the path means a
+            // stale entry, never a shareable directory — try the next value.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+/// The exact TOR_PT_STATE_LOCATION byte token (see
+/// bridge_verify_core::pt_reap::pt_state_location_token); an empty token makes
+/// the sweep a no-op (it is always invoked).
+pub(super) fn pt_kill_token(check_dir: &std::path::Path, pt_binary: &std::path::Path) -> Vec<u8> {
+    bridge_verify_core::pt_reap::pt_state_location_token(check_dir, pt_binary)
+        .into_os_string()
+        .into_encoded_bytes()
+}
+
 /// Thin delegate to the shared implementation in `bridge-verify-core`, keeping
 /// this crate's historical `"bridge-verify: "` log prefix. See the shared
 /// `snapshot_cache_dir` doc for the full contract.
@@ -148,25 +196,17 @@ pub(super) fn snapshot_cache_dir(src: &std::path::Path, dest: &std::path::Path) 
 ///   reason to do. Dropping every Arc that points at it, or shutting the whole runtime down,
 ///   does nothing to wake that thread up; confirmed on device, the child stayed alive minutes
 ///   after the runtime it belonged to was gone. So this also reaps its own PT children
-///   explicitly, by *ownership* rather than time of appearance: per batch,
-///   [`pt_reap::create_kill_marker`] makes a uniquely named executable copy of the PT binary
-///   (hard link where possible, copy otherwise) inside the batch's scratch dir (`scratch_dir`
-///   under the config directory -- the only writable place under SELinux) and registers its
-///   file name in a module-level FIFO registry. The marker name is sized to exactly 15 bytes
-///   ("pt-" + 12 hex) so the kernel's `comm` truncation (TASK_COMM_LEN = 15) keeps the whole
-///   unique id visible. Checks are launched with that copy as their effective `pt_binary`, so
-///   the PT child `tor_ptmgr` spawns from it is identifiable by `comm` alone; after each check
-///   [`pt_reap::kill_marked_children`] `SIGKILL`s only own children whose `comm` matches a
-///   registered marker. An earlier version snapshotted child PIDs *and their kernel start
-///   times* before each check and killed every still-alive PT-named child absent from the
-///   baseline -- but the main engine's PT transport can RESTART inside the check window (new
-///   pid, new start_time, same binary name), and that diff killed it, taking the user's live
-///   tunnels down with the cleanup. A restarted main PT child carries the normal binary name
-///   and can never match a marker. See `docs/stability-review-2026-09-08.md` section 2 for the
-///   full ownership analysis. Marker-creation failure disables reaping for the batch on
-///   purpose (never a diff fallback: killing collateral is worse than a leak). Tradeoffs: one
-///   link/copy per batch (cheap); the registry never shrinks mid-process (capped at 128 names,
-///   FIFO eviction); marker files are wiped with the batch's scratch dir.
+///   explicitly, by *ownership* rather than time of appearance: each check launches the
+///   ORIGINAL PT binary path (never a copy: Android W^X forbids executing a scratch copy --
+///   observed `PermissionDenied` os error 13 on MIUI), and tor-ptmgr passes that check a
+///   `TOR_PT_STATE_LOCATION` derived from the check's own state dir, so each check's PT child
+///   carries a *unique* exact byte token in `/proc/<pid>/environ` (see
+///   [`pt_kill_token`]). After a check's runtime is shut down,
+///   [`pt_reap::kill_own_state_children`] `SIGKILL`s the children whose environ carries that
+///   exact token. Fail closed: unprovable ownership is never killed (and warned about); there
+///   is no global registry, so overlapping batches, sibling parallel checks, and the main
+///   engine's PT can never match -- their state locations differ by construction.
+///   See `docs/stability-review-2026-09-08.md` section 2 for the ownership analysis.
 /// - **A cache *snapshot*, not the live directory.** `tor_dirmgr`'s storage is a single sqlite
 ///   file, opened with its own fresh `rusqlite::Connection` here, completely independent of the
 ///   main engine's already-open connection to that same file. Sqlite's default `busy_timeout`
@@ -191,38 +231,20 @@ pub(crate) fn verify_bridges_sequential(
 ) {
     let cache_dir = shared_cache_snapshot(live_cache_dir, scratch_base);
 
-    // Ownership marker for this batch: the uniquely named executable copy the
-    // checks below launch instead of the shared PT binary, so their spawned
-    // PT children are identifiable as OURS by `comm` alone (see `pt_reap`).
-    // Created only when a PT is actually in play. If creation fails, no
-    // diff-based fallback runs on purpose: killing collateral (the main
-    // engine's PT) is worse than a leak, so reaping is simply disabled for
-    // this batch.
-    let needs_pt = pt_binary.is_some() && bridges.iter().any(|b| b.transport.is_some());
-    let kill_marker = if needs_pt {
-        pt_reap::create_kill_marker(pt_binary.as_ref().expect("checked above"), scratch_base)
-    } else {
-        None
-    };
-    let kill_marker_path = kill_marker.as_ref().map(|name| scratch_base.join(name));
-    if needs_pt && kill_marker.is_none() {
-        warn!(
-            "bridge-verify: no PT ownership marker could be created; \
-             leaked-child reaping is disabled for this batch"
-        );
-    }
-
     for (idx, bridge) in bridges.into_iter().enumerate() {
         let check_dir = scratch_base.join(idx.to_string());
+        // The ORIGINAL PT executable path, never a copy: Android W^X makes a
+        // scratch copy unexecutable (PermissionDenied os error 13 on MIUI).
+        // Ownership of the spawned PT child rests on its unique per-check
+        // state-location token, established inside `check_one_bridge`.
         let result = check_one_bridge(
             &bridge,
             &check_dir,
             cache_dir.clone(),
-            kill_marker_path.clone().or_else(|| pt_binary.clone()),
+            pt_binary.clone(),
             bootstrap_timeout,
             probe_timeout,
         );
-        pt_reap::kill_marked_children();
         on_result(&bridge, result);
     }
 }
@@ -232,13 +254,11 @@ pub(crate) fn verify_bridges_sequential(
 /// often mostly-dead bridges and checking them one at a time means the user watches the whole
 /// batch's timeout budget serialize even though each check is fully independent.
 ///
-/// The `pt_reap` marker/kill (see `verify_bridges_sequential`'s doc for why it exists at all)
-/// brackets the *whole* batch here instead of each bridge individually: the kill runs once,
-/// after `std::thread::scope` joins, because every marker-named child is a verify child --
-/// including ones still in use by concurrent checks -- so killing after one thread's check
-/// finishes would SIGKILL another thread's still-needed PT child. Correctness costs a little
-/// promptness -- a leaked helper from an early-finishing check survives until the slowest
-/// check in the batch completes, not until its own check does.
+/// PT-child reaping needs no batch-level bracket here: each check's ownership token is unique
+/// per check dir, so the per-check sweep inside [`execute_bridge_check`] (driven by
+/// [`check_one_bridge`]'s runner wiring) is safe mid-batch -- a thread's sweep cannot match another thread's still-running child (different check dir,
+/// different `TOR_PT_STATE_LOCATION`). That restores the promptness the old one-sweep-after-join
+/// scheme gave up: a leaked helper is reaped when ITS check ends, not when the slowest one does.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn verify_bridges_parallel(
     live_cache_dir: &std::path::Path,
@@ -252,24 +272,6 @@ pub(crate) fn verify_bridges_parallel(
 ) {
     let cache_dir = shared_cache_snapshot(live_cache_dir, scratch_base);
 
-    // Same per-batch ownership marker as the sequential path, computed BEFORE `bridges` is
-    // moved into the queue (and before any thread runs). See `verify_bridges_sequential` and
-    // the `pt_reap` module docs for why creation failure disables reaping instead of falling
-    // back to a diff-based kill.
-    let needs_pt = pt_binary.is_some() && bridges.iter().any(|b| b.transport.is_some());
-    let kill_marker = if needs_pt {
-        pt_reap::create_kill_marker(pt_binary.as_ref().expect("checked above"), scratch_base)
-    } else {
-        None
-    };
-    let kill_marker_path = kill_marker.as_ref().map(|name| scratch_base.join(name));
-    if needs_pt && kill_marker.is_none() {
-        warn!(
-            "bridge-verify: no PT ownership marker could be created; \
-             leaked-child reaping is disabled for this batch"
-        );
-    }
-
     let queue = Mutex::new(bridges.into_iter().enumerate());
 
     std::thread::scope(|scope| {
@@ -277,18 +279,19 @@ pub(crate) fn verify_bridges_parallel(
             let queue = &queue;
             let cache_dir = cache_dir.clone();
             let pt_binary = pt_binary.clone();
-            let kill_marker_path = kill_marker_path.clone();
             let on_result = &on_result;
             scope.spawn(move || loop {
                 let Some((idx, bridge)) = queue.lock().unwrap().next() else {
                     break;
                 };
                 let check_dir = scratch_base.join(idx.to_string());
+                // The ORIGINAL PT executable path, never a marker copy (see
+                // `verify_bridges_sequential` for why copies are off-limits).
                 let result = check_one_bridge(
                     &bridge,
                     &check_dir,
                     cache_dir.clone(),
-                    kill_marker_path.clone().or_else(|| pt_binary.clone()),
+                    pt_binary.clone(),
                     bootstrap_timeout,
                     probe_timeout,
                 );
@@ -296,11 +299,6 @@ pub(crate) fn verify_bridges_parallel(
             });
         }
     });
-
-    // One kill sweep for the WHOLE batch, after the scope joins: every marker-named child is
-    // a verify child, including ones still in use by concurrent checks, so killing after one
-    // thread's check would SIGKILL another thread's still-needed PT child.
-    pt_reap::kill_marked_children();
 }
 
 /// One-time cache-dir snapshot shared by every check in a batch -- see
@@ -313,11 +311,131 @@ pub(super) fn shared_cache_snapshot(
     snapshot_cache_dir(live_cache_dir, &cache_snapshot).then_some(cache_snapshot)
 }
 
-/// Checks exactly one bridge for real end-to-end reachability: a throwaway single-thread tokio
-/// runtime, `arti_wrapper::TorTunnel::verify_bridge_reachable`, then an explicit shutdown. Does
-/// *not* reap PT processes itself -- see [`verify_bridges_sequential`] and
-/// [`verify_bridges_parallel`], which bracket their own `pt_reap` marker-create/kill around
-/// one or more calls to this, at different granularity.
+/// Real check lifecycle: fresh current-thread runtime, future polled to
+/// completion (timeouts live inside the verification future), bounded
+/// `shutdown_timeout` on EVERY exit — success, error, and panic caught here
+/// and surfaced as Err — so cleanup never relies on an implicit Runtime::drop.
+pub(super) fn drive_check_future<E>(
+    fut: impl std::future::Future<Output = std::result::Result<Duration, E>>,
+) -> std::result::Result<Duration, String>
+where
+    E: std::fmt::Display,
+{
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("failed to create runtime: {e}"))?;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.block_on(fut)));
+    rt.shutdown_timeout(VERIFY_BRIDGE_RUNTIME_SHUTDOWN_GRACE);
+    match outcome {
+        Ok(result) => result.map_err(|e| e.to_string()),
+        Err(payload) => {
+            tracing::warn!(panic = ?payload, "bridge check panicked; runtime shut down");
+            Err("bridge check panicked".to_owned())
+        }
+    }
+}
+
+/// Runner for one check: production builds the throwaway current-thread
+/// Runner for one check: production wraps the real verification in
+/// [`drive_check_future`]. Injected so host tests can capture the
+/// constructed config and observe ordering.
+pub(super) type CheckRun<'a> =
+    dyn Fn(arti_wrapper::BridgeCheckSettings) -> std::result::Result<Duration, String> + 'a;
+/// Owned-child cleanup backend (production: `pt_reap::kill_own_state_children`).
+pub(super) type ChildReap<'a> = dyn Fn(&[u8], &[u8]) -> pt_reap::KillReport + 'a;
+
+/// The two seams [`execute_bridge_check`] drives, in order: `run` then (via
+/// the cleanup guard) `reap`.
+pub(super) struct CheckRunners<'a> {
+    pub run: &'a CheckRun<'a>,
+    pub reap: &'a ChildReap<'a>,
+}
+
+/// Runs the owned-child sweep and scratch removal EXACTLY ONCE, when dropped:
+/// after the runner returned (runtime already shut down) or after an unwind
+/// dropped the runtime — so teardown always precedes cleanup. Panic-free body.
+struct CheckCleanupGuard<'a> {
+    check_dir: &'a std::path::Path,
+    token: &'a [u8],
+    pt_name: &'a [u8],
+    reap: &'a ChildReap<'a>,
+}
+impl Drop for CheckCleanupGuard<'_> {
+    fn drop(&mut self) {
+        let report = (self.reap)(self.token, self.pt_name);
+        if report.killed > 0 || report.already_gone > 0 {
+            tracing::debug!(
+                killed = report.killed,
+                already_gone = report.already_gone,
+                "reaped leaked PT children by state-location token"
+            );
+        }
+        if !report.failures.is_empty() {
+            tracing::warn!(count = report.failures.len(), failures = ?report.failures,
+                "PT child cleanup failure; leak possible (fail-closed, no numeric-kill fallback)");
+        }
+        let _ = std::fs::remove_dir_all(self.check_dir);
+    }
+}
+
+/// Runs one bridge check with lifecycle guarantees: the runner owns
+/// bootstrap/probe/timeout (and the runtime shutdown, via [`drive_check_future`]),
+/// the guard owns cleanup, and a panic in the runner is caught, surfaced as a
+/// check failure, and STILL cleaned up before the guard's sweep runs.
+pub(super) fn execute_bridge_check(
+    bridge: &bridge_line::BridgeLine,
+    check_dir: &std::path::Path,
+    cache_dir: Option<std::path::PathBuf>,
+    pt_binary: Option<std::path::PathBuf>,
+    runners: &CheckRunners<'_>,
+) -> std::result::Result<Duration, String> {
+    if bridge.transport.is_some() && pt_binary.is_none() {
+        return Err("bridge requires a pluggable transport, but none is available".to_owned());
+    }
+    // Derive the check's identity BEFORE `pt_binary` moves into the settings.
+    let kill_token = pt_binary
+        .as_ref()
+        .map(|pb| pt_kill_token(check_dir, pb))
+        .unwrap_or_default();
+    let pt_name = pt_binary
+        .as_ref()
+        .map(|pb| pt_reap::pt_binary_comm(pb))
+        .unwrap_or_default();
+    if let Err(e) = std::fs::create_dir_all(check_dir) {
+        return Err(format!("could not create scratch directory: {e}"));
+    }
+    // Held for its Drop.
+    let _check_cleanup = CheckCleanupGuard {
+        check_dir,
+        token: &kill_token,
+        pt_name: &pt_name,
+        reap: runners.reap,
+    };
+    let check = arti_wrapper::BridgeCheckSettings {
+        bridge: bridge.clone(),
+        pt_binary,
+        cache_dir,
+        state_dir: check_dir.to_path_buf(),
+    };
+    // AssertUnwindSafe: the closure owns only throwaway check state — there
+    // is no shared invariant to poison, and cleanup is token-based and
+    // revalidated, so resuming after a panic is safe.
+    let outcome =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || (runners.run)(check)));
+    let result = match outcome {
+        Ok(result) => result,
+        Err(payload) => {
+            tracing::warn!(panic = ?payload, "bridge check panicked; runtime dropped, cleanup continues");
+            Err("bridge check panicked".to_owned())
+        }
+    };
+    result // guard drops HERE, on every path
+}
+
+/// Checks exactly one bridge for real end-to-end reachability: production
+/// wiring around [`execute_bridge_check`], supplying the real runner
+/// ([`drive_check_future`]) and the real owned-child sweep.
 pub(super) fn check_one_bridge(
     bridge: &bridge_line::BridgeLine,
     check_dir: &std::path::Path,
@@ -326,258 +444,25 @@ pub(super) fn check_one_bridge(
     bootstrap_timeout: Duration,
     probe_timeout: Duration,
 ) -> std::result::Result<Duration, String> {
-    if bridge.transport.is_some() && pt_binary.is_none() {
-        return Err("bridge requires a pluggable transport, but none is available".to_owned());
-    }
-
-    if let Err(e) = std::fs::create_dir_all(check_dir) {
-        return Err(format!("could not create scratch directory: {e}"));
-    }
-
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(check_dir);
-            return Err(format!("failed to create runtime: {e}"));
-        }
-    };
-
-    let check = arti_wrapper::BridgeCheckSettings {
-        bridge: bridge.clone(),
-        pt_binary,
-        cache_dir,
-        state_dir: check_dir.to_path_buf(),
-    };
-    let result = rt.block_on(arti_wrapper::TorTunnel::verify_bridge_reachable(
-        check,
-        (engine::LIVE_PROBE_TARGET, engine::LIVE_PROBE_PORT),
-        bootstrap_timeout,
-        probe_timeout,
-    ));
-    rt.shutdown_timeout(VERIFY_BRIDGE_RUNTIME_SHUTDOWN_GRACE);
-
-    let _ = std::fs::remove_dir_all(check_dir);
-    result.map_err(|e| e.to_string())
-}
-
-/// First `TASK_COMM_LEN - 1` (15) bytes of `path`'s file name -- what Linux would report as the
-/// process's `comm` (field 2 of `/proc/<pid>/stat`, truncated by the kernel to exactly this) if
-/// it exec'd `path`. Used by [`reap_targets`] to compare each child's `comm` against the
-/// *registered marker* names -- a marker is a uniquely named copy WE created of the PT binary,
-/// so a `comm` match is proof of ownership, not of mere resemblance. An empty/parentless path
-/// yields an empty vec, which (together with the empty-registry rule) keeps the reap a no-op
-/// in the no-marker case.
-#[cfg_attr(all(not(target_os = "android"), not(test)), expect(dead_code))]
-fn pt_binary_comm(pt_binary: &std::path::Path) -> Vec<u8> {
-    #[cfg(unix)]
-    let name = pt_binary
-        .file_name()
-        .map(std::os::unix::ffi::OsStrExt::as_bytes)
-        .unwrap_or(&[])
-        .to_vec();
-    #[cfg(not(unix))]
-    let name = pt_binary
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned().into_bytes())
-        .unwrap_or_default();
-    name.into_iter().take(15).collect()
-}
-
-/// One live process as observed in `/proc` -- see the android `pt_reap::own_child_procs` for the
-/// source. Deliberately defined outside the cfg'd module so the pure selection logic below (and
-/// its tests) compile and run on host builds too.
-#[cfg_attr(all(not(target_os = "android"), not(test)), expect(dead_code))]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ChildProc {
-    pub pid: u32,
-    pub ppid: u32,
-    /// First 15 bytes of the executable's basename (kernel TASK_COMM_LEN truncation), from the
-    /// `comm` field of `/proc/<pid>/stat`. For a verify-spawned PT child this is the marker
-    /// name we registered -- the ownership proof.
-    pub comm: Vec<u8>,
-}
-
-/// Reaps the PT processes a throwaway verify client's arti client leaves running --
-/// see [`verify_bridges_sequential`]'s doc for why nothing short of an explicit kill reliably
-/// stops them. Ownership is marker-based, not time-of-appearance-based, so the pure parts
-/// (registry, kill decision) live in `bridge_verify_core::pt_reap` and are tested on every
-/// target; only the /proc snapshot, the marker file creation (48-bit-masked `comm`-sized
-/// naming, `create_dir_all`, chmod), and the `kill(2)` sweep are android-specific (host
-/// builds never spawn a real PT child, so there is nothing to reap).
-mod pt_reap {
-    use std::path::Path;
-
-    use super::ChildProc;
-
-    /// Creates a uniquely named executable copy of `pt_binary` inside
-    /// `scratch_base` and registers its file name. `scratch_base` must be the
-    /// batch's scratch dir (`scratch_dir` under the config directory -- the
-    /// only guaranteed-writable location under SELinux on Android, never
-    /// `std::env::temp_dir()`). Hard link first (shares the source inode, and
-    /// thus its SELinux label and executability), fall back to a full copy;
-    /// on unix the copy is made executable, because a non-executable marker
-    /// would fail the check itself -- and a copied marker may in any case be
-    /// denied exec on newer Android under W^X policy on some devices, in
-    /// which case the check itself fails visibly. Returns the marker FILE
-    /// NAME (not the path) on success, `None` on ANY failure -- callers must
-    /// treat `None` as "leak reaping disabled for this batch", NEVER as
-    /// "fall back to diff-based killing": killing collateral (the main
-    /// engine's PT) is worse than a leak. The name is exactly 15 bytes
-    /// ("pt-" + 12 hex) so the kernel's `comm` truncation (TASK_COMM_LEN =
-    /// 15) keeps the whole unique id visible; no ".exe" suffix (Linux, and
-    /// suffix bytes would be cut off by the truncation anyway).
-    pub(crate) fn create_kill_marker(pt_binary: &Path, scratch_base: &Path) -> Option<String> {
-        if let Err(error) = std::fs::create_dir_all(scratch_base) {
-            tracing::warn!(%error, "bridge-verify: could not create PT marker scratch dir");
-            return None;
-        }
-        // `{:012x}` is a MINIMUM width, not a fixed one -- a full 64-bit value
-        // can need up to 16 hex digits, overflowing the 12 this depends on
-        // (marker name = exactly TASK_COMM_LEN-1 bytes, see below). Mask to
-        // the low 48 bits so the formatted width is always exactly 12.
-        let unique = format!(
-            "{:012x}",
-            bridge_verify_core::pt_reap::unique_marker_bits() & 0xFFFF_FFFF_FFFF
-        );
-        let marker_name = format!("pt-{unique}");
-        let marker_path = scratch_base.join(&marker_name);
-        let linked = std::fs::hard_link(pt_binary, &marker_path);
-        if linked.is_ok() {
-            // Hard link shares the source inode -- nothing to chmod.
-        } else {
-            if let Err(error) = std::fs::copy(pt_binary, &marker_path).map(|_| ()) {
-                tracing::warn!(%error, marker = %marker_name,
-                    "bridge-verify: could not create PT kill marker; \
-                     leaked-child reaping disabled for this batch");
-                return None;
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let source_mode = std::fs::metadata(pt_binary)
-                    .map(|m| m.permissions().mode())
-                    .ok()?;
-                if std::fs::set_permissions(
-                    &marker_path,
-                    std::fs::Permissions::from_mode(source_mode | 0o111),
-                )
-                .is_err()
-                {
-                    // A non-executable marker copy would fail the check
-                    // itself; disabling reaping instead keeps checks working.
-                    tracing::warn!(
-                        "bridge-verify: could not make PT marker copy executable; \
-                         leaked-child reaping disabled for this batch"
-                    );
-                    return None;
-                }
-            }
-        }
-
-        Some(bridge_verify_core::pt_reap::register_kill_marker(
-            marker_name,
+    let run = |check: arti_wrapper::BridgeCheckSettings| {
+        drive_check_future(arti_wrapper::TorTunnel::verify_bridge_reachable(
+            check,
+            (engine::LIVE_PROBE_TARGET, engine::LIVE_PROBE_PORT),
+            bootstrap_timeout,
+            probe_timeout,
         ))
-    }
-
-    /// Snapshot of the currently registered marker names (test-visible via
-    /// `pub(crate)`); the registry itself is shared, in
-    /// `bridge-verify-core::pt_reap`.
-    #[cfg_attr(all(not(target_os = "android"), not(test)), expect(dead_code))]
-    pub(crate) fn current_markers() -> std::collections::HashSet<String> {
-        bridge_verify_core::pt_reap::current_markers()
-    }
-
-    /// Live children of this process, read from `/proc`. Linux's process tree has no concept of
-    /// "which logical client spawned this" -- every child of our own PID shows up here
-    /// regardless of which throwaway `TorTunnel` (or the long-lived main engine) started it.
-    /// Ownership is therefore established by `comm` against the registered markers (via the
-    /// shared `bridge_verify_core::pt_reap::kill_targets` decision), not by this listing.
-    #[cfg(target_os = "android")]
-    pub(crate) fn own_child_procs() -> Vec<ChildProc> {
-        let my_pid = std::process::id();
-        let mut children = Vec::new();
-        let Ok(entries) = std::fs::read_dir("/proc") else {
-            return children;
-        };
-        for entry in entries.flatten() {
-            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
-                continue;
-            };
-            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-                continue;
-            };
-            // Format: "pid (comm) state ppid ...". `comm` can itself contain spaces or
-            // parentheses, so take the bytes between the *first* '(' and the *last* ')'
-            // before splitting the remaining fields.
-            let Some((_, comm_and_rest)) = stat.split_once('(') else {
-                continue;
-            };
-            let Some((comm, after_comm)) = comm_and_rest.rsplit_once(')') else {
-                continue;
-            };
-            let mut fields = after_comm.split_whitespace();
-            let _state = fields.next(); // field 3
-            let Some(ppid) = fields.next().and_then(|s| s.parse::<u32>().ok()) else {
-                continue; // field 4
-            };
-            if ppid == my_pid {
-                children.push(ChildProc {
-                    pid,
-                    ppid,
-                    comm: comm.as_bytes().iter().copied().take(15).collect(),
-                });
-            }
-        }
-        children
-    }
-
-    /// Host stub: host builds never spawn a real PT child, so there is nothing to reap.
-    #[cfg_attr(not(target_os = "android"), expect(dead_code))]
-    #[cfg(not(target_os = "android"))]
-    pub(crate) fn own_child_procs() -> Vec<ChildProc> {
-        Vec::new()
-    }
-
-    /// `SIGKILL`s every currently-live own child whose `comm` matches a registered kill marker
-    /// (see [`create_kill_marker`]). A no-op while the registry is empty. Deliberately
-    /// name-verified, not time-of-appearance-verified: the main engine's PT child -- however
-    /// freshly restarted -- carries the normal binary name and can never match. The selection
-    /// itself is the shared `bridge_verify_core::pt_reap::kill_targets`, fed marker names
-    /// truncated to 15 bytes (matching what `pt_binary_comm`/`own_child_procs` observe).
-    #[cfg(target_os = "android")]
-    pub(crate) fn kill_marked_children() {
-        let markers: std::collections::HashSet<Vec<u8>> =
-            bridge_verify_core::pt_reap::current_markers()
-                .into_iter()
-                .map(|m| m.as_bytes().iter().copied().take(15).collect())
-                .collect();
-        if markers.is_empty() {
-            return;
-        }
-        let my_pid = std::process::id();
-        for pid in bridge_verify_core::pt_reap::kill_targets(
-            own_child_procs()
-                .into_iter()
-                .map(|c| (c.pid, c.ppid, c.comm)),
-            my_pid,
-            &markers,
-        ) {
-            // Safety: `kill(2)` on a PID we just observed as our own child in a fresh /proc
-            // scan AND whose `comm` matches one of the marker copies we created ourselves.
-            // Failure (the process already exited on its own between the scan and this call)
-            // is not an error worth surfacing -- the end state either way is "not running".
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGKILL);
-            }
-        }
-    }
-
-    /// Host stub -- see [`own_child_procs`].
-    #[cfg(not(target_os = "android"))]
-    pub(crate) fn kill_marked_children() {}
+    };
+    let reap = |token: &[u8], name: &[u8]| pt_reap::kill_own_state_children(token, name);
+    execute_bridge_check(
+        bridge,
+        check_dir,
+        cache_dir,
+        pt_binary,
+        &CheckRunners {
+            run: &run,
+            reap: &reap,
+        },
+    )
 }
 
 /// How many bridges [`verify_bridges_blocking`] checks at once. The QR-scan flow has a user
@@ -589,7 +474,11 @@ mod pt_reap {
 pub(super) const QR_VERIFY_CONCURRENCY: usize = 4;
 
 /// Worker behind [`nativeVerifyBridges`]. Called from a dedicated OS thread, never from the main
-/// engine's own runtime, so the two never contend.
+/// engine's own runtime, so the two never contend. Its scratch base is guaranteed-fresh via
+/// exclusive creation (see [`batch_scratch_dir`]), so overlapping invocations (two manual QR
+/// scans, or a scan overlapping the background tick) can neither collide on check dirs nor
+/// delete each other's scratch. A scratch setup failure is reported per-bridge as an
+/// unavailable verdict rather than silently skipped.
 pub(super) fn verify_bridges_blocking(
     config_path: &str,
     bridges: Vec<bridge_line::BridgeLine>,
@@ -598,7 +487,6 @@ pub(super) fn verify_bridges_blocking(
 ) {
     let config_path = std::path::Path::new(config_path);
     let live_cache_dir = arti_cache_dir(config_path);
-    let scratch_base = scratch_dir(config_path, &format!("bridge-check-{}", std::process::id()));
 
     let emit = |bridge: &bridge_line::BridgeLine, result: std::result::Result<Duration, String>| {
         let bridge_text = bridge.to_string();
@@ -628,6 +516,25 @@ pub(super) fn verify_bridges_blocking(
         );
     }
 
+    let scratch_base = match batch_scratch_dir(Some(config_path), "bridge-check") {
+        Ok(dir) => dir,
+        Err(e) => {
+            tracing::error!(error = %e, "bridge-verify: could not create scratch directory");
+            for bridge in &to_check {
+                emit(
+                    bridge,
+                    Err(format!(
+                        "verification unavailable: could not create scratch directory: {e}"
+                    )),
+                );
+            }
+            callback.emit_done();
+            return;
+        }
+    };
+    // Batch scratch cleanup on every path: success, error, or unwind.
+    let _scratch_guard = BatchScratchGuard(&scratch_base);
+
     verify_bridges_parallel(
         &live_cache_dir,
         &scratch_base,
@@ -639,16 +546,24 @@ pub(super) fn verify_bridges_blocking(
         emit,
     );
 
-    let _ = std::fs::remove_dir_all(&scratch_base);
     callback.emit_done();
+}
+
+/// Removes the batch scratch dir when dropped — success, error, or unwind.
+struct BatchScratchGuard<'a>(&'a std::path::Path);
+impl Drop for BatchScratchGuard<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(self.0);
+    }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Kill-decision scenarios (previously against `reap_targets`) moved to
-    // `bridge-verify-core::pt_reap`'s tests (suffix `_android`) when the
-    // decision logic was extracted.
+    // Device-only limits: the /proc environ kill path and the real spawn
+    // contract can only be validated on an Android device. Host tests cover
+    // the pure decision (in `bridge-verify-core`), the token wiring, and
+    // scratch isolation below.
 
     /// Cheap unique temp dir without `tempfile` (not a dev-dependency here).
     fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
@@ -667,43 +582,292 @@ mod tests {
     }
 
     #[test]
-    fn create_kill_marker_makes_unique_registered_names() {
-        let base = unique_temp_dir("marker");
-        let scratch = base.join("scratch");
-        let fake_pt = base.join("fake-pt");
-        std::fs::write(&fake_pt, b"pretend PT binary").expect("write fake pt");
+    fn pt_kill_token_is_exact_state_location() {
+        // Pins the wiring actually used by check_one_bridge. ".so" survives
+        // on every platform because "so" never equals EXE_EXTENSION.
+        let token = pt_kill_token(
+            std::path::Path::new("check-A"),
+            std::path::Path::new("native/libtorpthelper.so"),
+        );
+        let expected = std::path::PathBuf::from("check-A")
+            .join("state")
+            .join("pt_state")
+            .join("libtorpthelper.so")
+            .into_os_string()
+            .into_encoded_bytes();
+        assert_eq!(token, expected);
 
-        let marker_a = pt_reap::create_kill_marker(&fake_pt, &scratch).expect("marker a");
-        let marker_b = pt_reap::create_kill_marker(&fake_pt, &scratch).expect("marker b");
-        assert_ne!(marker_a, marker_b, "names must be unique per call");
-        for name in [&marker_a, &marker_b] {
-            assert_eq!(name.len(), 15, "must be exactly TASK_COMM_LEN-1 bytes");
-            assert!(name.starts_with("pt-"), "must carry the pt- prefix");
+        // A binary with no file name ("../") yields no identifier component:
+        // the token is just base/state/pt_state bytes (PathBuf::new() join
+        // adds nothing), matching tor-ptmgr's NotAFile refusal degenerate.
+        let token = pt_kill_token(std::path::Path::new("check-A"), std::path::Path::new("../"));
+        // Raw-byte comparison, so the expected value must go through the
+        // identical join chain -- joining an empty identifier appends a
+        // trailing separator, which is part of the bytes on every platform.
+        let expected = std::path::PathBuf::from("check-A")
+            .join("state")
+            .join("pt_state")
+            .join(std::path::PathBuf::new())
+            .into_os_string()
+            .into_encoded_bytes();
+        assert_eq!(token, expected);
+    }
+
+    /// (token, pt_name) seen by the fake reap.
+    type ReapedArgs = Option<(Vec<u8>, Vec<u8>)>;
+    #[derive(Default, Clone)]
+    struct Harness {
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        captured: std::sync::Arc<std::sync::Mutex<Option<arti_wrapper::BridgeCheckSettings>>>,
+        // Kept out of `events` so the ordering assertions stay exact.
+        reaped: std::sync::Arc<std::sync::Mutex<ReapedArgs>>,
+    }
+
+    /// Set to true when the wrapped value is dropped.
+    struct DropSentinel(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for DropSentinel {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+    }
 
-        let content = std::fs::read(&fake_pt).expect("read fake pt");
-        assert_eq!(
-            std::fs::read(scratch.join(&marker_a)).expect("read marker a"),
-            content
-        );
-        assert_eq!(
-            std::fs::read(scratch.join(&marker_b)).expect("read marker b"),
-            content
-        );
-        let registered = pt_reap::current_markers();
-        assert!(registered.contains(&marker_a));
-        assert!(registered.contains(&marker_b));
+    fn push(harness: &Harness, event: &str) {
+        harness
+            .events
+            .lock()
+            .expect("event lock")
+            .push(event.to_owned());
+    }
 
+    /// Fake run closure: records the call and captures the constructed
+    /// settings; outcome injected per test.
+    fn fake_run(
+        harness: &Harness,
+        outcome: std::result::Result<Duration, String>,
+    ) -> impl Fn(arti_wrapper::BridgeCheckSettings) -> std::result::Result<Duration, String> + Clone
+    {
+        let harness = harness.clone();
+        move |check| {
+            push(&harness, "run");
+            *harness.captured.lock().expect("captured lock") = Some(check);
+            outcome.clone()
+        }
+    }
+
+    /// Fake reap closure: records the sweep, asserts the check dir still
+    /// exists at sweep time (scratch removal must happen AFTER the sweep),
+    /// and records the received token/pt_name.
+    fn fake_reap(
+        harness: &Harness,
+        check_dir: std::path::PathBuf,
+    ) -> impl Fn(&[u8], &[u8]) -> pt_reap::KillReport + Clone {
+        let harness = harness.clone();
+        move |token, pt_name| {
+            push(&harness, "sweep");
+            std::assert!(check_dir.exists(), "sweep must run before scratch removal");
+            *harness.reaped.lock().expect("reaped lock") = Some((token.to_vec(), pt_name.to_vec()));
+            pt_reap::KillReport::default()
+        }
+    }
+
+    fn events_of(harness: &Harness) -> Vec<String> {
+        harness.events.lock().expect("event lock").clone()
+    }
+
+    #[test]
+    fn execute_bridge_check_forwards_original_pt_binary() {
+        let harness = Harness::default();
+        let check_dir = unique_temp_dir("forward");
+        std::fs::create_dir_all(&check_dir).expect("mkdir check dir");
+        let original = std::path::PathBuf::from("fake-pt/libtorpthelper.so");
+        let bridge: bridge_line::BridgeLine =
+            "1.2.3.4:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01"
+                .parse()
+                .expect("bridge line");
+        let run = fake_run(&harness, Ok(Duration::ZERO));
+        let reap = fake_reap(&harness, check_dir.clone());
+        let result = execute_bridge_check(
+            &bridge,
+            &check_dir,
+            None,
+            Some(original.clone()),
+            &CheckRunners {
+                run: &run,
+                reap: &reap,
+            },
+        );
+        std::assert!(result.is_ok());
+        let captured = harness
+            .captured
+            .lock()
+            .expect("captured lock")
+            .take()
+            .expect("runner was called");
+        // The ORIGINAL executable path is forwarded verbatim into the check
+        // settings (never a copy), and the state dir is the check's own.
+        std::assert_eq!(captured.pt_binary.as_deref(), Some(original.as_path()));
+        std::assert_eq!(captured.state_dir, check_dir);
+        std::assert_eq!(captured.bridge.to_string(), bridge.to_string());
+        // The sweep saw the token/comm derived from the SAME original path.
+        let (token, pt_name) = harness
+            .reaped
+            .lock()
+            .expect("reaped lock")
+            .take()
+            .expect("reap was called");
+        std::assert_eq!(token, pt_kill_token(&check_dir, &original));
+        std::assert_eq!(pt_name, pt_reap::pt_binary_comm(&original));
+        let _ = std::fs::remove_dir_all(&check_dir);
+    }
+
+    #[test]
+    fn drive_check_future_shuts_runtime_before_returning() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let inner = std::sync::Arc::clone(&flag);
+        let result = drive_check_future(async move {
+            let sentinel = DropSentinel(inner);
+            tokio::spawn(async move {
+                let _keep_alive = sentinel;
+                std::future::pending::<()>().await;
+            });
+            Ok::<Duration, std::convert::Infallible>(Duration::from_millis(1))
+        });
+        std::assert!(result.is_ok());
+        std::assert!(
+            flag.load(std::sync::atomic::Ordering::Relaxed),
+            "spawned task dropped by shutdown_timeout before the helper returned"
+        );
+    }
+
+    #[test]
+    fn drive_check_future_surfaces_timeout_of_pending_future() {
+        let result = drive_check_future(async {
+            tokio::time::timeout(Duration::from_millis(50), std::future::pending::<()>())
+                .await
+                .map(|_: ()| Duration::ZERO)
+        });
+        match result {
+            Err(e) => std::assert!(e.contains("elapsed"), "timeout surfaced: {e}"),
+            Ok(_) => panic!("expected Err for a pending future"),
+        }
+    }
+
+    #[test]
+    fn drive_check_future_catches_panic_and_still_shuts_down() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let inner = std::sync::Arc::clone(&flag);
+        let result = drive_check_future::<std::convert::Infallible>(async move {
+            let sentinel = DropSentinel(inner);
+            tokio::spawn(async move {
+                let _keep_alive = sentinel;
+                std::future::pending::<()>().await;
+            });
+            panic!("boom")
+        });
+        match result {
+            Err(e) => std::assert!(e.contains("panicked"), "panic surfaced: {e}"),
+            Ok(_) => panic!("expected Err after panic"),
+        }
+        std::assert!(
+            flag.load(std::sync::atomic::Ordering::Relaxed),
+            "spawned task dropped by shutdown_timeout despite the panic"
+        );
+    }
+
+    #[test]
+    fn execute_bridge_check_reaps_after_runtime_shutdown() {
+        let harness = Harness::default();
+        let check_dir = unique_temp_dir("reap");
+        std::fs::create_dir_all(&check_dir).expect("mkdir check dir");
+        let bridge: bridge_line::BridgeLine =
+            "1.2.3.4:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01"
+                .parse()
+                .expect("bridge line");
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let run_flag = std::sync::Arc::clone(&flag);
+        let run = move |_check: arti_wrapper::BridgeCheckSettings| {
+            let spawned_flag = std::sync::Arc::clone(&run_flag);
+            drive_check_future::<std::convert::Infallible>(async move {
+                let sentinel = DropSentinel(spawned_flag);
+                tokio::spawn(async move {
+                    let _keep_alive = sentinel;
+                    std::future::pending::<()>().await;
+                });
+                panic!("boom")
+            })
+        };
+        let reap = |token: &[u8], pt_name: &[u8]| {
+            push(&harness, "sweep");
+            std::assert!(
+                flag.load(std::sync::atomic::Ordering::Relaxed),
+                "spawned task dropped before reap"
+            );
+            *harness.reaped.lock().expect("reaped lock") = Some((token.to_vec(), pt_name.to_vec()));
+            pt_reap::KillReport::default()
+        };
+        let result = execute_bridge_check(
+            &bridge,
+            &check_dir,
+            None,
+            None,
+            &CheckRunners {
+                run: &run,
+                reap: &reap,
+            },
+        );
+        match result {
+            Err(e) => std::assert!(e.contains("panicked"), "panic surfaced: {e}"),
+            Ok(_) => panic!("expected Err after panic"),
+        }
+        // No "shutdown" events: the real shutdown is proven by the sentinel
+        // flag, observed true at reap time above.
+        std::assert_eq!(events_of(&harness), vec!["sweep"]);
+        std::assert!(!check_dir.exists(), "scratch removed after the sweep");
+        let _ = std::fs::remove_dir_all(&check_dir);
+    }
+
+    #[test]
+    fn create_exclusive_scratch_skips_existing_collision() {
+        let base = unique_temp_dir("scratch-base");
+        let counter = std::sync::atomic::AtomicU64::new(0);
+        let first = create_exclusive_scratch(&base, "kind", &counter).expect("first alloc");
+        let name = first.file_name().unwrap().to_string_lossy().into_owned();
+        std::assert_eq!(
+            name,
+            format!("kind-{}-0", std::process::id()),
+            "first call takes sequence 0"
+        );
+        // Process restart reusing the pid: counter back at 0 while the stale
+        // -0 dir still exists -- the forced-collision regression case.
+        counter.store(0, std::sync::atomic::Ordering::Relaxed);
+        let second = create_exclusive_scratch(&base, "kind", &counter).expect("second alloc");
+        std::assert!(first.exists(), "stale -0 dir left untouched");
+        std::assert_ne!(first, second, "collision must be skipped, not shared");
+        std::assert!(
+            second
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("-1"),
+            "retry advanced the counter past the stale name: {second:?}"
+        );
+        let third = create_exclusive_scratch(&base, "kind", &counter).expect("third alloc");
+        let fourth = create_exclusive_scratch(&base, "kind", &counter).expect("fourth alloc");
+        std::assert_ne!(third, fourth);
+        std::assert_ne!(second, third);
         let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
-    fn pt_binary_comm_truncates_to_15_bytes() {
-        // "libtorpthelper.so" is 18 bytes; the first 15 cut mid-extension.
-        let comm = pt_binary_comm(std::path::Path::new(
-            "/data/app/org.torproject/lib/libtorpthelper.so",
-        ));
-        assert_eq!(comm, b"libtorpthelper.");
-        assert_eq!(comm.len(), 15);
+    fn create_exclusive_scratch_surfaces_setup_errors() {
+        // An existing FILE at the base path: create_dir_all must fail and the
+        // error must surface, not be swallowed as "retry forever".
+        let base = unique_temp_dir("setup-err");
+        let blocker = base.join("not-a-dir");
+        std::fs::write(&blocker, b"x").expect("write blocker file");
+        let counter = std::sync::atomic::AtomicU64::new(0);
+        let result = create_exclusive_scratch(&blocker, "kind", &counter);
+        std::assert!(result.is_err(), "setup error must surface as Err");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

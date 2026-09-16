@@ -301,6 +301,15 @@ pub(super) fn is_permanent_bridge_failure(rendered_error: &str) -> bool {
     rendered_error.contains("does not match target")
 }
 
+/// Owns the tick's scratch dir; removed on drop — including a queued-but-
+/// never-run closure, whose captures drop with it.
+struct ScratchGuard(std::path::PathBuf);
+impl Drop for ScratchGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Runs alongside `wait_bootstrapped()` (spawned right before it, aborted right after it
 /// resolves either way). Bootstrap has no built-in stall detection: if every currently-tried
 /// bridge fails at the PT/TLS layer (deeper than the plain TCP reachability probe already run
@@ -569,42 +578,53 @@ pub(super) async fn stall_watchdog(
                     .as_deref()
                     .map(crate::arti_cache_dir)
                     .unwrap_or_else(|| std::path::PathBuf::from("arti-data/cache"));
-                let scratch_base = bridge_health
-                    .config_path
-                    .as_deref()
-                    .map(|p| {
-                        crate::scratch_dir(p, &format!("circuit-verify-{}", std::process::id()))
-                    })
-                    .unwrap_or_else(|| {
-                        std::path::PathBuf::from(format!(
-                            "verify-scratch/circuit-verify-{}",
-                            std::process::id()
-                        ))
-                    });
+                // Guaranteed-exclusive scratch creation (see
+                // `batch_scratch_dir`): no name collisions across overlapping
+                // ticks or the QR flow; a real setup failure skips the tick.
+                let tick_config = bridge_health.config_path.clone();
                 let verify_pt_binary = pt_binary.clone();
                 let verify_health = bridge_health.clone();
                 tokio::spawn(async move {
-                    // `verify_bridges_sequential` blocks its calling thread (it builds and
-                    // drives its own throwaway tokio runtimes internally, one per bridge) --
-                    // `spawn_blocking` moves it off this runtime's async worker threads, the
-                    // same reason `nativeVerifyBridges` runs it on a dedicated OS thread rather
-                    // than as a plain async task.
-                    let results = tokio::task::spawn_blocking(move || {
-                        let mut results = Vec::new();
-                        crate::verify_bridges_sequential(
-                            &live_cache_dir,
-                            &scratch_base,
-                            due,
-                            verify_pt_binary,
-                            CIRCUIT_VERIFY_BOOTSTRAP_TIMEOUT,
-                            CIRCUIT_VERIFY_PROBE_TIMEOUT,
-                            |bridge, result| results.push((bridge.clone(), result.is_ok())),
-                        );
-                        let _ = std::fs::remove_dir_all(&scratch_base);
-                        results
-                    })
-                    .await
-                    .unwrap_or_default();
+                    let results = match crate::batch_scratch_dir(
+                        tick_config.as_deref(),
+                        "circuit-verify",
+                    ) {
+                        Err(error) => {
+                            tracing::error!(
+                                error = %error,
+                                "circuit-verify: could not create scratch directory; skipping tick"
+                            );
+                            Vec::new()
+                        }
+                        Ok(scratch_base) => {
+                            // Guard built BEFORE spawn_blocking and moved into the
+                            // closure: a queued-but-never-run closure still cleans up.
+                            let scratch_guard = ScratchGuard(scratch_base);
+                            // `verify_bridges_sequential` blocks its calling thread (it builds and
+                            // drives its own throwaway tokio runtimes internally, one per bridge) --
+                            // `spawn_blocking` moves it off this runtime's async worker threads, the
+                            // same reason `nativeVerifyBridges` runs it on a dedicated OS thread rather
+                            // than as a plain async task.
+                            tokio::task::spawn_blocking(move || {
+                                // Guard-based cleanup: covers the success path
+                                // AND an unwind inside the blocking closure.
+                                let scratch_base = &scratch_guard.0;
+                                let mut results = Vec::new();
+                                crate::verify_bridges_sequential(
+                                    &live_cache_dir,
+                                    scratch_base,
+                                    due,
+                                    verify_pt_binary,
+                                    CIRCUIT_VERIFY_BOOTSTRAP_TIMEOUT,
+                                    CIRCUIT_VERIFY_PROBE_TIMEOUT,
+                                    |bridge, result| results.push((bridge.clone(), result.is_ok())),
+                                );
+                                results
+                            })
+                            .await
+                            .unwrap_or_default()
+                        }
+                    };
 
                     let verified = results.iter().filter(|(_, ok)| *ok).count();
                     info!(
@@ -781,5 +801,32 @@ pub(super) async fn stall_watchdog(
         }
         last_reset = Some(now);
         consecutive_failures = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scratch_guard_cleans_up_unstarted_closure() {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "engine-bootstrap-guard-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir temp dir");
+        std::fs::write(dir.join("sentinel"), b"x").expect("write sentinel");
+        let guard = ScratchGuard(dir.clone());
+        // Never run: dropping the closure must still drop the guard's dir.
+        let never: Box<dyn FnOnce()> = Box::new(move || {
+            let _ = &guard;
+        });
+        drop(never);
+        std::assert!(
+            !dir.exists(),
+            "scratch dir removed with the unstarted closure"
+        );
     }
 }

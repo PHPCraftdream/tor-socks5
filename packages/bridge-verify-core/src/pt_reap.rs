@@ -115,6 +115,106 @@ pub fn kill_targets(
         .collect()
 }
 
+/// Mirrors tor-ptmgr 0.43.0's `pt_identifier_as_path` (tor-ptmgr-0.43.0/src/
+/// managed.rs): take the file name, strip the extension iff it equals
+/// `EXE_EXTENSION` case-insensitively (on Windows "lyrebird.exe" becomes
+/// "lyrebird"; on Android `EXE_EXTENSION` is "" so "libtorpthelper.so" stays
+/// whole). No file name (e.g. "/" or "") yields an empty `PathBuf`: tor-ptmgr
+/// itself refuses to spawn such a binary (`PtError::NotAFile`), so that
+/// degenerate token is never used to kill anything.
+pub fn pt_state_identifier(binary_path: &std::path::Path) -> std::path::PathBuf {
+    let Some(file_name) = binary_path.file_name() else {
+        return std::path::PathBuf::new();
+    };
+    let mut identifier = std::path::PathBuf::from(file_name);
+    let exe_ext = std::env::consts::EXE_EXTENSION;
+    let matches_exe_ext = identifier
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(exe_ext));
+    if matches_exe_ext {
+        identifier.set_extension("");
+    }
+    identifier
+}
+
+/// The exact `TOR_PT_STATE_LOCATION` value tor-ptmgr 0.43.0 passes the PT
+/// child for one throwaway bridge check, computed the same way its stack
+/// does: arti-wrapper's `build_config` appends "state" to
+/// `Settings.state_dir` (the check dir); arti-client 0.43 appends "pt_state"
+/// (arti-client-0.43.0/src/client.rs); tor-ptmgr 0.43 appends the binary
+/// identifier (see [`pt_state_identifier`]) and passes the result verbatim as
+/// `TOR_PT_STATE_LOCATION` (tor-ptmgr-0.43.0/src/ipc.rs). Because the check
+/// dir is unique per check, the result is a unique per-check ownership token.
+/// Assumption: these are app-private paths carrying no CfgPath variable
+/// syntax, so the lossy string round-trip of the path is the identity. A
+/// consumer may use this value as an exact-byte ownership token compared
+/// against bytes from /proc/<pid>/environ.
+pub fn pt_state_location_token(
+    check_state_dir: &std::path::Path,
+    pt_binary: &std::path::Path,
+) -> std::path::PathBuf {
+    check_state_dir
+        .join("state")
+        .join("pt_state")
+        .join(pt_state_identifier(pt_binary))
+}
+
+/// The key parsed out of a raw /proc/<pid>/environ blob.
+const STATE_LOCATION_KEY: &[u8] = b"TOR_PT_STATE_LOCATION";
+
+/// Extracts the `TOR_PT_STATE_LOCATION` value from a raw
+/// /proc/<pid>/environ byte blob (entries separated by b'\0', each
+/// `KEY=VALUE` split at the FIRST b'='). Returns the value bytes of the
+/// FIRST matching entry, or None when absent. An unreadable/empty environ
+/// (zombie, vanished process) also yields None, and callers must treat None
+/// as "ownership unproven -- do not kill": fail closed.
+pub fn environ_state_location(environ: &[u8]) -> Option<&[u8]> {
+    environ.split(|byte| *byte == 0).find_map(|entry| {
+        let eq = entry.iter().position(|byte| *byte == b'=')?;
+        let (key, value) = (&entry[..eq], &entry[eq + 1..]);
+        (key == STATE_LOCATION_KEY).then_some(value)
+    })
+}
+
+/// Pure kill decision for the state-location ownership scheme: the per-check
+/// token analogue of [`kill_targets`] for the Android verify flow, which can
+/// no longer use a marker-name scheme (Android W^X forbids executing a
+/// copied PT binary in scratch, and a global marker registry would let one
+/// verification batch kill another's children). Each child yields
+/// `(pid, ppid, Option<state_location_bytes>)` where the Option is the
+/// parsed [`environ_state_location`] value (None = unproven). A pid is a
+/// kill target iff ALL hold:
+/// - `token` non-empty: an empty token kills nothing (fail closed).
+/// - `ppid == my_pid`: only ever our own direct children.
+/// - `pid != my_pid`: never target ourselves.
+/// - `pid != 0`: pid 0 is the kernel (kill(2) semantics: process group 0 /
+///   calling group), never a child -- exclude it defensively.
+/// - state_location is Some and equals `token` by EXACT full-byte equality
+///   -- never prefix, never suffix: a sibling directory `.../pt_state0/...`
+///   or a longer path sharing the token as a prefix must NOT match.
+///
+/// Recycled-PID contract: callers re-read environ at kill time, so a
+/// recycled PID whose environ no longer carries the token is rejected.
+pub fn owned_process_targets(
+    children: impl IntoIterator<Item = (u32, u32, Option<Vec<u8>>)>,
+    my_pid: u32,
+    token: &[u8],
+) -> Vec<u32> {
+    if token.is_empty() {
+        return Vec::new();
+    }
+    children
+        .into_iter()
+        .filter(|(pid, ppid, state_location)| {
+            *ppid == my_pid
+                && *pid != my_pid
+                && *pid != 0
+                && state_location.as_deref() == Some(token)
+        })
+        .map(|(pid, _, _)| pid)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,5 +331,218 @@ mod tests {
             &cli_markers(),
         );
         assert!(targets.is_empty());
+    }
+
+    // -- State-location ownership scheme (Android verify flow) --
+
+    #[test]
+    fn pt_state_identifier_keeps_android_so_suffix() {
+        // "so" never equals EXE_EXTENSION ("" on unix, "exe" on windows),
+        // so the identifier keeps the full file name on ALL platforms.
+        let path = std::path::Path::new("/x/libtorpthelper.so");
+        assert_eq!(
+            pt_state_identifier(path),
+            std::path::PathBuf::from("libtorpthelper.so")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pt_state_identifier_strips_exe_on_windows() {
+        assert_eq!(
+            pt_state_identifier(std::path::Path::new("C:/x/lyrebird.exe")),
+            std::path::PathBuf::from("lyrebird")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn pt_state_identifier_keeps_exe_off_windows() {
+        // Documents platform parity with tor-ptmgr's EXE_EXTENSION rule:
+        // off Windows the ".exe" extension is not the exe extension, so it
+        // stays.
+        assert_eq!(
+            pt_state_identifier(std::path::Path::new("/x/lyrebird.exe")),
+            std::path::PathBuf::from("lyrebird.exe")
+        );
+    }
+
+    #[test]
+    fn pt_state_location_token_composes_state_and_pt_state() {
+        // Portable composition: relative inputs keep Path::join well-formed
+        // on every host platform.
+        let token = pt_state_location_token(
+            std::path::Path::new("check-A"),
+            std::path::Path::new("native/libtorpthelper.so"),
+        );
+        assert_eq!(
+            token,
+            std::path::PathBuf::from("check-A")
+                .join("state")
+                .join("pt_state")
+                .join("libtorpthelper.so")
+        );
+        // Degenerate identifier: a binary with no file name joins nothing,
+        // so the token is exactly base/state/pt_state. (tor-ptmgr refuses to
+        // spawn such a binary, so this token never kills.)
+        let degenerate =
+            pt_state_location_token(std::path::Path::new("check-A"), std::path::Path::new("/"));
+        assert_eq!(
+            degenerate,
+            std::path::PathBuf::from("check-A")
+                .join("state")
+                .join("pt_state")
+        );
+    }
+
+    #[test]
+    fn environ_state_location_finds_value() {
+        assert_eq!(
+            environ_state_location(
+                b"HOME=/x\0TOR_PT_STATE_LOCATION=/check/state/pt_state/lib.so\0"
+            ),
+            Some(b"/check/state/pt_state/lib.so".as_slice())
+        );
+    }
+
+    #[test]
+    fn environ_state_location_absent() {
+        assert_eq!(environ_state_location(b"HOME=/x\0PATH=/bin"), None);
+    }
+
+    #[test]
+    fn environ_state_location_entry_without_equals_is_skipped() {
+        assert_eq!(
+            environ_state_location(b"NOVALUE\0TOR_PT_STATE_LOCATION=/v"),
+            Some(&b"/v"[..])
+        );
+    }
+
+    #[test]
+    fn environ_state_location_empty_slice_is_none() {
+        assert_eq!(environ_state_location(b""), None);
+    }
+
+    #[test]
+    fn environ_state_location_first_match_wins() {
+        assert_eq!(
+            environ_state_location(b"TOR_PT_STATE_LOCATION=/first\0TOR_PT_STATE_LOCATION=/second"),
+            Some(b"/first".as_slice())
+        );
+    }
+
+    #[test]
+    fn environ_state_location_value_may_contain_equals() {
+        // Split at the FIRST '=' only.
+        assert_eq!(
+            environ_state_location(b"TOR_PT_STATE_LOCATION=/a=b/c"),
+            Some(b"/a=b/c".as_slice())
+        );
+    }
+
+    #[test]
+    fn environ_state_location_key_match_is_exact_case() {
+        assert_eq!(environ_state_location(b"tor_pt_state_location=/v"), None);
+    }
+
+    fn token() -> Vec<u8> {
+        pt_state_location_token(
+            std::path::Path::new("check-A"),
+            std::path::Path::new("libtorpthelper.so"),
+        )
+        .into_os_string()
+        .into_encoded_bytes()
+    }
+
+    #[test]
+    fn owned_targets_kill_exact_token_child() {
+        let tok = token();
+        let children = [
+            (80u32, 7u32, Some(tok.clone())),
+            (81, 7, Some(b"/other/pt_state/libtorpthelper.so".to_vec())),
+        ];
+        assert_eq!(owned_process_targets(children, 7, &tok), vec![80]);
+    }
+
+    #[test]
+    fn owned_targets_spare_main_engine_location() {
+        // Main-engine-style location (abstract placeholder package path) is
+        // a different path, so never a target.
+        let tok = token();
+        let children = [(
+            80,
+            7,
+            Some(
+                b"/data/data/app.placeholder/files/tor/arti-data/state/pt_state/libtorpthelper.so"
+                    .to_vec(),
+            ),
+        )];
+        assert!(owned_process_targets(children, 7, &tok).is_empty());
+    }
+
+    #[test]
+    fn owned_targets_spare_another_batchs_children() {
+        // A concurrent batch's check dir yields a different token: its
+        // children are exact non-matches.
+        let tok = token();
+        let other = pt_state_location_token(
+            std::path::Path::new("check-B"),
+            std::path::Path::new("libtorpthelper.so"),
+        )
+        .into_os_string()
+        .into_encoded_bytes();
+        let children = [(80, 7, Some(other))];
+        assert!(owned_process_targets(children, 7, &tok).is_empty());
+    }
+
+    #[test]
+    fn owned_targets_reject_prefix_and_sibling_matches() {
+        // Exact full-byte equality only: a token-suffixed longer path and a
+        // sibling directory (one extra char) must both be rejected.
+        let tok = token();
+        let mut prefix = tok.clone();
+        prefix.extend_from_slice(b"/x");
+        let mut sibling_dir = tok.clone();
+        // .../pt_state/libtorpthelper.so -> .../pt_state2/libtorpthelper.so
+        let last = sibling_dir.len() - "libtorpthelper.so".len();
+        sibling_dir.insert(last - 1, b'2');
+        let children = [(80, 7, Some(prefix)), (81, 7, Some(sibling_dir))];
+        assert!(owned_process_targets(children, 7, &tok).is_empty());
+    }
+
+    #[test]
+    fn owned_targets_spare_unproven_and_different_children() {
+        let tok = token();
+        let children = [
+            (80, 7, None), // recycled PID / unreadable environ: fail closed
+            (81, 7, Some(b"/somewhere/else".to_vec())),
+        ];
+        assert!(owned_process_targets(children, 7, &tok).is_empty());
+    }
+
+    #[test]
+    fn owned_targets_spare_non_children_and_self() {
+        let tok = token();
+        let children = [
+            (80, 8, Some(tok.clone())), // not our child
+            (7, 7, Some(tok.clone())),  // ourselves
+        ];
+        assert!(owned_process_targets(children, 7, &tok).is_empty());
+    }
+
+    #[test]
+    fn owned_targets_spares_pid_zero() {
+        // pid 0 is the kernel, never a child; exclude it defensively.
+        let tok = token();
+        let children = [(0u32, 7u32, Some(tok.clone()))];
+        assert!(owned_process_targets(children, 7, &tok).is_empty());
+    }
+
+    #[test]
+    fn owned_targets_empty_token_kills_nothing() {
+        // Fail closed: an empty (degenerate) token never kills, even for an
+        // exact-looking child.
+        let children = [(80, 7, Some(Vec::new()))];
+        assert!(owned_process_targets(children, 7, b"").is_empty());
     }
 }

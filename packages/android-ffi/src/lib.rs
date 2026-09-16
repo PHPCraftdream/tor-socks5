@@ -301,6 +301,7 @@ fn ensure_tracing_subscriber(cfg: &Config) {
 mod jni_bridges;
 mod jni_engine;
 mod jni_verify;
+mod pt_reap;
 
 pub use jni_bridges::*;
 pub use jni_engine::*;
