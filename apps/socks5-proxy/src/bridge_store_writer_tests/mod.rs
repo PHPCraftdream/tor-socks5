@@ -1,5 +1,6 @@
 mod backoff_tests;
 mod coalescing_tests;
+mod cross_process_lock_tests;
 mod external_cli_tests;
 mod panic_tests;
 mod retirement_tests;

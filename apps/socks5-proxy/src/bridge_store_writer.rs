@@ -49,6 +49,18 @@
 //!   dropping the snapshot as soon as a publish succeeds with no tail
 //!   mutations, so a clean state is `store = None` and every op after a
 //!   successful publish reloads the file.
+//! * Cross-process read-modify-write coordination: every writer of the
+//!   store file — this actor and the CLI inline fallback — holds the
+//!   per-path advisory lock ([`crate::path_lock::PathLock`], sibling
+//!   `<store>.lock` file) from the load that reads the file through the
+//!   publish that writes it. The clean-state re-read alone cannot heal an
+//!   overlap: a CLI transaction that loads while a daemon publish is in
+//!   flight saves a snapshot the daemon's rename buries permanently. With
+//!   the lock, the CLI waits out the daemon's dirty window (including
+//!   backoff retries) and then mutates the published state, so both sides'
+//!   mutations survive. The actor acquires the lock inside its clean-load
+//!   `spawn_blocking` job (never on an async worker) and releases it as soon
+//!   as a publish succeeds with no tail mutations.
 //! * Shutdown is explicit: [`StoreWriter::close`] sends a close op, waits
 //!   for any in-flight publish (and one coalesced follow-up), performs a
 //!   final flush if the snapshot is still dirty — regardless of the backoff
@@ -57,26 +69,23 @@
 //!   drop all handles without closing keep the legacy best-effort final
 //!   flush, but the daemon must use the explicit protocol.
 //! * CLI subcommands and unit tests run without an initialized writer and
-//!   fall back to an inline load→mutate→save (atomic per snapshot thanks to
-//!   bridge-store's unique temp names). Policy for a CLI subcommand running
-//!   while the daemon is live: both sides publish whole files atomically, so
-//!   the file is never torn; concurrent publication resolves as
-//!   last-writer-wins per snapshot, and the daemon's next clean-state op
-//!   re-reads the file and incorporates the CLI's version. Cross-process
-//!   file locking was considered and rejected: it adds a new dependency for
-//!   an ops-window race that is self-healing on the daemon's next write,
-//!   while sequential CLI usage is fully preserved by the clean-state
-//!   re-read rule above.
+//!   fall back to an inline load→mutate→save under the same per-path write
+//!   lock, with a bounded wait ([`crate::path_lock::CLI_LOCK_WAIT`]) so a
+//!   CLI fails with a clear "busy" error instead of hanging behind a daemon
+//!   stuck retrying a failing publish. Between daemon dirty windows the
+//!   lock is free, so sequential CLI usage is unaffected.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use bridge_store::BridgeStore;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
+
+use crate::path_lock::{PathLock, CLI_LOCK_WAIT};
 
 type MutateFn = Box<dyn FnOnce(&mut BridgeStore) + Send>;
 /// Publishing strategy; production uses `BridgeStore::save`, tests inject failures.
@@ -249,6 +258,10 @@ impl StoreWriter {
             let retirements = actor_retirements;
             let mut retry = RetryState::new(initial_backoff);
             let mut store: Option<Arc<BridgeStore>> = None;
+            // Lock spans clean load → publish; released when clean again
+            // (or at task exit, covering the shutdown flush). Unlock is a
+            // cheap syscall, safe inline on this async worker.
+            let mut lock: Option<PathLock> = None;
             let mut publishing = false;
             let mut mutations_since_publish: u32 = 0;
             let mut closing = false;
@@ -272,6 +285,7 @@ impl StoreWriter {
                                     res,
                                     &mut retry,
                                     &mut store,
+                                    &mut lock,
                                     &mut mutations_since_publish,
                                     &retirements,
                                 );
@@ -344,21 +358,29 @@ impl StoreWriter {
                             closing = true;
                         }
                         Some(Op::Mutate { apply, ack }) => {
-                            // Clean snapshot: re-read the file so whole-file
-                            // writes by other processes are seen and preserved.
-                            // The load runs on the blocking pool; ops arriving
-                            // meanwhile just buffer in the channel.
+                            // Clean snapshot: lock + re-read, so external
+                            // whole-file writes are seen and no CLI
+                            // transaction can interleave between this load
+                            // and its publish. Lock wait and load run on the
+                            // blocking pool; ops buffer in the channel.
                             if store.is_none() {
                                 let load_path = path.clone();
                                 match tokio::task::spawn_blocking(move || {
-                                    BridgeStore::load(load_path)
+                                    let lock = PathLock::acquire(&load_path)?;
+                                    let store = BridgeStore::load(load_path.clone())?;
+                                    Ok::<(PathLock, BridgeStore), anyhow::Error>((lock, store))
                                 })
                                 .await
                                 {
-                                    Ok(Ok(loaded)) => store = Some(Arc::new(loaded)),
+                                    Ok(Ok((acquired, loaded))) => {
+                                        lock = Some(acquired);
+                                        store = Some(Arc::new(loaded));
+                                    }
                                     Ok(Err(error)) => {
                                         // Never apply to, or publish from, a
-                                        // snapshot we failed to load.
+                                        // snapshot we failed to load. The lock
+                                        // guard dies inside the job on this
+                                        // path, so the file stays writable.
                                         warn!(error = %error, path = %path.display(), "bridge health store unreadable; keeping the caller's data queued");
                                         let _ = ack.send(Err(error));
                                         continue;
@@ -461,6 +483,7 @@ impl StoreWriter {
                             res,
                             &mut retry,
                             &mut store,
+                            &mut lock,
                             &mut mutations_since_publish,
                             &retirements,
                         );
@@ -509,6 +532,7 @@ fn absorb_publish_result(
     res: Result<()>,
     retry: &mut RetryState,
     store: &mut Option<Arc<BridgeStore>>,
+    lock: &mut Option<PathLock>,
     mutations_since_publish: &mut u32,
     retirements: &RetirementLog,
 ) {
@@ -518,16 +542,17 @@ fn absorb_publish_result(
             retry.record_success();
             if routine {
                 debug_assert!(!retry.dirty);
-                // Success with no tail: retire the snapshot so the next
-                // mutation reloads the file and preserves whole-file writes
-                // made by other processes in the meantime. Same pattern as
-                // the mutation-apply site: the Arc's drop runs on the
-                // blocking pool, not inline on this async worker (this
-                // function is called from the actor's select! loop).
+                // Clean again: retire the snapshot (next op re-reads the
+                // file) and release the lock with it — a waiting CLI may now
+                // build on what was just published. Arc drop off-worker;
+                // unlock is a cheap syscall, stays inline.
                 drop_off_worker(store.take(), Arc::clone(retirements));
+                drop(lock.take());
             } else {
                 // Mutations absorbed while the save ran stay dirty; the
-                // caller starts the coalesced follow-up publish.
+                // caller starts the coalesced follow-up publish (and the
+                // lock stays held — the follow-up is part of the same
+                // read-modify-write window).
                 retry.dirty = true;
             }
         }
@@ -632,8 +657,8 @@ pub(crate) async fn close_global() -> Option<Result<()>> {
 }
 
 /// Apply a mutation through the single writer when this process has one for
-/// `config_path`; otherwise (CLI subcommands, unit tests) fall back to an
-/// inline atomic read-modify-write (see module docs for the CLI policy).
+/// `config_path`; otherwise (CLI subcommands, unit tests) fall back to a
+/// locked whole-file read-modify-write on the blocking pool.
 pub(crate) async fn apply(
     config_path: Option<&Path>,
     apply: impl FnOnce(&mut BridgeStore) + Send + 'static,
@@ -641,11 +666,21 @@ pub(crate) async fn apply(
     let resolved = BridgeStore::resolve_path(config_path);
     match global() {
         Some(writer) if writer.path() == resolved => writer.apply(apply).await,
-        _ => {
-            let mut store = BridgeStore::load(resolved)?;
+        _ => tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            crate::test_seams::park_if_armed(crate::test_seams::Site::PreAcquire, &resolved);
+            let lock = PathLock::acquire_bounded(&resolved, CLI_LOCK_WAIT)
+                .context("bridge health store write lock")?;
+            let mut store = BridgeStore::load(resolved.clone())?;
+            #[cfg(test)]
+            crate::test_seams::park_if_armed(crate::test_seams::Site::PostLoad, &resolved);
             apply(&mut store);
-            store.save()
-        }
+            let saved = store.save();
+            drop(lock);
+            saved
+        })
+        .await
+        .map_err(|join_error| anyhow!("bridge health store write task failed: {join_error}"))?,
     }
 }
 

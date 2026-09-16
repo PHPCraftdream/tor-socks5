@@ -132,6 +132,10 @@ async fn fetch_sources(
 /// already in the working config or already pooled, and persist the rest.
 /// Returns how many new candidates were added.
 ///
+/// The pool update is one cross-process transaction, run off the async
+/// worker so the lock wait cannot block it; on caller cancellation the job
+/// finishes detached — a complete, lock-protected whole-file write.
+///
 /// cancel-safe: NO — performs network I/O over Tor and writes the pool.
 pub(crate) async fn refresh_candidate_pool(
     tor: &TorTunnel,
@@ -144,18 +148,25 @@ pub(crate) async fn refresh_candidate_pool(
         return Ok(0);
     }
     let exclude = working_keys(cfg);
-    let mut pool = CandidatePool::load(CandidatePool::resolve_path(config_path))
-        .context("loading candidate pool")?;
+    let pool_path = CandidatePool::resolve_path(config_path);
     let migration = cfg
         .bridges
         .sources
         .iter()
         .any(|source| current_source_url(&source.url) != source.url);
-    let added = pool.merge(fetched.iter().cloned(), &exclude);
-    if migration {
-        pool.prioritize(&fetched, cfg.bridges.preferred_transport());
-    }
-    pool.save().context("saving candidate pool")?;
+    let preferred_transport = cfg.bridges.preferred_transport().map(str::to_owned);
+    let (added, pool_len) = tokio::task::spawn_blocking(move || {
+        CandidatePool::transaction(&pool_path, |pool| {
+            let added = pool.merge(fetched.iter().cloned(), &exclude);
+            if migration {
+                pool.prioritize(&fetched, preferred_transport.as_deref());
+            }
+            (added, pool.len())
+        })
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("candidate pool update task failed: {e}"))?
+    .context("updating candidate pool")?;
     if migration {
         if let Some(path) = config_path {
             let mut latest = Config::load_with_override(Some(path))?.into_config();
@@ -168,7 +179,7 @@ pub(crate) async fn refresh_candidate_pool(
     }
     info!(
         added,
-        pool = pool.len(),
+        pool = pool_len,
         "refreshed candidate pool from sources"
     );
     Ok(added)
@@ -235,6 +246,13 @@ async fn admits_candidate(
 /// Drain the candidate pool: walk it lazily (one bridge at a time), promote
 /// up to `target` reachable bridges into the working config, and remove
 /// every probed candidate from the pool. Returns how many were promoted.
+///
+/// The pool access is one cross-process transaction: the write lock is held
+/// from the initial load through the final save — across the probe phase —
+/// so a concurrent refresh/drain waits instead of publishing over the
+/// removals this drain is about to make. The guard is a plain file handle,
+/// safe to hold across `.await`; cancellation drops it before any save,
+/// leaving the pool file untouched.
 ///
 /// Admission is two-layer: a TCP probe must pass, and when `tor` is `Some`,
 /// the candidate must additionally accept a real Tor channel
@@ -311,6 +329,20 @@ async fn drain_pool_with(
     };
     let cfg = Config::load_with_override(Some(path))?.into_config();
     let pool_path = CandidatePool::resolve_path(config_path);
+    // Test-only forcing point: park before the acquisition (blocking pool —
+    // never block a worker on the gate).
+    #[cfg(test)]
+    {
+        let seam_path = pool_path.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::test_seams::park_if_armed(crate::test_seams::Site::PreAcquire, &seam_path)
+        })
+        .await
+        .expect("pre-acquire park joined");
+    }
+    let pool_lock = CandidatePool::acquire_transaction_lock(&pool_path)
+        .await
+        .context("locking candidate pool for drain")?;
     let mut pool = CandidatePool::load(pool_path).context("loading candidate pool")?;
     if pool.is_empty() {
         return Ok(0);
@@ -374,9 +406,12 @@ async fn drain_pool_with(
     }
 
     // Unprobed candidates return to the pool; probed (alive + dead) do not.
+    // Still inside the drain's transaction: this save publishes the removals
+    // together with the front-returns.
     pool.return_front(unprobed);
     pool.merge(deferred, &HashSet::new());
     pool.save().context("saving candidate pool after drain")?;
+    drop(pool_lock);
     info!(
         promoted = promoted.len(),
         probed = attempts,
@@ -475,6 +510,7 @@ pub(crate) async fn top_up_working(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_seams::{HANG_GUARD, UNBLOCK_GUARD};
     use bridge_store::BridgeStore;
 
     #[test]
@@ -663,5 +699,108 @@ mod tests {
         let b = bridge();
         assert!(!admits_candidate(None, &b, Some(&spy)).await);
         assert!(!consulted.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// Actual-caller overlap: a pool transaction (the refresh path) parked
+    /// mid-flight owns the pool lock, so `drain_pool_with` — the
+    /// maintenance/CLI drain — must wait and then build on its published
+    /// state. Forcing: the drain is parked before its acquisition and
+    /// released only while the transaction provably owns the lock (parked
+    /// after its load, unreleased). The transaction's gate is released when
+    /// the drain completes, or — when the drain is correctly still blocked —
+    /// after a guard timeout; the timeout only picks the releaser, the lock
+    /// itself orders the correct-mode outcome.
+    #[tokio::test]
+    async fn drain_waits_for_a_concurrent_pool_transaction_and_both_effects_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.ktav");
+        let mut cfg = Config::default();
+        cfg.bridges.transport = "webtunnel".into();
+        cfg.write(&path).unwrap();
+
+        let wt: BridgeLine =
+            "webtunnel [2001:db8::1]:443 0123456789ABCDEF0123456789ABCDEF01234567 url=https://example.com/bridge"
+                .parse()
+                .unwrap();
+        let other: BridgeLine =
+            "obfs4 1.2.3.4:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA iat-mode=0"
+                .parse()
+                .unwrap();
+        let newcomer: BridgeLine =
+            "obfs4 1.2.3.9:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=CCC iat-mode=0"
+                .parse()
+                .unwrap();
+
+        let pool_path = CandidatePool::resolve_path(Some(&path));
+        let mut seed = CandidatePool::load(pool_path.clone()).unwrap();
+        assert_eq!(
+            seed.merge(vec![other.clone(), wt.clone()], &HashSet::new()),
+            2
+        );
+        seed.save().unwrap();
+
+        let pre =
+            crate::test_seams::ParkedGate::arm(crate::test_seams::Site::PreAcquire, &pool_path);
+        let post =
+            crate::test_seams::ParkedGate::arm(crate::test_seams::Site::PostLoad, &pool_path);
+        let post_for_drain = post.clone();
+        let (drain_done_tx, drain_done_rx) = std::sync::mpsc::channel();
+        let drain_path = path.clone();
+        let drain_task = tokio::spawn(async move {
+            let checker = check(true);
+            let probe = reachable_probe();
+            let out = drain_pool_with(Some(&drain_path), 1, Some(&checker), &probe).await;
+            post_for_drain.release();
+            let _ = drain_done_tx.send(());
+            out
+        });
+        let pre_wait = pre.clone();
+        tokio::task::spawn_blocking(move || pre_wait.wait_parked(HANG_GUARD))
+            .await
+            .unwrap();
+
+        let tx_path = pool_path.clone();
+        let newcomer_for_tx = newcomer.clone();
+        let tx = std::thread::spawn(move || {
+            CandidatePool::transaction(&tx_path, |p| {
+                p.merge([newcomer_for_tx.clone()], &HashSet::new())
+            })
+        });
+        let post_wait = post.clone();
+        tokio::task::spawn_blocking(move || post_wait.wait_parked(HANG_GUARD))
+            .await
+            .unwrap();
+
+        // The drain now reaches its acquisition while the transaction owns
+        // the lock.
+        pre.release();
+        let drain_finished =
+            tokio::task::spawn_blocking(move || drain_done_rx.recv_timeout(UNBLOCK_GUARD).is_ok())
+                .await
+                .unwrap();
+        let _drain_finished = drain_finished;
+        // Release the transaction in both modes. Correct locking leaves the
+        // drain blocked; bypassing it lets the final assertions fail.
+        post.release();
+
+        let added = tx.join().unwrap().unwrap();
+        let promoted = drain_task.await.unwrap().unwrap();
+        assert_eq!(added, 1, "the parked transaction adds the newcomer");
+        assert_eq!(promoted, 1, "the drain promotes the webtunnel candidate");
+
+        let latest = Config::load_with_override(Some(&path))
+            .unwrap()
+            .into_config();
+        assert!(
+            latest.bridges.parsed().unwrap().bridges.contains(&wt),
+            "the drain promoted the webtunnel candidate into the working config"
+        );
+
+        let mut pool = CandidatePool::load(pool_path).unwrap();
+        assert_eq!(
+            pool.take(10),
+            vec![other, newcomer],
+            "the parked transaction's addition survives; the consumed webtunnel candidate stays removed"
+        );
     }
 }

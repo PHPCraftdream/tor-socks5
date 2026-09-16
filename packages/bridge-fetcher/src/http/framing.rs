@@ -345,6 +345,20 @@ mod tests {
         assert!(err.to_string().contains("exceeds"), "{err}");
     }
 
+    /// Sibling case: chunk data that arrived with the headers (preloaded) is
+    /// bounded by the same decoded-size check before any further read.
+    #[tokio::test]
+    async fn preloaded_chunk_data_over_limit_is_too_large() {
+        let err = decode_chunked_body(
+            &mut PieceReader(pieces(&[b"0\r\n\r\n"])),
+            b"5\r\nhello\r\n",
+            4,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+    }
+
     #[tokio::test]
     async fn oversized_size_line_is_error() {
         let data = vec![b'a'; 2000];

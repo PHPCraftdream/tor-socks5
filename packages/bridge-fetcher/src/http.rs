@@ -429,6 +429,15 @@ where
                 body.extend_from_slice(&chunk[..n]);
             }
         } else {
+            // Bytes already buffered with the headers count against the cap
+            // BEFORE any further read: a body delivered whole in the first
+            // read and closed with EOF otherwise slips past the limit (the
+            // loop below re-checks only after a successful non-EOF read).
+            if body.len() > max_body_bytes {
+                return Err(FetchError::TooLarge {
+                    max_bytes: max_body_bytes,
+                });
+            }
             loop {
                 let mut chunk = vec![0u8; READ_BUF_SIZE];
                 let n = stream.read(&mut chunk).await.map_err(|e| FetchError::Io {
@@ -607,6 +616,49 @@ mod tests {
             .unwrap();
         match result {
             ResponseBody::Ok(body) => assert_eq!(body, "all the data"),
+            ResponseBody::Redirect(_) => panic!("expected Ok"),
+        }
+    }
+
+    /// A 200 without Content-Length/chunked whose whole body arrived in the
+    /// FIRST read (with the headers) and closed with EOF must be rejected
+    /// over the cap: the pre-fix reader checked the limit only after a later
+    /// non-EOF read, so this response was accepted at `max_body_bytes = 0`.
+    #[tokio::test]
+    async fn eof_body_fully_buffered_with_headers_over_limit_is_too_large() {
+        let response =
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nobfs4 192.0.2.1:443 0123 cert=aaaa";
+        let mut cursor = tokio::io::BufReader::new(&response[..]);
+        let err = read_http_response(&mut cursor, 0).await.unwrap_err();
+        assert!(
+            matches!(err, FetchError::TooLarge { max_bytes: 0 }),
+            "expected TooLarge, got: {err}"
+        );
+    }
+
+    /// Boundary that must remain accepted: the fully-buffered EOF body is
+    /// exactly at the cap.
+    #[tokio::test]
+    async fn eof_body_fully_buffered_exactly_at_the_limit_is_accepted() {
+        let body = b"obfs4 192.0.2.1:443 0123 cert=aaaa";
+        let mut response = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
+        response.extend_from_slice(body);
+        let mut cursor = tokio::io::BufReader::new(&response[..]);
+        let result = read_http_response(&mut cursor, body.len()).await.unwrap();
+        match result {
+            ResponseBody::Ok(text) => assert_eq!(text, String::from_utf8_lossy(body)),
+            ResponseBody::Redirect(_) => panic!("expected Ok"),
+        }
+    }
+
+    /// Boundary that must remain accepted: no body at all under a zero cap.
+    #[tokio::test]
+    async fn eof_response_without_a_body_is_accepted_at_max_zero() {
+        let response = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+        let mut cursor = tokio::io::BufReader::new(&response[..]);
+        let result = read_http_response(&mut cursor, 0).await.unwrap();
+        match result {
+            ResponseBody::Ok(text) => assert_eq!(text, ""),
             ResponseBody::Redirect(_) => panic!("expected Ok"),
         }
     }

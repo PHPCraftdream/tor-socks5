@@ -11,12 +11,15 @@ mod conn_health;
 mod daemon;
 mod fetch_merge;
 mod help_cmd;
+mod path_lock;
 mod seed;
 mod server;
 mod service;
 mod shutdown;
 mod socks5;
 mod startup;
+#[cfg(test)]
+mod test_seams;
 mod tor_setup;
 mod tor_watchdog;
 mod upstream;

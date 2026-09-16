@@ -88,6 +88,13 @@ Two independent signal layers drive the bridge lifecycle:
 
 This is deliberately gentle — no network flood.
 
+Writers of the store (the daemon's single-writer actor and CLI
+subcommands' inline fallback) hold a per-path advisory write lock
+(`<stem>.alive-bridges.log.lock`) across each whole read-modify-write
+cycle, so a `bridges fetch` run overlapping a live daemon serializes
+behind it instead of publishing a stale snapshot over the daemon's
+in-flight write.
+
 ## Active health observation (`circuit_fails`)
 
 A TCP-reachable bridge is not always usable for multi-hop Tor traffic.
@@ -159,6 +166,12 @@ The startup auto-fetch and the periodic maintenance loop refresh the pool
 and drain it to top the working list up to `min_alive`. Both obfs4 and
 webtunnel sources are pulled, so the pool — and the working list — grow in
 both transports.
+
+Refresh and drain each run as one cross-process transaction on a per-path
+write lock (`<stem>.candidates.log.lock`): a daemon drain and a CLI
+`bridges fetch` serialize instead of overwriting each other's snapshot, so
+concurrent additions survive and entries consumed by a drain (promoted or
+dead) stay removed.
 
 ## Sources (`bridges.sources`)
 
