@@ -665,6 +665,9 @@ mod bootstrap;
 pub(crate) use bootstrap::notify_fatal_protocol_error;
 /// Client reconfiguration and stream operations.
 mod operations;
+/// Exit stream-open timeout selection and bounded retry policy.
+mod stream_retry;
+use stream_retry::{retry_exit_stream, retryable_stream_error, snapshot_exit_stream_timeouts};
 impl<R: Runtime> ClientShared<R> {
     /// Used by `bootstrap_inner`: Return a `RunningInner`, constructing it if necessary.
     fn instantiate_running_inner(
@@ -923,50 +926,6 @@ async fn tasks_monitor_dormant<R: Runtime>(
                 task.fire();
             }
         }
-    }
-}
-
-/// Transient failures before a stream becomes available to the application.
-fn retryable_stream_error(error: &ErrorDetail) -> bool {
-    match error {
-        ErrorDetail::ExitTimeout => true,
-        ErrorDetail::StreamFailed {
-            cause: tor_circmgr::Error::Protocol { error, .. },
-            ..
-        } => {
-            matches!(
-                error,
-                tor_proto::Error::NotConnected | tor_proto::Error::CircuitClosed
-            )
-        }
-        _ => false,
-    }
-}
-
-/// Retry once on another circuit, before returning a stream to the application.
-/// cancel-safe: yes — no application data is sent; retirement preserves existing streams.
-async fn retry_exit_stream<T, I, F, Fut>(
-    mut open: F,
-    mut retire: impl FnMut(&I),
-) -> StdResult<T, ErrorDetail>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = StdResult<(I, StdResult<T, ErrorDetail>), ErrorDetail>>,
-{
-    let mut retried = false;
-    loop {
-        let (id, result) = open().await?;
-        if let Err(error) = &result {
-            if retryable_stream_error(error) {
-                retire(&id);
-                if !retried {
-                    info!(%error, "stream open failed; retrying on a fresh circuit");
-                    retried = true;
-                    continue;
-                }
-            }
-        }
-        return result;
     }
 }
 

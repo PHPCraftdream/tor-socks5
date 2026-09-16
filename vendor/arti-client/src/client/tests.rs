@@ -12,30 +12,48 @@
 #![allow(clippy::needless_pass_by_value)]
 //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
 
+use std::time::Duration;
+use tokio_crate as tokio;
 use tor_config::Reconfigure;
 
 use super::*;
+
+fn paused_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap()
+}
 
 #[test]
 fn stream_retry_retires_the_failed_circuit_before_opening_again() {
     use std::cell::{Cell, RefCell};
     let calls = Cell::new(0);
     let retired = RefCell::new(Vec::new());
-    let result = futures::executor::block_on(retry_exit_stream(
-        || {
-            let call = calls.get();
-            calls.set(call + 1);
-            let result = if call == 0 {
-                Err(ErrorDetail::ExitTimeout)
-            } else {
-                assert_eq!(*retired.borrow(), vec![0]);
-                Ok(42)
-            };
-            std::future::ready(Ok((call, result)))
-        },
-        |id| retired.borrow_mut().push(*id),
-    ));
-    assert_eq!(result.unwrap(), 42);
+    let tokio_runtime = paused_runtime();
+    tokio_runtime.block_on(async {
+        let runtime = tor_rtcompat::PreferredRuntime::current().unwrap();
+        let result = retry_exit_stream(
+            &runtime,
+            None,
+            Duration::from_secs(10),
+            || {
+                let call = calls.get();
+                calls.set(call + 1);
+                let result = if call == 0 {
+                    Err(ErrorDetail::ExitTimeout)
+                } else {
+                    assert_eq!(*retired.borrow(), vec![0]);
+                    Ok(42)
+                };
+                std::future::ready(Ok((call, std::future::ready(result))))
+            },
+            |id| retired.borrow_mut().push(*id),
+        )
+        .await;
+        assert_eq!(result.unwrap(), 42);
+    });
     assert_eq!(calls.get(), 2);
 }
 
@@ -44,25 +62,51 @@ fn stream_retry_is_bounded_and_retires_the_last_failed_circuit() {
     use std::cell::{Cell, RefCell};
     let calls = Cell::new(0);
     let retired = RefCell::new(Vec::new());
-    let result: StdResult<(), _> = futures::executor::block_on(retry_exit_stream(
-        || {
-            let call = calls.get();
-            calls.set(call + 1);
-            std::future::ready(Ok((call, Err(ErrorDetail::ExitTimeout))))
-        },
-        |id| retired.borrow_mut().push(*id),
-    ));
-    assert!(matches!(result, Err(ErrorDetail::ExitTimeout)));
+    let tokio_runtime = paused_runtime();
+    tokio_runtime.block_on(async {
+        let runtime = tor_rtcompat::PreferredRuntime::current().unwrap();
+        let started = tokio::time::Instant::now();
+        let result: StdResult<(), _> = retry_exit_stream(
+            &runtime,
+            Some(Duration::from_secs(4)),
+            Duration::from_secs(10),
+            || {
+                let call = calls.get();
+                calls.set(call + 1);
+                async move { Ok((call, std::future::pending::<StdResult<(), ErrorDetail>>())) }
+            },
+            |id| retired.borrow_mut().push(*id),
+        )
+        .await;
+        assert!(matches!(result, Err(ErrorDetail::ExitTimeout)));
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_secs(14)
+        );
+    });
     assert_eq!(calls.get(), 2);
     assert_eq!(*retired.borrow(), vec![0, 1]);
 }
 
 #[test]
 fn stream_retry_leaves_permanent_errors_alone() {
-    let result: StdResult<(), _> = futures::executor::block_on(retry_exit_stream(
-        || std::future::ready(Ok((0, Err(ErrorDetail::OnionAddressNotSupported)))),
-        |_| panic!("a permanent error must not retire circuits"),
-    ));
+    let tokio_runtime = paused_runtime();
+    let result: StdResult<(), _> = tokio_runtime.block_on(async {
+        let runtime = tor_rtcompat::PreferredRuntime::current().unwrap();
+        retry_exit_stream(
+            &runtime,
+            None,
+            Duration::from_secs(10),
+            || {
+                std::future::ready(Ok((
+                    0,
+                    std::future::ready(Err(ErrorDetail::OnionAddressNotSupported)),
+                )))
+            },
+            |_| panic!("a permanent error must not retire circuits"),
+        )
+        .await
+    });
     assert!(matches!(result, Err(ErrorDetail::OnionAddressNotSupported)));
     let closed = ErrorDetail::StreamFailed {
         kind: "data",
@@ -74,6 +118,163 @@ fn stream_retry_leaves_permanent_errors_alone() {
         },
     };
     assert!(retryable_stream_error(&closed));
+}
+
+#[test]
+fn stream_retry_default_budget_bounds_both_attempts() {
+    let tokio_runtime = paused_runtime();
+    tokio_runtime.block_on(async {
+        let runtime = tor_rtcompat::PreferredRuntime::current().unwrap();
+        let started = tokio::time::Instant::now();
+        let attempts = std::cell::Cell::new(0);
+        let retired = std::cell::RefCell::new(Vec::new());
+        let result: StdResult<(), _> = retry_exit_stream(
+            &runtime,
+            None,
+            Duration::from_secs(10),
+            || {
+                let attempt = attempts.get();
+                attempts.set(attempt + 1);
+                async move {
+                    Ok((
+                        attempt,
+                        std::future::pending::<StdResult<(), ErrorDetail>>(),
+                    ))
+                }
+            },
+            |id| retired.borrow_mut().push(*id),
+        )
+        .await;
+        assert!(matches!(result, Err(ErrorDetail::ExitTimeout)));
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_secs(20)
+        );
+        assert_eq!(*retired.borrow(), vec![0, 1]);
+    });
+}
+
+#[test]
+fn request_timeout_snapshot_survives_reconfigure_during_first_attempt() {
+    let tokio_runtime = paused_runtime();
+    tokio_runtime.block_on(async {
+        use tor_rtcompat::SleepProvider as _;
+        let runtime = tor_rtcompat::PreferredRuntime::current().unwrap();
+        let config = tor_config::MutCfg::new(StreamTimeoutConfig {
+            connect_timeout: Duration::from_secs(10),
+            initial_connect_timeout: Some(Duration::from_secs(4)),
+            resolve_timeout: Duration::from_secs(10),
+            resolve_ptr_timeout: Duration::from_secs(10),
+        });
+        let snapshot = config.get();
+        let (initial_timeout, ordinary_timeout) = snapshot_exit_stream_timeouts(&snapshot);
+        let attempts = std::cell::Cell::new(0);
+        let result = retry_exit_stream(
+            &runtime,
+            initial_timeout,
+            ordinary_timeout,
+            || {
+                let attempt = attempts.get();
+                attempts.set(attempt + 1);
+                let config = &config;
+                let runtime = runtime.clone();
+                async move {
+                    let stream = async move {
+                        if attempt == 0 {
+                            config.replace(StreamTimeoutConfig {
+                                connect_timeout: Duration::from_secs(1),
+                                initial_connect_timeout: Some(Duration::from_secs(1)),
+                                resolve_timeout: Duration::from_secs(10),
+                                resolve_ptr_timeout: Duration::from_secs(10),
+                            });
+                            std::future::pending::<()>().await;
+                        } else {
+                            runtime.sleep(Duration::from_secs(6)).await;
+                        }
+                        Ok::<_, ErrorDetail>(42)
+                    };
+                    Ok((attempt, stream))
+                }
+            },
+            |_| {},
+        )
+        .await;
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(attempts.get(), 2);
+    });
+}
+
+#[test]
+fn stream_retry_uses_fast_first_timer_and_ordinary_retry_timer() {
+    let tokio_runtime = paused_runtime();
+    tokio_runtime.block_on(async {
+        use tor_rtcompat::SleepProvider as _;
+        let rt = tor_rtcompat::PreferredRuntime::current().unwrap();
+        let attempts = std::cell::Cell::new(0);
+        let retired = std::cell::RefCell::new(Vec::new());
+        let started = tokio::time::Instant::now();
+        let result = retry_exit_stream(
+            &rt,
+            Some(Duration::from_secs(4)),
+            Duration::from_secs(10),
+            || {
+                let attempt = attempts.get();
+                attempts.set(attempt + 1);
+                let rt = rt.clone();
+                async move {
+                    let stream = async move {
+                        if attempt == 0 {
+                            std::future::pending::<()>().await;
+                        } else {
+                            rt.sleep(Duration::from_secs(6)).await;
+                        }
+                        Ok::<_, ErrorDetail>(42)
+                    };
+                    Ok((attempt, stream))
+                }
+            },
+            |id| retired.borrow_mut().push(*id),
+        )
+        .await;
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(*retired.borrow(), vec![0]);
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_secs(10)
+        );
+    });
+}
+
+#[test]
+fn stream_retry_caps_fast_timer_at_shorter_ordinary_budget() {
+    let tokio_runtime = paused_runtime();
+    tokio_runtime.block_on(async {
+        use tor_rtcompat::SleepProvider as _;
+        let rt = tor_rtcompat::PreferredRuntime::current().unwrap();
+        let attempts = std::cell::Cell::new(0);
+        let result: StdResult<(), _> = retry_exit_stream(
+            &rt,
+            Some(Duration::from_secs(4)),
+            Duration::from_secs(2),
+            || {
+                let attempt = attempts.get();
+                attempts.set(attempt + 1);
+                let rt = rt.clone();
+                async move {
+                    let stream = async move {
+                        rt.sleep(Duration::from_secs(3)).await;
+                        Ok::<_, ErrorDetail>(())
+                    };
+                    Ok((attempt, stream))
+                }
+            },
+            |_| {},
+        )
+        .await;
+        assert!(matches!(result, Err(ErrorDetail::ExitTimeout)));
+        assert_eq!(attempts.get(), 2);
+    });
 }
 use crate::config::TorClientConfigBuilder;
 use crate::{ErrorKind, HasKind};

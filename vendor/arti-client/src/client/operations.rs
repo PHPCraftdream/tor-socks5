@@ -160,6 +160,9 @@ impl<R: Runtime> TorClient<R> {
         target: A,
         prefs: &StreamPrefs,
     ) -> crate::Result<DataStream> {
+        // Reconfiguration affects future requests, not this request's retry budget.
+        let timeout_cfg = self.client.timeoutcfg.get();
+        let (initial_timeout, ordinary_timeout) = snapshot_exit_stream_timeouts(&timeout_cfg);
         let addr = target.into_tor_addr().map_err(wrap_err)?;
         let mut stream_parameters = prefs.stream_parameters();
         // This macro helps prevent code duplication in the match below.
@@ -172,11 +175,11 @@ impl<R: Runtime> TorClient<R> {
         // TODO: replace with an async closure (when our MSRV allows it),
         // or with a more elegant approach.
         macro_rules! begin_stream {
-            ($tunnel:expr, $addr:expr, $port:expr, $stream_params:expr) => {{
+            ($tunnel:expr, $addr:expr, $port:expr, $stream_params:expr, $timeout:expr) => {{
                 let fut = $tunnel.begin_stream($addr, $port, $stream_params);
                 self.client
                     .runtime
-                    .timeout(self.client.timeoutcfg.get().connect_timeout, fut)
+                    .timeout($timeout, fut)
                     .await
                     .map_err(|_| ErrorDetail::ExitTimeout)?
                     .map_err(|cause| ErrorDetail::StreamFailed {
@@ -193,15 +196,32 @@ impl<R: Runtime> TorClient<R> {
             } => {
                 let exit_ports = [prefs.wrap_target_port(port)];
                 retry_exit_stream(
-                    || async {
-                        let tunnel = self.get_or_launch_exit_tunnel(&exit_ports, prefs).await?;
-                        let id = tunnel.unique_id();
-                        debug!(tunnel_id = %id, "Got a circuit for {}:{}", sensitive(&addr), port);
-                        let result = async {
-                            begin_stream!(tunnel, &addr, port, Some(stream_parameters.clone()))
+                    &self.client.runtime,
+                    initial_timeout,
+                    ordinary_timeout,
+                    || {
+                        let addr = addr.clone();
+                        let stream_parameters = stream_parameters.clone();
+                        async move {
+                            let tunnel = self.get_or_launch_exit_tunnel(&exit_ports, prefs).await?;
+                            let id = tunnel.unique_id();
+                            debug!(
+                                tunnel_id = %id,
+                                "Got a circuit for {}:{}",
+                                sensitive(&addr),
+                                port
+                            );
+                            let stream = async move {
+                                tunnel
+                                    .begin_stream(&addr, port, Some(stream_parameters))
+                                    .await
+                                    .map_err(|cause| ErrorDetail::StreamFailed {
+                                        cause,
+                                        kind: "data",
+                                    })
+                            };
+                            Ok((id, stream))
                         }
-                        .await;
-                        Ok((id, result))
                     },
                     |id| {
                         if let Ok(running) =
@@ -276,7 +296,13 @@ impl<R: Runtime> TorClient<R> {
                     .suppress_begin_flags()
                     .optimistic(false);
 
-                begin_stream!(tunnel, &hostname, port, Some(stream_parameters))
+                begin_stream!(
+                    tunnel,
+                    &hostname,
+                    port,
+                    Some(stream_parameters),
+                    timeout_cfg.connect_timeout
+                )
             }
         };
 

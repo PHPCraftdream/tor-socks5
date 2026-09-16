@@ -3,6 +3,40 @@ use super::*;
 /// How long `nativeStop` waits for the engine thread (unchanged 10s contract).
 const STOP_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Build the settings used by the Android MAIN engine. Keeping this in one
+/// helper makes startup and any future in-process reconfiguration share the
+/// same stream-open policy; bridge verifiers do not call it.
+pub(crate) fn main_engine_settings(
+    bridges: Vec<bridge_line::BridgeLine>,
+    pt_binary: Option<std::path::PathBuf>,
+    state_dir: std::path::PathBuf,
+    obfs4_iat_mode: Option<u8>,
+) -> arti_wrapper::Settings {
+    arti_wrapper::Settings {
+        bridges,
+        pt_binary,
+        state_dir: Some(state_dir),
+        obfs4_iat_mode,
+        initial_connect_timeout: Some(Duration::from_secs(4)),
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::main_engine_settings;
+
+    #[test]
+    fn main_engine_settings_opts_into_fast_first_exit_attempt() {
+        let settings = main_engine_settings(Vec::new(), None, "state".into(), None);
+        assert_eq!(
+            settings.initial_connect_timeout,
+            Some(std::time::Duration::from_secs(4))
+        );
+        assert!(!settings.is_default());
+    }
+}
+
 /// First phase of `nativeStop`, run under the ENGINE lock. Pure state
 /// transition — no status writes, no waiting (side-effect-free so it is
 /// directly unit-testable).
@@ -282,13 +316,12 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
         };
 
         // 8. Build Settings
-        let settings = arti_wrapper::Settings {
-            bridges: parsed_bridges.bridges,
+        let settings = main_engine_settings(
+            parsed_bridges.bridges,
             pt_binary,
-            state_dir: Some(state_dir),
-            obfs4_iat_mode: cfg.bridges.iat_mode_override(),
-            ..Default::default()
-        };
+            state_dir,
+            cfg.bridges.iat_mode_override(),
+        );
         let block_onion = cfg.security.block_onion;
         // Captured before `loaded`/`cfg` go out of scope: the engine thread
         // needs its own owned copies to persist/rank bridge health via the

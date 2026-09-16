@@ -140,6 +140,12 @@ pub struct StreamTimeoutConfig {
     #[deftly(tor_config(default = "default_connect_timeout()"))]
     pub(crate) connect_timeout: Duration,
 
+    /// Optional timeout for the first exit stream-open attempt. When set,
+    /// only the initial attempt made by the exit-stream retry policy uses
+    /// this budget; its one retry uses `connect_timeout`.
+    #[deftly(tor_config(no_magic, setter(skip), build = "Self::build_initial_connect_timeout"))]
+    pub(crate) initial_connect_timeout: Option<Duration>,
+
     /// How long should we wait before timing out when resolving a DNS record?
     #[deftly(tor_config(default = "default_dns_resolve_timeout()"))]
     pub(crate) resolve_timeout: Duration,
@@ -153,6 +159,31 @@ pub struct StreamTimeoutConfig {
 /// Return the default stream timeout
 fn default_connect_timeout() -> Duration {
     Duration::new(10, 0)
+}
+
+impl StreamTimeoutConfigBuilder {
+    /// Set or clear the optional fast first-attempt timeout.
+    pub fn initial_connect_timeout(&mut self, timeout: Option<Duration>) -> &mut Self {
+        self.initial_connect_timeout = Some(timeout);
+        self
+    }
+
+    /// Flatten the specialized builder's optional slot.
+    fn build_initial_connect_timeout(&self) -> Option<Duration> {
+        self.initial_connect_timeout.flatten()
+    }
+}
+
+impl StreamTimeoutConfig {
+    /// Return the optional timeout used for the first exit CONNECT attempt.
+    pub fn initial_connect_timeout(&self) -> Option<Duration> {
+        self.initial_connect_timeout
+    }
+
+    /// Return the ordinary timeout used for stream opens and retries.
+    pub fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
 }
 
 /// Return the default resolve timeout
@@ -811,6 +842,13 @@ impl TorClientConfigBuilder {
     // NOTE: This is necessary for now because sub_builder isn't compatible with build().
     pub fn override_net_params(&mut self) -> &mut HashMap<String, i32> {
         &mut self.override_net_params
+    }
+}
+
+impl TorClientConfig {
+    /// Return stream-open timeout settings.
+    pub fn stream_timeouts(&self) -> &StreamTimeoutConfig {
+        &self.stream_timeouts
     }
 }
 

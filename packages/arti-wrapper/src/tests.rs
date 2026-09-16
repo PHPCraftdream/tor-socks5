@@ -26,6 +26,21 @@ fn settings_default_is_default() {
     assert!(s.is_default());
     assert!(s.bridges.is_empty());
     assert!(s.pt_binary.is_none());
+    assert!(s.initial_connect_timeout.is_none());
+}
+
+#[test]
+fn settings_initial_connect_timeout_is_an_explicit_opt_in() {
+    let settings = Settings {
+        initial_connect_timeout: Some(std::time::Duration::from_secs(4)),
+        ..Default::default()
+    };
+    assert!(!settings.is_default());
+    let config = build_config(&settings).unwrap();
+    assert_eq!(
+        config.stream_timeouts().initial_connect_timeout(),
+        Some(std::time::Duration::from_secs(4))
+    );
 }
 
 #[test]
@@ -73,6 +88,24 @@ fn build_config_cache_dir_without_state_dir_is_ignored() {
         ..Default::default()
     };
     assert!(build_config(&s).is_ok());
+}
+
+#[tokio::test]
+async fn reconfigure_settings_accepts_updated_stream_timeout_profile() {
+    ensure_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let initial = Settings {
+        state_dir: Some(dir.path().to_path_buf()),
+        initial_connect_timeout: Some(std::time::Duration::from_secs(4)),
+        ..Default::default()
+    };
+    let updated = Settings {
+        state_dir: Some(dir.path().to_path_buf()),
+        initial_connect_timeout: Some(std::time::Duration::from_secs(3)),
+        ..Default::default()
+    };
+    let tunnel = TorTunnel::create_unbootstrapped_with(initial).unwrap();
+    tunnel.reconfigure_bridges(&updated).unwrap();
 }
 
 #[test]

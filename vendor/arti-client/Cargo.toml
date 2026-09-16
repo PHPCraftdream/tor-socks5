@@ -469,6 +469,7 @@ features = [
     "net",
     "time",
     "macros",
+    "test-util",
 ]
 package = "tokio"
 

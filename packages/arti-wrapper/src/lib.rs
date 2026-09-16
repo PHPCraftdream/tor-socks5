@@ -164,6 +164,9 @@ pub struct Settings {
     /// for consensus-fetch parallelism) -- and even when it doesn't, it is
     /// pure waste for a client that will be torn down after one probe.
     pub disable_preemptive_circuits: bool,
+    /// Optional first-attempt timeout for exit CONNECT stream opens. When set,
+    /// the one retry keeps arti's ordinary `connect_timeout` budget.
+    pub initial_connect_timeout: Option<Duration>,
 }
 
 impl Settings {
@@ -174,6 +177,7 @@ impl Settings {
             && self.min_bandwidth_percentile == 0
             && self.obfs4_iat_mode.is_none()
             && !self.disable_preemptive_circuits
+            && self.initial_connect_timeout.is_none()
     }
 }
 
@@ -533,10 +537,11 @@ impl TorTunnel {
         self.inner.bootstrap().await.map_err(TorError::Bootstrap)
     }
 
-    /// Apply a new bridge order before bootstrap starts. The channel manager may already have
+    /// Apply updated settings before bootstrap starts. The channel manager may already have
     /// warmed channels for this same client; reconfiguring the guard set makes the measured
     /// fastest candidates the first choices instead of leaving the initial bootstrap to the
-    /// original config-file order.
+    /// original config-file order. Stream timeout settings also take effect for subsequent
+    /// stream requests, while requests already in progress retain their snapshot.
     pub fn reconfigure_bridges(&self, settings: &Settings) -> Result<()> {
         let config = build_config(settings)?;
         self.inner
@@ -667,6 +672,10 @@ fn fatal_protocol_error_hook(error: &arti_client::Error) {
 
 fn build_config(settings: &Settings) -> Result<TorClientConfig> {
     let mut builder: TorClientConfigBuilder = TorClientConfig::builder();
+
+    builder
+        .stream_timeouts()
+        .initial_connect_timeout(settings.initial_connect_timeout);
 
     // Patience for slow bridges. arti's default download schedules are tuned
     // for fast public relays; over a slow/marginal obfs4 or webtunnel bridge

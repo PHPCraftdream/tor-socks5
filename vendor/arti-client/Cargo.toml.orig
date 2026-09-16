@@ -235,6 +235,7 @@ tokio-crate = { package = "tokio", version = "1.7", features = [
     "net",
     "time",
     "macros",
+    "test-util",
 ] }
 toml = "1.0.3"
 tor-relay-selection = { path = "../tor-relay-selection", version = "0.43.0" }

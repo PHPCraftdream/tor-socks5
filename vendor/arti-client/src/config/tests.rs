@@ -74,6 +74,40 @@ fn builder() {
 }
 
 #[test]
+fn stream_timeout_builder_preserves_optional_initial_connect_budget() {
+    let timeout = std::time::Duration::from_secs(4);
+    let mut builder = TorClientConfig::builder();
+    builder
+        .stream_timeouts()
+        .initial_connect_timeout(Some(timeout));
+    let config = builder.build().unwrap();
+    assert_eq!(
+        config.stream_timeouts.initial_connect_timeout,
+        Some(timeout)
+    );
+    assert_eq!(
+        config.stream_timeouts.connect_timeout,
+        std::time::Duration::from_secs(10)
+    );
+    assert_eq!(
+        TorClientConfig::default()
+            .stream_timeouts
+            .initial_connect_timeout,
+        None
+    );
+    assert_eq!(
+        TorClientConfig::default().stream_timeouts.resolve_timeout,
+        std::time::Duration::from_secs(10)
+    );
+    assert_eq!(
+        TorClientConfig::default()
+            .stream_timeouts
+            .resolve_ptr_timeout,
+        std::time::Duration::from_secs(10)
+    );
+}
+
+#[test]
 fn bridges_supported() {
     /// checks that when s is processed as TOML for a client config,
     /// the resulting number of bridges is according to `exp`
