@@ -31,6 +31,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bridge_line::BridgeLine;
@@ -40,7 +41,20 @@ mod observe;
 mod persistence;
 mod stats;
 
-type Key = bridge_probe::BridgeIdentity;
+type Identity = bridge_probe::BridgeIdentity;
+type Key = Arc<Identity>;
+
+// A one-item, thread-local query cache for the hot read path. The map owns its
+// canonical identity in an `Arc<Identity>`, but a BTreeMap lookup still needs a
+// key value. Keeping the most recently queried bridge alongside that identity
+// makes the common sequence of health reads for one bridge (for example, a
+// ranking comparator) reuse the parsed WebTunnel endpoint and all of its
+// strings. The bridge value is retained to make pointer reuse and mutation
+// safe; the cache is bounded to one entry per calling thread.
+thread_local! {
+    static LAST_LOOKUP_KEY: std::cell::RefCell<Option<(BridgeLine, Key)>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 #[derive(Debug, Clone)]
 struct Entry {
@@ -183,12 +197,25 @@ impl Entry {
     }
 
     fn key(&self) -> Key {
+        // The map key is the canonical identity for this entry. Returning a
+        // clone only increments its Arc count; it never reparses the bridge.
         key_of(&self.bridge)
     }
 }
 
 fn key_of(b: &BridgeLine) -> Key {
-    bridge_probe::bridge_identity(b)
+    LAST_LOOKUP_KEY.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some((cached_bridge, key)) = cache.as_ref() {
+            if cached_bridge == b {
+                return Arc::clone(key);
+            }
+        }
+
+        let key = Arc::new(bridge_probe::bridge_identity(b));
+        *cache = Some((b.clone(), Arc::clone(&key)));
+        key
+    })
 }
 
 #[derive(Debug, Clone)]

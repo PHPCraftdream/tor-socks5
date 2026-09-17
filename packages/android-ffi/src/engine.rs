@@ -461,7 +461,8 @@ async fn engine_async(
         // further down, which is never reached if bridges never come up -- nativeStop would
         // then block for its full 10s timeout instead of returning immediately.
         let preferred = preferred_transport_bridges(&settings.bridges, &bridge_health);
-        let active_probe_bridges = select_active_probe_bridges(&preferred, &bridge_health);
+        let active_probe_bridges =
+            select_active_probe_bridges_async(&preferred, &bridge_health).await;
         let probing_all_configured = active_probe_bridges.len() == settings.bridges.len();
         info!(
             count = active_probe_bridges.len(),
@@ -477,7 +478,7 @@ async fn engine_async(
             round = bridge_probe::probe_round_with_policy(active_probe_bridges.clone(), Duration::from_secs(5), bridge_health.resolver_policy) => round,
         };
 
-        persist_and_rank_probe(&active_probe_bridges, &mut round, &bridge_health);
+        persist_and_rank_probe_async(&active_probe_bridges, &mut round, &bridge_health).await;
         let mut alive = std::mem::take(&mut round.alive);
 
         // A stale health store must not make a new installation unusable. If none of the
@@ -498,7 +499,7 @@ async fn engine_async(
                 }
                 round = bridge_probe::probe_round_with_policy(settings.bridges.clone(), Duration::from_secs(5), bridge_health.resolver_policy) => round,
             };
-            persist_and_rank_probe(&settings.bridges, &mut round, &bridge_health);
+            persist_and_rank_probe_async(&settings.bridges, &mut round, &bridge_health).await;
             alive = std::mem::take(&mut round.alive);
         }
 
@@ -633,7 +634,7 @@ async fn engine_async(
             }
             pool = warm_bridge_pool(warm_tunnel, warm_bridges) => pool,
         };
-        persist_warm_results(&pool, &warm_health);
+        persist_warm_results_async(&pool, &warm_health).await;
         if let Some((fastest, latency)) = pool.warmed.first() {
             info!(
                 bridge = %fastest.addr,

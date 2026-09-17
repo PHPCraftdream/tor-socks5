@@ -310,6 +310,11 @@ impl Drop for ScratchGuard {
     }
 }
 
+fn reset_warm_session_state(warm_session_failed: &mut HashSet<String>) {
+    bridge_probe::flush_dns_cache();
+    warm_session_failed.clear();
+}
+
 /// Runs alongside `wait_bootstrapped()` (spawned right before it, aborted right after it
 /// resolves either way). Bootstrap has no built-in stall detection: if every currently-tried
 /// bridge fails at the PT/TLS layer (deeper than the plain TCP reachability probe already run
@@ -481,14 +486,16 @@ pub(super) async fn stall_watchdog(
             // layer and every one of those attempts is doomed before it starts, starving the
             // transport the user actually asked for of its share of each round's batch.
             let preferred = preferred_transport_bridges(&bridges, &bridge_health);
-            let batch: Vec<BridgeLine> = select_active_probe_bridges(&preferred, &bridge_health)
-                .into_iter()
-                .filter(|bridge| {
-                    let text = bridge.to_string();
-                    !already_active.contains(&text) && !warm_session_failed.contains(&text)
-                })
-                .take(batch_size)
-                .collect();
+            let batch: Vec<BridgeLine> =
+                select_active_probe_bridges_async(&preferred, &bridge_health)
+                    .await
+                    .into_iter()
+                    .filter(|bridge| {
+                        let text = bridge.to_string();
+                        !already_active.contains(&text) && !warm_session_failed.contains(&text)
+                    })
+                    .take(batch_size)
+                    .collect();
 
             if !batch.is_empty() {
                 info!(
@@ -502,7 +509,7 @@ pub(super) async fn stall_watchdog(
                     _ = stop_rx.changed() => return,
                     pool = warm_bridge_pool(tunnel.clone(), batch.clone()) => pool,
                 };
-                persist_warm_results(&pool, &bridge_health);
+                persist_warm_results_async(&pool, &bridge_health).await;
 
                 let warmed_keys: HashSet<String> =
                     pool.warmed.iter().map(|(b, _)| b.to_string()).collect();
@@ -556,20 +563,7 @@ pub(super) async fn stall_watchdog(
         // check costs a real Tor circuit per bridge, not a local socket.
         if last_circuit_verify.elapsed() >= CIRCUIT_VERIFY_INTERVAL {
             last_circuit_verify = Instant::now();
-            let store_path = BridgeStore::resolve_path(bridge_health.config_path.as_deref());
-            let due = match BridgeStore::load(store_path) {
-                Ok(store) => store.needing_circuit_verification(
-                    OffsetDateTime::now_utc(),
-                    CIRCUIT_VERIFY_MAX_AGE,
-                    CIRCUIT_VERIFY_BATCH,
-                    // android ranks the whole pool; no active-set restriction here
-                    |_| true,
-                ),
-                Err(error) => {
-                    warn!(error = %error, "circuit-verify: failed to load bridge store");
-                    Vec::new()
-                }
-            };
+            let due = needing_circuit_verification_async(&bridge_health).await;
 
             if !due.is_empty() {
                 info!(count = due.len(), "circuit-verify: checking due bridges");
@@ -631,7 +625,7 @@ pub(super) async fn stall_watchdog(
                         checked = results.len(),
                         verified, "circuit-verify: tick complete"
                     );
-                    persist_circuit_verify_results(&results, &verify_health);
+                    persist_circuit_verify_results_async(&results, &verify_health).await;
                 });
             }
         }
@@ -668,7 +662,7 @@ pub(super) async fn stall_watchdog(
                     _ = reprobe_stop_rx.changed() => return,
                     round = bridge_probe::probe_round_with_policy(reprobe_bridges.clone(), BRIDGE_REPROBE_TIMEOUT, reprobe_health.resolver_policy) => round,
                 };
-                persist_and_rank_probe(&reprobe_bridges, &mut round, &reprobe_health);
+                persist_and_rank_probe_async(&reprobe_bridges, &mut round, &reprobe_health).await;
                 let alive = std::mem::take(&mut round.alive);
                 debug!(
                     alive = alive.len(),
@@ -680,7 +674,7 @@ pub(super) async fn stall_watchdog(
                     && reprobe_health.bridges_cfg.auto_fetch
                     && !reprobe_health.bridges_cfg.sources.is_empty()
                 {
-                    let barren = barren_sources(&reprobe_health, this_round);
+                    let barren = barren_sources_async(&reprobe_health, this_round).await;
                     let sources: Vec<bridge_fetcher::Source> = reprobe_health
                         .bridges_cfg
                         .sources
@@ -719,7 +713,7 @@ pub(super) async fn stall_watchdog(
                             );
                         }
                     }
-                    persist_bridge_sources(&outcomes, &reprobe_health);
+                    persist_bridge_sources_async(outcomes, &reprobe_health).await;
                     let (unique, duplicates) = bridge_fetcher::dedup_bridges(fetched);
                     info!(
                         unique = unique.len(),
@@ -762,7 +756,7 @@ pub(super) async fn stall_watchdog(
         // A sustained stall is what a network change looks like from in here,
         // and the DNS cache plus the DoH provider scores both describe the
         // network we were on, not the one we may now be on.
-        bridge_probe::flush_dns_cache();
+        reset_warm_session_state(&mut warm_session_failed);
         if let Err(e) = tunnel.terminate_all_channels() {
             warn!(error = %e, "watchdog: terminate_all_channels failed");
         } else {
@@ -778,7 +772,7 @@ pub(super) async fn stall_watchdog(
             };
             // Persist even when nothing warmed: a round that only retired stale
             // bridges is still progress worth keeping.
-            persist_warm_results(&pool, &bridge_health);
+            persist_warm_results_async(&pool, &bridge_health).await;
             if !pool.retired.is_empty() {
                 let retired: HashSet<String> = pool.retired.iter().map(|b| b.to_string()).collect();
                 rotation_bridges.retain(|(b, _)| !retired.contains(&b.to_string()));
@@ -807,6 +801,15 @@ pub(super) async fn stall_watchdog(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_reset_forgets_warm_session_failures() {
+        let mut failed = HashSet::from(["obfs4 192.0.2.1:443".to_owned()]);
+
+        reset_warm_session_state(&mut failed);
+
+        assert!(failed.is_empty());
+    }
 
     #[test]
     fn scratch_guard_cleans_up_unstarted_closure() {

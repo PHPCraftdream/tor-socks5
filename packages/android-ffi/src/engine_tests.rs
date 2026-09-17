@@ -251,6 +251,8 @@ fn concurrent_store_writers_do_not_lose_each_others_updates() {
     use super::BridgesConfig;
     use super::WarmPool;
 
+    let _test_serial = super::bridges::lock_store_test_serial();
+
     struct HookGuard;
     impl Drop for HookGuard {
         fn drop(&mut self) {
@@ -535,6 +537,76 @@ fn failed_circuit_verify_batch_advances_the_due_queue() {
             "an isolated check failure is not a live outage"
         );
     }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Bridge-store persistence must not run its filesystem work on the Tokio worker.
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn async_bridge_store_persistence_runs_on_blocking_pool() {
+    use super::bridges::{lock_store_test_serial, persist_warm_results_async, set_store_test_hook};
+    use super::{BridgeHealthContext, BridgeLine, BridgesConfig, WarmPool};
+
+    let _test_serial = lock_store_test_serial();
+
+    struct HookGuard;
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            set_store_test_hook(None);
+        }
+    }
+
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "engine-store-off-worker-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).expect("mkdir temp dir");
+    let cfg_path = dir.join("cfg.ktav");
+    let health = BridgeHealthContext {
+        config_path: Some(cfg_path),
+        bridges_cfg: BridgesConfig::default(),
+        resolver_policy: bridge_probe::ResolverPolicy::default(),
+    };
+    let bridge = "webtunnel 192.0.2.44:443 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA url=https://bridge.example.test/x"
+        .parse::<BridgeLine>()
+        .expect("well-formed bridge line");
+
+    let executor_thread = std::thread::current().id();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let entered_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(entered_tx)));
+    let entered_tx_for_hook = std::sync::Arc::clone(&entered_tx);
+    set_store_test_hook(Some(std::sync::Arc::new(move |site| {
+        if site == "persist_warm_results:after_load" {
+            if let Some(sender) = entered_tx_for_hook
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            {
+                let _ = sender.send(std::thread::current().id());
+            }
+        }
+    })));
+    let _hook_guard = HookGuard;
+
+    let save = tokio::spawn(async move {
+        persist_warm_results_async(
+            &WarmPool {
+                warmed: vec![(bridge, Duration::from_millis(1))],
+                retired: Vec::new(),
+            },
+            &health,
+        )
+        .await;
+    });
+    let blocking_thread = tokio::time::timeout(Duration::from_secs(10), entered_rx)
+        .await
+        .expect("bridge-store job reaches its blocking phase")
+        .expect("bridge-store job signals entry");
+    assert_ne!(blocking_thread, executor_thread);
+    save.await.expect("bridge-store task joins");
+
     let _ = std::fs::remove_dir_all(dir);
 }
 

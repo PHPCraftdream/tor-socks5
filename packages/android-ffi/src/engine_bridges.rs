@@ -117,6 +117,27 @@ pub(super) fn select_active_probe_bridges(
     usable.into_iter().take(MAX_ACTIVE_BRIDGES).collect()
 }
 
+/// Run [`select_active_probe_bridges`] without doing bridge-store I/O on a Tokio worker.
+pub(super) async fn select_active_probe_bridges_async(
+    configured: &[BridgeLine],
+    bridge_health: &BridgeHealthContext,
+) -> Vec<BridgeLine> {
+    let configured = configured.to_vec();
+    let fallback = configured.clone();
+    let bridge_health = bridge_health.clone();
+    match tokio::task::spawn_blocking(move || {
+        select_active_probe_bridges(&configured, &bridge_health)
+    })
+    .await
+    {
+        Ok(selected) => selected,
+        Err(error) => {
+            warn!(error = %error, "bridge-store ranking task failed; using configured pool");
+            fallback.into_iter().take(MAX_ACTIVE_BRIDGES).collect()
+        }
+    }
+}
+
 /// Persist a probe round's reachability outcome to the shared bridge-health store
 /// (`<config-stem>.alive-bridges.log`, same file the CLI daemon uses) and re-sort `alive` by
 /// historical stability (`ok_count`, ties broken by latency) ahead of a bridge seen reachable
@@ -196,6 +217,26 @@ pub(crate) fn persist_and_rank_probe(
     }
 }
 
+/// Persist a probe round on Tokio's blocking pool and join the job before returning.
+pub(crate) async fn persist_and_rank_probe_async(
+    all_bridges: &[BridgeLine],
+    round: &mut bridge_probe::ProbeRound,
+    bridge_health: &BridgeHealthContext,
+) {
+    let all_bridges = all_bridges.to_vec();
+    let bridge_health = bridge_health.clone();
+    let original = round.clone();
+    let job = tokio::task::spawn_blocking(move || {
+        let mut round = original;
+        persist_and_rank_probe(&all_bridges, &mut round, &bridge_health);
+        round
+    });
+    match job.await {
+        Ok(updated) => *round = updated,
+        Err(error) => warn!(error = %error, "bridge-store probe persistence task failed"),
+    }
+}
+
 /// Path for the on-disk DNS fallback cache, next to the config file --
 /// same sibling-file convention as `active_bridges_path` in `lib.rs`.
 pub(super) fn dns_cache_path(config_path: Option<&std::path::Path>) -> std::path::PathBuf {
@@ -252,6 +293,49 @@ pub(super) fn barren_sources(bridge_health: &BridgeHealthContext, round: u32) ->
     barren
 }
 
+/// Read source health on Tokio's blocking pool and join the job before returning.
+pub(super) async fn barren_sources_async(
+    bridge_health: &BridgeHealthContext,
+    round: u32,
+) -> HashSet<String> {
+    let bridge_health = bridge_health.clone();
+    match tokio::task::spawn_blocking(move || barren_sources(&bridge_health, round)).await {
+        Ok(sources) => sources,
+        Err(error) => {
+            warn!(error = %error, "bridge-store source-health task failed");
+            HashSet::new()
+        }
+    }
+}
+
+/// Read the circuit-verification queue on Tokio's blocking pool and join the job.
+pub(super) async fn needing_circuit_verification_async(
+    bridge_health: &BridgeHealthContext,
+) -> Vec<BridgeLine> {
+    let path = BridgeStore::resolve_path(bridge_health.config_path.as_deref());
+    let job = tokio::task::spawn_blocking(move || {
+        BridgeStore::load(path).map(|store| {
+            store.needing_circuit_verification(
+                OffsetDateTime::now_utc(),
+                CIRCUIT_VERIFY_MAX_AGE,
+                CIRCUIT_VERIFY_BATCH,
+                |_| true,
+            )
+        })
+    });
+    match job.await {
+        Ok(Ok(due)) => due,
+        Ok(Err(error)) => {
+            warn!(error = %error, "circuit-verify: failed to load bridge store");
+            Vec::new()
+        }
+        Err(error) => {
+            warn!(error = %error, "circuit-verify: bridge-store load task failed");
+            Vec::new()
+        }
+    }
+}
+
 /// Credit each source with the bridges it supplied, so a collector can later be
 /// judged by what it yields rather than by whether its fetch returned 200.
 pub(super) fn persist_bridge_sources(
@@ -282,6 +366,21 @@ pub(super) fn persist_bridge_sources(
     run_store_test_hook("persist_bridge_sources:before_save");
     if let Err(error) = store.save() {
         warn!(error = %error, "could not persist bridge source attribution");
+    }
+}
+
+/// Persist source attribution on Tokio's blocking pool and join the job before returning.
+pub(super) async fn persist_bridge_sources_async(
+    outcomes: Vec<bridge_fetcher::FetchOutcome>,
+    bridge_health: &BridgeHealthContext,
+) {
+    let bridge_health = bridge_health.clone();
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        persist_bridge_sources(&outcomes, &bridge_health);
+    })
+    .await
+    {
+        warn!(error = %error, "bridge-store source persistence task failed");
     }
 }
 
@@ -356,7 +455,7 @@ pub(super) async fn cold_start_rescue_fetch(
             );
         }
     }
-    persist_bridge_sources(&outcomes, bridge_health);
+    persist_bridge_sources_async(outcomes, bridge_health).await;
     let (unique, duplicates) = bridge_fetcher::dedup_bridges(fetched);
     info!(
         unique = unique.len(),
@@ -372,7 +471,7 @@ pub(super) async fn cold_start_rescue_fetch(
         _ = stop_rx.changed() => return ColdStartRescue::StopRequested,
         round = bridge_probe::probe_round_with_policy(unique.clone(), Duration::from_secs(5), bridge_health.resolver_policy) => round,
     };
-    persist_and_rank_probe(&unique, &mut round, bridge_health);
+    persist_and_rank_probe_async(&unique, &mut round, bridge_health).await;
     ColdStartRescue::Alive(std::mem::take(&mut round.alive))
 }
 
@@ -403,6 +502,25 @@ pub(super) fn persist_warm_results(pool: &WarmPool, bridge_health: &BridgeHealth
     }
     if let Err(error) = store.save() {
         warn!(error = %error, "could not persist bridge rotation ranking");
+    }
+}
+
+/// Persist warm-pool results on Tokio's blocking pool and join the job before returning.
+pub(super) async fn persist_warm_results_async(
+    pool: &WarmPool,
+    bridge_health: &BridgeHealthContext,
+) {
+    let pool = WarmPool {
+        warmed: pool.warmed.clone(),
+        retired: pool.retired.clone(),
+    };
+    let bridge_health = bridge_health.clone();
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        persist_warm_results(&pool, &bridge_health);
+    })
+    .await
+    {
+        warn!(error = %error, "bridge-store warm persistence task failed");
     }
 }
 
@@ -447,6 +565,22 @@ pub(super) fn persist_circuit_verify_results(
     }
     if let Err(error) = store.save() {
         warn!(error = %error, "circuit-verify: could not persist results");
+    }
+}
+
+/// Persist circuit-verification results on Tokio's blocking pool and join the job.
+pub(super) async fn persist_circuit_verify_results_async(
+    results: &[(BridgeLine, bool)],
+    bridge_health: &BridgeHealthContext,
+) {
+    let results = results.to_vec();
+    let bridge_health = bridge_health.clone();
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        persist_circuit_verify_results(&results, &bridge_health);
+    })
+    .await
+    {
+        warn!(error = %error, "bridge-store circuit persistence task failed");
     }
 }
 
@@ -646,8 +780,16 @@ type StoreHook = std::sync::Arc<dyn Fn(&'static str) + Send + Sync>;
 static STORE_TEST_HOOK: Mutex<Option<StoreHook>> = Mutex::new(None);
 
 #[cfg(test)]
+static STORE_TEST_SERIAL: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
 pub(super) fn set_store_test_hook(hook: Option<StoreHook>) {
     *STORE_TEST_HOOK.lock().unwrap_or_else(|p| p.into_inner()) = hook;
+}
+
+#[cfg(test)]
+pub(super) fn lock_store_test_serial() -> std::sync::MutexGuard<'static, ()> {
+    STORE_TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 #[cfg(test)]
