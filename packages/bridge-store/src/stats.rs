@@ -316,6 +316,26 @@ impl BridgeStore {
         )
     }
 
+    /// Sorts a freshly probed round in place, most stable first: more
+    /// channel-proven warm-ups (`channel_ok_count`, descending), then more
+    /// cumulative successful probes (`ok_count`, descending), then lower
+    /// last latency. Equal keys keep their input order (stable sort) — the
+    /// exact total order the per-comparison comparator this replaces used to
+    /// produce. Reading the counters as a cached sort key costs one identity
+    /// build and one map lookup per bridge, where per-comparison getter
+    /// calls interleaved two bridges and rebuilt both keys on every
+    /// comparison.
+    pub fn rank_probe_round(&self, alive: &mut [(BridgeLine, Duration)]) {
+        alive.sort_by_cached_key(|(bridge, latency)| {
+            let entry = self.entries.get(&key_of(bridge));
+            (
+                std::cmp::Reverse(entry.map_or(0, |e| e.channel_ok_count)),
+                std::cmp::Reverse(entry.map_or(0, |e| e.ok_count)),
+                *latency,
+            )
+        });
+    }
+
     fn rank_and_take<'a>(
         healthy: impl Iterator<Item = &'a Entry>,
         limit: usize,

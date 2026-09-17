@@ -533,3 +533,144 @@ fn channel_proven_bridges_top_k_matches_full_ranking_at_every_limit() {
     assert_eq!(s.channel_proven_bridges(0), Vec::<BridgeLine>::new());
     assert_eq!(s.channel_proven_bridges(50), expected, "k >= N");
 }
+
+// -- TS17-06: rank_probe_round --------------------------------------------
+
+/// The probe-round ranking keeps the exact total order of the per-comparison
+/// comparator it replaces: channel_ok_count desc, then ok_count desc, then
+/// latency asc. Counters must dominate latency (`ok9` is the slowest bridge
+/// in the round and still outranks the fast `ok4`), and channel history must
+/// dominate ok_count (`ch1` has ok_count 1 and still outranks `ok9`).
+#[test]
+fn rank_probe_round_orders_by_channel_then_ok_then_latency() {
+    let mut s = empty();
+    let t0 = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+    let ch2 = bridge(OBFS4_A);
+    let ch1 = bridge(OBFS4_B);
+    let ok9 =
+        bridge("obfs4 2.2.2.2:443 3333333333333333333333333333333333333333 cert=CCC iat-mode=0");
+    let ok4 =
+        bridge("obfs4 3.3.3.3:443 4444444444444444444444444444444444444444 cert=DDD iat-mode=0");
+    for (b, channels, oks) in [(&ch2, 2u32, 1u32), (&ch1, 1, 1), (&ok9, 0, 9), (&ok4, 0, 4)] {
+        for _ in 0..oks {
+            s.record_at(b.clone(), Duration::from_millis(10), t0);
+        }
+        for _ in 0..channels {
+            s.note_channel_success_at(b, t0);
+        }
+    }
+
+    let mut alive = vec![
+        (ok4.clone(), Duration::from_millis(100)),
+        (ch2.clone(), Duration::from_millis(500)),
+        (ok9.clone(), Duration::from_millis(900)),
+        (ch1.clone(), Duration::from_millis(500)),
+    ];
+    s.rank_probe_round(&mut alive);
+    assert_eq!(
+        alive,
+        vec![
+            (ch2.clone(), Duration::from_millis(500)),
+            (ch1.clone(), Duration::from_millis(500)),
+            (ok9.clone(), Duration::from_millis(900)),
+            (ok4, Duration::from_millis(100)),
+        ],
+        "channel-proven count first, then ok_count, then latency"
+    );
+}
+
+/// Equal ranking keys (same counters, same latency) keep their input order:
+/// the stable sort the old per-comparison comparator relied on. The input is
+/// deliberately not in bridge-line order.
+#[test]
+fn rank_probe_round_keeps_input_order_for_equal_keys() {
+    let mut s = empty();
+    let t0 = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+    let a = bridge(OBFS4_A);
+    let b = bridge(OBFS4_B);
+    let c = bridge(OBFS4_C);
+    for b in [&a, &b, &c] {
+        s.record_at((*b).clone(), Duration::from_millis(10), t0);
+    }
+    let lat = Duration::from_millis(10);
+    let mut alive = vec![(c.clone(), lat), (a.clone(), lat), (b.clone(), lat)];
+    s.rank_probe_round(&mut alive);
+    assert_eq!(
+        alive,
+        vec![(c, lat), (a, lat), (b, lat)],
+        "fully tied bridges keep their input order"
+    );
+}
+
+/// The cached-key ranking must select the same order as the per-comparison
+/// comparator, tie behaviour included, on a mixed input: duplicate counters,
+/// duplicate latencies, and one bridge unknown to the store entirely.
+#[test]
+fn rank_probe_round_matches_the_per_comparison_comparator() {
+    let mut s = empty();
+    let t0 = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+    let ch2 = bridge(OBFS4_A);
+    let ch1 = bridge(OBFS4_B);
+    let ok3 = bridge(OBFS4_C);
+    let ch2_bis =
+        bridge("obfs4 2.2.2.2:443 3333333333333333333333333333333333333333 cert=CCC iat-mode=0");
+    let unknown =
+        bridge("obfs4 3.3.3.3:443 4444444444444444444444444444444444444444 cert=DDD iat-mode=0");
+    for (b, channels, oks) in [
+        (&ch2, 2u32, 1u32),
+        (&ch2_bis, 2, 1),
+        (&ch1, 1, 5),
+        (&ok3, 0, 3),
+    ] {
+        for _ in 0..oks {
+            s.record_at(b.clone(), Duration::from_millis(10), t0);
+        }
+        for _ in 0..channels {
+            s.note_channel_success_at(b, t0);
+        }
+    }
+
+    let lat = |ms: u64| Duration::from_millis(ms);
+    let mut alive = vec![
+        (unknown.clone(), lat(10)),
+        (ch2_bis.clone(), lat(20)),
+        (ok3.clone(), lat(20)),
+        (ch2.clone(), lat(30)),
+        (ch1.clone(), lat(10)),
+    ];
+    let mut expected = alive.clone();
+    expected.sort_by(|(ba, la), (bb, lb)| {
+        s.channel_ok_count(bb)
+            .cmp(&s.channel_ok_count(ba))
+            .then_with(|| s.ok_count(bb).cmp(&s.ok_count(ba)))
+            .then_with(|| la.cmp(lb))
+    });
+    s.rank_probe_round(&mut alive);
+    assert_eq!(alive, expected, "cached-key order == per-comparison order");
+}
+
+/// TS17-06: ranking must build each bridge's identity exactly once per pass
+/// (one cached sort key per element), not once per comparison — the old
+/// comparator built 52 identities for 8 bridges and 530 for 32.
+#[test]
+fn rank_probe_round_builds_each_identity_exactly_once() {
+    for n in [8usize, 32] {
+        let mut s = empty();
+        let t0 = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let mut alive = Vec::with_capacity(n);
+        for i in 0..n {
+            let line = format!(
+                "obfs4 10.0.{i}.1:443 {:040x} cert=ZZZ iat-mode=0",
+                0xABCDEF0123_u128 + i as u128
+            );
+            let b = bridge(&line);
+            s.record_at(b.clone(), Duration::from_millis(10), t0);
+            alive.push((b, Duration::from_millis(10)));
+        }
+        crate::test_identity_builds_reset();
+        s.rank_probe_round(&mut alive);
+        let builds = crate::test_identity_builds();
+        println!("TS17-06 AFTER: n={n} identity_builds={builds}");
+        assert_eq!(builds, n, "one identity build per bridge, n={n}");
+    }
+}

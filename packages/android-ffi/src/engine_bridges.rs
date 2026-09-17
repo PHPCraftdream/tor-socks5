@@ -140,7 +140,8 @@ pub(super) async fn select_active_probe_bridges_async(
 
 /// Persist a probe round's reachability outcome to the shared bridge-health store
 /// (`<config-stem>.alive-bridges.log`, same file the CLI daemon uses) and re-sort `alive` by
-/// historical stability (`ok_count`, ties broken by latency) ahead of a bridge seen reachable
+/// historical stability through `BridgeStore::rank_probe_round` (channel-proven count, then
+/// `ok_count`, ties broken by latency) ahead of a bridge seen reachable
 /// for the first time. Shared between the bootstrap-time probe in `engine_async`,
 /// `stall_watchdog`'s periodic re-probe, and `nativeProbeBridgeTransport`'s on-demand probe --
 /// all three need the identical persist-and-rank step, just with different cancellation/error
@@ -203,13 +204,7 @@ pub(crate) fn persist_and_rank_probe(
             if let Err(e) = store.save() {
                 warn!(path = %store_path.display(), error = %e, "could not persist bridge health store");
             }
-            round.alive.sort_by(|(ba, la), (bb, lb)| {
-                store
-                    .channel_ok_count(bb)
-                    .cmp(&store.channel_ok_count(ba))
-                    .then_with(|| store.ok_count(bb).cmp(&store.ok_count(ba)))
-                    .then_with(|| la.cmp(lb))
-            });
+            store.rank_probe_round(&mut round.alive);
         }
         Err(e) => {
             warn!(path = %store_path.display(), error = %e, "could not load bridge health store");

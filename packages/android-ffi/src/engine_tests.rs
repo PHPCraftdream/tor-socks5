@@ -804,3 +804,125 @@ fn current_generation_teardown_still_clears_shared_state() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// TS17-06: `persist_and_rank_probe` must order the round by historical
+/// stability through the store's cached-key ranking — channel-proven count,
+/// then ok_count, then latency, with fully tied bridges keeping their input
+/// order — and a bridge with the worst latency in the round must still
+/// outrank faster ones on counters alone.
+#[test]
+fn persist_and_rank_probe_ranks_alive_by_stability() {
+    use super::bridges::persist_and_rank_probe;
+    use super::{BridgeHealthContext, BridgeLine, BridgeStore, BridgesConfig};
+
+    fn parse(line: &str) -> BridgeLine {
+        line.parse().expect("test bridge line parses")
+    }
+    fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "engine-persist-rank-{}-{}-{tag}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir temp dir");
+        dir
+    }
+
+    let dir = unique_temp_dir("persist-rank-order");
+    let cfg_path = dir.join("cfg.ktav");
+    let ctx = BridgeHealthContext {
+        config_path: Some(cfg_path.clone()),
+        bridges_cfg: BridgesConfig::default(),
+        resolver_policy: bridge_probe::ResolverPolicy::default(),
+    };
+
+    let ch2 =
+        parse("obfs4 10.1.0.1:443 AAAA000000000000000000000000000000000AAA cert=Z iat-mode=0");
+    let ch1 =
+        parse("obfs4 10.1.0.2:443 AAAA000000000000000000000000000000000BBB cert=Z iat-mode=0");
+    let okbig =
+        parse("obfs4 10.1.0.3:443 AAAA000000000000000000000000000000000CCC cert=Z iat-mode=0");
+    let tie_a =
+        parse("obfs4 10.1.0.4:443 AAAA000000000000000000000000000000000DDD cert=Z iat-mode=0");
+    let tie_b =
+        parse("obfs4 10.1.0.5:443 AAAA000000000000000000000000000000000EEE cert=Z iat-mode=0");
+
+    // Seed the store file: channel history for ch2 (2x) and ch1 (1x), a long
+    // reachability history for okbig (10 probe rounds), nothing for the
+    // tied pair.
+    let store_path = BridgeStore::resolve_path(Some(cfg_path.as_path()));
+    {
+        let mut store = BridgeStore::load(store_path.clone()).expect("load empty store");
+        let now = time::OffsetDateTime::now_utc();
+        let fail_window = Duration::from_secs(3600);
+        for _ in 0..10 {
+            store.note_probe_round(
+                std::slice::from_ref(&okbig),
+                &[(okbig.clone(), Duration::from_millis(10))],
+                now,
+                fail_window,
+                24,
+                5,
+            );
+        }
+        // `note_channel_success_at` is a no-op for bridges the store does
+        // not track, so give ch1/ch2 a tracked entry first (one recorded
+        // probe round).
+        store.note_probe_round(
+            &[ch2.clone(), ch1.clone()],
+            &[
+                (ch2.clone(), Duration::from_millis(10)),
+                (ch1.clone(), Duration::from_millis(10)),
+            ],
+            now,
+            fail_window,
+            24,
+            5,
+        );
+        for (b, times) in [(&ch2, 2u32), (&ch1, 1)] {
+            for _ in 0..times {
+                store.note_channel_success_at(b, now);
+            }
+        }
+        store.save().expect("seed store");
+    }
+
+    let lat = |ms: u64| Duration::from_millis(ms);
+    let mut round = bridge_probe::ProbeRound {
+        alive: vec![
+            (tie_b.clone(), lat(100)),
+            (okbig.clone(), lat(900)),
+            (ch2.clone(), lat(100)),
+            (tie_a.clone(), lat(100)),
+            (ch1.clone(), lat(100)),
+        ],
+        unmeasured: Vec::new(),
+    };
+    persist_and_rank_probe(
+        &[
+            ch2.clone(),
+            ch1.clone(),
+            okbig.clone(),
+            tie_a.clone(),
+            tie_b.clone(),
+        ],
+        &mut round,
+        &ctx,
+    );
+
+    assert_eq!(
+        round.alive,
+        vec![
+            (ch2.clone(), lat(100)),
+            (ch1.clone(), lat(100)),
+            (okbig.clone(), lat(900)),
+            // The tied pair keeps its input order (tie_b was offered first),
+            // and okbig's 900 ms latency does not sink it below either.
+            (tie_b.clone(), lat(100)),
+            (tie_a, lat(100)),
+        ],
+    );
+    let _ = (&ch2, &ch1, &tie_b, &store_path);
+    let _ = std::fs::remove_dir_all(dir);
+}

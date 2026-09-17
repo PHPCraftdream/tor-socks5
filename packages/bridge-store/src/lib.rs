@@ -44,18 +44,6 @@ mod stats;
 type Identity = bridge_probe::BridgeIdentity;
 type Key = Arc<Identity>;
 
-// A one-item, thread-local query cache for the hot read path. The map owns its
-// canonical identity in an `Arc<Identity>`, but a BTreeMap lookup still needs a
-// key value. Keeping the most recently queried bridge alongside that identity
-// makes the common sequence of health reads for one bridge (for example, a
-// ranking comparator) reuse the parsed WebTunnel endpoint and all of its
-// strings. The bridge value is retained to make pointer reuse and mutation
-// safe; the cache is bounded to one entry per calling thread.
-thread_local! {
-    static LAST_LOOKUP_KEY: std::cell::RefCell<Option<(BridgeLine, Key)>> =
-        const { std::cell::RefCell::new(None) };
-}
-
 #[derive(Debug, Clone)]
 struct Entry {
     bridge: BridgeLine,
@@ -197,25 +185,40 @@ impl Entry {
     }
 
     fn key(&self) -> Key {
-        // The map key is the canonical identity for this entry. Returning a
-        // clone only increments its Arc count; it never reparses the bridge.
+        // Rebuilds the identity from `self.bridge` by reparsing the line: an
+        // entry does not keep its own copy of the map key, and the map cannot
+        // be reached from here. The load path is the only caller, so this
+        // costs one parse per stored line when reading the store file.
         key_of(&self.bridge)
     }
 }
 
-fn key_of(b: &BridgeLine) -> Key {
-    LAST_LOOKUP_KEY.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some((cached_bridge, key)) = cache.as_ref() {
-            if cached_bridge == b {
-                return Arc::clone(key);
-            }
-        }
+// Number of identity constructions `key_of` performed on this thread.
+// Test-only seam (TS17-06): ranking code must build each bridge's key once
+// per pass, not once per comparison. Thread-local so concurrently running
+// tests cannot pollute each other's counts.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_IDENTITY_BUILDS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
-        let key = Arc::new(bridge_probe::bridge_identity(b));
-        *cache = Some((b.clone(), Arc::clone(&key)));
-        key
-    })
+// Resets TEST_IDENTITY_BUILDS to zero.
+#[cfg(test)]
+pub(crate) fn test_identity_builds_reset() {
+    TEST_IDENTITY_BUILDS.with(|count| count.set(0));
+}
+
+// Reads TEST_IDENTITY_BUILDS.
+#[cfg(test)]
+pub(crate) fn test_identity_builds() -> usize {
+    TEST_IDENTITY_BUILDS.with(std::cell::Cell::get)
+}
+
+fn key_of(b: &BridgeLine) -> Key {
+    #[cfg(test)]
+    TEST_IDENTITY_BUILDS.with(|count| count.set(count.get() + 1));
+    Arc::new(bridge_probe::bridge_identity(b))
 }
 
 #[derive(Debug, Clone)]
