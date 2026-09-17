@@ -42,6 +42,25 @@ fn discovery_fixture() -> (tempfile::TempDir, std::path::PathBuf, BridgeLine) {
     (dir, path, wt)
 }
 
+/// Single-candidate fixture for the TS17-08 promotion tests: a config with
+/// one working obfs4 bridge and a pool holding exactly one webtunnel
+/// candidate. Returns the guard (keep alive), the config path and the
+/// candidate.
+fn promotion_fixture() -> (tempfile::TempDir, std::path::PathBuf, BridgeLine) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("proxy.ktav");
+    let mut cfg = Config::default();
+    cfg.bridges.transport = "webtunnel".into();
+    cfg.bridges.lines = vec![bridge().to_string()];
+    cfg.write(&path).unwrap();
+    let wt: BridgeLine = "webtunnel [2001:db8::1]:443 0123456789ABCDEF0123456789ABCDEF01234567 url=https://example.com/bridge"
+        .parse().unwrap();
+    let mut pool = CandidatePool::load(CandidatePool::resolve_path(Some(&path))).unwrap();
+    assert_eq!(pool.merge([wt.clone()], &HashSet::new()), 1);
+    pool.save().unwrap();
+    (dir, path, wt)
+}
+
 fn reachable_probe() -> ProbeCheck<'static> {
     Box::new(|bridge| {
         assert_eq!(bridge.transport.as_deref(), Some("webtunnel"));
@@ -533,4 +552,174 @@ async fn drain_waits_for_a_concurrent_pool_transaction_and_both_effects_survive(
         vec![other, newcomer],
         "the parked transaction's addition survives; the consumed webtunnel candidate stays removed"
     );
+}
+
+/// TS17-08 regression, exactly as the review demands: a verified candidate
+/// whose config write fails must survive in the pool, and the next drain —
+/// with no new fetch — must return and promote it once the write works.
+#[tokio::test]
+async fn failed_config_promotion_keeps_the_verified_candidate_pooled() {
+    let (_dir, path, wt) = promotion_fixture();
+    let pool_path = CandidatePool::resolve_path(Some(&path));
+
+    crate::test_seams::arm_failure(crate::test_seams::Site::ConfigPromotion, &path);
+    let first = drain_pool_with(
+        Some(&path),
+        1,
+        Some(&check(true)),
+        &reachable_probe(),
+        &aw(),
+    )
+    .await
+    .expect_err("the injected config-write failure must surface");
+    // `{:#}`, not `to_string()`: anyhow's plain Display shows only the
+    // outermost context ("promoting bridges in config"), so the injected
+    // cause would never match.
+    assert!(
+        format!("{first:#}").contains("injected config promotion failure"),
+        "the failure must be the config promotion, not an earlier step: {first:#}"
+    );
+
+    // THE core assertion: the verified candidate is still pooled — it was
+    // never written off before the config write confirmed it.
+    let mut pooled = CandidatePool::load(pool_path.clone()).unwrap();
+    assert_eq!(
+        pooled.take(10),
+        vec![wt.clone()],
+        "the verified candidate must survive a failed config promotion"
+    );
+    let cfg = Config::load_with_override(Some(&path))
+        .unwrap()
+        .into_config();
+    assert!(!cfg.bridges.parsed().unwrap().bridges.contains(&wt));
+
+    // Retry drain, still no fetch: the same candidate is returned, promoted
+    // (the injection was one-shot and is consumed) and only then shed.
+    let added = drain_pool_with(
+        Some(&path),
+        1,
+        Some(&check(true)),
+        &reachable_probe(),
+        &aw(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(added, 1);
+    let cfg = Config::load_with_override(Some(&path))
+        .unwrap()
+        .into_config();
+    assert!(cfg.bridges.parsed().unwrap().bridges.contains(&wt));
+    assert_eq!(
+        CandidatePool::load(pool_path).unwrap().len(),
+        0,
+        "the confirmed candidate is shed from the pool"
+    );
+}
+
+/// TS17-08, the unchanged-success-path guard: on a working config write the
+/// drain still promotes, still sheds the candidate from the pool, and a
+/// repeat drain without any fetch sees nothing left to do. Also pins the
+/// idempotency the confirm-after-success relies on: promoting a line that
+/// is already present adds nothing.
+#[tokio::test]
+async fn successful_drain_promotes_sheds_and_a_repeat_drain_sees_nothing() {
+    let (_dir, path, wt) = promotion_fixture();
+    let pool_path = CandidatePool::resolve_path(Some(&path));
+
+    let added = drain_pool_with(
+        Some(&path),
+        1,
+        Some(&check(true)),
+        &reachable_probe(),
+        &aw(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(added, 1);
+    let cfg = Config::load_with_override(Some(&path))
+        .unwrap()
+        .into_config();
+    assert!(cfg.bridges.parsed().unwrap().bridges.contains(&wt));
+    assert_eq!(
+        CandidatePool::load(pool_path.clone()).unwrap().len(),
+        0,
+        "the promoted candidate is removed from the pool"
+    );
+
+    // Second drain without any fetch: the pool is empty, nothing to do.
+    let again = drain_pool_with(
+        Some(&path),
+        1,
+        Some(&check(true)),
+        &reachable_probe(),
+        &aw(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(again, 0);
+
+    // Idempotent promotion: the same line again adds nothing.
+    // (anyhow::Error is not PartialEq, so compare the Ok payload.)
+    assert_eq!(
+        promote_bridges_in_config(&path, &[wt]).expect("repeat promotion succeeds"),
+        0
+    );
+}
+
+/// TS17-08, the concurrency guard: the confirm transaction must merge with
+/// the pool as it exists AFTER the config write, never write back the
+/// drain's stale snapshot. A refresh that merges a newcomer while the drain
+/// sits between its take and its confirm must survive the promoted
+/// candidate's removal.
+#[tokio::test]
+async fn confirm_removals_merge_with_a_concurrent_refresh_instead_of_clobbering_it() {
+    let (_dir, path, wt) = promotion_fixture();
+    let pool_path = CandidatePool::resolve_path(Some(&path));
+    let newcomer: BridgeLine =
+        "obfs4 1.2.3.9:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=CCC iat-mode=0"
+            .parse()
+            .unwrap();
+
+    // Park the drain right before its confirm transaction: the config
+    // promotion has already succeeded and the pool lock is NOT held.
+    let gate = crate::test_seams::ParkedGate::arm(crate::test_seams::Site::PreRestore, &pool_path);
+    let drain_path = path.clone();
+    let drain = tokio::spawn(async move {
+        drain_pool_with(
+            Some(&drain_path),
+            1,
+            Some(&check(true)),
+            &reachable_probe(),
+            &aw(),
+        )
+        .await
+    });
+    let wait = gate.clone();
+    tokio::task::spawn_blocking(move || wait.wait_parked(HANG_GUARD))
+        .await
+        .unwrap();
+
+    // While the drain is parked, a concurrent refresh merges a newcomer.
+    let tx_path = pool_path.clone();
+    let newcomer_for_tx = newcomer.clone();
+    let added = tokio::task::spawn_blocking(move || {
+        CandidatePool::transaction(&tx_path, |p| p.merge([newcomer_for_tx], &HashSet::new()))
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(added, 1);
+
+    gate.release();
+    assert_eq!(drain.await.unwrap().unwrap(), 1);
+
+    // The newcomer survives; the promoted candidate is shed. A stale
+    // snapshot write-back would have erased the newcomer (and kept the
+    // promoted candidate, which by then lives in the config).
+    let mut pool = CandidatePool::load(pool_path).unwrap();
+    assert_eq!(pool.take(10), vec![newcomer]);
+    let cfg = Config::load_with_override(Some(&path))
+        .unwrap()
+        .into_config();
+    assert!(cfg.bridges.parsed().unwrap().bridges.contains(&wt));
 }

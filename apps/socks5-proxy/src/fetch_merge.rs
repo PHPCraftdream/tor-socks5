@@ -5,10 +5,11 @@
 //!    rest in the persistent [`CandidatePool`]. Touches the network to the
 //!    public collectors; no bridge probing.
 //! 2. **drain** ([`drain_pool`]) — walk the pool **lazily, one bridge at a
-//!    time**, promote the reachable ones into the working config, and remove
-//!    removed
-//!    from the pool (alive → promoted, dead → discarded; unprobed stay for
-//!    next time). Touches the network to the bridges; when a live [`TorTunnel`]
+//!    time**, promote the reachable ones into the working config, and shed
+//!    probed candidates from the pool only once their outcome is durable
+//!    (alive → promoted into the config, then removed; dead → discarded;
+//!    unprobed and deferred stay for next time). Touches the network to the
+//!    bridges; when a live [`TorTunnel`]
 //!    is available, admission also requires a real Tor channel to the bridge,
 //!    so mere TCP-alive impostors are rejected.
 //! 3. [`top_up_working`] ties them together: drain what we already have,
@@ -250,8 +251,11 @@ async fn admits_candidate(
 }
 
 /// Drain the candidate pool: walk it lazily (one bridge at a time), promote
-/// up to `target` reachable bridges into the working config, and remove
-/// every probed candidate from the pool. Returns how many were promoted.
+/// up to `target` reachable bridges into the working config, and shed probed
+/// candidates from the pool once their outcome is durable: dead candidates
+/// are discarded, promoted ones only after the config write succeeds — on a
+/// config-write failure they stay pooled for the next drain (TS17-08).
+/// Returns how many were promoted.
 ///
 /// The real admission channel-check: webtunnel candidates go through the
 /// blocking circuit verifier (bounded by the remaining drain budget minus
@@ -297,12 +301,19 @@ fn channel_checker(
     )
 }
 
-/// The pool access is one cross-process transaction: the write lock is held
-/// from the initial load through the final save — across probe and admission —
-/// so a concurrent refresh/drain waits instead of publishing over the
-/// removals this drain is about to make. The guard is a plain file handle,
-/// safe to hold across `.await`; cancellation drops it before any save,
-/// leaving the pool file untouched.
+/// The pool access is two cross-process transactions. The first holds the
+/// write lock from the initial load through the probe/admission walk, so a
+/// concurrent refresh/drain waits instead of taking the same batch — but it
+/// saves NOTHING: `take_transport` mutates only the in-memory snapshot, and
+/// the on-disk pool keeps every taken candidate. Publishing removals before
+/// the config write is what lost verified candidates when that write then
+/// failed (TS17-08). The second transaction runs after the config outcome is
+/// known: it re-loads the pool fresh under the same cross-process lock and
+/// removes exactly the candidates whose outcome is now durable elsewhere —
+/// the dead always, the promoted only after a successful config promotion —
+/// merging with, never overwriting, whatever a concurrent writer published
+/// in between. The pool lock is never held across the config write itself
+/// (that long hold was removed in R-09/TS17-02).
 ///
 /// Admission is two-layer: a TCP probe must pass, and when `tor` is `Some`,
 /// the candidate must additionally accept a real Tor channel
@@ -369,16 +380,19 @@ async fn drain_pool_with(
     let pool_lock = CandidatePool::acquire_transaction_lock(&pool_path)
         .await
         .context("locking candidate pool for drain")?;
-    let mut pool = CandidatePool::load(pool_path).context("loading candidate pool")?;
+    // Cloned: the confirm transaction below needs the same path after this
+    // snapshot is consumed.
+    let mut pool = CandidatePool::load(pool_path.clone()).context("loading candidate pool")?;
     if pool.is_empty() {
         return Ok(0);
     }
 
     // Take a bounded batch (we never probe more than `max_attempts`), then
-    // walk it one at a time. Dead candidates are dropped from the pool;
-    // unprobed ones go back for next time. Because dead entries are removed,
-    // the pool steadily advances across drains rather than re-probing a
-    // dead head.
+    // walk it one at a time. Nothing is saved here: the on-disk pool keeps
+    // the whole batch until the confirm transaction below knows each
+    // candidate's outcome is durable elsewhere. Dead entries are shed by
+    // that confirm, so the pool still steadily advances across drains
+    // rather than re-probing a dead head.
     let max_attempts = target.saturating_mul(50).min(MAX_DRAIN_ATTEMPTS);
     let batch_size = max_attempts.min(pool.len());
     let mut batch = pool.take_transport(batch_size, cfg.bridges.preferred_transport());
@@ -386,8 +400,7 @@ async fn drain_pool_with(
 
     let mut promoted: Vec<BridgeLine> = Vec::new();
     let mut channel_ok: Vec<BridgeLine> = Vec::new();
-    let mut unprobed: Vec<BridgeLine> = Vec::new();
-    let mut deferred = Vec::new();
+    let mut dead = Vec::new();
     let mut reachable = Vec::new();
     let deadline = tokio::time::Instant::now() + DRAIN_BUDGET;
     let mut attempts = 0usize;
@@ -396,8 +409,7 @@ async fn drain_pool_with(
             || attempts >= max_attempts
             || tokio::time::Instant::now() >= deadline
         {
-            unprobed.push(bridge);
-            continue;
+            continue; // stays pooled where it is; a later drain picks it up
         }
         attempts += 1;
         let latency = match tokio::time::timeout_at(deadline, probe(&bridge)).await {
@@ -408,13 +420,9 @@ async fn drain_pool_with(
             }
             Ok(bridge_probe::Outcome::Unmeasured { reason }) => {
                 tracing::debug!(transport = ?bridge.transport, %reason, "candidate probe deferred");
-                deferred.push(bridge);
-                continue;
+                continue; // stays pooled for the next drain
             }
-            Err(_) => {
-                deferred.push(bridge);
-                continue;
-            }
+            Err(_) => continue, // probe lost or timed out: stays pooled
         };
         // Admission receives the remaining drain budget. The outer deadline
         // also bounds injected checks that do not honor that budget; the
@@ -435,17 +443,21 @@ async fn drain_pool_with(
                 channel_ok.push(bridge);
             }
         } else if latency.is_some() {
-            deferred.push(bridge);
+            // TCP-alive but admission not proven: stays pooled for the next
+            // drain, exactly where it is.
+        } else {
+            dead.push(bridge);
         }
-        // Dead: already removed from the pool by take().
     }
 
-    // Unprobed candidates return to the pool; probed (alive + dead) do not.
-    // Still inside the drain's transaction: this save publishes the removals
-    // together with the front-returns.
-    pool.return_front(unprobed);
-    pool.merge(deferred, &HashSet::new());
-    pool.save().context("saving candidate pool after drain")?;
+    // TS17-08: nothing has been published yet. `take_transport` mutated only
+    // the in-memory snapshot, so the on-disk pool still holds every taken
+    // candidate — unprobed, deferred and promoted alike. The old code saved
+    // the removals HERE, before the config write, so a failed or timed-out
+    // promotion left a verified candidate in neither store. Instead the pool
+    // lock is released now (never held across the config write — that long
+    // hold was removed in R-09/TS17-02) and the removals are committed by
+    // one confirm transaction after the outcome is known.
     drop(pool_lock);
     // TS17-02: workers whose decision timed out are joined HERE — after the
     // pool transaction is closed. Worker completion is mandatory, but it
@@ -457,7 +469,6 @@ async fn drain_pool_with(
     info!(
         promoted = promoted.len(),
         probed = attempts,
-        pool = pool.len(),
         "drained candidate pool"
     );
 
@@ -501,11 +512,75 @@ async fn drain_pool_with(
         }
     }
 
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || promote_bridges_in_config(&path, &promoted))
+    // The config promotion decides whether the verified candidates are now
+    // durable in the working config. `promote_bridges_in_config` is
+    // idempotent (it skips lines already present), so a repeat after a
+    // failed attempt cannot double a bridge.
+    let promotion: Result<usize> = if promoted.is_empty() {
+        Ok(0)
+    } else {
+        let path = path.to_path_buf();
+        let for_config = promoted.clone();
+        tokio::task::spawn_blocking(move || promote_bridges_in_config(&path, &for_config))
+            .await
+            .map_err(|e| anyhow::anyhow!("config promotion task failed: {e}"))
+            .and_then(|added| added.context("promoting bridges in config"))
+    };
+
+    // The confirm: shed exactly the candidates whose outcome is now durable
+    // — the dead always, the promoted only after a successful config write.
+    // On a promotion failure the verified candidates are left pooled: the
+    // file still holds them (nothing was saved after the take), so the next
+    // drain re-probes and re-promotes them idempotently. The transaction
+    // loads the pool FRESH under the cross-process lock, so a refresh that
+    // merged newcomers while this drain was promoting is merged with, never
+    // overwritten by, these removals (TS17-08).
+    #[cfg(test)]
+    {
+        let seam_path = pool_path.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::test_seams::park_if_armed(crate::test_seams::Site::PreRestore, &seam_path)
+        })
         .await
-        .map_err(|e| anyhow::anyhow!("config promotion task failed: {e}"))?
-        .context("promoting bridges in config")
+        .expect("pre-restore park joined");
+    }
+    let mut discard = dead;
+    if promotion.is_ok() {
+        discard.extend(promoted.iter().cloned());
+    }
+    let confirmed = if discard.is_empty() {
+        Ok(())
+    } else {
+        tokio::task::spawn_blocking({
+            let pool_path = pool_path.clone();
+            move || {
+                CandidatePool::transaction(&pool_path, |fresh| {
+                    fresh.remove_all(&discard);
+                })
+            }
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("candidate pool confirm task failed: {e}"))
+        .and_then(|inner| inner.map(|_| ()))
+    };
+
+    match promotion {
+        Ok(added) => {
+            if let Err(error) = confirmed {
+                // The promotion is durable; the shed is not. The leftovers
+                // stay pooled and the next drain sheds them (the promotion
+                // it repeats is idempotent), so this is not data loss.
+                warn!(%error, "promoted but could not confirm pool removals; the next drain will shed them");
+            }
+            Ok(added)
+        }
+        Err(error) => {
+            if let Err(confirm_error) = confirmed {
+                warn!(%confirm_error, "pool confirm failed too; the pool file keeps every candidate");
+            }
+            Err(error)
+        }
+    }
 }
 
 /// Update the legacy source URL as one locked config transaction.
@@ -522,8 +597,15 @@ fn migrate_legacy_source(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Add promoted candidates to the latest config snapshot under its path lock.
+/// Add promoted candidates to the latest config snapshot under its path
+/// lock. Idempotent: a line already in the working config is not added
+/// again, and when nothing is new the config is not rewritten at all —
+/// this is what makes the drain's retry after a failed promotion safe.
 fn promote_bridges_in_config(path: &Path, promoted: &[BridgeLine]) -> Result<usize> {
+    #[cfg(test)]
+    if crate::test_seams::take_failure(crate::test_seams::Site::ConfigPromotion, path) {
+        anyhow::bail!("injected config promotion failure");
+    }
     let _lock = PathLock::acquire_bounded(path, CLI_LOCK_WAIT)
         .context("config write lock while promoting bridges")?;
     let mut latest = Config::load_with_override(Some(path))

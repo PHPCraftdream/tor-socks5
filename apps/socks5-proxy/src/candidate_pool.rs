@@ -220,17 +220,26 @@ impl CandidatePool {
             .sort_by_cached_key(|bridge| !fresh_keys.contains(&key_of(bridge)));
     }
 
-    /// Put bridges back at the front of the pool (e.g. a taken batch that
-    /// was not probed this round), preserving dedup.
-    pub fn return_front(&mut self, bridges: Vec<BridgeLine>) {
-        let mut prefix = Vec::with_capacity(bridges.len());
-        for b in bridges {
-            if self.keys.insert(key_of(&b)) {
-                prefix.push(b);
-            }
+    /// Remove exactly the given bridges, matched by the full identity key
+    /// ([`key_of`]); returns how many entries were removed. The drain's
+    /// confirm step runs this on a freshly loaded pool under the
+    /// transaction lock, shedding only its own outcomes — entries a
+    /// concurrent writer merged in the meantime are untouched.
+    pub fn remove_all(&mut self, bridges: &[BridgeLine]) -> usize {
+        // One pass, not one retain per bridge: `key_of` reparses a WebTunnel
+        // carrier URL, so a nested scan would pay that for every (pool entry,
+        // request) pair.
+        let mut removed = 0;
+        let doomed: HashSet<Key> = bridges
+            .iter()
+            .map(key_of)
+            .filter(|key| self.keys.remove(key))
+            .inspect(|_| removed += 1)
+            .collect();
+        if removed > 0 {
+            self.bridges.retain(|b| !doomed.contains(&key_of(b)));
         }
-        prefix.append(&mut self.bridges);
-        self.bridges = prefix;
+        removed
     }
 
     #[must_use]
@@ -653,15 +662,16 @@ url=https://edge.example/x servername=edge.example addr=9.9.9.9:443 ver=0.0.3";
     }
 
     #[test]
-    fn return_front_puts_back_unprobed() {
+    fn remove_all_sheds_by_identity_and_counts() {
         let mut p = empty(PathBuf::from("mem"));
-        p.merge(vec![b(B)], &HashSet::new());
-        p.return_front(vec![b(A), b(WT)]);
-        assert_eq!(p.len(), 3);
-        // A and WT are at the front now.
-        let taken = p.take(2);
-        let keys: HashSet<Key> = taken.iter().map(key_of).collect();
-        assert!(keys.contains(&key_of(&b(A))) && keys.contains(&key_of(&b(WT))));
+        p.merge(vec![b(A), b(B), b(WT)], &HashSet::new());
+        assert_eq!(
+            p.remove_all(&[b(A), b(WT), b(A)]),
+            2,
+            "a duplicate request removes and counts once"
+        );
+        assert_eq!(p.take(10), vec![b(B)]);
+        assert_eq!(p.remove_all(&[b(A)]), 0, "absent entries remove nothing");
     }
 
     /// Two competing transactions serialize on the pool lock: both mutations

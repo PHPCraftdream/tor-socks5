@@ -3,7 +3,7 @@
 //! drop, so a panicking test cannot leave one armed). Compiles away outside
 //! `cfg(test)`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -18,6 +18,15 @@ pub(crate) enum Site {
     /// acquired VERIFY_LOCK (see `bridge_verifier::verify_bridges_sequential`).
     /// Lets a test pin the worker while it owns the verifier lock.
     AdmissionVerifyPostLock,
+    /// In `drain_pool_with`, right before the confirm transaction that sheds
+    /// the drained candidates whose outcome is durable. The drain holds NO
+    /// pool lock here; a test parks the drain to run a concurrent pool
+    /// writer between the take and the confirm.
+    PreRestore,
+    /// At the top of `promote_bridges_in_config` in `fetch_merge.rs`, before
+    /// it touches the config. Used with the failure-injection registry, not
+    /// the park gates.
+    ConfigPromotion,
 }
 
 /// Guard for waits that must succeed (a transaction reaching its gated
@@ -168,4 +177,32 @@ pub(crate) fn worker_done_count(site: Site, path: &Path) -> usize {
         .get(&(site, path.to_path_buf()))
         .copied()
         .unwrap_or(0)
+}
+
+/// One-shot failure injections, keyed like the gates. Arming is not RAII:
+/// a leaked arm is keyed by a per-test temp path and harmless. `take_failure`
+/// consumes the arm, so the first arrival at the site fails and later ones
+/// proceed — the "first drain loses, the retry succeeds" shape the TS17-08
+/// regression needs, with no sleeps and no clocks.
+static FAILURES: OnceLock<Mutex<HashSet<GateKey>>> = OnceLock::new();
+
+fn failure_registry() -> &'static Mutex<HashSet<GateKey>> {
+    FAILURES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Arm a one-shot failure for `site` at `path`: the next
+/// [take_failure] there returns true.
+pub(crate) fn arm_failure(site: Site, path: &Path) {
+    failure_registry()
+        .lock()
+        .expect("failure registry")
+        .insert((site, path.to_path_buf()));
+}
+
+/// Consume the armed failure for `site` at `path`, if any.
+pub(crate) fn take_failure(site: Site, path: &Path) -> bool {
+    failure_registry()
+        .lock()
+        .expect("failure registry")
+        .remove(&(site, path.to_path_buf()))
 }
