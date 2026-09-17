@@ -16,6 +16,7 @@ use time::OffsetDateTime;
 use tracing::{info, warn};
 
 use crate::config::Config;
+use crate::path_lock::{PathLock, CLI_LOCK_WAIT};
 use bridge_store::BridgeStore;
 
 /// How long each bridge gets to complete a TCP handshake before we declare
@@ -496,14 +497,19 @@ pub(crate) async fn update_health_and_prune(
         .unwrap_or_default();
     if !pruned.is_empty() {
         if let Some(path) = config_path {
-            match prune_bridges_from_config(path, &pruned) {
-                Ok(n) if n > 0 => info!(
+            let path = path.to_path_buf();
+            let log_path = path.clone();
+            let dead = pruned.clone();
+            match tokio::task::spawn_blocking(move || prune_bridges_from_config(&path, &dead)).await
+            {
+                Ok(Ok(n)) if n > 0 => info!(
                     removed = n,
-                    path = %path.display(),
+                    path = %log_path.display(),
                     "removed dead bridges (reached max_fails) from config"
                 ),
-                Ok(_) => {}
-                Err(e) => warn!(error = %e, "could not prune dead bridges from config"),
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => warn!(error = %e, "could not prune dead bridges from config"),
+                Err(e) => warn!(error = %e, "config prune task failed"),
             }
         }
     }
@@ -521,6 +527,8 @@ fn prune_bridges_from_config(path: &Path, dead: &[BridgeLine]) -> Result<usize> 
     use std::collections::HashSet;
     let dead_keys: HashSet<_> = dead.iter().map(bridge_identity).collect();
 
+    let _lock = PathLock::acquire_bounded(path, CLI_LOCK_WAIT)
+        .context("config write lock while pruning dead bridges")?;
     let mut cfg = Config::load_with_override(Some(path))
         .context("reloading config to prune dead bridges")?
         .into_config();
@@ -685,6 +693,47 @@ mod tests {
         assert!(!parsed.contains(&webtunnel_variant("/old")));
         assert!(!parsed.contains(&obfs4_variant(CERT_OLD)));
         let _ = std::fs::remove_dir_all(path.parent().expect("test config parent"));
+    }
+
+    #[test]
+    fn prune_waits_for_config_transaction_and_preserves_its_concurrent_addition() {
+        let dir = tempfile::tempdir().expect("create config directory");
+        let path = dir.path().join("config.ktav");
+        let dead = webtunnel_variant("/dead");
+        let survivor = webtunnel_variant("/survivor");
+        let newcomer = obfs4_variant(CERT_NEW);
+        let mut cfg = Config::default();
+        cfg.bridges.lines = vec![dead.to_string(), survivor.to_string()];
+        cfg.write(&path).expect("save config");
+
+        // Hold the same path lock that a promotion/migration writer uses.
+        // The prune worker must load after this transaction publishes, so the
+        // newcomer cannot be lost to a stale snapshot.
+        let lock = PathLock::acquire(&path).expect("acquire config lock");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let prune_path = path.clone();
+        let dead_for_worker = dead.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).expect("signal prune start");
+            prune_bridges_from_config(&prune_path, std::slice::from_ref(&dead_for_worker))
+        });
+        started_rx.recv().expect("wait for prune worker");
+
+        let mut latest = Config::load_with_override(Some(&path))
+            .expect("load config under transaction lock")
+            .into_config();
+        latest.bridges.lines.push(newcomer.to_string());
+        latest.write(&path).expect("publish concurrent addition");
+        drop(lock);
+
+        assert_eq!(worker.join().expect("join prune worker").unwrap(), 1);
+        let final_cfg = Config::load_with_override(Some(&path))
+            .expect("reload final config")
+            .into_config();
+        let parsed = final_cfg.bridges.parsed().expect("parse final bridges");
+        assert!(!parsed.bridges.contains(&dead));
+        assert!(parsed.bridges.contains(&survivor));
+        assert!(parsed.bridges.contains(&newcomer));
     }
 
     #[test]

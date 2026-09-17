@@ -29,6 +29,7 @@ use tracing::{info, warn};
 
 use crate::candidate_pool::{key_of, CandidatePool, Key};
 use crate::config::Config;
+use crate::path_lock::{PathLock, CLI_LOCK_WAIT};
 
 /// Per-bridge timeout for the **lazy** pool drain. Shorter than the startup
 /// config probe ([`crate::tor_setup::BRIDGE_PROBE_TIMEOUT`]): a live bridge's
@@ -43,6 +44,7 @@ const REFRESH_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_DRAIN_ATTEMPTS: usize = 12;
 const DRAIN_BUDGET: Duration = Duration::from_secs(60);
 const CHANNEL_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
+const ADMISSION_JOIN_MARGIN: Duration = Duration::from_millis(50);
 
 fn current_source_url(url: &str) -> &str {
     match url {
@@ -169,11 +171,10 @@ pub(crate) async fn refresh_candidate_pool(
     .context("updating candidate pool")?;
     if migration {
         if let Some(path) = config_path {
-            let mut latest = Config::load_with_override(Some(path))?.into_config();
-            for source in &mut latest.bridges.sources {
-                source.url = current_source_url(&source.url).to_owned();
-            }
-            latest.write(path)?;
+            let path = path.to_path_buf();
+            tokio::task::spawn_blocking(move || migrate_legacy_source(&path))
+                .await
+                .map_err(|e| anyhow::anyhow!("config migration task failed: {e}"))??;
             info!("updated the legacy WebTunnel source to the current tested list");
         }
     }
@@ -189,7 +190,7 @@ pub(crate) async fn refresh_candidate_pool(
 /// admission decision can be tested without a network. `true` means a real
 /// Tor link handshake succeeded against the bridge.
 type ChannelCheck<'a> =
-    Box<dyn for<'b> Fn(&'b BridgeLine) -> BoxFuture<'b, bool> + Send + Sync + 'a>;
+    Box<dyn for<'b> Fn(&'b BridgeLine, Duration) -> BoxFuture<'b, bool> + Send + Sync + 'a>;
 
 type ProbeCheck<'a> =
     Box<dyn for<'b> Fn(&'b BridgeLine) -> BoxFuture<'b, bridge_probe::Outcome> + Send + Sync + 'a>;
@@ -204,6 +205,7 @@ async fn admits_candidate(
     tcp_latency: Option<Duration>,
     bridge: &BridgeLine,
     channel: Option<&ChannelCheck<'_>>,
+    deadline: tokio::time::Instant,
 ) -> bool {
     let Some(latency) = tcp_latency else {
         // TCP-dead candidates are never admitted and never channel-checked:
@@ -213,7 +215,11 @@ async fn admits_candidate(
     };
     match channel {
         Some(check) => {
-            if check(bridge).await {
+            let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if budget.is_zero() {
+                return false;
+            }
+            if check(bridge, budget).await {
                 info!(
                     addr = %bridge.addr,
                     transport = ?bridge.transport,
@@ -248,7 +254,7 @@ async fn admits_candidate(
 /// every probed candidate from the pool. Returns how many were promoted.
 ///
 /// The pool access is one cross-process transaction: the write lock is held
-/// from the initial load through the final save — across the probe phase —
+/// from the initial load through the final save — across probe and admission —
 /// so a concurrent refresh/drain waits instead of publishing over the
 /// removals this drain is about to make. The guard is a plain file handle,
 /// safe to hold across `.await`; cancellation drops it before any save,
@@ -271,8 +277,8 @@ pub(crate) async fn drain_pool(
         // Clone the tunnel handle (cheap, Arc-backed) so the future owns its
         // data and the checker is HRTB over the bridge reference alone.
         let tor = tor.clone();
-        let check: ChannelCheck<'static> =
-            Box::new(move |bridge: &BridgeLine| -> BoxFuture<'_, bool> {
+        let check: ChannelCheck<'static> = Box::new(
+            move |bridge: &BridgeLine, budget: Duration| -> BoxFuture<'_, bool> {
                 let tor = tor.clone();
                 let admission_config = admission_config.clone();
                 Box::pin(async move {
@@ -280,6 +286,8 @@ pub(crate) async fn drain_pool(
                         return match crate::bridge_verifier::verify_for_admission(
                             bridge.clone(),
                             admission_config,
+                            std::time::Instant::now()
+                                + budget.saturating_sub(ADMISSION_JOIN_MARGIN),
                         )
                         .await
                         {
@@ -295,7 +303,8 @@ pub(crate) async fn drain_pool(
                         Ok(Ok(true))
                     )
                 })
-            });
+            },
+        );
         check
     });
     let cfg = Config::load_with_override(config_path)?.into_config();
@@ -390,8 +399,15 @@ async fn drain_pool_with(
                 continue;
             }
         };
-        // The owned verification worker has its own budgets and must be joined.
-        if admits_candidate(latency, &bridge, checker).await {
+        // Admission receives the remaining drain budget. The outer deadline
+        // also bounds injected checks that do not honor that budget.
+        if tokio::time::timeout_at(
+            deadline,
+            admits_candidate(latency, &bridge, checker, deadline),
+        )
+        .await
+        .unwrap_or(false)
+        {
             promoted.push(bridge.clone());
             if let Some(latency) = latency {
                 reachable.push((bridge.clone(), latency));
@@ -459,12 +475,36 @@ async fn drain_pool_with(
         }
     }
 
-    // Reload from disk so we don't clobber concurrent edits/prunes.
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || promote_bridges_in_config(&path, &promoted))
+        .await
+        .map_err(|e| anyhow::anyhow!("config promotion task failed: {e}"))?
+        .context("promoting bridges in config")
+}
+
+/// Update the legacy source URL as one locked config transaction.
+fn migrate_legacy_source(path: &Path) -> Result<()> {
+    let _lock = PathLock::acquire_bounded(path, CLI_LOCK_WAIT)
+        .context("config write lock while migrating bridge source")?;
+    let mut latest = Config::load_with_override(Some(path))?.into_config();
+    for source in &mut latest.bridges.sources {
+        source.url = current_source_url(&source.url).to_owned();
+    }
+    latest
+        .write(path)
+        .context("writing migrated bridge source")?;
+    Ok(())
+}
+
+/// Add promoted candidates to the latest config snapshot under its path lock.
+fn promote_bridges_in_config(path: &Path, promoted: &[BridgeLine]) -> Result<usize> {
+    let _lock = PathLock::acquire_bounded(path, CLI_LOCK_WAIT)
+        .context("config write lock while promoting bridges")?;
     let mut latest = Config::load_with_override(Some(path))
         .context("reloading config to promote bridges")?
         .into_config();
     let before = latest.bridges.lines.len();
-    for b in &promoted {
+    for b in promoted {
         let line = b.to_string();
         if !latest.bridges.lines.contains(&line) {
             latest.bridges.lines.push(line);
@@ -657,7 +697,7 @@ mod tests {
     }
 
     fn check(ok: bool) -> ChannelCheck<'static> {
-        Box::new(move |_: &BridgeLine| Box::pin(async move { ok }))
+        Box::new(move |_: &BridgeLine, _: Duration| Box::pin(async move { ok }))
     }
 
     fn bridge() -> BridgeLine {
@@ -669,27 +709,51 @@ mod tests {
     #[tokio::test]
     async fn tcp_ok_and_channel_ok_promotes() {
         let b = bridge();
-        assert!(admits_candidate(Some(Duration::from_millis(120)), &b, Some(&check(true))).await);
+        assert!(
+            admits_candidate(
+                Some(Duration::from_millis(120)),
+                &b,
+                Some(&check(true)),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+        );
     }
 
     #[tokio::test]
     async fn tcp_ok_but_channel_fails_rejects() {
         let b = bridge();
-        assert!(!admits_candidate(Some(Duration::from_millis(120)), &b, Some(&check(false))).await);
+        assert!(
+            !admits_candidate(
+                Some(Duration::from_millis(120)),
+                &b,
+                Some(&check(false)),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+        );
     }
 
     #[tokio::test]
     async fn tcp_ok_with_no_channel_check_falls_back_to_tcp_only() {
         // Documented cold-start fallback: no live tunnel to warm through.
         let b = bridge();
-        assert!(admits_candidate(Some(Duration::from_millis(120)), &b, None).await);
+        assert!(
+            admits_candidate(
+                Some(Duration::from_millis(120)),
+                &b,
+                None,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+        );
     }
 
     #[tokio::test]
     async fn tcp_dead_rejects_without_consulting_channel_check() {
         let consulted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = consulted.clone();
-        let spy: ChannelCheck<'static> = Box::new(move |_: &BridgeLine| {
+        let spy: ChannelCheck<'static> = Box::new(move |_: &BridgeLine, _: Duration| {
             let flag = flag.clone();
             Box::pin(async move {
                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -697,8 +761,74 @@ mod tests {
             })
         });
         let b = bridge();
-        assert!(!admits_candidate(None, &b, Some(&spy)).await);
+        assert!(
+            !admits_candidate(
+                None,
+                &b,
+                Some(&spy),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+        );
         assert!(!consulted.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admission_timeout_returns_candidate_and_releases_pool_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.ktav");
+        let mut cfg = Config::default();
+        cfg.bridges.transport = "webtunnel".into();
+        cfg.write(&path).unwrap();
+        let candidate: BridgeLine =
+            "webtunnel [2001:db8::1]:443 0123456789ABCDEF0123456789ABCDEF01234567 url=https://example.com/bridge"
+                .parse()
+                .unwrap();
+        let pool_path = CandidatePool::resolve_path(Some(&path));
+        let mut pool = CandidatePool::load(pool_path.clone()).unwrap();
+        assert_eq!(pool.merge([candidate.clone()], &HashSet::new()), 1);
+        pool.save().unwrap();
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let started_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(started_tx)));
+        let started_for_checker = started_tx.clone();
+        let checker: ChannelCheck<'static> = Box::new(move |_: &BridgeLine, _: Duration| {
+            if let Some(sender) = started_for_checker.lock().unwrap().take() {
+                let _ = sender.send(());
+            }
+            Box::pin(std::future::pending::<bool>())
+        });
+        let probe: ProbeCheck<'static> = Box::new(|_| {
+            Box::pin(async {
+                bridge_probe::Outcome::Reachable {
+                    latency: Duration::from_millis(1),
+                }
+            })
+        });
+        let task_path = path.clone();
+        let task = tokio::spawn(async move {
+            drain_pool_with(Some(&task_path), 1, Some(&checker), &probe).await
+        });
+        started_rx.await.unwrap();
+        tokio::time::advance(DRAIN_BUDGET).await;
+        assert_eq!(task.await.unwrap().unwrap(), 0);
+
+        // The timed-out admission is deferred, and the pool transaction has
+        // completed, so another writer can acquire the lock immediately.
+        let added = tokio::task::spawn_blocking(move || {
+            CandidatePool::transaction(&pool_path, |pool| {
+                assert_eq!(pool.len(), 1);
+                pool.merge([], &HashSet::new())
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(added, 0);
+        let restored = CandidatePool::load(CandidatePool::resolve_path(Some(&path)))
+            .unwrap()
+            .take(1);
+        assert_eq!(restored, vec![candidate]);
     }
 
     /// Actual-caller overlap: a pool transaction (the refresh path) parked

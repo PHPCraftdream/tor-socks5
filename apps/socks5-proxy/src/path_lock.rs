@@ -36,9 +36,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub(crate) const CLI_LOCK_WAIT: Duration = Duration::from_secs(60);
 
 /// Wait bound for candidate-pool transactions. A drain holds the pool lock
-/// across its probe phase, which `fetch_merge` caps with `DRAIN_BUDGET`
-/// (60s); the bound leaves headroom for a competing transaction to finish
-/// before giving up with an error.
+/// across its bounded probe and admission phase; competing transactions fail
+/// with a clear error once this limit expires.
 pub(crate) const POOL_LOCK_WAIT: Duration = Duration::from_secs(120);
 
 /// An exclusive advisory lock on the sibling `.lock` file of a target path.

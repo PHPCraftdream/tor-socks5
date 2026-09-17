@@ -10,6 +10,7 @@
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{env, fs};
 
 use anyhow::{Context, Result};
@@ -20,6 +21,41 @@ use serde::{Deserialize, Serialize};
 
 const ENV_VAR: &str = "TOR_SOCKS5_CONFIG";
 const DEFAULT_FILE: &str = "tor-socks5.ktav";
+static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn cleanup_temp_files(path: &Path) {
+    let Some(file_name) = path.file_name().map(|name| name.to_string_lossy()) else {
+        return;
+    };
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let prefix = format!(".{file_name}.");
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let stale = name.to_string_lossy().starts_with(&prefix)
+            && name.to_string_lossy().ends_with(".tmp")
+            && name
+                .to_string_lossy()
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.split('.').next())
+                .and_then(|pid| pid.parse::<u32>().ok())
+                != Some(std::process::id());
+        if stale {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let _ = fs::File::open(dir).and_then(|file| file.sync_all());
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -754,6 +790,7 @@ impl Config {
     }
 
     fn from_file(path: &Path) -> Result<Self> {
+        cleanup_temp_files(path);
         let src = fs::read_to_string(path).context("read config file")?;
         let cfg: Config = ktav::from_str(&src).context("parse Ktav config")?;
         Ok(cfg)
@@ -772,7 +809,8 @@ impl Config {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| DEFAULT_FILE.to_string());
-        let tmp = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
+        let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = dir.join(format!(".{file_name}.{}.{seq}.tmp", std::process::id()));
         {
             let mut f =
                 fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
@@ -781,9 +819,18 @@ impl Config {
             f.sync_all()
                 .with_context(|| format!("fsync {}", tmp.display()))?;
         }
-        fs::rename(&tmp, path)
-            .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))?;
-        Ok(())
+        match fs::rename(&tmp, path)
+            .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))
+        {
+            Ok(()) => {
+                sync_parent_dir(path);
+                Ok(())
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&tmp);
+                Err(error)
+            }
+        }
     }
 }
 

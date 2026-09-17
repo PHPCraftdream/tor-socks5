@@ -81,10 +81,12 @@ pub(crate) fn confirms_tor(body: &str) -> bool {
         == Some(true)
 }
 
-/// Joined to completion: cancelling an outer timeout must not leak the blocking check.
+/// Runs the blocking verifier with an absolute deadline so admission can
+/// release its transaction lock without detaching an over-budget check.
 pub(crate) async fn verify_for_admission(
     bridge: BridgeLine,
     config_path: Option<PathBuf>,
+    deadline: std::time::Instant,
 ) -> anyhow::Result<bool> {
     let live_cache = crate::tor_setup::arti_base_dir(config_path.as_deref()).join("cache");
     let pt = Some(crate::tor_setup::resolve_pt_binary()?);
@@ -100,6 +102,7 @@ pub(crate) async fn verify_for_admission(
             pt,
             CIRCUIT_VERIFY_BOOTSTRAP_TIMEOUT,
             CIRCUIT_VERIFY_PROBE_TIMEOUT,
+            Some(deadline),
             |_, result| verified = result.is_ok(),
         );
         Ok(verified)
@@ -196,6 +199,7 @@ async fn run_circuit_verify_tick(config_path: Option<&Path>, active: &[BridgeLin
             pt_binary,
             CIRCUIT_VERIFY_BOOTSTRAP_TIMEOUT,
             CIRCUIT_VERIFY_PROBE_TIMEOUT,
+            None,
             |bridge, result| results.push((bridge.clone(), result.is_ok())),
         );
         let _ = std::fs::remove_dir_all(&scratch_base);
@@ -223,6 +227,10 @@ fn snapshot_cache_dir(src: &Path, dest: &Path) -> bool {
 /// sharing one cache-dir snapshot taken once up front from `live_cache_dir`
 /// (if it exists). Calls `on_result` as each bridge's check completes, with
 /// `Err` carrying a human-readable reason.
+///
+/// `max_deadline` bounds verifier-lock wait and all per-bridge work when the
+/// caller has a transaction lock that must not be held through an unbounded
+/// verification. `None` keeps the normal background verifier budgets.
 ///
 /// Ported from android-ffi's `verify_bridges_sequential` (lib.rs:1534-1597),
 /// keeping its hard-won structure:
@@ -464,6 +472,7 @@ mod pt_reap {
     pub(crate) fn kill_marked_children() {}
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn verify_bridges_sequential(
     live_cache_dir: &Path,
     scratch_base: &Path,
@@ -471,13 +480,42 @@ pub(crate) fn verify_bridges_sequential(
     pt_binary: Option<PathBuf>,
     bootstrap_timeout: Duration,
     probe_timeout: Duration,
+    max_deadline: Option<std::time::Instant>,
     mut on_result: impl FnMut(&BridgeLine, Result<Duration, String>),
 ) {
-    // Only mutual exclusion is stored; each check owns its resources.
-    let _serial = VERIFY_LOCK.lock().unwrap_or_else(|error| {
-        VERIFY_LOCK.clear_poison();
-        error.into_inner()
-    });
+    let deadline = max_deadline;
+    // Only mutual exclusion is stored; each check owns its resources. An
+    // admission check must also bound waiting for the shared verifier lock,
+    // because its caller holds the candidate-pool lock until this returns.
+    let _serial = if let Some(deadline) = deadline {
+        loop {
+            match VERIFY_LOCK.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(error)) => {
+                    VERIFY_LOCK.clear_poison();
+                    break error.into_inner();
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        for bridge in &bridges {
+                            on_result(
+                                bridge,
+                                Err("bridge verification budget exhausted waiting for verifier lock".to_owned()),
+                            );
+                        }
+                        return;
+                    }
+                    std::thread::sleep(remaining.min(Duration::from_millis(10)));
+                }
+            }
+        }
+    } else {
+        VERIFY_LOCK.lock().unwrap_or_else(|error| {
+            VERIFY_LOCK.clear_poison();
+            error.into_inner()
+        })
+    };
     let cache_snapshot = scratch_base.join("cache-snapshot");
     let cache_dir = snapshot_cache_dir(live_cache_dir, &cache_snapshot).then_some(cache_snapshot);
 
@@ -504,6 +542,13 @@ pub(crate) fn verify_bridges_sequential(
     }
 
     for (idx, bridge) in bridges.into_iter().enumerate() {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            on_result(
+                &bridge,
+                Err("bridge verification budget exhausted".to_owned()),
+            );
+            continue;
+        }
         if bridge.transport.is_some() && pt_binary.is_none() {
             on_result(
                 &bridge,
@@ -545,6 +590,11 @@ pub(crate) fn verify_bridges_sequential(
         let result: anyhow::Result<Duration> =
             crate::arti_observability::without_guard_observations(|| {
                 rt.block_on(async {
+                    let remaining = || {
+                        deadline.map_or(Duration::MAX, |deadline| {
+                            deadline.saturating_duration_since(std::time::Instant::now())
+                        })
+                    };
                     let tunnel = arti_wrapper::TorTunnel::create_unbootstrapped_with(
                         arti_wrapper::Settings {
                             bridges: vec![check.bridge],
@@ -555,12 +605,22 @@ pub(crate) fn verify_bridges_sequential(
                             ..Default::default()
                         },
                     )?;
-                    tokio::time::timeout(bootstrap_timeout, tunnel.wait_bootstrapped()).await??;
+                    let bootstrap_limit = bootstrap_timeout.min(remaining());
+                    anyhow::ensure!(
+                        !bootstrap_limit.is_zero(),
+                        "bridge verification budget exhausted before bootstrap"
+                    );
+                    tokio::time::timeout(bootstrap_limit, tunnel.wait_bootstrapped()).await??;
                     let started = std::time::Instant::now();
+                    let probe_limit = probe_timeout.min(remaining());
+                    anyhow::ensure!(
+                        !probe_limit.is_zero(),
+                        "bridge verification budget exhausted before live probe"
+                    );
                     let body = bridge_fetcher::fetch_one(
                         &tunnel,
                         LIVE_PROBE_URL,
-                        probe_timeout,
+                        probe_limit,
                         4096,
                         &[],
                         &[],
@@ -574,7 +634,11 @@ pub(crate) fn verify_bridges_sequential(
                     Ok(started.elapsed())
                 })
             });
-        rt.shutdown_timeout(VERIFY_RUNTIME_SHUTDOWN_GRACE);
+        let shutdown_grace = deadline.map_or(VERIFY_RUNTIME_SHUTDOWN_GRACE, |deadline| {
+            VERIFY_RUNTIME_SHUTDOWN_GRACE
+                .min(deadline.saturating_duration_since(std::time::Instant::now()))
+        });
+        rt.shutdown_timeout(shutdown_grace);
         pt_reap::kill_marked_children();
 
         if let Err(error) = &result {

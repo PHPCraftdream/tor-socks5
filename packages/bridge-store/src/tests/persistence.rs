@@ -15,6 +15,46 @@ fn load_missing_file_is_empty() {
     assert_eq!(store.len(), 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn load_removes_own_stale_temp_files() {
+    let dir = tmp_dir();
+    let path = dir.join("alive.log");
+    let stale = dir.join(".alive.log.1.42.tmp");
+    std::fs::write(&stale, "partial").unwrap();
+    BridgeStore::load(path).expect("load");
+    assert!(!stale.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cached_identity_keeps_carrier_distinctions_across_save_load() {
+    let dir = tmp_dir();
+    let path = dir.join("carrier-cache.log");
+    let first = bridge(
+        "webtunnel 192.0.2.10:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 url=https://a.example/tor ver=0.0.3",
+    );
+    let second = bridge(
+        "webtunnel 192.0.2.10:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 url=https://b.example/tor ver=0.0.3",
+    );
+    let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+
+    let mut store = BridgeStore::load(path.clone()).unwrap();
+    store.record_at(first.clone(), Duration::from_millis(20), now);
+    store.record_at(second.clone(), Duration::from_millis(30), now);
+    assert_eq!(store.len(), 2, "carrier endpoints remain distinct keys");
+    assert_eq!(store.ok_count(&first), 1);
+    assert_eq!(store.ok_count(&second), 1);
+
+    store.save().unwrap();
+    let loaded = BridgeStore::load(path).unwrap();
+    assert_eq!(loaded.len(), 2, "both canonical identities survive reload");
+    assert_eq!(loaded.ok_count(&first), 1);
+    assert_eq!(loaded.ok_count(&second), 1);
+    assert_eq!(loaded.health_snapshot(&first).unwrap().ok_count, 1);
+    assert_eq!(loaded.health_snapshot(&second).unwrap().ok_count, 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
 #[test]
 fn record_save_load_roundtrip_with_health() {
     let dir = tmp_dir();
