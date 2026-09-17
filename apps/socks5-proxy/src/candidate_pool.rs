@@ -8,7 +8,8 @@
 //!   deduplicated and minus anything already in the working config;
 //! * a **drain** walks this pool lazily (one bridge at a time), promotes
 //!   the reachable ones into the working config, and removes every probed
-//!   candidate from the pool (reachable → promoted, dead → discarded).
+//!   candidate from the pool (reachable → promoted, dead → discarded,
+//!   deferred → moved to the back of the queue).
 //!
 //! Stored next to the active config as `<stem>.candidates.log`, a scratch
 //! staging file (plain bridge lines, one per line):
@@ -240,6 +241,30 @@ impl CandidatePool {
             self.bridges.retain(|b| !doomed.contains(&key_of(b)));
         }
         removed
+    }
+
+    /// Move the given candidates to the back of the queue, keeping their
+    /// relative order. Entries the pool no longer holds are ignored — a
+    /// concurrent writer may have removed or promoted them, and rotation
+    /// must not resurrect anything. The keys set is untouched: every moved
+    /// entry goes straight back with the identity it already had. Runs
+    /// inside the drain's confirm transaction on a freshly loaded pool, so
+    /// an attempted-deferred batch goes behind everything the pool currently
+    /// has, including newcomers a concurrent refresh merged in the meantime.
+    pub fn rotate_to_back(&mut self, bridges: &[BridgeLine]) -> usize {
+        let requested: HashSet<Key> = bridges.iter().map(key_of).collect();
+        let mut rotated = Vec::new();
+        self.bridges.retain(|bridge| {
+            if requested.contains(&key_of(bridge)) {
+                rotated.push(bridge.clone());
+                false
+            } else {
+                true
+            }
+        });
+        let count = rotated.len();
+        self.bridges.extend(rotated);
+        count
     }
 
     #[must_use]
@@ -672,6 +697,22 @@ url=https://edge.example/x servername=edge.example addr=9.9.9.9:443 ver=0.0.3";
         );
         assert_eq!(p.take(10), vec![b(B)]);
         assert_eq!(p.remove_all(&[b(A)]), 0, "absent entries remove nothing");
+    }
+
+    #[test]
+    fn rotate_to_back_moves_present_entries_to_the_back_and_ignores_absent_ones() {
+        let mut p = empty(PathBuf::from("mem"));
+        p.merge(vec![b(A), b(B), b(WT)], &HashSet::new());
+        // B is present and moves behind WT; WT_NEW is absent and must not be
+        // resurrected by the rotation request.
+        assert_eq!(p.rotate_to_back(&[b(B), b(WT_NEW)]), 1);
+        // Moved entries keep their identity: re-merging them adds nothing.
+        // (Checked before take: take() drops keys by design, so a merge
+        // after it would legitimately re-add.)
+        assert_eq!(p.merge(vec![b(B), b(WT)], &HashSet::new()), 0);
+        // An empty request rotates nothing.
+        assert_eq!(p.rotate_to_back(&[]), 0);
+        assert_eq!(p.take(10), vec![b(A), b(WT), b(B)]);
     }
 
     /// Two competing transactions serialize on the pool lock: both mutations

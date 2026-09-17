@@ -723,3 +723,242 @@ async fn confirm_removals_merge_with_a_concurrent_refresh_instead_of_clobbering_
         .into_config();
     assert!(cfg.bridges.parsed().unwrap().bridges.contains(&wt));
 }
+
+// --- TS18-02 / TS18-03: the drain's confirm must run even when nothing is
+// --- promoted, and attempted-deferred candidates must rotate to the back.
+
+/// webtunnel candidate line with a distinctive marker in the carrier URL,
+/// so probes and assertions can tell entries apart.
+fn wt_candidate(i: u32, marker: &str) -> BridgeLine {
+    format!(
+        "webtunnel 9.9.9.{i}:443 {:040x} url=https://e{i}.example/{marker} ver=0.0.3",
+        i
+    )
+    .parse::<BridgeLine>()
+    .unwrap()
+}
+
+fn wt_pool_fixture(
+    candidates: impl IntoIterator<Item = BridgeLine>,
+) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("proxy.ktav");
+    let mut cfg = Config::default();
+    cfg.bridges.transport = "webtunnel".into();
+    cfg.bridges.lines = vec![bridge().to_string()];
+    cfg.write(&path).unwrap();
+    let pool_path = CandidatePool::resolve_path(Some(&path));
+    let mut pool = CandidatePool::load(pool_path.clone()).unwrap();
+    let candidates: Vec<BridgeLine> = candidates.into_iter().collect();
+    let expected = candidates.len();
+    let added = pool.merge(candidates, &HashSet::new());
+    assert_eq!(added, expected, "fixture candidates are all distinct");
+    pool.save().unwrap();
+    (dir, path, pool_path)
+}
+
+/// TS18-02 counterfactual: a batch that probes entirely dead promotes
+/// nothing, and the pre-fix early return skipped the confirm — the dead
+/// batch stayed at the head of the on-disk pool forever, so a working
+/// bridge right behind it was never reached. After one drain the dead
+/// entries must be gone from the pool, and the next drain must reach the
+/// good bridge.
+#[tokio::test]
+async fn dead_only_drain_confirms_its_batch_and_the_next_drain_reaches_past_it() {
+    let dead: Vec<BridgeLine> = (1..=12).map(|i| wt_candidate(i, "dead")).collect();
+    let good = wt_candidate(13, "good");
+    let (_dir, path, pool_path) = wt_pool_fixture(dead.iter().cloned().chain([good.clone()]));
+
+    let dead_probe: ProbeCheck<'static> = Box::new(|_bridge| {
+        Box::pin(async {
+            bridge_probe::Outcome::Unreachable {
+                reason: "tcp dead".into(),
+            }
+        })
+    });
+    let first = drain_pool_with(Some(&path), 1, Some(&check(true)), &dead_probe, &aw())
+        .await
+        .unwrap();
+    assert_eq!(first, 0, "nothing was probed alive, so nothing is promoted");
+
+    // THE core assertion: the confirm ran despite zero promotions — the 12
+    // dead entries are shed and only the good bridge is left.
+    let mut pool = CandidatePool::load(pool_path.clone()).unwrap();
+    assert_eq!(
+        pool.len(),
+        1,
+        "the dead batch must be shed even with no promotion"
+    );
+    assert_eq!(
+        pool.take(10),
+        vec![good.clone()],
+        "the good bridge must be the only candidate left"
+    );
+
+    let added = drain_pool_with(
+        Some(&path),
+        1,
+        Some(&check(true)),
+        &reachable_probe(),
+        &aw(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(added, 1, "the second drain reaches the good bridge");
+    let cfg = Config::load_with_override(Some(&path))
+        .unwrap()
+        .into_config();
+    assert!(
+        cfg.bridges.parsed().unwrap().bridges.contains(&good),
+        "the good bridge behind the dead batch must be promoted"
+    );
+}
+
+/// TS18-03 counterfactual: candidates that probe Unmeasured used to keep
+/// their on-disk positions, so a full deferred batch (12 = MAX_DRAIN_ATTEMPTS)
+/// starved everything behind it forever. The confirm must rotate the
+/// attempted-deferred to the BACK of the freshly loaded queue. Boundary:
+/// batch_size = min(min(target*50, MAX_DRAIN_ATTEMPTS) = 12, pool.len());
+/// each round sheds or rotates the whole attempted prefix, so the queue
+/// front advances by the full batch per round — a good bridge behind 12
+/// deferred entries is reached within ceil(13 / 12) = 2 rounds. This test
+/// pins that exact bound.
+#[tokio::test]
+async fn deferred_prefix_rotates_and_the_working_tail_is_reached_within_two_rounds() {
+    let deferred: Vec<BridgeLine> = (1..=12).map(|i| wt_candidate(i, "defer")).collect();
+    let good = wt_candidate(13, "good");
+    let (_dir, path, _pool_path) = wt_pool_fixture(deferred.iter().cloned().chain([good.clone()]));
+
+    let unmeasured_probe: ProbeCheck<'static> = Box::new(|_bridge| {
+        Box::pin(async {
+            bridge_probe::Outcome::Unmeasured {
+                reason: "resolver unavailable".into(),
+            }
+        })
+    });
+    let first = drain_pool_with(Some(&path), 1, Some(&check(true)), &unmeasured_probe, &aw())
+        .await
+        .unwrap();
+    assert_eq!(first, 0, "nothing was measured, so nothing is promoted");
+
+    // THE core assertion: the deferred prefix is now at the BACK — the good
+    // bridge sits at the front of the queue (pre-fix it was still deferred
+    // candidate #1).
+    let mut pool = CandidatePool::load(CandidatePool::resolve_path(Some(&path))).unwrap();
+    assert_eq!(
+        pool.take_transport(1, Some("webtunnel")),
+        vec![good.clone()],
+        "the deferred prefix must rotate behind the good bridge"
+    );
+
+    // The second round must reach the good bridge specifically: only `good`
+    // probes reachable, the (shuffled) deferred rest stays Unmeasured and
+    // rotates again — a blanket-reachable probe would let whichever shuffled
+    // candidate is probed first win the single promotion slot.
+    let good_probe: ProbeCheck<'static> = {
+        let good = good.clone();
+        Box::new(move |bridge| {
+            let good = good.clone();
+            if key_of(bridge) == key_of(&good) {
+                Box::pin(async {
+                    bridge_probe::Outcome::Reachable {
+                        latency: Duration::from_millis(10),
+                    }
+                })
+            } else {
+                Box::pin(async {
+                    bridge_probe::Outcome::Unmeasured {
+                        reason: "not the good bridge".into(),
+                    }
+                })
+            }
+        })
+    };
+    let added = drain_pool_with(Some(&path), 1, Some(&check(true)), &good_probe, &aw())
+        .await
+        .unwrap();
+    assert_eq!(added, 1, "the second round reaches the good bridge");
+    let cfg = Config::load_with_override(Some(&path))
+        .unwrap()
+        .into_config();
+    assert!(
+        cfg.bridges.parsed().unwrap().bridges.contains(&good),
+        "the good bridge behind the deferred prefix must be promoted"
+    );
+}
+
+/// TS18-02 + TS18-03 concurrency guard, sibling of
+/// `confirm_removals_merge_with_a_concurrent_refresh_instead_of_clobbering_it`:
+/// even when the drain promotes NOTHING, its confirm must run on a freshly
+/// loaded pool — shedding the dead, rotating the deferred to the back, and
+/// merging with (never clobbering) a newcomer a concurrent refresh merged
+/// in between.
+#[tokio::test]
+async fn confirm_of_dead_and_rotation_merges_with_a_concurrent_refresh_instead_of_clobbering_it() {
+    let d1 = wt_candidate(1, "defer");
+    let d2 = wt_candidate(2, "dead");
+    let (_dir, path, pool_path) = wt_pool_fixture([d1.clone(), d2.clone()]);
+    let newcomer: BridgeLine =
+        "obfs4 1.2.3.9:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=CCC iat-mode=0"
+            .parse()
+            .unwrap();
+
+    // d1 probes Unmeasured (deferred), d2 probes Unreachable (dead); the
+    // checker is never consulted because neither is admitted.
+    let mixed_probe: ProbeCheck<'static> = Box::new(|bridge| {
+        let defer = bridge.to_string().contains("defer");
+        Box::pin(async move {
+            if defer {
+                bridge_probe::Outcome::Unmeasured {
+                    reason: "resolver unavailable".into(),
+                }
+            } else {
+                bridge_probe::Outcome::Unreachable {
+                    reason: "tcp dead".into(),
+                }
+            }
+        })
+    });
+
+    let gate = crate::test_seams::ParkedGate::arm(crate::test_seams::Site::PreRestore, &pool_path);
+    let drain_path = path.clone();
+    let drain = tokio::spawn(async move {
+        drain_pool_with(
+            Some(&drain_path),
+            1,
+            Some(&check(true)),
+            &mixed_probe,
+            &aw(),
+        )
+        .await
+    });
+    let wait = gate.clone();
+    tokio::task::spawn_blocking(move || wait.wait_parked(HANG_GUARD))
+        .await
+        .unwrap();
+
+    // While the drain is parked before its confirm, a refresh merges a
+    // newcomer into the pool.
+    let tx_path = pool_path.clone();
+    let newcomer_for_tx = newcomer.clone();
+    let added = tokio::task::spawn_blocking(move || {
+        CandidatePool::transaction(&tx_path, |p| p.merge([newcomer_for_tx], &HashSet::new()))
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(added, 1, "the concurrent refresh must be able to merge");
+
+    gate.release();
+    assert_eq!(drain.await.unwrap().unwrap(), 0, "nothing was promoted");
+
+    // THE core assertion: the newcomer survives the stale-snapshot hazard,
+    // the dead d2 is shed even with zero promotions, and the deferred d1
+    // sits behind it.
+    let mut pool = CandidatePool::load(pool_path).unwrap();
+    assert_eq!(
+        pool.take(10),
+        vec![newcomer, d1],
+        "newcomer first, then the rotated deferred; the dead entry is gone"
+    );
+}

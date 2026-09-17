@@ -8,7 +8,8 @@
 //!    time**, promote the reachable ones into the working config, and shed
 //!    probed candidates from the pool only once their outcome is durable
 //!    (alive → promoted into the config, then removed; dead → discarded;
-//!    unprobed and deferred stay for next time). Touches the network to the
+//!    attempted-deferred → rotated to the back of the queue; unprobed stay
+//!    where they are). Touches the network to the
 //!    bridges; when a live [`TorTunnel`]
 //!    is available, admission also requires a real Tor channel to the bridge,
 //!    so mere TCP-alive impostors are rejected.
@@ -254,7 +255,9 @@ async fn admits_candidate(
 /// up to `target` reachable bridges into the working config, and shed probed
 /// candidates from the pool once their outcome is durable: dead candidates
 /// are discarded, promoted ones only after the config write succeeds — on a
-/// config-write failure they stay pooled for the next drain (TS17-08).
+/// config-write failure they stay pooled for the next drain (TS17-08). The
+/// same confirm moves attempted-deferred candidates behind the rest of the
+/// queue, so a deferred batch cannot starve the candidates behind it.
 /// Returns how many were promoted.
 ///
 /// The real admission channel-check: webtunnel candidates go through the
@@ -311,8 +314,9 @@ fn channel_checker(
 /// known: it re-loads the pool fresh under the same cross-process lock and
 /// removes exactly the candidates whose outcome is now durable elsewhere —
 /// the dead always, the promoted only after a successful config promotion —
-/// merging with, never overwriting, whatever a concurrent writer published
-/// in between. The pool lock is never held across the config write itself
+/// and rotates the attempted-deferred to the back of the freshly loaded
+/// queue, merging with, never overwriting, whatever a concurrent writer
+/// published in between. The pool lock is never held across the config write itself
 /// (that long hold was removed in R-09/TS17-02).
 ///
 /// Admission is two-layer: a TCP probe must pass, and when `tor` is `Some`,
@@ -391,8 +395,9 @@ async fn drain_pool_with(
     // walk it one at a time. Nothing is saved here: the on-disk pool keeps
     // the whole batch until the confirm transaction below knows each
     // candidate's outcome is durable elsewhere. Dead entries are shed by
-    // that confirm, so the pool still steadily advances across drains
-    // rather than re-probing a dead head.
+    // that confirm, and attempted-deferred ones are rotated behind the rest
+    // of the queue, so the pool still steadily advances across drains
+    // rather than re-probing a dead or indefinitely deferred head.
     let max_attempts = target.saturating_mul(50).min(MAX_DRAIN_ATTEMPTS);
     let batch_size = max_attempts.min(pool.len());
     let mut batch = pool.take_transport(batch_size, cfg.bridges.preferred_transport());
@@ -401,6 +406,7 @@ async fn drain_pool_with(
     let mut promoted: Vec<BridgeLine> = Vec::new();
     let mut channel_ok: Vec<BridgeLine> = Vec::new();
     let mut dead = Vec::new();
+    let mut deferred = Vec::new();
     let mut reachable = Vec::new();
     let deadline = tokio::time::Instant::now() + DRAIN_BUDGET;
     let mut attempts = 0usize;
@@ -420,9 +426,13 @@ async fn drain_pool_with(
             }
             Ok(bridge_probe::Outcome::Unmeasured { reason }) => {
                 tracing::debug!(transport = ?bridge.transport, %reason, "candidate probe deferred");
-                continue; // stays pooled for the next drain
+                deferred.push(bridge);
+                continue; // rotates to the back of the queue in the confirm below
             }
-            Err(_) => continue, // probe lost or timed out: stays pooled
+            Err(_) => {
+                deferred.push(bridge);
+                continue; // probe lost or timed out → rotated to the back by the confirm
+            }
         };
         // Admission receives the remaining drain budget. The outer deadline
         // also bounds injected checks that do not honor that budget; the
@@ -443,8 +453,9 @@ async fn drain_pool_with(
                 channel_ok.push(bridge);
             }
         } else if latency.is_some() {
-            // TCP-alive but admission not proven: stays pooled for the next
-            // drain, exactly where it is.
+            // TCP-alive but admission not proven: the confirm below moves it
+            // behind the rest of the queue.
+            deferred.push(bridge);
         } else {
             dead.push(bridge);
         }
@@ -452,7 +463,8 @@ async fn drain_pool_with(
 
     // TS17-08: nothing has been published yet. `take_transport` mutated only
     // the in-memory snapshot, so the on-disk pool still holds every taken
-    // candidate — unprobed, deferred and promoted alike. The old code saved
+    // candidate — unprobed, deferred and promoted alike. The confirm below
+    // sheds the durable outcomes and rotates the attempted-deferred. The old code saved
     // the removals HERE, before the config write, so a failed or timed-out
     // promotion left a verified candidate in neither store. Instead the pool
     // lock is released now (never held across the config write — that long
@@ -469,12 +481,9 @@ async fn drain_pool_with(
     info!(
         promoted = promoted.len(),
         probed = attempts,
+        deferred = deferred.len(),
         "drained candidate pool"
     );
-
-    if promoted.is_empty() {
-        return Ok(0);
-    }
 
     // Best-effort record — routed through the single bridge-store writer.
     // This site runs both inside the daemon (maintenance auto-fetch via
@@ -548,7 +557,7 @@ async fn drain_pool_with(
     if promotion.is_ok() {
         discard.extend(promoted.iter().cloned());
     }
-    let confirmed = if discard.is_empty() {
+    let confirmed = if discard.is_empty() && deferred.is_empty() {
         Ok(())
     } else {
         tokio::task::spawn_blocking({
@@ -556,6 +565,7 @@ async fn drain_pool_with(
             move || {
                 CandidatePool::transaction(&pool_path, |fresh| {
                     fresh.remove_all(&discard);
+                    fresh.rotate_to_back(&deferred);
                 })
             }
         })
