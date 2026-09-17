@@ -19,6 +19,10 @@ const CHANNEL_TIMEOUT: Duration = Duration::from_secs(15);
 const ROUND_TIMEOUT: Duration = Duration::from_secs(60);
 const FALLBACK_POOL_SIZE: usize = 8;
 
+fn warm_bridge_proves_channel(result: arti_wrapper::Result<bool>) -> bool {
+    matches!(result, Ok(true))
+}
+
 fn candidates(configured: &[BridgeLine], selected: &[BridgeLine]) -> Vec<BridgeLine> {
     let mut seen = HashSet::new();
     selected
@@ -111,7 +115,7 @@ pub(super) async fn authenticate_fallback(
         let tor = tor.clone();
         Box::pin(async move {
             matches!(tor.bridge_is_disabled(&bridge), Ok(false))
-                && tor.warm_bridge(&bridge).await.is_ok()
+                && warm_bridge_proves_channel(tor.warm_bridge(&bridge).await)
                 && matches!(tor.bridge_is_disabled(&bridge), Ok(false))
         })
     };
@@ -171,6 +175,15 @@ mod tests {
                     .unwrap()
             })
             .collect()
+    }
+
+    #[test]
+    fn warm_bridge_only_proves_the_requested_endpoint_on_true() {
+        assert!(warm_bridge_proves_channel(Ok(true)));
+        assert!(!warm_bridge_proves_channel(Ok(false)));
+        assert!(!warm_bridge_proves_channel(Err(
+            arti_wrapper::TorError::InvalidBridge("test".to_owned())
+        )));
     }
 
     #[tokio::test]
