@@ -222,10 +222,31 @@ async fn bounded_sweep_removes_dead_entries_and_spares_the_inflight_one() {
 
     // Phase 4: the live entry must still coalesce -- a joiner shares the
     // parked lookup instead of starting a second wave search.
+    //
+    // The sweeps above must not have evicted this still-live entry; check that
+    // before building the joiner, so an eviction is reported as an eviction
+    // rather than as the joiner hanging sixty seconds further down.
+    assert!(
+        inflight_doh_contains_host(&primary_live_host),
+        "the bounded sweep must spare the entry whose lookup is still in flight"
+    );
+    let searches_before_joiner = live_searches.load(Ordering::SeqCst);
     let mut joiner = Box::pin(coalesced_doh_lookup(&primary_live_host));
     assert!(
         matches!(futures::poll!(joiner.as_mut()), std::task::Poll::Pending),
         "the joiner must register on the parked cell before release"
+    );
+    // Registration is synchronous -- everything before `get_or_init().await`
+    // in `coalesced_doh_lookup` runs on that first poll -- so by now the
+    // joiner has either upgraded the owner's cell or created its own. Only the
+    // latter starts a fresh wave search, and it would park on a release
+    // channel this test never sends, hanging the join below. Fail here, with
+    // the reason, instead of there.
+    assert_eq!(
+        live_searches.load(Ordering::SeqCst),
+        searches_before_joiner,
+        "the joiner must coalesce onto the parked owner's cell, not start a \
+         second wave search"
     );
     for release in live_releases {
         release.send(()).expect("live owner is parked");
