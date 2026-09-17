@@ -29,7 +29,7 @@ pub(super) fn snapshot_exit_stream_timeouts(
     (config.initial_connect_timeout, config.connect_timeout)
 }
 
-/// Retry once on another circuit, before returning a stream to the application.
+/// Retry once before returning a stream error to the application.
 /// cancel-safe: yes — no application data is sent; retirement preserves existing streams.
 pub(super) async fn retry_exit_stream<R, T, I, F, OpenFut, StreamFut>(
     runtime: &R,
@@ -56,15 +56,21 @@ where
         let (id, stream) = open().await?;
         // Treat expiry as an ordinary retryable attempt failure. Returning
         // here would skip retirement and the one permitted retry.
-        let result = match runtime.timeout(timeout, stream).await {
-            Ok(result) => result,
-            Err(_) => Err(ErrorDetail::ExitTimeout),
+        let (result, timed_out) = match runtime.timeout(timeout, stream).await {
+            Ok(result) => (result, false),
+            Err(_) => (Err(ErrorDetail::ExitTimeout), true),
         };
         if let Err(error) = &result {
             if retryable_stream_error(error) {
-                retire(&id);
+                // The abbreviated Android budget is an admission deadline,
+                // so its expiry does not establish that the circuit is bad.
+                let abbreviated_timeout =
+                    !retried && initial_timeout.is_some_and(|initial| initial < ordinary_timeout);
+                if !(timed_out && abbreviated_timeout) {
+                    retire(&id);
+                }
                 if !retried {
-                    info!(%error, "stream open failed; retrying on a fresh circuit");
+                    info!(%error, "stream open failed; retrying stream open");
                     retried = true;
                     continue;
                 }

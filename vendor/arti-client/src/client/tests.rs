@@ -85,7 +85,7 @@ fn stream_retry_is_bounded_and_retires_the_last_failed_circuit() {
         );
     });
     assert_eq!(calls.get(), 2);
-    assert_eq!(*retired.borrow(), vec![0, 1]);
+    assert_eq!(*retired.borrow(), vec![1]);
 }
 
 #[test]
@@ -205,7 +205,7 @@ fn request_timeout_snapshot_survives_reconfigure_during_first_attempt() {
 }
 
 #[test]
-fn stream_retry_uses_fast_first_timer_and_ordinary_retry_timer() {
+fn stream_retry_initial_timeout_does_not_retire_circuit() {
     let tokio_runtime = paused_runtime();
     tokio_runtime.block_on(async {
         use tor_rtcompat::SleepProvider as _;
@@ -238,7 +238,7 @@ fn stream_retry_uses_fast_first_timer_and_ordinary_retry_timer() {
         .await;
         assert_eq!(result.unwrap(), 42);
         assert_eq!(attempts.get(), 2);
-        assert_eq!(*retired.borrow(), vec![0]);
+        assert!(retired.borrow().is_empty());
         assert_eq!(
             tokio::time::Instant::now() - started,
             Duration::from_secs(10)
