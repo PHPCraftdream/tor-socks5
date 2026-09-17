@@ -70,21 +70,91 @@ pub(crate) async fn connect_direct(
     port: u16,
     resolver_policy: ResolverPolicy,
 ) -> Result<TcpStream, FetchError> {
+    connect_direct_with(
+        host,
+        port,
+        resolver_policy,
+        |stream| async move { Ok(stream) },
+    )
+    .await
+}
+
+/// Dial candidate addresses and run the caller's protocol handshake on each
+/// connected socket. A TCP-successful address is not final until `accept`
+/// succeeds (for example, TLS can reject a stale pin); later pins and the
+/// resolver candidates remain eligible after that failure.
+pub(crate) async fn connect_direct_with<T, F, Fut>(
+    host: &str,
+    port: u16,
+    resolver_policy: ResolverPolicy,
+    accept: F,
+) -> Result<T, FetchError>
+where
+    F: FnMut(TcpStream) -> Fut,
+    Fut: Future<Output = Result<T, FetchError>>,
+{
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return connect_dialing_pins(
+        return connect_candidates_with(
             host,
             vec![SocketAddr::new(ip, port)],
-            // No resolver at all: a failed literal dial must not fall into DNS.
             None::<fn() -> std::future::Pending<Result<Vec<SocketAddr>, String>>>,
+            accept,
         )
         .await;
     }
-    connect_dialing_pins(
+    connect_candidates_with(
         host,
         pinned_addrs(host, port),
         Some(move || bridge_probe::resolve_addrs(host, port, resolver_policy)),
+        accept,
     )
     .await
+}
+
+async fn connect_candidates_with<T, F, Fut, R, RFut>(
+    host: &str,
+    pins: Vec<SocketAddr>,
+    resolve: Option<R>,
+    mut accept: F,
+) -> Result<T, FetchError>
+where
+    F: FnMut(TcpStream) -> Fut,
+    Fut: Future<Output = Result<T, FetchError>>,
+    R: FnOnce() -> RFut,
+    RFut: Future<Output = Result<Vec<SocketAddr>, String>>,
+{
+    let had_pins = !pins.is_empty();
+    let mut last_error = None;
+    for addr in pins {
+        match dial_one(addr).await {
+            Ok(stream) => match accept(stream).await {
+                Ok(value) => return Ok(value),
+                Err(error) => last_error = Some(error),
+            },
+            Err(error) => last_error = Some(FetchError::Resolve(error)),
+        }
+    }
+
+    let dynamic = match resolve {
+        Some(resolve) => match resolve().await {
+            Ok(addresses) => addresses,
+            Err(error) if !had_pins => return Err(FetchError::Resolve(format!("{host}: {error}"))),
+            Err(_) => Vec::new(),
+        },
+        None => Vec::new(),
+    };
+    for addr in dynamic {
+        match dial_one(addr).await {
+            Ok(stream) => match accept(stream).await {
+                Ok(value) => return Ok(value),
+                Err(error) => last_error = Some(error),
+            },
+            Err(error) => last_error = Some(FetchError::Resolve(error)),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        FetchError::Resolve(format!("{host}: no pinned or resolved address available"))
+    }))
 }
 
 /// Dial `pins` first; only once every pin failed to connect (or there are no
@@ -103,6 +173,7 @@ pub(crate) async fn connect_direct(
 /// bridge-probe (every reader treats a miss as a normal lookup, and a cold
 /// process starts with an empty cache anyway), and for a pinned host a later
 /// fetch short-circuits at the pin dial without needing DNS at all.
+#[cfg(test)]
 async fn connect_dialing_pins<F, Fut>(
     host: &str,
     pins: Vec<SocketAddr>,
@@ -112,50 +183,7 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<Vec<SocketAddr>, String>>,
 {
-    // Phase 1: pins dial first, in order.
-    let mut last_err = None;
-    for addr in pins.iter().copied() {
-        match dial_one(addr).await {
-            Ok(stream) => return Ok(stream),
-            Err(e) => last_err = Some(e),
-        }
-    }
-
-    // Phase 2: resolution only runs when no pin accepted a connection.
-    // A pin that DOES accept TCP is still untrusted: the fetch proceeds only
-    // through the unchanged rustls handshake in http.rs (real cert + SNI for
-    // the hostname), so skipping DNS on a connected pin changes latency,
-    // never the trust boundary. And because every pin dial failure falls
-    // through to the DoH-resolved addresses here, a stale/incomplete pin
-    // table degrades to the same reliability as having no pins at all.
-    let dynamic = match resolve {
-        Some(resolve) => match resolve().await {
-            Ok(resolved) => resolved,
-            Err(e) if pins.is_empty() => {
-                return Err(FetchError::Resolve(format!("{host}: {e}")));
-            }
-            // Pins existed; a DoH failure alone is not fatal, they were tried.
-            Err(_) => Vec::new(),
-        },
-        None => Vec::new(),
-    };
-
-    if pins.is_empty() && dynamic.is_empty() {
-        return Err(FetchError::Resolve(format!(
-            "{host}: no pinned or DoH-resolved address available"
-        )));
-    }
-
-    for addr in dynamic {
-        match dial_one(addr).await {
-            Ok(stream) => return Ok(stream),
-            Err(e) => last_err = Some(e),
-        }
-    }
-    Err(FetchError::Resolve(format!(
-        "{host}: every candidate address failed to connect ({})",
-        last_err.unwrap_or_default()
-    )))
+    connect_candidates_with(host, pins, resolve, |stream| async move { Ok(stream) }).await
 }
 
 /// One bounded connect attempt. On success returns the stream; on failure an
@@ -203,6 +231,42 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, FetchError::Resolve(_)));
+    }
+
+    #[tokio::test]
+    async fn protocol_failure_on_one_connected_pin_tries_the_next() {
+        let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_addr = first.local_addr().unwrap();
+        let second_addr = second.local_addr().unwrap();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_accept = attempts.clone();
+        let listener = tokio::spawn(async move {
+            let _ = first.accept().await;
+            let _ = second.accept().await;
+        });
+        let stream = connect_candidates_with(
+            "example.invalid",
+            vec![first_addr, second_addr],
+            None::<fn() -> std::future::Pending<Result<Vec<SocketAddr>, String>>>,
+            move |stream| {
+                let attempt = attempts_for_accept.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        drop(stream);
+                        Err(FetchError::Tls("first pin rejected protocol".into()))
+                    } else {
+                        Ok(stream)
+                    }
+                }
+            },
+        )
+        .await;
+        let stream = stream.expect("second connected pin must be tried");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(stream.peer_addr().unwrap().port(), second_addr.port());
+        listener.await.unwrap();
+        let _ = first_addr;
     }
 
     #[tokio::test]

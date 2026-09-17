@@ -64,7 +64,7 @@ pub(crate) use webtunnel_upgrade::webtunnel_upgrade_probe;
 ///
 /// Exception: webtunnel bridges legitimately carry a `2001:db8::/32` ORPort
 /// placeholder — the real endpoint lives in the `url=`/`addr=` param (see
-/// [`resolve_probe_target`]), so the RFC 3849 check must not apply to them.
+/// `resolve_probe_target`), so the RFC 3849 check must not apply to them.
 pub fn usable_for_tor(bridge: &BridgeLine) -> bool {
     if bridge.transport.as_deref() == Some("webtunnel") {
         return bridge.params.contains_key("url") || bridge.params.contains_key("addr");
@@ -267,7 +267,7 @@ impl PreparedTarget {
 }
 
 /// Canonical WebTunnel carrier identity for dedup/pool keys: every field of
-/// [`PreparedTarget`] that shapes the actual connection — dial address, TLS
+/// `PreparedTarget` that shapes the actual connection — dial address, TLS
 /// SNI, HTTP Host authority, TLS-vs-plain, and path+query. Two bridge lines
 /// collapse into one dedup/pool candidate only when the probe would dial them
 /// identically, so first-wins dedup can no longer discard a distinct,
@@ -280,7 +280,7 @@ pub struct WebtunnelEndpointIdentity {
     pub dial_port: u16,
     /// TLS SNI / Host-header name (`servername=` override wins, else URL host).
     pub sni: String,
-    /// Preformatted HTTP Host header value (see [`PreparedTarget::host_header`]).
+    /// Preformatted HTTP Host header value (see `PreparedTarget::host_header`).
     pub host_header: String,
     /// HTTP request-target: URL path (or "/") plus "?query" when present.
     pub request_target: String,
@@ -324,7 +324,7 @@ pub fn bridge_identity(bridge: &BridgeLine) -> BridgeIdentity {
 }
 
 /// Canonical WebTunnel carrier identity for dedup/pool keys, computed via
-/// [`PreparedTarget`] so dedup and probing can never disagree about what
+/// `PreparedTarget` so dedup and probing can never disagree about what
 /// counts as "the same connection". See [`WebtunnelEndpointIdentity`].
 /// `None` for non-webtunnel bridges or when the params don't parse — the
 /// caller should then fall back to the plain (transport, addr, fingerprint)

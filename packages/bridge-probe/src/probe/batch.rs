@@ -9,7 +9,7 @@ use std::time::Duration;
 pub(crate) const MAX_INFLIGHT_PROBES: usize = 64;
 
 /// Probe every bridge in `bridges` concurrently. Each probe is bounded by
-/// `per_bridge_timeout`. At most [`MAX_INFLIGHT_PROBES`] probes are in
+/// `per_bridge_timeout`. At most `MAX_INFLIGHT_PROBES` probes are in
 /// flight at any time. The returned vector is **not** guaranteed to
 /// preserve input order.
 pub async fn probe_all(bridges: Vec<BridgeLine>, per_bridge_timeout: Duration) -> Vec<Report> {

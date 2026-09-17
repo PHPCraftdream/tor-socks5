@@ -12,7 +12,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tracing::debug;
 
-use crate::direct::connect_direct;
+use crate::direct::{connect_direct, connect_direct_with};
 use crate::error::FetchError;
 use crate::url_parse::parse_https_url;
 
@@ -294,16 +294,35 @@ async fn fetch_one_inner(
             "fetching"
         );
 
-        let raw = connector.connect(&target.dial_host, target.port).await?;
-
-        let server_name = rustls::pki_types::ServerName::try_from(target.dial_host.clone())
-            .map_err(|e| FetchError::Tls(format!("invalid SNI: {e}")))?;
-
-        let tls_connector = tokio_rustls::TlsConnector::from(tls_cfg.clone());
-        let mut tls = tls_connector
-            .connect(server_name, raw)
-            .await
-            .map_err(|e| FetchError::Tls(e.to_string()))?;
+        let mut tls: tokio_rustls::client::TlsStream<BoxedIo> = match connector {
+            Connector::Direct(policy) => {
+                let host = target.dial_host.clone();
+                let cfg = tls_cfg.clone();
+                connect_direct_with(&target.dial_host, target.port, *policy, move |raw| {
+                    let host = host.clone();
+                    let cfg = cfg.clone();
+                    async move {
+                        let server_name = rustls::pki_types::ServerName::try_from(host)
+                            .map_err(|e| FetchError::Tls(format!("invalid SNI: {e}")))?;
+                        let raw: BoxedIo = Box::pin(raw);
+                        tokio_rustls::TlsConnector::from(cfg)
+                            .connect(server_name, raw)
+                            .await
+                            .map_err(|e| FetchError::Tls(e.to_string()))
+                    }
+                })
+                .await?
+            }
+            _ => {
+                let raw = connector.connect(&target.dial_host, target.port).await?;
+                let server_name = rustls::pki_types::ServerName::try_from(target.dial_host.clone())
+                    .map_err(|e| FetchError::Tls(format!("invalid SNI: {e}")))?;
+                tokio_rustls::TlsConnector::from(tls_cfg.clone())
+                    .connect(server_name, raw)
+                    .await
+                    .map_err(|e| FetchError::Tls(e.to_string()))?
+            }
+        };
 
         let req = build_get_request(
             &target.host_header,

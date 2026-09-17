@@ -20,7 +20,7 @@ use crate::probe::resolve_probe_target;
 /// A portable DNS resolution, shareable across devices and processes.
 ///
 /// Shareability is the whole point of this type existing separately from the
-/// internal [`CachedAnswer`]/[`PersistedAnswer`] representations: an answer
+/// internal `CachedAnswer`/`PersistedAnswer` representations: an answer
 /// only belongs here if the (host, addrs) pairing is a fact about the
 /// Internet, not a fact about the network the resolving device happened to
 /// be on. A CDN-fronted hostname's resolved IP is viewpoint-dependent and
@@ -58,7 +58,7 @@ pub fn format_dns_hint_line(hint: &DnsHint) -> String {
 /// anything that is not a well-formed hint line, including a plain bridge
 /// line or an unrelated comment -- callers should treat that the same as
 /// "not a hint", never as an error. A `resolved_at_unix` further ahead than
-/// [`DNS_TIMESTAMP_FUTURE_TOLERANCE`] is likewise rejected as malformed.
+/// a timestamp beyond the configured future tolerance is likewise rejected.
 pub fn parse_dns_hint_line(line: &str) -> Option<DnsHint> {
     let rest = line.strip_prefix(DNS_HINT_PREFIX)?;
     let mut parts = rest.split_whitespace();
@@ -101,7 +101,7 @@ pub fn dns_hostname_of(bridge: &BridgeLine) -> Option<String> {
 /// Read-only -- never attempts a network resolution. This is the query side
 /// of exporting [`DnsHint`]s (see `dns_hostname_of` for picking which
 /// bridges are worth asking about); resolving a hostname to serve live
-/// traffic goes through [`resolve_addrs`] instead.
+/// traffic goes through the crate's `resolve_addrs` API instead.
 pub fn best_known_answer(host: &str) -> Option<DnsHint> {
     {
         let cache = doh_cache().lock().unwrap_or_else(|p| p.into_inner());
@@ -136,7 +136,7 @@ pub fn best_known_answer(host: &str) -> Option<DnsHint> {
 /// can skip DNS entirely on a device whose network cannot resolve it.
 ///
 /// Last-write-wins by `resolved_at_unix` via the same merge as
-/// [`load_persisted_dns_cache`] -- call order between the two never matters.
+/// `load_persisted_dns_cache` -- call order between the two never matters.
 pub fn seed_disk_fallback(hints: &[DnsHint]) {
     for hint in hints {
         merge_disk_fallback_entry(
