@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use arti_client::config::pt::TransportConfigBuilder;
@@ -199,10 +199,38 @@ fn with_iat_mode_override(line: &BridgeLine, iat_mode: Option<u8>) -> BridgeLine
     overridden
 }
 
+/// Parse a bridge line for arti, applying the same client-side obfs4 setting
+/// override as [`build_config`].
+fn build_bridge_config_builder(
+    line: &BridgeLine,
+    iat_mode: Option<u8>,
+) -> Result<(String, BridgeConfigBuilder)> {
+    let serialized = with_iat_mode_override(line, iat_mode).to_string();
+    let builder: BridgeConfigBuilder =
+        serialized
+            .parse()
+            .map_err(|e: arti_client::config::BridgeParseError| {
+                TorError::InvalidBridge(format!("{serialized:?}: {e}"))
+            })?;
+    Ok((serialized, builder))
+}
+
+fn build_bridge_target(
+    line: &BridgeLine,
+    iat_mode: Option<u8>,
+) -> Result<(String, tor_guardmgr::bridge::BridgeConfig)> {
+    let (serialized, builder) = build_bridge_config_builder(line, iat_mode)?;
+    let target = builder
+        .build()
+        .map_err(|e| TorError::InvalidBridge(format!("{serialized:?}: {e}")))?;
+    Ok((serialized, target))
+}
+
 /// Tor tunnel client. Cheap to clone (uses `Arc` internally).
 #[derive(Clone)]
 pub struct TorTunnel {
     inner: Arc<TorClient<PreferredRuntime>>,
+    obfs4_iat_mode: Arc<RwLock<Option<u8>>>,
 }
 
 /// Map one `BootstrapStatus` to callback event(s). Returns `true` when
@@ -249,19 +277,30 @@ impl TorTunnel {
 
     /// Bootstrap a Tor client applying the given [`Settings`].
     pub async fn bootstrap_with(settings: Settings) -> Result<Self> {
+        let iat_mode = settings.obfs4_iat_mode;
         let config = build_config(&settings)?;
-        Self::bootstrap_raw(config).await
+        Self::bootstrap_raw_with_mode(config, iat_mode).await
     }
 
     /// Bootstrap using a pre-built `arti-client` config (escape hatch).
     pub async fn bootstrap_raw(config: TorClientConfig) -> Result<Self> {
+        Self::bootstrap_raw_with_mode(config, None).await
+    }
+
+    async fn bootstrap_raw_with_mode(
+        config: TorClientConfig,
+        obfs4_iat_mode: Option<u8>,
+    ) -> Result<Self> {
         tracing::info!("bootstrapping Tor client...");
         let client = tor_builder(config)
             .create_bootstrapped()
             .await
             .map_err(TorError::Bootstrap)?;
         tracing::info!("Tor is ready");
-        Ok(Self { inner: client })
+        Ok(Self {
+            inner: client,
+            obfs4_iat_mode: Arc::new(RwLock::new(obfs4_iat_mode)),
+        })
     }
 
     /// Forward this client's bootstrap events to `on_event` from a background
@@ -307,8 +346,9 @@ impl TorTunnel {
         settings: Settings,
         on_event: Option<BootstrapEventCallback>,
     ) -> Result<Self> {
+        let iat_mode = settings.obfs4_iat_mode;
         let config = build_config(&settings)?;
-        let tunnel = Self::create_unbootstrapped(config)?;
+        let tunnel = Self::create_unbootstrapped_with_mode(config, iat_mode)?;
         if let Some(on_event) = &on_event {
             tunnel.forward_bootstrap_events(on_event.clone());
         }
@@ -402,16 +442,7 @@ impl TorTunnel {
     /// [`terminate_all_channels`](Self::terminate_all_channels).
     pub async fn warm_bridge(&self, bridge: &BridgeLine) -> Result<bool> {
         let chanmgr = self.inner.chanmgr().map_err(TorError::ChanMgrUnavailable)?;
-        let serialized = bridge.to_string();
-        let builder: BridgeConfigBuilder =
-            serialized
-                .parse()
-                .map_err(|e: arti_client::config::BridgeParseError| {
-                    TorError::InvalidBridge(format!("{serialized:?}: {e}"))
-                })?;
-        let target = builder
-            .build()
-            .map_err(|e| TorError::InvalidBridge(format!("{serialized:?}: {e}")))?;
+        let (serialized, target) = build_bridge_target(bridge, self.iat_mode())?;
         let (chan, _provenance) = chanmgr
             .get_or_launch(&target, tor_chanmgr::ChannelUsage::UserTraffic)
             .await
@@ -431,16 +462,7 @@ impl TorTunnel {
 
     /// Query guard security policy without changing its failure history.
     pub fn bridge_is_disabled(&self, bridge: &BridgeLine) -> Result<bool> {
-        let serialized = bridge.to_string();
-        let builder: BridgeConfigBuilder =
-            serialized
-                .parse()
-                .map_err(|e: arti_client::config::BridgeParseError| {
-                    TorError::InvalidBridge(format!("{serialized:?}: {e}"))
-                })?;
-        let target = builder
-            .build()
-            .map_err(|e| TorError::InvalidBridge(format!("{serialized:?}: {e}")))?;
+        let (_serialized, target) = build_bridge_target(bridge, self.iat_mode())?;
         self.inner
             .guard_is_disabled(&target)
             .map_err(TorError::ChanMgrUnavailable)
@@ -477,16 +499,7 @@ impl TorTunnel {
         bridge: &BridgeLine,
         activity: tor_guardmgr::ExternalActivity,
     ) -> Result<()> {
-        let serialized = bridge.to_string();
-        let builder: BridgeConfigBuilder =
-            serialized
-                .parse()
-                .map_err(|e: arti_client::config::BridgeParseError| {
-                    TorError::InvalidBridge(format!("{serialized:?}: {e}"))
-                })?;
-        let target = builder
-            .build()
-            .map_err(|e| TorError::InvalidBridge(format!("{serialized:?}: {e}")))?;
+        let (serialized, target) = build_bridge_target(bridge, self.iat_mode())?;
         self.inner
             .note_external_guard_failure(&target, activity)
             .map_err(|source| TorError::SignalFailure {
@@ -507,6 +520,13 @@ impl TorTunnel {
     /// tasks (chanmgr/circmgr/dirmgr/ptmgr) — the caller always keeps the
     /// `TorTunnel` value and can explicitly `drop` it.
     pub fn create_unbootstrapped(config: TorClientConfig) -> Result<Self> {
+        Self::create_unbootstrapped_with_mode(config, None)
+    }
+
+    fn create_unbootstrapped_with_mode(
+        config: TorClientConfig,
+        obfs4_iat_mode: Option<u8>,
+    ) -> Result<Self> {
         // `tor_builder` mirrors `TorClient::create_bootstrapped`'s own runtime
         // lookup, including its panic-on-no-runtime `.expect(...)` semantics
         // — this app always runs inside a tokio runtime, so that's consistent,
@@ -515,7 +535,10 @@ impl TorTunnel {
         let client = tor_builder(config)
             .create_unbootstrapped()
             .map_err(TorError::Bootstrap)?;
-        Ok(Self { inner: client })
+        Ok(Self {
+            inner: client,
+            obfs4_iat_mode: Arc::new(RwLock::new(obfs4_iat_mode)),
+        })
     }
 
     /// Settings-based convenience mirror of `bootstrap_with`, but synchronous
@@ -523,8 +546,9 @@ impl TorTunnel {
     /// [`create_unbootstrapped`](Self::create_unbootstrapped) the way
     /// `bootstrap_with` parallels `bootstrap_raw`.
     pub fn create_unbootstrapped_with(settings: Settings) -> Result<Self> {
+        let iat_mode = settings.obfs4_iat_mode;
         let config = build_config(&settings)?;
-        Self::create_unbootstrapped(config)
+        Self::create_unbootstrapped_with_mode(config, iat_mode)
     }
 
     /// Wait for the client to reach a usable directory.
@@ -546,7 +570,12 @@ impl TorTunnel {
         let config = build_config(settings)?;
         self.inner
             .reconfigure(&config, Reconfigure::AllOrNothing)
-            .map_err(TorError::Reconfigure)
+            .map_err(TorError::Reconfigure)?;
+        *self
+            .obfs4_iat_mode
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = settings.obfs4_iat_mode;
+        Ok(())
     }
 
     /// Check whether `check.bridge` can carry real Tor traffic to the open internet, not
@@ -579,8 +608,9 @@ impl TorTunnel {
             disable_preemptive_circuits: true,
             ..Settings::default()
         };
+        let iat_mode = settings.obfs4_iat_mode;
         let config = build_config(&settings)?;
-        let tunnel = Self::create_unbootstrapped(config)?;
+        let tunnel = Self::create_unbootstrapped_with_mode(config, iat_mode)?;
 
         tokio::time::timeout(bootstrap_timeout, tunnel.wait_bootstrapped())
             .await
@@ -615,6 +645,13 @@ impl TorTunnel {
         .map_err(|_| TorError::BridgeCheckProbeTimeout(probe_timeout))??;
 
         Ok(started.elapsed())
+    }
+
+    fn iat_mode(&self) -> Option<u8> {
+        *self
+            .obfs4_iat_mode
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -737,13 +774,7 @@ fn build_config(settings: &Settings) -> Result<TorClientConfig> {
             .override_net_params()
             .insert("cbtmintimeout".into(), 10_000);
         for line in &settings.bridges {
-            let serialized = with_iat_mode_override(line, settings.obfs4_iat_mode).to_string();
-            let bridge: BridgeConfigBuilder =
-                serialized
-                    .parse()
-                    .map_err(|e: arti_client::config::BridgeParseError| {
-                        TorError::InvalidBridge(format!("{serialized:?}: {e}"))
-                    })?;
+            let (_serialized, bridge) = build_bridge_config_builder(line, settings.obfs4_iat_mode)?;
             builder.bridges().bridges().push(bridge);
         }
 

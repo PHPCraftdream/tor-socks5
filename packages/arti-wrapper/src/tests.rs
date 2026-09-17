@@ -378,6 +378,29 @@ fn iat_mode_override_adds_the_param_when_the_line_omits_it() {
     );
 }
 
+#[test]
+fn bridge_target_applies_iat_mode_override() {
+    use tor_linkspec::{ChannelMethod, HasChanMethod};
+
+    let bridge: BridgeLine =
+        "obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA iat-mode=0"
+            .parse()
+            .expect("obfs4 line parses");
+    let (_serialized, builder) =
+        build_bridge_config_builder(&bridge, Some(2)).expect("target builder builds");
+    let target = builder.build().expect("target builds");
+    let ChannelMethod::Pluggable(pt_target) = target.chan_method() else {
+        panic!("obfs4 bridge must produce a pluggable target");
+    };
+    assert_eq!(
+        pt_target
+            .settings()
+            .find(|(key, _)| *key == "iat-mode")
+            .map(|(_, value)| value),
+        Some("2")
+    );
+}
+
 #[tokio::test]
 async fn verify_bridge_reachable_reports_bootstrap_timeout_for_an_unreachable_bridge() {
     // 192.0.2.0/24 is RFC 5737 documentation space -- guaranteed to have nothing
