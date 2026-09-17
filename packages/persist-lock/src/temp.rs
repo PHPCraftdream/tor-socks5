@@ -30,13 +30,252 @@
 //! removed only after the temp is gone (renamed onto the target, or deleted
 //! by the guard's `Drop`), so there is no window in which a canonical temp
 //! exists without a live owner's lock behind it.
+//!
+//! # Why the companion alone is not enough (TS18-01)
+//!
+//! The companion lock lives on an *unlinkable* name: cleanup removes the
+//! companion file after acquiring its lock, but unlink does not disturb an
+//! already-open locked handle, and a new opener gets a fresh inode — mutual
+//! exclusion breaks (TS18-01). The stable, never-unlinked
+//! `<target>.templock` file (precedent: `path_lock.rs`) serialises every
+//! (companion, temp) name-state transition: creation (companion open +
+//! `try_lock` + temp create), companion/temp removal in `Drop` and cleanup,
+//! and the cleanup candidate/orphan decisions. Long work (writes, fsyncs,
+//! the publishing rename) stays outside the section, so writers of one
+//! target do not serialise their payloads. Ownership of a specific temp is
+//! STILL proven exclusively by its companion's advisory lock (the kernel
+//! releases it on holder death; a PID is never liveness evidence).
+//!
+//! # Migration boundary (known limitation)
+//!
+//! A temp written by an OLD binary has no companion. In mixed old/new
+//! deployments a missing companion does NOT prove the writer is dead, and
+//! cleanup's delete-on-missing-companion rule must not be read as a
+//! guarantee over foreign writers.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+/// Test-only interleaving seams for the TS18-01 forcing tests. `park` is a
+/// no-op outside the crate's own unit-test build, so production code carries
+/// no synchronization. A forcing test arms a slot, parks a participant at an
+/// exact interleaving point, and releases it deterministically.
+#[cfg(test)]
+pub(crate) mod seam {
+    use std::cell::Cell;
+    use std::collections::HashMap;
+    use std::sync::{Condvar, Mutex, OnceLock};
+    use std::time::Duration;
+
+    /// How long a participant parks before proceeding on its own. A timeout
+    /// here is a DESIGNED outcome: in the fixed protocol the parked writer
+    /// holds the state-transition lock and the forcing test's cleanup cannot
+    /// reach the release point, so the writer must proceed when the bound
+    /// expires.
+    pub const PARK_TIMEOUT: Duration = Duration::from_secs(5);
+    /// How long a test waits for a participant to reach a slot before
+    /// concluding it never will.
+    pub const WAIT_PARKED_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// `TempFileGuard::create`: parked before the writer can establish
+    /// ownership of the companion (before its `try_lock`; in the pre-TS18-01
+    /// protocol the companion is already open at this point, in the fixed
+    /// protocol this sits just before the critical section that wraps
+    /// open+try_lock).
+    pub const CREATE_BEFORE_OWNERSHIP: usize = 0;
+    /// `remove_temp_if_unlocked`: parked between `drop(lock)` and
+    /// `remove_file(lock_path)` — the unlocked-name unlink window.
+    pub const UNLOCKED_BEFORE_UNLINK: usize = 1;
+
+    #[derive(Default)]
+    struct Slot {
+        armed: bool,
+        parked: bool,
+        released: bool,
+    }
+
+    fn slots() -> &'static Mutex<HashMap<usize, Slot>> {
+        static SLOTS: OnceLock<Mutex<HashMap<usize, Slot>>> = OnceLock::new();
+        SLOTS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn slot(slots: &mut HashMap<usize, Slot>, idx: usize) -> &mut Slot {
+        slots.entry(idx).or_default()
+    }
+
+    /// Arm (or re-arm) a slot; clears any stale state from a previous test.
+    pub fn arm(idx: usize) {
+        let mut guard = slots().lock().unwrap();
+        let s = slot(&mut guard, idx);
+        *s = Slot {
+            armed: true,
+            parked: false,
+            released: false,
+        };
+        drop(guard);
+    }
+
+    pub fn disarm(idx: usize) {
+        if let Ok(mut slots) = slots().lock() {
+            slots.remove(&idx);
+        }
+    }
+
+    thread_local! {
+        /// Only threads that opted in as forcing-test participants may park;
+        /// concurrent ordinary tests never block even while a slot is armed.
+        static ENABLED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Mark the calling thread as a forcing-test participant that may park on
+    /// armed slots. Must be the first statement of a spawned participant.
+    pub fn enable() {
+        ENABLED.with(|e| e.set(true));
+    }
+
+    /// Block the calling thread iff this thread opted in AND the slot is
+    /// armed AND it has not already been sticky-released; otherwise return at
+    /// once. Bounded by [`PARK_TIMEOUT`]: returns whether someone released
+    /// us. A timeout is not an error (see PARK_TIMEOUT).
+    pub fn park(idx: usize) -> bool {
+        if !ENABLED.with(|e| e.get()) {
+            return true;
+        }
+        let mut guard = slots().lock().unwrap();
+        if !guard.get(&idx).is_some_and(|s| s.armed) {
+            return true;
+        }
+        let s = slot(&mut guard, idx);
+        if s.released {
+            // Sticky release: released before we arrived; sail through.
+            s.parked = false;
+            s.released = false;
+            return true;
+        }
+        s.parked = true;
+        drop(guard);
+        CONDVAR.notify_all();
+        let deadline = std::time::Instant::now() + PARK_TIMEOUT;
+        let mut slots = slots().lock().unwrap();
+        let released = loop {
+            if slots.get(&idx).is_some_and(|s| s.released) {
+                break true;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break false;
+            }
+            let (s, _t) = CONDVAR.wait_timeout(slots, deadline - now).unwrap();
+            slots = s;
+        };
+        {
+            let mut guard = slots;
+            let s = slot(&mut guard, idx);
+            s.parked = false;
+            s.released = false;
+        }
+        released
+    }
+
+    /// Wait until some thread is parked at `idx`, bounded by
+    /// [`WAIT_PARKED_TIMEOUT`]; `false` on timeout (no stale parked flag is
+    /// left behind).
+    pub fn wait_parked(idx: usize) -> bool {
+        let deadline = std::time::Instant::now() + WAIT_PARKED_TIMEOUT;
+        let mut slots = slots().lock().unwrap();
+        loop {
+            if slots.get(&idx).is_some_and(|s| s.parked) {
+                return true;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                if let Some(s) = slots.get_mut(&idx) {
+                    s.parked = false;
+                }
+                return false;
+            }
+            let (s, _t) = CONDVAR.wait_timeout(slots, deadline - now).unwrap();
+            slots = s;
+        }
+    }
+
+    /// Release the thread parked at `idx`.
+    pub fn release(idx: usize) {
+        let mut slots = slots().lock().unwrap();
+        if let Some(s) = slots.get_mut(&idx) {
+            s.released = true;
+        }
+        drop(slots);
+        CONDVAR.notify_all();
+    }
+
+    static CONDVAR: Condvar = Condvar::new();
+}
+
+#[cfg(not(test))]
+pub(crate) mod seam {
+    pub const CREATE_BEFORE_OWNERSHIP: usize = 0;
+    pub const UNLOCKED_BEFORE_UNLINK: usize = 1;
+    pub fn park(_idx: usize) -> bool {
+        true
+    }
+}
+
 /// Suffix of the companion lock file that carries a temp's ownership.
 const LOCK_SUFFIX: &str = ".lock";
+
+/// Suffix of the stable, NEVER-unlinked critical-section lock file that
+/// serialises every (companion, temp) name-state transition for one target.
+const TEMPLOCK_SUFFIX: &str = ".templock";
+
+/// Sibling critical-section lock path for `target` (same style as
+/// [`crate::path_lock::PathLock::lock_path`]).
+fn templock_path_for(target: &Path) -> PathBuf {
+    let mut name = target.as_os_str().to_os_string();
+    name.push(TEMPLOCK_SUFFIX);
+    PathBuf::from(name)
+}
+
+/// A short critical-section lock over the (companion, temp) name state of
+/// one target. Unlike the companion, this file is created on demand and
+/// NEVER unlinked (same rule as [`crate::path_lock::PathLock`]'s sibling
+/// `.lock`): unlinking a lock file that someone still holds open lets a
+/// later opener lock a fresh inode alongside the existing holder — exactly
+/// the TS18-01 substitution. Holding it covers only name-state transitions
+/// (a few syscalls); writes, fsyncs and the publishing rename stay outside,
+/// so writers of one target do not serialize their payloads.
+struct TempLock {
+    file: File,
+}
+
+impl TempLock {
+    fn acquire(target: &Path) -> io::Result<Self> {
+        let templock_path = templock_path_for(target);
+        if let Some(dir) = templock_path.parent() {
+            if !dir.as_os_str().is_empty() {
+                fs::create_dir_all(dir).ok();
+            }
+        }
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&templock_path)
+            .map_err(|e| with_context(e, "create", &templock_path))?;
+        // Blocking: the holder keeps it only for a few syscalls, and the
+        // kernel releases it if the holder dies.
+        file.lock()
+            .map_err(|e| with_context(e, "lock", &templock_path))?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for TempLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
 
 /// Pure name builder: canonical temp-file name for a target whose file name
 /// is `target_name`. ONE source of truth for the format; [`parse_temp_name`]
@@ -142,6 +381,13 @@ impl TempFileGuard {
             }
         }
 
+        // Critical section: while the ownership of (companion, temp) is
+        // established, no cleanup may observe or mutate those names. The
+        // seam park is INSIDE the section — a parked writer holds the
+        // templock, so cleanup physically cannot interleave.
+        let _templock = TempLock::acquire(target)?;
+        let _ = seam::park(seam::CREATE_BEFORE_OWNERSHIP);
+
         // The companion is created (not create_new: a dead owner may have
         // left one behind) and locked BEFORE the temp exists, so the temp is
         // never visible without a live owner's lock standing behind it.
@@ -153,7 +399,8 @@ impl TempFileGuard {
             .map_err(|e| with_context(e, "create", &lock_path))?;
         // try_lock, not lock: (pid, seq) is unique per live writer, so a held
         // companion means a name collision that must be reported rather than
-        // waited on.
+        // waited on. The templock guard drops on return, releasing the
+        // section.
         if lock.try_lock().is_err() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -172,10 +419,14 @@ impl TempFileGuard {
             Ok(file) => file,
             Err(e) => {
                 drop(lock);
-                let _ = fs::remove_file(&lock_path);
+                let _ = fs::remove_file(&lock_path); // still inside the section
                 return Err(with_context(e, "create", &temp));
             }
         };
+
+        // Ownership established; leave the critical section before any long
+        // work.
+        drop(_templock);
 
         Ok(Self {
             file: Some(file),
@@ -240,11 +491,17 @@ impl TempFileGuard {
 }
 
 impl Drop for TempFileGuard {
-    /// Best-effort removal of an uncommitted temp, then of the companion.
-    /// The companion goes last and its lock is released only when `_lock`
-    /// closes right after, so no cleanup can see the temp unowned.
+    /// Best-effort removal of an uncommitted temp, then of the companion,
+    /// under the templock critical section. If the section cannot be
+    /// acquired we degrade to removals without it, which is benign: the
+    /// guard still holds the companion's advisory lock until this struct's
+    /// fields drop, so a concurrent cleanup's `try_lock` still fails — and
+    /// on this path both sides want the files gone anyway. The companion
+    /// goes last and its lock is released only when `_lock` closes right
+    /// after, so no cleanup can see the temp unowned.
     fn drop(&mut self) {
         self.file.take();
+        let _section = TempLock::acquire(&self.target).ok();
         if !self.done {
             let _ = fs::remove_file(&self.temp);
         }
@@ -254,23 +511,31 @@ impl Drop for TempFileGuard {
 
 /// Lock-disciplined delete: remove `path` iff its companion lock can be
 /// acquired, or no companion exists at all (the writer creates the companion
-/// before the temp, so a temp without one is provably ownerless). Never
-/// blocks. Returns true if the file is gone afterwards (including NotFound),
-/// false if a live owner holds it or the attempt errored.
-pub fn remove_temp_if_unlocked(path: &Path) -> bool {
-    let lock_path = lock_path_for(path);
+/// before the temp, so a temp without one is provably ownerless). The whole
+/// decision+act runs under the `<target>.templock` critical section (`target`
+/// keys it), which makes the lock-acquisition decision and the unlinks atomic
+/// against writers and other cleanups; the advisory companion lock remains
+/// the liveness proof (the kernel releases it on holder death). Never blocks
+/// on the companion: returns true if the file is gone afterwards (including
+/// NotFound), false if a live owner holds it or the attempt errored.
+pub fn remove_temp_if_unlocked(target: &Path, temp: &Path) -> bool {
+    let Ok(_section) = TempLock::acquire(target) else {
+        return false;
+    };
+    let lock_path = lock_path_for(temp);
     match OpenOptions::new().write(true).open(&lock_path) {
         Ok(lock) => {
             if lock.try_lock().is_err() {
                 return false;
             }
             drop(lock);
+            let _ = seam::park(seam::UNLOCKED_BEFORE_UNLINK);
             let _ = fs::remove_file(&lock_path);
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(_) => return false,
     }
-    match fs::remove_file(path) {
+    match fs::remove_file(temp) {
         Ok(()) => true,
         Err(e) if e.kind() == io::ErrorKind::NotFound => true,
         Err(_) => false,
@@ -309,12 +574,23 @@ pub fn cleanup_temp_files_with(target: &Path, legacy_match: impl Fn(&str) -> boo
             }
             continue;
         }
+        // A `*.templock` name can never be a canonical temp (those end in
+        // `.tmp`) nor a companion (those end in `.lock`), but a caller-supplied
+        // legacy predicate must not be able to nominate it either.
+        if file_name.ends_with(TEMPLOCK_SUFFIX) {
+            continue;
+        }
         let is_candidate = parse_temp_name(&file_name, name).is_some() || legacy_match(&file_name);
         if is_candidate {
-            remove_temp_if_unlocked(&entry.path());
+            remove_temp_if_unlocked(target, &entry.path());
         }
     }
     for (lock, temp) in orphan_locks {
+        // Re-check orphanhood INSIDE the section: a writer may have created
+        // the temp between the scan above and now.
+        let Ok(_section) = TempLock::acquire(target) else {
+            continue;
+        };
         if temp.exists() {
             // Handled above (or owned by a live writer); not an orphan.
             continue;
@@ -330,202 +606,5 @@ pub fn cleanup_temp_files_with(target: &Path, legacy_match: impl Fn(&str) -> boo
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn tmp_dir() -> PathBuf {
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "tor-socks5-persist-lock-test-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    #[test]
-    fn temp_name_round_trips_through_parse() {
-        for target in ["store.log", "tor-socks5.ktav", "data", "a.b.c"] {
-            for (pid, seq) in [(1u32, 0u64), (4_294_967_295, 18_446_744_073_709_551_615)] {
-                let name = temp_file_name(target, pid, seq);
-                assert_eq!(parse_temp_name(&name, target), Some((pid, seq)));
-            }
-        }
-    }
-
-    #[test]
-    fn parse_rejects_malformed_names() {
-        let negatives = [
-            ".t.xyz.1.tmp",         // garbage pid
-            ".t.99999999999.1.tmp", // pid > u32::MAX
-            ".t.1.abc.tmp",         // non-numeric seq
-            ".t.1.tmp",             // missing seq
-            ".t.1.2.3.tmp",         // extra segment
-            ".t.1.2.tmpx",          // wrong extension
-            ".t.1.2.tmp.bak",       // extra segment after extension
-            ".t.1.2.tmp.lock",      // the companion, not a temp
-            ".other.1.2.tmp",       // different target prefix
-            "t.1.2.tmp",            // no leading dot
-        ];
-        for name in negatives {
-            assert_eq!(parse_temp_name(name, "t"), None, "{name}");
-        }
-    }
-
-    #[test]
-    fn guard_finish_publishes_and_leaves_no_temp() {
-        let dir = tmp_dir();
-        let target = dir.join("store.log");
-        let mut guard = TempFileGuard::create(&target, 1).unwrap();
-        let temp = guard.temp_path().to_path_buf();
-        assert!(temp.exists());
-        assert!(
-            parse_temp_name(temp.file_name().unwrap().to_str().unwrap(), "store.log").is_some()
-        );
-        guard.write_all(b"hello").unwrap();
-        guard.finish().unwrap();
-        assert_eq!(fs::read(&target).unwrap(), b"hello");
-        assert!(!temp.exists());
-        assert_eq!(
-            fs::read_dir(&dir).unwrap().count(),
-            1,
-            "no temp and no companion left"
-        );
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// The published file must be readable the instant `finish` returns. A
-    /// lock held on the temp itself stayed in force on the target for the
-    /// moments between the rename and the handle's close, and on Windows —
-    /// where `File::lock` is mandatory — every reader in that window failed
-    /// with os error 33. The lock lives on a companion precisely so this
-    /// cannot happen.
-    #[test]
-    fn published_target_is_immediately_readable() {
-        let dir = tmp_dir();
-        let target = dir.join("store.log");
-        for seq in 0..50 {
-            let mut guard = TempFileGuard::create(&target, seq).unwrap();
-            guard.write_all(b"published").unwrap();
-            guard.finish().unwrap();
-            assert_eq!(
-                fs::read(&target).expect("published target reads without a lock conflict"),
-                b"published"
-            );
-        }
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// Readers must also be able to read the PREVIOUS contents of the target
-    /// while a writer is mid-save, which is the normal steady state.
-    #[test]
-    fn target_stays_readable_while_a_guard_is_open() {
-        let dir = tmp_dir();
-        let target = dir.join("store.log");
-        fs::write(&target, b"old").unwrap();
-        let mut guard = TempFileGuard::create(&target, 7).unwrap();
-        guard.write_all(b"new").unwrap();
-        assert_eq!(
-            fs::read(&target).expect("target reads while a save is in flight"),
-            b"old"
-        );
-        guard.finish().unwrap();
-        assert_eq!(fs::read(&target).unwrap(), b"new");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn guard_drop_without_finish_removes_temp_and_keeps_target() {
-        let dir = tmp_dir();
-        let target = dir.join("store.log");
-        fs::write(&target, b"keep").unwrap();
-        let temp;
-        {
-            let mut guard = TempFileGuard::create(&target, 2).unwrap();
-            temp = guard.temp_path().to_path_buf();
-            guard.write_all(b"partial").unwrap();
-        }
-        assert!(!temp.exists());
-        assert!(!lock_path_for(&temp).exists(), "companion removed too");
-        assert_eq!(fs::read(&target).unwrap(), b"keep");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn unlocked_file_is_removed_locked_file_survives() {
-        let dir = tmp_dir();
-        let target = dir.join("store.log");
-        let plain = dir.join(".store.log.1.9.tmp");
-        fs::write(&plain, b"dead owner").unwrap();
-        assert!(remove_temp_if_unlocked(&plain));
-        assert!(!plain.exists());
-
-        let guard = TempFileGuard::create(&target, 3).unwrap();
-        assert!(!remove_temp_if_unlocked(guard.temp_path()));
-        assert!(guard.temp_path().exists());
-        drop(guard);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn cleanup_skips_live_temp_and_removes_dead_one() {
-        let dir = tmp_dir();
-        let target = dir.join("store.log");
-        let guard = TempFileGuard::create(&target, 4).unwrap();
-        let dead = dir.join(temp_file_name("store.log", 12345, 77));
-        fs::write(&dead, b"dead").unwrap();
-
-        cleanup_temp_files(&target);
-
-        assert!(guard.temp_path().exists(), "live writer's temp survives");
-        assert!(
-            lock_path_for(guard.temp_path()).exists(),
-            "live writer's companion survives"
-        );
-        assert!(!dead.exists(), "ownerless temp is cleaned");
-        drop(guard);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// A dead writer that got as far as the rename leaves its companion
-    /// behind with no temp next to it. Nothing else would ever remove it, so
-    /// cleanup has to — but only when its lock can be acquired.
-    #[test]
-    fn cleanup_removes_an_orphan_companion_but_spares_a_live_one() {
-        let dir = tmp_dir();
-        let target = dir.join("store.log");
-        let orphan = lock_path_for(&dir.join(temp_file_name("store.log", 4242, 5)));
-        fs::write(&orphan, b"").unwrap();
-
-        let guard = TempFileGuard::create(&target, 6).unwrap();
-        let live_lock = lock_path_for(guard.temp_path());
-
-        cleanup_temp_files(&target);
-
-        assert!(!orphan.exists(), "orphan companion is cleaned");
-        assert!(live_lock.exists(), "live writer's companion survives");
-        assert!(guard.temp_path().exists(), "live writer's temp survives");
-        drop(guard);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn cleanup_with_legacy_removes_legacy_and_malformed_survives_both() {
-        let dir = tmp_dir();
-        let target = dir.join("store.log");
-        let legacy = dir.join(".store.log.tmp.old");
-        fs::write(&legacy, b"legacy").unwrap();
-        let malformed = dir.join(".store.log.not-a-pid.1.tmp");
-        fs::write(&malformed, b"garbage").unwrap();
-
-        cleanup_temp_files_with(&target, |n| n == ".store.log.tmp.old");
-        assert!(!legacy.exists(), "legacy temp cleaned");
-        assert!(malformed.exists(), "malformed name survives first cleanup");
-
-        cleanup_temp_files(&target);
-        assert!(malformed.exists(), "malformed name survives second cleanup");
-        let _ = fs::remove_dir_all(&dir);
-    }
-}
+#[path = "temp_tests.rs"]
+mod tests;
