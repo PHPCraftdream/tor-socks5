@@ -132,3 +132,104 @@ pub(crate) fn critical_section_pause() {
         }
     }
 }
+
+// TS17-03: parks `flush_dns_cache` in the exact window the fix targets --
+// AFTER the live cache is cleared (and `doh_cache()` released), BEFORE the
+// preserved answers are merged into `disk_fallback_store()`. While parked,
+// flush holds `dns::flush_gate` and no store lock, so a save
+// started here must block behind that gate instead of capturing two empty
+// stores. Test-only: never compiled into non-test builds.
+static FLUSH_MERGE_PAUSE: std::sync::Mutex<Option<std::sync::Arc<PublishParkGate>>> =
+    std::sync::Mutex::new(None);
+
+// Parked bit OUTSIDE the Option, same reason as `PRE_PUBLISH_PAUSE_PARKED`
+// above: the hook `take()`s the gate out before parking, which would make a
+// flag stored inside that same Option unobservable to the test the instant
+// it is set.
+static FLUSH_MERGE_PAUSE_PARKED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn arm_flush_merge_pause() -> std::sync::Arc<PublishParkGate> {
+    let gate = std::sync::Arc::new(PublishParkGate {
+        released: std::sync::Mutex::new(false),
+        cv: std::sync::Condvar::new(),
+    });
+    FLUSH_MERGE_PAUSE_PARKED.store(false, std::sync::atomic::Ordering::SeqCst);
+    *FLUSH_MERGE_PAUSE.lock().unwrap_or_else(|p| p.into_inner()) =
+        Some(std::sync::Arc::clone(&gate));
+    gate
+}
+
+pub(crate) fn disarm_flush_merge_pause() {
+    *FLUSH_MERGE_PAUSE.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    FLUSH_MERGE_PAUSE_PARKED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn flush_merge_pause_parked() -> bool {
+    FLUSH_MERGE_PAUSE_PARKED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// One-shot, same contract as `pre_publish_pause`: the first flush to reach
+/// the hook consumes the gate and parks; later ones sail through.
+pub(crate) fn flush_merge_pause() {
+    let gate = FLUSH_MERGE_PAUSE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take();
+    if let Some(gate) = gate {
+        FLUSH_MERGE_PAUSE_PARKED.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut released = gate.released.lock().unwrap_or_else(|p| p.into_inner());
+        while !*released {
+            released = gate.cv.wait(released).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+}
+
+// TS17-03: parks `capture_persist_snapshots_with_generation` between its
+// live and disk store reads -- holding the per-path `snapshot_lock` AND
+// `dns::flush_gate`, NO store locks. This is the reverse-order
+// probe: flush must wait behind the gate and complete once this capture is
+// released, proving the shared gate cannot ABBA-deadlock. Test-only: never
+// compiled into non-test builds.
+static CAPTURE_PAUSE: std::sync::Mutex<Option<std::sync::Arc<PublishParkGate>>> =
+    std::sync::Mutex::new(None);
+
+// Parked bit OUTSIDE the Option -- same `take()` trap as
+// `PRE_PUBLISH_PAUSE_PARKED` above.
+static CAPTURE_PAUSE_PARKED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn arm_capture_pause() -> std::sync::Arc<PublishParkGate> {
+    let gate = std::sync::Arc::new(PublishParkGate {
+        released: std::sync::Mutex::new(false),
+        cv: std::sync::Condvar::new(),
+    });
+    CAPTURE_PAUSE_PARKED.store(false, std::sync::atomic::Ordering::SeqCst);
+    *CAPTURE_PAUSE.lock().unwrap_or_else(|p| p.into_inner()) = Some(std::sync::Arc::clone(&gate));
+    gate
+}
+
+pub(crate) fn disarm_capture_pause() {
+    *CAPTURE_PAUSE.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    CAPTURE_PAUSE_PARKED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn capture_pause_parked() -> bool {
+    CAPTURE_PAUSE_PARKED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// One-shot, same contract as `pre_publish_pause`: the first capture to
+/// reach the hook consumes the gate and parks; later ones sail through.
+pub(crate) fn capture_pause() {
+    let gate = CAPTURE_PAUSE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take();
+    if let Some(gate) = gate {
+        CAPTURE_PAUSE_PARKED.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut released = gate.released.lock().unwrap_or_else(|p| p.into_inner());
+        while !*released {
+            released = gate.cv.wait(released).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+}

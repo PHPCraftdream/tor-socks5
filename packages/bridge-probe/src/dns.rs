@@ -373,6 +373,27 @@ pub(super) fn store_cached_if_generation_observed(
 pub(super) static DNS_NETWORK_GENERATION: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// TS17-03: held across [`flush_dns_cache`]'s WHOLE live→fallback
+/// transition (bump generation + clear the live cache, then merge the
+/// preserved answers into [`disk_fallback_store()`]) and, inside the
+/// `snapshot_lock` section, by [`capture_persist_snapshots_with_generation`].
+/// A save capture therefore sees either the pre-flush or the post-flush
+/// state, never the window in which live is already cleared but the
+/// fallback not yet merged -- there, two empty stores plus a freshly
+/// allocated save generation used to publish an empty file whose
+/// generation vetoed every older non-empty save (TS7-01/02 protocol).
+///
+/// Module-wide lock order (no ABBA cycle): `snapshot_lock` → this gate →
+/// `doh_cache()`/`disk_fallback_store()` (leaf locks, never held together)
+/// → `next_generation` (only under `snapshot_lock`) / `published_generation`
+/// (only under `publish_lock`). Flush takes this gate first and never
+/// touches `snapshot_lock`; a capture takes `snapshot_lock` first, then
+/// this gate.
+pub(super) fn flush_gate() -> &'static std::sync::Mutex<()> {
+    static GATE: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    GATE.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 /// Forget every live cached answer and every provider score, preserving usable
 /// positive answers in the disk fallback store for the current session.
 ///
@@ -400,6 +421,9 @@ pub fn flush_dns_cache() {
     // change), so the fence costs nothing that matters. (Relaxed would also
     // be defensible -- the cache has its own mutex -- but SeqCst is the
     // conservative default.)
+    // TS17-03: spans bump+clear AND the merges below; order and rationale
+    // in flush_gate. In-memory only -- no file I/O under locks.
+    let _transition = flush_gate().lock().unwrap_or_else(|p| p.into_inner());
     let preserved = {
         let mut cache = doh_cache().lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
@@ -420,6 +444,10 @@ pub fn flush_dns_cache() {
         cache.clear();
         preserved
     }; // doh_cache() lock released before disk_fallback_store() is taken
+       // TS17-03 test seam: parked in the live→fallback window (gate held,
+       // doh_cache() NOT held) so tests can start a save right here.
+    #[cfg(test)]
+    super::dns_publish_pause::flush_merge_pause();
     for (host, entry) in preserved {
         merge_disk_fallback_entry(host, entry);
     }
@@ -663,8 +691,9 @@ pub(super) async fn save_persisted_dns_cache_with_writer(
 /// per-path snapshot gate is held across both store snapshots and the
 /// generation allocation, so the returned number always reflects the age
 /// of the captured data -- two overlapping saves to one path strictly
-/// order their (snapshot, generation) pairs (TS7-01). The store locks
-/// are leaf locks taken only inside this section.
+/// order their (snapshot, generation) pairs (TS7-01). The store locks are
+/// leaf locks, taken only after the flush transition gate inside this
+/// section (see `flush_gate` for the module-wide lock order).
 pub(super) fn capture_persist_snapshots_with_generation(
     path: &std::path::Path,
 ) -> (Vec<PersistSnapshot>, Vec<PersistSnapshot>, u64) {
@@ -673,6 +702,8 @@ pub(super) fn capture_persist_snapshots_with_generation(
         .snapshot_lock
         .lock()
         .unwrap_or_else(|p| p.into_inner());
+    // TS17-03: gate across both store reads (order: snapshot_lock → gate).
+    let _transition = flush_gate().lock().unwrap_or_else(|p| p.into_inner());
     let now_instant = Instant::now();
     let live_snapshot: Vec<PersistSnapshot> = {
         let cache = doh_cache().lock().unwrap_or_else(|p| p.into_inner());
@@ -688,6 +719,10 @@ pub(super) fn capture_persist_snapshots_with_generation(
             })
             .collect()
     }; // doh_cache() lock released -- only the raw snapshot is held from here on
+       // TS17-03 test seam: parked holding snapshot_lock + the gate, NO store
+       // locks, for the reverse-order (flush blocked behind a save) test.
+    #[cfg(test)]
+    super::dns_publish_pause::capture_pause();
     let live_hosts: std::collections::HashSet<&str> =
         live_snapshot.iter().map(|s| s.host.as_str()).collect();
     let now = now_unix();
@@ -728,8 +763,9 @@ pub(super) fn capture_persist_snapshots_with_generation(
 /// ever locked while its own gate (`snapshot_lock` / `publish_lock`) is
 /// held -- never the other way around -- and the two gates are never
 /// held together: capture finishes before any job exists, and a job only
-/// ever takes `publish_lock`. The global store locks are only ever
-/// taken inside the `snapshot_lock` section.
+/// ever takes `publish_lock`. The global store locks are only ever taken
+/// inside the `snapshot_lock` section, after the flush transition gate
+/// (see `flush_gate` for the module-wide lock order).
 #[derive(Default)]
 pub(super) struct PersistPathState {
     pub(super) snapshot_lock: std::sync::Mutex<()>,

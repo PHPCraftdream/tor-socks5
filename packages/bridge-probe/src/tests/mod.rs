@@ -1,4 +1,5 @@
 mod dns_cache_tests;
+mod dns_flush_save_race_tests;
 mod dns_invalidation_tests;
 mod dns_registry_tests;
 mod dns_save_regression_tests;
