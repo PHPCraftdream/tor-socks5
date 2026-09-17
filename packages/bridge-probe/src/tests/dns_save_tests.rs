@@ -12,7 +12,7 @@ fn unique_dir_suffix() -> u64 {
 
 #[tokio::test]
 async fn save_preserves_an_unexpired_disk_fallback_entry() {
-    let _dns_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
+    let _dns_serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host = "save-keeps-disk.test.invalid";
     let ip: IpAddr = "203.0.113.70".parse().unwrap();
     let stamp = now_unix() - 3600;
@@ -68,7 +68,7 @@ async fn save_preserves_an_unexpired_disk_fallback_entry() {
 
 #[tokio::test]
 async fn save_drops_a_genuinely_expired_disk_fallback_entry() {
-    let _dns_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
+    let _dns_serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host = "save-drops-expired.test.invalid";
     let ip: IpAddr = "203.0.113.71".parse().unwrap();
     {
@@ -113,7 +113,7 @@ async fn save_drops_a_genuinely_expired_disk_fallback_entry() {
 
 #[tokio::test]
 async fn save_prefers_the_live_answer_for_a_host() {
-    let _dns_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
+    let _dns_serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host = "save-live-wins.test.invalid";
     let live_ip: IpAddr = "203.0.113.72".parse().unwrap();
     let disk_ip: IpAddr = "203.0.113.73".parse().unwrap();
@@ -164,7 +164,7 @@ async fn save_prefers_the_live_answer_for_a_host() {
 
 #[tokio::test]
 async fn save_keeps_the_fallback_when_the_live_cache_only_remembers_a_failure() {
-    let _dns_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
+    let _dns_serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host = "save-failure-keeps-disk.test.invalid";
     let ip: IpAddr = "203.0.113.74".parse().unwrap();
     remember_doh_failure(host);
@@ -215,7 +215,7 @@ async fn save_keeps_the_fallback_when_the_live_cache_only_remembers_a_failure() 
 /// address as freshly resolved.
 #[tokio::test]
 async fn save_drops_a_resident_live_answer_past_the_stale_window() {
-    let _dns_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
+    let _dns_serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host = "save-drops-stale-live.test.invalid";
     let ip: IpAddr = "203.0.113.80".parse().unwrap();
     // Straight into the map with an expiry past the stale-fallback window --
@@ -260,7 +260,7 @@ async fn save_drops_a_resident_live_answer_past_the_stale_window() {
 /// being dropped in favour of a day-stale resident answer.
 #[tokio::test]
 async fn save_keeps_a_valid_disk_answer_when_the_live_answer_is_past_the_stale_window() {
-    let _dns_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
+    let _dns_serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host = "save-disk-beats-stale-live.test.invalid";
     let stale_live_ip: IpAddr = "203.0.113.81".parse().unwrap();
     let disk_ip: IpAddr = "203.0.113.82".parse().unwrap();
@@ -326,7 +326,7 @@ async fn save_keeps_a_valid_disk_answer_when_the_live_answer_is_past_the_stale_w
 /// A blocked save must leave the executor and cache available.
 #[tokio::test]
 async fn save_persisted_dns_cache_does_not_block_the_async_worker() {
-    let _dns_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
+    let _dns_serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host = "save-off-worker.test.invalid";
     let ip: IpAddr = "203.0.113.83".parse().unwrap();
     remember_doh_answer(host, &[ip], Duration::from_secs(300));
@@ -396,7 +396,7 @@ async fn superseded_save_must_not_publish_stale_snapshot() {
     // process-global disk fallback store by a parallel test's save/load
     // while it is still live here (`forget_dns_answer` forgets only the
     // live cache, and every save merges the WHOLE store into the file).
-    let _dns_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
+    let _dns_serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host_b = "superseded-b.test.invalid";
     let host_extra = "superseded-extra.test.invalid";
     let ip1: IpAddr = "203.0.113.91".parse().unwrap();
@@ -511,7 +511,7 @@ fn snapshot_capture_and_generation_allocation_are_serialized_per_path() {
     let _dns_serial = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("test runtime builds")
-        .block_on(super::DNS_GLOBAL_STORE_LOCK.lock());
+        .block_on(super::DNS_GLOBAL_TEST_LOCK.lock());
     let host = "ts701-gate.test.invalid";
     let ip1: IpAddr = "203.0.113.101".parse().unwrap();
     let ip2: IpAddr = "203.0.113.102".parse().unwrap();
@@ -578,7 +578,7 @@ fn snapshot_capture_and_generation_allocation_are_serialized_per_path() {
 /// published newer one (TS7-01 end-to-end).
 #[tokio::test]
 async fn older_snapshot_paused_behind_full_newer_publish_keeps_newer_state() {
-    let _dns_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
+    let _dns_serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host = "ts701-superseded.test.invalid";
     let host_extra = "ts701-superseded-extra.test.invalid";
     let ip1: IpAddr = "203.0.113.103".parse().unwrap();
@@ -672,7 +672,7 @@ async fn older_snapshot_paused_behind_full_newer_publish_keeps_newer_state() {
 /// and return Ok, so Ok never means "nothing is on disk" (TS7-02).
 #[tokio::test]
 async fn failed_newer_write_lets_older_save_publish_and_report_ok() {
-    let _dns_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
+    let _dns_serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host = "ts702-write-fail.test.invalid";
     let ip1: IpAddr = "203.0.113.105".parse().unwrap();
     let ip2: IpAddr = "203.0.113.106".parse().unwrap();
@@ -757,7 +757,7 @@ async fn failed_newer_write_lets_older_save_publish_and_report_ok() {
 /// attempt publication and surface its own rename failure as Err (TS7-02).
 #[tokio::test]
 async fn failed_newer_rename_makes_older_save_err_not_false_ok() {
-    let _dns_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
+    let _dns_serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host = "ts702-rename-fail.test.invalid";
     let ip1: IpAddr = "203.0.113.107".parse().unwrap();
     let ip2: IpAddr = "203.0.113.109".parse().unwrap();
@@ -842,7 +842,7 @@ async fn failed_newer_rename_makes_older_save_err_not_false_ok() {
 /// surfaced by every failed attempt in between.
 #[tokio::test]
 async fn repeated_rename_failures_leave_no_orphaned_temp_files() {
-    let _dns_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
+    let _dns_serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host = "ts708-rename-leak.test.invalid";
     let ip: IpAddr = "203.0.113.201".parse().unwrap();
     remember_doh_answer(host, &[ip], Duration::from_secs(300));
@@ -904,7 +904,7 @@ async fn repeated_rename_failures_leave_no_orphaned_temp_files() {
 /// snapshot a subsequent save published.
 #[tokio::test]
 async fn cancelled_caller_leaves_latest_snapshot_intact() {
-    let _dns_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
+    let _dns_serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host_b = "cancel-b.test.invalid";
     let host_extra = "cancel-extra.test.invalid";
     let ip1: IpAddr = "203.0.113.94".parse().unwrap();

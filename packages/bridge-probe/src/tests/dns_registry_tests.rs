@@ -73,7 +73,7 @@ async fn recv_started(
 async fn bounded_sweep_removes_dead_entries_and_spares_the_inflight_one() {
     // The registry and the fake wave-search seam are process-global: same
     // serialization as every other registry-writing test.
-    let _serial = super::probe_coalesce_tests::FAKE_WAVE_LOCK.lock().await;
+    let _serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let _fake_cleanup = FakeSearchCleanup;
     let primary_live_host = live_host(0);
 

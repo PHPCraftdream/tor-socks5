@@ -18,7 +18,7 @@ fn unique_dir(label: &str) -> std::path::PathBuf {
 /// the owner is gone (TS17-01).
 #[tokio::test]
 async fn load_spares_persist_temp_of_live_owner() {
-    let _dns_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
+    let _dns_serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let dir = unique_dir("dns-temp-live-owner");
     let path = dir.join("dns-cache.txt");
     std::fs::write(&path, "").unwrap();
@@ -50,7 +50,7 @@ async fn load_spares_persist_temp_of_live_owner() {
 /// by `load_persisted_dns_cache`.
 #[tokio::test]
 async fn load_cleans_dead_owner_temp_created_by_the_real_generator() {
-    let _dns_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
+    let _dns_serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let dir = unique_dir("dns-temp-dead-owner");
     let path = dir.join("dns-cache.txt");
     std::fs::write(&path, "").unwrap();
@@ -79,7 +79,7 @@ async fn load_cleans_dead_owner_temp_created_by_the_real_generator() {
 /// temp shape -- canonical or legacy -- are never touched (TS17-01).
 #[tokio::test]
 async fn load_never_touches_malformed_persist_temp_names() {
-    let _dns_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
+    let _dns_serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let dir = unique_dir("dns-temp-malformed");
     let path = dir.join("dns-cache.txt");
     std::fs::write(&path, "").unwrap();

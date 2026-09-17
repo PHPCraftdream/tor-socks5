@@ -7,13 +7,10 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-async fn serial() -> (
-    tokio::sync::MutexGuard<'static, ()>,
-    tokio::sync::MutexGuard<'static, ()>,
-) {
-    let wave = super::probe_coalesce_tests::FAKE_WAVE_LOCK.lock().await;
-    let store = super::DNS_GLOBAL_STORE_LOCK.lock().await;
-    (wave, store)
+/// Every test here touches process-global DNS state (live cache, generation,
+/// fallback store), so all of them serialize on the one lock that covers it.
+async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+    super::DNS_GLOBAL_TEST_LOCK.lock().await
 }
 
 fn ip(value: &str) -> IpAddr {

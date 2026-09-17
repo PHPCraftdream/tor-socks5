@@ -5,8 +5,7 @@ use std::time::Duration;
 
 #[tokio::test]
 async fn a_fresh_same_generation_answer_wins_over_a_parked_failure() {
-    let _serial = super::probe_coalesce_tests::FAKE_WAVE_LOCK.lock().await;
-    let _store_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
+    let _serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host = "same-generation-failure-race.test.invalid";
     forget_dns_answer(host);
     disarm_pre_publish_pause();

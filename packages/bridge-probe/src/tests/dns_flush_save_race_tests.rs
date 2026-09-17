@@ -20,7 +20,7 @@ static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
 /// disk without a single persisted answer until the next save.
 #[tokio::test]
 async fn save_started_inside_flush_transition_never_publishes_an_empty_file() {
-    let _dns_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
+    let _dns_serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host = "ts1703-window-save.test.invalid";
     let ip: IpAddr = "203.0.113.210".parse().unwrap();
     forget_dns_answer(host);
@@ -118,7 +118,7 @@ async fn save_started_inside_flush_transition_never_publishes_an_empty_file() {
 /// them -- must keep publishing the preserved answer unchanged.
 #[tokio::test]
 async fn sequential_flush_then_save_still_persists_the_preserved_answer() {
-    let _dns_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
+    let _dns_serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host = "ts1703-sequential.test.invalid";
     let ip: IpAddr = "203.0.113.211".parse().unwrap();
     forget_dns_answer(host);
@@ -172,7 +172,7 @@ async fn sequential_flush_then_save_still_persists_the_preserved_answer() {
 /// the gate actually excludes flush during the capture.
 #[tokio::test]
 async fn flush_blocked_behind_a_parked_save_completes_without_deadlock() {
-    let _dns_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
+    let _dns_serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host = "ts1703-reverse.test.invalid";
     let ip: IpAddr = "203.0.113.212".parse().unwrap();
     forget_dns_answer(host);

@@ -7,7 +7,7 @@ static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[tokio::test]
 async fn flush_then_save_preserves_the_current_session_fallback() {
-    let _dns_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
+    let _dns_serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host = "save-flush-keeps-live.test.invalid";
     let ip: IpAddr = "203.0.113.75".parse().unwrap();
     forget_dns_answer(host);

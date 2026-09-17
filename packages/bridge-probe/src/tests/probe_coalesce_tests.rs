@@ -11,12 +11,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 // whole provider wave set and counts how many wave sets the production
 // lookup launches -- with zero network access. The seam is process-wide and
 // cargo runs tests in parallel threads, so every fake-using test holds
-// FAKE_WAVE_LOCK for its whole body.
-
-// pub(crate): the TS10-02 registry test in dns_registry_tests.rs also
-// mutates the shared INFLIGHT_DOH registry and the fake seam, so it must
-// serialize against these tests too.
-pub(crate) static FAKE_WAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+// `super::DNS_GLOBAL_TEST_LOCK` for its whole body -- the one lock covering
+// all process-global DNS state (see its doc comment in `tests/mod.rs` for
+// why the fake seam, the in-flight registry and the stores share it).
 
 /// A wave-search stand-in that counts how often it is started, optionally
 /// flags that start (for "the owner is now mid-lookup" coordination), waits
@@ -48,7 +45,7 @@ fn counting_wave_fake(
 
 #[tokio::test]
 async fn concurrent_resolves_of_one_host_share_one_doh_wave_search() {
-    let _serial = FAKE_WAVE_LOCK.lock().await;
+    let _serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host = "coalesce-one-wave.test.invalid";
     forget_dns_answer(host);
 
@@ -96,7 +93,7 @@ async fn concurrent_resolves_of_one_host_share_one_doh_wave_search() {
 
 #[tokio::test]
 async fn coalesced_waiters_each_apply_their_own_port() {
-    let _serial = FAKE_WAVE_LOCK.lock().await;
+    let _serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host = "coalesce-ports.test.invalid";
     forget_dns_answer(host);
 
@@ -138,7 +135,7 @@ async fn coalesced_waiters_each_apply_their_own_port() {
 
 #[tokio::test]
 async fn cancelling_the_lookup_owner_does_not_abandon_its_waiter() {
-    let _serial = FAKE_WAVE_LOCK.lock().await;
+    let _serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host = "coalesce-cancel.test.invalid";
     forget_dns_answer(host);
 
@@ -187,7 +184,7 @@ async fn cancelling_the_lookup_owner_does_not_abandon_its_waiter() {
 
 #[tokio::test]
 async fn a_finished_failed_coalesced_lookup_can_be_retried() {
-    let _serial = FAKE_WAVE_LOCK.lock().await;
+    let _serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host = "coalesce-retry.test.invalid";
     forget_dns_answer(host);
 
@@ -224,13 +221,13 @@ async fn a_finished_failed_coalesced_lookup_can_be_retried() {
 // bound the map: sequential lookups of DISTINCT hosts (each fully finished
 // before the next starts, so no concurrency at all) used to leave one
 // permanently dead entry behind per lookup, growing the registry linearly
-// with every hostname ever resolved. FAKE_WAVE_LOCK makes every
+// with every hostname ever resolved. DNS_GLOBAL_TEST_LOCK makes every
 // registry-writing test mutually exclusive, so the observed length is
 // deterministic: each distinct-host insertion sweeps the previous lookup's
 // dead entry, and nothing sweeps the LAST one -- hence at most 1 entry.
 #[tokio::test]
 async fn sequential_distinct_host_lookups_do_not_grow_the_inflight_registry() {
-    let _serial = FAKE_WAVE_LOCK.lock().await;
+    let _serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
 
     const DISTINCT_HOSTS: usize = 20;
     let searches = std::sync::Arc::new(AtomicUsize::new(0));
@@ -273,7 +270,7 @@ async fn sequential_distinct_host_lookups_do_not_grow_the_inflight_registry() {
 // exactly what the live-host search counter observes here.
 #[tokio::test]
 async fn sweeping_dead_entries_never_drops_a_still_inflight_lookup() {
-    let _serial = FAKE_WAVE_LOCK.lock().await;
+    let _serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let dead_host = "sweep-dead.test.invalid";
     let live_host = "sweep-live.test.invalid";
     forget_dns_answer(live_host);
@@ -369,10 +366,7 @@ async fn sweeping_dead_entries_never_drops_a_still_inflight_lookup() {
 // overwrite B's new-network answer.
 #[tokio::test]
 async fn flush_separates_an_inflight_lookup_of_the_previous_network() {
-    let _serial = FAKE_WAVE_LOCK.lock().await;
-    // flush_dns_cache clears the SHARED live cache: serialize against the
-    // dns_*_tests that snapshot it (see DNS_GLOBAL_STORE_LOCK in mod.rs).
-    let _store_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
+    let _serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host = "flush-inflight.test.invalid";
     forget_dns_answer(host);
 
@@ -487,10 +481,7 @@ async fn flush_separates_an_inflight_lookup_of_the_previous_network() {
 // after the network change.
 #[tokio::test]
 async fn flush_prevents_a_pre_flush_failure_from_poisoning_the_new_generation() {
-    let _serial = FAKE_WAVE_LOCK.lock().await;
-    // flush_dns_cache clears the SHARED live cache: serialize against the
-    // dns_*_tests that snapshot it (see DNS_GLOBAL_STORE_LOCK in mod.rs).
-    let _store_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
+    let _serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host = "flush-failure.test.invalid";
     forget_dns_answer(host);
 
@@ -564,10 +555,7 @@ async fn flush_prevents_a_pre_flush_failure_from_poisoning_the_new_generation() 
 // reordered, and in particular must not overwrite (or evict) B.
 #[tokio::test]
 async fn flush_landing_after_the_generation_check_still_blocks_the_write() {
-    let _serial = FAKE_WAVE_LOCK.lock().await;
-    // flush_dns_cache clears the SHARED live cache: serialize against the
-    // dns_*_tests that snapshot it (see DNS_GLOBAL_STORE_LOCK in mod.rs).
-    let _store_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
+    let _serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host = "flush-after-check.test.invalid";
     forget_dns_answer(host);
     disarm_pre_publish_pause();
@@ -645,10 +633,7 @@ async fn flush_landing_after_the_generation_check_still_blocks_the_write() {
 // A's negative entry.
 #[tokio::test]
 async fn flush_landing_after_the_generation_check_still_blocks_the_failure_write() {
-    let _serial = FAKE_WAVE_LOCK.lock().await;
-    // flush_dns_cache clears the SHARED live cache: serialize against the
-    // dns_*_tests that snapshot it (see DNS_GLOBAL_STORE_LOCK in mod.rs).
-    let _store_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
+    let _serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host = "flush-after-check-fail.test.invalid";
     forget_dns_answer(host);
     disarm_pre_publish_pause();
@@ -731,12 +716,7 @@ async fn critical_section_park_with_generation_bump_vetoes_the_write() {
     // the old generation unreachable by its own pointwise removal and break
     // its exact registry length assert -- so this test must hold the same
     // registry lock first.
-    let _registry_serial = FAKE_WAVE_LOCK.lock().await;
-    // The assertions read the shared live cache: serialize against the
-    // global store lock. Lock ORDER is the suite-wide FAKE -> GLOBAL (see
-    // flush_landing_* tests) -- taking GLOBAL first here deadlocks under a
-    // parallel run.
-    let _store_serial = super::DNS_GLOBAL_STORE_LOCK.lock().await;
+    let _registry_serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host = "critical-section-veto.test.invalid";
     forget_dns_answer(host);
     disarm_pre_publish_pause();
@@ -813,7 +793,7 @@ async fn critical_section_park_with_generation_bump_vetoes_the_write() {
 // the sweep no longer needs to run on the insertion path at all.
 #[tokio::test]
 async fn a_finished_lookup_removes_its_own_registry_entry_pointwise() {
-    let _serial = FAKE_WAVE_LOCK.lock().await;
+    let _serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host = "ts804-point-remove.test.invalid";
     forget_dns_answer(host);
 
@@ -849,7 +829,7 @@ async fn a_finished_lookup_removes_its_own_registry_entry_pointwise() {
 // entries cannot accumulate without bound.
 #[tokio::test]
 async fn an_abandoned_lookup_does_not_stick_in_the_registry() {
-    let _serial = FAKE_WAVE_LOCK.lock().await;
+    let _serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host = "ts804-abandoned.test.invalid";
     forget_dns_answer(host);
 
@@ -921,7 +901,7 @@ async fn an_abandoned_lookup_does_not_stick_in_the_registry() {
 // after the value is published to every waiter.
 #[tokio::test]
 async fn the_registry_entry_survives_while_waiters_hold_the_cell() {
-    let _serial = FAKE_WAVE_LOCK.lock().await;
+    let _serial = super::DNS_GLOBAL_TEST_LOCK.lock().await;
     let host = "ts804-inflight-entry.test.invalid";
     forget_dns_answer(host);
 
