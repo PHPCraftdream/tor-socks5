@@ -1,17 +1,12 @@
-//! Deduplicate bridge lines by their identity tuple.
+//! Deduplicate bridge lines by the canonical bridge identity.
 
 use std::collections::HashSet;
 
 use bridge_line::BridgeLine;
-use bridge_probe::webtunnel_endpoint_identity;
+use bridge_probe::bridge_identity;
 
-/// Dedup bridge lines by (transport, addr, fingerprint) plus, for webtunnel
-/// bridges, the full canonical carrier identity `WebtunnelEndpointIdentity`
-/// (dial host/port, TLS SNI, HTTP Host authority, TLS-vs-plain, path+query)
-/// from `bridge_probe::webtunnel_endpoint_identity` (non-webtunnel bridges
-/// get `None` there), plus the obfs4 `cert=` parameter: a different cert on
-/// the same relay is a different cryptographic endpoint (obfs4 key rotation
-/// keeps addr + fingerprint), not a duplicate. Keeps the first occurrence.
+/// Dedup bridge lines by the canonical [`bridge_probe::BridgeIdentity`]. This
+/// keeps the fetcher and candidate pool on the same identity definition.
 /// Returns (unique, duplicates_count).
 #[must_use]
 pub fn dedup_bridges(bridges: Vec<BridgeLine>) -> (Vec<BridgeLine>, usize) {
@@ -19,13 +14,7 @@ pub fn dedup_bridges(bridges: Vec<BridgeLine>) -> (Vec<BridgeLine>, usize) {
     let mut unique = Vec::with_capacity(bridges.len());
     let mut dups = 0usize;
     for b in bridges {
-        let key = (
-            b.transport.clone(),
-            b.addr,
-            b.fingerprint.clone(),
-            webtunnel_endpoint_identity(&b),
-            b.params.get("cert").cloned(),
-        );
+        let key = bridge_identity(&b);
         if seen.insert(key) {
             unique.push(b);
         } else {
