@@ -828,9 +828,12 @@ async fn a_finished_lookup_removes_its_own_registry_entry_pointwise() {
 
     assert!(coalesced_doh_lookup(host).await.is_err());
 
-    assert_eq!(
-        inflight_doh_registry_len(),
-        0,
+    // Per-key, not a global length: tests running concurrently in this binary
+    // legitimately share the registry (see the seam's own doc comment), so a
+    // global zero races them. What TS8-04 is about, and what this test owns,
+    // is THIS host's entry.
+    assert!(
+        !inflight_doh_contains_host(host),
         "a finished lookup must delete its own entry by key; no dead Weak may \
          linger in the registry"
     );
@@ -903,10 +906,9 @@ async fn an_abandoned_lookup_does_not_stick_in_the_registry() {
          not join the dead cell"
     );
     assert_eq!(ips, (answer_ips.clone(), Duration::from_secs(300)));
-    assert_eq!(
-        inflight_doh_registry_len(),
-        0,
-        "the fresh lookup's pointwise removal must leave the registry empty"
+    assert!(
+        !inflight_doh_contains_host(host),
+        "the fresh lookup's pointwise removal must drop this host's entry"
     );
 
     clear_fake_doh_wave_search();
@@ -961,9 +963,8 @@ async fn the_registry_entry_survives_while_waiters_hold_the_cell() {
 
     let joiner = tokio::spawn(coalesced_doh_lookup(host));
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(
-        inflight_doh_registry_len(),
-        1,
+    assert!(
+        inflight_doh_contains_host(host),
         "the entry must stay while callers still hold the in-flight cell"
     );
 
@@ -984,9 +985,8 @@ async fn the_registry_entry_survives_while_waiters_hold_the_cell() {
         1,
         "the joiner must coalesce onto the owner's cell, not start a second search"
     );
-    assert_eq!(
-        inflight_doh_registry_len(),
-        0,
+    assert!(
+        !inflight_doh_contains_host(host),
         "only after the result is published to every waiter may the entry go"
     );
 

@@ -20,6 +20,16 @@ use std::time::Duration;
 const LIVE_PREFIX: usize = 129;
 const DEAD_ENTRIES: usize = 140;
 
+/// Ceiling on how long a parked fake lookup may take to finish once it is
+/// released — a guard against a wedged test, never a claim about latency.
+/// This test spawns hundreds of tasks, so on a slow or loaded CI runner the
+/// join can legitimately take seconds; the previous 5s budget expired on the
+/// macOS runner and failed the run. Worse, failing here leaves entries in the
+/// process-wide in-flight registry, which then fails unrelated tests, so a
+/// tight bound here is expensive in a way that is not obvious from the
+/// failure it produces.
+const TASK_SETTLE_GUARD: Duration = Duration::from_secs(60);
+
 fn dead_host(i: usize) -> String {
     format!("ts1002-dead-{i}.test.invalid")
 }
@@ -53,7 +63,7 @@ impl Drop for FakeSearchCleanup {
 async fn recv_started(
     started_rx: &mut tokio::sync::mpsc::Receiver<(String, tokio::sync::oneshot::Sender<()>)>,
 ) -> (String, tokio::sync::oneshot::Sender<()>) {
-    tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+    tokio::time::timeout(TASK_SETTLE_GUARD, started_rx.recv())
         .await
         .expect("fake lookup starts promptly")
         .expect("fake lookup sender remains connected")
@@ -151,7 +161,7 @@ async fn bounded_sweep_removes_dead_entries_and_spares_the_inflight_one() {
     }
     for handle in doomed.0.drain(..) {
         handle.abort();
-        let cancelled = tokio::time::timeout(Duration::from_secs(5), handle)
+        let cancelled = tokio::time::timeout(TASK_SETTLE_GUARD, handle)
             .await
             .expect("aborted owner joins")
             .is_err();
@@ -222,17 +232,17 @@ async fn bounded_sweep_removes_dead_entries_and_spares_the_inflight_one() {
     }
 
     let owner = live_owners.0.remove(0);
-    let owner_ips = tokio::time::timeout(Duration::from_secs(5), owner)
+    let owner_ips = tokio::time::timeout(TASK_SETTLE_GUARD, owner)
         .await
         .expect("owner finishes")
         .expect("owner task joins")
         .expect("owner lookup succeeds");
-    let joiner_ips = tokio::time::timeout(Duration::from_secs(5), joiner)
+    let joiner_ips = tokio::time::timeout(TASK_SETTLE_GUARD, joiner)
         .await
         .expect("joiner finishes")
         .expect("joiner lookup succeeds");
     for owner in live_owners.0.drain(..) {
-        tokio::time::timeout(Duration::from_secs(5), owner)
+        tokio::time::timeout(TASK_SETTLE_GUARD, owner)
             .await
             .expect("live owner finishes")
             .expect("live owner task joins")
