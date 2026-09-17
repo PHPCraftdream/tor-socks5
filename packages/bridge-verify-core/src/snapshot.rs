@@ -20,10 +20,21 @@
 /// `log_prefix` prefixes every warning line (including its trailing space) so
 /// each consumer keeps its exact historical log output, e.g.
 /// `"circuit-verify: "` (CLI) or `"bridge-verify: "` (Android).
+///
+/// `deadline`, when set, bounds the snapshot with the caller's shared
+/// budget: the sqlite backup gets at most the shorter of its own 15s budget
+/// and the remaining shared time, and the file-copy phase stops between
+/// files once the shared deadline has passed. A copy stopped early keeps
+/// what it copied: the DB always travels whole or not at all (backup API,
+/// wiped on failure), and the other files are individually atomic artifacts
+/// the check client refetches when missing — so a partially copied tree is
+/// degraded, never inconsistent. `None` keeps the historical
+/// backup-budget-only behavior (Android, which has no shared deadline).
 pub fn snapshot_cache_dir(
     src: &std::path::Path,
     dest: &std::path::Path,
     log_prefix: &'static str,
+    deadline: Option<std::time::Instant>,
 ) -> bool {
     // ~4 MiB per step at the default 4 KiB page size: few steps for a
     // tor-dirmgr-sized DB, without hogging the writer between steps.
@@ -73,6 +84,7 @@ pub fn snapshot_cache_dir(
         dest: &std::path::Path,
         skip: &[&str],
         log_prefix: &'static str,
+        deadline: Option<std::time::Instant>,
     ) {
         if let Err(e) = std::fs::create_dir_all(dest) {
             tracing::warn!(
@@ -109,10 +121,17 @@ pub fn snapshot_cache_dir(
             {
                 continue;
             }
+            if copy_deadline_passed(deadline) {
+                tracing::warn!(
+                    "{log_prefix}snapshot copy stopped: shared deadline expired; \
+                     check client will refetch the remaining files"
+                );
+                return;
+            }
             let dest_path = dest.join(&name);
             match entry.file_type() {
                 Ok(ft) if ft.is_dir() => {
-                    copy_rest_recursive(&entry.path(), &dest_path, skip, log_prefix)
+                    copy_rest_recursive(&entry.path(), &dest_path, skip, log_prefix, deadline)
                 }
                 Ok(_) => {
                     if let Err(e) = std::fs::copy(entry.path(), &dest_path) {
@@ -131,6 +150,27 @@ pub fn snapshot_cache_dir(
                 }
             }
         }
+    }
+
+    /// Shared-deadline check for the copy phase. Test builds can cap how many
+    /// copy-step checks pass before this reports "expired", which makes the
+    /// mid-copy stop deterministic (see `CopyStepBudgetCap` in the tests).
+    fn copy_deadline_passed(deadline: Option<std::time::Instant>) -> bool {
+        #[cfg(test)]
+        {
+            let expired = COPY_STEP_BUDGET.with(|budget| {
+                if budget.get() == 0 {
+                    true
+                } else {
+                    budget.set(budget.get() - 1);
+                    false
+                }
+            });
+            if expired {
+                return true;
+            }
+        }
+        deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
     }
 
     // 1. Ensure the destination exists.
@@ -191,15 +231,22 @@ pub fn snapshot_cache_dir(
         match dest_conn {
             Ok(mut dest_conn) => match rusqlite::backup::Backup::new(&src_conn, &mut dest_conn) {
                 Ok(backup) => {
-                    let deadline = std::time::Instant::now() + SNAPSHOT_BACKUP_DEADLINE;
+                    // At most the shorter of the snapshot's own budget and
+                    // the caller's shared deadline.
+                    let backup_deadline = match deadline {
+                        Some(shared) => {
+                            (std::time::Instant::now() + SNAPSHOT_BACKUP_DEADLINE).min(shared)
+                        }
+                        None => std::time::Instant::now() + SNAPSHOT_BACKUP_DEADLINE,
+                    };
                     loop {
                         // Checked on EVERY iteration, not just Busy/Locked:
                         // a source that keeps growing (concurrent writer)
                         // can make step() return `More` forever without
                         // ever reporting Busy/Locked, which would starve a
                         // deadline check placed only in that arm.
-                        if std::time::Instant::now() >= deadline {
-                            break Err("online backup did not finish within 15s".to_owned());
+                        if std::time::Instant::now() >= backup_deadline {
+                            break Err("online backup did not finish within its budget".to_owned());
                         }
                         match backup.step(SNAPSHOT_BACKUP_PAGES_PER_STEP) {
                             Ok(rusqlite::backup::StepResult::Done) => break Ok(()),
@@ -239,20 +286,46 @@ pub fn snapshot_cache_dir(
     }
 
     // 4. DB snapshot done: best-effort copy of the rest of the cache dir.
-    copy_rest_recursive(src, dest, &REST_COPY_SKIP, log_prefix);
+    copy_rest_recursive(src, dest, &REST_COPY_SKIP, log_prefix, deadline);
     true
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only cap on copy-phase deadline checks (usize::MAX = off).
+    /// Thread-local so parallel tests cannot interfere with each other.
+    static COPY_STEP_BUDGET: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
 }
 
 #[cfg(test)]
 mod tests {
     use super::snapshot_cache_dir;
+    use super::COPY_STEP_BUDGET;
 
     fn snapshot_cli(src: &std::path::Path, dest: &std::path::Path) -> bool {
-        snapshot_cache_dir(src, dest, "circuit-verify: ")
+        snapshot_cache_dir(src, dest, "circuit-verify: ", None)
     }
 
     fn snapshot_android(src: &std::path::Path, dest: &std::path::Path) -> bool {
-        snapshot_cache_dir(src, dest, "bridge-verify: ")
+        snapshot_cache_dir(src, dest, "bridge-verify: ", None)
+    }
+
+    /// RAII cap for the copy-step budget: restores `usize::MAX` on drop so a
+    /// panicking or early-returning test cannot leave the thread's budget
+    /// exhausted (cargo reuses test threads across tests).
+    struct CopyStepBudgetCap(());
+
+    impl CopyStepBudgetCap {
+        fn exact(steps: usize) -> Self {
+            COPY_STEP_BUDGET.with(|budget| budget.set(steps));
+            Self(())
+        }
+    }
+
+    impl Drop for CopyStepBudgetCap {
+        fn drop(&mut self) {
+            COPY_STEP_BUDGET.with(|budget| budget.set(usize::MAX));
+        }
     }
 
     /// Builds a small valid source cache DB at `dir/dir.sqlite3` with a
@@ -663,5 +736,102 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---- Shared-deadline pins (TS17-02): only the CLI passes a deadline ----
+
+    /// An expired shared deadline must never ship a half-written DB: the
+    /// backup is aborted, the partial DB is wiped, and dest is left as the
+    /// explicitly clean empty cache dir — the same outcome as the
+    /// pre-existing failed-backup path. This is the "a partial snapshot is
+    /// never served as valid" pin.
+    #[test]
+    fn snapshot_expired_shared_deadline_yields_clean_empty_dir_cli() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("src");
+        seed_source_db(&src, 5);
+        let dest = dir.path().join("dest");
+        assert!(snapshot_cache_dir(
+            &src,
+            &dest,
+            "circuit-verify: ",
+            Some(std::time::Instant::now())
+        ));
+        assert!(dest.is_dir());
+        assert!(
+            !dest.join("dir.sqlite3").exists(),
+            "no partial DB may be served"
+        );
+        assert!(!dest.join("dir.sqlite3-journal").exists());
+        assert!(!dest.join("dir.sqlite3-wal").exists());
+        assert!(
+            std::fs::read_dir(&dest)
+                .expect("list dest")
+                .next()
+                .is_none(),
+            "dest must be the explicitly empty cache fallback"
+        );
+    }
+
+    /// With the deadline "expiring" after exactly two copy steps (test-only
+    /// budget seam), the copy stops between files and keeps what it copied,
+    /// while the DB — which finished before the copy phase started — stays
+    /// complete and consistent. Partial blobs are usable by contract (the
+    /// check client refetches them); a partial DB is the thing that must
+    /// never happen.
+    #[test]
+    fn snapshot_shared_deadline_stops_copy_between_files_but_keeps_consistent_db_cli() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("src");
+        seed_source_db(&src, 5);
+        for i in 0..3 {
+            std::fs::write(src.join(format!("blob{i}.bin")), [i as u8; 8]).expect("write blob");
+        }
+        let dest = dir.path().join("dest");
+        let _budget = CopyStepBudgetCap::exact(2);
+        assert!(
+            snapshot_cache_dir(&src, &dest, "circuit-verify: ", None),
+            "a stopped copy phase is still a usable cache dir"
+        );
+        // Exactly two blobs + the snapshot DB, regardless of read_dir order:
+        // all three blobs are copyable, so the third deadline check is the
+        // one that reports expiry.
+        let copied = std::fs::read_dir(&dest).expect("list dest").count();
+        assert_eq!(copied, 3, "copy must have stopped after two blobs");
+        let snap = rusqlite::Connection::open(dest.join("dir.sqlite3")).expect("open snapshot db");
+        let integrity: String = snap
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .expect("integrity_check");
+        assert_eq!(integrity, "ok", "the DB never travels partially");
+    }
+
+    /// An unexpired shared deadline must not change anything: full copy,
+    /// consistent DB (behavior parity with `deadline: None`).
+    #[test]
+    fn snapshot_unexpired_shared_deadline_copies_everything_cli() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("src");
+        seed_source_db(&src, 5);
+        for i in 0..3 {
+            std::fs::write(src.join(format!("blob{i}.bin")), [i as u8; 8]).expect("write blob");
+        }
+        let dest = dir.path().join("dest");
+        assert!(snapshot_cache_dir(
+            &src,
+            &dest,
+            "circuit-verify: ",
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(60))
+        ));
+        for i in 0..3 {
+            assert!(
+                dest.join(format!("blob{i}.bin")).exists(),
+                "blob{i} must travel"
+            );
+        }
+        let snap = rusqlite::Connection::open(dest.join("dir.sqlite3")).expect("open snapshot db");
+        let n: i64 = snap
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .expect("trivial query");
+        assert_eq!(n, 5, "full DB snapshot");
     }
 }

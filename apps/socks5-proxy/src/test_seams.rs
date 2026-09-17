@@ -14,6 +14,10 @@ use std::time::{Duration, Instant};
 pub(crate) enum Site {
     PreAcquire,
     PostLoad,
+    /// Inside the admission verifier's blocking worker, right after it
+    /// acquired VERIFY_LOCK (see `bridge_verifier::verify_bridges_sequential`).
+    /// Lets a test pin the worker while it owns the verifier lock.
+    AdmissionVerifyPostLock,
 }
 
 /// Guard for waits that must succeed (a transaction reaching its gated
@@ -136,4 +140,32 @@ pub(crate) fn park_if_armed(site: Site, path: &Path) {
     while !state.1 {
         state = gate.cv.wait(state).unwrap_or_else(|p| p.into_inner());
     }
+}
+
+/// Completion counters, keyed like the gates. A worker records itself here
+/// AFTER the gated section finished (its lock guard already dropped), so a
+/// test can prove that the worker itself — not the caller — reached
+/// completion (the TS17-02 "worker finished" event).
+static WORKER_DONE: OnceLock<Mutex<HashMap<GateKey, usize>>> = OnceLock::new();
+
+fn done_registry() -> &'static Mutex<HashMap<GateKey, usize>> {
+    WORKER_DONE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Called by the worker itself, after the gated section completed.
+pub(crate) fn mark_worker_done(site: Site, path: &Path) {
+    let mut done = done_registry().lock().unwrap_or_else(|p| p.into_inner());
+    *done.entry((site, path.to_path_buf())).or_insert(0) += 1;
+}
+
+/// How many times a worker marked itself done at this site and path.
+// Consumer arrives with the TS17-02 regression test (next chunk).
+#[allow(dead_code)]
+pub(crate) fn worker_done_count(site: Site, path: &Path) -> usize {
+    done_registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&(site, path.to_path_buf()))
+        .copied()
+        .unwrap_or(0)
 }

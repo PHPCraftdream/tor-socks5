@@ -166,9 +166,10 @@ pub(super) fn pt_kill_token(check_dir: &std::path::Path, pt_binary: &std::path::
 
 /// Thin delegate to the shared implementation in `bridge-verify-core`, keeping
 /// this crate's historical `"bridge-verify: "` log prefix. See the shared
-/// `snapshot_cache_dir` doc for the full contract.
+/// `snapshot_cache_dir` doc for the full contract. Android has no shared
+/// admission deadline, so the snapshot keeps only its own backup budget.
 pub(super) fn snapshot_cache_dir(src: &std::path::Path, dest: &std::path::Path) -> bool {
-    bridge_verify_core::snapshot::snapshot_cache_dir(src, dest, "bridge-verify: ")
+    bridge_verify_core::snapshot::snapshot_cache_dir(src, dest, "bridge-verify: ", None)
 }
 
 /// Verifies each of `bridges` for real end-to-end reachability, one at a time, sharing one

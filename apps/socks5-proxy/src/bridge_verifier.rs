@@ -81,33 +81,161 @@ pub(crate) fn confirms_tor(body: &str) -> bool {
         == Some(true)
 }
 
-/// Runs the blocking verifier with an absolute deadline so admission can
-/// release its transaction lock without detaching an over-budget check.
+/// Registry of admission-verification workers whose owning decision already
+/// returned. TS17-02: the admission decision has a deadline, but the blocking
+/// worker behind it cannot be cancelled — dropping its `spawn_blocking`
+/// `JoinHandle` would detach it (rust-intel §B21), letting it keep
+/// `VERIFY_LOCK` and copy files while the caller has already released the
+/// candidate-pool lock and moved on. So `verify_for_admission` registers
+/// every worker here synchronously right after spawn — before any `.await`,
+/// so cancellation cannot separate the two — and the drain joins the whole
+/// registry (`join_all`) once the pool transaction is done, OUTSIDE the pool
+/// lock: worker completion is mandatory, but it must not extend the pool
+/// transaction (that would re-open the long pool-lock hold R-09 removed).
+///
+/// The join is deliberately unbounded: every phase of the worker is
+/// internally bounded by the decision deadline (VERIFY_LOCK wait; snapshot,
+/// which now honors the same deadline between copy steps; bootstrap/probe
+/// within their own per-check budgets; runtime shutdown within its grace),
+/// so the join always terminates — a hang here is a bug this join surfaces
+/// instead of hiding. A worker that starts late (blocking-pool queue) finds
+/// the deadline already expired and exits fast.
+///
+/// Residual scope: if the drain task itself is ABORTED before `join_all`
+/// runs, the handles drop and the workers detach — the reviewed timeout path
+/// no longer does this, and such a worker still finishes and cleans up via
+/// RAII (temp dir, lock guard); it is merely no longer observed.
+#[derive(Default)]
+pub(crate) struct AdmissionWorkers {
+    handles: Mutex<Vec<tokio::task::JoinHandle<anyhow::Result<bool>>>>,
+}
+
+impl AdmissionWorkers {
+    /// Registers a freshly spawned worker. Synchronous on purpose: must run
+    /// before the spawning future can be cancelled.
+    pub(crate) fn track(&self, handle: tokio::task::JoinHandle<anyhow::Result<bool>>) {
+        self.handles
+            .lock()
+            .unwrap_or_else(|error| {
+                self.handles.clear_poison();
+                error.into_inner()
+            })
+            .push(handle);
+    }
+
+    /// Waits for every tracked worker to completion, in spawn order. A
+    /// failed or panicked worker is logged, not propagated — it only means
+    /// its candidate was not verified.
+    pub(crate) async fn join_all(&self) {
+        let handles: Vec<_> = {
+            let mut handles = self.handles.lock().unwrap_or_else(|error| {
+                self.handles.clear_poison();
+                error.into_inner()
+            });
+            std::mem::take(&mut *handles)
+        };
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(verified)) => {
+                    tracing::debug!(verified, "circuit-verify: admission worker joined");
+                }
+                Ok(Err(error)) => {
+                    warn!(error = %error, "circuit-verify: admission worker failed");
+                }
+                Err(join_error) => {
+                    warn!(error = %join_error, "circuit-verify: admission worker panicked");
+                }
+            }
+        }
+    }
+}
+
+/// Runs the blocking verifier for one admission decision, split into two
+/// deadlines (TS17-02):
+///
+/// - `deadline` bounds the DECISION: when it passes, this returns `Ok(false)`
+///   and the caller defers the candidate — but the worker behind the decision
+///   keeps running, owned by `workers` until `join_all` is awaited.
+/// - worker COMPLETION gets no deadline of its own: every worker phase is
+///   internally bounded by `deadline` (see [`AdmissionWorkers`]), so
+///   completion follows shortly after without anyone waiting on it under the
+///   pool lock.
+///
+/// The `JoinHandle` is never dropped: it is registered with `workers`
+/// synchronously after spawn (before the first `.await`, so cancellation
+/// cannot orphan the worker), and the decision is consumed from a oneshot
+/// instead. A oneshot send to an already-timed-out decision is a legitimate
+/// best-effort drop — the receiver vanished exactly because the decision
+/// deadline expired, and the full result still travels through the joined
+/// handle.
+///
+/// cancel-safe: yes — cancellation after `track()` leaves the worker owned
+/// by `workers`; nothing is lost by dropping this future mid-`await`.
 pub(crate) async fn verify_for_admission(
     bridge: BridgeLine,
     config_path: Option<PathBuf>,
     deadline: std::time::Instant,
+    workers: &AdmissionWorkers,
 ) -> anyhow::Result<bool> {
     let live_cache = crate::tor_setup::arti_base_dir(config_path.as_deref()).join("cache");
+    let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+    let worker = tokio::task::spawn_blocking(move || {
+        let verified = admission_verification(bridge, live_cache, deadline);
+        // Best-effort: the decision receiver is gone once the decision
+        // deadline expired; the joined handle still carries the result.
+        let _ = decision_tx.send(verified.as_ref().is_ok_and(|verified| *verified));
+        verified
+    });
+    workers.track(worker);
+
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    match tokio::time::timeout(remaining, decision_rx).await {
+        Ok(Ok(verified)) => Ok(verified),
+        // The worker died without sending a decision (e.g. it panicked and
+        // the sender was dropped with it).
+        Ok(Err(_)) => Err(anyhow::anyhow!(
+            "admission verifier worker ended without a decision"
+        )),
+        // Decision deadline: the candidate is deferred by the caller; the
+        // worker stays tracked and is joined outside the pool transaction.
+        Err(_elapsed) => Ok(false),
+    }
+}
+
+/// The blocking body of one admission verification. `Err` means "not
+/// verified" and reaches both the decision (via the oneshot) and the join
+/// log (via the registry's handle). Resolving the PT binary here keeps sync
+/// path probing off the async caller and turns a resolution failure into a
+/// normal worker error.
+fn admission_verification(
+    bridge: BridgeLine,
+    live_cache: PathBuf,
+    deadline: std::time::Instant,
+) -> anyhow::Result<bool> {
+    let scratch = tempfile::Builder::new()
+        .prefix("tor-socks5-admission-")
+        .tempdir()?;
     let pt = Some(crate::tor_setup::resolve_pt_binary()?);
-    tokio::task::spawn_blocking(move || {
-        let scratch = tempfile::Builder::new()
-            .prefix("tor-socks5-admission-")
-            .tempdir()?;
-        let mut verified = false;
-        verify_bridges_sequential(
-            &live_cache,
-            scratch.path(),
-            vec![bridge],
-            pt,
-            CIRCUIT_VERIFY_BOOTSTRAP_TIMEOUT,
-            CIRCUIT_VERIFY_PROBE_TIMEOUT,
-            Some(deadline),
-            |_, result| verified = result.is_ok(),
-        );
-        Ok(verified)
-    })
-    .await?
+    let mut verified = false;
+    verify_bridges_sequential(
+        &live_cache,
+        scratch.path(),
+        vec![bridge],
+        pt,
+        CIRCUIT_VERIFY_BOOTSTRAP_TIMEOUT,
+        CIRCUIT_VERIFY_PROBE_TIMEOUT,
+        Some(deadline),
+        |_, result| verified = result.is_ok(),
+    );
+    // Test-visible completion event, set by the worker itself (NOT the
+    // caller) after `verify_bridges_sequential` returned — i.e. after its
+    // VERIFY_LOCK guard was dropped.
+    #[cfg(test)]
+    crate::test_seams::mark_worker_done(
+        crate::test_seams::Site::AdmissionVerifyPostLock,
+        &live_cache,
+    );
+    Ok(verified)
 }
 
 /// Spawn the background circuit-verify task, returning its join handle for the shutdown join.
@@ -219,8 +347,8 @@ async fn run_circuit_verify_tick(config_path: Option<&Path>, active: &[BridgeLin
 /// Thin delegate to the shared implementation in `bridge-verify-core`, keeping
 /// this crate's historical `"circuit-verify: "` log prefix. See the shared
 /// `snapshot_cache_dir` doc for the full contract.
-fn snapshot_cache_dir(src: &Path, dest: &Path) -> bool {
-    bridge_verify_core::snapshot::snapshot_cache_dir(src, dest, "circuit-verify: ")
+fn snapshot_cache_dir(src: &Path, dest: &Path, deadline: Option<std::time::Instant>) -> bool {
+    bridge_verify_core::snapshot::snapshot_cache_dir(src, dest, "circuit-verify: ", deadline)
 }
 
 /// Verifies each of `bridges` for real end-to-end reachability, sequentially,
@@ -516,8 +644,18 @@ pub(crate) fn verify_bridges_sequential(
             error.into_inner()
         })
     };
+    // Test seam (TS17-02): parks the worker while it HOLDS VERIFY_LOCK, so a
+    // test can pin an admission worker mid-run deterministically. Placed
+    // after the guard acquisition on purpose: a worker parked here is a
+    // worker that owns the verifier lock.
+    #[cfg(test)]
+    crate::test_seams::park_if_armed(
+        crate::test_seams::Site::AdmissionVerifyPostLock,
+        live_cache_dir,
+    );
     let cache_snapshot = scratch_base.join("cache-snapshot");
-    let cache_dir = snapshot_cache_dir(live_cache_dir, &cache_snapshot).then_some(cache_snapshot);
+    let cache_dir =
+        snapshot_cache_dir(live_cache_dir, &cache_snapshot, deadline).then_some(cache_snapshot);
 
     // Ownership marker for this batch (Windows; see `pt_reap` module docs).
     // Created once per batch, before the Vec is consumed, only when a PT is
