@@ -58,16 +58,21 @@ async fn same_generation_replacement_cannot_be_removed_by_old_probe() {
 }
 
 #[tokio::test]
-async fn only_all_observed_failed_ips_invalidate_the_matching_entry() {
+async fn only_all_tried_failed_ips_invalidate_the_matching_entry() {
     let _serial = serial().await;
     let host = "dns-invalidate-addresses.test.invalid";
     forget_dns_answer(host);
-    let addrs = [ip("203.0.113.30"), ip("203.0.113.31")];
+    let addrs = [
+        ip("203.0.113.30"),
+        ip("203.0.113.31"),
+        ip("203.0.113.32"),
+        ip("203.0.113.33"),
+    ];
     remember_doh_answer(host, &addrs, Duration::from_secs(300));
     let identity = cached_doh_answer_observed(host).unwrap().1;
 
-    assert!(!invalidate_if_current(host, identity, &addrs[..1]));
-    assert!(invalidate_if_current(host, identity, &addrs));
+    assert!(!invalidate_if_current(host, identity, &[]));
+    assert!(invalidate_if_current(host, identity, &addrs[..3]));
     assert!(cached_doh_answer(host).is_none());
 }
 

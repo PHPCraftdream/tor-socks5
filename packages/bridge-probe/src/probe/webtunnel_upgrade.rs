@@ -80,13 +80,13 @@ pub(crate) async fn webtunnel_upgrade_probe_observed(
     let per_addr_budget = budget / (addrs.len().max(1) as u32);
     let attempt = async {
         let mut last = "hostname resolved to no usable address".to_owned();
-        let mut failed = Vec::with_capacity(addrs.len());
+        let mut tried = Vec::with_capacity(addrs.len());
         let mut saw_protocol_failure = false;
         for addr in addrs {
+            tried.push(*addr);
             match webtunnel_upgrade_attempt(*addr, plan, per_addr_budget).await {
                 Ok(()) => return Ok(()),
                 Err(UpgradeFailure::Connection(reason)) => {
-                    failed.push(*addr);
                     last = format!("{addr}: {reason}");
                 }
                 Err(UpgradeFailure::Protocol(reason)) => {
@@ -98,7 +98,7 @@ pub(crate) async fn webtunnel_upgrade_probe_observed(
         if saw_protocol_failure {
             Err((last, Vec::new()))
         } else {
-            Err((last, failed))
+            Err((last, tried))
         }
     };
     match timeout(budget, attempt).await {

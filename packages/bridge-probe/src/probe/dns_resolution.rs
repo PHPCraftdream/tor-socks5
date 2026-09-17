@@ -445,7 +445,8 @@ fn remove_finished_inflight_entry(
 /// number of hash map operations is independent of map size and capacity.
 fn sweep_inflight_dead_entries(registry: &mut InflightDohRegistry) -> usize {
     let mut visited = 0;
-    for _ in 0..INFLIGHT_SWEEP_BUDGET {
+    let visit_limit = INFLIGHT_SWEEP_BUDGET.min(registry.sweep_queue.len());
+    for _ in 0..visit_limit {
         let Some(key) = registry.sweep_queue.pop_front() else {
             break;
         };
@@ -707,28 +708,27 @@ pub(crate) async fn tcp_probe_observed(
 ) -> (Outcome, Vec<SocketAddr>) {
     let started = Instant::now();
     let mut last = "hostname resolved to no usable address".to_owned();
-    let mut failed = Vec::with_capacity(addrs.len());
+    let mut tried = Vec::with_capacity(addrs.len());
     for addr in addrs {
+        tried.push(*addr);
         match timeout(per_bridge_timeout, TcpStream::connect(*addr)).await {
             Ok(Ok(_)) => {
                 return (
                     Outcome::Reachable {
                         latency: started.elapsed(),
                     },
-                    failed,
+                    Vec::new(),
                 );
             }
             Ok(Err(e)) => {
-                failed.push(*addr);
                 last = format!("{addr}: {e}");
             }
             Err(_) => {
-                failed.push(*addr);
                 last = format!("{addr}: timed out after {per_bridge_timeout:?}");
             }
         }
     }
-    (Outcome::Unreachable { reason: last }, failed)
+    (Outcome::Unreachable { reason: last }, tried)
 }
 
 #[cfg(test)]
@@ -755,7 +755,8 @@ mod registry_tests {
         let _cell = add_entry(&mut registry, key.clone(), true).expect("live cell is retained");
         assert_eq!(
             sweep_inflight_dead_entries(&mut registry),
-            INFLIGHT_SWEEP_BUDGET
+            1,
+            "a sweep visits each queued key at most once"
         );
         assert!(Arc::ptr_eq(
             &key.0,

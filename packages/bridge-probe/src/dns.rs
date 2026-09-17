@@ -1,6 +1,7 @@
 use super::probe::dns_invalidation::{cache_identity, next_cache_version};
 use super::probe::resolve_probe_target;
 use super::*;
+use std::io::Write;
 
 #[cfg(test)]
 pub(super) use super::probe::dns_invalidation::{
@@ -267,11 +268,30 @@ pub(super) fn remember_doh_answer_if_generation_observed(
     )
 }
 
-/// TS8-01: generation-gated twin of [`remember_doh_failure`]. Returns
-/// false (and writes nothing) when the generation changed under the
-/// lookup.
+/// TS8-01: generation-gated twin of [`remember_doh_failure`]. Returns false
+/// when the generation changed under the lookup or a fresh positive answer
+/// already won the same-generation race.
 pub(super) fn remember_doh_failure_if_generation(host: &str, expected_gen: u64) -> bool {
-    store_cached_if_generation(
+    // Keep this gate under the same cache mutex as the generation check and
+    // insert. Otherwise a late negative result can overwrite a positive
+    // result published by a newer lookup in this generation.
+    #[cfg(test)]
+    super::dns_publish_pause::pre_publish_pause();
+    let mut cache = doh_cache().lock().unwrap_or_else(|p| p.into_inner());
+    #[cfg(test)]
+    super::dns_publish_pause::critical_section_pause();
+    if DNS_NETWORK_GENERATION.load(AtomicOrdering::SeqCst) != expected_gen {
+        return false;
+    }
+    if cache.get(host).is_some_and(|entry| {
+        entry.generation == expected_gen
+            && !entry.addrs.is_empty()
+            && entry.expires_at > Instant::now()
+    }) {
+        return false;
+    }
+    insert_capped(
+        &mut cache,
         host,
         CachedAnswer {
             addrs: Vec::new(),
@@ -280,8 +300,8 @@ pub(super) fn remember_doh_failure_if_generation(host: &str, expected_gen: u64) 
             generation: 0,
             version: 0,
         },
-        expected_gen,
-    )
+    );
+    true
 }
 
 /// TS8-01: unconditional (non-generation-gated) insert. Production callers
@@ -322,17 +342,6 @@ fn insert_capped(cache: &mut HashMap<String, CachedAnswer>, host: &str, answer: 
     cache.insert(host.to_owned(), answer);
 }
 
-/// TS8-01: generation gate: the re-check and the insert happen under ONE
-/// `doh_cache()` acquisition (the same mutex [`flush_dns_cache`] holds for
-/// bump+clear); returns false when the generation changed under the caller.
-pub(super) fn store_cached_if_generation(
-    host: &str,
-    answer: CachedAnswer,
-    expected_gen: u64,
-) -> bool {
-    store_cached_if_generation_observed(host, answer, expected_gen).is_some()
-}
-
 pub(super) fn store_cached_if_generation_observed(
     host: &str,
     answer: CachedAnswer,
@@ -365,7 +374,8 @@ pub(super) fn store_cached_if_generation_observed(
 pub(super) static DNS_NETWORK_GENERATION: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Forget every cached answer and every provider score.
+/// Forget every live cached answer and every provider score, preserving usable
+/// positive answers in the disk fallback store for the current session.
 ///
 /// Both describe the network the device is attached to, not the bridges:
 /// which resolver is reachable and which address a name maps to can both
@@ -391,10 +401,28 @@ pub fn flush_dns_cache() {
     // change), so the fence costs nothing that matters. (Relaxed would also
     // be defensible -- the cache has its own mutex -- but SeqCst is the
     // conservative default.)
-    {
+    let preserved = {
         let mut cache = doh_cache().lock().unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        let preserved = cache
+            .iter()
+            .filter(|(_, entry)| !entry.addrs.is_empty() && live_entry_is_usable(entry, now))
+            .map(|(host, entry)| {
+                (
+                    host.clone(),
+                    PersistedAnswer {
+                        addrs: entry.addrs.clone(),
+                        resolved_at_unix: entry.resolved_at_unix,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
         DNS_NETWORK_GENERATION.fetch_add(1, AtomicOrdering::SeqCst);
         cache.clear();
+        preserved
+    }; // doh_cache() lock released before disk_fallback_store() is taken
+    for (host, entry) in preserved {
+        merge_disk_fallback_entry(host, entry);
     }
     for slot in doh_scores() {
         slot.store(0, AtomicOrdering::Relaxed);
@@ -514,18 +542,11 @@ pub(super) fn merge_disk_fallback_entry(host: String, entry: PersistedAnswer) {
     }
 }
 
-/// Load the on-disk last-known-good DNS answers from a previous run into
-/// memory, for [`disk_fallback_answer`] to serve once every DoH provider and
-/// the in-memory stale fallback have both failed.
-///
-/// Call once at engine start. Deliberately independent of
-/// [`flush_dns_cache`]'s wipe of the *live* cache: this store only ever acts
-/// as an absolute last resort (see the age check in
-/// [`disk_fallback_answer`]), so carrying it across a network change cannot
-/// shadow a fresh answer -- it can only provide one where a cold start would
-/// otherwise have none at all. Silently does nothing if the file is missing
-/// or unreadable: a first run, or one with nothing worth persisting yet.
+/// Load last-known-good answers for use after live and stale DoH lookups fail.
+/// Missing or malformed files are ignored; live-cache flushes leave this store
+/// intact so a network change cannot erase the cold-start fallback.
 pub fn load_persisted_dns_cache(path: &std::path::Path) {
+    cleanup_persist_temp_files(path);
     let Ok(data) = std::fs::read_to_string(path) else {
         return;
     };
@@ -539,68 +560,62 @@ pub fn load_persisted_dns_cache(path: &std::path::Path) {
     tracing::debug!(loaded, path = %path.display(), "loaded persisted DNS fallback cache");
 }
 
-/// Persist the DNS answers a future cold start may need to `path`.
-///
-/// The union of two sources, so a periodic save can never erase what it
-/// exists to protect:
-/// - every positive answer in the live DoH cache that is still usable --
-///   inside its TTL, or within [`DNS_STALE_FALLBACK_WINDOW`] past it, the
-///   same predicate `cached_doh_answer`/`stale_fallback_answer` apply when
-///   serving -- written with its ORIGINAL `resolved_at_unix`: re-stamping
-///   would keep an aging answer perpetually fresh, every periodic save
-///   resetting the very clock the next cold start measures it by;
-/// - every on-disk fallback entry that no usable live answer replaces and
-///   whose own age still fits in [`DNS_STALE_FALLBACK_WINDOW`], also with
-///   its original stamp.
-///
-/// A live cache entry wins for a host only when it is a positive answer
-/// that is still usable: a remembered *failure*, or an answer past the
-/// fallback window, must not displace the persisted last-known-good,
-/// which is the lifeline of the next session rather than a fact about this
-/// one. Entries past the fallback window are left out and thereby expire
-/// for good. Call periodically (e.g. from the watchdog loop), not
-/// per-lookup.
-///
-/// Snapshots are taken under short-lived locks; the formatting and the
-/// file write run on tokio's blocking pool, so awaiting this from an async
-/// worker never blocks the runtime on formatting or disk I/O.
-///
-/// Concurrent or delayed saves to one path never interleave bytes and
-/// never publish a snapshot older than an already-published newer one:
-/// each call captures its snapshots AND takes its generation number in
-/// one per-path critical section, so the number always reflects the
-/// snapshot's age. Publication happens under the per-path publish lock
-/// only when the call's generation is strictly newer than the last
-/// generation actually renamed onto the path; a superseded job skips
-/// publication and returns `Ok` precisely because a snapshot at least as
-/// fresh is verifiably on disk, and removes its temp file. A job whose
-/// write or rename fails returns `Err` and does NOT prevent an older
-/// in-flight job from publishing, so a caller's `Ok` always means its own
-/// data or a strictly fresher snapshot is on disk. A cancelled caller
-/// cannot stop its already-dispatched blocking job, but that job is
-/// self-sufficient: the published-generation check makes it harmless.
-/// Residual limitation: the registry is keyed by the literal `path`
-/// spelling, so two different spellings of the same file are not mutually
-/// protected.
+/// Persist the union of usable live answers and unexpired disk fallbacks.
+/// Original timestamps are retained so periodic saves cannot rejuvenate data;
+/// failures and expired entries never displace a usable fallback. Snapshot and
+/// publication generations serialize overlapping saves and prevent rollback.
+/// Formatting and I/O run on Tokio's blocking pool.
 pub async fn save_persisted_dns_cache(path: &std::path::Path) -> std::io::Result<()> {
-    save_persisted_dns_cache_with_writer(path, |path, contents| std::fs::write(path, contents))
-        .await
+    save_persisted_dns_cache_with_writer(path, |path, contents| {
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()
+    })
+    .await
 }
 
-/// Like [`save_persisted_dns_cache`], but the write itself goes through
-/// `write`, which receives the TEMP file path (not the final one): the
-/// shared publication code publishes only when this call's generation is
-/// strictly newer than the last generation actually renamed onto the
-/// path, then performs the atomic rename from temp to final.
+fn cleanup_persist_temp_files(path: &std::path::Path) {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let prefix = format!(".{file_name}.");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_str().is_some_and(|name| {
+            if !name.starts_with(&prefix) || !name.ends_with(".tmp") {
+                return false;
+            }
+            let pid = name
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.split('.').next())
+                .and_then(|pid| pid.parse::<u32>().ok());
+            pid != Some(std::process::id())
+        }) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+#[cfg(unix)]
+fn sync_persist_parent_dir(path: &std::path::Path) {
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let _ = std::fs::File::open(dir).and_then(|file| file.sync_all());
+}
+
+#[cfg(not(unix))]
+fn sync_persist_parent_dir(_path: &std::path::Path) {}
+
+/// Testable save variant whose writer receives the temporary path.
 pub(super) async fn save_persisted_dns_cache_with_writer(
     path: &std::path::Path,
     write: impl FnOnce(&std::path::Path, &str) -> std::io::Result<()> + Send + 'static,
 ) -> std::io::Result<()> {
     let path = path.to_owned();
     let (live_snapshot, disk_snapshot, gen) = capture_persist_snapshots_with_generation(&path);
-    // The spawned job is self-sufficient: even if this caller's future is
-    // cancelled and the JoinHandle detaches, the generation check below
-    // keeps a superseded job from publishing stale data.
     tokio::task::spawn_blocking(move || {
         let lines: Vec<String> = live_snapshot
             .into_iter()
@@ -622,8 +637,6 @@ pub(super) async fn save_persisted_dns_cache_with_writer(
                 format!("persist path has no file name: {}", path.display()),
             ));
         };
-        // Same directory as the final path, so the rename stays on one
-        // filesystem and is atomic.
         let temp_path = path.with_file_name(format!(
             "{}.{}.{}.tmp",
             file_name.to_string_lossy(),
@@ -654,11 +667,10 @@ pub(super) async fn save_persisted_dns_cache_with_writer(
             let _ = std::fs::remove_file(&temp_path);
             return Ok(());
         }
-        // MoveFileEx(MOVEFILE_REPLACE_EXISTING) on Windows, rename(2) on
-        // Unix: both atomically replace the destination.
         let result = std::fs::rename(&temp_path, &path);
         match &result {
             Ok(()) => {
+                sync_persist_parent_dir(&path);
                 *state
                     .published_generation
                     .lock()

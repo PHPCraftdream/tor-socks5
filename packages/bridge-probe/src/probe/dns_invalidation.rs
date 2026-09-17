@@ -80,12 +80,14 @@ pub(crate) fn forget_dns_answer(host: &str) {
         .remove(host);
 }
 
-/// Invalidate only the cache entry that supplied every failed address. A
-/// newer answer or a different network generation is left intact.
+/// Invalidate only the cache entry that supplied every address actually tried
+/// by a failed probe. A resolver may return more addresses than the probe
+/// budget permits, so untried cached addresses must not block invalidation.
+/// A newer answer or a different network generation is left intact.
 pub(crate) fn invalidate_if_current(
     host: &str,
     observed: CacheIdentity,
-    failed_addrs: &[IpAddr],
+    tried_addrs: &[IpAddr],
 ) -> bool {
     if DNS_NETWORK_GENERATION.load(Ordering::SeqCst) != observed.generation {
         return false;
@@ -98,7 +100,8 @@ pub(crate) fn invalidate_if_current(
     };
     if cache_identity(entry) != observed
         || entry.addrs.is_empty()
-        || !entry.addrs.iter().all(|ip| failed_addrs.contains(ip))
+        || tried_addrs.is_empty()
+        || !tried_addrs.iter().all(|ip| entry.addrs.contains(ip))
     {
         return false;
     }

@@ -123,8 +123,7 @@ impl Report {
     }
 }
 
-/// Determine the `(host, port)` pair that should be probed for a given
-/// bridge, based on its transport type.
+/// Canonical parsed target shared by WebTunnel probing and identity building.
 ///
 /// - No transport or `obfs4` → `bridge.addr`.
 /// - `webtunnel` → `addr=` param if present, otherwise the host:port from
@@ -346,6 +345,9 @@ pub fn webtunnel_endpoint_identity(bridge: &BridgeLine) -> Option<WebtunnelEndpo
         })
 }
 
+/// Determine the `(host, port)` pair that should be probed for a bridge.
+/// WebTunnel uses its canonical `addr=`/URL target; other transports use the
+/// bridge-line address directly.
 pub(super) fn resolve_probe_target(bridge: &BridgeLine) -> Result<(String, u16), String> {
     match bridge.transport.as_deref() {
         None | Some("obfs4") => Ok((bridge.addr.ip().to_string(), bridge.addr.port())),
@@ -455,7 +457,7 @@ pub(super) async fn resolve_and_probe(
         }
     };
 
-    let (outcome, failed_addrs) = if let Some(plan) = &plan {
+    let (outcome, tried_addrs) = if let Some(plan) = &plan {
         webtunnel_upgrade_probe_observed(
             &resolved.addrs,
             plan,
@@ -466,13 +468,13 @@ pub(super) async fn resolve_and_probe(
         tcp_probe_observed(&resolved.addrs, per_bridge_timeout).await
     };
 
-    // Invalidate only the exact DNS answer that supplied every failed address.
+    // Invalidate only the exact DNS answer that supplied every tried address.
     // A newer answer, a different network generation, or a protocol-level
     // WebTunnel failure must remain cached for other bridge variants.
     if resolved_by_dns {
         if let Some(identity) = resolved.cache_identity {
-            let failed_ips: Vec<IpAddr> = failed_addrs.iter().map(SocketAddr::ip).collect();
-            invalidate_if_current(host.trim_end_matches('.'), identity, &failed_ips);
+            let tried_ips: Vec<IpAddr> = tried_addrs.iter().map(SocketAddr::ip).collect();
+            invalidate_if_current(host.trim_end_matches('.'), identity, &tried_ips);
         }
     }
 
