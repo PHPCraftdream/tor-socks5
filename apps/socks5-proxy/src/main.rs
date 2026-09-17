@@ -21,6 +21,8 @@ mod startup;
 mod test_seams;
 mod tor_setup;
 mod tor_watchdog;
+#[cfg(test)]
+mod ts19_tests;
 mod upstream;
 mod users_cli;
 

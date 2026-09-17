@@ -368,7 +368,12 @@ async fn engine_async(
     // provider and the in-memory stale fallback have both failed this run.
     // Carrying it across a network change cannot shadow a fresh answer --
     // it can only provide one where a cold start would otherwise have none.
-    bridge_probe::load_persisted_dns_cache(&dns_cache_path(bridge_health.config_path.as_deref()));
+    // Blocking file read (incl. reader-side temp sweep) — must not run on an
+    // async worker (TS19-01); same off-worker rule as every other store load.
+    bridge_probe::load_persisted_dns_cache_async(&dns_cache_path(
+        bridge_health.config_path.as_deref(),
+    ))
+    .await;
 
     // Create a shared callback that updates status AND emits to Java
     // Set once `engine_async` itself has declared the engine On (see the explicit

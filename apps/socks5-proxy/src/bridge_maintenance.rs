@@ -154,6 +154,21 @@ pub(crate) fn spawn(
     })
 }
 
+/// `Config::load_with_override` does blocking file I/O (config read plus
+/// reader-side stale-temp cleanup); run it on Tokio's blocking pool so it
+/// cannot stall an async worker (TS19-01).
+pub(crate) async fn load_config_off_worker(path: Option<&Path>) -> Result<Config> {
+    let path = path.map(Path::to_path_buf);
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        crate::test_seams::note_task_context(crate::test_seams::Site::MaintenanceConfigLoad);
+        crate::config::Config::load_with_override(path.as_deref())
+            .map(|loaded| loaded.into_config())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("config load task failed: {e}"))?
+}
+
 async fn refresh(
     handle: &TorHandle,
     path: Option<&Path>,
@@ -162,7 +177,7 @@ async fn refresh(
     next_recovery: &mut Instant,
     channel_cursor: &mut usize,
 ) -> Result<()> {
-    let cfg = Config::load_with_override(path)?.into_config();
+    let cfg = load_config_off_worker(path).await?;
     let Some(tor) = handle.tunnel().await else {
         return Ok(());
     };

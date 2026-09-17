@@ -49,6 +49,95 @@ fn load_spares_temp_owned_by_live_writer() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// TS19-01: while another participant holds the store's `.templock` section,
+/// `load` must still return the stored data promptly (cleanup skips, never
+/// waits) and must not touch a live writer's temp. Mechanism-level
+/// counterfactual lives in persist-lock (blocking revert there panics this
+/// shape's recv_timeout guard); this pins the reader-facing contract.
+#[test]
+fn load_under_busy_templock_returns_data_and_spares_live_temp() {
+    let dir = tmp_dir();
+    let path = dir.join("alive.log");
+    std::fs::write(&path, format!("{OBFS4_A}\n")).unwrap();
+
+    // Live writer's canonical temp, lock held by this process's guard.
+    let guard = persist_lock::TempFileGuard::create(&path, 1).expect("guard");
+    // Dead leftover temp nobody owns; a later load must sweep it.
+    let dead = dir.join(".alive.log.999.42.tmp");
+    std::fs::write(&dead, b"partial").unwrap();
+
+    // A second participant holds the store's .templock section. The lock is
+    // taken on the thread that owns the handle: a byte-range lock belongs to
+    // the handle, and taking it twice on the same handle is not a no-op.
+    let templock = path.with_file_name(format!(
+        "{}.templock",
+        path.file_name().unwrap().to_string_lossy()
+    ));
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder_handle = std::thread::spawn(move || {
+        let holder = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&templock)
+            .expect("open templock");
+        holder.lock().expect("lock templock");
+        held_tx.send(()).expect("send held");
+        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+        drop(holder);
+    });
+    held_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("holder acquired templock");
+
+    // Reader must not block on the busy templock.
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let read_path = path.clone();
+    let reader = std::thread::spawn(move || {
+        let store = BridgeStore::load(read_path).expect("load");
+        done_tx.send(store).expect("send store");
+    });
+    let store = done_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap_or_else(|_| {
+            panic!("TS19-01: reader blocked on a busy templock instead of skipping")
+        });
+    assert_eq!(
+        store.len(),
+        1,
+        "stored data must be returned despite the busy templock"
+    );
+    assert!(
+        guard.temp_path().exists(),
+        "a live writer's temp must not be swept while the templock is busy"
+    );
+    assert!(
+        dead.exists(),
+        "dead temp must be skipped while the templock is busy"
+    );
+
+    reader.join().expect("reader thread");
+    release_tx.send(()).expect("release holder");
+    holder_handle.join().expect("holder thread");
+
+    // Once the templock is free, a load sweeps the dead temp and spares the
+    // live one.
+    let store = BridgeStore::load(path.clone()).expect("second load");
+    assert_eq!(store.len(), 1, "entry must survive both loads");
+    assert!(
+        !dead.exists(),
+        "dead temp must be swept once the templock is free"
+    );
+    assert!(
+        guard.temp_path().exists(),
+        "live writer's temp must survive the post-release sweep"
+    );
+
+    drop(guard);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn load_spares_malformed_temp_names() {
     let dir = tmp_dir();

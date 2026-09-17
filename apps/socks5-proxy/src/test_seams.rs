@@ -27,6 +27,11 @@ pub(crate) enum Site {
     /// it touches the config. Used with the failure-injection registry, not
     /// the park gates.
     ConfigPromotion,
+    /// TS19-01 recorder site: `bridge_maintenance::load_config_off_worker`.
+    MaintenanceConfigLoad,
+    /// TS19-01 recorder site: `bridge_verifier::run_circuit_verify_tick`'s
+    /// bridge-store load.
+    CircuitVerifyStoreLoad,
 }
 
 /// Guard for waits that must succeed (a transaction reaching its gated
@@ -205,4 +210,36 @@ pub(crate) fn take_failure(site: Site, path: &Path) -> bool {
         .lock()
         .expect("failure registry")
         .remove(&(site, path.to_path_buf()))
+}
+
+/// TS19-01 seam: records, per site, which thread actually executed the
+/// blocking file read. Comparing it with the caller's thread is what makes
+/// "ran off the async worker" observable: an inline call necessarily runs on
+/// the caller's thread (no `.await` sits between the async fn's entry and the
+/// blocking work), a `spawn_blocking` one cannot.
+///
+/// Tokio's own `task::try_id()` is NOT a usable discriminator here:
+/// `spawn_blocking` wraps the closure in a `BlockingTask` future that is
+/// polled as a real task, so a task id is present on the blocking pool as
+/// well as on a worker.
+static RAN_ON_THREAD: OnceLock<Mutex<HashMap<Site, std::thread::ThreadId>>> = OnceLock::new();
+
+/// Called from inside each blocking-read site; records the executing thread
+/// for `ran_on_thread`.
+pub(crate) fn note_task_context(site: Site) {
+    let mut records = RAN_ON_THREAD
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    records.insert(site, std::thread::current().id());
+}
+
+/// The thread that executed the site's blocking read, if recorded yet.
+pub(crate) fn ran_on_thread(site: Site) -> Option<std::thread::ThreadId> {
+    RAN_ON_THREAD
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&site)
+        .copied()
 }

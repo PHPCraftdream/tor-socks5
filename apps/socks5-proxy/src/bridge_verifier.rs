@@ -273,9 +273,18 @@ pub(crate) fn spawn_bridge_circuit_verifier(
 }
 
 /// One tick: pick the due batch, verify it, persist the results.
-async fn run_circuit_verify_tick(config_path: Option<&Path>, active: &[BridgeLine]) {
-    let due = match BridgeStore::load(BridgeStore::resolve_path(config_path)) {
-        Ok(store) => store.needing_circuit_verification(
+pub(crate) async fn run_circuit_verify_tick(config_path: Option<&Path>, active: &[BridgeLine]) {
+    let store_path = BridgeStore::resolve_path(config_path);
+    // Blocking file read (incl. reader-side stale-temp cleanup) must not run
+    // on an async worker (TS19-01).
+    let due = match tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        crate::test_seams::note_task_context(crate::test_seams::Site::CircuitVerifyStoreLoad);
+        BridgeStore::load(store_path)
+    })
+    .await
+    {
+        Ok(Ok(store)) => store.needing_circuit_verification(
             OffsetDateTime::now_utc(),
             CIRCUIT_VERIFY_MAX_AGE,
             CIRCUIT_VERIFY_BATCH,
@@ -284,8 +293,12 @@ async fn run_circuit_verify_tick(config_path: Option<&Path>, active: &[BridgeLin
             // inactive bridges and starve the actives.
             |bridge| active.contains(bridge),
         ),
-        Err(error) => {
+        Ok(Err(error)) => {
             warn!(error = %error, "circuit-verify: failed to load bridge store");
+            return;
+        }
+        Err(error) => {
+            warn!(error = %error, "circuit-verify: bridge-store load task failed");
             return;
         }
     };

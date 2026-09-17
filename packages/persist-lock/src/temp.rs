@@ -52,6 +52,19 @@
 //! deployments a missing companion does NOT prove the writer is dead, and
 //! cleanup's delete-on-missing-companion rule must not be read as a
 //! guarantee over foreign writers.
+//!
+//! # Mandatory vs best-effort templock acquisition (TS19-01)
+//!
+//! [`TempLock`] has two explicit constructors. Writers and critical
+//! removals (`TempFileGuard::create`, `TempFileGuard::drop`) use the
+//! BLOCKING [`TempLock::acquire`]: skipping there would let two
+//! participants run name-state transitions concurrently, re-opening
+//! TS18-01. Reader-side cleanup (`remove_temp_if_unlocked`, the
+//! orphan-companion sweep) uses the NON-BLOCKING
+//! [`TempLock::try_acquire`]: a busy section means another participant is
+//! mid name-state transition, so the candidate behind it is either live or
+//! about to be resolved by its own owner — the best-effort sweep simply
+//! skips it and a later reader sweeps what remains.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -77,6 +90,11 @@ pub(crate) mod seam {
     /// How long a test waits for a participant to reach a slot before
     /// concluding it never will.
     pub const WAIT_PARKED_TIMEOUT: Duration = Duration::from_secs(10);
+    /// How long a "must NOT happen" wait is bounded: long enough that a
+    /// broken protocol (which reaches the forbidden slot within
+    /// microseconds) is caught, without stalling the test suite when the
+    /// protocol is correct and the slot is genuinely never reached.
+    pub const NEGATIVE_WAIT: Duration = Duration::from_secs(2);
 
     /// `TempFileGuard::create`: parked before the writer can establish
     /// ownership of the companion (before its `try_lock`; in the pre-TS18-01
@@ -178,11 +196,10 @@ pub(crate) mod seam {
         released
     }
 
-    /// Wait until some thread is parked at `idx`, bounded by
-    /// [`WAIT_PARKED_TIMEOUT`]; `false` on timeout (no stale parked flag is
-    /// left behind).
-    pub fn wait_parked(idx: usize) -> bool {
-        let deadline = std::time::Instant::now() + WAIT_PARKED_TIMEOUT;
+    /// Wait until some thread is parked at `idx`, bounded by the caller's
+    /// `timeout`; `false` on timeout (no stale parked flag is left behind).
+    pub fn wait_parked_bounded(idx: usize, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
         let mut slots = slots().lock().unwrap();
         loop {
             if slots.get(&idx).is_some_and(|s| s.parked) {
@@ -198,6 +215,13 @@ pub(crate) mod seam {
             let (s, _t) = CONDVAR.wait_timeout(slots, deadline - now).unwrap();
             slots = s;
         }
+    }
+
+    /// Wait until some thread is parked at `idx`, bounded by
+    /// [`WAIT_PARKED_TIMEOUT`]; `false` on timeout (no stale parked flag is
+    /// left behind).
+    pub fn wait_parked(idx: usize) -> bool {
+        wait_parked_bounded(idx, WAIT_PARKED_TIMEOUT)
     }
 
     /// Release the thread parked at `idx`.
@@ -250,23 +274,54 @@ struct TempLock {
 }
 
 impl TempLock {
-    fn acquire(target: &Path) -> io::Result<Self> {
+    /// Open the templock file (created on demand), without locking.
+    fn open_templock(target: &Path) -> io::Result<File> {
         let templock_path = templock_path_for(target);
         if let Some(dir) = templock_path.parent() {
             if !dir.as_os_str().is_empty() {
                 fs::create_dir_all(dir).ok();
             }
         }
-        let file = OpenOptions::new()
+        OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(false)
             .open(&templock_path)
-            .map_err(|e| with_context(e, "create", &templock_path))?;
+            .map_err(|e| with_context(e, "create", &templock_path))
+    }
+
+    /// BLOCKING acquisition — the mandatory path. Used ONLY by
+    /// [`TempFileGuard::create`] (ownership establishment) and
+    /// [`TempFileGuard::drop`] (critical removals). A writer/remover MUST
+    /// wait rather than skip: skipping would let two participants run
+    /// name-state transitions concurrently, re-opening TS18-01 (a
+    /// companion unlinked while its writer sits between open and
+    /// `try_lock`; a later sweep then deletes a live writer's temp).
+    /// Waiting is bounded in practice: the section covers a few syscalls,
+    /// and the kernel releases the lock if the holder dies. Reader-side
+    /// cleanup must NEVER call this — see [`Self::try_acquire`].
+    fn acquire(target: &Path) -> io::Result<Self> {
+        let file = Self::open_templock(target)?;
         // Blocking: the holder keeps it only for a few syscalls, and the
         // kernel releases it if the holder dies.
         file.lock()
-            .map_err(|e| with_context(e, "lock", &templock_path))?;
+            .map_err(|e| with_context(e, "lock", &templock_path_for(target)))?;
+        Ok(Self { file })
+    }
+
+    /// NON-BLOCKING acquisition — the best-effort reader-cleanup path.
+    /// Used ONLY by reader-side cleanup (`remove_temp_if_unlocked`, the
+    /// orphan-companion sweep): `WouldBlock` means another participant is
+    /// mid name-state transition, so whatever sits behind the section is
+    /// not ours to sweep — it is either live or about to be resolved by
+    /// its own owner. Skipping is harmless: cleanup is opportunistic
+    /// sweeping of dead writers' leftovers, and a later reader sweeps what
+    /// remains. NEVER call this from a writer or a critical removal —
+    /// see [`Self::acquire`].
+    fn try_acquire(target: &Path) -> io::Result<Self> {
+        let file = Self::open_templock(target)?;
+        file.try_lock()
+            .map_err(|e| with_context(e.into(), "try_lock", &templock_path_for(target)))?;
         Ok(Self { file })
     }
 }
@@ -517,9 +572,15 @@ impl Drop for TempFileGuard {
 /// against writers and other cleanups; the advisory companion lock remains
 /// the liveness proof (the kernel releases it on holder death). Never blocks
 /// on the companion: returns true if the file is gone afterwards (including
-/// NotFound), false if a live owner holds it or the attempt errored.
+/// NotFound), false if a live owner holds it, the templock section is busy,
+/// or the attempt errored.
+///
+/// The templock section is acquired NON-blocking (TS19-01): this is
+/// best-effort reader cleanup, so a busy section — another writer or
+/// cleanup mid name-state transition — means this candidate is SKIPPED
+/// (returns false) instead of being waited on.
 pub fn remove_temp_if_unlocked(target: &Path, temp: &Path) -> bool {
-    let Ok(_section) = TempLock::acquire(target) else {
+    let Ok(_section) = TempLock::try_acquire(target) else {
         return false;
     };
     let lock_path = lock_path_for(temp);
@@ -546,7 +607,10 @@ pub fn remove_temp_if_unlocked(target: &Path, temp: &Path) -> bool {
 /// [`parse_temp_name`], every candidate through
 /// [`remove_temp_if_unlocked`]. Read-only with respect to any live writer.
 /// Best-effort overall: a missing directory or unreadable entries are
-/// silently ignored (same policy as the helpers this replaces).
+/// silently ignored (same policy as the helpers this replaces). Candidates
+/// are also SKIPPED while the target's templock section is busy (TS19-01):
+/// the sweep never blocks on, or races behind, an in-flight name-state
+/// transition; a later reader sweeps what remains.
 pub fn cleanup_temp_files(target: &Path) {
     cleanup_temp_files_with(target, |_| false);
 }
@@ -587,8 +651,10 @@ pub fn cleanup_temp_files_with(target: &Path, legacy_match: impl Fn(&str) -> boo
     }
     for (lock, temp) in orphan_locks {
         // Re-check orphanhood INSIDE the section: a writer may have created
-        // the temp between the scan above and now.
-        let Ok(_section) = TempLock::acquire(target) else {
+        // the temp between the scan above and now. Non-blocking (TS19-01):
+        // a busy section means this orphan is mid-transition elsewhere, so
+        // skip it — a later reader sweeps what remains.
+        let Ok(_section) = TempLock::try_acquire(target) else {
             continue;
         };
         if temp.exists() {

@@ -1,5 +1,4 @@
 use super::probe::dns_invalidation::{cache_identity, next_cache_version};
-use super::probe::resolve_probe_target;
 use super::*;
 
 #[cfg(test)]
@@ -194,7 +193,7 @@ pub(super) enum CacheHit {
 /// SAME predicate `cached_doh_answer`/`stale_fallback_answer` effectively
 /// apply, reused here so export/priority decisions cannot disagree with
 /// what would actually be served live (TS5-04).
-fn live_entry_is_usable(entry: &CachedAnswer, now: Instant) -> bool {
+pub(super) fn live_entry_is_usable(entry: &CachedAnswer, now: Instant) -> bool {
     entry.expires_at > now || now.duration_since(entry.expires_at) <= DNS_STALE_FALLBACK_WINDOW
 }
 
@@ -591,6 +590,50 @@ pub fn load_persisted_dns_cache(path: &std::path::Path) {
     tracing::debug!(loaded, path = %path.display(), "loaded persisted DNS fallback cache");
 }
 
+/// Async counterpart of [`load_persisted_dns_cache`]: the disk read and the
+/// reader-side temp sweep it performs are blocking file I/O, so they run on
+/// Tokio's blocking pool and never on an async worker (TS19-01). Best-effort
+/// like the sync version; a blocking job that fails to join is logged and
+/// otherwise ignored, exactly as an unreadable file would be.
+pub async fn load_persisted_dns_cache_async(path: &std::path::Path) {
+    let path = path.to_owned();
+    let join = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        note_dns_load_thread();
+        load_persisted_dns_cache(&path);
+    })
+    .await;
+    if let Err(error) = join {
+        tracing::debug!(%error, "persisted DNS fallback load task failed");
+    }
+}
+
+/// TS19-01 seam: which thread actually executed the load. Comparing it with
+/// the caller's thread is what makes "ran off the async worker" observable:
+/// an inline call necessarily runs on the caller's thread (there is no
+/// `.await` between), a `spawn_blocking` one cannot. Tokio's own
+/// `task::try_id()` is NOT a usable discriminator here — `spawn_blocking`
+/// wraps the closure in a `BlockingTask` future that is polled as a real
+/// task, so a task id is present on both sides.
+#[cfg(test)]
+static DNS_LOAD_THREAD: std::sync::Mutex<Option<std::thread::ThreadId>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn note_dns_load_thread() {
+    *DNS_LOAD_THREAD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(std::thread::current().id());
+}
+
+/// The thread that ran the load, if one has been recorded yet.
+#[cfg(test)]
+pub(crate) fn dns_load_thread_recorded() -> Option<std::thread::ThreadId> {
+    *DNS_LOAD_THREAD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Persist the union of usable live answers and unexpired disk fallbacks.
 /// Original timestamps are retained so periodic saves cannot rejuvenate data;
 /// failures and expired entries never displace a usable fallback. Snapshot and
@@ -824,138 +867,6 @@ pub(super) fn disk_fallback_answer(host: &str) -> Option<Vec<IpAddr>> {
         return None;
     }
     Some(entry.addrs.clone())
-}
-
-/// A portable DNS resolution, shareable across devices and processes.
-///
-/// Shareability is the whole point of this type existing separately from the
-/// internal [`CachedAnswer`]/[`PersistedAnswer`] representations: an answer
-/// only belongs here if the (host, addrs) pairing is a fact about the
-/// Internet, not a fact about the network the resolving device happened to
-/// be on. A CDN-fronted hostname's resolved IP is viewpoint-dependent and
-/// must never become a `DnsHint` -- see [`best_known_answer`], the only
-/// constructor, for where that line is actually drawn.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DnsHint {
-    pub host: String,
-    pub addrs: Vec<IpAddr>,
-    pub resolved_at_unix: u64,
-}
-
-/// Prefix marking a DNS-hint directive line among otherwise plain bridge
-/// lines (see `proxy-config::BridgesConfig::parsed`, which must recognise
-/// and divert these before attempting to parse a line as a `BridgeLine`).
-/// Chosen to look like an ordinary comment to anything that does not know
-/// about it, and to be unambiguous with any real bridge-line syntax.
-pub const DNS_HINT_PREFIX: &str = "# xorbot:dns ";
-
-/// Render one hint as `"{DNS_HINT_PREFIX}{host} {ip1,ip2,...} {resolved_at_unix}"`.
-pub fn format_dns_hint_line(hint: &DnsHint) -> String {
-    let addrs = hint
-        .addrs
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(
-        "{DNS_HINT_PREFIX}{} {addrs} {}",
-        hint.host, hint.resolved_at_unix
-    )
-}
-
-/// Parse one directive line produced by [`format_dns_hint_line`]. `None` for
-/// anything that is not a well-formed hint line, including a plain bridge
-/// line or an unrelated comment -- callers should treat that the same as
-/// "not a hint", never as an error. A `resolved_at_unix` further ahead than
-/// [`DNS_TIMESTAMP_FUTURE_TOLERANCE`] is likewise rejected as malformed.
-pub fn parse_dns_hint_line(line: &str) -> Option<DnsHint> {
-    let rest = line.strip_prefix(DNS_HINT_PREFIX)?;
-    let mut parts = rest.split_whitespace();
-    let host = parts.next()?.to_owned();
-    let addrs: Vec<IpAddr> = parts
-        .next()?
-        .split(',')
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    let resolved_at_unix: u64 = parts.next()?.parse().ok()?;
-    if addrs.is_empty() || stamp_beyond_future_tolerance(resolved_at_unix) {
-        return None;
-    }
-    Some(DnsHint {
-        host,
-        addrs,
-        resolved_at_unix,
-    })
-}
-
-/// The hostname `bridge` needs resolved, if any.
-///
-/// `None` when the bridge's own target is already a literal IP (obfs4 and
-/// plain bridges: the address in the bridge line itself; a webtunnel bridge
-/// pinned via `addr=`) -- there is nothing to hint at for those. `Some` only
-/// for a webtunnel bridge whose target comes from a `url=` hostname, the one
-/// case that actually costs a DNS lookup.
-pub fn dns_hostname_of(bridge: &BridgeLine) -> Option<String> {
-    let (host, _port) = resolve_probe_target(bridge).ok()?;
-    if host.parse::<IpAddr>().is_ok() {
-        return None;
-    }
-    Some(host)
-}
-
-/// The best answer currently known for `host`, wall-clock-stamped, from
-/// whichever tier has one: the live cache (fresh, or stale-but-inside the
-/// fallback window) first, then the on-disk store from a previous run.
-/// Read-only -- never attempts a network resolution. This is the query side
-/// of exporting [`DnsHint`]s (see `dns_hostname_of` for picking which
-/// bridges are worth asking about); resolving a hostname to serve live
-/// traffic goes through [`resolve_addrs`] instead.
-pub fn best_known_answer(host: &str) -> Option<DnsHint> {
-    {
-        let cache = doh_cache().lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(entry) = cache.get(host) {
-            if !entry.addrs.is_empty() && live_entry_is_usable(entry, Instant::now()) {
-                return Some(DnsHint {
-                    host: host.to_owned(),
-                    addrs: entry.addrs.clone(),
-                    resolved_at_unix: entry.resolved_at_unix,
-                });
-            }
-        }
-    }
-    let store = disk_fallback_store()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    let entry = store.get(host)?;
-    let age = now_unix().saturating_sub(entry.resolved_at_unix);
-    if age > DNS_STALE_FALLBACK_WINDOW.as_secs() {
-        return None;
-    }
-    Some(DnsHint {
-        host: host.to_owned(),
-        addrs: entry.addrs.clone(),
-        resolved_at_unix: entry.resolved_at_unix,
-    })
-}
-
-/// Merge imported [`DnsHint`]s into the on-disk fallback store, so an
-/// imported bridge (typically from a QR code, see
-/// `proxy-config::BridgesConfig::parsed`'s scope check on the caller side)
-/// can skip DNS entirely on a device whose network cannot resolve it.
-///
-/// Last-write-wins by `resolved_at_unix` via the same merge as
-/// [`load_persisted_dns_cache`] -- call order between the two never matters.
-pub fn seed_disk_fallback(hints: &[DnsHint]) {
-    for hint in hints {
-        merge_disk_fallback_entry(
-            hint.host.clone(),
-            PersistedAnswer {
-                addrs: hint.addrs.clone(),
-                resolved_at_unix: hint.resolved_at_unix,
-            },
-        );
-    }
 }
 
 /// Running tally per provider: `+1` when it answers, `-1` when it does not.

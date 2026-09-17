@@ -21,7 +21,6 @@ use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use bridge_line::BridgeLine;
 #[allow(unused_imports)]
 use futures::stream::{self, StreamExt};
 #[allow(unused_imports)]
@@ -31,12 +30,16 @@ use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 mod dns;
+mod dns_hint;
 mod probe;
 
 pub use dns::{
-    best_known_answer, dns_hostname_of, flush_dns_cache, format_dns_hint_line,
-    load_persisted_dns_cache, parse_dns_hint_line, save_persisted_dns_cache, seed_disk_fallback,
-    DnsHint, ResolverPolicy, DNS_HINT_PREFIX,
+    flush_dns_cache, load_persisted_dns_cache, load_persisted_dns_cache_async,
+    save_persisted_dns_cache, ResolverPolicy,
+};
+pub use dns_hint::{
+    best_known_answer, dns_hostname_of, format_dns_hint_line, parse_dns_hint_line,
+    seed_disk_fallback, DnsHint, DNS_HINT_PREFIX,
 };
 pub use probe::{
     bridge_identity, probe_all, probe_all_with_policy, probe_and_sort, probe_and_sort_with_policy,

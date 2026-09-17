@@ -406,3 +406,168 @@ fn cleanup_window_in_remove_temp_if_unlocked_cannot_kill_a_new_writer() {
     seam::disarm(seam::UNLOCKED_BEFORE_UNLINK);
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// TS19-01, test 1: while some other participant holds the target's
+/// templock section, reader cleanup must SKIP every candidate (live temp,
+/// dead temp, orphan companion) instead of blocking on the busy section.
+/// Everything skipped in one pass is swept by a later cleanup once the
+/// section is free.
+#[test]
+fn cleanup_skips_everything_while_templock_is_busy_elsewhere() {
+    let dir = tmp_dir();
+    let target = dir.join("store.log");
+
+    // A live writer: its temp and companion must survive every cleanup.
+    let guard = TempFileGuard::create(&target, 4).unwrap();
+    // A dead writer's temp (no companion, no lock behind it).
+    let dead = dir.join(".store.log.12345.77.tmp");
+    fs::write(&dead, b"dead owner").unwrap();
+    // An orphan companion (temp already renamed away by its dead writer).
+    let orphan = lock_path_for(&dir.join(temp_file_name("store.log", 4242, 5)));
+    fs::write(&orphan, b"").unwrap();
+
+    // Hold the templock from a foreign thread, exactly like another
+    // participant mid name-state transition would.
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder_target = target.clone();
+    let holder = std::thread::spawn(move || {
+        let path = templock_path_for(&holder_target);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .expect("holder opens the templock");
+        file.lock().expect("holder locks the templock");
+        held_tx.send(()).expect("holder reports held");
+        // Bounded wait so the test always unwinds even if it fails.
+        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+    });
+    held_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("holder never acquired the templock");
+
+    // Cleanup must return promptly (skip), not block on the busy section.
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let cleanup_target = target.clone();
+    let cleanup = std::thread::spawn(move || {
+        cleanup_temp_files(&cleanup_target);
+        done_tx.send(()).expect("cleanup reports completion");
+    });
+    assert!(
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok(),
+        "TS19-01: reader cleanup blocked on a busy templock instead of \
+         skipping"
+    );
+
+    // While the section was busy, EVERYTHING was skipped — this documents
+    // the skip, not a partial sweep.
+    assert!(
+        guard.temp_path().exists(),
+        "live temp must survive the skip"
+    );
+    assert!(
+        lock_path_for(guard.temp_path()).exists(),
+        "live companion must survive the skip"
+    );
+    assert!(
+        dead.exists(),
+        "dead temp must still exist (skipped, not swept)"
+    );
+    assert!(
+        orphan.exists(),
+        "orphan companion must still exist (skipped, not swept)"
+    );
+
+    // Release the holder; the next cleanup sweeps the leftovers normally.
+    drop(release_tx);
+    holder.join().unwrap();
+    cleanup.join().unwrap();
+
+    cleanup_temp_files(&target);
+    assert!(!dead.exists(), "dead temp swept once the section is free");
+    assert!(
+        !orphan.exists(),
+        "orphan companion swept once the section is free"
+    );
+    assert!(
+        guard.temp_path().exists(),
+        "live temp survives both cleanups"
+    );
+    assert!(
+        lock_path_for(guard.temp_path()).exists(),
+        "live companion survives both cleanups"
+    );
+
+    drop(guard);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// TS19-01, test 2: a writer's `create` must BLOCK on a busy templock
+/// section and proceed only once the holder releases — serialization, not
+/// failure and not a lock-free dash through the section.
+#[test]
+fn writer_create_blocks_while_templock_is_busy_then_proceeds() {
+    let _serial = FORCING.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tmp_dir();
+    let target = dir.join("store.log");
+
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder_target = target.clone();
+    let holder = std::thread::spawn(move || {
+        let path = templock_path_for(&holder_target);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .expect("holder opens the templock");
+        file.lock().expect("holder locks the templock");
+        held_tx.send(()).expect("holder reports held");
+        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+    });
+    held_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("holder never acquired the templock");
+
+    seam::arm(seam::CREATE_BEFORE_OWNERSHIP);
+    let writer = {
+        let target = target.clone();
+        std::thread::spawn(move || {
+            seam::enable();
+            TempFileGuard::create(&target, 11)
+        })
+    };
+
+    // NEGATIVE wait: while the holder owns the section, the writer must be
+    // blocked on the templock and never reach the ownership seam.
+    assert!(
+        !seam::wait_parked_bounded(seam::CREATE_BEFORE_OWNERSHIP, seam::NEGATIVE_WAIT),
+        "TS19-01 regression: writer create reached the ownership seam while \
+         another writer held the templock"
+    );
+
+    // Release the holder; the writer must now acquire the section and park.
+    drop(release_tx);
+    holder.join().unwrap();
+    assert!(
+        seam::wait_parked(seam::CREATE_BEFORE_OWNERSHIP),
+        "writer never reached the ownership seam after the holder released"
+    );
+    seam::release(seam::CREATE_BEFORE_OWNERSHIP);
+    seam::disarm(seam::CREATE_BEFORE_OWNERSHIP);
+
+    // Blocked-then-proceeded, not failed.
+    let mut guard = writer.join().unwrap().expect("create must succeed");
+    let temp = guard.temp_path().to_path_buf();
+    assert!(temp.exists(), "writer's temp must exist after create");
+    guard.write_all(b"ts19-01").unwrap();
+    guard.finish().expect("publish must succeed");
+    assert_eq!(fs::read(&target).unwrap(), b"ts19-01");
+
+    let _ = fs::remove_dir_all(&dir);
+}
