@@ -18,7 +18,6 @@
 //! ```
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -73,47 +72,26 @@ impl UsersConfig {
         }
     }
 
-    /// Atomic write via sibling temp file + rename, like our other
-    /// stores. The temp-file name is unique per call (pid + monotonic
-    /// sequence), so concurrent saves never collide; the final rename is
-    /// atomic, so readers see the old or the new full file, never a torn
+    /// Atomic write via [`persist_lock::TempFileGuard`]: a sibling temp
+    /// whose canonical name is built and recognised by the one
+    /// builder/recogniser pair (`persist_lock::temp_file_name` /
+    /// `parse_temp_name`), owned for the whole create→rename span by an
+    /// advisory exclusive lock on a companion `<temp>.lock` file, so a
+    /// concurrent reader's stale-temp cleanup only deletes a temp whose
+    /// owner provably died (TS17-01/04 class). The final rename is
+    /// atomic: readers see the old or the new full file, never a torn
     /// one. Creates the parent directory if missing.
     pub fn save(&self, path: &Path) -> Result<()> {
         let body = ktav::to_string(self).context("serialise users config")?;
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent).ok();
-            }
-        }
-        let dir = path.parent().unwrap_or_else(|| Path::new("."));
-        let file_name = path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| DEFAULT_FILE.to_string());
         let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp = dir.join(format!(".{file_name}.{}.{seq}.tmp", std::process::id()));
-        let write_out = || -> Result<()> {
-            {
-                let mut f =
-                    fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-                f.write_all(body.as_bytes())
-                    .with_context(|| format!("write {}", tmp.display()))?;
-                f.sync_all()
-                    .with_context(|| format!("fsync {}", tmp.display()))?;
-            }
-            fs::rename(&tmp, path)
-                .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))?;
-            Ok(())
-        };
-        match write_out() {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                // Best-effort cleanup of the failed temp file; never masks
-                // the original error.
-                let _ = fs::remove_file(&tmp);
-                Err(err)
-            }
-        }
+        let mut guard = persist_lock::TempFileGuard::create(path, seq)?;
+        guard
+            .write_all(body.as_bytes())
+            .with_context(|| format!("write {}", guard.temp_path().display()))?;
+        guard
+            .finish()
+            .with_context(|| format!("publish {}", path.display()))?;
+        Ok(())
     }
 
     /// Locate a user by name. Returns `None` if no such record exists.

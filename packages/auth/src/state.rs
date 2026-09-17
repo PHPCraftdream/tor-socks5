@@ -24,11 +24,16 @@
 //!   `init`, still claimable by a later client. The registry write-lock
 //!   is held across the state transition **and** the save, so
 //!   concurrent resolutions of different `init` accounts cannot write
-//!   an older snapshot over a newer one; before each TOFU transition
-//!   the on-disk registry is re-read, so edits made concurrently by
-//!   CLI `tor-socks5 users ...` commands (separate process, atomic
-//!   whole-file read-modify-write) are incorporated rather than
-//!   clobbered. The first connection to arrive wins; any concurrent
+//!   an older snapshot over a newer one. Every writer of the registry —
+//!   this TOFU write-back and every CLI `tor-socks5 users ...`
+//!   mutation in another process — also holds a cross-process
+//!   transaction lock ([`persist_lock::PathLock`], sibling
+//!   `<users-file>.lock`) across its whole read-modify-write: the
+//!   on-disk registry is re-read **under** that lock and the save
+//!   publishes before it is released, so a concurrent CLI edit is
+//!   serialised behind (or ahead of) the transition+save pair instead
+//!   of being clobbered by a stale snapshot. The first connection to
+//!   arrive wins; any concurrent
 //!   connection offering a different password is then checked against
 //!   the freshly set hash and rejected.
 
@@ -38,6 +43,7 @@ use std::sync::RwLock;
 use anyhow::Result;
 use dashmap::DashMap;
 use hmac::{Hmac, Mac};
+use persist_lock::PathLock;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
@@ -85,6 +91,13 @@ pub struct AuthState {
     /// Never present in production builds.
     #[cfg(test)]
     save_hook: std::sync::OnceLock<Box<dyn Fn() -> anyhow::Result<()> + Send + Sync>>,
+    /// Test-only hook invoked immediately before the cross-process
+    /// registry transaction lock is taken in `resolve_init` (after the
+    /// password hash is computed), letting tests prove the lock ordering
+    /// and edit the registry in the seam window. Never present in
+    /// production builds.
+    #[cfg(test)]
+    lock_hook: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// Test-only hook invoked immediately before the Argon2id
     /// `verify_hash` call in `verify_with_cache`, letting tests park a
     /// verification at a deterministic point. Never present in
@@ -118,6 +131,8 @@ impl AuthState {
             #[cfg(test)]
             save_hook: std::sync::OnceLock::new(),
             #[cfg(test)]
+            lock_hook: std::sync::OnceLock::new(),
+            #[cfg(test)]
             verify_hook: std::sync::OnceLock::new(),
         })
     }
@@ -137,6 +152,15 @@ impl AuthState {
     #[cfg(test)]
     pub(crate) fn set_save_hook(&self, f: Box<dyn Fn() -> anyhow::Result<()> + Send + Sync>) {
         let _ = self.save_hook.set(f);
+    }
+
+    /// Test-only hook: install a callback invoked immediately before the
+    /// cross-process registry transaction lock is acquired in
+    /// `resolve_init`. The callback may block to force deterministic
+    /// interleavings.
+    #[cfg(test)]
+    pub(crate) fn set_lock_hook(&self, f: Box<dyn Fn() + Send + Sync>) {
+        let _ = self.lock_hook.set(f);
     }
 
     /// Number of users known to this authenticator.
@@ -271,16 +295,23 @@ impl AuthState {
     /// only once the save is confirmed — populate the cache and accept
     /// the login.
     ///
-    /// Concurrency contract: the write-lock is held across the state
-    /// transition **and** the disk save, so the transition+save pair is
-    /// one atomic operation. This makes concurrent resolutions of
-    /// different `init` accounts monotonic (a stale snapshot can never
-    /// overwrite a newer one) and lets us re-read the on-disk registry
-    /// before the transition, so concurrent CLI edits from a separate
-    /// process are incorporated instead of clobbered. If the save
-    /// fails, the login is refused, memory and cache are left untouched,
-    /// and the account remains in `init` and claimable by a later
-    /// client.
+    /// Concurrency contract: the Argon2id hash is computed **before** any
+    /// lock is taken, so the critical section stays short. The
+    /// cross-process registry transaction lock
+    /// ([`persist_lock::PathLock`], sibling `<users-file>.lock`) is then
+    /// held from the authoritative on-disk re-read through the publish,
+    /// so a `tor-socks5 users ...` mutation in another process can never
+    /// interleave inside this read-modify-write and be clobbered by our
+    /// snapshot: the loser waits and builds on the winner's published
+    /// state (TS17-07). The daemon takes that lock with a blocking wait —
+    /// a refused login cannot be retried by the client, so the
+    /// provisioning must not fail just because another writer happened to
+    /// be mid-transaction. In-process, the registry write-lock is held
+    /// across the transition and the save, which keeps concurrent
+    /// resolutions of different `init` accounts monotonic. If anything
+    /// fails (lock, re-read, save), the login is refused, memory and
+    /// cache are left untouched, and the account remains in `init` and
+    /// claimable by a later client.
     fn resolve_init(&self, name: &str, password: &str) -> bool {
         if password.is_empty() {
             tracing::debug!(name = %name, "auth: init account rejected empty password");
@@ -297,6 +328,28 @@ impl AuthState {
                 tracing::error!(name = %name, error = %e, "auth: hashing init password failed");
                 return false;
             }
+        };
+        // Cross-process transaction lock: held from the authoritative
+        // re-read below through the save, so no CLI mutation in another
+        // process can slip between our read and our publish (TS17-07).
+        // Acquired BEFORE the in-process write lock; every registry
+        // writer follows the same order, so the two lock domains cannot
+        // cycle. Blocking acquire on purpose: see the doc comment.
+        let file_lock = match &self.users_path {
+            Some(path) => {
+                #[cfg(test)]
+                if let Some(hook) = self.lock_hook.get() {
+                    hook();
+                }
+                match PathLock::acquire(path) {
+                    Ok(lock) => Some(lock),
+                    Err(e) => {
+                        tracing::warn!(name = %name, error = %e, "auth: could not take the users registry transaction lock; refusing init login");
+                        return false;
+                    }
+                }
+            }
+            None => None,
         };
         let mut guard = self.users.write().expect("auth users lock poisoned");
 
@@ -333,6 +386,8 @@ impl AuthState {
                 let h = u.hash.clone();
                 *guard = current;
                 drop(guard);
+                // Release the registry before the (potentially expensive) verify.
+                drop(file_lock);
                 return self.verify_with_cache(name, password, &h);
             }
             Some(_) => {}
@@ -366,6 +421,7 @@ impl AuthState {
         }
         *guard = current;
         drop(guard);
+        drop(file_lock);
         self.cache.insert(
             name.to_string(),
             CacheEntry {
@@ -700,69 +756,6 @@ mod tests {
         .unwrap();
         assert!(!s.verify("alice", "pw1"));
         assert_eq!(s.cache_len(), 0);
-
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
-    }
-
-    #[test]
-    fn concurrent_inits_cannot_write_older_snapshot_over_newer() {
-        let path = tmp_path("conc");
-        let cfg = UsersConfig {
-            users: vec![init_user("alice"), init_user("bob")],
-        };
-        cfg.save(&path).unwrap();
-        let st = std::sync::Arc::new(
-            AuthState::build_persistent(&UsersConfig::load(&path).unwrap(), path.clone()).unwrap(),
-        );
-
-        // One-shot save hook: on its first invocation signal the main
-        // thread, then block until it releases us (or 5s pass — the
-        // timeout is a fail-safe so a regression degrades to a normal
-        // pass-through instead of a deadlock). Later invocations are
-        // no-ops.
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
-        let rx_hook = std::sync::Arc::new(std::sync::Mutex::new(rx));
-        let rx_main = rx_hook.clone();
-        let fired = std::sync::atomic::AtomicBool::new(false);
-        st.set_save_hook(Box::new(move || {
-            if !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                tx.send(()).ok();
-                let _ = rx_hook
-                    .lock()
-                    .unwrap()
-                    .recv_timeout(std::time::Duration::from_secs(5));
-            }
-            Ok(())
-        }));
-
-        // Thread A claims alice; it blocks inside save() while holding
-        // the write lock.
-        let st_a = st.clone();
-        let a = std::thread::spawn(move || st_a.verify("alice", "pwA"));
-        rx_main
-            .lock()
-            .unwrap()
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("hook fired: A is blocked in save under the write lock");
-
-        // Thread B claims bob. With the fix, B's transition+save can only
-        // run after A committed; the old code would let A's stale save
-        // later regress bob to the sentinel.
-        let st_b = st.clone();
-        let b = std::thread::spawn(move || st_b.verify("bob", "pwB"));
-
-        assert!(a.join().unwrap(), "alice's init accepted");
-        assert!(b.join().unwrap(), "bob's init accepted");
-
-        // Restart simulation: both passwords survived, neither hash is
-        // the sentinel.
-        let reloaded = UsersConfig::load(&path).unwrap();
-        let ha = &reloaded.find("alice").unwrap().hash;
-        let hb = &reloaded.find("bob").unwrap().hash;
-        assert_ne!(*ha, INIT_SENTINEL);
-        assert_ne!(*hb, INIT_SENTINEL);
-        assert!(verify_hash(ha, "pwA").unwrap());
-        assert!(verify_hash(hb, "pwB").unwrap());
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

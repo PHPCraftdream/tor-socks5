@@ -18,6 +18,9 @@ mod state;
 mod user;
 mod users_config;
 
+#[cfg(test)]
+mod registry_lock_tests;
+
 pub use compute_hash::{compute_hash, verify_hash};
 pub use params::{argon2_instance, ARGON_M_KIB, ARGON_P, ARGON_T};
 pub use state::{AuthState, INIT_SENTINEL};

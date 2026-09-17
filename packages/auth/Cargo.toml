@@ -20,6 +20,8 @@ subtle.workspace = true
 dashmap.workspace = true
 getrandom.workspace = true
 
+persist-lock = { path = "../persist-lock" }
+
 ktav.workspace = true
 serde.workspace = true
 thiserror.workspace = true
