@@ -33,23 +33,23 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// lock only for the length of one publish; a daemon stuck retrying a
 /// failing publish holds it longer, and a CLI must fail with a clear error
 /// instead of hanging indefinitely behind it.
-pub(crate) const CLI_LOCK_WAIT: Duration = Duration::from_secs(60);
+pub const CLI_LOCK_WAIT: Duration = Duration::from_secs(60);
 
 /// Wait bound for candidate-pool transactions. A drain holds the pool lock
 /// across its bounded probe and admission phase; competing transactions fail
 /// with a clear error once this limit expires.
-pub(crate) const POOL_LOCK_WAIT: Duration = Duration::from_secs(120);
+pub const POOL_LOCK_WAIT: Duration = Duration::from_secs(120);
 
 /// An exclusive advisory lock on the sibling `.lock` file of a target path.
 /// Held for the whole read-modify-write cycle; dropping it releases the lock.
-pub(crate) struct PathLock {
+pub struct PathLock {
     // The lock lives in this open handle; closing it releases what is left.
     file: File,
 }
 
 impl PathLock {
     /// Sibling lock file for `target`.
-    pub(crate) fn lock_path(target: &Path) -> PathBuf {
+    pub fn lock_path(target: &Path) -> PathBuf {
         let mut name = target.as_os_str().to_os_string();
         name.push(".lock");
         PathBuf::from(name)
@@ -73,7 +73,7 @@ impl PathLock {
     /// Acquire, blocking until the current holder is done. For the daemon
     /// writer: the holder is a live process mid-transaction and the mutation
     /// must not be failed. Blocking — run it off the async runtime.
-    pub(crate) fn acquire(target: &Path) -> Result<Self> {
+    pub fn acquire(target: &Path) -> Result<Self> {
         let lock_path = Self::lock_path(target);
         let file = Self::open(target).with_context(|| format!("open {}", lock_path.display()))?;
         file.lock()
@@ -84,7 +84,7 @@ impl PathLock {
     /// Acquire, giving up after `wait` with an error naming the lock file.
     /// For CLI-side transactions: a bounded wait beats hanging behind a
     /// daemon that keeps failing (and retrying) its own publish.
-    pub(crate) fn acquire_bounded(target: &Path, wait: Duration) -> Result<Self> {
+    pub fn acquire_bounded(target: &Path, wait: Duration) -> Result<Self> {
         let lock_path = Self::lock_path(target);
         let file = Self::open(target).with_context(|| format!("open {}", lock_path.display()))?;
         let deadline = Instant::now() + wait;

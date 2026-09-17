@@ -3,6 +3,7 @@ mod dns_invalidation_tests;
 mod dns_registry_tests;
 mod dns_save_regression_tests;
 mod dns_save_tests;
+mod dns_temp_ownership_tests;
 mod dns_timestamp_tests;
 mod probe_coalesce_regression_tests;
 mod probe_coalesce_tests;

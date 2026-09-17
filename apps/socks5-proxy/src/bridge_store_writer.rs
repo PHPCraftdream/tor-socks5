@@ -51,7 +51,7 @@
 //!   successful publish reloads the file.
 //! * Cross-process read-modify-write coordination: every writer of the
 //!   store file — this actor and the CLI inline fallback — holds the
-//!   per-path advisory lock ([`crate::path_lock::PathLock`], sibling
+//!   per-path advisory lock ([`persist_lock::PathLock`], sibling
 //!   `<store>.lock` file) from the load that reads the file through the
 //!   publish that writes it. The clean-state re-read alone cannot heal an
 //!   overlap: a CLI transaction that loads while a daemon publish is in
@@ -70,7 +70,7 @@
 //!   flush, but the daemon must use the explicit protocol.
 //! * CLI subcommands and unit tests run without an initialized writer and
 //!   fall back to an inline load→mutate→save under the same per-path write
-//!   lock, with a bounded wait ([`crate::path_lock::CLI_LOCK_WAIT`]) so a
+//!   lock, with a bounded wait ([`persist_lock::CLI_LOCK_WAIT`]) so a
 //!   CLI fails with a clear "busy" error instead of hanging behind a daemon
 //!   stuck retrying a failing publish. Between daemon dirty windows the
 //!   lock is free, so sequential CLI usage is unaffected.
@@ -85,7 +85,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::path_lock::{PathLock, CLI_LOCK_WAIT};
+use persist_lock::{PathLock, CLI_LOCK_WAIT};
 
 type MutateFn = Box<dyn FnOnce(&mut BridgeStore) + Send>;
 /// Publishing strategy; production uses `BridgeStore::save`, tests inject failures.

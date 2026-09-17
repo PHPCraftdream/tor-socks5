@@ -14,6 +14,7 @@ rust-version.workspace = true
 
 [dependencies]
 bridge-line.workspace = true
+persist-lock = { path = "../persist-lock" }
 
 tokio = { workspace = true, features = ["net", "time", "macros", "rt", "io-util"] }
 # TS5-02: the DoH wave race owns an admission token that stops still-queued

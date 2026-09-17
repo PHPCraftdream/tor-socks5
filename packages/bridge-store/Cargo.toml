@@ -15,6 +15,7 @@ rust-version.workspace = true
 [dependencies]
 bridge-line.workspace = true
 bridge-probe = { path = "../bridge-probe" }
+persist-lock = { path = "../persist-lock" }
 anyhow.workspace = true
 time.workspace = true
 

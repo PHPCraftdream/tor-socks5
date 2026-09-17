@@ -20,6 +20,7 @@ bridge-fetcher = { path = "../../packages/bridge-fetcher" }
 bridge-probe = { path = "../../packages/bridge-probe" }
 bridge-store = { path = "../../packages/bridge-store" }
 bridge-verify-core = { path = "../../packages/bridge-verify-core" }
+persist-lock = { path = "../../packages/persist-lock" }
 rusqlite = { version = "0.39", features = ["backup"] }
 proxy-config = { path = "../../packages/proxy-config" }
 socks5-proto = { path = "../../packages/socks5-proto" }

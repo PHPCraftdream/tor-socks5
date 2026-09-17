@@ -18,4 +18,5 @@ serde.workspace = true
 indexmap.workspace = true
 bridge-line.workspace = true
 bridge-probe = { path = "../bridge-probe" }
+persist-lock = { path = "../persist-lock" }
 anyhow.workspace = true

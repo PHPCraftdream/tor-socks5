@@ -629,3 +629,62 @@ fn parses_dns_policy_and_roundtrips() {
     let restored: Config = ktav::from_str(&serialized).expect("deserialize DNS policy");
     assert_eq!(restored.dns, cfg.dns);
 }
+
+fn unique_test_dir(label: &str) -> std::path::PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "tor-socks5-proxy-config-{}-{}-{label}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn from_file_spares_temp_owned_by_live_writer() {
+    let dir = unique_test_dir("live-writer");
+    let path = dir.join("tor-socks5.ktav");
+    std::fs::write(&path, "listen: 127.0.0.1:1080\n").unwrap();
+    // Models a live writer: same canonical temp name the writer produces,
+    // advisory lock held across processes by the OS.
+    let guard = persist_lock::TempFileGuard::create(&path, 1).expect("guard");
+    Config::from_file(&path).expect("from_file");
+    assert!(
+        guard.temp_path().exists(),
+        "cleanup must not delete a temp whose owner still holds the lock"
+    );
+    drop(guard);
+    Config::from_file(&path).expect("from_file");
+    assert!(
+        !persist_lock::temp_path_for(&path, 1).unwrap().exists(),
+        "dead owner temp must be cleaned"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn from_file_spares_malformed_temp_names() {
+    let dir = unique_test_dir("malformed");
+    let path = dir.join("tor-socks5.ktav");
+    std::fs::write(&path, "listen: 127.0.0.1:1080\n").unwrap();
+    let names = [
+        ".tor-socks5.ktav.notapid.42.tmp",     // garbage pid
+        ".tor-socks5.ktav.99999999999.42.tmp", // pid over u32::MAX
+        ".tor-socks5.ktav.1.abc.tmp",          // non-numeric seq
+        ".tor-socks5.ktav.1.42.tmp.bak",       // extra segment
+        ".tor-socks5.ktav.1.tmp",              // missing seq
+    ];
+    for name in names {
+        std::fs::write(dir.join(name), "x").unwrap();
+    }
+    Config::from_file(&path).expect("from_file");
+    for name in names {
+        assert!(
+            dir.join(name).exists(),
+            "malformed temp {name} must survive cleanup"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

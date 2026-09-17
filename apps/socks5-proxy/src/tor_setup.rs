@@ -16,8 +16,8 @@ use time::OffsetDateTime;
 use tracing::{info, warn};
 
 use crate::config::Config;
-use crate::path_lock::{PathLock, CLI_LOCK_WAIT};
 use bridge_store::BridgeStore;
+use persist_lock::{PathLock, CLI_LOCK_WAIT};
 
 /// How long each bridge gets to complete a TCP handshake before we declare
 /// it unreachable for this startup. The probes run in parallel, so the

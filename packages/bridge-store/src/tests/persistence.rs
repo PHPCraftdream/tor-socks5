@@ -28,6 +28,52 @@ fn load_removes_own_stale_temp_files() {
 }
 
 #[test]
+fn load_spares_temp_owned_by_live_writer() {
+    let dir = tmp_dir();
+    let path = dir.join("alive.log");
+    std::fs::write(&path, "# seed\n").unwrap();
+    // Models a live writer: same canonical temp name the writer produces,
+    // advisory lock held across processes by the OS.
+    let guard = persist_lock::TempFileGuard::create(&path, 1).expect("guard");
+    BridgeStore::load(path.clone()).expect("load");
+    assert!(
+        guard.temp_path().exists(),
+        "cleanup must not delete a temp whose owner still holds the lock"
+    );
+    drop(guard);
+    BridgeStore::load(path.clone()).expect("load");
+    assert!(
+        !persist_lock::temp_path_for(&path, 1).unwrap().exists(),
+        "dead owner temp must be cleaned"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn load_spares_malformed_temp_names() {
+    let dir = tmp_dir();
+    let path = dir.join("alive.log");
+    let names = [
+        ".alive.log.notapid.42.tmp",     // garbage pid
+        ".alive.log.99999999999.42.tmp", // pid over u32::MAX
+        ".alive.log.1.abc.tmp",          // non-numeric seq
+        ".alive.log.1.42.tmp.bak",       // extra segment
+        ".alive.log.1.tmp",              // missing seq
+    ];
+    for name in names {
+        std::fs::write(dir.join(name), "x").unwrap();
+    }
+    BridgeStore::load(path).expect("load");
+    for name in names {
+        assert!(
+            dir.join(name).exists(),
+            "malformed temp {name} must survive cleanup"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn cached_identity_keeps_carrier_distinctions_across_save_load() {
     let dir = tmp_dir();
     let path = dir.join("carrier-cache.log");

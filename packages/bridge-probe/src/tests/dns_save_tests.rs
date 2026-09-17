@@ -346,13 +346,13 @@ async fn save_persisted_dns_cache_does_not_block_the_async_worker() {
     let save = {
         let path = path.clone();
         tokio::spawn(async move {
-            save_persisted_dns_cache_with_writer(&path, move |path, contents| {
+            save_persisted_dns_cache_with_writer(&path, move |guard, contents| {
                 assert_ne!(std::thread::current().id(), executor_thread);
                 let _ = entered_tx.send(());
                 release_rx
                     .recv_timeout(Duration::from_secs(10))
                     .map_err(std::io::Error::other)?;
-                std::fs::write(path, contents)
+                guard.write_all(contents.as_bytes())
             })
             .await
         })
@@ -423,14 +423,13 @@ async fn superseded_save_must_not_publish_stale_snapshot() {
     let save_a = {
         let path = path.clone();
         tokio::spawn(async move {
-            save_persisted_dns_cache_with_writer(&path, move |path, contents| {
+            save_persisted_dns_cache_with_writer(&path, move |guard, contents| {
                 assert_ne!(std::thread::current().id(), executor_thread);
                 let _ = entered_tx.send(());
                 release_rx
                     .recv_timeout(Duration::from_secs(10))
                     .map_err(std::io::Error::other)?;
-                std::fs::write(path, contents)?;
-                Ok(())
+                guard.write_all(contents.as_bytes())
             })
             .await
         })
@@ -603,13 +602,12 @@ async fn older_snapshot_paused_behind_full_newer_publish_keeps_newer_state() {
     let save_a = {
         let path = path.clone();
         tokio::spawn(async move {
-            save_persisted_dns_cache_with_writer(&path, move |path, contents| {
+            save_persisted_dns_cache_with_writer(&path, move |guard, contents| {
                 let _ = entered_tx.send(());
                 release_rx
                     .recv_timeout(Duration::from_secs(10))
                     .map_err(std::io::Error::other)?;
-                std::fs::write(path, contents)?;
-                Ok(())
+                guard.write_all(contents.as_bytes())
             })
             .await
         })
@@ -696,12 +694,12 @@ async fn failed_newer_write_lets_older_save_publish_and_report_ok() {
     let save_a = {
         let path = path.clone();
         tokio::spawn(async move {
-            save_persisted_dns_cache_with_writer(&path, move |path, contents| {
+            save_persisted_dns_cache_with_writer(&path, move |guard, contents| {
                 let _ = entered_tx.send(());
                 release_rx
                     .recv_timeout(Duration::from_secs(10))
                     .map_err(std::io::Error::other)?;
-                std::fs::write(path, contents)
+                guard.write_all(contents.as_bytes())
             })
             .await
         })
@@ -713,7 +711,7 @@ async fn failed_newer_write_lets_older_save_publish_and_report_ok() {
 
     // Mutate, then run a NEWER save whose write fails.
     remember_doh_answer(host, &[ip2], Duration::from_secs(300));
-    let result_b = save_persisted_dns_cache_with_writer(&path, |_path, _contents| {
+    let result_b = save_persisted_dns_cache_with_writer(&path, |_guard, _contents| {
         Err(std::io::Error::other("injected write failure"))
     })
     .await;
@@ -785,12 +783,12 @@ async fn failed_newer_rename_makes_older_save_err_not_false_ok() {
     let save_a = {
         let path = path.clone();
         tokio::spawn(async move {
-            save_persisted_dns_cache_with_writer(&path, move |path, contents| {
+            save_persisted_dns_cache_with_writer(&path, move |guard, contents| {
                 let _ = entered_tx.send(());
                 release_rx
                     .recv_timeout(Duration::from_secs(10))
                     .map_err(std::io::Error::other)?;
-                std::fs::write(path, contents)
+                guard.write_all(contents.as_bytes())
             })
             .await
         })
@@ -932,12 +930,12 @@ async fn cancelled_caller_leaves_latest_snapshot_intact() {
     let save_a = {
         let path = path.clone();
         tokio::spawn(async move {
-            save_persisted_dns_cache_with_writer(&path, move |path, contents| {
+            save_persisted_dns_cache_with_writer(&path, move |guard, contents| {
                 let _ = entered_tx.send(());
                 release_rx
                     .recv_timeout(Duration::from_secs(10))
                     .map_err(std::io::Error::other)?;
-                std::fs::write(path, contents)?;
+                guard.write_all(contents.as_bytes())?;
                 let _ = written_tx.send(());
                 Ok(())
             })

@@ -29,7 +29,7 @@ use tracing::{info, warn};
 
 use crate::candidate_pool::{key_of, CandidatePool, Key};
 use crate::config::Config;
-use crate::path_lock::{PathLock, CLI_LOCK_WAIT};
+use persist_lock::{PathLock, CLI_LOCK_WAIT};
 
 /// Per-bridge timeout for the **lazy** pool drain. Shorter than the startup
 /// config probe ([`crate::tor_setup::BRIDGE_PROBE_TIMEOUT`]): a live bridge's

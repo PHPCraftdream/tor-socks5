@@ -1,7 +1,6 @@
 use super::probe::dns_invalidation::{cache_identity, next_cache_version};
 use super::probe::resolve_probe_target;
 use super::*;
-use std::io::Write;
 
 #[cfg(test)]
 pub(super) use super::probe::dns_invalidation::{
@@ -546,7 +545,11 @@ pub(super) fn merge_disk_fallback_entry(host: String, entry: PersistedAnswer) {
 /// Missing or malformed files are ignored; live-cache flushes leave this store
 /// intact so a network change cannot erase the cold-start fallback.
 pub fn load_persisted_dns_cache(path: &std::path::Path) {
-    cleanup_persist_temp_files(path);
+    if let Some(file_name) = path.file_name().and_then(|name| name.to_str()) {
+        persist_lock::cleanup_temp_files_with(path, |name| {
+            is_legacy_persist_temp_name(name, file_name)
+        });
+    }
     let Ok(data) = std::fs::read_to_string(path) else {
         return;
     };
@@ -566,53 +569,34 @@ pub fn load_persisted_dns_cache(path: &std::path::Path) {
 /// publication generations serialize overlapping saves and prevent rollback.
 /// Formatting and I/O run on Tokio's blocking pool.
 pub async fn save_persisted_dns_cache(path: &std::path::Path) -> std::io::Result<()> {
-    save_persisted_dns_cache_with_writer(path, |path, contents| {
-        let mut file = std::fs::File::create(path)?;
-        file.write_all(contents.as_bytes())?;
-        file.sync_all()
-    })
-    .await
+    save_persisted_dns_cache_with_writer(path, |temp, contents| temp.write_all(contents.as_bytes()))
+        .await
 }
 
-fn cleanup_persist_temp_files(path: &std::path::Path) {
-    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-        return;
+/// Recogniser for the PRE-persist-lock temp format `{file}.{pid}.{gen}.tmp`
+/// (no leading dot) written by older versions. Pure migration sweep: current
+/// writers never produce this shape again, so any such file is a leftover;
+/// the lock discipline in `cleanup_temp_files_with` still refuses to delete
+/// one if something actually holds it.
+fn is_legacy_persist_temp_name(entry_name: &str, target_name: &str) -> bool {
+    let Some(rest) = entry_name.strip_prefix(target_name) else {
+        return false;
     };
-    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let prefix = format!(".{file_name}.");
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+    let Some(rest) = rest.strip_prefix('.') else {
+        return false;
     };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        if name.to_str().is_some_and(|name| {
-            if !name.starts_with(&prefix) || !name.ends_with(".tmp") {
-                return false;
-            }
-            let pid = name
-                .strip_prefix(&prefix)
-                .and_then(|rest| rest.split('.').next())
-                .and_then(|pid| pid.parse::<u32>().ok());
-            pid != Some(std::process::id())
-        }) {
-            let _ = std::fs::remove_file(entry.path());
-        }
+    let parts: Vec<&str> = rest.split('.').collect();
+    if parts.len() != 3 || parts[2] != "tmp" {
+        return false;
     }
+    parts[0].parse::<u32>().is_ok() && parts[1].parse::<u64>().is_ok()
 }
 
-#[cfg(unix)]
-fn sync_persist_parent_dir(path: &std::path::Path) {
-    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let _ = std::fs::File::open(dir).and_then(|file| file.sync_all());
-}
-
-#[cfg(not(unix))]
-fn sync_persist_parent_dir(_path: &std::path::Path) {}
-
-/// Testable save variant whose writer receives the temporary path.
+/// Testable save variant whose writer writes through the persist-lock temp
+/// guard (the guard owns the temp file and removes it on error/drop).
 pub(super) async fn save_persisted_dns_cache_with_writer(
     path: &std::path::Path,
-    write: impl FnOnce(&std::path::Path, &str) -> std::io::Result<()> + Send + 'static,
+    write: impl FnOnce(&mut persist_lock::TempFileGuard, &str) -> std::io::Result<()> + Send + 'static,
 ) -> std::io::Result<()> {
     let path = path.to_owned();
     let (live_snapshot, disk_snapshot, gen) = capture_persist_snapshots_with_generation(&path);
@@ -631,22 +615,12 @@ pub(super) async fn save_persisted_dns_cache_with_writer(
             })
             .collect();
         let contents = lines.join("\n");
-        let Some(file_name) = path.file_name() else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("persist path has no file name: {}", path.display()),
-            ));
-        };
-        let temp_path = path.with_file_name(format!(
-            "{}.{}.{}.tmp",
-            file_name.to_string_lossy(),
-            std::process::id(),
-            gen
-        ));
-        if let Err(error) = write(&temp_path, &contents) {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(error);
-        }
+        let mut temp = persist_lock::TempFileGuard::create(&path, gen)?;
+        // On error the guard's Drop removes the temp file.
+        write(&mut temp, &contents)?;
+        // Sync the data BEFORE entering the publication critical section,
+        // matching the old writer-closure-internal fsync ordering.
+        temp.fsync()?;
         // Publication critical section: check-and-rename under the per-path
         // publish lock, so publications to one path are serialized. The
         // comparison is against the last ACTUALLY PUBLISHED generation, not
@@ -664,31 +638,18 @@ pub(super) async fn save_persisted_dns_cache_with_writer(
         {
             // A snapshot at least as new as this one is already on disk;
             // publishing this (older or equal) one would be a rollback.
-            let _ = std::fs::remove_file(&temp_path);
+            drop(temp); // Drop removes the temp file.
             return Ok(());
         }
-        let result = std::fs::rename(&temp_path, &path);
-        match &result {
-            Ok(()) => {
-                sync_persist_parent_dir(&path);
-                *state
-                    .published_generation
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner()) = gen;
-            }
-            Err(_) => {
-                // TS7-08: rename failed (destination held open incompatibly
-                // on Windows, replaced by a directory, etc.) -- the temp
-                // file is otherwise ownerless from here on, since no other
-                // branch of this function will ever touch this exact
-                // (pid, gen) name again. Remove it so a long publication
-                // outage does not leak one full snapshot per failed
-                // attempt; the original rename error is still returned.
-                let _ = std::fs::remove_file(&temp_path);
-            }
-        }
+        // On error the moved guard's Drop removes the now-ownerless temp;
+        // the original error is still returned.
+        temp.rename_into_target()?;
+        *state
+            .published_generation
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = gen;
         drop(publish_guard);
-        result
+        Ok(())
     })
     .await
     .unwrap_or_else(|join_error| {
