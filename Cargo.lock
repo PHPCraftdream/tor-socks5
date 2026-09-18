@@ -1581,7 +1581,7 @@ checksum = "bd5850ec9ad2d9ba0aa33fb22c0b0ef4d91e524566be497ac2a6e40b847e67bb"
 dependencies = [
  "heck",
  "indexmap 2.14.0",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro-crate",
  "proc-macro2",
  "quote",
@@ -3252,9 +3252,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.30"
+version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "616ec5685824bcc94416c6d4a7a446eea774a31efd7062c8480ba6fd06d7a6e5"
+checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 dependencies = [
  "value-bag",
 ]
@@ -4158,18 +4158,18 @@ dependencies = [
 
 [[package]]
 name = "ptrs-gesher-bridge-line"
-version = "0.5.3"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73ab92e03b2958a0a572749ea7e84a2149fc80ab4f540e3ae78a872458abe5d0"
+checksum = "14b8fbf4b34b882b0e795f916c0f42dfa9a7662beea4aa04df0f1a757831dffc"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "ptrs-gesher-core"
-version = "0.5.3"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88d68b78073195a78ab36fc4ce7fe8627f051ef43ced080c2faefc29c44176e0"
+checksum = "3c919c65ffe735cff6a71e34aacdc05fca57ee348eb92852ab06e8146e04548b"
 dependencies = [
  "futures",
  "itertools 0.14.0",
@@ -4182,15 +4182,17 @@ dependencies = [
 
 [[package]]
 name = "ptrs-gesher-lyrebird"
-version = "0.5.3"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3a32259c72e300427937a8a1398d7f66e2e0bde09cb58a4f548416d2258984b"
+checksum = "09e23599e853e51e8f9f7791279d26dc2194c9fa9e799af21ae505fbfeb1b34d"
 dependencies = [
  "anyhow",
  "async-trait",
  "clap",
  "fast-socks5",
  "futures",
+ "libc",
+ "log",
  "ptrs-gesher-core",
  "ptrs-gesher-obfs4",
  "ptrs-gesher-webtunnel",
@@ -4200,15 +4202,17 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-core",
+ "tracing-log",
  "tracing-subscriber",
- "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "ptrs-gesher-obfs4"
-version = "0.5.3"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e12c4d1a7730ffcf0fee1d1e565dbc9b982d6669b7cf3b1791eee129ce6aa684"
+checksum = "1bbc456bad6e19a1feb95c2000e488200556ca8c821082331c47510d13c9d371"
 dependencies = [
  "base64",
  "bytes",
@@ -4231,6 +4235,7 @@ dependencies = [
  "sha2",
  "siphasher",
  "subtle",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -4245,9 +4250,9 @@ dependencies = [
 
 [[package]]
 name = "ptrs-gesher-webtunnel"
-version = "0.5.3"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00888e2a2da0101c6202275271f582ee98e9118f798b224d1422fd4b8b151c9e"
+checksum = "b4acead74e24c5777968bdd76377abd1855723d6e9ab8906861775c782b3f70d"
 dependencies = [
  "base64",
  "getrandom 0.2.17",
@@ -4720,9 +4725,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.40"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "log",
  "once_cell",
@@ -4744,9 +4749,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -5136,7 +5141,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32824fab5e16e6c4d86dc1ba84489390419a39f97699852b66480bb87d297ed8"
 dependencies = [
  "bstr",
- "dirs 6.0.0",
+ "dirs 4.0.0",
  "os_str_bytes",
 ]
 

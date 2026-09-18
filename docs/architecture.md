@@ -31,10 +31,10 @@ tor-socks5/
 ```
 
 The torrc `Bridge` line grammar is parsed by the external
-`ptrs-gesher-bridge-line` crate (`bridge-line = { version = "0.5",
+`ptrs-gesher-bridge-line` crate (`bridge-line = { version = "0.6",
 package = "ptrs-gesher-bridge-line" }` in `Cargo.toml`) — there is no
 local `bridge-line` package. Likewise the obfs4 + webtunnel PT client
-comes from the published `ptrs-gesher-lyrebird` crate (`lyrebird` 0.5);
+comes from the published `ptrs-gesher-lyrebird` crate (`lyrebird` 0.6);
 it is **not** vendored.
 
 ## Crates and their responsibilities
@@ -238,7 +238,7 @@ depend on — bump alongside any arti upgrade.
 
 The obfs4 + webtunnel PT client is **not** vendored. It comes from the
 published `ptrs-gesher` crates on crates.io (`lyrebird` =
-`ptrs-gesher-lyrebird` 0.5); our obfs4 fixes (handshake-residual,
+`ptrs-gesher-lyrebird` 0.6); our obfs4 fixes (handshake-residual,
 decode-eof, TCP keepalive) are part of that published release.
 
 ## Pluggable-transport dispatch (busybox)

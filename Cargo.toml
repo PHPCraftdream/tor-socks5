@@ -75,8 +75,8 @@ httparse = "1"
 base64 = "0.22"
 getrandom = "0.2"
 url = "2"
-bridge-line = { version = "0.5.3", package = "ptrs-gesher-bridge-line" }
-lyrebird = { version = "0.5.3", package = "ptrs-gesher-lyrebird" }
+bridge-line = { version = "0.6", package = "ptrs-gesher-bridge-line" }
+lyrebird = { version = "0.6", package = "ptrs-gesher-lyrebird" }
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 proptest = "1"
 

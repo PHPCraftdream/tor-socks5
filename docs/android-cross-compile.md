@@ -50,7 +50,7 @@ These items were the focus of this task, confirmed by compiling all 4 ABIs and E
 - zstd-sys via cc — OK
 - daemonize 0.5 + service-manager 0.11 compile under cfg(unix) — OK (Android is cfg(unix); runtime behaviour untested)
 - vendored crates: tor-dirclient, tor-dirmgr, tor-chanmgr, tor-guardmgr, arti-client, saturating-time — OK
-- ptrs-gesher: lyrebird/obfs4/webtunnel 0.5.2 — OK
+- ptrs-gesher: lyrebird/obfs4/webtunnel 0.6.x — OK
 
 ## Artifacts note
 

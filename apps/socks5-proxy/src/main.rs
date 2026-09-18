@@ -70,7 +70,7 @@ fn main() -> Result<()> {
     if std::env::var_os("TOR_PT_MANAGED_TRANSPORT_VER").is_some() {
         // arti (tor-ptmgr) sets TOR_PT_EXIT_ON_STDIN_CLOSE=1 on managed PT
         // children and, per the pluggable-transport spec, signals shutdown by
-        // closing the child's stdin. `ptrs-gesher-lyrebird` 0.5.2+ honours
+        // closing the child's stdin. `ptrs-gesher-lyrebird` 0.6.0+ honours
         // this itself (fixed upstream: the process now watches stdin and
         // exits cleanly on EOF when the env var is set) — no workaround
         // needed here.

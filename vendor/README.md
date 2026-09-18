@@ -8,7 +8,7 @@ Why they live here: the build must be self-contained and must NOT depend on
 our fixes being accepted upstream. Everything needed to build is in git.
 
 > Note: the `ptrs-gesher-*` crates are **not** vendored here — they are our own
-> project, consumed from crates.io at version 0.5.3 or later.
+> project, consumed from crates.io at version 0.6.x.
 > Only third-party / upstream crates we had to fix are
 > vendored in this directory.
 

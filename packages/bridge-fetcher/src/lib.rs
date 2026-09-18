@@ -11,7 +11,7 @@
 //! * [`fetch`] — the parallel multi-source batch fetch.
 //!
 //! Pinned workspace versions: tokio 1, tokio-rustls 0.26, rustls 0.23,
-//! httparse 1, url 2, webpki-roots 0.26, bridge-line (ptrs-gesher 0.2).
+//! httparse 1, url 2, webpki-roots 0.26, bridge-line (ptrs-gesher 0.6).
 
 mod dedup;
 mod direct;
