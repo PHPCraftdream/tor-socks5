@@ -13,17 +13,17 @@ categories.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-arti-wrapper = { path = "../../packages/arti-wrapper" }
-auth = { path = "../../packages/auth" }
+arti-wrapper = { path = "../../packages/arti-wrapper", version = "0.1.0" }
+auth = { path = "../../packages/auth", version = "0.1.0", package = "tor-socks5-auth" }
 bridge-line.workspace = true
-bridge-fetcher = { path = "../../packages/bridge-fetcher" }
-bridge-probe = { path = "../../packages/bridge-probe" }
-bridge-store = { path = "../../packages/bridge-store" }
-bridge-verify-core = { path = "../../packages/bridge-verify-core" }
-persist-lock = { path = "../../packages/persist-lock" }
-rusqlite = { version = "0.39", features = ["backup"] }
-proxy-config = { path = "../../packages/proxy-config" }
-socks5-proto = { path = "../../packages/socks5-proto" }
+bridge-fetcher = { path = "../../packages/bridge-fetcher", version = "0.1.0" }
+bridge-probe = { path = "../../packages/bridge-probe", version = "0.1.0" }
+bridge-store = { path = "../../packages/bridge-store", version = "0.1.0" }
+bridge-verify-core = { path = "../../packages/bridge-verify-core", version = "0.1.0" }
+persist-lock = { path = "../../packages/persist-lock", version = "0.1.0" }
+rusqlite = { workspace = true }
+proxy-config = { path = "../../packages/proxy-config", version = "0.1.0", package = "tor-socks5-config" }
+socks5-proto = { path = "../../packages/socks5-proto", version = "0.1.0", package = "tor-socks5-proto" }
 tor-error.workspace = true
 lyrebird.workspace = true
 

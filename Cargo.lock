@@ -92,21 +92,21 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arti-wrapper",
- "auth",
  "bridge-fetcher",
  "bridge-probe",
  "bridge-store",
  "bridge-verify-core",
  "jni 0.21.1",
  "libc",
- "proxy-config",
  "ptrs-gesher-bridge-line",
  "rusqlite",
  "rustls",
- "socks5-proto",
  "time",
  "tokio",
  "tokio-util",
+ "tor-socks5-auth",
+ "tor-socks5-config",
+ "tor-socks5-proto",
  "tracing",
  "tracing-subscriber",
 ]
@@ -611,26 +611,6 @@ name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
-
-[[package]]
-name = "auth"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "argon2",
- "criterion",
- "dashmap",
- "getrandom 0.2.17",
- "hmac",
- "ktav",
- "persist-lock",
- "serde",
- "sha2",
- "subtle",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
 
 [[package]]
 name = "autocfg"
@@ -4135,19 +4115,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "proxy-config"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bridge-probe",
- "indexmap 2.14.0",
- "ktav",
- "persist-lock",
- "ptrs-gesher-bridge-line",
- "serde",
-]
-
-[[package]]
 name = "pt-helper"
 version = "0.1.0"
 dependencies = [
@@ -5262,22 +5229,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "socks5-proto"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "auth",
- "futures",
- "tokio",
-]
-
-[[package]]
 name = "socks5-proxy"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "arti-wrapper",
- "auth",
  "bridge-fetcher",
  "bridge-probe",
  "bridge-store",
@@ -5290,7 +5246,6 @@ dependencies = [
  "indexmap 2.14.0",
  "ktav",
  "persist-lock",
- "proxy-config",
  "ptrs-gesher-bridge-line",
  "ptrs-gesher-lyrebird",
  "rpassword",
@@ -5299,13 +5254,15 @@ dependencies = [
  "serde",
  "serde_json",
  "service-manager",
- "socks5-proto",
  "tempfile",
  "thiserror 2.0.18",
  "time",
  "tokio",
  "tokio-util",
  "tor-error",
+ "tor-socks5-auth",
+ "tor-socks5-config",
+ "tor-socks5-proto",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -7034,6 +6991,49 @@ dependencies = [
  "tracing-test",
  "void",
  "web-time-compat",
+]
+
+[[package]]
+name = "tor-socks5-auth"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "argon2",
+ "criterion",
+ "dashmap",
+ "getrandom 0.2.17",
+ "hmac",
+ "ktav",
+ "persist-lock",
+ "serde",
+ "sha2",
+ "subtle",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "tor-socks5-config"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bridge-probe",
+ "indexmap 2.14.0",
+ "ktav",
+ "persist-lock",
+ "ptrs-gesher-bridge-line",
+ "serde",
+]
+
+[[package]]
+name = "tor-socks5-proto"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "tokio",
+ "tor-socks5-auth",
 ]
 
 [[package]]

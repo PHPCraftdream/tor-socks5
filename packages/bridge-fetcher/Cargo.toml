@@ -13,9 +13,9 @@ categories.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-arti-wrapper = { path = "../arti-wrapper" }
+arti-wrapper = { path = "../arti-wrapper", version = "0.1.0" }
 bridge-line.workspace = true
-bridge-probe = { path = "../bridge-probe" }
+bridge-probe = { path = "../bridge-probe", version = "0.1.0" }
 
 tokio.workspace = true
 tokio-util.workspace = true

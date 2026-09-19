@@ -1,5 +1,9 @@
 [package]
-name = "proxy-config"
+# Published name differs from the in-tree package/directory: "proxy-config"
+# is already taken on crates.io by an unrelated, stale crate
+# (mattico/proxy-config, last released 0.0.2 in 2017). See
+# packages/auth/Cargo.toml for the same rename pattern.
+name = "tor-socks5-config"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -12,11 +16,18 @@ keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
 
+# The produced library target keeps the pre-rename identifier: this
+# crate's own integration tests (tests/bridge_config_filtering.rs) and
+# every in-workspace `use proxy_config::...` stay unchanged. Only the
+# crates.io-facing [package] name above differs.
+[lib]
+name = "proxy_config"
+
 [dependencies]
 ktav.workspace = true
 serde.workspace = true
 indexmap.workspace = true
 bridge-line.workspace = true
-bridge-probe = { path = "../bridge-probe" }
-persist-lock = { path = "../persist-lock" }
+bridge-probe = { path = "../bridge-probe", version = "0.1.0" }
+persist-lock = { path = "../persist-lock", version = "0.1.0" }
 anyhow.workspace = true

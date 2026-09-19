@@ -17,15 +17,15 @@ name = "torsocks5"
 crate-type = ["cdylib"]
 
 [dependencies]
-arti-wrapper = { path = "../arti-wrapper" }
-auth = { path = "../auth" }
-proxy-config = { path = "../proxy-config" }
-socks5-proto = { path = "../socks5-proto" }
-bridge-probe = { path = "../bridge-probe" }
-bridge-fetcher = { path = "../bridge-fetcher" }
-bridge-store = { path = "../bridge-store" }
-bridge-verify-core = { path = "../bridge-verify-core" }
-rusqlite = { version = "0.39", features = ["backup"] }
+arti-wrapper = { path = "../arti-wrapper", version = "0.1.0" }
+auth = { path = "../auth", version = "0.1.0", package = "tor-socks5-auth" }
+proxy-config = { path = "../proxy-config", version = "0.1.0", package = "tor-socks5-config" }
+socks5-proto = { path = "../socks5-proto", version = "0.1.0", package = "tor-socks5-proto" }
+bridge-probe = { path = "../bridge-probe", version = "0.1.0" }
+bridge-fetcher = { path = "../bridge-fetcher", version = "0.1.0" }
+bridge-store = { path = "../bridge-store", version = "0.1.0" }
+bridge-verify-core = { path = "../bridge-verify-core", version = "0.1.0" }
+rusqlite = { workspace = true }
 bridge-line.workspace = true
 tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["compat"] }
