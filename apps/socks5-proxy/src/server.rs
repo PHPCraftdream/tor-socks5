@@ -592,6 +592,18 @@ pub(crate) fn classify_conn_failure(err: &anyhow::Error) -> (ConnStage, ConnErro
     (stage, kind)
 }
 
+/// Adapter from the app's [`AuthState`] user store to the protocol
+/// crate's `PasswordVerifier` port. The impl lives here — the only
+/// crate that sees both types — so `socks5-proto` stays dependency-free
+/// and `auth` never grows a dependency on `socks5-proto`.
+struct AuthStateVerifier(Arc<AuthState>);
+
+impl socks5::PasswordVerifier for AuthStateVerifier {
+    fn verify(&self, username: &str, password: &str) -> bool {
+        self.0.verify(username, password)
+    }
+}
+
 async fn handle_client(
     mut client: TcpStream,
     egress: Egress,
@@ -603,9 +615,12 @@ async fn handle_client(
     let started_at = std::time::Instant::now();
     // Absolute deadline for the whole handshake chain — armed once here and
     // never renewed per read.
+    let proto_auth: Option<Arc<dyn socks5::PasswordVerifier>> = auth
+        .clone()
+        .map(|state| Arc::new(AuthStateVerifier(state)) as Arc<dyn socks5::PasswordVerifier>);
     let handshake = tokio::time::timeout(
         HANDSHAKE_DEADLINE,
-        socks5::handshake(&mut client, auth.clone()),
+        socks5::handshake(&mut client, proto_auth),
     )
     .await;
     // BOTH arms carry the stage tag: the classifier keys on it, and the

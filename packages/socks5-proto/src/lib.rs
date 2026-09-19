@@ -1,12 +1,11 @@
 //! Minimal SOCKS5 server-side implementation (RFC 1928), CONNECT command
 //! only. Supports either no authentication or RFC 1929 USERNAME/PASSWORD,
-//! depending on whether the caller passes an `AuthState` to [`handshake`].
+//! depending on whether the caller passes a [`PasswordVerifier`] to [`handshake`].
 
 use std::net::Ipv6Addr;
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
-use auth::AuthState;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const SOCKS_VERSION: u8 = 0x05;
@@ -24,6 +23,34 @@ const CMD_CONNECT: u8 = 0x01;
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_IPV6: u8 = 0x04;
+
+/// Credential-check port for the RFC 1929 USERNAME/PASSWORD
+/// sub-negotiation.
+///
+/// `socks5-proto` is a dependency-free leaf crate, so it cannot know
+/// about any concrete user database. [`handshake`] instead accepts an
+/// `Arc<dyn PasswordVerifier>`; hosts plug in their own credential
+/// store (in this workspace, `apps/socks5-proxy` and
+/// `packages/android-ffi` adapt their shared `auth::AuthState` to this
+/// trait at the call site — the impl must not live in `auth`, or the
+/// two crates would be re-coupled in the opposite direction).
+///
+/// Object-safe on purpose: one verifier instance is shared across all
+/// of a server's connection tasks, and [`handshake`] deliberately stays
+/// non-generic over the credential-store type.
+pub trait PasswordVerifier: Send + Sync {
+    /// Check one USERNAME/PASSWD pair (UTF-8 decoded off the wire).
+    ///
+    /// Called at most once per RFC 1929 attempt, inside
+    /// `tokio::task::spawn_blocking` — so implementations may block
+    /// (e.g. an Argon2 verify) without stalling async workers.
+    ///
+    /// A `false` answer is indistinguishable on the wire from an
+    /// unknown user: both get the same `[0x01, 0x01]` failure frame.
+    /// Implementations should keep it that way (no oracle for user
+    /// enumeration).
+    fn verify(&self, username: &str, password: &str) -> bool;
+}
 
 /// SOCKS5 server reply codes.
 #[allow(dead_code)] // part of the protocol — keep all codes for future use
@@ -66,15 +93,27 @@ impl ConnectRequest {
 
 /// Perform the SOCKS5 handshake and parse the CONNECT request.
 ///
-/// If `auth` is `Some(&state)` the server insists on RFC 1929
-/// USERNAME/PASSWORD authentication (method `0x02`) and runs the sub-
-/// negotiation immediately after the method selection. Failed auth is
-/// signalled with `[0x01, 0x01]` and propagated as `Err`. When `auth`
-/// is `None` the legacy NO_AUTH (method `0x00`) path is used.
+/// If `auth` is `Some(verifier)` the server insists on RFC 1929
+/// USERNAME/PASSWORD authentication (method `0x02`), runs the sub-
+/// negotiation immediately after the method selection, and checks the
+/// credentials with `verifier.verify(...)` on the blocking pool. Failed
+/// auth is signalled with `[0x01, 0x01]` and propagated as `Err`. When
+/// `auth` is `None` the legacy NO_AUTH (method `0x00`) path is used.
 ///
 /// On success the caller still has to send the SOCKS5 reply via
 /// [`reply`].
-pub async fn handshake<S>(stream: &mut S, auth: Option<Arc<AuthState>>) -> Result<ConnectRequest>
+///
+/// # Cancel safety
+///
+/// Not cancel-safe: the handshake interleaves several `read_exact`
+/// calls and may have already written method-selection or auth frames,
+/// so a cancelled call leaves `stream` mid-frame. Treat the stream as
+/// dead after cancelling — both in-workspace callers wrap the whole
+/// handshake in one absolute `tokio::time::timeout` and drop the socket.
+pub async fn handshake<S>(
+    stream: &mut S,
+    auth: Option<Arc<dyn PasswordVerifier>>,
+) -> Result<ConnectRequest>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -242,13 +281,13 @@ mod tests {
         client_script: impl FnOnce(DuplexStream) -> futures::future::BoxFuture<'static, Vec<u8>>
             + Send
             + 'static,
-        auth: Option<AuthState>,
+        auth: Option<OneUserVerifier>,
     ) -> (Result<ConnectRequest>, Vec<u8>) {
         let (server_half, client_half) = duplex(256);
 
         let client_task = tokio::spawn(client_script(client_half));
         let mut server_half = server_half;
-        let auth = auth.map(std::sync::Arc::new);
+        let auth = auth.map(|v| Arc::new(v) as Arc<dyn PasswordVerifier>);
         let server_res = handshake(&mut server_half, auth).await;
         // Drop the server-side half so the client side reads EOF when it
         // finishes its script.
@@ -451,14 +490,28 @@ mod tests {
 
     // -------------------------- USER/PASS auth path --------------------------
 
-    fn one_user_state(name: &str, password: &str) -> AuthState {
-        let user = auth::User {
+    /// Test stand-in for a real credential store (the `auth` crate is
+    /// no longer a dependency of this crate): a single account checked
+    /// by plain string comparison. `enabled: false` models a disabled
+    /// account so the rejection path keeps its dedicated test.
+    struct OneUserVerifier {
+        name: String,
+        password: String,
+        enabled: bool,
+    }
+
+    impl PasswordVerifier for OneUserVerifier {
+        fn verify(&self, username: &str, password: &str) -> bool {
+            self.enabled && username == self.name && password == self.password
+        }
+    }
+
+    fn one_user_state(name: &str, password: &str) -> OneUserVerifier {
+        OneUserVerifier {
             name: name.into(),
-            hash: auth::compute_hash(password).unwrap(),
-            is_enabled: true,
-            allowed_onion: false,
-        };
-        AuthState::build(&auth::UsersConfig { users: vec![user] }).unwrap()
+            password: password.into(),
+            enabled: true,
+        }
     }
 
     fn rfc1929_frame(user: &str, passwd: &str) -> Vec<u8> {
@@ -596,13 +649,11 @@ mod tests {
     async fn user_pass_disabled_user_treated_as_failure() {
         // Disabled user with correct password should still be rejected,
         // returning the standard `[0x01, 0x01]` failure.
-        let user = auth::User {
+        let state = OneUserVerifier {
             name: "alice".into(),
-            hash: auth::compute_hash("secret").unwrap(),
-            is_enabled: false,
-            allowed_onion: false,
+            password: "secret".into(),
+            enabled: false,
         };
-        let state = AuthState::build(&auth::UsersConfig { users: vec![user] }).unwrap();
         let (res, writes) = run_handshake_with(
             user_pass_then_connect("alice".into(), "secret".into(), [1, 2, 3, 4], 80),
             Some(state),

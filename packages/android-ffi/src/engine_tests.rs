@@ -13,7 +13,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{onion_destination_allowed, ACCEPT_ERROR_BACKOFF};
+use super::{onion_destination_allowed, AuthStateVerifier, ACCEPT_ERROR_BACKOFF};
 use auth::{AuthState, User, UsersConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -63,6 +63,8 @@ async fn run_handshake_over_loopback(
     });
 
     let (mut server_stream, _peer) = listener.accept().await.unwrap();
+    let auth = auth
+        .map(|state| Arc::new(AuthStateVerifier(state)) as Arc<dyn socks5_proto::PasswordVerifier>);
     let result = socks5_proto::handshake(&mut server_stream, auth).await;
     drop(server_stream);
 

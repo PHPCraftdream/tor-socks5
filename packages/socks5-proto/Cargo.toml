@@ -24,7 +24,6 @@ name = "socks5_proto"
 
 [dependencies]
 anyhow.workspace = true
-auth = { path = "../auth", version = "0.1.0", package = "tor-socks5-auth" }
 tokio.workspace = true
 
 [dev-dependencies]

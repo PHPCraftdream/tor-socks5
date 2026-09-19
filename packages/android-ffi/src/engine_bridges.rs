@@ -663,6 +663,8 @@ pub(super) async fn handle_connection(
     block_onion: bool,
 ) -> Result<()> {
     // SOCKS5 handshake: USER/PASS when `auth` is configured, NO_AUTH otherwise.
+    let auth = auth
+        .map(|state| Arc::new(AuthStateVerifier(state)) as Arc<dyn socks5_proto::PasswordVerifier>);
     let req = handshake_with_deadline(&mut client, auth).await?;
 
     if !onion_destination_allowed(&req, block_onion) {
@@ -702,7 +704,7 @@ pub(super) async fn handle_connection(
 /// timeout, so slow byte-by-byte clients cannot extend it indefinitely.
 async fn handshake_with_deadline<S>(
     stream: &mut S,
-    auth: Option<Arc<AuthState>>,
+    auth: Option<Arc<dyn socks5_proto::PasswordVerifier>>,
 ) -> anyhow::Result<socks5_proto::ConnectRequest>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,

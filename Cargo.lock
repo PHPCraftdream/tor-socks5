@@ -7033,7 +7033,6 @@ dependencies = [
  "anyhow",
  "futures",
  "tokio",
- "tor-socks5-auth",
 ]
 
 [[package]]

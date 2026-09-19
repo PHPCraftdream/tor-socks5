@@ -29,6 +29,19 @@ use tokio::sync::Semaphore;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tracing::{debug, error, info, warn};
 
+/// Adapter from the JNI-side [`AuthState`] user store to the protocol
+/// crate's `PasswordVerifier` port. The impl lives here — the only
+/// module that sees both types — so `socks5-proto` stays dependency-free
+/// and `auth` never grows a dependency on `socks5-proto`. Visible to
+/// `bridges` via its `use super::*` and to `engine_tests` via `super::`.
+struct AuthStateVerifier(Arc<AuthState>);
+
+impl socks5_proto::PasswordVerifier for AuthStateVerifier {
+    fn verify(&self, username: &str, password: &str) -> bool {
+        self.0.verify(username, password)
+    }
+}
+
 /// Maximum concurrent SOCKS5 connections.
 ///
 /// Each connection may perform network I/O and hold a Tor circuit, so we bound
