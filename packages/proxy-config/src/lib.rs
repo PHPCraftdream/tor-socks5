@@ -22,6 +22,12 @@ const ENV_VAR: &str = "TOR_SOCKS5_CONFIG";
 const DEFAULT_FILE: &str = "tor-socks5.ktav";
 static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// The full startup configuration, loaded from a Ktav file (see the module
+/// docs for the resolution order: `TOR_SOCKS5_CONFIG` env var, then
+/// `tor-socks5.ktav` in the current working directory, then built-in
+/// defaults). Every section has defaults, so a file setting only `listen`
+/// parses. Load with [`Config::load_with_override`], write with
+/// [`Config::write`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -70,6 +76,8 @@ impl Default for DnsConfig {
 }
 
 impl DnsConfig {
+    /// Map this section onto [`bridge_probe::ResolverPolicy`] for the
+    /// bridge-reachability prober.
     pub fn resolver_policy(self) -> bridge_probe::ResolverPolicy {
         bridge_probe::ResolverPolicy {
             doh_enabled: self.doh_enabled,
@@ -304,6 +312,10 @@ pub enum LogOutput {
     File,
 }
 
+/// Logging configuration (`log.*` keys in the Ktav file): default level,
+/// per-target overrides in insertion order, output sink, and ANSI coloring.
+/// [`LogConfig::to_filter`] renders it as a `tracing-subscriber` env-filter
+/// directive.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LogConfig {
@@ -329,6 +341,10 @@ pub struct LogConfig {
     pub ansi: bool,
 }
 
+/// Bridge pool configuration (`bridges.*` keys): raw bridge lines plus
+/// fetch sources, seed/auto-fetch behavior, and the TCP- and circuit-layer
+/// health thresholds that drive pruning. Raw `lines` are parsed and
+/// deduplicated by [`BridgesConfig::parsed`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BridgesConfig {
@@ -559,7 +575,12 @@ impl Default for BridgesConfig {
 /// Outcome of parsing the raw bridge-line strings from the config.
 #[derive(Debug, Default)]
 pub struct ParsedBridges {
+    /// Parsed bridge lines in first-occurrence order, deduplicated by full
+    /// [`bridge_probe::BridgeIdentity`]; documentation/local-only addresses
+    /// are already dropped (counted in `rejected`).
     pub bridges: Vec<BridgeLine>,
+    /// How many lines were dropped as duplicates of an earlier line (the
+    /// first occurrence wins).
     pub duplicates: usize,
     /// Bridge lines that parsed successfully but use documentation/local-only
     /// addresses and were therefore ignored.
@@ -689,10 +710,8 @@ impl LogConfig {
 
 /// Outcome of [`Config::load`]: where the values came from.
 pub enum Loaded {
-    FromFile {
-        path: PathBuf,
-        config: Config,
-    },
+    /// The configuration was read from `path` on disk.
+    FromFile { path: PathBuf, config: Config },
     /// Reserved for an explicit "skip file IO" code path; not used by
     /// `Config::load` after the default-file-autocreate behaviour was
     /// added, but kept so external callers can still bypass disk.
@@ -701,6 +720,8 @@ pub enum Loaded {
 }
 
 impl Loaded {
+    /// Consumes the load outcome and returns the [`Config`] it carries,
+    /// regardless of where it came from.
     pub fn into_config(self) -> Config {
         match self {
             Loaded::FromFile { config, .. } => config,
