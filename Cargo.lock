@@ -1721,6 +1721,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dns-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arti-wrapper",
+ "hickory-proto",
+ "persist-lock",
+ "rustls",
+ "serde",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+]
+
+[[package]]
 name = "downcast-rs"
 version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
