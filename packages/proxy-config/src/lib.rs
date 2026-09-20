@@ -31,8 +31,21 @@ static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// Local address the SOCKS5 listener binds to.
-    pub listen: String,
+    /// Local addresses the SOCKS5 listeners bind to, one listener per
+    /// address. The canonical Ktav form is a block array:
+    ///
+    /// ```text
+    /// listen: [
+    ///     127.0.0.1:1080
+    /// ]
+    /// ```
+    ///
+    /// For compatibility a single scalar string (`listen:
+    /// 127.0.0.1:1080`) is also accepted and wrapped into a one-element
+    /// vector. An empty list parses but is rejected when the server
+    /// starts (fail fast).
+    #[serde(deserialize_with = "listen_addresses")]
+    pub listen: Vec<String>,
     /// Logging configuration.
     pub log: LogConfig,
     /// Bridges configuration.
@@ -661,7 +674,7 @@ impl BridgesConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            listen: "127.0.0.1:1080".to_string(),
+            listen: vec!["127.0.0.1:1080".to_string()],
             log: LogConfig::default(),
             bridges: BridgesConfig::default(),
             watchdog: WatchdogConfig::default(),
@@ -673,6 +686,41 @@ impl Default for Config {
             dns: DnsConfig::default(),
         }
     }
+}
+
+/// Deserialize `listen` from either the new list form (`listen: [ ... ]`)
+/// or the legacy scalar form (`listen: 127.0.0.1:1080`), which is wrapped
+/// into a single-element vector so existing Ktav configs keep parsing.
+fn listen_addresses<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct ListenAddresses;
+
+    impl<'de> serde::de::Visitor<'de> for ListenAddresses {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an address string or a list of address strings")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            Ok(vec![value.to_owned()])
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut addrs = Vec::new();
+            while let Some(addr) = seq.next_element::<String>()? {
+                addrs.push(addr);
+            }
+            Ok(addrs)
+        }
+    }
+
+    deserializer.deserialize_any(ListenAddresses)
 }
 
 impl Default for LogConfig {

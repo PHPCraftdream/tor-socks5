@@ -255,17 +255,60 @@ pub(crate) async fn run_server(
     let conn_health = ConnHealthCounters::default();
     spawn_conn_health_logger(conn_health.clone(), cfg.conn_health);
 
-    let listener = TcpListener::bind(&cfg.listen)
-        .await
-        .with_context(|| format!("failed to bind {}", cfg.listen))?;
-    info!(listen_addr = %cfg.listen, "SOCKS5 proxy is listening");
+    // Fail fast on an empty listen list (the deserializer accepts it, but
+    // a proxy listening on nothing would silently serve no one).
+    if cfg.listen.is_empty() {
+        bail!(
+            "no listen addresses configured — set `listen` in the config \
+             (a single address or a list)"
+        );
+    }
+
+    // Bind every configured address, fail on the first error: a partial
+    // bind ("listening on only part of what was configured") is a silent
+    // degradation, harder to diagnose than a clean refusal to start.
+    let mut listeners = Vec::with_capacity(cfg.listen.len());
+    for addr in &cfg.listen {
+        let listener = TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("failed to bind {addr}"))?;
+        info!(listen_addr = %addr, "SOCKS5 proxy is listening");
+        listeners.push(listener);
+    }
+
+    // One accept loop per listener, polled concurrently. The futures are
+    // kept on this task (FuturesUnordered) rather than spawned per
+    // address: on shutdown the `() = shutdown` branch wins the select and
+    // the whole FuturesUnordered is dropped, dropping every accept loop —
+    // and with it its `TcpListener`, so new accepts stop immediately.
+    // Detached spawned loops would keep accepting through teardown and
+    // need explicit aborts. Every loop runs forever, so `next()` can only
+    // ever complete via shutdown, never `None`.
+    use futures::StreamExt;
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    // Shared across all listeners so log-correlation conn_ids stay unique.
+    let next_conn_id = Arc::new(AtomicU64::new(1));
+    let mut accept_loops = listeners
+        .into_iter()
+        .map(|listener| {
+            accept_loop(
+                listener,
+                egress.clone(),
+                auth_state.clone(),
+                permits.clone(),
+                conn_health.clone(),
+                next_conn_id.clone(),
+                cfg.security.block_onion,
+            )
+        })
+        .collect::<futures::stream::FuturesUnordered<_>>();
 
     tokio::select! {
         biased;
         () = shutdown => {}
-        _ = accept_loop(listener, egress.clone(), auth_state.clone(), Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS)), conn_health.clone(), cfg.security.block_onion) => {
-            // The accept loop retries accept errors internally with a
-            // backoff, so this branch means the loop itself ended.
+        _ = accept_loops.next() => {
+            // The accept loops retry accept errors internally with a
+            // backoff, so this branch means a loop itself ended.
             warn!("accept loop exited unexpectedly");
         }
     }
@@ -393,17 +436,24 @@ fn pick_upstream(
     Ok(Some(upstream::Upstream::new(address, credentials)))
 }
 
+/// Accept connections on `listener` forever, spawning one task per
+/// connection. Accept errors are logged and retried with a backoff, so the
+/// loop only ends by being dropped (shutdown).
+///
+/// `next_conn_id` is the shared, monotonic per-connection identifier for
+/// log correlation — shared across every listener's accept loop, since
+/// per-loop counters would hand out colliding conn_ids once several
+/// listeners are bound. Wraps only after 2^64 connections — never, in
+/// practice.
 async fn accept_loop(
     listener: TcpListener,
     egress: Egress,
     auth: Option<Arc<AuthState>>,
     permits: Arc<tokio::sync::Semaphore>,
     conn_health: ConnHealthCounters,
+    next_conn_id: Arc<AtomicU64>,
     block_onion: bool,
 ) {
-    // Monotonic per-connection identifier for log correlation. Wraps only
-    // after 2^64 connections — never, in practice.
-    let next_conn_id = AtomicU64::new(1);
     loop {
         let (client, peer) = match listener.accept().await {
             Ok(v) => v,

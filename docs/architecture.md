@@ -278,7 +278,9 @@ Auxiliary files live next to the resolved config: `tor-socks5.users.ktav`
 Schema (defaults):
 
 ```ktav
-listen: 127.0.0.1:1080
+listen: [
+    127.0.0.1:1080
+]
 
 log.default: info
 log.targets.socks5_proxy: debug
@@ -294,7 +296,9 @@ No `pt_binary` field: the proxy uses its own `current_exe()` for the
 PT child. See `README.md` for the full schema (`upstream.*`,
 `bridges.*`) and `docs/bridges.md` for the bridge-health knobs. See
 `docs/auth.md` for `auth.enabled` / `auth.users_file` — the
-Android-facing knobs for RFC 1929 local authentication.
+Android-facing knobs for RFC 1929 local authentication. The legacy
+scalar form `listen: addr` is still parsed for compatibility (a
+one-element list); an empty list parses but fails at startup.
 
 ## Request flow
 

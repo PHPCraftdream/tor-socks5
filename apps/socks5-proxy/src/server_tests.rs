@@ -1,5 +1,5 @@
 use super::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -457,6 +457,7 @@ async fn spawn_test_server_with_upstream(
         None,
         permits.clone(),
         ConnHealthCounters::default(),
+        Arc::new(AtomicU64::new(1)),
         false,
     ));
     (addr, permits, handle)

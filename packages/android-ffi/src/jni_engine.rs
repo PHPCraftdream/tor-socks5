@@ -221,9 +221,15 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
             bridge_probe::seed_disk_fallback(&parsed_bridges.dns_hints);
         }
 
-        // 5. Parse listen address
+        // 5. Parse listen address. The Android engine binds exactly ONE
+        // listener (`engine.rs` takes a single SocketAddr, the status
+        // string is "On:ADDR", one VPN tun interface points at it), so
+        // only the first configured address is used even when the config
+        // lists several.
         let listen_addr: std::net::SocketAddr = cfg
             .listen
+            .first()
+            .with_context(|| "listen: no addresses configured (set `listen` in the config)")?
             .parse()
             .context("parsing listen address")
             .map_err(|e| {

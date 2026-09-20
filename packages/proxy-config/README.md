@@ -12,7 +12,7 @@ The crate publishes as `tor-socks5-config`, while the library target keeps the i
 use proxy_config::{BridgesConfig, Config};
 
 let cfg = Config {
-    listen: "127.0.0.1:9050".into(),
+    listen: vec!["127.0.0.1:9050".into()],
     bridges: BridgesConfig {
         lines: vec![
             "obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=ZZZ iat-mode=0"

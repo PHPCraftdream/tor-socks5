@@ -7,7 +7,7 @@ use proxy_config::{BridgesConfig, Config, Loaded};
 
 fn main() -> anyhow::Result<()> {
     let cfg = Config {
-        listen: "127.0.0.1:9050".to_string(),
+        listen: vec!["127.0.0.1:9050".to_string()],
         bridges: BridgesConfig {
             lines: vec![
                 "obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=ZZZ iat-mode=0"
@@ -37,7 +37,7 @@ fn main() -> anyhow::Result<()> {
     }
     let cfg = loaded.into_config();
 
-    println!("listen: {}", cfg.listen);
+    println!("listen: {:?}", cfg.listen);
     println!(
         "log: filter {:?}, output {:?}",
         cfg.log.to_filter(),

@@ -70,7 +70,11 @@ Config is a [Ktav](https://github.com/ktav-lang/rust) file. Resolution order:
 3. `tor-socks5.ktav` in the current directory (copy from `tor-socks5.example.ktav`).
 
 ```ktav
-listen: 127.0.0.1:1080
+## Addresses to listen on — one SOCKS5 listener per address.
+## A single address (`listen: 127.0.0.1:1080`) is also accepted.
+listen: [
+    127.0.0.1:1080
+]
 
 log.default: info
 ## log.output: stderr (default) | stdout | file

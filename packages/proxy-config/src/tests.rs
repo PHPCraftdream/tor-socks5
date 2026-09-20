@@ -6,7 +6,7 @@ const CERT_NEW: &str = "EREREREREREREREREREREREREREzMzMzMzMzMzMzMzMzMzMzMzMzMzMz
 #[test]
 fn default_listen_address_is_loopback_1080() {
     let cfg = Config::default();
-    assert_eq!(cfg.listen, "127.0.0.1:1080");
+    assert_eq!(cfg.listen, vec!["127.0.0.1:1080"]);
 }
 
 #[test]
@@ -73,10 +73,53 @@ fn parses_minimal_ktav() {
 listen: 127.0.0.1:9050
 "#;
     let cfg: Config = ktav::from_str(src).expect("ktav parses");
-    assert_eq!(cfg.listen, "127.0.0.1:9050");
+    assert_eq!(cfg.listen, vec!["127.0.0.1:9050"]);
     // Other fields should fall back to defaults.
     assert_eq!(cfg.log.default, LogConfig::default().default);
     assert!(cfg.bridges.lines.is_empty());
+}
+
+#[test]
+fn parses_legacy_scalar_listen_as_single_address() {
+    // Compat contract: the old scalar `listen:` form keeps parsing and
+    // becomes a one-element vector.
+    let src = "listen: 127.0.0.1:9050\n";
+    let cfg: Config = ktav::from_str(src).expect("ktav parses");
+    assert_eq!(cfg.listen, vec!["127.0.0.1:9050".to_string()]);
+}
+
+#[test]
+fn parses_listen_list_form() {
+    let src = r#"
+listen: [
+    127.0.0.1:9050
+    127.0.0.1:1080
+]
+"#;
+    let cfg: Config = ktav::from_str(src).expect("ktav parses");
+    assert_eq!(
+        cfg.listen,
+        vec!["127.0.0.1:9050".to_string(), "127.0.0.1:1080".to_string()]
+    );
+}
+
+#[test]
+fn listen_round_trips_through_write() {
+    let dir = unique_test_dir("listen-roundtrip");
+    let path = dir.join("tor-socks5.ktav");
+    let cfg = Config {
+        listen: vec!["127.0.0.1:9050".to_string(), "[::1]:1080".to_string()],
+        ..Default::default()
+    };
+    cfg.write(&path).expect("write");
+    let loaded = Config::load_with_override(Some(&path))
+        .expect("load")
+        .into_config();
+    assert_eq!(
+        loaded.listen,
+        vec!["127.0.0.1:9050".to_string(), "[::1]:1080".to_string()]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -272,7 +315,7 @@ bridges.lines: [
 ]
 ";
     let cfg: Config = ktav::from_str(src).expect("double-hash comments + block array parse");
-    assert_eq!(cfg.listen, "127.0.0.1:1080");
+    assert_eq!(cfg.listen, vec!["127.0.0.1:1080"]);
     assert_eq!(cfg.bridges.lines.len(), 2);
 }
 

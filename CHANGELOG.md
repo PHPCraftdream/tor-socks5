@@ -115,6 +115,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (default `600`) — existing config files pick up the new defaults
   automatically.
 
+### Changed
+
+- **`listen` accepts a list of addresses** (`proxy-config`,
+  `apps/socks5-proxy`): `Config.listen` is now a `Vec<String>` — every
+  configured address gets its own accept loop, and connections from any
+  listener are served by the shared per-connection handler (the global
+  256 concurrent-connection cap and the `conn_id` counter are common to
+  all listeners). The canonical Ktav form is a block array (`listen: [`
+  ... `]`); the old scalar form (`listen: 127.0.0.1:1080`) is still
+  accepted and wrapped into a one-element list, so existing config files
+  need no changes. Failing to bind any configured address — including an
+  empty list — aborts startup entirely: fail fast instead of listening on
+  only part of what was configured. Android JNI keeps consuming a single
+  (first) address.
+
 ### Fixed
 
 - A descriptor-less bridge guard aborted an entire circuit-build attempt
