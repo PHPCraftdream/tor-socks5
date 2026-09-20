@@ -57,3 +57,22 @@ security.block_onion: true
 warm_pool.enabled: false
 warm_pool.pool_size: 3
 warm_pool.refresh_interval_secs: 60
+
+## Optional local DNS server (default OFF): clients send plain UDP/TCP
+## DNS queries to dns_server.listen; each is answered via public
+## DNS-over-HTTPS providers with every exchange tunnelled through the
+## Tor tunnel. Requires the Tor egress (incompatible with upstream.*);
+## the cache lands in a .dns-cache file next to this config. Full
+## manual: tor-socks5 help dns-server. To enable, uncomment:
+## dns_server.enabled: true
+## dns_server.listen: [
+##     127.0.0.1:15353
+## ]
+## dns_server.disable_builtin_providers: false
+## dns_server.custom_doh_providers: [
+##     {
+##         ip: 9.9.9.10
+##         hostname: dns10.quad9.net
+##         path: /dns-query
+##     }
+## ]

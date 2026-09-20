@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Local DNS server (DNS-over-Tor)** (opt-in, default OFF): a new
+  `dns_server.*` config section turns tor-socks5 into a local DNS
+  resolver — clients send ordinary UDP/TCP DNS queries, and each is
+  answered from a pool of 36 built-in public DNS-over-HTTPS providers
+  (extendable via `dns_server.custom_doh_providers`, or replaceable
+  entirely via `dns_server.disable_builtin_providers`) with every DoH
+  exchange tunnelled through the live Tor tunnel, so a hostname never
+  leaves the machine as plaintext DNS. Answers are cached on disk (a
+  `.dns-cache` file next to the config, TTL-aware, flushed every five
+  minutes and at shutdown), so a restart keeps serving still-fresh
+  answers without paying a new Tor round-trip. Deliberate limitations:
+  no EDNS0 (UDP answers capped at the legacy 512-byte payload with the
+  TC=1 TCP fallback), and answers carry all known addresses for the
+  host (A + AAAA) regardless of the queried type. Requires the Tor
+  egress — enabling it together with `upstream.*` is a startup error
+  rather than a silent plaintext-DNS leak. Documented in
+  `docs/dns-server.md` (`tor-socks5 help dns-server`).
 - **Periodic connection-health summary log** (`conn_health.rs`): a new
   background task drains a rolling window of accept-loop counters — new
   connections, successful `tor connection established` events, and errors

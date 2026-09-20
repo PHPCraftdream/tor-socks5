@@ -126,6 +126,11 @@ auth.users_file:
 ## response wins. System DNS is opt-in because carrier DNS may be blocked.
 dns.doh_enabled: true
 dns.system_fallback: false
+
+## Optional local DNS server (default OFF): plain UDP/TCP DNS queries
+## answered via public DoH providers, every exchange tunnelled through
+## Tor. Requires the Tor egress; enable with dns_server.enabled: true.
+## Details: tor-socks5 help dns-server
 ```
 
 > **Ktav comments are `##` at the start of a line** (a single `#` is content, and there are no
@@ -142,6 +147,7 @@ to print them all. See [`docs/`](docs/) for the source:
 - [webtunnel](docs/webtunnel.md) — the webtunnel transport
 - [authentication](docs/auth.md) — users, trust-on-first-use, `.onion` gating
 - [upstream SOCKS5](docs/upstream.md) — chaining through another proxy
+- [local DNS server](docs/dns-server.md) — DNS-over-Tor resolver for client queries
 - [service](docs/service.md) — install/start/stop/status on each OS
 - [logging](docs/logging.md) — sinks, levels, non-blocking writer
 - [architecture](docs/architecture.md) — workspace layout and data flow

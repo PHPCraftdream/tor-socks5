@@ -33,6 +33,11 @@ const TOPICS: &[(&str, &str, &str)] = &[
         include_str!("../../../docs/upstream.md"),
     ),
     (
+        "dns-server",
+        "Optional local DNS server resolving every query via DoH over Tor",
+        include_str!("../../../docs/dns-server.md"),
+    ),
+    (
         "logging",
         "Log sinks, levels, non-blocking writer",
         include_str!("../../../docs/logging.md"),

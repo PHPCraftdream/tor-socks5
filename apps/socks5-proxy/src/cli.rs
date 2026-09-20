@@ -23,6 +23,9 @@ bridges from public collectors over Tor and merges the working ones into the con
 Optional extras: RFC 1929 username/password auth for SOCKS5 clients (with trust-on-first-use \
 provisioning), routing egress through an upstream SOCKS5 proxy instead of Tor, and installation \
 as an OS service (systemd / launchd / Windows SCM / rc.d).\n\n\
+An optional local DNS server (`dns_server.*` config section, default off) answers clients' plain \
+DNS queries over DNS-over-HTTPS with every exchange tunnelled through the Tor network — see \
+`tor-socks5 help dns-server`.\n\n\
 With no subcommand, the proxy server runs. Configuration is read from a Ktav file \
 (default `tor-socks5.ktav` in the current directory, or `$TOR_SOCKS5_CONFIG`); a template is \
 created on first run.",

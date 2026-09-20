@@ -290,10 +290,14 @@ log.targets.tor_: warn
 log.targets.arti_: warn
 
 bridges.lines: []
+dns_server.enabled: false
+dns_server.listen: [
+    127.0.0.1:15353
+]
 ```
 
 No `pt_binary` field: the proxy uses its own `current_exe()` for the
-PT child. See `README.md` for the full schema (`upstream.*`,
+PT child. See `README.md` for the full schema (`upstream.*`, `dns_server.*`,
 `bridges.*`) and `docs/bridges.md` for the bridge-health knobs. See
 `docs/auth.md` for `auth.enabled` / `auth.users_file` — the
 Android-facing knobs for RFC 1929 local authentication. The legacy
