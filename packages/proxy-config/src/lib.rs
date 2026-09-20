@@ -116,10 +116,23 @@ pub struct DnsServerConfig {
     /// Master switch. Default `false` — opt-in: enabling it opens a local
     /// UDP/TCP listener and tunnels client DNS through Tor.
     pub enabled: bool,
-    /// Local `host:port` bind address for the DNS listener. Default
+    /// Local `host:port` bind addresses for the DNS listener — one UDP+TCP
+    /// listener pair is bound per address. The canonical Ktav form is a
+    /// block array:
+    ///
+    /// ```text
+    /// dns_server.listen: [
+    ///     127.0.0.1:15353
+    /// ]
+    /// ```
+    ///
+    /// For compatibility a single scalar string (`dns_server.listen:
+    /// 127.0.0.1:15353`) is also accepted and wrapped into a one-element
+    /// vector — the same rule as [`Config::listen`]. Default
     /// `127.0.0.1:15353` — deliberately not 53, a privileged port that
     /// needs root/administrator to bind.
-    pub listen: String,
+    #[serde(deserialize_with = "listen_addresses")]
+    pub listen: Vec<String>,
     /// When `true`, the built-in DoH provider list is dropped from the pool
     /// entirely and only [`Self::custom_doh_providers`] remains — the escape
     /// hatch for an operator who wants full control over which resolvers
@@ -134,7 +147,7 @@ impl Default for DnsServerConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            listen: "127.0.0.1:15353".to_owned(),
+            listen: vec!["127.0.0.1:15353".to_owned()],
             disable_builtin_providers: false,
             custom_doh_providers: Vec::new(),
         }

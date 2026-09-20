@@ -736,9 +736,55 @@ fn from_file_spares_malformed_temp_names() {
 fn dns_server_defaults_to_disabled_on_loopback_15353() {
     let cfg = DnsServerConfig::default();
     assert!(!cfg.enabled);
-    assert_eq!(cfg.listen, "127.0.0.1:15353");
+    assert_eq!(cfg.listen, vec!["127.0.0.1:15353"]);
     assert!(!cfg.disable_builtin_providers);
     assert!(cfg.custom_doh_providers.is_empty());
+}
+
+#[test]
+fn parses_dns_server_legacy_scalar_listen_as_single_address() {
+    // Compat contract: the legacy scalar `dns_server.listen:` form keeps
+    // parsing and becomes a one-element vector (same rule as
+    // `Config::listen`).
+    let src = "listen: 127.0.0.1:1080\ndns_server.listen: 127.0.0.1:15353\n";
+    let cfg: Config = ktav::from_str(src).expect("ktav parses");
+    assert_eq!(cfg.dns_server.listen, vec!["127.0.0.1:15353".to_string()]);
+}
+
+#[test]
+fn parses_dns_server_listen_list_form() {
+    let src = r#"
+listen: 127.0.0.1:1080
+
+dns_server.listen: [
+    127.0.0.1:15353
+    127.0.0.1:25353
+]
+"#;
+    let cfg: Config = ktav::from_str(src).expect("ktav parses");
+    assert_eq!(
+        cfg.dns_server.listen,
+        vec!["127.0.0.1:15353".to_string(), "127.0.0.1:25353".to_string()]
+    );
+}
+
+#[test]
+fn dns_server_listen_round_trips_through_write() {
+    // A plain `ktav::to_string`/`from_str` round trip is enough here —
+    // `Config::write` delegates to the same serializer.
+    let cfg = Config {
+        dns_server: DnsServerConfig {
+            listen: vec!["127.0.0.1:15353".to_string(), "127.0.0.1:25353".to_string()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let serialized = ktav::to_string(&cfg).expect("serialize");
+    let deserialized: Config = ktav::from_str(&serialized).expect("deserialize");
+    assert_eq!(
+        deserialized.dns_server.listen,
+        vec!["127.0.0.1:15353".to_string(), "127.0.0.1:25353".to_string()]
+    );
 }
 
 #[test]

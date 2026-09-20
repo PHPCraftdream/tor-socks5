@@ -9,6 +9,7 @@ mod cli;
 mod config;
 mod conn_health;
 mod daemon;
+mod dns_wiring;
 mod fetch_merge;
 mod help_cmd;
 mod seed;

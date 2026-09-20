@@ -20,6 +20,7 @@ bridge-fetcher = { path = "../../packages/bridge-fetcher", version = "0.1.0" }
 bridge-probe = { path = "../../packages/bridge-probe", version = "0.1.0" }
 bridge-store = { path = "../../packages/bridge-store", version = "0.1.0" }
 bridge-verify-core = { path = "../../packages/bridge-verify-core", version = "0.1.0" }
+dns-server = { path = "../../packages/dns-server", version = "0.1.0" }
 persist-lock = { path = "../../packages/persist-lock", version = "0.1.0" }
 rusqlite = { workspace = true }
 proxy-config = { path = "../../packages/proxy-config", version = "0.1.0", package = "tor-socks5-config" }

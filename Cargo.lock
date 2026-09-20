@@ -1726,6 +1726,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arti-wrapper",
+ "futures",
  "hickory-proto",
  "httparse",
  "persist-lock",
@@ -5261,6 +5262,7 @@ dependencies = [
  "clap",
  "criterion",
  "daemonize",
+ "dns-server",
  "futures",
  "getrandom 0.2.17",
  "indexmap 2.14.0",

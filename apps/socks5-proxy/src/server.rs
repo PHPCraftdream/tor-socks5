@@ -15,6 +15,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, Loaded, UpstreamConfig};
 use crate::conn_health::{spawn_conn_health_logger, ConnHealthCounters};
+use crate::dns_wiring::{convert_custom_doh_providers, dns_cache_path};
 use crate::socks5::{self, Reply};
 use crate::startup::{init_tracing, install_crypto_provider};
 use crate::tor_setup::build_tor_settings;
@@ -246,6 +247,53 @@ pub(crate) async fn run_server(
             Egress::Tor(handle)
         }
     };
+
+    // Optional local DNS listener (opt-in, default OFF). Every DoH exchange
+    // it performs is tunnelled through the live Tor tunnel, so the feature
+    // requires the Tor egress: behind an upstream SOCKS5 proxy the premise
+    // ("client DNS leaves the machine only inside Tor") cannot be honoured,
+    // and refusing to start beats silently leaking plaintext queries.
+    if cfg.dns_server.enabled {
+        let Egress::Tor(handle) = &egress else {
+            bail!(
+                "dns_server.enabled requires Tor egress, not an upstream SOCKS5 proxy — \
+                 disable dns_server or remove the upstream"
+            );
+        };
+        let custom = convert_custom_doh_providers(&cfg.dns_server.custom_doh_providers);
+        let pool =
+            dns_server::providers::provider_pool(&custom, cfg.dns_server.disable_builtin_providers);
+        let cache_path = dns_cache_path(config_path.as_deref());
+        let cache = Arc::new(dns_server::cache::DnsCache::load(&cache_path).await);
+        info!(
+            listen = ?cfg.dns_server.listen,
+            cache = %cache_path.display(),
+            providers = pool.len(),
+            "starting DNS-over-Tor listener"
+        );
+        // One more producer beside the bridge-upkeep tasks: cancelled and
+        // joined by the same shutdown choreography below. `run` binds the
+        // UDP+TCP listeners itself; an error exit is logged, not fatal —
+        // the DNS listener is an auxiliary service next to the SOCKS5 path.
+        let dns_listen = cfg.dns_server.listen.clone();
+        let producer_handle = handle.clone();
+        let dns_token = producer_token.clone();
+        producers.push(tokio::spawn(async move {
+            // The inner per-call clone makes the future 'static: the closure
+            // owns its handle, and `tunnel()` snapshots the current slot so a
+            // watchdog rebuild is picked up on the next query.
+            let tunnel = move || {
+                let handle = producer_handle.clone();
+                async move { handle.tunnel().await }
+            };
+            if let Err(error) =
+                dns_server::server::run(&dns_listen, tunnel, cache, pool, cache_path, dns_token)
+                    .await
+            {
+                error!(%error, "dns server exited");
+            }
+        }));
+    }
 
     // Periodic connection-health summary: drains a rolling window of
     // accept-loop counters (attempts, established, errors by kind) into one
