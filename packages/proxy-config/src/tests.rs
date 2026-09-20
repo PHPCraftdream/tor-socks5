@@ -731,3 +731,99 @@ fn from_file_spares_malformed_temp_names() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn dns_server_defaults_to_disabled_on_loopback_15353() {
+    let cfg = DnsServerConfig::default();
+    assert!(!cfg.enabled);
+    assert_eq!(cfg.listen, "127.0.0.1:15353");
+    assert!(!cfg.disable_builtin_providers);
+    assert!(cfg.custom_doh_providers.is_empty());
+}
+
+#[test]
+fn dns_server_section_falls_back_to_defaults_when_absent() {
+    // A config that predates the section must still parse, and the
+    // feature must stay OFF (`#[serde(default)]` section wiring).
+    let src = "listen: 127.0.0.1:1080\n";
+    let cfg: Config = ktav::from_str(src).expect("ktav parses without dns_server");
+    assert_eq!(cfg.dns_server, DnsServerConfig::default());
+}
+
+#[test]
+fn parses_dns_server_section_with_a_custom_provider() {
+    let src = "listen: 127.0.0.1:1080\n\
+               dns_server.enabled: true\n\
+               dns_server.disable_builtin_providers: true\n\
+               dns_server.custom_doh_providers: [\n\
+               \t{\n\
+               \t\tip: 9.9.9.9\n\
+               \t\thostname: dns.quad9.net\n\
+               \t\tpath: /dns-query\n\
+               \t}\n\
+               ]\n";
+    let cfg: Config = ktav::from_str(src).expect("ktav parses dns_server section");
+    assert!(cfg.dns_server.enabled);
+    assert!(cfg.dns_server.disable_builtin_providers);
+    assert_eq!(cfg.dns_server.custom_doh_providers.len(), 1);
+    let p = &cfg.dns_server.custom_doh_providers[0];
+    assert_eq!(p.ip, "9.9.9.9");
+    assert_eq!(p.hostname, "dns.quad9.net");
+    assert_eq!(p.path, "/dns-query");
+}
+
+#[test]
+fn dns_server_roundtrip_preserves_custom_providers_exactly() {
+    let mut cfg = Config::default();
+    cfg.dns_server.enabled = true;
+    cfg.dns_server.custom_doh_providers = vec![
+        DohProviderConfig {
+            ip: "1.1.1.1".into(),
+            hostname: "cloudflare-dns.com".into(),
+            path: "/dns-query".into(),
+        },
+        DohProviderConfig {
+            ip: "2620:fe::fe".into(),
+            hostname: "dns.quad9.net".into(),
+            path: "/dns-query".into(),
+        },
+    ];
+    let serialized = ktav::to_string(&cfg).expect("serialize");
+    let deserialized: Config = ktav::from_str(&serialized).expect("deserialize");
+    assert!(deserialized.dns_server.enabled);
+    assert_eq!(
+        deserialized.dns_server.custom_doh_providers,
+        cfg.dns_server.custom_doh_providers
+    );
+    assert_eq!(
+        deserialized.dns_server.custom_doh_providers[1].ip,
+        "2620:fe::fe"
+    );
+}
+
+#[test]
+fn dns_server_unknown_field_is_rejected() {
+    // deny_unknown_fields: a typo inside the section must fail loudly.
+    let src = "listen: 127.0.0.1:1080\ndns_server.port: 5353\n";
+    assert!(
+        ktav::from_str::<Config>(src).is_err(),
+        "unknown key inside dns_server must be rejected"
+    );
+}
+
+#[test]
+fn dns_server_unknown_field_inside_custom_provider_is_rejected() {
+    let src = "listen: 127.0.0.1:1080\n\
+               dns_server.custom_doh_providers: [\n\
+               \t{\n\
+               \t\tip: 9.9.9.9\n\
+               \t\thostname: dns.quad9.net\n\
+               \t\tpath: /dns-query\n\
+               \t\tscheme: https\n\
+               \t}\n\
+               ]\n";
+    assert!(
+        ktav::from_str::<Config>(src).is_err(),
+        "unknown key inside a custom provider must be rejected"
+    );
+}

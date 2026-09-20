@@ -65,6 +65,10 @@ pub struct Config {
     pub security: SecurityConfig,
     /// Name-resolution policy used by bridge reachability probes.
     pub dns: DnsConfig,
+    /// Optional local DNS server (plain UDP/TCP wire format) answering
+    /// client queries through public DoH providers reached over the live
+    /// Tor tunnel. See [`DnsServerConfig`].
+    pub dns_server: DnsServerConfig,
 }
 
 /// Name-resolution policy for bridge probes. DoH is deliberately the default:
@@ -97,6 +101,61 @@ impl DnsConfig {
             system_fallback: self.system_fallback,
         }
     }
+}
+
+/// Optional local DNS listener for **client** queries. Do not confuse this
+/// with [`DnsConfig`] (`dns.*`): that section is the name-resolution policy
+/// used by BRIDGE reachability probes, which resolve bridge hostnames
+/// directly, before Tor is up. This section (`dns_server.*`) is the
+/// optional local DNS server that CLIENT queries hit, with every upstream
+/// DoH exchange tunnelled through the live Tor circuit. Default OFF —
+/// see [`DnsServerConfig::enabled`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DnsServerConfig {
+    /// Master switch. Default `false` — opt-in: enabling it opens a local
+    /// UDP/TCP listener and tunnels client DNS through Tor.
+    pub enabled: bool,
+    /// Local `host:port` bind address for the DNS listener. Default
+    /// `127.0.0.1:15353` — deliberately not 53, a privileged port that
+    /// needs root/administrator to bind.
+    pub listen: String,
+    /// When `true`, the built-in DoH provider list is dropped from the pool
+    /// entirely and only [`Self::custom_doh_providers`] remains — the escape
+    /// hatch for an operator who wants full control over which resolvers
+    /// see their queries. Default `false`.
+    pub disable_builtin_providers: bool,
+    /// User-added DoH providers merged after the built-ins (the only pool
+    /// when [`Self::disable_builtin_providers`] is set). Default empty.
+    pub custom_doh_providers: Vec<DohProviderConfig>,
+}
+
+impl Default for DnsServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: "127.0.0.1:15353".to_owned(),
+            disable_builtin_providers: false,
+            custom_doh_providers: Vec::new(),
+        }
+    }
+}
+
+/// One operator-configured DoH provider for the [`DnsServerConfig`] pool.
+/// A pure serde configuration type — NOT a re-export or wrapper of the
+/// dns-server crate's `DohProvider`: proxy-config must not depend on
+/// dns-server, so converting into a runnable `dns_server::DohProvider` is
+/// the caller's job.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DohProviderConfig {
+    /// IPv4/IPv6 literal the DoH exchange's TCP connection is opened to
+    /// THROUGH TOR — the hostname is never resolved locally.
+    pub ip: String,
+    /// Hostname used only for TLS SNI and the HTTP `Host` header.
+    pub hostname: String,
+    /// DoH endpoint path, usually `/dns-query`.
+    pub path: String,
 }
 
 /// Security policy for destinations accepted by the local SOCKS5 listener.
@@ -684,6 +743,7 @@ impl Default for Config {
             auth: AuthConfig::default(),
             security: SecurityConfig::default(),
             dns: DnsConfig::default(),
+            dns_server: DnsServerConfig::default(),
         }
     }
 }

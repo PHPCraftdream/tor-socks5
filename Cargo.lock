@@ -1727,12 +1727,17 @@ dependencies = [
  "anyhow",
  "arti-wrapper",
  "hickory-proto",
+ "httparse",
  "persist-lock",
  "rustls",
  "serde",
  "thiserror 2.0.18",
  "time",
  "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
