@@ -15,7 +15,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, Loaded, UpstreamConfig};
 use crate::conn_health::{spawn_conn_health_logger, ConnHealthCounters};
-use crate::dns_wiring::{convert_custom_doh_providers, dns_cache_path};
+use crate::dns_wiring::{convert_custom_doh_providers, convert_dns_overrides, dns_cache_path};
 use crate::socks5::{self, Reply};
 use crate::startup::{init_tracing, install_crypto_provider};
 use crate::tor_setup::build_tor_settings;
@@ -263,6 +263,7 @@ pub(crate) async fn run_server(
         let custom = convert_custom_doh_providers(&cfg.dns_server.custom_doh_providers);
         let pool =
             dns_server::providers::provider_pool(&custom, cfg.dns_server.disable_builtin_providers);
+        let overrides = convert_dns_overrides(&cfg.dns_server.overrides);
         let cache_path = dns_cache_path(config_path.as_deref());
         let cache = Arc::new(dns_server::cache::DnsCache::load(&cache_path).await);
         info!(
@@ -286,9 +287,16 @@ pub(crate) async fn run_server(
                 let handle = producer_handle.clone();
                 async move { handle.tunnel().await }
             };
-            if let Err(error) =
-                dns_server::server::run(&dns_listen, tunnel, cache, pool, cache_path, dns_token)
-                    .await
+            if let Err(error) = dns_server::server::run(
+                &dns_listen,
+                tunnel,
+                cache,
+                pool,
+                overrides,
+                cache_path,
+                dns_token,
+            )
+            .await
             {
                 error!(%error, "dns server exited");
             }

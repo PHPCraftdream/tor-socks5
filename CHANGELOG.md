@@ -26,6 +26,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   egress — enabling it together with `upstream.*` is a startup error
   rather than a silent plaintext-DNS leak. Documented in
   `docs/dns-server.md` (`tor-socks5 help dns-server`).
+- **Per-mask resolver exceptions for the local DNS server**
+  (`dns_server.overrides`): the operator lists hostname masks (`*` wildcard,
+  case-insensitive, whole-host match, first match in list order wins); a queried
+  host matching a mask bypasses the DoH-over-Tor pool and is resolved via plain
+  DNS (`resolver: dns` + `server: ip:port`) or the operating-system resolver
+  (`resolver: system`) — both deliberately OUTSIDE the Tor tunnel, an explicit
+  operator-chosen exception to the otherwise tunnel-everything posture (the
+  default empty list keeps the documented "plaintext DNS only inside the tunnel"
+  guarantee intact). Override answers share the same TTL cache as ordinary
+  answers; conversion is forgiving — a broken entry is logged and skipped rather
+  than fatal. Documented in `docs/dns-server.md`.
 - **Periodic connection-health summary log** (`conn_health.rs`): a new
   background task drains a rolling window of accept-loop counters — new
   connections, successful `tor connection established` events, and errors

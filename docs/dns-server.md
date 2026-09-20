@@ -61,6 +61,50 @@ are dropped, keeping the first. The full list lives in
 inherited from the bridge-probe list have since become HTTP/2-only frontends — such entries
 simply never win and cost one timed-out attempt each (details in the providers.rs module docs).
 
+## Exceptions (per-mask overrides)
+
+`dns_server.overrides` is an operator-listed array of hostname masks that skip the
+DoH-over-Tor pool entirely: each entry pairs a glob `pattern` with the resolver that
+handles matching hosts — the operating-system resolver (`resolver: system`, 10s
+timeout) or one plain DNS server (`resolver: dns` + `server: ip:port`, UDP with a
+TCP retry on truncation, 5s timeout). Masks are scanned in list order and the FIRST
+match wins; a host matching no mask keeps the default pool path. Override answers
+share the same TTL cache as ordinary answers.
+
+> **Warning:** a host matching a mask deliberately LEAVES the Tor tunnel. The plain
+> DNS or OS-resolver exchange runs over the machine's own network, so the queried
+> name is visible to the local network and ISP — a conscious, operator-opted
+> exception to this document's security model. Do not add masks for hosts whose
+> names you do not want to reveal to the local network/ISP.
+
+```ktav
+dns_server.overrides: [
+    {
+        ## all three fields are required; `server` stays empty for `system`
+        pattern: *.lan
+        resolver: system
+        server: 
+    }
+    {
+        pattern: ns.home.arpa
+        resolver: dns
+        server: 192.168.1.1:53
+    }
+]
+```
+
+**Mask syntax:** `*` matches any run of characters including none; matching is
+case-insensitive and always against the WHOLE host, never per-label. A pattern with
+no `*` is an exact hostname match. The deliberate edge case: `*.example.com` does
+NOT match the bare `example.com` (the pattern's literal `.` must appear in the
+host) — list both entries if you want both covered. The exact edge-case semantics
+live in the `matches()` doc comment in `packages/dns-server/src/overrides.rs`.
+
+**Forgiving conversion:** as with the rest of the configuration, a broken entry is
+logged and skipped, not fatal: a `dns` entry whose `server` does not parse is
+skipped; a `system` entry with a non-empty `server` warns and keeps the system
+resolver; an entry with an empty `pattern` is skipped.
+
 ## Caching
 
 Answers are cached on disk in a sibling file of the main config: same directory, same file
@@ -83,7 +127,9 @@ every 5 minutes and saved once more, best-effort, at shutdown.
 
 ## Security note
 
-Queries leave the machine only inside the Tor tunnel. The DoH provider still sees the
-queried names (it terminates TLS), but only at a Tor exit's IP address — not yours.
+Queries for hosts matching no `dns_server.overrides` mask leave the machine only
+inside the Tor tunnel; the per-mask overrides (Exceptions section above) are the one
+deliberate, operator-opted exception. The DoH provider still sees the queried names
+(it terminates TLS), but only at a Tor exit's IP address — not yours.
 `custom_doh_providers` (with `disable_builtin_providers`) shifts that trust to whichever
 operators you configure.

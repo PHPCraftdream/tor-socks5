@@ -13,6 +13,14 @@
 //!    inside the Tor tunnel ([`resolve_with_pool`]), insert into the cache,
 //!    and answer.
 //!
+//! Hostnames matching an operator-configured override mask
+//! ([`crate::overrides::DnsOverride`]) are checked between the cache and
+//! the pool and never reach the DoH pool at all: they are resolved via
+//! plain DNS or the OS resolver, both DELIBERATELY outside the Tor tunnel
+//! (an operator-opted exception; see the security framing in
+//! [`crate::overrides`]' module docs), while every host matching no mask
+//! keeps the unchanged three-step path.
+//!
 //! # Concurrency and shutdown
 //!
 //! DoH misses run in detached tasks, bounded by a
@@ -63,6 +71,9 @@ use tracing::{debug, error, info, warn};
 use crate::cache::DnsCache;
 use crate::doh_client::resolve_with_pool;
 use crate::error::DnsServerError;
+use crate::overrides::{
+    find_override, resolve_via_dns_server, resolve_via_system, DnsOverride, OverrideResolver,
+};
 use crate::types::{DohProvider, ResolvedAnswer};
 
 /// Upper bound on in-flight query resolutions. A permit is acquired BEFORE
@@ -104,7 +115,7 @@ const MAX_UDP_RESPONSE_BYTES: usize = 512;
 const UDP_RECV_BUFFER_SIZE: usize = 4096;
 
 /// Shared per-loop/per-task state. Cheap to clone: one closure clone, one
-/// `Arc`, and a small `Vec` of provider descriptors.
+/// `Arc`, and two small `Vec`s — provider descriptors and override masks.
 struct QueryCtx<T> {
     /// Yields the CURRENT Tor tunnel. Called fresh per resolution: after a
     /// watchdog rebuild the previous tunnel is invalid, and `None` means
@@ -112,6 +123,7 @@ struct QueryCtx<T> {
     tunnel: T,
     cache: Arc<DnsCache>,
     providers: Vec<DohProvider>,
+    overrides: Vec<DnsOverride>,
 }
 
 impl<T: Clone> Clone for QueryCtx<T> {
@@ -120,6 +132,7 @@ impl<T: Clone> Clone for QueryCtx<T> {
             tunnel: self.tunnel.clone(),
             cache: self.cache.clone(),
             providers: self.providers.clone(),
+            overrides: self.overrides.clone(),
         }
     }
 }
@@ -134,6 +147,9 @@ impl<T: Clone> Clone for QueryCtx<T> {
 /// rather than typed against the app's concrete handle on purpose — this
 /// crate must not depend on the app's `TorHandle` — and `Clone` because
 /// every spawned task carries its own copy.
+///
+/// `overrides` carries the operator's override masks; matching hosts
+/// bypass the DoH pool entirely (see [`resolve_host`]).
 ///
 /// `cache_path` drives the periodic (and final) best-effort cache saves;
 /// see [`DnsCache::save`]. A bind failure on ANY address fails the whole
@@ -150,6 +166,7 @@ pub async fn run<T, F>(
     tunnel: T,
     cache: Arc<DnsCache>,
     providers: Vec<DohProvider>,
+    overrides: Vec<DnsOverride>,
     cache_path: PathBuf,
     shutdown: CancellationToken,
 ) -> Result<()>
@@ -185,6 +202,7 @@ where
         tunnel,
         cache: cache.clone(),
         providers,
+        overrides,
     };
     let permits = Arc::new(Semaphore::new(MAX_DNS_CONCURRENT_QUERIES));
 
@@ -318,6 +336,7 @@ async fn udp_loop<T, F>(
                 ctx.tunnel.clone(),
                 ctx.cache.clone(),
                 ctx.providers.clone(),
+                ctx.overrides.clone(),
                 &host,
             )
             .await
@@ -426,6 +445,7 @@ where
                     ctx.tunnel.clone(),
                     ctx.cache.clone(),
                     ctx.providers.clone(),
+                    ctx.overrides.clone(),
                     &host,
                 )
                 .await
@@ -459,23 +479,34 @@ where
     }
 }
 
-/// Resolve `host` cache-first, then through the DoH pool over the CURRENT
-/// tunnel.
+/// Resolve `host` cache-first, then through a matching override mask, then
+/// through the DoH pool over the CURRENT tunnel.
 ///
-/// * `Ok(Some(answer))` — resolved (cache hit, or DoH success which is
-///   also inserted into the cache on the way out);
+/// * `Ok(Some(answer))` — resolved (cache hit, override success, or DoH
+///   success; override and DoH answers are inserted into the cache on the
+///   way out);
 /// * `Ok(None)` — the tunnel closure yielded `None`: shutdown/drain is in
-///   progress, callers answer SERVFAIL;
-/// * `Err(error)` — every DoH provider failed, callers answer SERVFAIL.
+///   progress, callers answer SERVFAIL (never happens on the override
+///   path);
+/// * `Err(error)` — the matched override's resolver, or every DoH
+///   provider, failed; callers answer SERVFAIL.
 ///
-/// Takes OWNED clones (closure + Arc + a small provider vec) rather than
-/// references, so the returned future is self-contained `Send` without
-/// needing the closure type to be `Sync` — the future holds nothing by
-/// reference across its awaits.
+/// The override check sits BETWEEN cache and pool: the first matching
+/// [`DnsOverride`](crate::overrides::DnsOverride) routes the lookup to
+/// [`resolve_via_dns_server`] or [`resolve_via_system`], and the tunnel
+/// closure is never consulted on that path — overrides deliberately leave
+/// the Tor tunnel and must keep resolving while Tor is down or draining,
+/// exactly when the closure would yield `None`.
+///
+/// Takes OWNED clones (closure + Arc + small provider and override vecs)
+/// rather than references, so the returned future is self-contained `Send`
+/// without needing the closure type to be `Sync` — the future holds
+/// nothing by reference across its awaits.
 async fn resolve_host<T, F>(
     tunnel: T,
     cache: Arc<DnsCache>,
     providers: Vec<DohProvider>,
+    overrides: Vec<DnsOverride>,
     host: &str,
 ) -> Result<Option<ResolvedAnswer>, DnsServerError>
 where
@@ -484,6 +515,22 @@ where
 {
     if let Some(answer) = cache.get(host) {
         return Ok(Some(answer));
+    }
+    // Override masks sit between cache and pool (see doc): a match never
+    // reaches the tunnel closure below, so overrides keep resolving even
+    // while Tor is down or the server is draining.
+    if let Some(override_entry) = find_override(&overrides, host) {
+        let resolved = match &override_entry.resolver {
+            OverrideResolver::Dns { server } => resolve_via_dns_server(host, *server).await,
+            OverrideResolver::System => resolve_via_system(host).await,
+        };
+        return match resolved {
+            Ok(answer) => {
+                cache.insert(host, answer.clone());
+                Ok(Some(answer))
+            }
+            Err(error) => Err(error),
+        };
     }
     // Fresh read of the CURRENT tunnel every time: a watchdog rebuild
     // invalidates the previous tunnel, so caching one here across queries

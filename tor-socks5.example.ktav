@@ -76,3 +76,19 @@ warm_pool.refresh_interval_secs: 60
 ##         path: /dns-query
 ##     }
 ## ]
+##
+## Per-mask resolver overrides: hosts matching a glob mask skip the DoH pool and
+## are resolved OUTSIDE the Tor tunnel (plain DNS or the OS resolver) — a
+## deliberate, operator-opted exception. Full manual: docs/dns-server.md.
+## dns_server.overrides: [
+##     {
+##         pattern: *.lan
+##         resolver: system
+##         server: 
+##     }
+##     {
+##         pattern: ns.home.arpa
+##         resolver: dns
+##         server: 192.168.1.1:53
+##     }
+## ]

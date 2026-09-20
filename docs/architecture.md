@@ -294,6 +294,7 @@ dns_server.enabled: false
 dns_server.listen: [
     127.0.0.1:15353
 ]
+dns_server.overrides: []
 ```
 
 No `pt_binary` field: the proxy uses its own `current_exe()` for the
