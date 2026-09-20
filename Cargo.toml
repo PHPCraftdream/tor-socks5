@@ -41,7 +41,7 @@ futures = "0.3"
 # builds an EMPTY RootCertStore, so every DoH provider's certificate fails to verify
 # and encrypted bridge-hostname resolution silently never works. Bundled Mozilla roots
 # are used rather than rustls-platform-verifier, which would need Android JNI wiring.
-hickory-resolver = { version = "0.26.1", default-features = false, features = ["tokio", "https-ring", "webpki-roots"] }
+hickory-resolver = { version = "0.26.1", default-features = false, features = ["tokio", "https-ring", "webpki-roots", "system-config"] }
 
 ktav = "0.6.0"
 serde = { version = "1", features = ["derive"] }

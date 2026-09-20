@@ -37,7 +37,7 @@ pub const DOH_PROVIDER_TIMEOUT: Duration = Duration::from_secs(20);
 /// Upper bound for a DNS response body. A DNS message cannot exceed 64 KiB
 /// per its own u16 length fields, so anything larger is a malicious or
 /// broken server and is rejected instead of being read into memory.
-const MAX_DNS_RESPONSE_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_DNS_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// Upper bound for the HTTP header block before the response is abandoned.
 const MAX_HEADER_BYTES: usize = 16 * 1024;
@@ -61,9 +61,9 @@ trait AsyncStream: AsyncRead + AsyncWrite + Send {}
 impl<T: AsyncRead + AsyncWrite + Send> AsyncStream for T {}
 
 /// A DNS query ready for the wire: its transaction id and encoded bytes.
-struct DnsQuery {
-    id: u16,
-    bytes: Vec<u8>,
+pub(crate) struct DnsQuery {
+    pub(crate) id: u16,
+    pub(crate) bytes: Vec<u8>,
 }
 
 /// Build and cache the rustls client config (same pattern as
@@ -197,7 +197,7 @@ async fn resolve_with_provider(
 }
 
 /// Encode one DNS query message carrying exactly one QUESTION.
-fn build_query(hostname: &str, query_type: RecordType) -> Result<DnsQuery, String> {
+pub(crate) fn build_query(hostname: &str, query_type: RecordType) -> Result<DnsQuery, String> {
     let name: Name = hostname
         .parse()
         .map_err(|e| format!("invalid query hostname {hostname:?}: {e}"))?;
@@ -447,7 +447,7 @@ fn parse_head(buf: &[u8]) -> Result<Option<HttpHead>, DnsServerError> {
 
 /// Outcome of ONE validated DNS response.
 #[derive(Debug, Clone)]
-struct ExchangeResult {
+pub(crate) struct ExchangeResult {
     /// A/AAAA addresses carried by the answer records, in wire order.
     addrs: Vec<IpAddr>,
     /// Smallest TTL over ALL answer records; `None` only when the response
@@ -456,7 +456,7 @@ struct ExchangeResult {
 }
 
 /// Decode and validate one DNS response against the query id that was sent.
-fn parse_response(query_id: u16, body: &[u8]) -> Result<ExchangeResult, DnsServerError> {
+pub(crate) fn parse_response(query_id: u16, body: &[u8]) -> Result<ExchangeResult, DnsServerError> {
     let message = Message::from_vec(body)
         .map_err(|e| DnsServerError::Wire(format!("decode DNS response: {e}")))?;
     if message.metadata.id != query_id {
@@ -512,7 +512,10 @@ fn parse_response(query_id: u16, body: &[u8]) -> Result<ExchangeResult, DnsServe
 /// [`Duration::ZERO`] = "no TTL information reported"; the cache layer
 /// decides its own floor. `resolved_at` is stamped once, here, after both
 /// exchanges completed.
-fn merge_exchanges(a: Option<ExchangeResult>, aaaa: Option<ExchangeResult>) -> ResolvedAnswer {
+pub(crate) fn merge_exchanges(
+    a: Option<ExchangeResult>,
+    aaaa: Option<ExchangeResult>,
+) -> ResolvedAnswer {
     let mut addrs = Vec::new();
     let mut min_ttl: Option<Duration> = None;
     for result in [a, aaaa].into_iter().flatten() {

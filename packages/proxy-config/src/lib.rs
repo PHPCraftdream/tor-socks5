@@ -141,6 +141,13 @@ pub struct DnsServerConfig {
     /// User-added DoH providers merged after the built-ins (the only pool
     /// when [`Self::disable_builtin_providers`] is set). Default empty.
     pub custom_doh_providers: Vec<DohProviderConfig>,
+    /// Per-hostname exceptions to the default DoH-over-Tor resolution.
+    /// Entries are checked in list order against each queried hostname; the
+    /// first matching pattern wins, and a host matching no pattern falls
+    /// through to the default DoH-over-Tor pool. Default empty — the
+    /// security posture ("queries leave the machine only inside the Tor
+    /// tunnel") is unchanged unless an operator explicitly opts a host in.
+    pub overrides: Vec<DnsOverrideConfig>,
 }
 
 impl Default for DnsServerConfig {
@@ -150,6 +157,7 @@ impl Default for DnsServerConfig {
             listen: vec!["127.0.0.1:15353".to_owned()],
             disable_builtin_providers: false,
             custom_doh_providers: Vec::new(),
+            overrides: Vec::new(),
         }
     }
 }
@@ -169,6 +177,45 @@ pub struct DohProviderConfig {
     pub hostname: String,
     /// DoH endpoint path, usually `/dns-query`.
     pub path: String,
+}
+
+/// Which resolver a [`DnsOverrideConfig`] entry routes a hostname to.
+/// Deliberately no `Default` impl: a resolver must be named explicitly in
+/// every override entry. A silent default here would hand operators a way
+/// to bypass the DoH-over-Tor pool without noticing — opting a host out
+/// of tunnelled resolution must always be a conscious, spelled-out choice.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DnsOverrideKind {
+    /// The operating system's own resolver. May leak the queried hostname
+    /// outside the Tor tunnel — this is exactly the escape hatch the
+    /// operator is opting into for this host.
+    System,
+    /// A specific plain DNS server, given as [`DnsOverrideConfig::server`]
+    /// in the same entry.
+    Dns,
+}
+
+/// One per-hostname exception to the default DoH-over-Tor resolution
+/// (see [`DnsServerConfig::overrides`]). A pure serde configuration type —
+/// like [`DohProviderConfig`], converting it into runtime behaviour is the
+/// caller's job.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DnsOverrideConfig {
+    /// Hostname glob: `*` matches any run of characters (including none),
+    /// matched case-insensitively against the whole queried hostname.
+    /// No `*` present => exact-hostname match.
+    pub pattern: String,
+    /// Where this host's resolution goes instead of the default
+    /// DoH-over-Tor pool: `system` (OS resolver) or `dns` (a specific
+    /// plain DNS server). Required in every entry — there is no default.
+    pub resolver: DnsOverrideKind,
+    /// `ip:port` of the plain DNS server, required (non-empty, valid)
+    /// when `resolver` is `dns`; must be empty when `resolver` is `system`.
+    /// Deliberately a plain string here: validating it is NOT this crate's
+    /// job — the conversion into the runtime engine validates it.
+    pub server: String,
 }
 
 /// Security policy for destinations accepted by the local SOCKS5 listener.

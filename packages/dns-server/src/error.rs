@@ -29,6 +29,14 @@ pub enum DnsServerError {
         #[source]
         source: std::io::Error,
     },
+    /// A plain (direct, non-Tor, non-DoH) UDP/TCP DNS exchange with an
+    /// override server failed.
+    #[error("plain dns exchange failed: {0}")]
+    PlainDns(String),
+    /// The operating-system resolver lookup (hickory-resolver system
+    /// configuration) failed.
+    #[error("system resolver failed: {0}")]
+    SystemResolver(String),
     /// Every configured DoH provider failed (or the pool is empty).
     #[error("all DoH providers failed")]
     AllProvidersFailed,

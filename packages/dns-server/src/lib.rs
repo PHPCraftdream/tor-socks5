@@ -12,11 +12,15 @@
 //!
 //! * [`cache`] — on-disk, TTL-aware store of resolved answers;
 //! * [`doh_client`] — DNS-over-HTTPS exchanges sent through [`arti_wrapper::TorTunnel`];
+//! * [`overrides`] — runtime DNS overrides: operator-listed host masks
+//!   resolved directly (plain DNS to a given server, or the OS resolver),
+//!   deliberately leaving the Tor tunnel;
 //! * [`providers`] — the pool of [`DohProvider`] endpoints;
 //! * [`server`] — the UDP/TCP listener tying it all together.
 
 pub mod cache;
 pub mod doh_client;
+pub mod overrides;
 pub mod providers;
 pub mod server;
 
@@ -24,4 +28,5 @@ mod error;
 mod types;
 
 pub use error::DnsServerError;
+pub use overrides::{DnsOverride, OverrideResolver};
 pub use types::{DohProvider, ResolvedAnswer};

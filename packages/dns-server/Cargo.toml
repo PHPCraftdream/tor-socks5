@@ -16,6 +16,7 @@ rust-version.workspace = true
 arti-wrapper = { path = "../arti-wrapper", version = "0.1.0" }
 persist-lock = { path = "../persist-lock", version = "0.1.0" }
 hickory-proto = "0.26.1"
+hickory-resolver.workspace = true
 anyhow.workspace = true
 futures.workspace = true
 httparse.workspace = true

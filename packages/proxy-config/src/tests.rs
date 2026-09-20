@@ -873,3 +873,110 @@ fn dns_server_unknown_field_inside_custom_provider_is_rejected() {
         "unknown key inside a custom provider must be rejected"
     );
 }
+
+#[test]
+fn dns_server_defaults_include_empty_overrides() {
+    let cfg = DnsServerConfig::default();
+    assert!(cfg.overrides.is_empty());
+}
+
+#[test]
+fn parses_dns_server_override_with_system_resolver() {
+    // `server` carries no serde default (same rule as every
+    // `DohProviderConfig` field), so it must be present even when it means
+    // "none" — an empty value (`server: `) is how Ktav spells that.
+    let src = "listen: 127.0.0.1:1080\n\
+               dns_server.overrides: [\n\
+               \t{\n\
+               \t\tpattern: *.example.com\n\
+               \t\tresolver: system\n\
+               \t\tserver: \n\
+               \t}\n\
+               ]\n";
+    let cfg: Config = ktav::from_str(src).expect("ktav parses dns_server section");
+    assert_eq!(cfg.dns_server.overrides.len(), 1);
+    let o = &cfg.dns_server.overrides[0];
+    assert_eq!(o.pattern, "*.example.com");
+    assert_eq!(o.resolver, DnsOverrideKind::System);
+    assert_eq!(o.server, "");
+}
+
+#[test]
+fn parses_dns_server_override_with_specific_dns_server() {
+    let src = "listen: 127.0.0.1:1080\n\
+               dns_server.overrides: [\n\
+               \t{\n\
+               \t\tpattern: *.example.org\n\
+               \t\tresolver: dns\n\
+               \t\tserver: 192.0.2.53:53\n\
+               \t}\n\
+               ]\n";
+    let cfg: Config = ktav::from_str(src).expect("ktav parses dns_server section");
+    assert_eq!(cfg.dns_server.overrides.len(), 1);
+    let o = &cfg.dns_server.overrides[0];
+    assert_eq!(o.pattern, "*.example.org");
+    assert_eq!(o.resolver, DnsOverrideKind::Dns);
+    assert_eq!(o.server, "192.0.2.53:53");
+}
+
+#[test]
+fn dns_server_overrides_roundtrip_preserves_entries_exactly() {
+    // A plain `ktav::to_string`/`from_str` round trip is enough here —
+    // `Config::write` delegates to the same serializer.
+    let mut cfg = Config::default();
+    cfg.dns_server.overrides = vec![
+        DnsOverrideConfig {
+            pattern: "*.example.com".into(),
+            resolver: DnsOverrideKind::System,
+            server: String::new(),
+        },
+        DnsOverrideConfig {
+            pattern: "exact.example.net".into(),
+            resolver: DnsOverrideKind::Dns,
+            server: "192.0.2.53:53".into(),
+        },
+    ];
+    let serialized = ktav::to_string(&cfg).expect("serialize");
+    let deserialized: Config = ktav::from_str(&serialized).expect("deserialize");
+    assert_eq!(deserialized.dns_server.overrides, cfg.dns_server.overrides);
+    assert_eq!(
+        deserialized.dns_server.overrides[0].resolver,
+        DnsOverrideKind::System
+    );
+    assert_eq!(deserialized.dns_server.overrides[1].server, "192.0.2.53:53");
+}
+
+#[test]
+fn dns_server_unknown_field_inside_override_is_rejected() {
+    // deny_unknown_fields: a typo inside an override entry must fail loudly.
+    let src = "listen: 127.0.0.1:1080\n\
+               dns_server.overrides: [\n\
+               \t{\n\
+               \t\tpattern: *.example.com\n\
+               \t\tresolver: system\n\
+               \t\tserver: \n\
+               \t\tproxy: tor\n\
+               \t}\n\
+               ]\n";
+    assert!(
+        ktav::from_str::<Config>(src).is_err(),
+        "unknown key inside an override must be rejected"
+    );
+}
+
+#[test]
+fn dns_server_override_requires_explicit_resolver() {
+    // No silent default: an entry without `resolver` must fail to parse
+    // rather than quietly falling back to a resolver that bypasses Tor.
+    let src = "listen: 127.0.0.1:1080\n\
+               dns_server.overrides: [\n\
+               \t{\n\
+               \t\tpattern: *.example.com\n\
+               \t\tserver: \n\
+               \t}\n\
+               ]\n";
+    assert!(
+        ktav::from_str::<Config>(src).is_err(),
+        "override without resolver must be rejected"
+    );
+}
