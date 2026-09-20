@@ -31,6 +31,10 @@ SOCKS5 proxy instead of Tor, and install itself as an OS service.
   cache and **trust-on-first-use** account provisioning.
 - **Upstream SOCKS5 egress** — chain `client → tor-socks5 → upstream → target` instead of using
   Tor, with optional upstream auth.
+- **Local DNS server (optional)** — answers clients' plain DNS queries through public DoH
+  providers with every exchange tunnelled through Tor; per-host `dns_server.overrides` masks can
+  opt selected names out to the OS resolver or a plain DNS server.
+  See [`docs/dns-server.md`](docs/dns-server.md).
 - **Install as a service** — systemd, OpenRC, launchd, Windows SCM, BSD `rc.d`.
 - **Non-blocking logging** to stderr / stdout / file, configurable level and per-target filters.
 
@@ -69,33 +73,49 @@ Config is a [Ktav](https://github.com/ktav-lang/rust) file. Resolution order:
 2. `$TOR_SOCKS5_CONFIG`, then
 3. `tor-socks5.ktav` in the current directory (copy from `tor-socks5.example.ktav`).
 
+The block below is the **canonical complete reference**: every configuration section and every
+field, shown at its built-in default (mirroring `packages/proxy-config/src/lib.rs`). The committed
+starter template `tor-socks5.example.ktav` — a bare default `tor-socks5.ktav` is also auto-created
+on first run — is a shorter, ready-to-edit subset of the same defaults; any key you omit keeps the
+default shown here.
+
 ```ktav
+## Canonical complete configuration reference: every section and field
+## at its built-in default (mirrors packages/proxy-config/src/lib.rs).
+## Any key you omit keeps the default shown here.
+
 ## Addresses to listen on — one SOCKS5 listener per address.
-## A single address (`listen: 127.0.0.1:1080`) is also accepted.
+## A single scalar (`listen: 127.0.0.1:1080`) is also accepted.
 listen: [
     127.0.0.1:1080
 ]
 
+## Logging: default level, per-target overrides, sink, ANSI color.
 log.default: info
-## log.output: stderr (default) | stdout | file
-log.output: stderr
-## log.file: path used when output: file
-log.file:
-log.ansi: true
 log.targets.socks5_proxy: debug
+log.targets.arti_wrapper: debug
+log.targets.bridge_line: debug
 log.targets.tor_: warn
+log.targets.arti_: warn
+## stderr (default) | stdout | file
+log.output: stderr
+## Path used when output: file (empty falls back to stderr)
+log.file:
+## Colorize on a real terminal; forced off for file/pipe output
+log.ansi: true
 
+## Bridge lines in torrc format (obfs4 / webtunnel).
 bridges.lines: [
-    obfs4 1.2.3.4:443 FINGERPRINT cert=... iat-mode=0
+    obfs4 198.51.100.7:9001 FINGERPRINT cert=... iat-mode=0
 ]
 
-## Where to fetch fresh bridges from. A source is at minimum `{ url: ... }`;
-## `label`, `headers` (full `Name: Value` lines) and `cookies` (`name=value`)
-## are optional, for collectors that need an API token or session cookie.
-## `allow_credentials_cross_origin` (default `false`) opts in to sending
-## those headers/cookies to redirect targets on a different origin.
+## Where `tor-socks5 bridges fetch` pulls fresh bridge lists from. A
+## source is at minimum { url: ... }; label, headers (full Name: Value
+## lines) and cookies (name=value) are optional, for collectors that
+## need an API token or session cookie. allow_credentials_cross_origin
+## (default false) opts in to sending those headers/cookies to redirect
+## targets on a different origin. Omit the key for the built-in pool.
 bridges.sources: [
-    { url: https://example.com/bridges-obfs4 }
     {
         label: private-collector
         url: https://api.example.org/bridges
@@ -105,32 +125,127 @@ bridges.sources: [
         cookies: [
             session=abc123
         ]
+        allow_credentials_cross_origin: false
     }
 ]
 
+## Fall back to built-in seed bridges when no configured line is reachable
+bridges.use_seeds: true
+## Background-fetch from sources after bootstrap when fewer than
+## bridges.min_alive bridges are usable
+bridges.auto_fetch: true
+## auto_fetch threshold: fetch when fewer than this many are usable
+bridges.min_alive: 8
+## Reject a bridge-list response larger than this many MiB
+bridges.max_body_mib: 64
+## TCP-probe failures before a bridge is pruned from the config
+bridges.max_fails: 24
+## Rate-limit window for that counter, in minutes
+bridges.fail_window_mins: 60
+## Cadence of the background re-probe/fetch task, in minutes (0 = off)
+bridges.recheck_interval_mins: 60
+## Circuit-layer failures before a TCP-alive bridge is pruned
+bridges.max_circuit_fails: 5
+## Rate-limit window for that counter, in minutes
+bridges.circuit_observation_window_mins: 30
+## Override iat-mode on every obfs4 line: 0 keeps published values,
+## 1 on, 2 paranoid (costs latency and throughput)
+bridges.iat_mode: 0
+## Preferred transport: any | obfs4 | webtunnel — a preference; the
+## rest of the pool stays available as fallback
+bridges.transport: any
+
+## Stale-channel watchdog: rebuilds the Tor client when connects keep
+## failing against channels left half-open by a silent network change.
+watchdog.enabled: true
+## Seconds between watchdog checks
+watchdog.check_interval_secs: 45
+## Seconds without a successful connect before a rebuild
+watchdog.stale_after_secs: 180
+## Minimum seconds between two rebuilds
+watchdog.rebuild_cooldown_secs: 300
+## Soft failover: consecutive circuit failures before the watchdog
+## steers arti's guard manager away from a degraded bridge
+watchdog.failover_min_circuit_fails: 3
+## A replacement must be this many circuit-failures healthier
+watchdog.failover_min_margin: 2
+## Minimum seconds between failover signals for the same bridge
+watchdog.failover_signal_cooldown_secs: 600
+
+## Background warm pool of bridge channels (opt-in; prep only — it does
+## not choose which bridge carries traffic).
+warm_pool.enabled: false
+warm_pool.pool_size: 3
+warm_pool.refresh_interval_secs: 60
+
+## Periodic connection-health summary line (pure observation).
+conn_health.enabled: true
+conn_health.interval_secs: 60
+
 ## Optional: egress through an upstream SOCKS5 proxy instead of Tor.
+## When enabled, Tor is not started and dns_server must stay off.
 upstream.enabled: false
 upstream.address: 127.0.0.1:9050
 upstream.username:
 upstream.password:
 
-## Local SOCKS5 (RFC 1929) authentication. The CLI needs neither field set —
-## it auto-detects `tor-socks5.users.ktav` next to this config. Both exist
-## mainly for the Android JNI FFI crate, which is handed an explicit config
-## path with no implicit CWD/env-var fallback. See docs/auth.md.
+## Local SOCKS5 (RFC 1929) authentication. The CLI needs neither field
+## set — it auto-detects tor-socks5.users.ktav next to this config.
+## Both exist mainly for the Android JNI FFI crate. See docs/auth.md.
 auth.enabled: true
 auth.users_file:
 
-## Bridge hostname resolution. DoH uses a built-in pool of public providers
-## with pinned IP bootstrap addresses and races them; the fastest successful
-## response wins. System DNS is opt-in because carrier DNS may be blocked.
+## Destination policy: refuse .onion targets at the listener.
+security.block_onion: true
+
+## Bridge hostname resolution (used while probing bridges, before Tor
+## is up). DoH races a built-in pool of public providers with pinned
+## IP bootstrap addresses; system DNS is opt-in because carrier DNS
+## may be blocked. Not to be confused with dns_server.* below.
 dns.doh_enabled: true
 dns.system_fallback: false
 
-## Optional local DNS server (default OFF): plain UDP/TCP DNS queries
-## answered via public DoH providers, every exchange tunnelled through
-## Tor. Requires the Tor egress; enable with dns_server.enabled: true.
-## Details: tor-socks5 help dns-server
+## Optional local DNS server (default OFF): clients send plain UDP/TCP
+## DNS queries; each is answered via public DoH providers with every
+## exchange tunnelled through Tor. Requires the Tor egress (a startup
+## error when upstream.* is enabled). The TTL cache lands in a
+## .dns-cache file next to this config. Details: tor-socks5 help
+## dns-server.
+dns_server.enabled: false
+## Bind addresses; one UDP+TCP listener pair per address. Deliberately
+## not 53 (privileged). A single scalar is also accepted, as with listen.
+dns_server.listen: [
+    127.0.0.1:15353
+]
+## Drop the built-in provider pool; keep only the custom entries
+dns_server.disable_builtin_providers: false
+## Operator-added DoH providers, merged after the built-ins. `ip` is
+## the address the DoH TCP connection opens to THROUGH Tor; hostname
+## is only TLS SNI + the HTTP Host header.
+dns_server.custom_doh_providers: [
+    {
+        ip: 9.9.9.9
+        hostname: dns.quad9.net
+        path: /dns-query
+    }
+]
+## Per-mask exceptions: hosts matching a glob pattern skip the
+## DoH-over-Tor pool and resolve via the OS resolver (resolver: system)
+## or one plain DNS server (resolver: dns + server ip:port). First
+## match wins. A matching host LEAVES the Tor tunnel — see the warning
+## in docs/dns-server.md.
+dns_server.overrides: [
+    {
+        pattern: *.lan
+        resolver: system
+        server:
+    }
+    {
+        pattern: ns.home.arpa
+        resolver: dns
+        server: 192.168.1.1:53
+    }
+]
 ```
 
 > **Ktav comments are `##` at the start of a line** (a single `#` is content, and there are no

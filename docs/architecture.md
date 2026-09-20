@@ -20,6 +20,7 @@ tor-socks5/
 │   ├── auth/                   # SOCKS5 user accounts + Argon2id authenticator
 │   ├── bridge-fetcher/         # HTTPS-over-Tor bridge list fetching
 │   ├── bridge-probe/           # parallel TCP reachability probe + latency sort
+│   ├── dns-server/             # optional local DNS/DoH-over-Tor resolver + per-mask overrides
 │   ├── proxy-config/           # Ktav Config schema, shared by the CLI and android-ffi
 │   └── socks5-proto/           # RFC 1928/1929 SOCKS5 server, shared by the CLI and android-ffi
 ├── apps/
@@ -84,7 +85,8 @@ including the Android-specific `Config.auth` section.
 ### `packages/proxy-config`
 
 The Ktav `Config` schema (`listen` / `log` / `bridges` / `watchdog` /
-`warm_pool` / `conn_health` / `upstream` / `auth` / `path` / `security`), shared verbatim by
+`warm_pool` / `conn_health` / `upstream` / `auth` / `security` / `dns` /
+`dns_server`), shared verbatim by
 `apps/socks5-proxy` (via the `crate::config` re-export shim) and
 `packages/android-ffi` (loaded directly from the `configPath` argument to
 `nativeStart`). Depends only on `ktav`/`serde`/`indexmap`/`bridge-line` — no
@@ -147,6 +149,19 @@ lives in the `url=` parameter (with an optional `addr=` override), so
 the handshake. A bridge that completes TCP can still fail the PT
 handshake later; we accept this as the cost of a fast first filter.
 
+### `packages/dns-server`
+
+The optional local DNS server (default OFF; the `dns_server.*` config
+section): plain UDP/TCP DNS listeners answered via a pool of public
+DoH providers, with every DoH exchange tunnelled through the live Tor
+circuit. Modules: `server` (the UDP+TCP listeners), `doh_client`
+(the HTTPS exchange over Tor), `providers` (the built-in pool),
+`overrides` (per-mask hostname exceptions resolved outside the
+tunnel), `cache` (TTL-aware disk cache in a `.dns-cache` file next to
+the config). Requires the Tor egress — combined with an upstream SOCKS5
+proxy it is a fail-fast startup error. Wired into the binary by
+`apps/socks5-proxy/src/dns_wiring.rs`. See `docs/dns-server.md`.
+
 ### `apps/socks5-proxy`
 
 The user-facing binary. Source modules under `src/`:
@@ -168,8 +183,9 @@ The user-facing binary. Source modules under `src/`:
   `--upstream-user` / `--upstream-pass` / `--no-upstream`, `--daemon` /
   `--pid-file`. Subcommands: `users`, `bridges` (with `fetch`),
   `service`, `help`.
-* `config.rs` — Ktav loader, schema (`listen` / `log` / `bridges` /
-  `upstream`). Writes a default `tor-socks5.ktav` on first run.
+* `config.rs` — Ktav loader over the shared `proxy_config::Config`
+  schema (see `packages/proxy-config` and the canonical reference in
+  `README.md`). Writes a default `tor-socks5.ktav` on first run.
 * `server.rs` — the SOCKS5 listener runtime: egress selection (Tor vs.
   upstream), accept loop, per-connection handler. Bounded to 256
   concurrent connections (each may run an Argon2id verify).
@@ -183,6 +199,11 @@ The user-facing binary. Source modules under `src/`:
 * `upstream.rs` — optional upstream SOCKS5 egress
   (`client → tor-socks5 → upstream → target`). When active, Tor is not
   started.
+* `dns_wiring.rs` — startup glue for the optional local DNS server
+  (`dns_server.*`): converts the config into the resolver pool plus
+  the per-mask override engine and binds the UDP/TCP listeners.
+  Requires the Tor egress; a DNS-listener runtime error is logged,
+  not fatal — the SOCKS5 proxy path keeps running.
 * `bridge_store.rs` — dedup-upsert log of bridges that completed a
   TCP probe, stored as `<config_stem>.alive-bridges.log` next to the
   active config. Carries the health counters (`fails`, `seen`,
@@ -298,8 +319,9 @@ dns_server.overrides: []
 ```
 
 No `pt_binary` field: the proxy uses its own `current_exe()` for the
-PT child. See `README.md` for the full schema (`upstream.*`, `dns_server.*`,
-`bridges.*`) and `docs/bridges.md` for the bridge-health knobs. See
+PT child. See `README.md` for the canonical complete configuration reference
+(every section and field with its default) and `docs/bridges.md` for
+the bridge-health knobs. See
 `docs/auth.md` for `auth.enabled` / `auth.users_file` — the
 Android-facing knobs for RFC 1929 local authentication. The legacy
 scalar form `listen: addr` is still parsed for compatibility (a
