@@ -15,7 +15,7 @@
 //! no mask keeps going through the tunnel; a mask is an operator decision
 //! that leak-ability is acceptable (or preferable) for those names.
 //!
-//! Matching is a small, dependency-free hostname glob ([`matches`]) and
+//! Matching is a small, dependency-free hostname glob ([`matches()`]) and
 //! lookup is a first-match scan in list order ([`find_override`]) — the
 //! same fixed-order convention as the DoH provider pool.
 
@@ -54,7 +54,7 @@ pub const SYSTEM_RESOLVER_TIMEOUT: Duration = Duration::from_secs(10);
 /// handle matching hosts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsOverride {
-    /// Hostname glob; `*` matches any run of characters (see [`matches`]).
+    /// Hostname glob; `*` matches any run of characters (see [`matches()`]).
     pub pattern: String,
     /// Which escape route matching hosts take.
     pub resolver: OverrideResolver,

@@ -108,14 +108,47 @@ Accept: */*\r\n"
     req.into_bytes()
 }
 
+/// The parsed head of an HTTP/1.1 response: the status plus the handful of
+/// fields the fetch loop acts on. Produced by [`parse_response_headers`];
+/// the body is not part of this struct — it begins at `header_len` in the
+/// buffer that was parsed and is read separately.
 pub struct HttpResponse {
+    /// Status code as sent (200, 301, 404, …). The fetch loop follows
+    /// 301/302/307/308 and rejects every other non-200 status with
+    /// [`FetchError::Non200`].
     pub status: u16,
+    /// `Location` header value if the response carried one (the last
+    /// occurrence wins). Required for the redirect statuses, ignored for
+    /// everything else.
     pub location: Option<String>,
+    /// Body size in bytes as declared by the `Content-Length` header.
+    /// Used only for the early [`FetchError::TooLarge`] check and as the
+    /// `expected` side of [`FetchError::IncompleteBody`] — the actual read
+    /// stops at exactly this many bytes. An absent or unparseable header
+    /// means "unknown": the body is then read until EOF instead. Ignored
+    /// when `chunked` is set (RFC 9112: Transfer-Encoding overrides
+    /// Content-Length).
     pub content_length: Option<usize>,
+    /// Whether `Transfer-Encoding` advertises the `chunked` coding; the
+    /// body is then decoded by the chunked-framing reader, which enforces
+    /// `max_body_bytes` itself and can fail with
+    /// [`FetchError::ChunkedEncoding`].
     pub chunked: bool,
+    /// Length in bytes of the head (status line + headers + the blank line
+    /// that ends it) within the buffer passed to [`parse_response_headers`]
+    /// — the offset at which the body starts. Head bytes are consumed by
+    /// the parser and skipped, never counted as body.
     pub header_len: usize,
 }
 
+/// Incrementally parse an HTTP/1.1 response head from the front of `buf`.
+///
+/// Returns `Ok(None)` while the head is still incomplete (read more bytes
+/// and call again), `Ok(Some(HttpResponse))` once a complete head has been
+/// seen, and [`FetchError::Http`] when `buf` cannot be a response head at
+/// all (httparse rejects it). Only the head is inspected: any body bytes
+/// already present in `buf` behind it are left untouched — resume reading
+/// at the returned `header_len`.
 pub fn parse_response_headers(buf: &[u8]) -> Result<Option<HttpResponse>, FetchError> {
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut resp = httparse::Response::new(&mut headers);

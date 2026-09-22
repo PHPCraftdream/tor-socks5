@@ -34,6 +34,7 @@
 //! name has an *empty* parent, which `File::open("")` cannot open — the
 //! parent-directory fsync guarantee was silently skipped for the default
 //! configuration. Empty parents are normalised to `.`.
+#![warn(missing_docs)]
 
 mod dir;
 pub mod path_lock;

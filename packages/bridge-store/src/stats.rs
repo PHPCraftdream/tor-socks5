@@ -17,7 +17,7 @@ impl BridgeStore {
     /// plausible. A webtunnel bridge in particular can answer probes forever
     /// while the relay behind its website is long gone.
     ///
-    /// Selection uses the bounded heap [`take_best`] instead of a full stable
+    /// Selection uses the bounded heap `take_best` instead of a full stable
     /// sort: at every limit the result is identical to the previous stable
     /// sort + take (entries tied under the ranking keep store map order), at
     /// O(N log k) time and O(k) memory beyond the map's own references.
@@ -119,8 +119,8 @@ impl BridgeStore {
 
     /// Number of bridges with proven reachability: they answered at least
     /// one probe (`ok_count > 0`), have no failure since (`fails == 0`), and
-    /// are not retired — the same predicate [`healthiest_bridges`]
-    /// (Self::healthiest_bridges) filters by. Mere `fails == 0` was wrong for
+    /// are not retired — the same predicate
+    /// [`healthiest_bridges`](Self::healthiest_bridges) filters by. Mere `fails == 0` was wrong for
     /// this method's only consumer, the stale-channel watchdog: a
     /// source-attributed entry is born with `fails == 0` without ever being
     /// probed, and a retired bridge keeps a perfect TCP record, so either

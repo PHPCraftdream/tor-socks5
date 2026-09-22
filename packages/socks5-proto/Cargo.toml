@@ -4,6 +4,9 @@
 # (EAimTY/socks5-server, 248k downloads). See packages/auth/Cargo.toml
 # for the same rename pattern.
 name = "tor-socks5-proto"
+# Not published: the release artifact is the single `tor-socks5` package;
+# workspace crates are its internal modules (docs/sdk-package-design.md).
+publish = false
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -15,6 +18,10 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 # The produced library target keeps the pre-rename identifier so every
 # in-workspace `use socks5_proto::...` stays unchanged. Only the

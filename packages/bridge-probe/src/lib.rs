@@ -12,6 +12,7 @@
 //! target lives in the `url=` parameter (with an optional `addr=` override).
 //! `resolve_probe_target` computes the correct `(host, port)` pair per
 //! transport before the TCP handshake.
+#![warn(missing_docs)]
 
 #[allow(unused_imports)]
 use std::collections::{BTreeMap, HashMap};

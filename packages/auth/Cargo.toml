@@ -6,6 +6,9 @@
 # keeps `use auth::...` working unchanged — Cargo's dependency-renaming
 # feature makes the table KEY the extern-crate name, not this field.
 name = "tor-socks5-auth"
+# Not published: the release artifact is the single `tor-socks5` package;
+# workspace crates are its internal modules (docs/sdk-package-design.md).
+publish = false
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -17,6 +20,10 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 # The produced library target keeps the pre-rename identifier: benches,
 # this crate's own tests, and every in-workspace `use auth::...` stay

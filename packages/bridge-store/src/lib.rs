@@ -28,6 +28,7 @@
 //! Shared by the CLI daemon (`apps/socks5-proxy`) and the Android JNI
 //! engine (`packages/android-ffi`) — both processes probe bridges and want
 //! to remember which ones tend to work across restarts.
+#![warn(missing_docs)]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -112,17 +113,38 @@ const RETIRED_CIRCUIT_FAILS: u32 = u32::MAX;
 pub struct TransportStats {
     /// `obfs4`, `webtunnel`, or `plain` for bridges with no transport.
     pub transport: String,
+    /// Bridges of this transport the store has seen: every entry,
+    /// retired ones included. Compare against the caller's configured
+    /// pool to spot bridges that have never been probed.
     pub known: usize,
+    /// Of those, bridges with proven reachability: at least one
+    /// successful probe ever (`ok_count > 0`) and none since
+    /// (`fails == 0`). Retired bridges are excluded — see
+    /// [`retired`](Self::retired).
     pub alive: usize,
+    /// Of those, bridges that have completed a Tor channel at least
+    /// once. The gap to [`alive`](Self::alive) is bridges that answer
+    /// reachability probes but cannot carry traffic.
     pub channel_proven: usize,
+    /// Bridges marked permanently unusable
+    /// ([`BridgeStore::note_permanent_failure_at`]). Counted here and in
+    /// [`known`](Self::known), but excluded from the usable counts and
+    /// timestamps below.
     pub retired: usize,
+    /// Freshest successful reachability probe among this transport's
+    /// non-retired bridges; `None` if none has ever probed OK.
     pub last_probe_ok: Option<OffsetDateTime>,
+    /// Freshest successful PT/channel warm-up among the same bridges;
+    /// `None` if none has ever carried a channel.
     pub last_channel_ok: Option<OffsetDateTime>,
 }
 
 /// What one bridge-list source has yielded, for scoring and for display.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceStats {
+    /// The bridge-list source this row aggregates — the same label the
+    /// store records on each entry that source offered
+    /// ([`BridgeStore::sources_of`]).
     pub label: String,
     /// Bridges this source has offered, whether or not they ever worked.
     pub offered: usize,
@@ -221,6 +243,12 @@ fn key_of(b: &BridgeLine) -> Key {
     Arc::new(bridge_probe::bridge_identity(b))
 }
 
+/// In-memory health store for the bridge pool, loaded from — and saved
+/// back to — the `.alive-bridges.log` file at [`path`](Self::path): one
+/// bridge line per entry, its counters kept in the `#` meta comment
+/// lines interleaved with it. Entries are keyed by bridge identity, so
+/// a re-published line updates the existing entry instead of adding a
+/// duplicate.
 #[derive(Debug, Clone)]
 pub struct BridgeStore {
     path: PathBuf,
@@ -228,15 +256,22 @@ pub struct BridgeStore {
 }
 
 impl BridgeStore {
+    /// The file this store was loaded from and is written back to by
+    /// [`save`](Self::save) — the path resolved by
+    /// [`BridgeStore::resolve_path`] (next to the main config, same
+    /// stem, `.alive-bridges.log` suffix).
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// Number of entries in the store, retired ones included.
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// True when the store holds no entries — e.g. it was loaded from a
+    /// missing file, which yields an empty store rather than an error.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()

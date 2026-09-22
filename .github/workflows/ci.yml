@@ -1,7 +1,8 @@
 # CI — fmt, clippy, test across Linux / macOS / Windows; first-party line
-# limit, MSRV 1.89 and Android arm64 cross-compile checks.
-# fmt/clippy/test mirror the local pre-push hook at .githooks/pre-push;
-# line-limit/msrv/android are CI-only.
+# limit, publish guard, crate packageability, MSRV 1.89 and Android arm64
+# cross-compile checks. fmt/clippy/test mirror the local pre-push hook at
+# .githooks/pre-push; line-limit/publish-guard/packageability/msrv/android
+# are CI-only.
 
 name: CI
 
@@ -69,6 +70,37 @@ jobs:
       - uses: actions/checkout@v7
       - name: Check first-party Rust files stay under 1000 lines
         run: sh scripts/check-line-limit.sh
+
+  publish-guard:
+    name: Publish guard (publish = false)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check every package manifest is marked publish = false
+        run: sh scripts/check-publish-guard.sh
+
+  packageability:
+    name: Packageability (cargo package)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The publishable set has a single source — scripts/publishable-crates.sh,
+      # the same list scripts/check-publish-guard.sh enforces. It is empty
+      # today (all 20 package manifests carry publish = false), so the job
+      # logs an explicit no-op instead of failing or skipping silently; once
+      # the consolidated tor-socks5 crate exists (docs/sdk-package-design.md,
+      # §6), every listed crate is packaged with `cargo package -p <crate>
+      # --no-verify` (docs/publishing.md).
+      - name: Resolve the publishable crate list
+        id: crates
+        run: echo "crates=$(sh scripts/publishable-crates.sh | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
+      # cargo package --no-verify packs the .crate tarball without compiling
+      # anything, so there is no build cache worth restoring, and the
+      # toolchain is only needed once the list is non-empty.
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.crates.outputs.crates != ''
+      - name: cargo package every publishable crate (or log the empty no-op)
+        run: sh scripts/check-packageability.sh
 
   msrv:
     name: MSRV (1.89)

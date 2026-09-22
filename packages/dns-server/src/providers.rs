@@ -101,8 +101,8 @@ const BUILTIN_DOH_PROVIDER_TUPLES: &[(&str, &str, &str)] = &[
 /// The built-in DoH provider pool, parsed once and cached for the process
 /// lifetime.
 ///
-/// Parsed lazily from [`BUILTIN_DOH_PROVIDER_TUPLES`] into
-/// [`DohProvider`](crate::types::DohProvider) values via a `OnceLock`
+/// Parsed lazily from `BUILTIN_DOH_PROVIDER_TUPLES` into [`DohProvider`]
+/// values via a `OnceLock`
 /// (project idiom). The `expect` below cannot fire: the table is static,
 /// compile-time-known data whose IP literals all parse as `IpAddr`, and the
 /// `all_builtin_tuples_parse` test pins every entry.

@@ -16,6 +16,16 @@ pub async fn probe_all(bridges: Vec<BridgeLine>, per_bridge_timeout: Duration) -
     probe_all_with_policy(bridges, per_bridge_timeout, ResolverPolicy::default()).await
 }
 
+/// [`probe_all`] with an explicit [`ResolverPolicy`] instead of the
+/// default (DoH-only, no system fallback) one.
+///
+/// Same semantics as [`probe_all`]: every input bridge is probed
+/// concurrently, at most `MAX_INFLIGHT_PROBES` at a time, each probe
+/// bounded by `per_bridge_timeout` (plus the separate DNS budget when the
+/// target is a hostname). `resolver_policy` decides how those hostname
+/// lookups are performed. Every input yields exactly one [`Report`] —
+/// including `Unmeasured` ones — and the returned vector is **not**
+/// guaranteed to preserve input order (unordered concurrent collection).
 pub async fn probe_all_with_policy(
     bridges: Vec<BridgeLine>,
     per_bridge_timeout: Duration,
@@ -42,6 +52,13 @@ pub async fn probe_and_sort(
     probe_and_sort_with_policy(bridges, per_bridge_timeout, ResolverPolicy::default()).await
 }
 
+/// [`probe_and_sort`] with an explicit [`ResolverPolicy`] instead of the
+/// default one. Probes every bridge, logs the summary, and returns only
+/// the reachable ones as `(bridge, latency)` pairs sorted by ascending
+/// latency (fastest first). `Unreachable` and `Unmeasured` inputs are
+/// both dropped here; callers that must distinguish "measured dead" from
+/// "never measured" should use [`probe_round_with_policy`], which
+/// returns the groups separately instead of collapsing them.
 pub async fn probe_and_sort_with_policy(
     bridges: Vec<BridgeLine>,
     per_bridge_timeout: Duration,
@@ -97,6 +114,12 @@ pub async fn probe_one(bridge: &BridgeLine, per_bridge_timeout: Duration) -> Opt
     probe_one_with_policy(bridge, per_bridge_timeout, ResolverPolicy::default()).await
 }
 
+/// [`probe_one`] with an explicit [`ResolverPolicy`] instead of the
+/// default one. `Some(latency)` only when the bridge is reachable within
+/// `per_bridge_timeout`; `None` deliberately conflates "measured dead"
+/// with "never measured" (e.g. the DNS lookup failed) — callers that
+/// need the distinction should go through [`probe_round_with_policy`]
+/// instead.
 pub async fn probe_one_with_policy(
     bridge: &BridgeLine,
     per_bridge_timeout: Duration,
@@ -135,6 +158,17 @@ pub async fn probe_until(
     .await
 }
 
+/// [`probe_until`] with an explicit [`ResolverPolicy`] instead of the
+/// default one.
+///
+/// Walks `bridges` in input order, probing strictly one bridge at a time
+/// (no concurrent burst), and returns as soon as either `target` live
+/// bridges have been found or `max_attempts` probes have been made —
+/// whichever comes first. Every attempted bridge counts against
+/// `max_attempts`, unmeasured ones included, and a `target` of 0 returns
+/// an empty vector without probing anything. Live results are in
+/// discovery order, not latency order, and each probe has the same
+/// budget semantics as [`probe_one_with_policy`].
 pub async fn probe_until_with_policy(
     bridges: Vec<BridgeLine>,
     per_bridge_timeout: Duration,

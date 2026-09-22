@@ -2,18 +2,28 @@
 
 use crate::error::FetchError;
 
+/// Connect target for one `https://` request: what to dial, what the
+/// `Host` header must say, and what path to request. Built by
+/// [`parse_https_url`]. Note the two host spellings with different jobs:
+/// `dial_host` is for dialling and TLS SNI only, `host_header` is the only
+/// one that may go on the wire in a header.
 #[derive(Debug)]
 pub struct UrlTarget {
     /// Dial host for the TCP socket and TLS ServerName: an IP literal
     /// WITHOUT brackets (IPv6 included) or a bare hostname. Never send this
     /// on the wire as an HTTP authority.
     pub dial_host: String,
+    /// Port to dial: the URL's explicit port if it carried one, otherwise
+    /// the `https` default (443).
     pub port: u16,
     /// Preformatted HTTP `Host` header value: the host bracketed if it is an
     /// IPv6 literal, plus ":port" ONLY when the URL carried an explicit port
     /// (`url::Url::port()`); a defaulted port (`port_or_known_default()`)
     /// must NOT appear here.
     pub host_header: String,
+    /// Request target for the `GET` request line, sent verbatim: the URL's
+    /// path (`/` if the URL had none) with `?query` appended when the URL
+    /// carried a query string, e.g. `/bridges?country=de`.
     pub path_and_query: String,
 }
 
@@ -34,6 +44,14 @@ impl UrlTarget {
     }
 }
 
+/// Parse an `https://` URL into a [`UrlTarget`].
+///
+/// Fails with [`FetchError::InvalidUrl`] when the string does not parse as
+/// a URL at all, the scheme is anything other than `https`, the host is
+/// missing, or no port can be determined. IPv6 literals are accepted in
+/// bracketed authority form and normalised (lowercased, brackets stripped
+/// in `dial_host`, kept in `host_header`); otherwise parsing and
+/// normalisation are the `url` crate's.
 pub fn parse_https_url(url_str: &str) -> Result<UrlTarget, FetchError> {
     let parsed = url::Url::parse(url_str).map_err(|e| FetchError::InvalidUrl(e.to_string()))?;
     if parsed.scheme() != "https" {

@@ -32,9 +32,16 @@ const DEFAULT_FILE: &str = "tor-socks5.users.ktav";
 /// when saves run concurrently within one process.
 static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// The on-disk users registry: the account list backed by a single
+/// Ktav file. Read with [`load`](Self::load), written back atomically
+/// with [`save`](Self::save); see the module docs for the file layout.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UsersConfig {
+    /// The known accounts, in the order they appear in the file.
+    /// Lookups by name ([`find`](Self::find) / [`find_mut`](Self::find_mut))
+    /// scan this vector linearly, so a duplicate `name` means only the
+    /// first record ever matches.
     pub users: Vec<User>,
 }
 

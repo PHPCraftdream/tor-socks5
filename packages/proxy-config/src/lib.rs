@@ -6,6 +6,7 @@
 //! 3. Built-in defaults (if no file is found).
 //!
 //! This schema is shared with the Android JNI FFI crate via this crate.
+#![warn(missing_docs)]
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -879,7 +880,14 @@ impl LogConfig {
 /// Outcome of [`Config::load`]: where the values came from.
 pub enum Loaded {
     /// The configuration was read from `path` on disk.
-    FromFile { path: PathBuf, config: Config },
+    FromFile {
+        /// File the configuration was parsed from: whichever path won the
+        /// [`Config::load_with_override`] resolution order — the CLI
+        /// override, the env-var path, or the default file.
+        path: PathBuf,
+        /// The parsed configuration values.
+        config: Config,
+    },
     /// Reserved for an explicit "skip file IO" code path; not used by
     /// `Config::load` after the default-file-autocreate behaviour was
     /// added, but kept so external callers can still bypass disk.

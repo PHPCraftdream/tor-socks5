@@ -17,6 +17,7 @@
 //!   deliberately leaving the Tor tunnel;
 //! * [`providers`] — the pool of [`DohProvider`] endpoints;
 //! * [`server`] — the UDP/TCP listener tying it all together.
+#![warn(missing_docs)]
 
 pub mod cache;
 pub mod doh_client;

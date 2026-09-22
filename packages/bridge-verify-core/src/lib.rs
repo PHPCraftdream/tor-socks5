@@ -11,6 +11,7 @@
 //! Platform-specific parts (the Win32 Toolhelp32 snapshot + `TerminateProcess`
 //! sweep, the Android `/proc` snapshot + `kill(2)` sweep, and each platform's
 //! marker file creation) stay in the consumers as thin adapters.
+#![warn(missing_docs)]
 
 pub mod pt_reap;
 pub mod snapshot;

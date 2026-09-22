@@ -1,6 +1,7 @@
 //! Minimal SOCKS5 server-side implementation (RFC 1928), CONNECT command
 //! only. Supports either no authentication or RFC 1929 USERNAME/PASSWORD,
 //! depending on whether the caller passes a [`PasswordVerifier`] to [`handshake`].
+#![warn(missing_docs)]
 
 use std::net::Ipv6Addr;
 use std::sync::Arc;
@@ -52,25 +53,79 @@ pub trait PasswordVerifier: Send + Sync {
     fn verify(&self, username: &str, password: &str) -> bool;
 }
 
-/// SOCKS5 server reply codes.
+/// SOCKS5 server reply codes (RFC 1928 §6): the `REP` byte of the
+/// 10-byte `VER REP RSV ATYP BND.ADDR BND.PORT` frame written by
+/// [`reply`]. Only [`Reply::CommandNotSupported`] and
+/// [`Reply::AddressTypeNotSupported`] are produced by [`handshake`]
+/// itself; the rest are the caller's to send once its own egress (here:
+/// the Tor connection) has an outcome to report.
 #[allow(dead_code)] // part of the protocol — keep all codes for future use
 #[derive(Clone, Copy)]
 #[repr(u8)]
 pub enum Reply {
+    /// Succeeded (REP=0x00). Never sent by [`handshake`] — parsing the
+    /// request says nothing about whether the destination is reachable.
+    /// The caller dials `host:port` (through Tor) first and answers the
+    /// client with this code only once that egress actually works.
     Success = 0x00,
+    /// General SOCKS server failure (REP=0x01): the egress failed for a
+    /// reason none of the more specific codes covers. Not produced in
+    /// this crate; the in-workspace server answers with it when the Tor
+    /// tunnel is unavailable or the stream open through it fails.
     GeneralFailure = 0x01,
+    /// Connection not allowed by ruleset (REP=0x02): a policy refusal,
+    /// not a network condition. The in-workspace server uses it for both
+    /// `.onion` gates (the global `block_onion` switch and the
+    /// per-account `allowed_onion` check on
+    /// [`ConnectRequest::authed_user`]).
     ConnectionNotAllowed = 0x02,
+    /// Network unreachable (REP=0x03). Not produced anywhere today: a
+    /// server that dials through Tor cannot observe the egress network's
+    /// routing failures, so it cannot honestly claim this condition.
+    /// Kept for protocol completeness, so callers can map an upstream
+    /// error onto the canonical code if one ever becomes observable.
     NetworkUnreachable = 0x03,
+    /// Host unreachable (REP=0x04). Not produced anywhere today, for the
+    /// same reason as [`Reply::NetworkUnreachable`] — kept for protocol
+    /// completeness.
     HostUnreachable = 0x04,
+    /// Connection refused (REP=0x05). Not produced anywhere today, for
+    /// the same reason as [`Reply::NetworkUnreachable`] — kept for
+    /// protocol completeness.
     ConnectionRefused = 0x05,
+    /// TTL expired (REP=0x06). Not produced anywhere today, for the same
+    /// reason as [`Reply::NetworkUnreachable`] — kept for protocol
+    /// completeness.
     TtlExpired = 0x06,
+    /// Command not supported (REP=0x07). Produced by [`handshake`] when
+    /// the request's CMD is anything other than CONNECT (0x01); the reply
+    /// is sent best-effort before the handshake aborts with an error.
     CommandNotSupported = 0x07,
+    /// Address type not supported (REP=0x08). Produced by [`handshake`]
+    /// when the request's DST.ATYP is not IPv4 (0x01), fully-qualified
+    /// domain name (0x03), or IPv6 (0x04); sent best-effort before the
+    /// handshake aborts with an error.
     AddressTypeNotSupported = 0x08,
 }
 
+/// The parsed CONNECT request, as returned by [`handshake`].
+///
+/// The handshake has only read and validated the request at this point —
+/// no connection to the destination exists yet. Dialling `host:port`
+/// (through Tor) and reporting the outcome to the client via [`reply`]
+/// is the caller's job.
 #[derive(Debug)]
 pub struct ConnectRequest {
+    /// Destination host, normalised to a string regardless of the
+    /// address type the client sent: a dotted-quad IPv4 literal
+    /// (`ATYP=0x01`), a canonical compressed IPv6 literal (`ATYP=0x04`,
+    /// Rust's `Ipv6Addr` display form), or the domain name exactly as
+    /// sent (`ATYP=0x03`, decoded as UTF-8 — a non-UTF-8 name fails the
+    /// handshake). See [`ConnectRequest::is_onion`] for the domain
+    /// special case.
     pub host: String,
+    /// Destination port in host byte order, decoded from the wire's
+    /// big-endian DST.PORT.
     pub port: u16,
     /// The account that authenticated this request, when RFC 1929
     /// USER/PASS was used. `None` for the anonymous (NO_AUTH) path.

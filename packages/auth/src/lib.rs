@@ -11,6 +11,7 @@
 //! * An account whose stored hash is the `init` sentinel adopts the
 //!   first non-empty password presented at login (trust-on-first-use)
 //!   and the real hash is written back to disk.
+#![warn(missing_docs)]
 
 mod compute_hash;
 mod params;

@@ -148,7 +148,7 @@ pub fn pt_state_identifier(binary_path: &std::path::Path) -> std::path::PathBuf 
 /// Assumption: these are app-private paths carrying no CfgPath variable
 /// syntax, so the lossy string round-trip of the path is the identity. A
 /// consumer may use this value as an exact-byte ownership token compared
-/// against bytes from /proc/<pid>/environ.
+/// against bytes from `/proc/<pid>/environ`.
 pub fn pt_state_location_token(
     check_state_dir: &std::path::Path,
     pt_binary: &std::path::Path,
@@ -163,7 +163,7 @@ pub fn pt_state_location_token(
 const STATE_LOCATION_KEY: &[u8] = b"TOR_PT_STATE_LOCATION";
 
 /// Extracts the `TOR_PT_STATE_LOCATION` value from a raw
-/// /proc/<pid>/environ byte blob (entries separated by b'\0', each
+/// `/proc/<pid>/environ` byte blob (entries separated by b'\0', each
 /// `KEY=VALUE` split at the FIRST b'='). Returns the value bytes of the
 /// FIRST matching entry, or None when absent. An unreadable/empty environ
 /// (zombie, vanished process) also yields None, and callers must treat None

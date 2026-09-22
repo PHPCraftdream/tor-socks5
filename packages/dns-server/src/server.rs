@@ -24,7 +24,7 @@
 //! # Concurrency and shutdown
 //!
 //! DoH misses run in detached tasks, bounded by a
-//! [`MAX_DNS_CONCURRENT_QUERIES`] permit held for the task's whole life plus
+//! `MAX_DNS_CONCURRENT_QUERIES` permit held for the task's whole life plus
 //! the per-provider timeouts inside [`resolve_with_pool`] — bounded despite
 //! being fire-and-forget. UDP receive errors are per-datagram (including
 //! Windows' WSAECONNRESET raised after a send to a dead port) and only skip
@@ -149,7 +149,7 @@ impl<T: Clone> Clone for QueryCtx<T> {
 /// every spawned task carries its own copy.
 ///
 /// `overrides` carries the operator's override masks; matching hosts
-/// bypass the DoH pool entirely (see [`resolve_host`]).
+/// bypass the DoH pool entirely (see `resolve_host`).
 ///
 /// `cache_path` drives the periodic (and final) best-effort cache saves;
 /// see [`DnsCache::save`]. A bind failure on ANY address fails the whole

@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// One account record in the on-disk users registry — one entry of the
+/// `users` array in the `tor-socks5.users.ktav` file. Parsing is strict:
+/// an unknown key inside a record is an error, so a schema mismatch is
+/// never silently ignored.
 pub struct User {
     /// Unique username. Used as the SOCKS5 USER field at login.
     pub name: String,

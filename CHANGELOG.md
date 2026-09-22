@@ -145,6 +145,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Every crate manifest in the repo is now marked `publish = false`** (all
+  20 workspace and vendored crates): an accidental `cargo publish` from any
+  directory now fails fast instead of irreversibly uploading to crates.io —
+  `cargo yank` only hides a version and never removes it, and the
+  name+version pair is burned forever. The guard matters doubly for the
+  seven vendored Arti forks (`arti-client`, `saturating-time`,
+  `tor-chanmgr`, `tor-circmgr`, `tor-dirclient`, `tor-dirmgr`,
+  `tor-guardmgr`), which sit under upstream-owned crates.io names:
+  publishing one would hijack another project's crate. Publication is
+  deliberately withheld for now (the intended release artifact is one
+  cohesive `tor-socks5` package — `docs/sdk-package-design.md`), enforced
+  by the new `scripts/check-publish-guard.sh` and its CI `publish-guard`
+  job: the script discovers manifests the same way `check-line-limit.sh`
+  does (`git ls-files`, tracked + untracked), so a brand-new crate cannot
+  slip through without the key. Note that `cargo package` still works on
+  `publish = false` crates, so future packagability checks are unaffected.
+
+- **`dns-server` publishes as `tor-socks5-dns`** (`packages/dns-server`,
+  `apps/socks5-proxy`): the published crate name changes because
+  `dns-server` is already taken on crates.io by an unrelated crate — the
+  same treatment `auth` → `tor-socks5-auth`, `proxy-config` →
+  `tor-socks5-config`, and `socks5-proto` → `tor-socks5-proto` received.
+  The in-tree directory stays `packages/dns-server` and the library
+  target keeps the identifier `dns_server`, so every `use dns_server::…`
+  in `apps/socks5-proxy` compiles unchanged: the consumer's dependency
+  keeps the old table key and adds Cargo's dependency-renaming
+  (`package = "tor-socks5-dns"`). The `dns_server.*` config section is
+  unaffected — no config, CLI, or behavior changes.
+
 - **`listen` accepts a list of addresses** (`proxy-config`,
   `apps/socks5-proxy`): `Config.listen` is now a `Vec<String>` — every
   configured address gets its own accept loop, and connections from any

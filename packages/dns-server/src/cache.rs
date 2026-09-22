@@ -22,7 +22,7 @@
 //!   file or the new one, never a torn one. On any error the guard's `Drop`
 //!   removes the temp.
 //!
-//! The on-disk format is plain text, one line per host (see [`format_line`]),
+//! The on-disk format is plain text, one line per host (see `format_line`),
 //! in the spirit of this codebase's other file-based persistence (e.g.
 //! bridge-probe's persisted DNS fallback) rather than pulling in a
 //! serialization dependency for four fields.

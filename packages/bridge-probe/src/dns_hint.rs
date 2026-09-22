@@ -28,8 +28,19 @@ use crate::probe::resolve_probe_target;
 /// constructor, for where that line is actually drawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsHint {
+    /// The hostname the answer is for — never a literal IP: only hosts
+    /// that actually cost a DNS lookup get hints (see [`dns_hostname_of`]).
     pub host: String,
+    /// The addresses `host` resolved to, in the order the resolver
+    /// supplied them; serialised comma-separated by
+    /// [`format_dns_hint_line`]. Never empty on a valid hint (parsing
+    /// rejects that).
     pub addrs: Vec<IpAddr>,
+    /// Unix timestamp, in **seconds**, of when the resolution was
+    /// obtained. Orders the last-write-wins merge in [`seed_disk_fallback`];
+    /// parsing rejects a stamp further ahead of the wall clock than the
+    /// configured future tolerance, and consumers treat it as stale once
+    /// it falls outside the fallback window.
     pub resolved_at_unix: u64,
 }
 

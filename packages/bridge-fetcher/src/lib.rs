@@ -1,17 +1,18 @@
 //! Fetch Tor bridge lines from HTTPS sources over a Tor circuit.
 //!
 //! The crate is split into focused modules:
-//! * [`error`] — the [`FetchError`] type;
-//! * [`url_parse`] — `https://` URL parsing;
-//! * [`http`] — the HTTPS GET client (request, headers, body), over either a
+//! * `error` — the [`FetchError`] type;
+//! * `url_parse` — `https://` URL parsing;
+//! * `http` — the HTTPS GET client (request, headers, body), over either a
 //!   Tor circuit or, for the cold-start rescue path, a direct connection;
-//! * [`direct`] — the direct (non-Tor) connector `http` uses for that rescue path;
-//! * [`parse`] — extracting `BridgeLine`s from a response body;
-//! * [`dedup`] — deduplicating bridge lines;
-//! * [`fetch`] — the parallel multi-source batch fetch.
+//! * `direct` — the direct (non-Tor) connector `http` uses for that rescue path;
+//! * `parse` — extracting `BridgeLine`s from a response body;
+//! * `dedup` — deduplicating bridge lines;
+//! * `fetch` — the parallel multi-source batch fetch.
 //!
 //! Pinned workspace versions: tokio 1, tokio-rustls 0.26, rustls 0.23,
 //! httparse 1, url 2, webpki-roots 0.26, bridge-line (ptrs-gesher 0.6).
+#![warn(missing_docs)]
 
 mod dedup;
 mod direct;

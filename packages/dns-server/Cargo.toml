@@ -1,5 +1,11 @@
 [package]
-name = "dns-server"
+# Published name differs from the in-tree package/directory: "dns-server"
+# is already taken on crates.io by an unrelated crate. See
+# packages/auth/Cargo.toml for the same rename pattern.
+name = "tor-socks5-dns"
+# Not published: the release artifact is the single `tor-socks5` package;
+# workspace crates are its internal modules (docs/sdk-package-design.md).
+publish = false
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -11,6 +17,16 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+# The produced library target keeps the pre-rename identifier so every
+# in-workspace `use dns_server::...` stays unchanged. Only the
+# crates.io-facing [package] name above differs.
+[lib]
+name = "dns_server"
 
 [dependencies]
 arti-wrapper = { path = "../arti-wrapper", version = "0.1.0" }

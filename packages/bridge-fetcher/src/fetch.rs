@@ -30,7 +30,14 @@ use crate::parse::parse_bridges_from_body;
 /// ```
 #[derive(Debug, Clone)]
 pub struct Source {
+    /// Caller-chosen identifier for the source, copied into every
+    /// [`FetchOutcome`] so results and log lines can be joined back to the
+    /// configured collector. Never sent on the wire.
     pub label: String,
+    /// The `https://` URL to GET. If it does not parse as an HTTPS URL the
+    /// source fails with [`FetchError::InvalidUrl`] without any network
+    /// attempt; redirects may then take the actual fetch elsewhere (see
+    /// `allow_credentials_cross_origin` for what travels along).
     pub url: String,
     /// Extra request headers, each a full `Name: Value` line.
     pub headers: Vec<String>,
@@ -45,10 +52,21 @@ pub struct Source {
     pub allow_credentials_cross_origin: bool,
 }
 
+/// Per-source result of a batch fetch: what one [`Source`] yielded,
+/// successful or not. Exactly one outcome is produced per source, in input
+/// order, so a failed source stays visible next to its successful peers
+/// instead of silently vanishing from the merged bridge list.
 #[derive(Debug)]
 pub struct FetchOutcome {
+    /// Copy of the source's `label`.
     pub label: String,
+    /// How many bridge lines were extracted from the body (equals
+    /// `bridges.len()`); always 0 when `error` is set. Zero is also legal
+    /// without an error — a 200 response whose body parses to nothing.
     pub bridges_extracted: usize,
+    /// `None` when this source's fetch succeeded; otherwise the `Display`
+    /// string of the [`FetchError`] that killed it. One bad source never
+    /// fails the batch.
     pub error: Option<String>,
     /// The lines this source contributed, kept alongside the count so a bridge
     /// can be attributed back to where it came from.

@@ -13,6 +13,9 @@
 edition = "2024"
 rust-version = "1.89"
 name = "tor-circmgr"
+# Upstream-owned crates.io name; this is a locally-patched fork — publishing
+# it would hijack another project's crate.
+publish = false
 version = "0.43.0"
 authors = [
     "The Tor Project, Inc.",

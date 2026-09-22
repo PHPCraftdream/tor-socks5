@@ -78,10 +78,27 @@ pub fn usable_for_tor(bridge: &BridgeLine) -> bool {
 /// Outcome of probing a single bridge.
 #[derive(Debug, Clone)]
 pub enum Outcome {
+    /// The bridge answered its probe within the caller's budget: a
+    /// completed TCP handshake for plain/obfs4 targets, a completed
+    /// WebTunnel HTTP-upgrade round trip for webtunnel ones — so a live
+    /// website with no relay behind it does **not** count as reachable.
     Reachable {
+        /// Wall-clock time from the start of the probe attempt loop to
+        /// the successful handshake, i.e. including any earlier failed
+        /// candidates tried within the same budget (candidates are tried
+        /// in order until one connects).
         latency: Duration,
     },
+    /// The probe produced a negative verdict about the bridge itself: the
+    /// target refused, timed out, or answered like an ordinary web server
+    /// instead of upgrading (webtunnel); or the line was unusable before
+    /// any dial (documentation-range address, unparseable webtunnel
+    /// params).
     Unreachable {
+        /// Human-readable, one-line explanation of the failure that
+        /// decided the verdict (address and underlying error/timeout
+        /// included). Also emitted at `warn!` level by the round
+        /// summaries.
         reason: String,
     },
     /// The round never got far enough to learn anything about this bridge —
@@ -94,17 +111,31 @@ pub enum Outcome {
     /// this, and each one pushed a possibly-live bridge towards being pruned
     /// and its source towards being written off as barren.
     Unmeasured {
+        /// What blocked the measurement (e.g. the DNS resolution failed
+        /// or timed out) — a fact about our own resolver or network, not
+        /// about the bridge.
         reason: String,
     },
 }
 
+/// One bridge's probe result: the input line paired with what the round
+/// learned (or failed to learn) about it.
 #[derive(Debug, Clone)]
 pub struct Report {
+    /// The bridge that was probed, echoed back unchanged so callers can
+    /// key health records and sorting on it without re-deriving the
+    /// bridge's identity from an outcome alone.
     pub bridge: BridgeLine,
+    /// The verdict for [`Report::bridge`] — see [`Outcome`] for the three
+    /// cases and what each licenses callers to record.
     pub outcome: Outcome,
 }
 
 impl Report {
+    /// True only for an [`Outcome::Reachable`] result — the only verdict
+    /// that positively establishes the bridge can carry traffic. `false`
+    /// for both [`Outcome::Unreachable`] and [`Outcome::Unmeasured`],
+    /// which mean opposite things and must not be conflated.
     pub fn is_reachable(&self) -> bool {
         matches!(self.outcome, Outcome::Reachable { .. })
     }
@@ -115,6 +146,9 @@ impl Report {
         matches!(self.outcome, Outcome::Unmeasured { .. })
     }
 
+    /// The measured latency when the probe succeeded ([`Outcome::Reachable`]);
+    /// `None` for [`Outcome::Unreachable`] and [`Outcome::Unmeasured`],
+    /// neither of which observed a completed handshake.
     pub fn latency(&self) -> Option<Duration> {
         match &self.outcome {
             Outcome::Reachable { latency } => Some(*latency),

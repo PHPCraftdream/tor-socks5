@@ -173,6 +173,9 @@ impl AuthState {
             .len()
     }
 
+    /// True when this authenticator knows no users. Inverse of
+    /// [`len`](Self::len); [`require_auth`](Self::require_auth) is just
+    /// its negation.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.users
