@@ -1570,8 +1570,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bd5850ec9ad2d9ba0aa33fb22c0b0ef4d91e524566be497ac2a6e40b847e67bb"
 dependencies = [
  "heck",
- "indexmap 1.9.3",
- "itertools 0.10.5",
+ "indexmap 2.14.0",
+ "itertools 0.14.0",
  "proc-macro-crate",
  "proc-macro2",
  "quote",
@@ -3141,9 +3141,9 @@ dependencies = [
 
 [[package]]
 name = "ktav"
-version = "0.6.4"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1504089feedb8cf7abbf9d90782c007066e7c010c760eb94b23178ed6aeaf18e"
+checksum = "961a8932a06e7f2c02a301b70978c190b746925d615f20035a3e07c584282655"
 dependencies = [
  "bumpalo",
  "compact_str",
@@ -5148,7 +5148,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32824fab5e16e6c4d86dc1ba84489390419a39f97699852b66480bb87d297ed8"
 dependencies = [
  "bstr",
- "dirs 4.0.0",
+ "dirs 6.0.0",
  "os_str_bytes",
 ]
 
