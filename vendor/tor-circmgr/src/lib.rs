@@ -43,6 +43,7 @@
 #![allow(clippy::needless_lifetimes)] // See arti#1765
 #![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 #![allow(clippy::collapsible_if)] // See arti#2342
+#![allow(clippy::double_must_use)] // `#[async_trait]` expansion trips it on newer clippy
 #![deny(clippy::unused_async)]
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 

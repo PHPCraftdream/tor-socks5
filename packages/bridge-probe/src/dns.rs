@@ -890,6 +890,8 @@ pub(super) fn note_doh_result(index: usize, answered: bool) {
         return;
     };
     let delta = if answered { 1 } else { -1 };
+    // `try_update` is newer than our MSRV; `fetch_update` is its older name.
+    #[allow(deprecated)]
     let _ = slot.fetch_update(
         AtomicOrdering::Relaxed,
         AtomicOrdering::Relaxed,
