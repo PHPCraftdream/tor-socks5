@@ -4573,6 +4573,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "resocks5-net"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e3ed727237180530a8c3c0a7e518430916f8320e9e210025c9a1e2936c5c7ee"
+dependencies = [
+ "base64",
+ "socket2",
+ "tokio",
+]
+
+[[package]]
 name = "resolv-conf"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5288,6 +5299,7 @@ dependencies = [
  "persist-lock",
  "ptrs-gesher-bridge-line",
  "ptrs-gesher-lyrebird",
+ "resocks5-net",
  "rpassword",
  "rusqlite",
  "rustls",

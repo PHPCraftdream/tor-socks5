@@ -49,6 +49,8 @@ futures.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 getrandom.workspace = true
+# Upstream SOCKS5 egress: the client handshake itself comes from here.
+resocks5-net = { version = "0.2", default-features = false }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true

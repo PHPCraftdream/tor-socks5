@@ -81,6 +81,29 @@ fn pick_upstream_enabled_without_address_errors() {
     assert!(format!("{err}").contains("no address"));
 }
 
+#[test]
+fn pick_upstream_rejects_malformed_address_at_startup() {
+    let cfg = UpstreamConfig {
+        enabled: true,
+        address: "127.0.0.1".into(),
+        username: String::new(),
+        password: String::new(),
+    };
+    let err = pick_upstream(&cfg, None, None, None, false).unwrap_err();
+    assert!(format!("{err}").contains("HOST:PORT"), "got: {err}");
+
+    // A valid address still passes (guard on the check itself).
+    let cfg = UpstreamConfig {
+        enabled: true,
+        address: "127.0.0.1:9050".into(),
+        username: String::new(),
+        password: String::new(),
+    };
+    assert!(pick_upstream(&cfg, None, None, None, false)
+        .unwrap()
+        .is_some());
+}
+
 fn onion_state(name: &str, enabled: bool, allowed_onion: bool) -> AuthState {
     let user = auth::User {
         name: name.into(),

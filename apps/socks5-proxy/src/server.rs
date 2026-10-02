@@ -489,7 +489,17 @@ fn pick_upstream(
         .or_else(|| (!cfg.password.is_empty()).then(|| cfg.password.clone()));
     let credentials = username.map(|u| (u, password.unwrap_or_default()));
 
-    Ok(Some(upstream::Upstream::new(address, credentials)))
+    let up = upstream::Upstream::new(address, credentials);
+    // Fail fast at startup: the address is parsed once (into the
+    // library's `ProxyConfig`), so an unparsable one would otherwise
+    // only surface on the first client's CONNECT.
+    if !up.is_valid_address() {
+        bail!(
+            "upstream proxy address {:?} is not a valid HOST:PORT pair",
+            up.address()
+        );
+    }
+    Ok(Some(up))
 }
 
 /// Accept connections on `listener` forever, spawning one task per
