@@ -1,22 +1,81 @@
-//! Proves the Android accept-loop path (`handle_connection`) actually
-//! enforces RFC 1929 credentials when `auth_state` is configured,
-//! instead of the pre-fix behaviour of always calling
-//! `socks5_proto::handshake(&mut client, None)` (NO_AUTH) regardless
-//! of config. `TorTunnel` needs a live Tor bootstrap and cannot be
-//! constructed in a unit test, so these tests exercise the exact same
-//! call `handle_connection` makes — `socks5_proto::handshake(&mut
-//! client, auth)` — over a real loopback `TcpStream` pair, and assert
-//! that a failed handshake means the socket is closed with **no**
-//! SOCKS5 CONNECT reply ever sent, i.e. `handle_connection`'s `?`
-//! short-circuits before `tunnel.connect` / `socks5_proto::reply` run.
+//! JNI consumer tests. Adapter/auth tests below use real loopback sockets;
+//! handler tests use the production internal egress seam without phone/live Tor.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use super::{onion_destination_allowed, AuthStateVerifier, ACCEPT_ERROR_BACKOFF};
-use auth::{AuthState, User, UsersConfig};
+use resocks5_net::server::{IncomingRequest, ServerError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+use super::bridges::{accept_with_deadline, handle_connection_with_egress, EgressConnector};
+use auth::{AuthState, User, UsersConfig};
+use resocks5_net::connect::HostPort;
+
+struct GatedLoopbackConnector {
+    address: std::net::SocketAddr,
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl EgressConnector for GatedLoopbackConnector {
+    async fn open_egress(
+        self,
+        target: HostPort<'_>,
+    ) -> anyhow::Result<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>
+    {
+        assert_eq!(target.host, "127.0.0.1");
+        assert_eq!(target.port, self.address.port());
+        self.entered.send(()).unwrap();
+        self.release.await.unwrap();
+        Ok(TcpStream::connect(self.address).await?)
+    }
+}
+
+struct FailingConnector {
+    dialed: Arc<std::sync::atomic::AtomicBool>,
+    expected: Option<(&'static str, u16)>,
+}
+
+impl EgressConnector for FailingConnector {
+    async fn open_egress(
+        self,
+        target: HostPort<'_>,
+    ) -> anyhow::Result<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>
+    {
+        self.dialed.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(expected) = self.expected {
+            assert_eq!((target.host, target.port), expected);
+        }
+        Err::<TcpStream, _>(anyhow::anyhow!("injected egress failure"))
+    }
+}
+
+struct PrefixConnector<S> {
+    stream: S,
+    delivered: Arc<std::sync::atomic::AtomicUsize>,
+    input_len: usize,
+}
+
+impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> EgressConnector
+    for PrefixConnector<S>
+{
+    async fn open_egress(
+        self,
+        target: HostPort<'_>,
+    ) -> anyhow::Result<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>
+    {
+        assert_eq!((target.host, target.port), ("example.com", 443));
+        // All prefix bytes left the client transport before egress, so only
+        // the handler's pipeline path can deliver them upstream.
+        assert_eq!(
+            self.delivered.load(std::sync::atomic::Ordering::SeqCst),
+            self.input_len
+        );
+        Ok(self.stream)
+    }
+}
 
 fn one_user_state(name: &str, password: &str) -> Arc<AuthState> {
     let user = User {
@@ -38,22 +97,11 @@ fn rfc1929_frame(user: &str, passwd: &str) -> Vec<u8> {
     out
 }
 
-/// Spin up a loopback listener, connect a client, and run the given
-/// client-side script concurrently with
-/// `socks5_proto::handshake(&mut server_stream, auth)` — the exact
-/// call `handle_connection` makes. Returns the handshake `Result`.
-///
-/// `server_stream` is dropped (closing the socket) as soon as the
-/// handshake settles, *before* we wait on the client task — exactly
-/// like the real accept loop, where `handle_connection`'s early `?`
-/// return drops `client` on the way out. A client script that reads
-/// for EOF after a rejection depends on this ordering; awaiting the
-/// client task before dropping the server half would deadlock both
-/// sides against each other.
+/// Runs the JNI adapter/auth wiring over loopback; closes on terminal errors.
 async fn run_handshake_over_loopback(
     auth: Option<Arc<AuthState>>,
     client_script: impl FnOnce(TcpStream) -> tokio::task::JoinHandle<()> + Send + 'static,
-) -> anyhow::Result<socks5_proto::ConnectRequest> {
+) -> std::result::Result<IncomingRequest, ServerError> {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -65,10 +113,10 @@ async fn run_handshake_over_loopback(
     let (mut server_stream, _peer) = listener.accept().await.unwrap();
     let auth = auth
         .map(|state| Arc::new(AuthStateVerifier(state)) as Arc<dyn socks5_proto::PasswordVerifier>);
-    let result = socks5_proto::handshake(&mut server_stream, auth).await;
+    let result = accept_with_deadline(&mut server_stream, auth).await;
     drop(server_stream);
 
-    let _ = client_task.await;
+    client_task.await.unwrap();
     result
 }
 
@@ -164,7 +212,7 @@ async fn accept_loop_wiring_accepts_correct_credentials() {
             );
 
             // CONNECT to 1.2.3.4:80 so the handshake can complete and
-            // return a `ConnectRequest` (handle_connection would now
+            // return a SDK request (handle_connection would now
             // proceed to `tunnel.connect`).
             client
                 .write_all(&[0x05, 0x01, 0x00, 0x01, 1, 2, 3, 4, 0, 80])
@@ -175,9 +223,8 @@ async fn accept_loop_wiring_accepts_correct_credentials() {
     .await;
 
     let req = result.expect("correct credentials must be accepted");
-    assert_eq!(req.host, "1.2.3.4");
-    assert_eq!(req.port, 80);
-    assert_eq!(req.authed_user.as_deref(), Some("alice"));
+    assert_eq!(req.target(), "1.2.3.4:80");
+    assert_eq!(req.username(), Some("alice"));
 }
 
 #[tokio::test]
@@ -202,24 +249,377 @@ async fn accept_loop_wiring_no_auth_state_falls_back_to_no_auth() {
     .await;
 
     let req = result.expect("NO_AUTH must still work when auth is not configured");
-    assert!(req.authed_user.is_none());
+    assert!(req.username().is_none());
 }
 
 #[test]
 fn onion_policy_blocks_only_when_enabled() {
-    let onion = socks5_proto::ConnectRequest {
-        host: "example.onion".into(),
-        port: 443,
-        authed_user: None,
-    };
-    let clearnet = socks5_proto::ConnectRequest {
-        host: "example.com".into(),
-        port: 443,
-        authed_user: None,
-    };
-    assert!(!onion_destination_allowed(&onion, true));
-    assert!(onion_destination_allowed(&onion, false));
-    assert!(onion_destination_allowed(&clearnet, true));
+    for host in ["example.onion", "example.ONION."] {
+        assert!(!onion_destination_allowed(host, true));
+        assert!(onion_destination_allowed(host, false));
+    }
+    assert!(onion_destination_allowed("example.com", true));
+}
+
+/// Egress is gated so neither protocol may advertise success before readiness.
+#[tokio::test]
+async fn jni_same_port_protocols_wait_for_egress_and_relay_exact_payload() {
+    use std::future::Future;
+    use std::task::Poll;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    for http in [false, true] {
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let handler = tokio::spawn(handle_connection_with_egress(
+            server,
+            http.then(|| one_user_state("alice", "hunter2")),
+            false,
+            GatedLoopbackConnector {
+                address: upstream_addr,
+                entered: entered_tx,
+                release: release_rx,
+            },
+        ));
+        if http {
+            client
+                .write_all(
+                    format!("CONNECT {upstream_addr} HTTP/1.1\r\nProxy-Authorization: Basic YWxpY2U6aHVudGVyMg==\r\n\r\nprefix").as_bytes(),
+                )
+                .await
+                .unwrap();
+        } else {
+            client.write_all(&[5, 1, 0]).await.unwrap();
+            let mut method = [0; 2];
+            client.read_exact(&mut method).await.unwrap();
+            assert_eq!(method, [5, 0]);
+            let mut frame = vec![5, 1, 0, 1, 127, 0, 0, 1];
+            frame.extend_from_slice(&upstream_addr.port().to_be_bytes());
+            client.write_all(&frame).await.unwrap();
+            client.write_all(b"prefix").await.unwrap();
+        }
+        entered_rx.await.unwrap();
+        let mut first = [0];
+        let mut reading = Box::pin(client.read_exact(&mut first));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(reading.as_mut().poll(cx).is_pending())).await,
+            "no tunnel response before egress readiness"
+        );
+        drop(reading);
+        release_tx.send(()).unwrap();
+        let (mut upstream, _) = upstream_listener.accept().await.unwrap();
+        if http {
+            let mut reply = vec![0; b"HTTP/1.1 200 Connection Established\r\n\r\n".len()];
+            client.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply, b"HTTP/1.1 200 Connection Established\r\n\r\n");
+        } else {
+            let mut reply = [0; 10];
+            client.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply[1], 0);
+        }
+        client.write_all(b"suffix").await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        upstream.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, b"prefixsuffix");
+        upstream.write_all(b"egress-response").await.unwrap();
+        upstream.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, b"egress-response");
+        handler.await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn jni_http_auth_policy_and_upstream_failure_replies() {
+    for (input, configured, block, expected, dials, success) in [
+        ("CONNECT example.com:443 HTTP/1.1\r\n\r\n", true, false, 407, false, false),
+        ("CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic YWxpY2U6V1JPTkc=\r\n\r\n", true, false, 407, false, false),
+        ("CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic YWxpY2U6aHVudGVyMg==\r\n\r\n", false, false, 407, false, false),
+        ("CONNECT example.ONION.:443 HTTP/1.1\r\nProxy-Authorization: Basic YWxpY2U6aHVudGVyMg==\r\n\r\n", true, true, 403, false, true),
+        ("CONNECT example.onion:443 HTTP/1.1\r\n\r\n", false, false, 502, true, false),
+        ("CONNECT example.onion.evil.com:443 HTTP/1.1\r\n\r\n", false, true, 502, true, false),
+    ] {
+        let (server, mut client) = tokio::io::duplex(2048);
+        client.write_all(input.as_bytes()).await.unwrap();
+        let dialed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = dialed.clone();
+        let result = handle_connection_with_egress(
+            server,
+            configured.then(|| one_user_state("alice", "hunter2")),
+            block,
+            FailingConnector {
+                dialed: observed,
+                expected: None,
+            },
+        )
+        .await;
+        assert_eq!(result.is_ok(), success);
+        assert_eq!(dialed.load(std::sync::atomic::Ordering::SeqCst), dials);
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply).await.unwrap();
+        assert!(
+            reply.starts_with(format!("HTTP/1.1 {expected} ").as_bytes()),
+            "{reply:?}"
+        );
+        assert!(!reply.windows(b"HTTP/1.1 200".len()).any(|w| w == b"HTTP/1.1 200"));
+    }
+}
+
+#[tokio::test]
+async fn jni_http_ipv6_authority_passes_unbracketed_host_to_egress() {
+    let (server, mut client) = tokio::io::duplex(1024);
+    client
+        .write_all(b"CONNECT [::1]:8443 HTTP/1.1\r\n\r\n")
+        .await
+        .unwrap();
+    let result = handle_connection_with_egress(
+        server,
+        None,
+        false,
+        FailingConnector {
+            dialed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            expected: Some(("::1", 8443)),
+        },
+    )
+    .await;
+    assert!(result.is_err());
+    let mut reply = Vec::new();
+    client.read_to_end(&mut reply).await.unwrap();
+    assert!(reply.starts_with(b"HTTP/1.1 502 "));
+}
+
+#[tokio::test]
+async fn jni_socks_egress_failure_uses_general_failure_rep1() {
+    let (server, mut client) = tokio::io::duplex(256);
+    client
+        .write_all(&[5, 1, 0, 5, 1, 0, 1, 1, 2, 3, 4, 0, 80])
+        .await
+        .unwrap();
+    let result = handle_connection_with_egress(
+        server,
+        None,
+        false,
+        FailingConnector {
+            dialed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            expected: Some(("1.2.3.4", 80)),
+        },
+    )
+    .await;
+    assert!(result.is_err());
+    let mut reply = Vec::new();
+    client.read_to_end(&mut reply).await.unwrap();
+    assert_eq!(reply, [5, 0, 5, 1, 0, 1, 0, 0, 0, 0, 0, 0]);
+}
+
+struct ControlledPrefix<S> {
+    inner: S,
+    input: Vec<u8>,
+    delivered: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ControlledPrefix<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let offset = self.delivered.load(std::sync::atomic::Ordering::SeqCst);
+        if offset < self.input.len() {
+            let n = buf.remaining().min(self.input.len() - offset);
+            buf.put_slice(&self.input[offset..offset + n]);
+            self.delivered
+                .fetch_add(n, std::sync::atomic::Ordering::SeqCst);
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ControlledPrefix<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[tokio::test]
+async fn jni_http_buffered_binary_prefix_precedes_relay_exactly_once() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let prefix = b"\x00\xff\x80\r\n\x05";
+        let suffix = b"\xfe\x00tail";
+        let mut input = b"CONNECT example.com:443 HTTP/1.1\r\n\r\n".to_vec();
+        input.extend_from_slice(prefix);
+        let input_len = input.len();
+        let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = delivered.clone();
+        let (server, mut client) = tokio::io::duplex(2048);
+        let server = ControlledPrefix {
+            inner: server,
+            input,
+            delivered,
+        };
+        let (upstream, mut peer) = tokio::io::duplex(2048);
+        let handler = tokio::spawn(handle_connection_with_egress(
+            server,
+            None,
+            false,
+            PrefixConnector {
+                stream: upstream,
+                delivered: observed,
+                input_len,
+            },
+        ));
+        let mut reply = vec![0; b"HTTP/1.1 200 Connection Established\r\n\r\n".len()];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, b"HTTP/1.1 200 Connection Established\r\n\r\n");
+        let mut received_prefix = vec![0; prefix.len()];
+        peer.read_exact(&mut received_prefix).await.unwrap();
+        assert_eq!(received_prefix, prefix);
+        client.write_all(suffix).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut remainder = Vec::new();
+        peer.read_to_end(&mut remainder).await.unwrap();
+        assert_eq!(remainder, suffix);
+        peer.write_all(b"\x00\xffresponse").await.unwrap();
+        peer.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response, b"\x00\xffresponse");
+        handler.await.unwrap().unwrap();
+    })
+    .await
+    .expect("buffered prefix must be forwarded before waiting for relay input");
+}
+
+/// Fault injection after a confirmed short write. No retry, second response,
+/// or bidirectional-copy read may occur after either reply or pipeline failure.
+struct PartialFailure<S> {
+    inner: S,
+    remaining: usize,
+    reads: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PartialFailure<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for PartialFailure<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.remaining == 0 {
+            return std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+        }
+        let len = buf.len().min(self.remaining);
+        match std::pin::Pin::new(&mut self.inner).poll_write(cx, &buf[..len]) {
+            std::task::Poll::Ready(Ok(n)) => {
+                self.remaining -= n;
+                std::task::Poll::Ready(Ok(n))
+            }
+            other => other,
+        }
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[tokio::test]
+async fn jni_partial_reply_and_pipeline_errors_are_terminal() {
+    for fail_reply in [true, false] {
+        let (server, mut client) = tokio::io::duplex(2048);
+        let (upstream, mut peer) = tokio::io::duplex(2048);
+        let input = b"CONNECT example.com:443 HTTP/1.1\r\n\r\npayload".to_vec();
+        let input_len = input.len();
+        let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = delivered.clone();
+        let server = ControlledPrefix {
+            inner: server,
+            input,
+            delivered,
+        };
+        let upstream_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let egress = PartialFailure {
+            inner: upstream,
+            remaining: if fail_reply { usize::MAX } else { 3 },
+            reads: upstream_reads.clone(),
+        };
+        let server = PartialFailure {
+            inner: server,
+            remaining: if fail_reply { 5 } else { usize::MAX },
+            reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let result = handle_connection_with_egress(
+            server,
+            None,
+            false,
+            PrefixConnector {
+                stream: egress,
+                delivered: observed,
+                input_len,
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            upstream_reads.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "copy must not start after partial failure"
+        );
+        let mut received = Vec::new();
+        peer.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, if fail_reply { &b""[..] } else { &b"pay"[..] });
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply).await.unwrap();
+        assert_eq!(
+            reply,
+            if fail_reply {
+                &b"HTTP/"[..]
+            } else {
+                &b"HTTP/1.1 200 Connection Established\r\n\r\n"[..]
+            }
+        );
+    }
 }
 
 /// Regression test for the lost-update race on the shared bridge-health store:

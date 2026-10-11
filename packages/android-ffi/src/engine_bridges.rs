@@ -1,13 +1,7 @@
 use super::*;
 
-use anyhow::bail;
-
-/// Absolute deadline for the entire SOCKS5 handshake: method negotiation,
-/// RFC 1929 USER/PASS auth (including the Argon2 verify) and the CONNECT
-/// request. Armed once when the handshake starts and never renewed — a
-/// client trickling valid bytes one at a time still hits it. On expiry the
-/// client socket is dropped and the connection task exits, releasing its
-/// `MAX_CONCURRENT_CONNECTIONS` permit.
+/// Absolute deadline for SOCKS5 or HTTP CONNECT detection, framing and auth,
+/// including blocking password verification. Never renewed on partial progress.
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Narrow the startup pool to the user's preferred transport, if they set one.
@@ -579,12 +573,11 @@ pub(super) async fn persist_circuit_verify_results_async(
     }
 }
 
-/// SOCKS5 accept loop.
+/// SOCKS5 / HTTP CONNECT accept loop.
 ///
 /// Accepts connections, acquires a semaphore permit, spawns a task per connection.
 /// Each task:
-/// 1. Performs the SOCKS5 handshake — RFC 1929 USER/PASS when `auth_state` is
-///    `Some`, otherwise legacy NO_AUTH (see [`handle_connection`]).
+/// 1. Detects and authenticates SOCKS5 or HTTP CONNECT (passwords when configured).
 /// 2. Connects through Tor.
 /// 3. Sends success reply.
 /// 4. Bidirectionally copies data.
@@ -648,84 +641,109 @@ pub(super) async fn accept_loop(
     }
 }
 
-/// Handle a single SOCKS5 connection.
-///
-/// `auth` mirrors the CLI's behaviour (see `apps/socks5-proxy/src/server.rs`
-/// and `docs/auth.md`): `Some(state)` insists on RFC 1929 USER/PASS and
-/// rejects any connection with missing or incorrect credentials before a
-/// Tor circuit is ever built; `None` is the legacy anonymous NO_AUTH path,
-/// used only when no users are configured for this Android instance (see
-/// `nativeStart`'s auth-resolution step in `lib.rs`).
 pub(super) async fn handle_connection(
-    mut client: TcpStream,
+    client: TcpStream,
     tunnel: TorTunnel,
     auth: Option<Arc<AuthState>>,
     block_onion: bool,
 ) -> Result<()> {
-    // SOCKS5 handshake: USER/PASS when `auth` is configured, NO_AUTH otherwise.
+    let result = handle_connection_with_egress(client, auth, block_onion, tunnel.clone()).await;
+    drop(tunnel);
+    result
+}
+
+/// Private static-dispatch seam: RPITIT + Send, without a boxed connection future.
+pub(super) trait EgressConnector: Send {
+    fn open_egress(
+        self,
+        target: HostPort<'_>,
+    ) -> impl std::future::Future<
+        Output = Result<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>,
+    > + Send;
+}
+
+impl EgressConnector for TorTunnel {
+    async fn open_egress(
+        self,
+        target: HostPort<'_>,
+    ) -> Result<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> {
+        TorTunnel::connect(&self, target.host, target.port)
+            .await
+            .map(|stream| stream.compat())
+            .context("Tor connect failed")
+    }
+}
+
+/// cancel-safe: NO — framing, replies, pipeline write_all and relay may be partial.
+/// Every error is terminal: owned streams drop; never retry or send a second reply.
+pub(super) async fn handle_connection_with_egress<S, C>(
+    mut client: S,
+    auth: Option<Arc<AuthState>>,
+    block_onion: bool,
+    connect: C,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    C: EgressConnector,
+{
+    use tokio::io::AsyncWriteExt;
+
     let auth = auth
         .map(|state| Arc::new(AuthStateVerifier(state)) as Arc<dyn socks5_proto::PasswordVerifier>);
-    let req = handshake_with_deadline(&mut client, auth).await?;
-
-    if !onion_destination_allowed(&req, block_onion) {
-        info!(host = %req.host, port = req.port, "rejecting onion destination by local policy");
-        socks5_proto::reply(&mut client, Reply::ConnectionNotAllowed)
+    let mut req = accept_with_deadline(&mut client, auth)
+        .await
+        .context("client handshake")?;
+    let target = HostPort::parse(req.target()).context("invalid SDK target authority")?;
+    if !onion_destination_allowed(target.host, block_onion) {
+        info!(host = ?target.host, port = target.port, "rejecting onion destination by local policy");
+        req.reply(&mut client, Reply::Forbidden)
             .await
             .context("failed to send onion policy reply")?;
         return Ok(());
     }
 
-    debug!(host = %req.host, port = req.port, "SOCKS5 CONNECT request");
-
-    // Connect through Tor
-    let tor_stream = tunnel
-        .connect(&req.host, req.port)
+    let mut upstream = match connect.open_egress(target).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            req.reply(&mut client, Reply::GeneralFailure)
+                .await
+                .context("failed to send upstream failure reply")?;
+            return Err(error);
+        }
+    };
+    req.reply(&mut client, Reply::Established)
         .await
-        .context("Tor connect failed")?;
-
-    debug!(host = %req.host, port = req.port, "Tor connection established");
-
-    // Send success reply
-    socks5_proto::reply(&mut client, Reply::Success)
+        .context("failed to send tunnel reply")?;
+    let pipeline = req.take_pipeline();
+    upstream
+        .write_all(&pipeline)
         .await
-        .context("failed to send SOCKS5 reply")?;
-
-    // Bidirectional copy (DataStream is futures AsyncRead/Write)
-    let mut tor_compat = tor_stream.compat();
-    tokio::io::copy_bidirectional(&mut client, &mut tor_compat)
+        .context("pipeline relay failed")?;
+    tokio::io::copy_bidirectional(&mut client, &mut upstream)
         .await
         .context("data relay failed")?;
-
     Ok(())
 }
 
-/// [`socks5_proto::handshake`] under one absolute deadline: a single
-/// `tokio::time::timeout` around the whole negotiation — NOT a per-read
-/// timeout, so slow byte-by-byte clients cannot extend it indefinitely.
-async fn handshake_with_deadline<S>(
+/// One absolute deadline covers detection, authentication and request framing.
+/// cancel-safe: NO — SDK partial I/O is terminal; caller must discard the stream.
+pub(super) async fn accept_with_deadline<S>(
     stream: &mut S,
     auth: Option<Arc<dyn socks5_proto::PasswordVerifier>>,
-) -> anyhow::Result<socks5_proto::ConnectRequest>
+) -> std::result::Result<IncomingRequest, ServerError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let handshake =
-        tokio::time::timeout(HANDSHAKE_DEADLINE, socks5_proto::handshake(stream, auth)).await;
-    let req = match handshake {
-        Ok(res) => res,
-        Err(_elapsed) => bail!("handshake deadline of {HANDSHAKE_DEADLINE:?} exceeded"),
-    }
-    .context("SOCKS5 handshake")?;
-    Ok(req)
+    socks5_proto::accept(
+        stream,
+        tokio::time::Instant::now() + HANDSHAKE_DEADLINE,
+        auth,
+    )
+    .await
 }
 
-/// Apply the Android listener's global destination policy after SOCKS5
-/// authentication and before any Tor stream is opened.
-pub(super) fn onion_destination_allowed(
-    req: &socks5_proto::ConnectRequest,
-    block_onion: bool,
-) -> bool {
-    !block_onion || !req.is_onion()
+pub(super) fn onion_destination_allowed(host: &str, block_onion: bool) -> bool {
+    !block_onion || !socks5_proto::is_onion(host)
 }
 
 /// Helper: set the global status from the engine thread.
@@ -883,11 +901,9 @@ mod tests {
     use tokio::io::{duplex, AsyncWriteExt};
     use tokio::time::sleep;
 
-    /// Assert that `handle` is still running, then that it fails with a
-    /// deadline error containing "handshake" and "deadline" after the given
-    /// additional wait.
+    /// Assert pending framing ends with the SDK's typed deadline error.
     async fn assert_deadline_error(
-        handle: &mut tokio::task::JoinHandle<anyhow::Result<socks5_proto::ConnectRequest>>,
+        handle: &mut tokio::task::JoinHandle<std::result::Result<IncomingRequest, ServerError>>,
         wait_before_finish_check: Duration,
     ) {
         sleep(wait_before_finish_check).await;
@@ -900,9 +916,38 @@ mod tests {
             .expect("handshake task did not finish after the deadline")
             .expect("handshake task panicked");
         let err = result.expect_err("handshake must fail at the deadline");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("handshake"), "error text: {msg}");
-        assert!(msg.contains("deadline"), "error text: {msg}");
+        assert!(
+            matches!(err, ServerError::Deadline),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn http_partial_framing_does_not_renew_absolute_deadline() {
+        use std::future::Future;
+        use std::task::Poll;
+        let (mut client, mut server) = duplex(1024);
+        let deadline = tokio::time::Instant::now() + HANDSHAKE_DEADLINE;
+        let mut accepting = Box::pin(accept_with_deadline(&mut server, None));
+        client.write_all(b"C").await.unwrap();
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(accepting.as_mut().poll(cx).is_pending())).await
+        );
+        tokio::time::advance(Duration::from_secs(29)).await;
+        client
+            .write_all(b"ONNECT example.com:443 HTTP/1.1\r\n")
+            .await
+            .unwrap();
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(accepting.as_mut().poll(cx).is_pending())).await
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let result = accepting.await;
+        assert!(
+            matches!(result, Err(ServerError::Deadline)),
+            "unexpected result: {result:?}"
+        );
+        assert_eq!(tokio::time::Instant::now(), deadline);
     }
 
     #[tokio::test(start_paused = true)]
@@ -910,7 +955,7 @@ mod tests {
         let (client, server) = duplex(64);
         let mut handle = tokio::spawn(async move {
             let mut server = server;
-            handshake_with_deadline(&mut server, None).await
+            accept_with_deadline(&mut server, None).await
         });
 
         // Client sends nothing and keeps the stream open (never dropped).
@@ -927,7 +972,7 @@ mod tests {
         let (mut client, server) = duplex(64);
         let mut handle = tokio::spawn(async move {
             let mut server = server;
-            handshake_with_deadline(&mut server, None).await
+            accept_with_deadline(&mut server, None).await
         });
 
         // Client writes only the VER byte — an incomplete method-negotiation
@@ -945,7 +990,7 @@ mod tests {
         let (mut client, server) = duplex(64);
         let handle = tokio::spawn(async move {
             let mut server = server;
-            handshake_with_deadline(&mut server, None).await
+            accept_with_deadline(&mut server, None).await
         });
 
         // Trickling client: one valid byte every 12 s (HANDSHAKE_DEADLINE *
@@ -972,9 +1017,10 @@ mod tests {
             .expect("handshake task did not finish after the deadline")
             .expect("handshake task panicked");
         let err = result.expect_err("handshake must fail at the absolute deadline");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("handshake"), "error text: {msg}");
-        assert!(msg.contains("deadline"), "error text: {msg}");
+        assert!(
+            matches!(err, ServerError::Deadline),
+            "unexpected error: {err:?}"
+        );
 
         client_task.abort();
     }

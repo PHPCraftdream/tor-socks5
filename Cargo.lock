@@ -99,6 +99,7 @@ dependencies = [
  "jni 0.21.1",
  "libc",
  "ptrs-gesher-bridge-line",
+ "resocks5-net",
  "rusqlite",
  "rustls",
  "time",
@@ -4575,8 +4576,6 @@ dependencies = [
 [[package]]
 name = "resocks5-net"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e3ed727237180530a8c3c0a7e518430916f8320e9e210025c9a1e2936c5c7ee"
 dependencies = [
  "base64",
  "socket2",
@@ -7126,8 +7125,7 @@ dependencies = [
 name = "tor-socks5-proto"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "futures",
+ "resocks5-net",
  "tokio",
 ]
 

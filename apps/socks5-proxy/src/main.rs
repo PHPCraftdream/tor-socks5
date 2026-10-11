@@ -16,7 +16,6 @@ mod seed;
 mod server;
 mod service;
 mod shutdown;
-mod socks5;
 mod startup;
 #[cfg(test)]
 mod test_seams;

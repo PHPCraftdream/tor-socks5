@@ -1,6 +1,6 @@
 # Architecture
 
-A local SOCKS5 → Tor gateway built on `arti-client`, with pure-Rust
+A local same-port SOCKS5 / HTTP CONNECT → Tor gateway built on `arti-client`, with pure-Rust
 **obfs4 + webtunnel** pluggable-transport support. The user-facing
 artifact is a single binary (the `socks5-proxy` crate): it acts as the
 SOCKS5 proxy when invoked normally and as the PT process when re-invoked
@@ -22,7 +22,7 @@ tor-socks5/
 │   ├── bridge-probe/           # parallel TCP reachability probe + latency sort
 │   ├── dns-server/             # optional local DNS/DoH-over-Tor resolver + per-mask overrides
 │   ├── proxy-config/           # Ktav Config schema, shared by the CLI and android-ffi
-│   └── socks5-proto/           # RFC 1928/1929 SOCKS5 server, shared by the CLI and android-ffi
+│   └── socks5-proto/           # shared host auth adapter over resocks5-net framing
 ├── apps/
 │   └── socks5-proxy/           # the binary (SOCKS5 proxy + busybox PT dispatch)
 └── vendor/                     # locally-patched forks of 3 upstream crates
@@ -77,10 +77,10 @@ listener (RFC 1929 USERNAME/PASSWORD). Mirrors the `resocks5` design:
 * Per-account `.onion` gating: a user without `allowed_onion` is refused
   a circuit to a `.onion` destination.
 
-Consumed by both `apps/socks5-proxy` (directly) and `packages/android-ffi` (via
-`packages/socks5-proto`, which depends on `auth` and calls `AuthState::verify`
-during the RFC 1928 handshake). See `docs/auth.md` for the full picture,
-including the Android-specific `Config.auth` section.
+Consumed directly by both hosts, which implement `socks5_proto::PasswordVerifier`
+for their credential store. The adapter does not depend on `auth`. SDK framing
+supplies RFC 1929 or HTTP Basic credentials to the same verification path. See
+`docs/auth.md`, including the Android-specific `Config.auth` section.
 
 ### `packages/proxy-config`
 
@@ -94,13 +94,26 @@ crypto or filesystem-registry logic lives here, that's `packages/auth`.
 
 ### `packages/socks5-proto`
 
-The RFC 1928 SOCKS5 server implementation (CONNECT only) plus RFC 1929
-USERNAME/PASSWORD sub-negotiation, factored out of `apps/socks5-proxy` so
-`packages/android-ffi` can share the exact same wire-protocol and
-authentication code path instead of re-implementing it. `handshake(stream,
-auth: Option<Arc<AuthState>>)` is the single entry point both callers use;
-passing `None` is the anonymous NO_AUTH path, `Some(state)` insists on
-USER/PASS and calls `state.verify(name, password)`.
+Shared host authentication adapter, not a protocol implementation. Both CLI and
+JNI accept SOCKS5 CONNECT and HTTP CONNECT on the same port; ordinary HTTP
+forwarding, SOCKS5 BIND, and UDP ASSOCIATE are unsupported. `resocks5_net::server`
+owns detection, framing, auth responses, request identity/pipeline, and replies.
+
+`accept(stream, deadline: tokio::time::Instant,
+auth: Option<Arc<dyn PasswordVerifier>>)` returns SDK `IncomingRequest` / `ServerError`.
+Hosts supply one absolute 30-second deadline from handshake start. `None` enables
+anonymous access only; `Some(verifier)` requires passwords with no anonymous
+downgrade. Verification is awaited on the blocking pool with a process-wide cap
+of 256 queued/running calls, matching the host connection cap. Full admission
+rejects immediately; the owned slot
+stays in the blocking closure across timeout/cancellation until it exits. Connection
+caps cannot bound detached verification work. Errors, deadlines, and cancellation
+are terminal: discard the stream and any buffered wrapper.
+
+The shared `is_onion` predicate matches the final DNS label case-insensitively,
+tolerating trailing dots. Hosts pass a parsed host, not a target authority with a
+port. CLI policy uses the SDK's authenticated username for account permissions;
+JNI applies the global destination policy.
 
 ### `packages/android-ffi`
 
@@ -116,11 +129,9 @@ a second front end over the same engine pieces the CLI uses:
   `arti_wrapper::Settings`, and spawns a dedicated engine thread so the
   Android main/JNI-calling thread never blocks on Tor bootstrap.
 * `engine.rs` — the engine thread body: bridge probing, Tor bootstrap,
-  binding the SOCKS5 listener, and the accept loop. The accept loop mirrors
-  `apps/socks5-proxy/src/server.rs`'s: `socks5_proto::handshake(&mut client,
-  auth_state.clone())` per connection, `Some` requiring USER/PASS, `None`
-  falling back to NO_AUTH — the same `Option<Arc<AuthState>>` built once in
-  `lib.rs::nativeStart` is cloned into every spawned connection task.
+  binding the same-port SOCKS5/HTTP CONNECT listener, and the bounded accept loop.
+  Each connection calls `socks5_proto::accept` with an absolute 30-second deadline
+  and the host verifier selected at startup; framing and replies remain SDK-owned.
 * `callback.rs` — wraps the Java `BootstrapCallback` object (`GlobalRef` +
   `JavaVM`) so Tokio worker threads can attach to the JVM and dispatch
   `onProgress`/`onReady`/`onBlocked`/`onFailed`.
@@ -186,16 +197,12 @@ The user-facing binary. Source modules under `src/`:
 * `config.rs` — Ktav loader over the shared `proxy_config::Config`
   schema (see `packages/proxy-config` and the canonical reference in
   `README.md`). Writes a default `tor-socks5.ktav` on first run.
-* `server.rs` — the SOCKS5 listener runtime: egress selection (Tor vs.
-  upstream), accept loop, per-connection handler. Bounded to 256
-  concurrent connections (each may run an Argon2id verify).
-* `socks5.rs` — RFC 1928 server, CONNECT only. Supports either
-  NO_AUTH (method `0x00`) or RFC 1929 USERNAME/PASSWORD (method
-  `0x02`), depending on whether the caller passes an `AuthState`.
-  BIND and UDP ASSOCIATE are refused with `CommandNotSupported`.
+* `server.rs` — the same-port SOCKS5/HTTP CONNECT listener runtime: egress
+  selection (Tor vs. upstream), bounded accept loop (256 connections), host
+  authentication and destination policy, SDK replies, and byte forwarding.
 * `auth` integration — when at least one user exists in
-  `tor-socks5.users.ktav`, the listener insists on USER/PASS;
-  otherwise it falls back to anonymous NO_AUTH.
+  `tor-socks5.users.ktav`, the CLI requires RFC 1929 or HTTP Basic credentials;
+  otherwise it permits anonymous access.
 * `upstream.rs` — optional upstream SOCKS5 egress
   (`client → tor-socks5 → upstream → target`). When active, Tor is not
   started.
@@ -332,7 +339,7 @@ one-element list); an empty list parses but fails at startup.
 ```
 client app                        socks5-proxy (proxy mode)               arti-client                    socks5-proxy (PT mode, child)         bridge (obfs4 / webtunnel)
     |                                       |                                  |                                        |                              |
-    | SOCKS5 negotiate (+ RFC 1929 if auth) |                                  |                                        |                              |
+    | SOCKS5 or HTTP CONNECT (+ auth)       |                                  |                                        |                              |
     |-------------------------------------->|                                  |                                        |                              |
     |                                       | TorClient::connect((host, port)) |                                        |                              |
     |                                       |--------------------------------->|                                        |                              |
@@ -346,11 +353,20 @@ client app                        socks5-proxy (proxy mode)               arti-c
     |                                       |                                  |                                        |<-----------------------------|
     |                                       |                                  | Tor circuit through bridge → middle → exit                            |
     |                                       |                                  |======================================================================>|
-    | SOCKS5 success reply + bidi bytes                                                                                                                  |
+    | SDK success reply + bidi bytes                                                                                                                  |
     |<======================================|<==========================================================================|<=============================|
 ```
 
 ## Runtime / IO model
+
+Hosts apply destination policy and establish real Tor/upstream egress before
+sending SDK `Reply::Established`. After the success reply, forward
+`IncomingRequest::take_pipeline()` exactly once to egress, before unread client
+bytes, then relay bidirectionally. Never send success for an unconnected target.
+
+Tor egress failures use SDK `Reply::GeneralFailure` (SOCKS REP 1 / HTTP 502).
+`Reply::UpstreamUnavailable` maps to SOCKS REP 4 / HTTP 502; `Reply::Overloaded`
+is admission overload (SOCKS REP 1 / HTTP 503), not an egress-failure substitute.
 
 * `tokio` multi-thread runtime, pinned to 16 worker threads. arti's
   circuit manager can churn hard over flaky bridges; a generous pool

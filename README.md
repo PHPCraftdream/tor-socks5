@@ -6,17 +6,18 @@
 ![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-informational.svg)
 [![Release](https://img.shields.io/github/v/release/PHPCraftdream/tor-socks5?sort=semver&display_name=tag)](https://github.com/PHPCraftdream/tor-socks5/releases)
 
-A local **SOCKS5 proxy that tunnels TCP through Tor** — and **fetches and probes its own
+A local **SOCKS5 and HTTP CONNECT proxy that tunnels TCP through Tor** — and **fetches and probes its own
 bridges** so it keeps working on censored networks without manual bridge wrangling.
 
 By default it bootstraps an embedded Tor client ([arti](https://gitlab.torproject.org/tpo/core/arti))
-over pluggable-transport bridges (**obfs4** / **webtunnel**) and forwards every SOCKS5 `CONNECT`
-through the Tor network. It can also authenticate SOCKS5 clients, egress through an upstream
-SOCKS5 proxy instead of Tor, and install itself as an OS service.
+over pluggable-transport bridges (**obfs4** / **webtunnel**) and forwards every inbound `CONNECT`
+through the Tor network. SOCKS5 and HTTP CONNECT share the same listener port in both
+the CLI and Android JNI; ordinary HTTP forwarding is not supported. It can authenticate clients,
+egress through an upstream SOCKS5 proxy instead of Tor, and install itself as an OS service.
 
 ## Features
 
-- **SOCKS5 (RFC 1928) `CONNECT`** listener, tunnelled through Tor.
+- **Same-port SOCKS5 (RFC 1928) and HTTP CONNECT** listeners, tunnelled through Tor.
 - **Self-managing bridges:**
   - configured bridges are **probed** for reachability at startup — dead ones are skipped,
     live ones are sorted fastest-first and cached to `tor-socks5.alive-bridges.log`;
@@ -27,7 +28,7 @@ SOCKS5 proxy instead of Tor, and install itself as an OS service.
     fingerprint mismatch). See [`docs/bridges.md`](docs/bridges.md).
 - **obfs4 + webtunnel** pluggable transports, run in-process (the binary re-execs itself as the
   PT — no second executable to ship).
-- **User authentication** (RFC 1929 username/password), Argon2id-hashed, with an HMAC success
+- **User authentication** (RFC 1929 or HTTP Proxy-Authorization Basic), Argon2id-hashed, with an HMAC success
   cache and **trust-on-first-use** account provisioning.
 - **Upstream SOCKS5 egress** — chain `client → tor-socks5 → upstream → target` instead of using
   Tor, with optional upstream auth.
@@ -41,6 +42,11 @@ SOCKS5 proxy instead of Tor, and install itself as an OS service.
 ## Build
 
 Requires a recent stable Rust toolchain (edition 2021).
+
+Until the new `resocks5-net` server API is published, this workspace uses the
+local SDK at `../resocks5/crates/resocks5-net`. Keep a sibling `resocks5`
+checkout beside `tor-socks5`. After publication, remove the dependency's
+`path` and set `version` to the release containing that API.
 
 ```bash
 cargo build --release
@@ -84,7 +90,7 @@ default shown here.
 ## at its built-in default (mirrors packages/proxy-config/src/lib.rs).
 ## Any key you omit keeps the default shown here.
 
-## Addresses to listen on — one SOCKS5 listener per address.
+## Addresses to listen on — one SOCKS5 + HTTP CONNECT listener per address.
 ## A single scalar (`listen: 127.0.0.1:1080`) is also accepted.
 listen: [
     127.0.0.1:1080
@@ -189,7 +195,7 @@ upstream.address: 127.0.0.1:9050
 upstream.username:
 upstream.password:
 
-## Local SOCKS5 (RFC 1929) authentication. The CLI needs neither field
+## Local proxy authentication (RFC 1929 / HTTP Basic). The CLI needs neither field
 ## set — it auto-detects tor-socks5.users.ktav next to this config.
 ## Both exist mainly for the Android JNI FFI crate. See docs/auth.md.
 auth.enabled: true
@@ -277,8 +283,22 @@ tor-socks5 users list
 tor-socks5 users disable alice
 ```
 
-When at least one user exists, the listener requires RFC 1929 username/password. See
+When at least one user exists, the CLI listener requires RFC 1929 username/password
+or HTTP Proxy-Authorization Basic, with no anonymous downgrade. The authenticated
+username drives CLI account policy; JNI uses the global destination policy. See
 [docs/auth.md](docs/auth.md).
+
+Inbound framing and replies belong to `resocks5-net`; `socks5_proto` supplies the
+shared host authentication adapter. Each handshake has one absolute 30-second
+deadline and a process-wide limit of 256 queued/running blocking verifications,
+matching the host connection cap. Verification slots remain held across cancellation
+until the blocking work exits.
+Hosts send success only after real egress is established, then forward SDK-buffered
+pipeline bytes exactly once before unread client bytes.
+
+Tor egress failures use SDK `Reply::GeneralFailure` (SOCKS REP 1 / HTTP 502).
+`Reply::UpstreamUnavailable` maps to SOCKS REP 4 / HTTP 502; `Reply::Overloaded`
+is admission overload (SOCKS REP 1 / HTTP 503), not an egress failure.
 
 ## Upstream SOCKS5 egress (optional)
 
@@ -321,7 +341,8 @@ git config core.hooksPath .githooks
 ### Layout
 
 ```
-apps/socks5-proxy/        the binary (cli, server, bridges_cmd, service, socks5, upstream, …)
+apps/socks5-proxy/        the binary (cli, server, bridges_cmd, service, upstream, …)
+packages/socks5-proto/    shared host auth adapter over resocks5-net inbound framing
 packages/arti-wrapper/    thin wrapper over arti-client (TorTunnel)
 packages/auth/            user accounts, Argon2id, the live authenticator
 packages/bridge-fetcher/  HTTPS-over-Tor bridge fetching (error/http/parse/dedup/fetch)

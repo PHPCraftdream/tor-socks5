@@ -1,8 +1,17 @@
 # Authentication
 
-`tor-socks5` can require SOCKS5 clients to authenticate with a username and password
-(RFC 1929). Authentication is **off** when no users are configured and **on** as soon as at
-least one user exists.
+Both CLI and Android JNI accept SOCKS5 CONNECT and HTTP CONNECT on the same port
+(no ordinary HTTP forwarding). Credentials use RFC 1929 username/password for
+SOCKS5 or Proxy-Authorization Basic for HTTP CONNECT. The CLI enables
+authentication when at least one user exists; Android requires a nonempty registry
+when `auth.enabled` is true and permits anonymous access only when explicitly disabled.
+
+`resocks5-net` owns inbound framing and authentication responses. The shared
+`socks5_proto::accept` adapter takes a host-owned `PasswordVerifier` and returns
+SDK `IncomingRequest` / `ServerError`, preserving the authenticated username.
+`Some(verifier)` requires credentials and disables anonymous access; `None`
+enables anonymous access only. Credentials travel in plaintext unless transport
+protection is provided; do not log credentials or whole requests/errors containing identity.
 
 ## Storage
 
@@ -52,17 +61,18 @@ to `true`, so new and legacy configurations refuse `.onion` destinations unless 
 explicitly sets `security.block_onion: false`. With the global switch off, the per-account
 `allowed_onion` rules below apply.
 
-Each account carries an `allowed_onion` flag (**default `false`**). When a SOCKS5 CONNECT targets
-a `.onion` hidden-service address, the proxy checks the **authenticated** account:
+The CLI checks each account's `allowed_onion` flag (**default `false`**) using
+the SDK request's **authenticated username**, for either inbound protocol:
 
 - account with `allowed_onion: true` (and enabled) → the onion connection proceeds;
-- any other account → the connection is refused with SOCKS5 reply `0x02`
-  (*connection not allowed by ruleset*); clearnet destinations are unaffected.
+- any other account → SDK `Reply::Forbidden` (SOCKS5 `0x02` / HTTP 403);
+  clearnet destinations are unaffected.
 
-When **authentication is disabled** (no users configured), there is no account to gate on, so
-anonymous clients are **unrestricted** — `.onion` works as usual. The gate only constrains
-named accounts. Onion matching is on the final DNS label, case-insensitive, and tolerant of a
-trailing FQDN dot.
+With the global switch off and CLI authentication disabled (no users), there is
+no account to gate on, so anonymous clients may reach `.onion`. JNI applies only
+the global `security.block_onion` policy, not CLI per-account permissions.
+Both hosts use shared `is_onion` matching on the parsed host's final DNS label,
+case-insensitively and with trailing-dot tolerance.
 
 ## Trust on first use (`--init`)
 
@@ -110,6 +120,19 @@ brute-force attempt gains no speed-up. The Argon2id verify runs on a blocking th
 never stalls the async runtime under a connection flood. The cache key is drawn from the OS RNG
 once per process and is never persisted.
 
+Both hosts supply one absolute 30-second handshake deadline covering SDK detection,
+framing, and waiting for verification; progress never renews it. The adapter admits
+at most 256 queued/running blocking verifications process-wide, matching the host
+connection cap and rejecting the newest attempt immediately when full. The owned
+admission slot remains in the blocking closure across cancellation or timeout until
+it exits. A deadline stops waiting,
+not verification or TOFU persistence. Discard the socket and any buffered wrapper
+on error, timeout, or cancellation; partial framing cannot be resumed.
+
+Authentication acceptance is not tunnel success. Hosts apply policy and establish
+real egress before sending SDK `Reply::Established`, then forward SDK pipeline
+bytes exactly once before unread client bytes.
+
 ## Android (`packages/android-ffi`)
 
 The Android JNI FFI crate (`libtorsocks5.so`) shares this exact authenticator with the CLI — same
@@ -140,24 +163,16 @@ At `nativeStart`, the engine:
 3. Otherwise resolves the registry path (`auth.users_file` if set, else the sibling-file
    convention above) and loads it with `auth::UsersConfig::load` — a missing file is **not** an
    error, it just means "no users configured".
-4. If the registry is empty, the listener falls back to anonymous NO_AUTH (identical to the CLI's
-   behaviour) — again logged explicitly, never silently.
+4. If the registry is empty or missing, startup fails rather than exposing an
+   anonymous loopback proxy.
 5. Otherwise builds `auth::AuthState::build_persistent(&users, users_path)` (so a TOFU `init`
    account provisioned from an Android client gets its real hash written back to the same file)
-   and requires RFC 1929 USER/PASS for every accepted connection.
+   and requires RFC 1929 or HTTP Basic credentials for every accepted connection.
 
-Android differs from the CLI at step 4: an empty or missing registry is a startup error, not
-anonymous access. This prevents a malformed or deleted registry from exposing the loopback proxy.
-
-This decision is made once per `nativeStart` call and threaded through the accept loop
-(`packages/android-ffi/src/engine.rs`) as `Option<Arc<AuthState>>`, passed to
-`socks5_proto::handshake` exactly like the CLI path — there is no separate/weaker verification
-code path for Android. Before this was wired up, `engine.rs` always called
-`socks5_proto::handshake(&mut client, None)`, i.e. **any** `auth` configuration was ignored and
-the Android SOCKS5 listener silently accepted unauthenticated connections regardless of what the
-Kotlin side had configured. It now fails closed to NO_AUTH only when no users are configured (or
-`auth.enabled: false`), and that fallback is always logged at `info` level so it is visible in
-device logs, not a silent gap.
+The host implements `PasswordVerifier` over this state and passes it to
+`socks5_proto::accept` per connection with the absolute deadline. CLI and JNI
+share SDK framing and the same adapter verification path; only host configuration
+and destination policy differ.
 
 The exact Ktav key names for the users-registry file itself (`users:` array schema — see
 *Storage* above) are unchanged; only the **Android-side pointer to that file** is new. Aligning

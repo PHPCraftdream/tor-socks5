@@ -13,8 +13,10 @@ use crate::users_cli::UsersAction;
     bin_name = "tor-socks5",
     version,
     disable_help_subcommand = true,
-    about = "A local SOCKS5 proxy that tunnels TCP through Tor and fetches/probes its own bridges.",
-    long_about = "tor-socks5 is a local SOCKS5 (RFC 1928) proxy. By default it bootstraps an \
+    about = "A local same-port SOCKS5 + HTTP CONNECT proxy that tunnels TCP through Tor and fetches/probes its own bridges.",
+    long_about = "tor-socks5 is a local proxy supporting SOCKS5 (RFC 1928) and HTTP CONNECT on \
+the same listening port. HTTP support is CONNECT-only: ordinary HTTP forwarding (such as GET) \
+is not supported. By default it bootstraps an \
 embedded Tor client (arti) over pluggable-transport bridges (obfs4 / webtunnel) and forwards \
 every CONNECT through the Tor network.\n\n\
 It manages its own bridges: configured bridges are probed for reachability at startup (dead \

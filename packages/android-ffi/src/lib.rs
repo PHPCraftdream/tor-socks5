@@ -148,7 +148,10 @@
 //! Every branch above logs its decision — this proxy never silently falls back to an
 //! unauthenticated listener. The resulting `Option<Arc<AuthState>>` is threaded through
 //! `engine::engine_main` → `engine_async` → `accept_loop`, cloned once per accepted connection,
-//! and handed to `socks5_proto::handshake` exactly as the CLI does in `server.rs`.
+//! and handed to `socks5_proto::accept` through `AuthStateVerifier`. The same port also
+//! accepts HTTP CONNECT, using Basic credentials when users are configured. One absolute
+//! 30-second deadline covers detection, authentication and framing for both protocols;
+//! global `block_onion` applies before egress, and tunnel success follows a real Tor connect.
 
 mod android_log;
 mod callback;

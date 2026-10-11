@@ -1,4 +1,4 @@
-//! The SOCKS5 listener runtime: egress selection, the accept loop, and
+//! The shared SOCKS5/HTTP CONNECT listener runtime: egress selection, the accept loop, and
 //! the per-connection handler.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,6 +8,9 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use arti_wrapper::TorTunnel;
 use auth::{AuthState, UsersConfig};
+use resocks5_net::connect::HostPort;
+use resocks5_net::server::Reply;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::sync::CancellationToken;
@@ -16,7 +19,6 @@ use tracing::{debug, error, info, warn};
 use crate::config::{Config, Loaded, UpstreamConfig};
 use crate::conn_health::{spawn_conn_health_logger, ConnHealthCounters};
 use crate::dns_wiring::{convert_custom_doh_providers, convert_dns_overrides, dns_cache_path};
-use crate::socks5::{self, Reply};
 use crate::startup::{init_tracing, install_crypto_provider};
 use crate::tor_setup::build_tor_settings;
 use crate::tor_watchdog::{spawn_bridge_failover_watchdog, spawn_tor_watchdog, TorHandle};
@@ -27,9 +29,9 @@ use crate::{shutdown, upstream};
 /// exhaustion under connection floods.
 const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 
-/// Absolute deadline for the entire SOCKS5 handshake: method negotiation,
-/// RFC 1929 USER/PASS auth (including the Argon2 verify) and the CONNECT
-/// request. Armed once when the handshake starts and never renewed — a
+/// Absolute deadline for the entire SOCKS5/HTTP CONNECT handshake, including
+/// method negotiation, password authentication (including Argon2 verification),
+/// and the CONNECT request. Armed once when the handshake starts and never renewed — a
 /// client trickling valid bytes one at a time still hits it. On expiry the
 /// client socket is dropped and the connection task exits, releasing its
 /// `MAX_CONCURRENT_CONNECTIONS` permit.
@@ -710,16 +712,17 @@ pub(crate) fn classify_conn_failure(err: &anyhow::Error) -> (ConnStage, ConnErro
 
 /// Adapter from the app's [`AuthState`] user store to the protocol
 /// crate's `PasswordVerifier` port. The impl lives here — the only
-/// crate that sees both types — so `socks5-proto` stays dependency-free
-/// and `auth` never grows a dependency on `socks5-proto`.
+/// crate that sees both types — `auth` never depends on `socks5-proto`.
 struct AuthStateVerifier(Arc<AuthState>);
 
-impl socks5::PasswordVerifier for AuthStateVerifier {
+impl socks5_proto::PasswordVerifier for AuthStateVerifier {
     fn verify(&self, username: &str, password: &str) -> bool {
         self.0.verify(username, password)
     }
 }
 
+/// cancel-safe: NO — partial protocol replies/prefix writes/relay are terminal;
+/// dropping this handler closes its owned client and egress, with no replay.
 async fn handle_client(
     mut client: TcpStream,
     egress: Egress,
@@ -731,34 +734,24 @@ async fn handle_client(
     let started_at = std::time::Instant::now();
     // Absolute deadline for the whole handshake chain — armed once here and
     // never renewed per read.
-    let proto_auth: Option<Arc<dyn socks5::PasswordVerifier>> = auth
+    let deadline = tokio::time::Instant::now() + HANDSHAKE_DEADLINE;
+    let proto_auth: Option<Arc<dyn socks5_proto::PasswordVerifier>> = auth
         .clone()
-        .map(|state| Arc::new(AuthStateVerifier(state)) as Arc<dyn socks5::PasswordVerifier>);
-    let handshake = tokio::time::timeout(
-        HANDSHAKE_DEADLINE,
-        socks5::handshake(&mut client, proto_auth),
-    )
-    .await;
-    // BOTH arms carry the stage tag: the classifier keys on it, and the
-    // deadline branch is just as much a handshake-stage failure as an I/O
-    // error inside `socks5::handshake`.
-    let req = match handshake {
-        Ok(res) => res.context(STAGE_HANDSHAKE)?,
-        Err(_elapsed) => {
-            return Err(
-                anyhow!("handshake deadline of {HANDSHAKE_DEADLINE:?} exceeded")
-                    .context(STAGE_HANDSHAKE),
-            )
-        }
-    };
+        .map(|state| Arc::new(AuthStateVerifier(state)) as Arc<dyn socks5_proto::PasswordVerifier>);
+    let mut req = socks5_proto::accept(&mut client, deadline, proto_auth)
+        .await
+        .context(STAGE_HANDSHAKE)?;
+    // Consume the SDK-owned prefix once. A partial write is terminal: never replay.
+    let pipeline = req.take_pipeline();
+    let HostPort { host, port } = HostPort::parse(req.target())
+        .ok_or_else(|| anyhow!("SDK returned an invalid target authority"))
+        .context(STAGE_HANDSHAKE)?;
 
     // Global onion gate comes first. The per-account gate below remains
     // useful for CLI deployments that grant onion access selectively.
-    if block_onion && req.is_onion() {
-        warn!(host = %req.host, "refused .onion connection: blocked by security.block_onion");
-        socks5::reply(&mut client, Reply::ConnectionNotAllowed)
-            .await
-            .ok();
+    if block_onion && socks5_proto::is_onion(host) {
+        warn!(host = %host, "refused .onion connection: blocked by security.block_onion");
+        req.reply(&mut client, Reply::Forbidden).await.ok();
         return Ok(());
     }
 
@@ -766,22 +759,20 @@ async fn handle_client(
     // when the authenticated account carries `allowed_onion`. Anonymous
     // (NO_AUTH) clients are unrestricted — there is no account to gate
     // on, and the operator deliberately ran without auth.
-    if req.is_onion() && !onion_permitted(auth.as_deref(), req.authed_user.as_deref()) {
+    if socks5_proto::is_onion(host) && !onion_permitted(auth.as_deref(), req.username()) {
         warn!(
-            host = %req.host,
-            user = ?req.authed_user,
+            host = %host,
+            user = ?req.username(),
             "refused .onion connection: account not permitted (allowed_onion = false)"
         );
-        socks5::reply(&mut client, Reply::ConnectionNotAllowed)
-            .await
-            .ok();
+        req.reply(&mut client, Reply::Forbidden).await.ok();
         return Ok(());
     }
 
     match egress {
         Egress::Tor(handle) => {
             handle.bridge_refresh().request();
-            info!(host = ?req.host, port = req.port, "tunneling through Tor");
+            info!(host = ?host, port = port, "tunneling through Tor");
             // Read the *current* tunnel through the handle: a watchdog
             // rebuild swaps the slot, and new connections must pick up the
             // replacement. Returns None only while the server is draining
@@ -789,7 +780,7 @@ async fn handle_client(
             let tor = match handle.tunnel().await {
                 Some(t) => t,
                 None => {
-                    socks5::reply(&mut client, Reply::GeneralFailure).await.ok();
+                    req.reply(&mut client, Reply::GeneralFailure).await.ok();
                     conn_health.record_connect_failed();
                     return Err(anyhow!("tor tunnel unavailable (shutting down?)")
                         .context(STAGE_CONNECT_TOR));
@@ -801,14 +792,14 @@ async fn handle_client(
             handle.health().record_attempt();
             let tor_stream = match handle
                 .bridge_refresh()
-                .track_connection(tor.connect(&req.host, req.port))
+                .track_connection(tor.connect(host, port))
                 .await
             {
                 Ok(s) => {
                     handle.health().record_success();
-                    handle.health().record_success_target(&req.host, req.port);
+                    handle.health().record_success_target(host, port);
                     conn_health.record_connect_ok();
-                    info!(host = ?req.host, port = req.port, "tor connection established");
+                    info!(host = ?host, port = port, "tor connection established");
                     s
                 }
                 Err(e) => {
@@ -819,17 +810,15 @@ async fn handle_client(
                     // The watchdog needs the RAW `TorError` type — pass the
                     // un-wrapped error, not a context-wrapped one.
                     handle.bridge_refresh().request_after_failure(&e);
-                    // We don't try to map the underlying cause to a specific
-                    // SOCKS5 code; GeneralFailure is enough to tell the client
-                    // we refused.
-                    socks5::reply(&mut client, Reply::GeneralFailure).await.ok();
+                    req.reply(&mut client, Reply::GeneralFailure).await.ok();
                     conn_health.record_connect_failed();
                     return Err(anyhow::Error::new(e).context(STAGE_CONNECT_TOR));
                 }
             };
-            socks5::reply(&mut client, Reply::Success).await?;
+            req.reply(&mut client, Reply::Established).await?;
             // `DataStream` implements `futures::AsyncRead/Write`; wrap it for tokio.
             let mut tor_compat = tor_stream.compat();
+            tor_compat.write_all(&pipeline).await.context(STAGE_RELAY)?;
             // `copy_bidirectional` returns `(a_to_b, b_to_a)` where `a` is
             // the client stream — hence the field names below. A success here
             // (not merely a successful connect) is the real transfer
@@ -840,10 +829,10 @@ async fn handle_client(
                     conn_health.record_relay_closed();
                     info!(
                         conn_id,
-                        host = ?req.host,
-                        port = req.port,
+                        host = ?host,
+                        port = port,
                         elapsed = ?started_at.elapsed(),
-                        bytes_client_to_remote = sent,
+                        bytes_client_to_remote = sent + pipeline.len() as u64,
                         bytes_remote_to_client = recv,
                         "relay finished"
                     );
@@ -854,26 +843,30 @@ async fn handle_client(
             }
         }
         Egress::Upstream(up) => {
-            info!(host = ?req.host, port = req.port, "forwarding through upstream SOCKS5");
-            let mut upstream_stream = match up.connect(&req.host, req.port).await {
+            info!(host = ?host, port = port, "forwarding through upstream SOCKS5");
+            let mut upstream_stream = match up.connect(host, port).await {
                 Ok(s) => s,
                 Err(e) => {
-                    socks5::reply(&mut client, Reply::GeneralFailure).await.ok();
+                    req.reply(&mut client, Reply::GeneralFailure).await.ok();
                     conn_health.record_connect_failed();
                     return Err(e.context(STAGE_CONNECT_UPSTREAM));
                 }
             };
-            socks5::reply(&mut client, Reply::Success).await?;
+            req.reply(&mut client, Reply::Established).await?;
             // See the Tor branch for the field/counter semantics.
+            upstream_stream
+                .write_all(&pipeline)
+                .await
+                .context(STAGE_RELAY)?;
             match tokio::io::copy_bidirectional(&mut client, &mut upstream_stream).await {
                 Ok((sent, recv)) => {
                     conn_health.record_relay_closed();
                     info!(
                         conn_id,
-                        host = ?req.host,
-                        port = req.port,
+                        host = ?host,
+                        port = port,
                         elapsed = ?started_at.elapsed(),
-                        bytes_client_to_remote = sent,
+                        bytes_client_to_remote = sent + pipeline.len() as u64,
                         bytes_remote_to_client = recv,
                         "relay finished"
                     );

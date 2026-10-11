@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Same-port SOCKS5 CONNECT and HTTP CONNECT for CLI and Android JNI listeners;
+  ordinary HTTP forwarding is unsupported. Framing and protocol replies are
+  provided by `resocks5-net`.
+
+### Changed
+
+- `socks5_proto::accept` is the shared host authentication adapter over the SDK,
+  with one absolute 30-second deadline and 256 cancellation-retained blocking
+  verification slots. CLI account policy and JNI global destination policy
+  apply to both protocols.
+- Success is sent only after egress is connected; buffered HTTP payload is
+  forwarded exactly once before unread bytes. General failures preserve SOCKS
+  REP 1 and return HTTP 502. JNI retains its Tor owner throughout relay.
+- `resocks5-net` is consumed from the sibling filesystem checkout until the new
+  API is published; dependency versions and MSRV are unchanged.
+
+### Added
+
 - **Local DNS server (DNS-over-Tor)** (opt-in, default OFF): a new
   `dns_server.*` config section turns tor-socks5 into a local DNS
   resolver — clients send ordinary UDP/TCP DNS queries, and each is
