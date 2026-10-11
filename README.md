@@ -48,6 +48,10 @@ local SDK at `../resocks5/crates/resocks5-net`. Keep a sibling `resocks5`
 checkout beside `tor-socks5`. After publication, remove the dependency's
 `path` and set `version` to the release containing that API.
 
+CI and release builds provision the sibling SDK with
+`.github/actions/setup-local-sdk/action.yml`, pinned to commit
+`6bbacb078810e6ae016be89de81e58b1a0f3793b` rather than a moving branch.
+
 ```bash
 cargo build --release
 # binary: target/release/socks5-proxy   (invoked as `tor-socks5`)

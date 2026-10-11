@@ -767,3 +767,7 @@ pub(crate) use bridges::{
 #[cfg(test)]
 #[path = "engine_tests.rs"]
 mod engine_tests;
+
+#[cfg(test)]
+#[path = "engine_lifecycle_tests.rs"]
+mod lifecycle_tests;

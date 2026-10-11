@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- CI and release builds now provision the pinned sibling `resocks5` checkout
+  before Cargo and cache metadata resolution. The local dependency remains in use.
+- Split proxy and JNI regression tests into modules below the existing 1000-line
+  CI limit without changing their assertions or production behavior.
 - Android authentication rustdoc now describes the existing fail-closed startup:
   enabled authentication with an empty or missing registry raises
   `java.lang.RuntimeException` before engine-thread spawn; anonymous access requires
