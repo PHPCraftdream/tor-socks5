@@ -12,6 +12,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Same-port SOCKS5 CONNECT and HTTP CONNECT for CLI and Android JNI listeners;
   ordinary HTTP forwarding is unsupported. Framing and protocol replies are
   provided by `resocks5-net`.
+- Consumer adapter wire regressions for BIND, UDP ASSOCIATE, unknown address type,
+  and invalid request version in anonymous and password modes, using buffered I/O
+  and bounded whole-case timeouts.
+
+### Fixed
+
+- Android authentication rustdoc now describes the existing fail-closed startup:
+  enabled authentication with an empty or missing registry raises
+  `java.lang.RuntimeException` before engine-thread spawn; anonymous access requires
+  `auth.enabled: false`. Implementation is unchanged.
 
 ### Changed
 

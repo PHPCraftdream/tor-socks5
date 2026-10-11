@@ -141,9 +141,11 @@
 //! 2. Otherwise resolve the users-registry path: `cfg.auth.users_file` if non-empty, else
 //!    `auth::UsersConfig::resolve_path(configPath)` (same directory + filename stem as
 //!    `configPath`, `.users.ktav` suffix — identical convention to the CLI).
-//! 3. Load that file with `auth::UsersConfig::load` (a missing file is not an error — empty
-//!    registry) and, if non-empty, build `auth::AuthState::build_persistent` and require
-//!    USER/PASS; if empty, fall back to anonymous NO_AUTH.
+//! 3. Load that file with `auth::UsersConfig::load` (a missing file loads as an empty
+//!    registry). An empty or missing registry with `auth.enabled == true` causes a
+//!    `java.lang.RuntimeException` startup failure before the engine thread is spawned.
+//!    Otherwise build `auth::AuthState::build_persistent` and require USER/PASS.
+//!    Anonymous NO_AUTH is permitted only when `auth.enabled == false`.
 //!
 //! Every branch above logs its decision — this proxy never silently falls back to an
 //! unauthenticated listener. The resulting `Option<Arc<AuthState>>` is threaded through

@@ -163,8 +163,10 @@ At `nativeStart`, the engine:
 3. Otherwise resolves the registry path (`auth.users_file` if set, else the sibling-file
    convention above) and loads it with `auth::UsersConfig::load` — a missing file is **not** an
    error, it just means "no users configured".
-4. If the registry is empty or missing, startup fails rather than exposing an
-   anonymous loopback proxy.
+4. If the registry is empty or missing, startup fails with a
+   `java.lang.RuntimeException` before the engine thread is spawned, rather than
+   exposing an anonymous loopback proxy. Anonymous access is permitted only with
+   `auth.enabled: false`.
 5. Otherwise builds `auth::AuthState::build_persistent(&users, users_path)` (so a TOFU `init`
    account provisioned from an Android client gets its real hash written back to the same file)
    and requires RFC 1929 or HTTP Basic credentials for every accepted connection.
