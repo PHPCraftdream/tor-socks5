@@ -32,6 +32,7 @@ name = "dns_server"
 arti-wrapper = { path = "../arti-wrapper", version = "0.1.0" }
 persist-lock = { path = "../persist-lock", version = "0.1.0" }
 hickory-proto = "0.26.1"
+socket2 = "=0.6.3"
 hickory-resolver.workspace = true
 anyhow.workspace = true
 futures.workspace = true
@@ -45,3 +46,9 @@ tokio-rustls.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 webpki-roots.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Networking_WinSock"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

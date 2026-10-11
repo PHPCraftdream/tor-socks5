@@ -32,9 +32,15 @@ egress through an upstream SOCKS5 proxy instead of Tor, and install itself as an
   cache and **trust-on-first-use** account provisioning.
 - **Upstream SOCKS5 egress** — chain `client → tor-socks5 → upstream → target` instead of using
   Tor, with optional upstream auth.
-- **Local DNS server (optional)** — answers clients' plain DNS queries through public DoH
-  providers with every exchange tunnelled through Tor; per-host `dns_server.overrides` masks can
-  opt selected names out to the OS resolver or a plain DNS server.
+- **Local DNS server (optional)** — preserves typed DNS packets and negative answers
+  through public DoH providers tunnelled through Tor; `dns_server.overrides` masks can
+  opt selected names out to the OS resolver or plain DNS. Localhost/loopback policy
+  runs without upstream work, as does own-IP PTR (including wildcard coverage
+  derived from actual UDP/TCP socket options) unless explicitly overridden.
+  Local/cache answers bypass the shared
+  64-miss admission cap; TCP has a separate 64-connection cap. System resolver
+  callers wait for bounded capacity within the query budget; overload and the
+  absolute 30-second miss deadline produce SERVFAIL.
   See [`docs/dns-server.md`](docs/dns-server.md).
 - **Install as a service** — systemd, OpenRC, launchd, Windows SCM, BSD `rc.d`.
 - **Non-blocking logging** to stderr / stdout / file, configurable level and per-target filters.

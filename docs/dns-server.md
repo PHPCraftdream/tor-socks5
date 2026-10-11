@@ -111,16 +111,69 @@ Answers are cached on disk in a sibling file of the main config: same directory,
 stem, fixed `.dns-cache` suffix (`/etc/tor-socks5.ktav` → `/etc/tor-socks5.dns-cache`;
 `./tor-socks5.dns-cache` when the config has no path on disk). The cache is TTL-aware —
 a fresh hit is answered inline in the receive loop, with no Tor round-trip. It is flushed
-every 5 minutes and saved once more, best-effort, at shutdown.
+every 5 minutes and saved once more, best-effort, at shutdown. Periodic publication
+is polled concurrently with listeners, with at most one save outstanding; shutdown
+closes socket work, drains that publication, then performs the serialized final save.
+Positive answers and
+SOA-backed NXDOMAIN/NODATA results are cached with their remaining lifetimes;
+failures are not negative DNS answers. Legacy address-only cache data is not a
+source of synthesized mixed-family answers.
+
+## Local policy, deadlines and admission
+
+Before cache or any external resolver, `localhost` and its subdomains return
+`127.0.0.1` for A, `::1` for AAAA, and NOERROR/NODATA for other types. IPv4
+127/8 reverse names and the IPv6 `::1` reverse name return PTR `localhost.`.
+These queries never acquire a backend slot, consult Tor, or follow an override.
+PTR queries for an explicitly bound non-loopback listener IP, or an actual local
+IP covered by a same-family wildcard bind, return NOERROR/NODATA unless a matching
+explicit override is configured. Wildcard detection uses a route-only UDP
+connect/local-address probe (no payload), bounded to 100ms, before cache or backend
+admission. IPv4-mapped IPv6 addresses use IPv4 coverage. Binding reads the actual
+`IPV6_V6ONLY` option independently on both UDP and TCP sockets. Only an IPv6
+unspecified socket with that option disabled contributes a derived
+`0.0.0.0:bound-port` endpoint to local policy and recursion guards; no family or
+OS-default guess is used. Getter errors fail binding rather than invent coverage,
+and production does not change the socket option. Localhost, loopback and
+exact-bound-IP fast paths do
+not probe. A failed/expired probe retains normal routing; unrelated private and
+external reverse names are not suppressed. Policy uses actual bound UDP/TCP
+addresses, including ports chosen by port-zero binds.
+
+Misses share **64 backend resolution slots** across UDP and TCP. UDP never waits
+for a slot: local/cache replies remain inline while overload receives bounded,
+best-effort SERVFAIL without a queued task or extra upstream work. TCP has a
+separate 64-connection admission cap; excess connections are closed. Each TCP
+frame has one 30-second prefix-and-body deadline, writes have a 30-second cap,
+and a connection has a finite five-minute lifetime. Malformed/partial frames and
+expired framing/write deadlines close the connection, never restart a partial
+frame.
+
+One **absolute 30-second deadline** covers the entire miss, including current
+Tor tunnel acquisition, override resolution and all provider traversal. Attempts
+do not refresh it. Missing Tor, exhausted providers and expired deadlines return
+SERVFAIL; NOERROR, NXDOMAIN, REFUSED, NOTIMP and FORMERR are terminal DNS
+results, not provider outages. Only SERVFAIL is a temporary DNS rcode eligible
+for fallback; NODATA is NOERROR with an empty answer. Resolution/socket futures are listener-owned and
+cancelled on shutdown, releasing admission resources before the final cache save.
+
+Direct and system override resolvers receive the actual bound endpoints to reject
+self-recursion, including port-zero endpoints. System resolver callers wait for
+bounded capacity within their query budget, rather than failing immediately busy.
+Do not configure an override whose
+upstream forwards back to this listener: multi-hop forwarding loops are not a
+supported routing scheme.
 
 ## Limitations
 
 - **No EDNS0.** An OPT pseudo-RR is ignored, not echoed. UDP answers are capped at the
   legacy 512-byte payload with the TC=1 fallback (RFC 1035 §4.2.1); stub resolvers fall
   back to TCP on truncation, which the server fully supports.
-- **Answers are per-host, not per-type.** The merged A+AAAA answer is cached, so a
-  response carries all known addresses for the host regardless of the queried type;
-  clients pick the family they can use.
+- **Typed DNS answers.** Resolution and cache keys include normalized name, type and
+  class. Responses retain the backend rcode and full answer/authority/additional
+  sections (including CNAME, SOA, MX, TXT, HTTPS/SVCB and unknown records); A and
+  AAAA queries are not merged. The client ID and first question are echoed, RD/CD
+  follow the client, and AD is cleared: this frontend does not validate DNSSEC.
 - **First question only.** Only the first QUESTION-section entry of a message is answered.
 - The DNS listener is an auxiliary service: a runtime error exit is logged, not fatal —
   the SOCKS5 proxy path keeps running.

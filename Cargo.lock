@@ -7112,6 +7112,7 @@ dependencies = [
  "persist-lock",
  "rustls",
  "serde",
+ "socket2",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -7119,6 +7120,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "webpki-roots 0.26.11",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

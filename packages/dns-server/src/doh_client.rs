@@ -8,17 +8,15 @@
 //! [`crate::ResolvedAnswer`].
 //!
 //! The TCP connection is dialled by the provider's IP, so the provider's
-//! hostname is never resolved — locally or through the tunnel. The hostname
+//! hostname is never resolved -- locally or through the tunnel. The hostname
 //! is used only for TLS SNI and the HTTP `Host` header.
 
-use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arti_wrapper::TorTunnel;
-use hickory_proto::op::{Message, Query, ResponseCode};
-use hickory_proto::rr::{Name, RData, RecordType};
+use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
@@ -28,7 +26,7 @@ use crate::error::DnsServerError;
 use crate::{DohProvider, ResolvedAnswer};
 
 /// Per-provider bound on the WHOLE lookup: Tor connect + TLS handshake + the
-/// A and AAAA exchanges. Through a live Tor circuit a fresh stream and a TLS
+/// original-question exchange. Through a live Tor circuit a fresh stream and a TLS
 /// handshake can each take several seconds, so this is far more generous
 /// than the 4s `DOH_PROVIDER_TIMEOUT` the DIRECT path uses
 /// (bridge-probe/src/dns.rs).
@@ -64,6 +62,7 @@ impl<T: AsyncRead + AsyncWrite + Send> AsyncStream for T {}
 pub(crate) struct DnsQuery {
     pub(crate) id: u16,
     pub(crate) bytes: Vec<u8>,
+    pub(crate) question: Query,
 }
 
 /// Build and cache the rustls client config (same pattern as
@@ -82,136 +81,93 @@ fn tls_config() -> Arc<rustls::ClientConfig> {
     .clone()
 }
 
-/// Resolve a hostname through one DoH provider, every byte over the Tor
-/// tunnel.
-///
-/// The whole lookup — Tor connect, TLS handshake, and the A and AAAA
-/// exchanges — is bounded by [`DOH_PROVIDER_TIMEOUT`]; on expiry
-/// [`DnsServerError::Timeout`] is returned.
-///
-/// # Cancel-safety
-/// cancel-safe: yes — stateless: dropping the future mid-exchange just drops
-/// the connection.
+/// Absolute budget for the entire ordered provider traversal.
+pub const DOH_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Resolve exactly the client's question through one provider.
+/// cancel-safe: yes — connect/TLS/write/read state belongs to this attempt;
+/// cancellation closes the stream, never resumes partially consumed framing.
 pub async fn resolve(
-    hostname: &str,
+    question: &Query,
     tor: &TorTunnel,
     provider: &DohProvider,
 ) -> Result<ResolvedAnswer, DnsServerError> {
     tokio::time::timeout(
         DOH_PROVIDER_TIMEOUT,
-        resolve_with_provider(hostname, tor, provider),
+        resolve_with_provider(question, tor, provider),
     )
     .await
     .map_err(|_| DnsServerError::Timeout(DOH_PROVIDER_TIMEOUT))?
 }
 
-/// Try a pool of providers in fixed order; the first success wins.
-///
-/// Individual provider failures (including per-attempt timeouts, which
-/// surface as [`DnsServerError::Timeout`] before being consumed here) are
-/// logged at `debug!` and the next provider is tried. An empty pool, or
-/// every provider failing, yields [`DnsServerError::AllProvidersFailed`] —
-/// there is deliberately no distinction between "all errored" and "all
-/// timed out".
-///
-/// # Cancel-safety
-/// cancel-safe: yes — each attempt is [`resolve`], which is cancel-safe, and
-/// dropping the pool future between attempts drops nothing.
+/// Ordered fallback for transport failures and temporary DNS failures only.
+/// NXDOMAIN and NOERROR (including NODATA) are terminal answers.
+/// cancel-safe: yes — all attempts own disposable streams; no detached work.
 pub async fn resolve_with_pool(
-    hostname: &str,
+    question: &Query,
     tor: &TorTunnel,
     providers: &[DohProvider],
 ) -> Result<ResolvedAnswer, DnsServerError> {
-    if providers.is_empty() {
-        return Err(DnsServerError::AllProvidersFailed);
-    }
-    for (index, provider) in providers.iter().enumerate() {
-        let attempt = tokio::time::timeout(
-            DOH_PROVIDER_TIMEOUT,
-            resolve_with_provider(hostname, tor, provider),
-        )
-        .await
-        .map_err(|_| DnsServerError::Timeout(DOH_PROVIDER_TIMEOUT));
-        match attempt {
-            Ok(Ok(answer)) => return Ok(answer),
-            Ok(Err(error)) | Err(error) => {
-                debug!(
-                    provider = %provider.hostname,
-                    index,
-                    error = %error,
-                    "DoH provider failed; trying next"
-                );
-            }
+    ordered_pool(providers.len(), |index| {
+        resolve(question, tor, &providers[index])
+    })
+    .await
+}
+
+/// Shared production traversal seam: tests can supply exchanges without Tor.
+/// cancel-safe: yes — exchange futures must own disposable transport state.
+async fn ordered_pool<F, Fut>(
+    count: usize,
+    mut attempt: F,
+) -> Result<ResolvedAnswer, DnsServerError>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<ResolvedAnswer, DnsServerError>>,
+{
+    let deadline = tokio::time::Instant::now() + DOH_TOTAL_TIMEOUT;
+    for index in 0..count {
+        let provider_deadline = (tokio::time::Instant::now() + DOH_PROVIDER_TIMEOUT).min(deadline);
+        match tokio::time::timeout_at(provider_deadline, attempt(index)).await {
+            Ok(Ok(answer)) if !temporary_response(&answer.message) => return Ok(answer),
+            Ok(Ok(_)) => debug!(index, "temporary DNS failure; trying next provider"),
+            Ok(Err(error)) => debug!(index, %error, "provider failed; trying next"),
+            Err(_) => debug!(index, "provider deadline expired"),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(DnsServerError::Timeout(DOH_TOTAL_TIMEOUT));
         }
     }
     Err(DnsServerError::AllProvidersFailed)
 }
 
-/// One provider attempt: two concurrent DoH exchanges (A + AAAA), merged.
-///
-/// Concurrency: the exchanges are independent work — each opens its own Tor
-/// stream and TLS session — so they run via [`tokio::try_join!`]. A
-/// transport-level failure (Tor connect, TLS, HTTP) of either half fails the
-/// attempt immediately: a tunnel broken for one half is broken for both.
-/// DNS-level outcomes merge leniently (see the `match` below): the attempt
-/// only fails when BOTH halves fail.
+/// Only SERVFAIL is temporary; every other valid rcode is forwarded intact.
+pub(crate) fn temporary_response(message: &Message) -> bool {
+    message.metadata.response_code == ResponseCode::ServFail
+}
+
+/// cancel-safe: yes — the sole exchange owns its stream and is discarded on cancellation.
 async fn resolve_with_provider(
-    hostname: &str,
+    question: &Query,
     tor: &TorTunnel,
     provider: &DohProvider,
 ) -> Result<ResolvedAnswer, DnsServerError> {
-    // RFC 8484 practice: one QUESTION per message — resolvers answer only
-    // the first question-section entry, so A and AAAA are two exchanges.
-    let a_query = build_query(hostname, RecordType::A).map_err(DnsServerError::Wire)?;
-    let aaaa_query = build_query(hostname, RecordType::AAAA).map_err(DnsServerError::Wire)?;
-
-    let (a_body, aaaa_body) = tokio::try_join!(
-        exchange(tor, provider, &a_query),
-        exchange(tor, provider, &aaaa_query),
-    )?;
-
-    let a_result = parse_response(a_query.id, &a_body);
-    let aaaa_result = parse_response(aaaa_query.id, &aaaa_body);
-    match (a_result, aaaa_result) {
-        // Only when BOTH halves fail does the attempt fail; the first error
-        // is reported (the second adds no information a caller can act on).
-        (Err(first), Err(_)) => Err(first),
-        (Ok(a), Ok(aaaa)) => Ok(merge_exchanges(Some(a), Some(aaaa))),
-        (Ok(a), Err(error)) => {
-            debug!(
-                provider = %provider.hostname,
-                error = %error,
-                "AAAA exchange failed; keeping A records"
-            );
-            Ok(merge_exchanges(Some(a), None))
-        }
-        (Err(error), Ok(aaaa)) => {
-            debug!(
-                provider = %provider.hostname,
-                error = %error,
-                "A exchange failed; keeping AAAA records"
-            );
-            Ok(merge_exchanges(None, Some(aaaa)))
-        }
-    }
+    let query = build_query(question).map_err(DnsServerError::Wire)?;
+    let body = exchange(tor, provider, &query).await?;
+    parse_response(&query, &body)
 }
 
-/// Encode one DNS query message carrying exactly one QUESTION.
-pub(crate) fn build_query(hostname: &str, query_type: RecordType) -> Result<DnsQuery, String> {
-    let name: Name = hostname
-        .parse()
-        .map_err(|e| format!("invalid query hostname {hostname:?}: {e}"))?;
-    // `Message::query()` randomizes the transaction id; RD is set because we
-    // are asking a recursive public resolver.
+/// RFC 1035 §4.1.2: preserve QNAME, QTYPE and QCLASS, including unknown codes.
+pub(crate) fn build_query(question: &Query) -> Result<DnsQuery, String> {
     let mut message = Message::query();
     message.metadata.recursion_desired = true;
-    message.add_query(Query::query(name, query_type));
+    message.add_query(question.clone());
     let bytes = message
         .to_vec()
         .map_err(|e| format!("encode DNS query: {e}"))?;
     Ok(DnsQuery {
         id: message.metadata.id,
         bytes,
+        question: question.clone(),
     })
 }
 
@@ -391,7 +347,7 @@ struct HttpHead {
     status: u16,
     content_length: Option<usize>,
     chunked: bool,
-    /// Exact length of the header block INCLUDING the final CRLFCRLF — the
+    /// Exact length of the header block INCLUDING the final CRLFCRLF -- the
     /// body begins at this offset, no magic offsets added.
     header_len: usize,
 }
@@ -445,373 +401,54 @@ fn parse_head(buf: &[u8]) -> Result<Option<HttpHead>, DnsServerError> {
     }
 }
 
-/// Outcome of ONE validated DNS response.
-#[derive(Debug, Clone)]
-pub(crate) struct ExchangeResult {
-    /// A/AAAA addresses carried by the answer records, in wire order.
-    addrs: Vec<IpAddr>,
-    /// Smallest TTL over ALL answer records; `None` only when the response
-    /// carried zero answer records (NODATA), which contributes no TTL bound.
-    min_ttl: Option<Duration>,
-}
-
-/// Decode and validate one DNS response against the query id that was sent.
-pub(crate) fn parse_response(query_id: u16, body: &[u8]) -> Result<ExchangeResult, DnsServerError> {
+/// RFC 5452 §9.1: validate the echoed question and transaction before using
+/// any flags (especially TC) or records. Name comparison ignores ASCII case.
+pub(crate) fn validate_response(query: &DnsQuery, body: &[u8]) -> Result<Message, DnsServerError> {
     let message = Message::from_vec(body)
         .map_err(|e| DnsServerError::Wire(format!("decode DNS response: {e}")))?;
-    if message.metadata.id != query_id {
-        return Err(DnsServerError::DohExchange(format!(
-            "transaction id mismatch: sent {query_id:#06x}, got {:#06x}",
-            message.metadata.id
-        )));
+    if message.metadata.id != query.id
+        || message.metadata.message_type != MessageType::Response
+        || message.metadata.op_code != OpCode::Query
+        || message.queries.len() != 1
+    {
+        return Err(DnsServerError::DohExchange(
+            "response transaction/header/question count mismatch".into(),
+        ));
     }
-    if message.metadata.response_code != ResponseCode::NoError {
-        // `Display` renders the rcode's human string ("Non-Existent Domain",
-        // "Query Refused", ...).
-        return Err(DnsServerError::DohExchange(format!(
-            "resolver returned {}",
-            message.metadata.response_code
-        )));
+    let echoed = &message.queries[0];
+    if !echoed.name().eq_ignore_root(query.question.name())
+        || echoed.query_type() != query.question.query_type()
+        || echoed.query_class() != query.question.query_class()
+    {
+        return Err(DnsServerError::DohExchange(
+            "response question mismatch".into(),
+        ));
     }
-
-    // The question/answer owner name is deliberately NOT compared here:
-    // resolvers may 0x20-randomize the case of the query name they echo
-    // (cache-insertion diversity), so a byte-for-byte name comparison would
-    // reject perfectly valid answers. The transaction id is the integrity
-    // check that matters.
-    let mut result = ExchangeResult {
-        addrs: Vec::new(),
-        min_ttl: None,
-    };
-    for record in &message.answers {
-        // `Record` exposes its ttl/data as public fields (the ttl()/data()
-        // accessor methods belong to RecordRef in hickory-proto 0.26).
-        let ttl = Duration::from_secs(u64::from(record.ttl));
-        result.min_ttl = Some(match result.min_ttl {
-            Some(current) => current.min(ttl),
-            None => ttl,
-        });
-        match record.data {
-            RData::A(a) => result.addrs.push(IpAddr::V4(a.0)),
-            RData::AAAA(aaaa) => result.addrs.push(IpAddr::V6(aaaa.0)),
-            // CNAME/SOA/etc: no address of their own, but the TTL taken
-            // above still bounds how long the whole answer chain may be
-            // cached — the lower bound is the safe caching bound.
-            _ => {}
-        }
-    }
-    Ok(result)
+    Ok(message)
 }
 
-/// Merge the A and AAAA exchange outcomes into one answer.
-///
-/// Addresses are concatenated A-list first, then AAAA, without dedup — the
-/// lists are independent answers and duplicates are harmless. The TTL is the
-/// minimum over both halves (a missing half contributes nothing). When no
-/// half carries ANY answer record (both NODATA), the TTL is
-/// [`Duration::ZERO`] = "no TTL information reported"; the cache layer
-/// decides its own floor. `resolved_at` is stamped once, here, after both
-/// exchanges completed.
-pub(crate) fn merge_exchanges(
-    a: Option<ExchangeResult>,
-    aaaa: Option<ExchangeResult>,
-) -> ResolvedAnswer {
-    let mut addrs = Vec::new();
-    let mut min_ttl: Option<Duration> = None;
-    for result in [a, aaaa].into_iter().flatten() {
-        addrs.extend(result.addrs);
-        min_ttl = match (min_ttl, result.min_ttl) {
-            (None, ttl) | (ttl, None) => ttl,
-            (Some(current), Some(ttl)) => Some(current.min(ttl)),
-        };
+pub(crate) fn parse_response(
+    query: &DnsQuery,
+    body: &[u8],
+) -> Result<ResolvedAnswer, DnsServerError> {
+    let mut message = validate_response(query, body)?;
+    if message.metadata.truncation {
+        return Err(DnsServerError::DohExchange(
+            "incomplete DNS response (TC)".into(),
+        ));
     }
-    ResolvedAnswer {
-        addrs,
-        ttl: min_ttl.unwrap_or(Duration::ZERO),
+    crate::types::normalize_negative_soa_ttl(&query.question, &mut message);
+    let ttl = crate::types::cache_ttl(&query.question, &message).unwrap_or(Duration::ZERO);
+    Ok(ResolvedAnswer {
+        message,
+        ttl,
         resolved_at: OffsetDateTime::now_utc(),
-    }
+    })
 }
 
 #[cfg(test)]
-mod tests {
-    use std::io::{self, Cursor};
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-    use std::task::{Context, Poll};
-
-    use hickory_proto::op::{MessageType, OpCode};
-    use hickory_proto::rr::rdata::{A, AAAA, CNAME};
-    use hickory_proto::rr::{RData, Record};
-    use tokio::io::ReadBuf;
-
-    use super::*;
-
-    fn test_name() -> Name {
-        "example.com".parse().expect("valid test name")
-    }
-
-    fn test_response(id: u16) -> Message {
-        Message::new(id, MessageType::Response, OpCode::Query)
-    }
-
-    #[test]
-    fn build_query_carries_one_question_with_rd() {
-        for query_type in [RecordType::A, RecordType::AAAA] {
-            let query = build_query("example.com", query_type).expect("query builds");
-            let message = Message::from_vec(&query.bytes).expect("query decodes");
-            assert_eq!(message.queries.len(), 1, "one QUESTION per message");
-            assert_eq!(message.queries[0].query_type(), query_type);
-            assert_eq!(message.queries[0].name().to_string(), "example.com.");
-            assert!(message.metadata.recursion_desired);
-            assert_eq!(message.metadata.message_type, MessageType::Query);
-            assert_eq!(message.metadata.op_code, OpCode::Query);
-            assert_eq!(message.metadata.id, query.id, "returned id is the wire id");
-        }
-    }
-
-    #[test]
-    fn parse_response_collects_a_record() {
-        let owner = test_name();
-        let mut message = test_response(0x1F2E);
-        message.add_query(Query::query(owner.clone(), RecordType::A));
-        message.add_answer(Record::from_rdata(
-            owner,
-            120,
-            RData::A(A(Ipv4Addr::new(192, 0, 2, 7))),
-        ));
-        let bytes = message.to_vec().expect("response encodes");
-
-        let parsed = parse_response(0x1F2E, &bytes).expect("response parses");
-        assert_eq!(parsed.addrs, vec![IpAddr::from([192, 0, 2, 7])]);
-        assert_eq!(parsed.min_ttl, Some(Duration::from_secs(120)));
-    }
-
-    #[test]
-    fn parse_response_collects_aaaa_record() {
-        let owner = test_name();
-        let mut message = test_response(0x0B0B);
-        message.add_query(Query::query(owner.clone(), RecordType::AAAA));
-        message.add_answer(Record::from_rdata(
-            owner,
-            45,
-            RData::AAAA(AAAA(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))),
-        ));
-        let bytes = message.to_vec().expect("response encodes");
-
-        let parsed = parse_response(0x0B0B, &bytes).expect("response parses");
-        assert_eq!(
-            parsed.addrs,
-            vec![IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1])]
-        );
-        assert_eq!(parsed.min_ttl, Some(Duration::from_secs(45)));
-    }
-
-    #[test]
-    fn parse_response_min_ttl_includes_cname() {
-        let owner = test_name();
-        let alias: Name = "alias.example.com".parse().expect("valid test name");
-        let mut message = test_response(7);
-        message.add_query(Query::query(owner.clone(), RecordType::A));
-        message.add_answer(Record::from_rdata(
-            owner.clone(),
-            60,
-            RData::CNAME(CNAME(alias.clone())),
-        ));
-        message.add_answer(Record::from_rdata(
-            alias,
-            300,
-            RData::A(A(Ipv4Addr::new(203, 0, 113, 9))),
-        ));
-        let bytes = message.to_vec().expect("response encodes");
-
-        let parsed = parse_response(7, &bytes).expect("response parses");
-        // The CNAME contributes no address...
-        assert_eq!(parsed.addrs, vec![IpAddr::from([203, 0, 113, 9])]);
-        // ...but its smaller TTL bounds the whole answer chain.
-        assert_eq!(parsed.min_ttl, Some(Duration::from_secs(60)));
-    }
-
-    #[test]
-    fn parse_response_nxdomain_is_doh_exchange_error() {
-        let mut message = test_response(9);
-        message.metadata.response_code = ResponseCode::NXDomain;
-        let bytes = message.to_vec().expect("response encodes");
-
-        let error = parse_response(9, &bytes).expect_err("NXDomain must fail");
-        assert!(
-            matches!(error, DnsServerError::DohExchange(ref text) if text.contains("Non-Existent")),
-            "error should carry the rcode: {error:?}"
-        );
-    }
-
-    #[test]
-    fn parse_response_rejects_id_mismatch() {
-        let bytes = test_response(0x0102).to_vec().expect("response encodes");
-        let error = parse_response(0x0304, &bytes).expect_err("id mismatch must fail");
-        assert!(matches!(error, DnsServerError::DohExchange(_)));
-    }
-
-    #[test]
-    fn nodata_on_both_halves_is_success_with_zero_ttl() {
-        let mut message = test_response(3);
-        message.add_query(Query::query(test_name(), RecordType::A));
-        let bytes = message.to_vec().expect("response encodes");
-
-        let nodata_a = parse_response(3, &bytes).expect("rcode 0 is a success");
-        let nodata_aaaa = parse_response(3, &bytes).expect("rcode 0 is a success");
-        assert!(nodata_a.addrs.is_empty());
-        assert_eq!(nodata_a.min_ttl, None, "NODATA contributes no TTL bound");
-
-        let answer = merge_exchanges(Some(nodata_a), Some(nodata_aaaa));
-        assert!(answer.addrs.is_empty());
-        assert_eq!(answer.ttl, Duration::ZERO, "ZERO means no TTL information");
-    }
-
-    #[test]
-    fn merge_takes_minimum_ttl_and_keeps_both_lists() {
-        let a = ExchangeResult {
-            addrs: vec![IpAddr::from([192, 0, 2, 1])],
-            min_ttl: Some(Duration::from_secs(90)),
-        };
-        let aaaa = ExchangeResult {
-            addrs: vec![IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, 2])],
-            min_ttl: Some(Duration::from_secs(30)),
-        };
-        let answer = merge_exchanges(Some(a), Some(aaaa));
-        // A addresses first, then AAAA, no dedup.
-        assert_eq!(
-            answer.addrs,
-            vec![
-                IpAddr::from([192, 0, 2, 1]),
-                IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, 2]),
-            ]
-        );
-        assert_eq!(answer.ttl, Duration::from_secs(30));
-    }
-
-    #[test]
-    fn post_request_carries_exact_headers_and_body() {
-        let provider = DohProvider {
-            ip: IpAddr::from([192, 0, 2, 1]),
-            hostname: "dns.example".to_string(),
-            path: "/dns-query".to_string(),
-        };
-        let body = b"\x12\x34abcd";
-        let request = build_post_request(&provider.hostname, &provider.path, body);
-        let mut expected = format!(
-            "POST /dns-query HTTP/1.1\r\n\
-             Host: dns.example\r\n\
-             Accept: application/dns-message\r\n\
-             Content-Type: application/dns-message\r\n\
-             Content-Length: {}\r\n\
-             User-Agent: tor-socks5/0.1\r\n\
-             Connection: close\r\n\
-             \r\n",
-            body.len()
-        )
-        .into_bytes();
-        expected.extend_from_slice(body);
-        assert_eq!(request, expected);
-    }
-
-    /// AsyncRead over a fixed sequence of byte chunks: each poll_read hands
-    /// out up to the remainder of the current chunk, then moves on; running
-    /// dry is EOF.
-    struct ChunkReader {
-        chunks: Vec<Cursor<Vec<u8>>>,
-        current: usize,
-    }
-
-    impl ChunkReader {
-        fn new(chunks: &[&[u8]]) -> Self {
-            Self {
-                chunks: chunks
-                    .iter()
-                    .map(|chunk| Cursor::new(chunk.to_vec()))
-                    .collect(),
-                current: 0,
-            }
-        }
-    }
-
-    impl AsyncRead for ChunkReader {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &mut ReadBuf<'_>,
-        ) -> Poll<io::Result<()>> {
-            let this = self.get_mut();
-            while this.current < this.chunks.len() {
-                let cursor = &mut this.chunks[this.current];
-                let position = cursor.position() as usize;
-                let data = &cursor.get_ref()[position..];
-                if data.is_empty() {
-                    this.current += 1;
-                    continue;
-                }
-                let take = data.len().min(buf.remaining());
-                buf.put_slice(&data[..take]);
-                cursor.set_position((position + take) as u64);
-                return Poll::Ready(Ok(()));
-            }
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    #[tokio::test]
-    async fn reads_whole_response_in_one_chunk() {
-        let body = [0xABu8; 48];
-        let mut wire = b"HTTP/1.1 200 OK\r\nContent-Length: 48\r\n\r\n".to_vec();
-        wire.extend_from_slice(&body);
-        let mut reader = ChunkReader::new(&[&wire]);
-        let parsed = read_dns_body(&mut reader).await.expect("body read");
-        assert_eq!(parsed, body);
-    }
-
-    #[tokio::test]
-    async fn body_starts_exactly_at_httparse_header_len() {
-        // THE off-by-4 regression case: headers and the first body bytes
-        // arrive in one read, the rest split over two more. The body must
-        // begin exactly at httparse's header_len — no bytes skipped.
-        let body: Vec<u8> = (0..64u8).collect();
-        let mut first = b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\n".to_vec();
-        let header_len = first.len();
-        first.extend_from_slice(&body[..3]);
-        let mut reader = ChunkReader::new(&[&first, &body[3..40], &body[40..]]);
-
-        let parsed = read_dns_body(&mut reader).await.expect("body read");
-        assert_eq!(header_len, 39);
-        assert_eq!(parsed, body);
-    }
-
-    #[tokio::test]
-    async fn non_200_status_is_an_error() {
-        let wire = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
-        let mut reader = ChunkReader::new(&[wire]);
-        let error = read_dns_body(&mut reader).await.expect_err("503 must fail");
-        assert!(
-            matches!(error, DnsServerError::DohExchange(ref text) if text.contains("503")),
-            "error should carry the status: {error:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn oversized_content_length_is_rejected() {
-        let oversized = MAX_DNS_RESPONSE_BYTES + 1;
-        let wire = format!("HTTP/1.1 200 OK\r\nContent-Length: {oversized}\r\n\r\n");
-        let mut reader = ChunkReader::new(&[wire.as_bytes()]);
-        let error = read_dns_body(&mut reader)
-            .await
-            .expect_err("over-cap must fail");
-        assert!(matches!(error, DnsServerError::DohExchange(_)));
-    }
-
-    #[tokio::test]
-    async fn chunked_transfer_encoding_is_rejected() {
-        let wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
-        let mut reader = ChunkReader::new(&[wire]);
-        let error = read_dns_body(&mut reader)
-            .await
-            .expect_err("chunked must fail");
-        assert!(matches!(error, DnsServerError::DohExchange(_)));
-    }
-}
+#[path = "doh_http_tests.rs"]
+mod http_tests;
+#[cfg(test)]
+#[path = "dns_wire_tests.rs"]
+mod wire_tests;

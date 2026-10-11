@@ -1,654 +1,326 @@
-//! Persistent, TTL-aware cache of [`ResolvedAnswer`]s keyed by hostname.
-//!
-//! Answers are resolved through DoH (see [`crate::doh_client`]) and cached so a
-//! restart — or the next query for an already-seen name — does not pay the
-//! Tor-tunnel round trip again. Two properties shape the design:
-//!
-//! * **Wall-clock expiry survives restarts.** An entry is fresh while
-//!   `resolved_at + ttl` is still in the future, computed in whole unix
-//!   seconds with saturating arithmetic (a nonsense stamp can never overflow
-//!   into a panic or an unexpiry). Because both stamps are wall-clock, an
-//!   entry saved to disk and loaded back keeps exactly the lifetime it had —
-//!   a save can never rejuvenate an answer. On disk the timestamps have
-//!   whole-second precision (a sub-second `resolved_at` is truncated, which
-//!   can only make an entry expire *earlier*, never later), and sub-second
-//!   TTLs are likewise truncated to seconds.
-//! * **Disk IO is best-effort and atomic.** [`DnsCache::load`] treats a
-//!   missing, unreadable, or half-corrupt file as an empty cache — the cache
-//!   simply warms up from DoH instead — while [`DnsCache::save`] publishes a
-//!   whole file atomically on top of [`persist_lock::TempFileGuard`]: the
-//!   content is staged in a lock-owned temp file, fsynced, and renamed onto
-//!   the target, so a reader (or the next boot's loader) sees either the old
-//!   file or the new one, never a torn one. On any error the guard's `Drop`
-//!   removes the temp.
-//!
-//! The on-disk format is plain text, one line per host (see `format_line`),
-//! in the spirit of this codebase's other file-based persistence (e.g.
-//! bridge-probe's persisted DNS fallback) rather than pulling in a
-//! serialization dependency for four fields.
+//! Bounded, packet-aware DNS cache. Lock order: save gate, then entries.
+//! Packet bytes and original timestamps are immutable; reads age a decoded copy.
+//! Persistence never writes an aged copy or restamps the original resolution.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
+use hickory_proto::op::{Message, Query};
+use hickory_proto::rr::RecordType;
 use time::OffsetDateTime;
 
 use crate::error::DnsServerError;
-use crate::types::ResolvedAnswer;
+use crate::types::{cache_ttl, normalize_negative_soa_ttl, ResolvedAnswer};
 
-/// Bound on remembered hosts. The resolver only ever asks about names that
-/// appear in a (finite) bridge or provider list, but that list is refreshed
-/// at runtime and entries for names that left it should not accumulate for
-/// the life of a VPN session. Generous next to any real bridge list; small
-/// next to the megabyte-scale whole-file saves.
+#[path = "cache_disk.rs"]
+mod disk;
+#[cfg(test)]
+#[path = "cache_tests.rs"]
+mod tests;
+
+/// Maximum number of cached query tuples.
 pub const DNS_CACHE_CAP: usize = 4096;
+const MAX_PACKET: usize = 65_535;
+const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 
-/// Persistent, TTL-aware cache of resolved answers.
-///
-/// Shared interior state behind locks; every method takes `&self`. The
-/// `entries` lock is the only lock most callers ever touch. `save_lock`
-/// serialises one save's whole snapshot→publish span per instance (see
-/// [`DnsCache::save`]); `save_seq` hands [`persist_lock::TempFileGuard`]
-/// the unique-per-instance sequence number its temp-file naming needs.
+type Entries = HashMap<Query, Entry>;
+
+fn admitted_query(query: &Query) -> Query {
+    let mut key = query.clone();
+    key.name.set_fqdn(true);
+    key
+}
+
+fn same_question(left: &Query, right: &Query) -> bool {
+    left.name().eq_ignore_root(right.name())
+        && left.query_type() == right.query_type()
+        && left.query_class() == right.query_class()
+}
+
+#[derive(Clone)]
+struct Entry {
+    packet: Arc<[u8]>,
+    ttl: Duration,
+    resolved_at: OffsetDateTime,
+    admitted: Instant,
+    initial_age: Duration,
+}
+
+impl Entry {
+    fn age(&self, now: OffsetDateTime, instant: Instant) -> Duration {
+        self.initial_age
+            .saturating_add(instant.saturating_duration_since(self.admitted))
+            .max(wall_age(self.resolved_at, now).unwrap_or_default())
+    }
+
+    fn remaining(&self, now: OffsetDateTime, instant: Instant) -> Duration {
+        self.ttl.saturating_sub(self.age(now, instant))
+    }
+}
+
+fn record_ttls(message: &Message) -> impl Iterator<Item = u32> + '_ {
+    message
+        .answers
+        .iter()
+        .chain(&message.authorities)
+        .chain(&message.additionals)
+        .map(|record| record.ttl)
+}
+
+fn wall_age(stamp: OffsetDateTime, now: OffsetDateTime) -> Option<Duration> {
+    Duration::try_from(now - stamp).ok()
+}
+
+/// Test-only handshake that parks a save worker while it owns its permit.
+#[cfg(test)]
+struct SaveSeam {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+/// Thread-safe cache keyed by case-insensitive DNS name, type and class.
+/// Evicts soonest-expiring entries under count or aggregate packet-byte pressure.
+/// Saves are serialized per instance, including after cancellation of the caller.
+/// DEVIATION from RFC 2308 §5: NXDOMAIN is kept per type as required by the
+/// shared packet-cache contract, rather than reused across all query types.
 pub struct DnsCache {
-    /// Hostname → last fresh answer. Lock discipline: every access goes
-    /// through `.lock().unwrap_or_else(|p| p.into_inner())` — a poisoned
-    /// lock still holds valid entries, so panic in one thread must not take
-    /// the cache down.
-    entries: Mutex<HashMap<String, ResolvedAnswer>>,
-    /// Sequence number for `TempFileGuard::create` temp names, bumped per
-    /// save so two saves from one instance never collide on a temp name.
-    save_seq: AtomicU64,
-    /// Serialises save→publish per instance. Locked before the save's
-    /// snapshot is taken and held until the temp file has been renamed onto
-    /// the target, so a later save cannot snapshot — and therefore cannot
-    /// publish — anything older than what is already on disk. Deliberately
-    /// a tokio mutex, not a std one: the guard must live across the save's
-    /// only `.await` (the `spawn_blocking` join), and a
-    /// `std::sync::MutexGuard` is `!Send`, which poisons the future
-    /// (E0277) and cannot be moved into a `'static` closure either (E0521).
-    /// The tokio mutex is async-aware, so a queued save parks its task
-    /// instead of blocking a worker thread.
-    save_lock: tokio::sync::Mutex<()>,
+    entries: Arc<Mutex<Entries>>,
+    save_lock: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(test)]
+    save_seam: Arc<Mutex<Option<SaveSeam>>>,
 }
 
 impl DnsCache {
-    /// An empty cache.
+    /// Construct an empty cache.
     pub fn new() -> Self {
-        DnsCache {
-            entries: Mutex::new(HashMap::new()),
-            save_seq: AtomicU64::new(0),
-            save_lock: tokio::sync::Mutex::new(()),
+        Self::from_entries(HashMap::new())
+    }
+
+    fn from_entries(entries: Entries) -> Self {
+        Self {
+            entries: Arc::new(Mutex::new(entries)),
+            save_lock: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            save_seam: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// The fresh answer for `host`, if one is cached.
-    ///
-    /// Fresh means `resolved_at + ttl` is still in the future (whole unix
-    /// seconds, saturating). An expired entry is treated as absent *and
-    /// removed on access* — lazy removal: expired entries cost nothing
-    /// until someone asks, and no background sweeper is needed.
-    pub fn get(&self, host: &str) -> Option<ResolvedAnswer> {
-        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
-        let now = now_unix();
-        match entries.get(host) {
-            Some(answer) if is_fresh(answer, now) => Some(answer.clone()),
-            // Absent, or present but stale: stale ones are dropped here so
-            // `len()` does not keep counting dead entries forever.
-            Some(_) => {
-                entries.remove(host);
-                None
-            }
-            None => None,
-        }
+    /// Return a fresh packet copy with aged ordinary RR TTLs (never OPT).
+    /// `ttl` is the remaining lifetime; `resolved_at` is this copy's age epoch.
+    /// Transport owners must replace transaction ID/question and adapt EDNS.
+    pub fn get(&self, query: &Query) -> Option<ResolvedAnswer> {
+        self.get_at(query, OffsetDateTime::now_utc(), Instant::now())
     }
 
-    /// Remember `answer` for `host`, subject to [`DNS_CACHE_CAP`].
-    ///
-    /// When the cache is already at the cap: first the expired entries are
-    /// swept, then — if that was not enough — the entries soonest to expire
-    /// are evicted (they have the least left to give). The entry being
-    /// inserted is never the eviction victim, and `len()` is guaranteed to
-    /// be `<= DNS_CACHE_CAP` after the insert. No freshness check happens
-    /// here; [`DnsCache::get`] is the freshness gate.
-    pub fn insert(&self, host: &str, answer: ResolvedAnswer) {
-        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
-        if entries.len() >= DNS_CACHE_CAP {
-            // Sweep the dead first: after a quiet period this alone frees
-            // room, and expired entries must not displace fresh ones.
-            let now = now_unix();
-            entries.retain(|_, existing| is_fresh(existing, now));
-            // Still full: shed the entries soonest to expire. The one we
-            // are about to insert is excluded — it must never be the
-            // victim of the eviction that makes room for it.
-            let overflow = entries.len().saturating_sub(DNS_CACHE_CAP - 1);
-            if overflow > 0 {
-                let mut by_expiry: Vec<(String, i64)> = entries
-                    .iter()
-                    .filter(|(existing_host, _)| existing_host.as_str() != host)
-                    .map(|(existing_host, existing)| {
-                        (existing_host.clone(), expires_at_unix(existing))
-                    })
-                    .collect();
-                by_expiry.sort_by_key(|(_, expires_at)| *expires_at);
-                for (victim, _) in by_expiry.into_iter().take(overflow) {
-                    entries.remove(&victim);
+    fn get_at(
+        &self,
+        query: &Query,
+        now: OffsetDateTime,
+        instant: Instant,
+    ) -> Option<ResolvedAnswer> {
+        let entry = {
+            let mut entries = lock_entries(&self.entries);
+            // Hickory hashes the FQDN flag. Absolute wire queries use borrowed
+            // O(1) lookup; relative public queries use a bounded allocation-free
+            // scan because Borrow<Query> cannot change that hash/equality.
+            let entry = if query.name().is_fqdn() {
+                entries.get_mut(query)?
+            } else {
+                entries
+                    .iter_mut()
+                    .find(|(key, _)| same_question(key, query))?
+                    .1
+            };
+            if entry.remaining(now, instant).is_zero() {
+                if query.name().is_fqdn() {
+                    entries.remove(query);
+                } else {
+                    entries.retain(|key, _| !same_question(key, query));
                 }
+                return None;
+            }
+            // Retain the greatest observed age even if wall time jumps back.
+            entry.initial_age = entry.age(now, instant);
+            entry.admitted = instant;
+            entry.clone()
+        };
+        let age = entry.age(now, instant);
+        let mut message = Message::from_vec(&entry.packet).ok()?;
+        let seconds = u32::try_from(age.as_secs()).unwrap_or(u32::MAX);
+        normalize_negative_soa_ttl(query, &mut message);
+        for record in message
+            .answers
+            .iter_mut()
+            .chain(&mut message.authorities)
+            .chain(&mut message.additionals)
+        {
+            if record.record_type() != RecordType::OPT {
+                record.decrement_ttl(seconds);
             }
         }
-        entries.insert(host.to_owned(), answer);
+        Some(ResolvedAnswer {
+            message,
+            ttl: entry.ttl.saturating_sub(age),
+            resolved_at: now,
+        })
     }
 
-    /// How many hosts are currently remembered (including expired-but-not-
-    /// yet-swept entries — they leave the count on access, on save, or on
-    /// cap pressure).
+    /// Admit only useful NOERROR or SOA-backed NXDOMAIN/NODATA packets.
+    /// Caller TTL can shorten, but cannot extend, the packet's DNS lifetime.
+    pub fn insert(&self, query: &Query, answer: &ResolvedAnswer) {
+        self.insert_at(query, answer, OffsetDateTime::now_utc(), Instant::now());
+    }
+
+    fn insert_at(
+        &self,
+        query: &Query,
+        answer: &ResolvedAnswer,
+        now: OffsetDateTime,
+        instant: Instant,
+    ) {
+        let Some(policy_ttl) = cache_ttl(query, &answer.message) else {
+            return;
+        };
+        let ttl = answer.ttl.min(policy_ttl);
+        let Some(initial_age) = wall_age(answer.resolved_at, now) else {
+            return;
+        };
+        if ttl <= initial_age {
+            return;
+        }
+        let Ok(packet) = answer.message.to_vec() else {
+            return;
+        };
+        if packet.len() > MAX_PACKET {
+            return;
+        }
+        // Encoding must not silently truncate the packet at the encoder limit.
+        let Ok(decoded) = Message::from_vec(&packet) else {
+            return;
+        };
+        // Message has no stored header counts. Its derived equality does,
+        // however, delegate to Record equality, which intentionally ignores
+        // TTL (RFC 2136). Verify TTLs separately as part of packet fidelity.
+        if decoded != answer.message || !record_ttls(&decoded).eq(record_ttls(&answer.message)) {
+            return;
+        }
+        let entry = Entry {
+            packet: packet.into(),
+            ttl,
+            resolved_at: answer.resolved_at,
+            admitted: instant,
+            initial_age,
+        };
+        admit(
+            &mut lock_entries(&self.entries),
+            admitted_query(query),
+            entry,
+            now,
+            instant,
+        );
+    }
+
+    /// Number of remembered tuples, including not-yet-swept expired entries.
     pub fn len(&self) -> usize {
-        self.entries.lock().unwrap_or_else(|p| p.into_inner()).len()
+        lock_entries(&self.entries).len()
     }
 
-    /// Whether no host is currently remembered.
+    /// Whether no query tuples are remembered.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Best-effort constructor: load a previously saved cache from `path`.
-    ///
-    /// The disk read is blocking file IO, so it runs on Tokio's blocking
-    /// pool, never on an async worker. Any leftover temp files from dead
-    /// writers are swept first (best-effort, via
-    /// `persist_lock::cleanup_temp_files`). A missing, unreadable, or
-    /// half-corrupt file means an **empty** cache, not an error — the cache
-    /// is an optimisation and simply warms up from DoH again — and
-    /// malformed lines are skipped without panicking. Later duplicate
-    /// entries overwrite earlier ones (the loader builds a fresh map).
-    pub async fn load(path: &Path) -> DnsCache {
+    /// Best-effort bounded disk read and validation on the blocking pool.
+    pub async fn load(path: &Path) -> Self {
         let path = path.to_owned();
-        let entries = tokio::task::spawn_blocking(move || load_entries_from_disk(&path))
+        Self::from_entries(
+            tokio::task::spawn_blocking(move || {
+                disk::load(&path, OffsetDateTime::now_utc(), Instant::now())
+            })
             .await
-            // A blocking job that fails to join is as good as an unreadable
-            // file: start empty.
-            .unwrap_or_default();
-        DnsCache {
-            entries: Mutex::new(entries),
-            save_seq: AtomicU64::new(0),
-            save_lock: tokio::sync::Mutex::new(()),
-        }
+            .unwrap_or_default(),
+        )
     }
 
-    /// Atomically publish the fresh portion of the cache to `path`.
-    ///
-    /// Only fresh entries are written — a periodic save can never re-stamp a
-    /// long-expired entry into looking freshly resolved. The snapshot is
-    /// cloned under the `entries` lock and the lock guard is dropped before
-    /// any await, so queries never wait on disk IO.
-    ///
-    /// The per-instance `save_lock` is taken *before* the snapshot and held
-    /// across the whole snapshot→format→write→fsync→rename span (i.e. across
-    /// the `spawn_blocking` join below) — this is bridge-probe's generation
-    /// protocol reduced to what a per-instance cache needs: a later save
-    /// cannot start snapshotting until the earlier one has finished
-    /// renaming, so an older snapshot can never overwrite a newer one and no
-    /// rollback is possible. The guard stays in the parent and never enters
-    /// the `'static` closure (a guard borrowed from `self` cannot be moved
-    /// into it).
-    ///
-    /// Publication goes through [`persist_lock::TempFileGuard`]: temp file,
-    /// fsync, atomic rename onto the target. An empty cache publishes an
-    /// empty file — that is correct. Every IO error is reported as
-    /// [`DnsServerError::CacheIo`] with `op: "save"`; a panicked save task
-    /// is wrapped the same way.
+    /// Atomically save original packets/stamps on the blocking pool.
+    /// cancel-safe: publication already scheduled continues if the caller drops
+    /// this future. The worker owns the save permit until rename completes, so
+    /// cancellation cannot let an older snapshot overwrite a newer save.
     pub async fn save(&self, path: &Path) -> Result<(), DnsServerError> {
-        // Save critical section: taken before the snapshot, released when
-        // this future finishes (after the publish below has resolved).
-        let _save_guard = self.save_lock.lock().await;
-        let now = now_unix();
-        let snapshot: Vec<(String, ResolvedAnswer)> = {
-            let entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
-            entries
-                .iter()
-                .filter(|(_, answer)| is_fresh(answer, now))
-                .map(|(host, answer)| (host.clone(), answer.clone()))
-                .collect()
-        };
+        let permit = self.save_lock.clone().lock_owned().await;
+        let entries = self.entries.clone();
+        #[cfg(test)]
+        let seam = self.save_seam.clone();
         let path = path.to_owned();
-        let seq = self.save_seq.fetch_add(1, Ordering::Relaxed);
-        let publish = move || {
-            let lines: Vec<String> = snapshot
-                .iter()
-                .map(|(host, answer)| format_line(host, answer))
-                .collect();
-            let mut contents = lines.join("\n");
-            if !lines.is_empty() {
-                contents.push('\n');
+        // If the join is cancelled, intentional detach: worker owns all resources
+        // and serialization; no subsequent save can overtake its publication.
+        let job = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            #[cfg(test)]
+            {
+                let hook = seam.lock().unwrap().take();
+                if let Some(SaveSeam { entered, release }) = hook {
+                    let _ = entered.send(());
+                    release.recv().unwrap();
+                }
             }
-            let mut temp = persist_lock::TempFileGuard::create(&path, seq)?;
-            // On any error below, the guard's Drop removes the temp file.
-            temp.write_all(contents.as_bytes())?;
-            temp.fsync()?;
-            temp.rename_into_target()
-        };
-        match tokio::task::spawn_blocking(publish).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(source)) => Err(DnsServerError::CacheIo { op: "save", source }),
-            Err(join_error) => Err(DnsServerError::CacheIo {
-                op: "save",
-                source: std::io::Error::other(format!(
-                    "dns cache save task panicked: {join_error}"
-                )),
-            }),
-        }
+            let now = OffsetDateTime::now_utc();
+            let instant = Instant::now();
+            let snapshot = {
+                let mut entries = lock_entries(&entries);
+                entries.retain(|_, entry| !entry.remaining(now, instant).is_zero());
+                entries
+                    .values()
+                    .map(|entry| {
+                        let mut snapshot = entry.clone();
+                        // If wall time moved backward, persist the monotonic loss
+                        // as a shorter lease, keeping the original packet/stamp.
+                        let wall = wall_age(entry.resolved_at, now).unwrap_or_default();
+                        snapshot.ttl = entry
+                            .ttl
+                            .min(entry.remaining(now, instant).saturating_add(wall));
+                        snapshot
+                    })
+                    .collect::<Vec<_>>()
+            };
+            disk::save(&path, &snapshot)
+        });
+        let result = job.await.map_err(|error| DnsServerError::CacheIo {
+            op: "save",
+            source: std::io::Error::other(error.to_string()),
+        })?;
+        result.map_err(|source| DnsServerError::CacheIo { op: "save", source })
     }
 }
 
 impl Default for DnsCache {
     fn default() -> Self {
-        DnsCache::new()
+        Self::new()
     }
 }
 
-/// Whole unix seconds right now. The cache's entire notion of time is
-/// whole-second wall-clock stamps (see the module docs).
-fn now_unix() -> i64 {
-    OffsetDateTime::now_utc().unix_timestamp()
+fn lock_entries(entries: &Mutex<Entries>) -> MutexGuard<'_, Entries> {
+    // Preserve valid entries after an unrelated panic. The map and its owned
+    // immutable packets remain memory-safe; expiry/admission enforce their
+    // normal bounds on subsequent access. Poison remains diagnostic state.
+    entries.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
-/// Whether `answer` is still servable at `now_unix`: its `resolved_at + ttl`
-/// lies in the future. Saturating on purpose — a huge TTL or a stamp at the
-/// edge of the representable range must saturate, never panic and never wrap
-/// into a false "expired".
-fn is_fresh(answer: &ResolvedAnswer, now_unix: i64) -> bool {
-    expires_at_unix(answer) > now_unix
-}
-
-/// When `answer` stops being servable, in whole unix seconds. Also the
-/// eviction sort key: at cap pressure the entries soonest to this moment are
-/// shed first.
-fn expires_at_unix(answer: &ResolvedAnswer) -> i64 {
-    // `i64::try_from` rather than `as i64`: a `u64` count above `i64::MAX`
-    // would wrap into a negative (negative-TTL!) number under `as`; try_from
-    // saturates such absurd TTLs at `i64::MAX` instead.
-    let ttl_secs = i64::try_from(answer.ttl.as_secs()).unwrap_or(i64::MAX);
-    answer.resolved_at.unix_timestamp().saturating_add(ttl_secs)
-}
-
-/// One line per host: `host\tip1,ip2,...\tttl_secs\tresolved_at_unix`.
-/// Plain text, matching this codebase's other file-based persistence (see
-/// bridge-probe's `format_persisted_line`) rather than pulling in a
-/// serialization dependency for four fields.
-fn format_line(host: &str, answer: &ResolvedAnswer) -> String {
-    use std::fmt::Write as _;
-
-    // One growing String instead of a Vec<String> per address list: the
-    // persist path formats every entry on every save.
-    let mut line = String::with_capacity(host.len() + 32 + answer.addrs.len() * 16);
-    line.push_str(host);
-    line.push('\t');
-    for (index, addr) in answer.addrs.iter().enumerate() {
-        if index > 0 {
-            line.push(',');
-        }
-        let _ = write!(line, "{addr}");
-    }
-    line.push('\t');
-    let _ = write!(line, "{}", answer.ttl.as_secs());
-    line.push('\t');
-    // Whole-second precision on disk: truncating a sub-second `resolved_at`
-    // can only move expiry earlier, never later.
-    let _ = write!(line, "{}", answer.resolved_at.unix_timestamp());
-    line
-}
-
-/// Inverse of [`format_line`]; `None` for any malformed line — wrong field
-/// count, empty host, empty or partially-unparseable address list, bad ttl
-/// or timestamp — and callers treat `None` as "skip line". Never panics on
-/// arbitrary input. The stamp is `i64`, so pre-1970 stamps parse fine.
-fn parse_line(line: &str) -> Option<(String, ResolvedAnswer)> {
-    let mut parts = line.splitn(4, '\t');
-    let host = parts.next()?.to_owned();
-    if host.is_empty() {
-        return None;
-    }
-    let addr_field = parts.next()?;
-    let mut addrs: Vec<IpAddr> = Vec::new();
-    for part in addr_field.split(',') {
-        // `?` on every component: one bad address rejects the whole line
-        // rather than silently keeping a truncated list.
-        addrs.push(part.parse().ok()?);
-    }
-    if addrs.is_empty() {
-        return None;
-    }
-    let ttl_secs: u64 = parts.next()?.trim().parse().ok()?;
-    let stamp: i64 = parts.next()?.trim().parse().ok()?;
-    let resolved_at = OffsetDateTime::from_unix_timestamp(stamp).ok()?;
-    Some((
-        host,
-        ResolvedAnswer {
-            addrs,
-            ttl: Duration::from_secs(ttl_secs),
-            resolved_at,
-        },
-    ))
-}
-
-/// Blocking half of [`DnsCache::load`]: sweep dead writers' temp files
-/// (best-effort), read the file, parse every well-formed line. Missing or
-/// unreadable file → empty map. Runs on the blocking pool only.
-fn load_entries_from_disk(path: &Path) -> HashMap<String, ResolvedAnswer> {
-    persist_lock::cleanup_temp_files(path);
-    let Ok(data) = std::fs::read_to_string(path) else {
-        return HashMap::new();
-    };
-    let mut entries = HashMap::new();
-    for line in data.lines() {
-        if let Some((host, answer)) = parse_line(line) {
-            entries.insert(host, answer);
+fn admit(entries: &mut Entries, key: Query, entry: Entry, now: OffsetDateTime, instant: Instant) {
+    entries.retain(|_, existing| !existing.remaining(now, instant).is_zero());
+    entries.remove(&key);
+    let mut bytes: usize = entries.values().map(|value| value.packet.len()).sum();
+    while entries.len() >= DNS_CACHE_CAP || bytes + entry.packet.len() > MAX_PAYLOAD {
+        let victim = entries
+            .iter()
+            .min_by_key(|(_, value)| value.remaining(now, instant))
+            .map(|(key, _)| key.clone());
+        let Some(victim) = victim else { break };
+        if let Some(removed) = entries.remove(&victim) {
+            bytes -= removed.packet.len();
         }
     }
-    entries
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-    use std::sync::atomic::AtomicU64;
-
-    /// Scratch dir per test: temp_dir + pid + atomic seq, per the
-    /// bridge-store `tmp_dir()` pattern (no tempfile crate).
-    fn tmp_dir() -> PathBuf {
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "tor-socks5-dns-cache-test-{}-{}",
-            std::process::id(),
-            seq
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    /// Whole-second stamp from a unix timestamp, so `ResolvedAnswer`
-    /// equality (which includes nanoseconds) is exact across a disk
-    /// round-trip.
-    fn stamp(unix: i64) -> OffsetDateTime {
-        OffsetDateTime::from_unix_timestamp(unix).unwrap()
-    }
-
-    fn now() -> i64 {
-        OffsetDateTime::now_utc().unix_timestamp()
-    }
-
-    fn answer(ttl: Duration, resolved_at: OffsetDateTime, addrs: &[&str]) -> ResolvedAnswer {
-        ResolvedAnswer {
-            addrs: addrs.iter().map(|a| a.parse().unwrap()).collect(),
-            ttl,
-            resolved_at,
-        }
-    }
-
-    // -- get / insert --------------------------------------------------------
-
-    #[test]
-    fn insert_then_get_returns_same_answer() {
-        let cache = DnsCache::new();
-        let fresh = answer(Duration::from_secs(3600), stamp(now()), &["1.2.3.4"]);
-        cache.insert("example.com", fresh.clone());
-        assert_eq!(cache.get("example.com"), Some(fresh));
-    }
-
-    #[test]
-    fn get_absent_host_is_none() {
-        let cache = DnsCache::new();
-        assert_eq!(cache.get("never-inserted.example"), None);
-        assert!(cache.is_empty());
-    }
-
-    #[test]
-    fn expired_entry_reads_as_absent_and_is_removed() {
-        let cache = DnsCache::new();
-        // ttl ZERO: expires the moment it is inserted.
-        cache.insert(
-            "old.example",
-            answer(Duration::ZERO, stamp(now()), &["1.2.3.4"]),
-        );
-        assert_eq!(cache.len(), 1);
-        assert_eq!(cache.get("old.example"), None);
-        // Lazy removal on access: the read swept the dead entry.
-        assert_eq!(cache.len(), 0);
-    }
-
-    #[test]
-    fn fresh_entry_survives_alongside_an_expired_one() {
-        let cache = DnsCache::new();
-        cache.insert(
-            "old.example",
-            answer(Duration::ZERO, stamp(now()), &["1.2.3.4"]),
-        );
-        let fresh = answer(Duration::from_secs(3600), stamp(now()), &["5.6.7.8"]);
-        cache.insert("new.example", fresh.clone());
-        assert_eq!(cache.get("new.example"), Some(fresh));
-        assert_eq!(cache.get("old.example"), None);
-        // old was swept by its get; only the fresh one remains.
-        assert_eq!(cache.len(), 1);
-    }
-
-    #[test]
-    fn is_fresh_saturates_instead_of_overflowing() {
-        // A maximal TTL and an ancient-but-representable stamp must
-        // saturate at i64::MAX, not panic and not wrap into "expired".
-        let ancient = answer(Duration::MAX, stamp(-377_705_000_000), &["1.2.3.4"]);
-        assert!(is_fresh(&ancient, now_unix()));
-        let just_now = answer(Duration::ZERO, stamp(now_unix()), &["1.2.3.4"]);
-        // now + 0 > now is false: expires immediately.
-        assert!(!is_fresh(&just_now, now_unix()));
-    }
-
-    // -- format_line / parse_line ---------------------------------------------
-
-    #[test]
-    fn parse_line_accepts_minimal_valid_line() {
-        let parsed = parse_line("host.example\t1.2.3.4\t60\t1700000000").unwrap();
-        assert_eq!(parsed.0, "host.example");
-        assert_eq!(parsed.1.addrs, vec!["1.2.3.4".parse::<IpAddr>().unwrap()]);
-        assert_eq!(parsed.1.ttl, Duration::from_secs(60));
-        assert_eq!(parsed.1.resolved_at.unix_timestamp(), 1_700_000_000);
-    }
-
-    #[test]
-    fn parse_line_rejects_malformed_lines() {
-        let bad = [
-            // wrong field count
-            "host.example\t1.2.3.4\t60",
-            "",
-            // empty host / empty addrs
-            "\t1.2.3.4\t60\t1700000000",
-            "host.example\t\t60\t1700000000",
-            // bad ip, including one bad addr inside a list
-            "host.example\tnot-an-ip\t60\t1700000000",
-            "host.example\t1.2.3.4,zzz\t60\t1700000000",
-            // bad ttl / bad timestamp
-            "host.example\t1.2.3.4\tabc\t1700000000",
-            "host.example\t1.2.3.4\t60\tabc",
-            "host.example\t1.2.3.4\t60\t99999999999999999999",
-            // extra field rides along in field 4 and breaks the stamp
-            "host.example\t1.2.3.4\t60\t1700000000\textra",
-            // from_unix_timestamp out of range
-            "host.example\t1.2.3.4\t60\t999999999999999",
-        ];
-        for line in bad {
-            assert_eq!(parse_line(line), None, "line {line:?} must be rejected");
-        }
-    }
-
-    #[test]
-    fn parse_line_accepts_negative_pre_1970_stamp() {
-        let parsed = parse_line("host.example\t1.2.3.4\t60\t-1000").unwrap();
-        assert_eq!(parsed.1.resolved_at.unix_timestamp(), -1000);
-    }
-
-    #[test]
-    fn format_parse_round_trip_truncates_sub_second_stamps() {
-        let original = OffsetDateTime::from_unix_timestamp(1_700_000_123)
-            .unwrap()
-            .replace_nanosecond(500_000_000)
-            .unwrap();
-        let answer = answer(Duration::from_secs(90), original, &["1.2.3.4", "::1"]);
-        let line = format_line("host.example", &answer);
-        let (host, parsed) = parse_line(&line).unwrap();
-        assert_eq!(host, "host.example");
-        assert_eq!(parsed.ttl, Duration::from_secs(90));
-        assert_eq!(parsed.addrs, answer.addrs);
-        // On-disk precision is whole seconds: the parsed stamp is the
-        // truncated one, not the original.
-        assert_eq!(parsed.resolved_at.unix_timestamp(), 1_700_000_123);
-        assert_eq!(
-            parsed.resolved_at.unix_timestamp(),
-            original.unix_timestamp()
-        );
-    }
-
-    // -- save / load ------------------------------------------------------------
-
-    #[tokio::test]
-    async fn save_load_round_trip_preserves_entries_exactly() {
-        let dir = tmp_dir();
-        let path = dir.join("dns-cache.txt");
-        let cache = DnsCache::new();
-        let base = now();
-        let a = answer(Duration::from_secs(3600), stamp(base - 30), &["1.2.3.4"]);
-        let b = answer(
-            Duration::from_secs(3599),
-            stamp(base - 20),
-            &["5.6.7.8", "9.10.11.12"],
-        );
-        let c = answer(
-            Duration::from_secs(3601),
-            stamp(base - 10),
-            &["2001:db8::1"],
-        );
-        cache.insert("a.example", a.clone());
-        cache.insert("b.example", b.clone());
-        cache.insert("c.example", c.clone());
-
-        cache.save(&path).await.unwrap();
-        let loaded = DnsCache::load(&path).await;
-        assert_eq!(loaded.get("a.example"), Some(a));
-        assert_eq!(loaded.get("b.example"), Some(b));
-        assert_eq!(loaded.get("c.example"), Some(c));
-        assert_eq!(loaded.len(), 3);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn save_skips_expired_entries() {
-        let dir = tmp_dir();
-        let path = dir.join("dns-cache.txt");
-        let cache = DnsCache::new();
-        let base = now();
-        cache.insert(
-            "gone.example",
-            answer(Duration::ZERO, stamp(base - 5000), &["1.2.3.4"]),
-        );
-        let kept = answer(Duration::from_secs(3600), stamp(base), &["5.6.7.8"]);
-        cache.insert("kept.example", kept.clone());
-
-        cache.save(&path).await.unwrap();
-        let loaded = DnsCache::load(&path).await;
-        assert_eq!(loaded.get("gone.example"), None);
-        assert_eq!(loaded.get("kept.example"), Some(kept));
-        assert_eq!(loaded.len(), 1);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn empty_cache_saves_and_loads_as_empty() {
-        let dir = tmp_dir();
-        let path = dir.join("dns-cache.txt");
-        let cache = DnsCache::new();
-        cache.save(&path).await.unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), Vec::<u8>::new());
-
-        let loaded = DnsCache::load(&path).await;
-        assert!(loaded.is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn load_missing_file_is_empty_cache() {
-        let dir = tmp_dir();
-        let path = dir.join("does-not-exist.txt");
-        let loaded = DnsCache::load(&path).await;
-        assert!(loaded.is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn load_corrupted_file_skips_garbage_keeps_valid_line() {
-        let dir = tmp_dir();
-        let path = dir.join("dns-cache.txt");
-        let base = now();
-        let valid = answer(Duration::from_secs(3600), stamp(base), &["1.2.3.4"]);
-        let good_line = format_line("ok.example", &valid);
-        std::fs::write(
-            &path,
-            format!("total garbage\n\n{good_line}\nnonsense\t×\t×\t×\n"),
-        )
-        .unwrap();
-
-        let loaded = DnsCache::load(&path).await;
-        assert_eq!(loaded.get("ok.example"), Some(valid));
-        assert_eq!(loaded.len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // -- cap and eviction ---------------------------------------------------
-
-    #[test]
-    fn cap_evicts_oldest_expiring_keeps_newest() {
-        let cache = DnsCache::new();
-        let base = now();
-        for index in 0..DNS_CACHE_CAP + 5 {
-            let host = format!("host-{index}");
-            // Octet-safe unique address per index (4096+ fits in 3 octets).
-            let addr = format!(
-                "10.{}.{}.{}",
-                (index >> 16) & 0xff,
-                (index >> 8) & 0xff,
-                index & 0xff
-            );
-            cache.insert(
-                &host,
-                answer(Duration::from_secs(3600), stamp(base), &[&addr]),
-            );
-        }
-        assert_eq!(cache.len(), DNS_CACHE_CAP);
-        let last = format!("host-{}", DNS_CACHE_CAP + 4);
-        // New entries win: the newest host is still retrievable.
-        assert!(cache.get(&last).is_some());
-    }
-
-    #[test]
-    fn cap_pressure_sweeps_expired_before_evicting_fresh() {
-        let cache = DnsCache::new();
-        let base = now();
-        // Fill to the cap with expired entries.
-        for index in 0..DNS_CACHE_CAP {
-            let host = format!("dead-{index}");
-            let addr = format!("10.1.{}.{}", (index >> 8) & 0xff, index & 0xff);
-            cache.insert(&host, answer(Duration::ZERO, stamp(base - 5000), &[&addr]));
-        }
-        // One fresh entry squeezed in under cap pressure must not evict a
-        // fresh peer, and must itself survive.
-        let fresh = answer(Duration::from_secs(3600), stamp(base), &["10.2.3.4"]);
-        cache.insert("survivor.example", fresh.clone());
-        assert!(cache.len() <= DNS_CACHE_CAP);
-        assert_eq!(cache.get("survivor.example"), Some(fresh));
-    }
+    entries.insert(key, entry);
 }

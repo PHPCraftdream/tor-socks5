@@ -18,6 +18,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- DNS listener preserves typed full packets and terminal NXDOMAIN/NODATA,
+  answers localhost/loopback and own-address PTR locally, and passes actual bound
+  endpoints to override recursion guards. Local/cache responses bypass a shared
+  64-backend cap; overload returns SERVFAIL. One absolute 30-second miss deadline
+  includes tunnel acquisition and provider traversal. TCP admission, framing,
+  writes and connection lifetime are bounded; shutdown drops scoped work.
+  Periodic cache publication no longer blocks listeners; only one save is
+  outstanding and shutdown drains it before the serialized final publication.
+- Windows IPv6 listener coverage reads `IPV6_V6ONLY` into initialized storage,
+  accepting the observed one-byte boolean and the DWORD form without socket2's
+  short-result panic or uninitialized tail read.
 - CI and release builds now provision the pinned sibling `resocks5` checkout
   before Cargo and cache metadata resolution. The local dependency remains in use.
 - Split proxy and JNI regression tests into modules below the existing 1000-line
