@@ -613,8 +613,8 @@ async fn drain_pool_with(
     }
 }
 
-/// Move legacy source URLs and drop retired sources, as one locked config
-/// transaction.
+/// Move legacy source URLs and drop retired sources, as one locked
+/// transaction on the bridges file (the main config is not rewritten).
 fn migrate_legacy_source(path: &Path) -> Result<()> {
     let _lock = PathLock::acquire_bounded(path, CLI_LOCK_WAIT)
         .context("config write lock while migrating bridge source")?;
@@ -627,14 +627,14 @@ fn migrate_legacy_source(path: &Path) -> Result<()> {
         source.url = current_source_url(&source.url).to_owned();
     }
     latest
-        .write(path)
+        .write_bridges(path)
         .context("writing migrated bridge source")?;
     Ok(())
 }
 
-/// Add promoted candidates to the latest config snapshot under its path
-/// lock. Idempotent: a line already in the working config is not added
-/// again, and when nothing is new the config is not rewritten at all —
+/// Add promoted candidates to the latest bridges-file snapshot under the
+/// config's path lock. Idempotent: a line already in the working list is not
+/// added again, and when nothing is new the file is not rewritten at all —
 /// this is what makes the drain's retry after a failed promotion safe.
 fn promote_bridges_in_config(path: &Path, promoted: &[BridgeLine]) -> Result<usize> {
     #[cfg(test)]
@@ -656,8 +656,8 @@ fn promote_bridges_in_config(path: &Path, promoted: &[BridgeLine]) -> Result<usi
     let added = latest.bridges.lines.len() - before;
     if added > 0 {
         latest
-            .write(path)
-            .context("writing config with promoted bridges")?;
+            .write_bridges(path)
+            .context("writing bridges file with promoted bridges")?;
     }
     Ok(added)
 }

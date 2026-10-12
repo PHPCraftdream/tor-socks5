@@ -40,7 +40,7 @@ pub(crate) async fn cmd_bridges(
     install_crypto_provider();
 
     if cfg.bridges.sources.is_empty() {
-        bail!("no bridge sources configured in bridges.sources — nothing to fetch");
+        bail!("no bridge sources configured in the `sources` list of the bridges file — nothing to fetch");
     }
 
     // Bootstrap Tor using the configured bridges (or built-in seeds as a

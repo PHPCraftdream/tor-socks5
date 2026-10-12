@@ -520,9 +520,9 @@ pub(crate) async fn update_health_and_prune(
     Some(ranked)
 }
 
-/// Remove the given (dead) bridges from `bridges.lines` in the config file
-/// on disk, matched by the full shared bridge identity. Unparseable lines are
-/// left untouched. Returns the number of lines removed.
+/// Remove the given (dead) bridges from `lines` in the bridges file on disk,
+/// matched by the full shared bridge identity. Unparseable lines are left
+/// untouched. Returns the number of lines removed.
 fn prune_bridges_from_config(path: &Path, dead: &[BridgeLine]) -> Result<usize> {
     use std::collections::HashSet;
     let dead_keys: HashSet<_> = dead.iter().map(bridge_identity).collect();
@@ -541,7 +541,8 @@ fn prune_bridges_from_config(path: &Path, dead: &[BridgeLine]) -> Result<usize> 
         });
     let removed = before - cfg.bridges.lines.len();
     if removed > 0 {
-        cfg.write(path).context("writing pruned config")?;
+        cfg.write_bridges(path)
+            .context("writing pruned bridges file")?;
     }
     Ok(removed)
 }

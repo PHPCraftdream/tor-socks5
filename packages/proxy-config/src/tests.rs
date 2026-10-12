@@ -210,6 +210,7 @@ fn bridge_identity_survives_save_load_and_parsed() {
         .expect("load config")
         .into_config();
     let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(Config::bridges_path(&path));
 
     let parsed = loaded.bridges.parsed().expect("parse loaded config");
     assert_eq!(parsed.bridges.len(), 4);
@@ -308,15 +309,21 @@ fn parses_config_with_double_hash_comments() {
 ## ktav comments use a double hash.
 listen: 127.0.0.1:1080
 
-bridges.lines: [
+lines: [
 \tobfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=aa+bb/cc+dd/ee iat-mode=0
 
 \tobfs4 5.6.7.8:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=ff/gg+hh/ii iat-mode=0
 ]
 ";
-    let cfg: Config = ktav::from_str(src).expect("double-hash comments + block array parse");
-    assert_eq!(cfg.listen, vec!["127.0.0.1:1080"]);
-    assert_eq!(cfg.bridges.lines.len(), 2);
+    // The block array is the bridges file's `lines`; `listen` is the main
+    // config's. The same text exercises the comment/blank-line handling of
+    // both schemas.
+    let main: Config =
+        ktav::from_str(src.split("\nlines:").next().unwrap()).expect("double-hash comments parse");
+    assert_eq!(main.listen, vec!["127.0.0.1:1080"]);
+    let bridges: BridgesConfig = ktav::from_str(&src.replace("listen: 127.0.0.1:1080\n", ""))
+        .expect("double-hash comments + block array parse");
+    assert_eq!(bridges.lines.len(), 2);
 }
 
 #[test]
@@ -335,25 +342,23 @@ fn single_hash_line_is_content_not_comment() {
 #[test]
 fn parses_bridges_array() {
     let src = r#"
-listen: 127.0.0.1:1080
-
-bridges.lines: [
+lines: [
     obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=ZZZ iat-mode=0
     obfs4 5.6.7.8:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=YYY iat-mode=0
 ]
 "#;
-    let cfg: Config = ktav::from_str(src).expect("ktav parses");
-    assert_eq!(cfg.bridges.lines.len(), 2);
-    assert!(cfg.bridges.lines[0].starts_with("obfs4 1.2.3.4:80"));
+    let bridges: BridgesConfig = ktav::from_str(src).expect("ktav parses");
+    assert_eq!(bridges.lines.len(), 2);
+    assert!(bridges.lines[0].starts_with("obfs4 1.2.3.4:80"));
 }
 
 #[test]
 fn parses_source_with_headers_and_cookies() {
     // Mirrors the README example: a source with custom headers + cookies.
-    let src = "listen: 127.0.0.1:1080\nbridges.sources: [\n\t{\n\t\tlabel: private\n\t\turl: https://api.example.org/bridges\n\t\theaders: [\n\t\t\tAuthorization: Bearer SECRET\n\t\t]\n\t\tcookies: [\n\t\t\tsession=abc123\n\t\t]\n\t}\n]\n";
-    let cfg: Config = ktav::from_str(src).expect("source with headers/cookies parses");
-    assert_eq!(cfg.bridges.sources.len(), 1);
-    let s = &cfg.bridges.sources[0];
+    let src = "sources: [\n\t{\n\t\tlabel: private\n\t\turl: https://api.example.org/bridges\n\t\theaders: [\n\t\t\tAuthorization: Bearer SECRET\n\t\t]\n\t\tcookies: [\n\t\t\tsession=abc123\n\t\t]\n\t}\n]\n";
+    let cfg: BridgesConfig = ktav::from_str(src).expect("source with headers/cookies parses");
+    assert_eq!(cfg.sources.len(), 1);
+    let s = &cfg.sources[0];
     assert_eq!(s.url, "https://api.example.org/bridges");
     assert_eq!(s.headers, vec!["Authorization: Bearer SECRET".to_string()]);
     assert_eq!(s.cookies, vec!["session=abc123".to_string()]);
@@ -363,32 +368,30 @@ fn parses_source_with_headers_and_cookies() {
 fn minimal_source_is_just_a_url() {
     // A source can be the bare `{ url: ... }` form; label/headers/cookies
     // default to empty.
-    let src =
-        "listen: 127.0.0.1:1080\nbridges.sources: [\n\t{\n\t\turl: https://x.example/a\n\t}\n]\n";
-    let cfg: Config = ktav::from_str(src).expect("minimal {url} source parses");
-    assert_eq!(cfg.bridges.sources.len(), 1);
-    assert_eq!(cfg.bridges.sources[0].url, "https://x.example/a");
-    assert!(cfg.bridges.sources[0].label.is_empty());
-    assert!(cfg.bridges.sources[0].headers.is_empty());
-    assert!(cfg.bridges.sources[0].cookies.is_empty());
+    let src = "sources: [\n\t{\n\t\turl: https://x.example/a\n\t}\n]\n";
+    let cfg: BridgesConfig = ktav::from_str(src).expect("minimal {url} source parses");
+    assert_eq!(cfg.sources.len(), 1);
+    assert_eq!(cfg.sources[0].url, "https://x.example/a");
+    assert!(cfg.sources[0].label.is_empty());
+    assert!(cfg.sources[0].headers.is_empty());
+    assert!(cfg.sources[0].cookies.is_empty());
 }
 
 #[test]
 fn source_credentials_cross_origin_defaults_to_false() {
     // Without the key, credentials stay pinned to the source's own origin.
-    let src =
-        "listen: 127.0.0.1:1080\nbridges.sources: [\n\t{\n\t\turl: https://x.example/a\n\t}\n]\n";
-    let cfg: Config = ktav::from_str(src).expect("minimal source parses");
-    assert_eq!(cfg.bridges.sources.len(), 1);
-    assert!(!cfg.bridges.sources[0].allow_credentials_cross_origin);
+    let src = "sources: [\n\t{\n\t\turl: https://x.example/a\n\t}\n]\n";
+    let cfg: BridgesConfig = ktav::from_str(src).expect("minimal source parses");
+    assert_eq!(cfg.sources.len(), 1);
+    assert!(!cfg.sources[0].allow_credentials_cross_origin);
 }
 
 #[test]
 fn source_credentials_cross_origin_opt_in_parses() {
-    let src = "listen: 127.0.0.1:1080\nbridges.sources: [\n\t{\n\t\turl: https://x.example/a\n\t\tallow_credentials_cross_origin: true\n\t}\n]\n";
-    let cfg: Config = ktav::from_str(src).expect("opt-in source parses");
-    assert_eq!(cfg.bridges.sources.len(), 1);
-    assert!(cfg.bridges.sources[0].allow_credentials_cross_origin);
+    let src = "sources: [\n\t{\n\t\turl: https://x.example/a\n\t\tallow_credentials_cross_origin: true\n\t}\n]\n";
+    let cfg: BridgesConfig = ktav::from_str(src).expect("opt-in source parses");
+    assert_eq!(cfg.sources.len(), 1);
+    assert!(cfg.sources[0].allow_credentials_cross_origin);
 }
 
 // -- Config extension tests ---
@@ -406,13 +409,12 @@ fn default_circuit_pruning_knobs_are_sensible() {
 #[test]
 fn circuit_pruning_knobs_are_overridable_in_ktav() {
     let src = "\
-listen: 127.0.0.1:1080
-bridges.max_circuit_fails: 12
-bridges.circuit_observation_window_mins: 10
+max_circuit_fails: 12
+circuit_observation_window_mins: 10
 ";
-    let cfg: Config = ktav::from_str(src).expect("ktav parses circuit knobs");
-    assert_eq!(cfg.bridges.max_circuit_fails, 12);
-    assert_eq!(cfg.bridges.circuit_observation_window_mins, 10);
+    let cfg: BridgesConfig = ktav::from_str(src).expect("ktav parses circuit knobs");
+    assert_eq!(cfg.max_circuit_fails, 12);
+    assert_eq!(cfg.circuit_observation_window_mins, 10);
 }
 
 #[test]
@@ -483,18 +485,12 @@ fn upstream_roundtrip_preserves_fields() {
 }
 
 #[test]
-fn config_serialized_roundtrip_preserves_sources() {
-    let cfg = Config::default();
+fn bridges_serialized_roundtrip_preserves_sources() {
+    let cfg = BridgesConfig::default();
     let serialized = ktav::to_string(&cfg).expect("serialize");
-    let deserialized: Config = ktav::from_str(&serialized).expect("deserialize");
-    assert_eq!(
-        deserialized.bridges.sources.len(),
-        cfg.bridges.sources.len()
-    );
-    assert_eq!(
-        deserialized.bridges.sources[0].label,
-        cfg.bridges.sources[0].label
-    );
+    let deserialized: BridgesConfig = ktav::from_str(&serialized).expect("deserialize");
+    assert_eq!(deserialized.sources.len(), cfg.sources.len());
+    assert_eq!(deserialized.sources[0].label, cfg.sources[0].label);
 }
 
 // -- warm_pool config --------------------------------------------------

@@ -103,6 +103,9 @@ pub(crate) async fn run_server(
     }
 
     info!(%source, "loaded configuration");
+    if let Some(path) = &config_path {
+        crate::startup::ensure_bridges_file(&cfg, path);
+    }
 
     // Load the users registry (sits next to the main config). The file
     // is optional — when absent or empty, the SOCKS5 listener falls
@@ -153,10 +156,10 @@ pub(crate) async fn run_server(
             let settings = build_tor_settings(&cfg, config_path.as_deref()).await?;
             if settings.bridges.is_empty() {
                 bail!(
-                    "no bridges configured in {} — add at least one `bridges.lines: [ obfs4 ... ]` entry",
+                    "no bridges configured in {} — add at least one `lines: [ obfs4 ... ]` entry",
                     config_path
                         .as_deref()
-                        .map(|p| p.display().to_string())
+                        .map(|p| Config::bridges_path(p).display().to_string())
                         .unwrap_or_else(|| "<defaults>".to_string())
                 );
             }

@@ -7,6 +7,7 @@ mod bridges_cmd;
 mod candidate_pool;
 mod cli;
 mod config;
+mod config_cmd;
 mod conn_health;
 mod daemon;
 mod dns_wiring;
@@ -21,6 +22,7 @@ mod startup;
 #[cfg(test)]
 mod test_seams;
 mod tor_setup;
+#[path = "tor_watchdog/tor_watchdog.rs"]
 mod tor_watchdog;
 #[cfg(test)]
 mod ts19_tests;
@@ -198,6 +200,9 @@ async fn async_main(cli: Cli) -> Result<()> {
         }
         Some(Command::Service { action, user }) => {
             return service::run(action, user, cli.config.as_deref());
+        }
+        Some(Command::Config { action }) => {
+            return config_cmd::run(action, cli.config.as_deref());
         }
         Some(Command::Help { all, topic }) => {
             help_cmd::run(all, topic);

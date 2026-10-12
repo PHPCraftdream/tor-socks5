@@ -23,7 +23,7 @@ MAX_ENTRIES=7
 
 BASELINE="
 48 docs
-36 apps/socks5-proxy/src
+34 apps/socks5-proxy/src
 30 packages/dns-server/src
 16 packages/bridge-probe/src/tests
 15 .

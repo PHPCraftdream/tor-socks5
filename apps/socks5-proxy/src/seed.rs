@@ -3,8 +3,8 @@
 //! These let a fresh install bootstrap Tor without the operator first
 //! sourcing a working bridge by hand (the bootstrap chicken-and-egg).
 //! They are used only as a fallback when no configured bridge in
-//! `bridges.lines` is reachable at startup (and `bridges.use_seeds` is
-//! on). Once Tor is up, `auto_fetch` replenishes the config, so reliance
+//! `lines` of the bridges file is reachable at startup (and `use_seeds`
+//! there is on). Once Tor is up, `auto_fetch` replenishes the config, so reliance
 //! on seeds is transient.
 //!
 //! Seeds are deliberately **not** baked into the source: real bridge

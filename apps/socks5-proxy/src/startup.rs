@@ -2,6 +2,7 @@
 //! `bridges fetch` command: logging setup and the rustls crypto provider.
 
 use std::io::IsTerminal;
+use std::path::Path;
 
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 
@@ -200,9 +201,61 @@ fn propagate_color_preference_to_pt_child(log: &LogConfig) {
     }
 }
 
+/// First run on a main config the operator made by hand: create the bridges
+/// file with the defaults in `cfg`, so there is a file to edit. Taken under
+/// the config's path lock like every other writer of the pool, and re-checked
+/// inside it. Convenience only: a failure is logged, not fatal. Returns
+/// whether the file was created.
+pub(crate) fn ensure_bridges_file(cfg: &Config, config_path: &Path) -> bool {
+    use persist_lock::{PathLock, CLI_LOCK_WAIT};
+
+    let bridges_path = Config::bridges_path(config_path);
+    if bridges_path.exists() {
+        return false;
+    }
+    let _lock = match PathLock::acquire_bounded(config_path, CLI_LOCK_WAIT) {
+        Ok(lock) => lock,
+        Err(error) => {
+            tracing::warn!(%error, path = %bridges_path.display(), "could not lock the config to create the bridges file");
+            return false;
+        }
+    };
+    if bridges_path.exists() {
+        return false;
+    }
+    match cfg.write_bridges(config_path) {
+        Ok(()) => {
+            tracing::info!(path = %bridges_path.display(), "created the bridges file with defaults");
+            true
+        }
+        Err(error) => {
+            tracing::warn!(%error, path = %bridges_path.display(), "could not create the bridges file");
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bridges_file_is_created_once_and_never_overwritten() {
+        let dir = std::env::temp_dir().join(format!("tor-socks5-ensure-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("tor-socks5.ktav");
+        let mut cfg = Config::default();
+        assert!(ensure_bridges_file(&cfg, &config_path));
+        let bridges_path = Config::bridges_path(&config_path);
+        assert!(bridges_path.exists());
+
+        // An existing file (here: the operator's own pool) is left alone.
+        cfg.bridges.min_alive = 99;
+        assert!(!ensure_bridges_file(&cfg, &config_path));
+        let text = std::fs::read_to_string(&bridges_path).unwrap();
+        assert!(!text.contains("min_alive: 99"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // (а) configured on + real terminal → colours on.
     #[test]

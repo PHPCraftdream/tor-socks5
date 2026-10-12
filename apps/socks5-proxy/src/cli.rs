@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use crate::config_cmd::ConfigAction;
 use crate::service::ServiceAction;
 use crate::users_cli::UsersAction;
 
@@ -40,6 +41,7 @@ tor-socks5 users add --init alice       # add a user whose first login sets the 
 tor-socks5 users add --allow-onion bob  # add a user permitted to reach .onion services\n  \
 tor-socks5 users allow-onion alice      # grant .onion access to an existing user\n  \
 tor-socks5 bridges fetch                # fetch & merge fresh bridges over Tor\n  \
+tor-socks5 config migrate               # convert a config written in the old layout\n  \
 tor-socks5 --upstream 127.0.0.1:9050    # egress via an upstream SOCKS5 instead of Tor\n  \
 tor-socks5 service install              # install as a system service\n  \
 tor-socks5 --daemon --pid-file /run/tor-socks5.pid   # run in the background (Unix only)\n  \
@@ -97,6 +99,12 @@ pub(crate) enum Command {
     Bridges {
         #[command(subcommand)]
         action: BridgesAction,
+    },
+    /// Maintain the config files (convert a config written in the old
+    /// layout with `config migrate`).
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
     },
     /// Install/manage tor-socks5 as an OS service (systemd, launchd,
     /// Windows SCM, rc.d).

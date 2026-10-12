@@ -5,12 +5,17 @@
 //! 2. `tor-socks5.ktav` in the current working directory.
 //! 3. Built-in defaults (if no file is found).
 //!
+//! The bridge pool (`lines`, `sources`, thresholds) lives in its own file
+//! next to the main config, `<stem>.bridges.ktav` ([`Config::bridges_path`]).
+//! A config in the old layout is rejected at load with the command that
+//! converts it ([`migrate_config`]).
+//!
 //! This schema is shared with the Android JNI FFI crate via this crate.
 #![warn(missing_docs)]
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::{env, fs};
 
 use anyhow::{Context, Result};
@@ -19,14 +24,22 @@ use bridge_probe::{bridge_identity, usable_for_tor, BridgeIdentity};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
+#[path = "layout/bridges_file.rs"]
+mod bridges_file;
+#[path = "layout/legacy.rs"]
+mod legacy;
 mod listen_addresses;
+#[path = "layout/migrate.rs"]
+mod migrate;
 mod override_patterns;
 use listen_addresses::listen_addresses;
 use override_patterns::override_patterns;
 
+pub use migrate::{migrate_config, MigrationOutcome, MigrationReport};
+
 const ENV_VAR: &str = "TOR_SOCKS5_CONFIG";
 const DEFAULT_FILE: &str = "tor-socks5.ktav";
-static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// The full startup configuration, loaded from a Ktav file (see the module
 /// docs for the resolution order: `TOR_SOCKS5_CONFIG` env var, then
@@ -61,7 +74,10 @@ pub struct Config {
     pub listen: Vec<String>,
     /// Logging configuration.
     pub log: LogConfig,
-    /// Bridges configuration.
+    /// Bridges configuration. Not part of the main config file: it is read
+    /// from and written to the bridges file ([`Config::bridges_path`]); a
+    /// `bridges` key in the main file is the old layout and is rejected.
+    #[serde(skip)]
     pub bridges: BridgesConfig,
     /// Stale-channel watchdog configuration.
     pub watchdog: WatchdogConfig,
@@ -931,10 +947,23 @@ impl Config {
         })
     }
 
+    /// The config file a load with this CLI override would read: the
+    /// override, else the `TOR_SOCKS5_CONFIG` env var, else `tor-socks5.ktav`
+    /// in the current directory. Does not touch the disk.
+    pub fn resolve_path(cli_override: Option<&Path>) -> PathBuf {
+        cli_override
+            .map(Path::to_path_buf)
+            .or_else(|| env::var_os(ENV_VAR).map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_FILE))
+    }
+
     fn from_file(path: &Path) -> Result<Self> {
         persist_lock::cleanup_temp_files(path);
+        persist_lock::cleanup_temp_files(&Self::bridges_path(path));
         let src = fs::read_to_string(path).context("read config file")?;
-        let cfg: Config = ktav::from_str(&src).context("parse Ktav config")?;
+        legacy::check(&src, path)?;
+        let mut cfg: Config = ktav::from_str(&src).context("parse Ktav config")?;
+        cfg.bridges = bridges_file::load(path)?;
         Ok(cfg)
     }
 
@@ -945,13 +974,18 @@ impl Config {
     /// owner provably died (the kernel releases the lock on death). The
     /// final rename is atomic: readers see either the old or the new full
     /// file, never a torn state.
+    ///
+    /// Writes the bridges file first, then the main config (without the
+    /// bridge pool); see [`Config::write_bridges`] to touch only the pool.
     pub fn write(&self, path: &Path) -> Result<()> {
-        let body = ktav::to_string(self).context("serialise default config to Ktav")?;
-        let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
-        let mut guard = persist_lock::TempFileGuard::create(path, seq)?;
-        guard.write_all(body.as_bytes())?;
-        guard.finish()?;
-        Ok(())
+        self.write_bridges(path)?;
+        self.write_main(path)
+    }
+
+    /// Write only the main config file (the bridge pool is not part of it).
+    pub(crate) fn write_main(&self, path: &Path) -> Result<()> {
+        let body = ktav::to_string(self).context("serialise config to Ktav")?;
+        bridges_file::write_atomic(path, &body)
     }
 }
 
