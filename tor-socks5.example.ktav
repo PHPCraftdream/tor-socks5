@@ -22,18 +22,24 @@ bridges.lines: [
     webtunnel [2001:db8::1]:443 0000000000000000000000000000000000BBBBBB url=https://example.com/path ver=0.0.3
 ]
 
+## WebTunnel first: the three collectors read the same Tor Project distribution
+## and test it on their own schedule, together about 150 tested bridges.
 bridges.sources: [
     {
-        label: scriptzteam-obfs4
-        url: https://raw.githubusercontent.com/scriptzteam/Tor-Bridges-Collector/main/bridges-obfs4
+        label: scriptzteam-v2-webtunnel-tested
+        url: https://raw.githubusercontent.com/scriptzteam/Tor-Bridges-Collector-v2/main/bridges/webtunnel_tested.txt
     }
     {
-        label: scriptzteam-webtunnel
-        url: https://raw.githubusercontent.com/scriptzteam/Tor-Bridges-Collector/main/bridges-webtunnel
+        label: delta-webtunnel-tested
+        url: https://raw.githubusercontent.com/Delta-Kronecker/Tor-Bridges-Collector/main/bridge/webtunnel_tested.txt
     }
     {
-        label: tor-browser-obfs4
-        url: https://gitlab.torproject.org/tpo/applications/tor-browser/-/raw/main/projects/common/bridges_list.obfs4.txt
+        label: onionhop-webtunnel-tested
+        url: https://raw.githubusercontent.com/center2055/OnionHop-Bridges-Collector/main/bridge/webtunnel_tested.txt
+    }
+    {
+        label: scriptzteam-v2-obfs4
+        url: https://raw.githubusercontent.com/scriptzteam/Tor-Bridges-Collector-v2/main/bridges/obfs4.txt
     }
 ]
 

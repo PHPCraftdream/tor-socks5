@@ -616,6 +616,12 @@ pub struct BridgeSource {
 /// The `_tested` variants are listed alongside the full ones: they are much
 /// smaller and pre-filtered upstream, which gives a fresh client a usable pool
 /// before it has probed anything itself.
+///
+/// All three collectors read the Tor Project's own distribution, so they
+/// overlap heavily (about 210 distinct WebTunnel bridges across all of them);
+/// several are listed because each also tests and refreshes on its own
+/// schedule. The Tor Browser built-in lists are not here: their URL no longer
+/// exists upstream.
 pub fn default_bridge_sources() -> &'static [(&'static str, &'static str)] {
     &[
         // scriptzteam v2 — successor to the original collector, regenerated daily.
@@ -631,7 +637,7 @@ pub fn default_bridge_sources() -> &'static [(&'static str, &'static str)] {
             "scriptzteam-v2-obfs4",
             "https://raw.githubusercontent.com/scriptzteam/Tor-Bridges-Collector-v2/main/bridges/obfs4.txt",
         ),
-        // Delta-Kronecker — independent collector, same layout, regenerated daily.
+        // Delta-Kronecker — same layout, regenerated hourly.
         (
             "delta-webtunnel",
             "https://raw.githubusercontent.com/Delta-Kronecker/Tor-Bridges-Collector/main/bridge/webtunnel.txt",
@@ -644,7 +650,7 @@ pub fn default_bridge_sources() -> &'static [(&'static str, &'static str)] {
             "delta-obfs4",
             "https://raw.githubusercontent.com/Delta-Kronecker/Tor-Bridges-Collector/main/bridge/obfs4.txt",
         ),
-        // OnionHop — third independent collector.
+        // OnionHop — a derivative of the Delta layout, also hourly.
         (
             "onionhop-webtunnel",
             "https://raw.githubusercontent.com/center2055/OnionHop-Bridges-Collector/main/bridge/webtunnel.txt",
@@ -656,15 +662,6 @@ pub fn default_bridge_sources() -> &'static [(&'static str, &'static str)] {
         (
             "onionhop-obfs4",
             "https://raw.githubusercontent.com/center2055/OnionHop-Bridges-Collector/main/bridge/obfs4.txt",
-        ),
-        // The Tor Project's own built-in lists, as shipped with Tor Browser.
-        (
-            "tor-browser-obfs4",
-            "https://gitlab.torproject.org/tpo/applications/tor-browser/-/raw/main/projects/common/bridges_list.obfs4.txt",
-        ),
-        (
-            "tor-browser-webtunnel",
-            "https://gitlab.torproject.org/tpo/applications/tor-browser/-/raw/main/projects/common/bridges_list.webtunnel.txt",
         ),
     ]
 }

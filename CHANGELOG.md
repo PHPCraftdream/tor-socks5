@@ -42,6 +42,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   commits since 2026-07-29) is migrated to the regenerated v2 `obfs4.txt` list,
   the same way the legacy webtunnel source already is: a config that still lists
   the old URL is rewritten under its lock on the next refresh.
+- The two Tor Browser built-in bridge sources (`tor-browser-obfs4`,
+  `tor-browser-webtunnel`) are retired: their path no longer exists upstream
+  (HTTP 404; through Tor GitLab answers 403), so they only produced a warning on
+  every refresh. They are removed from the default source list, never fetched, and
+  deleted from a config that still names them at the next refresh, under the same
+  config lock as the other source migrations. The `tor-socks5.example.ktav`
+  template now lists the current WebTunnel-first set (the three collectors'
+  `webtunnel_tested` lists, about 150 tested bridges together, plus the v2 obfs4
+  list); all collectors read the Tor Project's own distribution, so they overlap.
 - Android authentication rustdoc now describes the existing fail-closed startup:
   enabled authentication with an empty or missing registry raises
   `java.lang.RuntimeException` before engine-thread spawn; anonymous access requires

@@ -58,6 +58,17 @@ fn current_source_url(url: &str) -> &str {
     }
 }
 
+/// Sources that no longer exist upstream (the path answers 404): the Tor
+/// Browser built-in lists were moved out of that repository. They are never
+/// fetched, and a config that still names one loses it at the next refresh.
+fn retired_source(url: &str) -> bool {
+    matches!(
+        url,
+        "https://gitlab.torproject.org/tpo/applications/tor-browser/-/raw/main/projects/common/bridges_list.obfs4.txt"
+            | "https://gitlab.torproject.org/tpo/applications/tor-browser/-/raw/main/projects/common/bridges_list.webtunnel.txt"
+    )
+}
+
 /// Shuffle in place using a `getrandom`-seeded xorshift (Fisher–Yates).
 /// Non-cryptographic — only used so a drain batch mixes transports/sources
 /// rather than probing a long run of one kind first. RNG failure → no-op.
@@ -100,6 +111,7 @@ async fn fetch_sources(
         .bridges
         .sources
         .iter()
+        .filter(|s| !retired_source(&s.url))
         .map(|s| bridge_fetcher::Source {
             label: s.label.clone(),
             url: current_source_url(&s.url).to_owned(),
@@ -160,6 +172,12 @@ pub(crate) async fn refresh_candidate_pool(
         .sources
         .iter()
         .any(|source| current_source_url(&source.url) != source.url);
+    let config_stale = migration
+        || cfg
+            .bridges
+            .sources
+            .iter()
+            .any(|source| retired_source(&source.url));
     let preferred_transport = cfg.bridges.preferred_transport().map(str::to_owned);
     let (added, pool_len) = tokio::task::spawn_blocking(move || {
         CandidatePool::transaction(&pool_path, |pool| {
@@ -173,13 +191,13 @@ pub(crate) async fn refresh_candidate_pool(
     .await
     .map_err(|e| anyhow::anyhow!("candidate pool update task failed: {e}"))?
     .context("updating candidate pool")?;
-    if migration {
+    if config_stale {
         if let Some(path) = config_path {
             let path = path.to_path_buf();
             tokio::task::spawn_blocking(move || migrate_legacy_source(&path))
                 .await
                 .map_err(|e| anyhow::anyhow!("config migration task failed: {e}"))??;
-            info!("updated the legacy WebTunnel source to the current tested list");
+            info!("updated legacy bridge sources in the config (moved or retired)");
         }
     }
     info!(
@@ -595,11 +613,16 @@ async fn drain_pool_with(
     }
 }
 
-/// Update the legacy source URL as one locked config transaction.
+/// Move legacy source URLs and drop retired sources, as one locked config
+/// transaction.
 fn migrate_legacy_source(path: &Path) -> Result<()> {
     let _lock = PathLock::acquire_bounded(path, CLI_LOCK_WAIT)
         .context("config write lock while migrating bridge source")?;
     let mut latest = Config::load_with_override(Some(path))?.into_config();
+    latest
+        .bridges
+        .sources
+        .retain(|source| !retired_source(&source.url));
     for source in &mut latest.bridges.sources {
         source.url = current_source_url(&source.url).to_owned();
     }
@@ -667,6 +690,9 @@ pub(crate) async fn top_up_working(
     Ok(promoted)
 }
 
+#[cfg(test)]
+#[path = "fetch_merge_source_tests.rs"]
+mod source_tests;
 #[cfg(test)]
 #[path = "fetch_merge_tests.rs"]
 mod tests;
