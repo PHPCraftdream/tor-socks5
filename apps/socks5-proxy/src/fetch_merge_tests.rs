@@ -22,6 +22,25 @@ fn source_migration_only_changes_the_known_legacy_webtunnel_list() {
     assert_eq!(current_source_url(custom), custom);
 }
 
+#[test]
+fn source_migration_moves_the_abandoned_obfs4_list_to_v2() {
+    let old =
+        "https://raw.githubusercontent.com/scriptzteam/Tor-Bridges-Collector/main/bridges-obfs4";
+    let current = current_source_url(old);
+    assert_eq!(
+        current,
+        "https://raw.githubusercontent.com/scriptzteam/Tor-Bridges-Collector-v2/main/bridges/obfs4.txt"
+    );
+    assert_eq!(current_source_url(current), current);
+    // Other sources, including the v2 webtunnel list, are left alone.
+    for untouched in [
+        "https://raw.githubusercontent.com/scriptzteam/Tor-Bridges-Collector-v2/main/bridges/webtunnel.txt",
+        "https://private.example/bridges-obfs4",
+    ] {
+        assert_eq!(current_source_url(untouched), untouched);
+    }
+}
+
 fn discovery_fixture() -> (tempfile::TempDir, std::path::PathBuf, BridgeLine) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("proxy.ktav");
