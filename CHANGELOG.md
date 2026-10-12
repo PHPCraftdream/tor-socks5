@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Directory-size rule in CI**: a first-party directory may hold at most 7
+  entries (files and sub-directories together), next to the existing limit of
+  1000 lines per Rust file. `scripts/check-dir-entries.sh` counts what git
+  tracks and runs in the new `dir-entries` CI job; `vendor/` is exempt. The eight
+  directories already over the limit are recorded with their current size as a
+  ratchet: they cannot grow, no new directory may exceed the limit, and entries
+  are lowered as directories are split.
+
 - Persistent, payload-free DNS query statistics and startup/two-hour refresh of
   observed popular name/type/class tuples. Background work uses existing routes
   with foreground headroom; shutdown drains accepted statistics and publishes

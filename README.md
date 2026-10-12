@@ -66,6 +66,17 @@ cargo build --release
 # binary: target/release/socks5-proxy   (invoked as `tor-socks5`)
 ```
 
+### Code structure rules (checked in CI)
+
+- A Rust file has at most **1000 lines** (`scripts/check-line-limit.sh`).
+- A directory has at most **7 entries**, files and sub-directories together
+  (`scripts/check-dir-entries.sh`; counts what git tracks).
+
+`vendor/` (upstream Arti forks) is exempt. Directories that were already over
+the limit when the rule was introduced are listed in the script's `BASELINE`
+with their current size: they may not grow, new ones may not appear, and an
+entry is lowered or deleted as the directory is split.
+
 ## Quick start
 
 ```bash

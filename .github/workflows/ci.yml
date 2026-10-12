@@ -1,8 +1,8 @@
 # CI — fmt, clippy, test across Linux / macOS / Windows; first-party line
-# limit, publish guard, crate packageability, MSRV 1.89 and Android arm64
-# cross-compile checks. fmt/clippy/test mirror the local pre-push hook at
-# .githooks/pre-push; line-limit/publish-guard/packageability/msrv/android
-# are CI-only.
+# limit and directory-size limit, publish guard, crate packageability, MSRV
+# 1.89 and Android arm64 cross-compile checks. fmt/clippy/test mirror the
+# local pre-push hook at .githooks/pre-push; line-limit/dir-entries/
+# publish-guard/packageability/msrv/android are CI-only.
 
 name: CI
 
@@ -73,6 +73,14 @@ jobs:
       - uses: actions/checkout@v7
       - name: Check first-party Rust files stay under 1000 lines
         run: sh scripts/check-line-limit.sh
+
+  dir-entries:
+    name: First-party directory size (7 entries)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check first-party directories stay at 7 entries or fewer
+        run: sh scripts/check-dir-entries.sh
 
   publish-guard:
     name: Publish guard (publish = false)
