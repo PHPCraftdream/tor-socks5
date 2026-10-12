@@ -51,7 +51,7 @@ Run `tor-socks5 <command> --help` for command-specific options, or \
 )]
 pub(crate) struct Cli {
     /// Override the main-config path used to resolve auxiliary files.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub(crate) config: Option<PathBuf>,
 
     /// Route egress through this upstream SOCKS5 proxy (`host:port`)
@@ -150,4 +150,39 @@ pub(crate) enum BridgesAction {
         #[arg(long, default_value = "10")]
         count: usize,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).expect("arguments parse")
+    }
+
+    #[test]
+    fn config_flag_is_accepted_after_a_subcommand() {
+        // The hint printed for an old-layout config uses this form.
+        let cli = parse(&[
+            "tor-socks5",
+            "config",
+            "migrate",
+            "--config",
+            "etc/node.ktav",
+        ]);
+        assert_eq!(cli.config, Some(PathBuf::from("etc/node.ktav")));
+        assert!(matches!(cli.command, Some(Command::Config { .. })));
+    }
+
+    #[test]
+    fn config_flag_is_accepted_before_a_subcommand() {
+        let cli = parse(&[
+            "tor-socks5",
+            "--config",
+            "etc/node.ktav",
+            "config",
+            "migrate",
+        ]);
+        assert_eq!(cli.config, Some(PathBuf::from("etc/node.ktav")));
+    }
 }
