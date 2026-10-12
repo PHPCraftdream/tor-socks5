@@ -186,7 +186,7 @@ Mullvad, ControlD, NextDNS, …). They are tried in a fixed order, falling throu
 next entry on error or timeout — no scoring or racing. Custom entries are appended after
 the built-ins, so they win only if every earlier entry fails; duplicates by `(ip, hostname)`
 are dropped, keeping the first. The full list lives in
-`packages/dns-server/src/providers.rs`. Honest caveat: a few of the base-20 entries
+`packages/dns-server/src/doh/providers.rs`. Honest caveat: a few of the base-20 entries
 inherited from the bridge-probe list have since become HTTP/2-only frontends — such entries
 simply never win and cost one timed-out attempt each (details in the providers.rs module docs).
 
@@ -238,7 +238,7 @@ case-insensitive and always against the WHOLE host, never per-label. A mask with
 no `*` is an exact hostname match. The deliberate edge case: `*.example.com` does
 NOT match the bare `example.com` (the mask's literal `.` must appear in the
 host) — list both entries if you want both covered. The exact edge-case semantics
-live in the `matches()` doc comment in `packages/dns-server/src/overrides.rs`.
+live in the `matches()` doc comment in `packages/dns-server/src/overrides/overrides.rs`.
 
 **Forgiving conversion:** as with the rest of the configuration, a broken entry is
 logged and skipped, not fatal: a `dns` entry whose `server` does not parse is

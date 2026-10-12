@@ -157,6 +157,7 @@
 
 mod android_log;
 mod callback;
+#[path = "engine/engine.rs"]
 mod engine;
 
 use std::panic::{self, AssertUnwindSafe};
@@ -303,8 +304,11 @@ fn ensure_tracing_subscriber(cfg: &Config) {
     });
 }
 
+#[path = "jni/jni_bridges.rs"]
 mod jni_bridges;
+#[path = "jni/jni_engine.rs"]
 mod jni_engine;
+#[path = "jni/jni_verify.rs"]
 mod jni_verify;
 mod pt_reap;
 

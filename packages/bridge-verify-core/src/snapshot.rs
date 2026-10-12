@@ -2,7 +2,7 @@
 //!
 //! Ported verbatim from the two byte-identical copies that used to live in
 //! `apps/socks5-proxy/src/bridge_verifier.rs` and
-//! `packages/android-ffi/src/jni_verify.rs` (they differed only in log-macro
+//! `packages/android-ffi/src/jni/jni_verify.rs` (they differed only in log-macro
 //! spelling, log prefix, and `Path` import style). The log prefix is a
 //! parameter so each consumer keeps its exact historical prefix string.
 

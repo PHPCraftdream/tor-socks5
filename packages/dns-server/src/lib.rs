@@ -19,16 +19,24 @@
 //! * [`server`] — the UDP/TCP listener tying it all together.
 #![warn(missing_docs)]
 
+#[path = "cache/cache.rs"]
 pub mod cache;
+#[path = "doh/doh_client.rs"]
 pub mod doh_client;
+#[path = "overrides/overrides.rs"]
 pub mod overrides;
+#[path = "doh/providers.rs"]
 pub mod providers;
+#[path = "server/server.rs"]
 pub mod server;
 
+#[path = "doh/error.rs"]
 mod error;
+#[path = "popular_prefetch/popular_prefetch.rs"]
 mod popular_prefetch;
 #[path = "statistics/query_statistics.rs"]
 mod query_statistics;
+#[path = "doh/types.rs"]
 mod types;
 
 pub use error::DnsServerError;

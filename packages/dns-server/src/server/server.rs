@@ -34,7 +34,7 @@ mod local;
 #[path = "server_socket_options.rs"]
 mod socket_options;
 #[cfg(test)]
-#[path = "server_tests.rs"]
+#[path = "tests/server_tests.rs"]
 mod tests;
 #[path = "server_wire.rs"]
 mod wire;

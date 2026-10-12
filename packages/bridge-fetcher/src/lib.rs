@@ -14,12 +14,17 @@
 //! httparse 1, url 2, webpki-roots 0.26, bridge-line (ptrs-gesher 0.6).
 #![warn(missing_docs)]
 
+#[path = "fetch/dedup.rs"]
 mod dedup;
+#[path = "fetch/direct.rs"]
 mod direct;
 mod error;
+#[path = "fetch/fetch.rs"]
 mod fetch;
 mod http;
+#[path = "parse/parse.rs"]
 mod parse;
+#[path = "parse/url_parse.rs"]
 mod url_parse;
 
 pub use dedup::dedup_bridges;

@@ -1,16 +1,30 @@
+#[path = "dns/dns_cache_tests.rs"]
 mod dns_cache_tests;
+#[path = "dns_save/dns_flush_save_race_tests.rs"]
 mod dns_flush_save_race_tests;
+#[path = "dns/dns_invalidation_tests.rs"]
 mod dns_invalidation_tests;
+#[path = "dns/dns_load_async_tests.rs"]
 mod dns_load_async_tests;
+#[path = "dns/dns_registry_tests.rs"]
 mod dns_registry_tests;
+#[path = "dns_save/dns_save_regression_tests.rs"]
 mod dns_save_regression_tests;
+#[path = "dns_save/dns_save_tests.rs"]
 mod dns_save_tests;
+#[path = "dns/dns_temp_ownership_tests.rs"]
 mod dns_temp_ownership_tests;
+#[path = "dns/dns_timestamp_tests.rs"]
 mod dns_timestamp_tests;
+#[path = "probe/probe_coalesce_regression_tests.rs"]
 mod probe_coalesce_regression_tests;
+#[path = "probe/probe_coalesce_tests.rs"]
 mod probe_coalesce_tests;
+#[path = "probe/probe_identity_tests.rs"]
 mod probe_identity_tests;
+#[path = "probe/probe_ordering_tests.rs"]
 mod probe_ordering_tests;
+#[path = "probe/probe_race_tests.rs"]
 mod probe_race_tests;
 mod transport_tests;
 
