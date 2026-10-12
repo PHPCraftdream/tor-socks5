@@ -229,7 +229,7 @@ The user-facing binary. Source modules under `src/`:
   env var overrides it, for embedding hosts (Android JNI) where
   `current_exe()` is the app process.
 * `seed.rs` — bundled seed bridges (`*.seeds`), the fallback when no
-  configured bridge is reachable at startup and `bridges.use_seeds`
+  configured bridge is reachable at startup and `use_seeds`
   is on.
 * `service.rs` — install/start/stop/status/uninstall across systemd,
   OpenRC, launchd, Windows SCM, BSD `rc.d` (via `service-manager`).
@@ -299,9 +299,15 @@ file. Resolution order (matches `README.md` and `Config::load_with_override`):
    (`tor-socks5.example.ktav` is the committed template; the default
    file is auto-created on first run if missing).
 
-Auxiliary files live next to the resolved config: `tor-socks5.users.ktav`
-(accounts) and `tor-socks5.alive-bridges.log` (probed-alive cache), plus
-`tor-socks5.candidates.log` and the pinned `arti-data/` state directory.
+Auxiliary files live next to the resolved config: `tor-socks5.bridges.ktav`
+(the bridge pool: `lines`, `sources`, health thresholds — the only config file
+the program rewrites at run time, via `Config::write_bridges`),
+`tor-socks5.users.ktav` (accounts) and `tor-socks5.alive-bridges.log`
+(probed-alive cache), plus `tor-socks5.candidates.log` and the pinned
+`arti-data/` state directory. A main config in the old layout (a `bridges`
+section, or `pattern` instead of `patterns` in `dns_server.overrides`) is
+rejected at load by `packages/proxy-config/src/layout/legacy.rs`;
+`tor-socks5 config migrate` (`layout/migrate.rs`) converts it.
 
 Schema (defaults):
 
@@ -317,7 +323,6 @@ log.targets.bridge_line: debug
 log.targets.tor_: warn
 log.targets.arti_: warn
 
-bridges.lines: []
 dns_server.enabled: false
 dns_server.listen: [
     127.0.0.1:15353
@@ -327,8 +332,8 @@ dns_server.overrides: []
 
 No `pt_binary` field: the proxy uses its own `current_exe()` for the
 PT child. See `README.md` for the canonical complete configuration reference
-(every section and field with its default) and `docs/bridges.md` for
-the bridge-health knobs. See
+(every section and field with its default, for both the main config and the
+bridges file) and `docs/bridges.md` for the bridge-health knobs. See
 `docs/auth.md` for `auth.enabled` / `auth.users_file` — the
 Android-facing knobs for RFC 1929 local authentication. The legacy
 scalar form `listen: addr` is still parsed for compatibility (a

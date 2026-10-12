@@ -8,7 +8,7 @@ actively blocked — its traffic looks like a normal TLS'd WebSocket
 session to a passive observer.
 
 tor-socks5 supports webtunnel alongside obfs4, and the two may be
-mixed freely in the same `bridges.lines` list. See `docs/bridges.md`
+mixed freely in the same `lines` list. See `docs/bridges.md`
 for the bridge-management machinery (probing, health, candidate pool)
 shared by both transports.
 
@@ -43,11 +43,12 @@ webtunnel binary, no extra build step.
 
 ## Configuring a webtunnel bridge
 
-Webtunnel bridges live in the main config under `bridges.lines`, one
-standard torrc bridge line each, alongside any obfs4 bridges:
+Webtunnel bridges live in the bridges file (`tor-socks5.bridges.ktav`, next to
+the main config) under `lines`, one standard torrc bridge line each,
+alongside any obfs4 bridges:
 
 ```ktav
-bridges.lines: [
+lines: [
     obfs4 198.51.100.7:9001 FINGERPRINT cert=... iat-mode=0
     webtunnel 192.0.2.3:1 2852538D49D7D73C1A6694FC492104983A9C4FA2 url=https://example.com/K2A2utQIMou4Ia2WjVseyDjV ver=0.0.3
 ]
@@ -76,7 +77,7 @@ A practical example mixing both transports, with a webtunnel bridge
 fronted by a CDN:
 
 ```ktav
-bridges.lines: [
+lines: [
     webtunnel [2001:db8::1]:443 1696D0A7C5994460B73E9A0FD853B3887388F6B0 url=https://fronted.example.com/secretpath ver=0.0.3
 ]
 ```

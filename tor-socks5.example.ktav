@@ -24,31 +24,12 @@ log.default: info
 log.output: stderr
 log.ansi: true
 
-bridges.lines: [
-    obfs4 198.51.100.7:9001 0000000000000000000000000000000000AAAAAA cert=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA iat-mode=0
-    webtunnel [2001:db8::1]:443 0000000000000000000000000000000000BBBBBB url=https://example.com/path ver=0.0.3
-]
-
-## WebTunnel first: the three collectors read the same Tor Project distribution
-## and test it on their own schedule, together about 150 tested bridges.
-bridges.sources: [
-    {
-        label: scriptzteam-v2-webtunnel-tested
-        url: https://raw.githubusercontent.com/scriptzteam/Tor-Bridges-Collector-v2/main/bridges/webtunnel_tested.txt
-    }
-    {
-        label: delta-webtunnel-tested
-        url: https://raw.githubusercontent.com/Delta-Kronecker/Tor-Bridges-Collector/main/bridge/webtunnel_tested.txt
-    }
-    {
-        label: onionhop-webtunnel-tested
-        url: https://raw.githubusercontent.com/center2055/OnionHop-Bridges-Collector/main/bridge/webtunnel_tested.txt
-    }
-    {
-        label: scriptzteam-v2-obfs4
-        url: https://raw.githubusercontent.com/scriptzteam/Tor-Bridges-Collector-v2/main/bridges/obfs4.txt
-    }
-]
+## The bridge pool (bridge lines, fetch sources, health thresholds) is NOT
+## configured here: it lives in tor-socks5.bridges.ktav next to this file,
+## created with defaults on first run. A starter with WebTunnel-first
+## sources: packages/proxy-config/examples/tor-socks5.bridges.example.ktav.
+## A config that still has a `bridges` section is rejected at start; convert
+## it with: tor-socks5 config migrate
 
 upstream.enabled: false
 upstream.address: 127.0.0.1:9050
@@ -100,14 +81,20 @@ warm_pool.refresh_interval_secs: 60
 ## Per-mask resolver overrides: hosts matching a glob mask skip the DoH pool and
 ## are resolved OUTSIDE the Tor tunnel (plain DNS or the OS resolver) — a
 ## deliberate, operator-opted exception. Full manual: docs/dns-server.md.
+## One entry takes a list of masks (`patterns`); first match wins, in list order.
 ## dns_server.overrides: [
 ##     {
-##         pattern: *.lan
+##         patterns: [
+##             *.lan
+##             *.home.arpa
+##         ]
 ##         resolver: system
-##         server: 
+##         server:
 ##     }
 ##     {
-##         pattern: ns.home.arpa
+##         patterns: [
+##             ns.home.arpa
+##         ]
 ##         resolver: dns
 ##         server: 192.168.1.1:53
 ##     }

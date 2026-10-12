@@ -24,15 +24,27 @@ provides both the `obfs4` and `webtunnel` client transports.
 
 ## Bridge lines (the working list)
 
-The working bridges live in the main config under `bridges.lines`, one
-standard torrc bridge line each. Both transports may be mixed freely:
+The whole bridge configuration — working list, fetch sources and health
+thresholds — lives in its own file next to the main config:
+`<stem>.bridges.ktav` (`tor-socks5.bridges.ktav` for `tor-socks5.ktav`). It is
+created with defaults on first run, and the program rewrites it as the pool
+changes, so the hand-edited main config is never touched at run time. Keys are
+top level, with no `bridges.` prefix; the README has the complete reference.
+
+The working bridges are the `lines` key, one standard torrc bridge line each.
+Both transports may be mixed freely:
 
 ```ktav
-bridges.lines: [
+lines: [
     obfs4 198.51.100.7:9001 FINGERPRINT cert=... iat-mode=0
     webtunnel [2001:db8::1]:443 FINGERPRINT url=https://example.com/path ver=0.0.3
 ]
 ```
+
+A config from an earlier version, with a `bridges` section inside the main
+file, is rejected at start with the command that converts it:
+`tor-socks5 config migrate --config <path>` (run with the service stopped; the
+old file is kept as `<name>.ktav.bak-N`).
 
 For webtunnel the `<addr>:<port>` is cosmetic — the real target is the
 `url=` host; the probe and the transport both account for this.
@@ -151,12 +163,12 @@ complementary, not a replacement.
 Fetching bridge lists, probing them, and using them are three decoupled
 steps so a huge crowd-sourced list never floods the network:
 
-1. **refresh** — fetch the configured `bridges.sources` over Tor, dedup,
+1. **refresh** — fetch the configured `sources` over Tor, dedup,
    drop anything already in the working list, and stash the rest in the
    **candidate pool** (`<stem>.candidates.log`). No probing here.
 2. **drain** — walk the pool **lazily, one bridge at a time** (short
    timeout, shuffled batch), promote the reachable ones into
-   `bridges.lines`, and remove every probed candidate from the pool
+   `lines`, and remove every probed candidate from the pool
    (reachable → promoted, dead → discarded; unprobed stay for next time).
    Because dead entries are dropped, the pool steadily advances across
    drains instead of re-probing a dead head. Needs no Tor — it only
@@ -173,14 +185,14 @@ write lock (`<stem>.candidates.log.lock`): a daemon drain and a CLI
 concurrent additions survive and entries consumed by a drain (promoted or
 dead) stay removed.
 
-## Sources (`bridges.sources`)
+## Sources (`sources`)
 
 Where fresh bridges are fetched from. The minimal form is just a `url`;
 `label`, `headers`, and `cookies` are optional, so a collector that needs
 an API token or a session cookie can be hit in a custom way:
 
 ```ktav
-bridges.sources: [
+sources: [
     { url: https://example.com/bridges-obfs4 }
     {
         label: private-collector

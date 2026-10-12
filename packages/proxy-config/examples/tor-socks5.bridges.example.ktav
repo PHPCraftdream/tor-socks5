@@ -1,0 +1,34 @@
+## tor-socks5 bridge pool template.
+## Copy this file to tor-socks5.bridges.ktav next to your tor-socks5.ktav and
+## edit. The program rewrites that file as the pool changes (new bridges
+## merged in, dead ones pruned), so comments are not kept after the first
+## rewrite. Keys are top level: there is no `bridges.` prefix.
+##
+## Ktav syntax: only ## at the start of a line is a comment.
+## A single # is content. No inline or trailing comments.
+
+lines: [
+    obfs4 198.51.100.7:9001 0000000000000000000000000000000000AAAAAA cert=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA iat-mode=0
+    webtunnel [2001:db8::1]:443 0000000000000000000000000000000000BBBBBB url=https://example.com/path ver=0.0.3
+]
+
+## WebTunnel first: the three collectors read the same Tor Project distribution
+## and test it on their own schedule, together about 150 tested bridges.
+sources: [
+    {
+        label: scriptzteam-v2-webtunnel-tested
+        url: https://raw.githubusercontent.com/scriptzteam/Tor-Bridges-Collector-v2/main/bridges/webtunnel_tested.txt
+    }
+    {
+        label: delta-webtunnel-tested
+        url: https://raw.githubusercontent.com/Delta-Kronecker/Tor-Bridges-Collector/main/bridge/webtunnel_tested.txt
+    }
+    {
+        label: onionhop-webtunnel-tested
+        url: https://raw.githubusercontent.com/center2055/OnionHop-Bridges-Collector/main/bridge/webtunnel_tested.txt
+    }
+    {
+        label: scriptzteam-v2-obfs4
+        url: https://raw.githubusercontent.com/scriptzteam/Tor-Bridges-Collector-v2/main/bridges/obfs4.txt
+    }
+]

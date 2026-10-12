@@ -193,8 +193,8 @@ simply never win and cost one timed-out attempt each (details in the providers.r
 ## Exceptions (per-mask overrides)
 
 `dns_server.overrides` is an operator-listed array of hostname masks that skip the
-DoH-over-Tor pool entirely: each entry pairs a glob `pattern` with the resolver that
-handles matching hosts — the operating-system resolver (`resolver: system`, 10s
+DoH-over-Tor pool entirely: each entry pairs a list of glob masks (`patterns`) with the resolver
+that handles matching hosts — the operating-system resolver (`resolver: system`, 10s
 timeout) or one plain DNS server (`resolver: dns` + `server: ip:port`, UDP with a
 TCP retry on truncation, 5s timeout). Masks are scanned in list order and the FIRST
 match wins; a host matching no mask keeps the default pool path. Override answers
@@ -210,29 +210,41 @@ share the same TTL cache as ordinary answers.
 dns_server.overrides: [
     {
         ## all three fields are required; `server` stays empty for `system`
-        pattern: *.lan
+        patterns: [
+            *.lan
+            *.home.arpa
+        ]
         resolver: system
-        server: 
+        server:
     }
     {
-        pattern: ns.home.arpa
+        patterns: [
+            ns.home.arpa
+        ]
         resolver: dns
         server: 192.168.1.1:53
     }
 ]
 ```
 
+One entry takes any number of masks; each mask becomes its own exception in list
+order, all sharing the entry's resolver. A lone string (`patterns: *.lan`) is read
+as a one-element list. The older single-mask key `pattern` is no longer accepted:
+a config that still uses it is rejected at start, and `tor-socks5 config migrate`
+rewrites every `pattern: X` as `patterns: [X]`.
+
 **Mask syntax:** `*` matches any run of characters including none; matching is
-case-insensitive and always against the WHOLE host, never per-label. A pattern with
+case-insensitive and always against the WHOLE host, never per-label. A mask with
 no `*` is an exact hostname match. The deliberate edge case: `*.example.com` does
-NOT match the bare `example.com` (the pattern's literal `.` must appear in the
+NOT match the bare `example.com` (the mask's literal `.` must appear in the
 host) — list both entries if you want both covered. The exact edge-case semantics
 live in the `matches()` doc comment in `packages/dns-server/src/overrides.rs`.
 
 **Forgiving conversion:** as with the rest of the configuration, a broken entry is
 logged and skipped, not fatal: a `dns` entry whose `server` does not parse is
 skipped; a `system` entry with a non-empty `server` warns and keeps the system
-resolver; an entry with an empty `pattern` is skipped.
+resolver; an empty mask is skipped (the entry's other masks stay), and so is an
+entry left with no usable mask.
 
 ## Caching
 

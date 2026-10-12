@@ -80,11 +80,12 @@ entry is lowered or deleted as the directory is split.
 ## Quick start
 
 ```bash
-# 1. Copy the example config and fill in your bridges:
+# 1. Copy the example config (the bridge pool lives in its own file, created on first run):
 cp tor-socks5.example.ktav tor-socks5.ktav   # Windows: copy tor-socks5.example.ktav tor-socks5.ktav
 
-# 2. Edit tor-socks5.ktav and add at least one working bridge under bridges.lines,
-#    then start the proxy. The proxy listens on 127.0.0.1:1080 by default.
+# 2. Start the proxy once: it creates tor-socks5.bridges.ktav next to the config.
+#    Add at least one working bridge under `lines` there, then start it again.
+#    The proxy listens on 127.0.0.1:1080 by default.
 #    (tor-socks5.ktav is .gitignore'd — your local edits stay out of version control.)
 tor-socks5
 
@@ -103,11 +104,18 @@ Config is a [Ktav](https://github.com/ktav-lang/rust) file. Resolution order:
 2. `$TOR_SOCKS5_CONFIG`, then
 3. `tor-socks5.ktav` in the current directory (copy from `tor-socks5.example.ktav`).
 
-The block below is the **canonical complete reference**: every configuration section and every
-field, shown at its built-in default (mirroring `packages/proxy-config/src/lib.rs`). The committed
-starter template `tor-socks5.example.ktav` — a bare default `tor-socks5.ktav` is also auto-created
-on first run — is a shorter, ready-to-edit subset of the same defaults; any key you omit keeps the
-default shown here.
+The configuration is **two files** next to each other:
+
+- `tor-socks5.ktav` — the main config, edited by hand; the program never rewrites it while running;
+- `tor-socks5.bridges.ktav` — the bridge pool (`lines`, `sources`, health thresholds), which the
+  program rewrites as the pool changes (new bridges merged in, dead ones pruned). It is created
+  with defaults on first run; its path is always `<main config stem>.bridges.ktav`.
+
+The block below is the **canonical complete reference of the main config**: every section and
+field, shown at its built-in default (mirroring `packages/proxy-config/src/lib.rs`); the bridges
+file has its own reference further down. The committed starter template
+`tor-socks5.example.ktav` — a bare default `tor-socks5.ktav` is also auto-created on first run — is
+a shorter, ready-to-edit subset of the same defaults; any key you omit keeps the default shown here.
 
 ```ktav
 ## Canonical complete configuration reference: every section and field
@@ -141,57 +149,6 @@ log.output: stderr
 log.file:
 ## Colorize on a real terminal; forced off for file/pipe output
 log.ansi: true
-
-## Bridge lines in torrc format (obfs4 / webtunnel).
-bridges.lines: [
-    obfs4 198.51.100.7:9001 FINGERPRINT cert=... iat-mode=0
-]
-
-## Where `tor-socks5 bridges fetch` pulls fresh bridge lists from. A
-## source is at minimum { url: ... }; label, headers (full Name: Value
-## lines) and cookies (name=value) are optional, for collectors that
-## need an API token or session cookie. allow_credentials_cross_origin
-## (default false) opts in to sending those headers/cookies to redirect
-## targets on a different origin. Omit the key for the built-in pool.
-bridges.sources: [
-    {
-        label: private-collector
-        url: https://api.example.org/bridges
-        headers: [
-            Authorization: Bearer SECRET
-        ]
-        cookies: [
-            session=abc123
-        ]
-        allow_credentials_cross_origin: false
-    }
-]
-
-## Fall back to built-in seed bridges when no configured line is reachable
-bridges.use_seeds: true
-## Background-fetch from sources after bootstrap when fewer than
-## bridges.min_alive bridges are usable
-bridges.auto_fetch: true
-## auto_fetch threshold: fetch when fewer than this many are usable
-bridges.min_alive: 8
-## Reject a bridge-list response larger than this many MiB
-bridges.max_body_mib: 64
-## TCP-probe failures before a bridge is pruned from the config
-bridges.max_fails: 24
-## Rate-limit window for that counter, in minutes
-bridges.fail_window_mins: 60
-## Cadence of the background re-probe/fetch task, in minutes (0 = off)
-bridges.recheck_interval_mins: 60
-## Circuit-layer failures before a TCP-alive bridge is pruned
-bridges.max_circuit_fails: 5
-## Rate-limit window for that counter, in minutes
-bridges.circuit_observation_window_mins: 30
-## Override iat-mode on every obfs4 line: 0 keeps published values,
-## 1 on, 2 paranoid (costs latency and throughput)
-bridges.iat_mode: 0
-## Preferred transport: any | obfs4 | webtunnel — a preference; the
-## rest of the pool stays available as fallback
-bridges.transport: any
 
 ## Stale-channel watchdog: rebuilds the Tor client when connects keep
 ## failing against channels left half-open by a silent network change.
@@ -273,19 +230,25 @@ dns_server.custom_doh_providers: [
         path: /dns-query
     }
 ]
-## Per-mask exceptions: hosts matching a glob pattern skip the
+## Per-mask exceptions: hosts matching any glob in `patterns` skip the
 ## DoH-over-Tor pool and resolve via the OS resolver (resolver: system)
-## or one plain DNS server (resolver: dns + server ip:port). First
-## match wins. A matching host LEAVES the Tor tunnel — see the warning
-## in docs/dns-server.md.
+## or one plain DNS server (resolver: dns + server ip:port). One entry
+## takes a whole list of masks (a lone string is read as a one-element
+## list). First match wins, in list order. A matching host LEAVES the
+## Tor tunnel — see the warning in docs/dns-server.md.
 dns_server.overrides: [
     {
-        pattern: *.lan
+        patterns: [
+            *.lan
+            *.home.arpa
+        ]
         resolver: system
         server:
     }
     {
-        pattern: ns.home.arpa
+        patterns: [
+            ns.home.arpa
+        ]
         resolver: dns
         server: 192.168.1.1:53
     }
@@ -295,7 +258,83 @@ dns_server.overrides: [
 > **Ktav comments are `##` at the start of a line** (a single `#` is content, and there are no
 > trailing/inline comments — a value runs verbatim to end of line).
 
-Auxiliary files live next to the main config: `tor-socks5.users.ktav` (accounts) and
+
+### The bridges file
+
+`tor-socks5.bridges.ktav` holds the bridge pool. It is the **canonical complete reference** of
+that file (every key at its built-in default); the keys are top level — there is no `bridges.`
+prefix and no wrapping section. The program rewrites the file whenever the pool changes (comments
+are not kept), so hand edits are best made while the service is stopped. A missing file means
+"built-in defaults"; it is created on the first run.
+
+```ktav
+## Bridge lines in torrc format (obfs4 / webtunnel).
+lines: [
+    obfs4 198.51.100.7:9001 FINGERPRINT cert=... iat-mode=0
+]
+
+## Where `tor-socks5 bridges fetch` pulls fresh bridge lists from. A
+## source is at minimum { url: ... }; label, headers (full Name: Value
+## lines) and cookies (name=value) are optional, for collectors that
+## need an API token or session cookie. allow_credentials_cross_origin
+## (default false) opts in to sending those headers/cookies to redirect
+## targets on a different origin. Omit the key for the built-in pool.
+sources: [
+    {
+        label: private-collector
+        url: https://api.example.org/bridges
+        headers: [
+            Authorization: Bearer SECRET
+        ]
+        cookies: [
+            session=abc123
+        ]
+        allow_credentials_cross_origin: false
+    }
+]
+
+## Fall back to built-in seed bridges when no configured line is reachable
+use_seeds: true
+## Background-fetch from sources after bootstrap when fewer than
+## min_alive bridges are usable
+auto_fetch: true
+## auto_fetch threshold: fetch when fewer than this many are usable
+min_alive: 8
+## Reject a bridge-list response larger than this many MiB
+max_body_mib: 64
+## TCP-probe failures before a bridge is pruned from the pool
+max_fails: 24
+## Rate-limit window for that counter, in minutes
+fail_window_mins: 60
+## Cadence of the background re-probe/fetch task, in minutes (0 = off)
+recheck_interval_mins: 60
+## Circuit-layer failures before a TCP-alive bridge is pruned
+max_circuit_fails: 5
+## Rate-limit window for that counter, in minutes
+circuit_observation_window_mins: 30
+## Override iat-mode on every obfs4 line: 0 keeps published values,
+## 1 on, 2 paranoid (costs latency and throughput)
+iat_mode: 0
+## Preferred transport: any | obfs4 | webtunnel — a preference; the
+## rest of the pool stays available as fallback
+transport: any
+```
+
+### Upgrading from the old layout
+
+Earlier versions kept the bridge pool as a `bridges` section inside `tor-socks5.ktav` and wrote
+each DNS exception mask as `pattern: <mask>`. Such a config is **rejected at start** with an error
+naming each difference. Convert it with the service stopped:
+
+```bash
+tor-socks5 config migrate --config /path/to/tor-socks5.ktav
+```
+
+The `bridges` section moves into `tor-socks5.bridges.ktav`, every `pattern: X` becomes
+`patterns: [X]`, and the old file is kept as `tor-socks5.ktav.bak-N`. Nothing is written unless
+the converted result is valid, and a config that is already current is left untouched.
+
+Other auxiliary files live next to the main config: `tor-socks5.users.ktav` (accounts) and
 `tor-socks5.alive-bridges.log` (probed-alive cache).
 
 These manuals are also embedded in the binary — run `tor-socks5 help` to

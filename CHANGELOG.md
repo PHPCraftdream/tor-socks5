@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (breaking: config layout)
+
+- **The bridge pool moved to its own file.** `lines`, `sources` and the health
+  thresholds (everything that used to be the `bridges` section) now live in
+  `<name>.bridges.ktav` next to the main config, with top-level keys and no
+  `bridges.` prefix. The program rewrites only that file as the pool changes, so
+  the hand-edited main config is no longer rewritten at run time. A missing file
+  means built-in defaults; it is created with defaults on first run.
+  `Config::write_bridges` writes the pool alone; `Config::write` writes both.
+- **`dns_server.overrides` entries take a list of masks**: `patterns: [*.ru,
+  *.рф]` replaces the single-mask `pattern: *.ru`. A lone string under
+  `patterns` is read as a one-element list; each mask becomes its own exception
+  in list order, sharing the entry's resolver.
+- A config in the old layout (a `bridges` section in the main file, or
+  `pattern`) is **rejected at start** with an error naming every difference and
+  the fix. New command `tor-socks5 config migrate [--config <path>]` converts it:
+  moves the pool into the bridges file, rewrites `pattern` as `patterns`, keeps
+  the old file as `<name>.ktav.bak-N`, writes nothing unless the converted result
+  is valid, and leaves a config that is already current untouched. Run it with
+  the service stopped.
+
 ### Added
 
 - **Directory-size rule in CI**: a first-party directory may hold at most 7

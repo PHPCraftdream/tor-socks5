@@ -24,7 +24,7 @@ tor-socks5 service install --user
 - Resolves the binary path (`current_exe`) and an **absolute** config path. Because a service
   has an unpredictable working directory, the config path is pinned into the service definition;
   if no `--config` is given, `tor-socks5.ktav` in the current directory is used. A default
-  config is created there if none exists, so the service can start.
+  config (with its bridges file) is created there if none exists, so the service can start.
 - Enables start-on-boot and an on-failure restart policy.
 
 So install from the directory holding your config, or pass `--config`:
