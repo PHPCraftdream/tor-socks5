@@ -381,13 +381,13 @@ pub(super) async fn bootstrap_stall_watchdog(tunnel: TorTunnel, callback: Bootst
 ///    [`persist_and_rank_probe`] -- the same store `engine_async` writes to at bootstrap. This
 ///    session's already-chosen bridge/circuit is unaffected; the point is keeping the
 ///    persisted ranking fresh so the *next* connect starts from the genuinely fastest known
-///    bridge (docs/circuit-speed-plan.md's Tier 1) instead of whatever was fastest whenever
+///    bridge (docs/plans/circuit-speed-plan.md's Tier 1) instead of whatever was fastest whenever
 ///    bootstrap last probed.
 /// 3. Immediately after job 2, if the reachable count fell below
 ///    `bridge_health.bridges_cfg.min_alive` and `auto_fetch` is enabled, fetches fresh
 ///    candidates from `bridges_cfg.sources` over this *already-live* tunnel -- the same fetch
 ///    `nativeRefreshBridges` does on a manual tap, just triggered automatically instead of only
-///    from the menu (docs/android-bridge-freshness-plan.md's Phase 2). Newly found bridges are
+///    from the menu (docs/plans/android-bridge-freshness-plan.md's Phase 2). Newly found bridges are
 ///    handed to Kotlin via [`take_auto_fetched_bridges`]/`nativeTakeAutoFetchedBridges`, mirroring
 ///    [`take_pruned_bridges`]'s pattern -- this task has no access to `Prefs.bridgesList`, only
 ///    Kotlin does.

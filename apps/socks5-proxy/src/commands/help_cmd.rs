@@ -15,37 +15,37 @@ const TOPICS: &[(&str, &str, &str)] = &[
     (
         "bridges",
         "Bridges, transports, health, candidate pool, sources",
-        include_str!("../../../../docs/bridges.md"),
+        include_str!("../../../../docs/guide/bridges.md"),
     ),
     (
         "webtunnel",
         "The webtunnel pluggable transport",
-        include_str!("../../../../docs/webtunnel.md"),
+        include_str!("../../../../docs/guide/webtunnel.md"),
     ),
     (
         "auth",
         "User accounts, passwords, and .onion gating",
-        include_str!("../../../../docs/auth.md"),
+        include_str!("../../../../docs/guide/auth.md"),
     ),
     (
         "upstream",
         "Egress through an upstream SOCKS5 proxy",
-        include_str!("../../../../docs/upstream.md"),
+        include_str!("../../../../docs/guide/upstream.md"),
     ),
     (
         "dns-server",
         "Optional local DNS server resolving every query via DoH over Tor",
-        include_str!("../../../../docs/dns-server.md"),
+        include_str!("../../../../docs/guide/dns-server.md"),
     ),
     (
         "logging",
         "Log sinks, levels, non-blocking writer",
-        include_str!("../../../../docs/logging.md"),
+        include_str!("../../../../docs/guide/logging.md"),
     ),
     (
         "service",
         "Install/start/stop as an OS service",
-        include_str!("../../../../docs/service.md"),
+        include_str!("../../../../docs/guide/service.md"),
     ),
     (
         "architecture",

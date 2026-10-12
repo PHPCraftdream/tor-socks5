@@ -226,4 +226,4 @@ unreachable» retry идёт по `parsed_bridges` (все транспорты)
   1–2 сократят время восстановления, но не устранят сами обрывы;
   структурный ответ на DPI — webtunnel-пул (отдельная, уже отложенная
   тема: скрейпленный webtunnel почти весь сожжён, см.
-  `docs/censorship-findings.md`).
+  `docs/project/censorship-findings.md`).

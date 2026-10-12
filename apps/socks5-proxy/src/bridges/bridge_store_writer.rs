@@ -1,8 +1,8 @@
 //! Single writer for the bridge health store (`<config>.alive-bridges.log`).
 //!
 //! Concurrency contract (fixes the P1 racing-writes finding in
-//! docs/stability-review-2026-09-08.md, plus TS2-02/TS2-03 in
-//! docs/review-round-2-2026-09-08.md):
+//! docs/reviews/2026-09-07-08/stability-review-2026-09-08.md, plus TS2-02/TS2-03 in
+//! docs/reviews/2026-09-07-08/review-round-2-2026-09-08.md):
 //!
 //! * Daemon: exactly one actor task owns every publish. Writers send a
 //!   mutation through an mpsc channel; the actor applies mutations one at a

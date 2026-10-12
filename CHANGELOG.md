@@ -33,10 +33,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Directory-size rule in CI**: a first-party directory may hold at most 7
   entries (files and sub-directories together), next to the existing limit of
   1000 lines per Rust file. `scripts/check-dir-entries.sh` counts what git
-  tracks and runs in the new `dir-entries` CI job; `vendor/` is exempt. The eight
-  directories already over the limit are recorded with their current size as a
-  ratchet: they cannot grow, no new directory may exceed the limit, and entries
-  are lowered as directories are split.
+  tracks and runs in the new `dir-entries` CI job; `vendor/` is exempt. The
+  directories over the limit are recorded with their current size as a ratchet:
+  they cannot grow, no new directory may exceed the limit, and entries are
+  lowered as directories are split. The application and four package source
+  trees and `docs/` are now within the limit; only the repository root and
+  `packages/` remain on the list.
+- **Documentation moved into sub-directories**: the manuals are in `docs/guide/`
+  (`bridges.md`, `webtunnel.md`, `auth.md`, `upstream.md`, `dns-server.md`,
+  `service.md`, `logging.md`), and `docs/architecture.md` stays. Design notes,
+  plans, Android material and review records live in `docs/project/`,
+  `docs/plans/`, `docs/android/` and `docs/reviews/`. Links in the README, the
+  examples and the built-in `tor-socks5 help` topics follow the new paths.
 - Comma shorthand `host1,host2:port` for scalar/list `listen` and
   `dns_server.listen` values, with bracketed IPv6 hosts. Expansion deduplicates
   addresses keeping the first occurrence; config writeback uses expanded lists.
@@ -133,7 +141,7 @@ First versioned release: versioning starts here, everything below is what
   A and AAAA questions are cached separately. Requires the Tor
   egress — enabling it together with `upstream.*` is a startup error
   rather than a silent plaintext-DNS leak. Documented in
-  `docs/dns-server.md` (`tor-socks5 help dns-server`).
+  `docs/guide/dns-server.md` (`tor-socks5 help dns-server`).
 - **Per-mask resolver exceptions for the local DNS server**
   (`dns_server.overrides`): the operator lists hostname masks (`*` wildcard,
   case-insensitive, whole-host match, first match in list order wins); a queried
@@ -144,7 +152,7 @@ First versioned release: versioning starts here, everything below is what
   default empty list keeps the documented "plaintext DNS only inside the tunnel"
   guarantee intact). Override answers share the same TTL cache as ordinary
   answers; conversion is forgiving — a broken entry is logged and skipped rather
-  than fatal. Documented in `docs/dns-server.md`.
+  than fatal. Documented in `docs/guide/dns-server.md`.
 - **Periodic connection-health summary log** (`conn_health.rs`): a new
   background task drains a rolling window of accept-loop counters — new
   connections, successful `tor connection established` events, and errors
@@ -292,7 +300,7 @@ First versioned release: versioning starts here, everything below is what
   `tor-guardmgr`), which sit under upstream-owned crates.io names:
   publishing one would hijack another project's crate. Publication is
   deliberately withheld for now (the intended release artifact is one
-  cohesive `tor-socks5` package — `docs/sdk-package-design.md`), enforced
+  cohesive `tor-socks5` package — `docs/project/sdk-package-design.md`), enforced
   by the new `scripts/check-publish-guard.sh` and its CI `publish-guard`
   job: the script discovers manifests the same way `check-line-limit.sh`
   does (`git ls-files`, tracked + untracked), so a brand-new crate cannot

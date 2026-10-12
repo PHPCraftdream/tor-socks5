@@ -7,7 +7,7 @@
 # feature makes the table KEY the extern-crate name, not this field.
 name = "tor-socks5-auth"
 # Not published: the release artifact is the single `tor-socks5` package;
-# workspace crates are its internal modules (docs/sdk-package-design.md).
+# workspace crates are its internal modules (docs/project/sdk-package-design.md).
 publish = false
 version = "0.1.0"
 edition.workspace = true

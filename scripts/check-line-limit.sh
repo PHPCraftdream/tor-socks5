@@ -5,7 +5,7 @@
 # vendor/* is deliberately out of scope: it is vendored upstream Arti code,
 # synced with upstream and split along upstream module boundaries, so the
 # first-party limit does not apply to it
-# (docs/stability-review-2026-09-08.md, "Проверки, которые стоит закрепить в CI").
+# (docs/reviews/2026-09-07-08/stability-review-2026-09-08.md, "Проверки, которые стоит закрепить в CI").
 #
 # BASELINE lists files that still exceeded the limit when this check was
 # introduced; splitting them is tracked separately. Any file outside the

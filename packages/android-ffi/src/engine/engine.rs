@@ -458,7 +458,7 @@ async fn engine_async(
 
     // Full, pristine set of configured bridges -- captured before the probe below narrows
     // `settings.bridges` down to just the ones alive at bootstrap time (see the reassignment
-    // a few lines down). `stall_watchdog`'s periodic re-probe (docs/circuit-speed-plan.md's
+    // a few lines down). `stall_watchdog`'s periodic re-probe (docs/plans/circuit-speed-plan.md's
     // Tier 1) needs the *original* list: a bridge dead at bootstrap can come back later, and
     // that is exactly the information the persisted ranking should pick up for the next
     // connect.

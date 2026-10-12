@@ -207,7 +207,7 @@ pub(super) fn snapshot_cache_dir(src: &std::path::Path, dest: &std::path::Path) 
 ///   exact token. Fail closed: unprovable ownership is never killed (and warned about); there
 ///   is no global registry, so overlapping batches, sibling parallel checks, and the main
 ///   engine's PT can never match -- their state locations differ by construction.
-///   See `docs/stability-review-2026-09-08.md` section 2 for the ownership analysis.
+///   See `docs/reviews/2026-09-07-08/stability-review-2026-09-08.md` section 2 for the ownership analysis.
 /// - **A cache *snapshot*, not the live directory.** `tor_dirmgr`'s storage is a single sqlite
 ///   file, opened with its own fresh `rusqlite::Connection` here, completely independent of the
 ///   main engine's already-open connection to that same file. Sqlite's default `busy_timeout`

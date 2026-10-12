@@ -134,7 +134,7 @@
 //!
 //! The SOCKS5 listener started by `nativeStart` shares the exact same RFC 1929
 //! USERNAME/PASSWORD authenticator (`auth::AuthState`, Argon2id + HMAC success cache) as the CLI
-//! (`apps/socks5-proxy`) — see `docs/auth.md` for the full design. Resolution happens once,
+//! (`apps/socks5-proxy`) — see `docs/guide/auth.md` for the full design. Resolution happens once,
 //! synchronously, inside `nativeStart` (step 7a below), *before* the engine thread is spawned:
 //!
 //! 1. `cfg.auth.enabled == false` → anonymous NO_AUTH, logged at `info`.

@@ -409,7 +409,7 @@ fn snapshot_cache_dir(src: &Path, dest: &Path, deadline: Option<std::time::Insta
 /// the check window and would then appear "new" and get killed, taking
 /// the user's live tunnels down with the cleanup. A restarted main PT
 /// child has the normal exe name and can never match a marker. See
-/// `docs/stability-review-2026-09-08.md` section 2.
+/// `docs/reviews/2026-09-07-08/stability-review-2026-09-08.md` section 2.
 ///
 /// Deliberate tradeoffs: the marker copy costs one file link/copy per
 /// batch (cheap, and the scratch dir is wiped with the batch); the

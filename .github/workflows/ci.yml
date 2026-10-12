@@ -99,9 +99,9 @@ jobs:
       # the same list scripts/check-publish-guard.sh enforces. It is empty
       # today (all 20 package manifests carry publish = false), so the job
       # logs an explicit no-op instead of failing or skipping silently; once
-      # the consolidated tor-socks5 crate exists (docs/sdk-package-design.md,
+      # the consolidated tor-socks5 crate exists (docs/project/sdk-package-design.md,
       # §6), every listed crate is packaged with `cargo package -p <crate>
-      # --no-verify` (docs/publishing.md).
+      # --no-verify` (docs/project/publishing.md).
       - name: Resolve the publishable crate list
         id: crates
         run: echo "crates=$(sh scripts/publishable-crates.sh | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
@@ -136,7 +136,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
-      # r27c matches the locally verified build in docs/android-cross-compile.md.
+      # r27c matches the locally verified build in docs/android/android-cross-compile.md.
       - id: ndk
         uses: nttld/setup-ndk@v1
         with:
@@ -148,7 +148,7 @@ jobs:
       # cargo-ndk injects the per-target CARGO_TARGET_*_LINKER plus CC/AR/CXX
       # env vars; without it, cc-based build scripts (ring, libsqlite3-sys
       # bundled sqlite, zstd-sys) have no NDK toolchain to compile C against
-      # (see docs/android-cross-compile.md, "Why no .cargo/config.toml").
+      # (see docs/android/android-cross-compile.md, "Why no .cargo/config.toml").
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
       # Scoped to the packages that actually ship on Android (matches the

@@ -223,7 +223,7 @@ pub struct Settings {
     /// its own, unshared `state_dir` for guard state -- an unverified candidate must never
     /// become part of anyone's real guard sample.
     pub cache_dir: Option<PathBuf>,
-    /// Tier 2 (docs/circuit-speed-plan.md): restrict middle/exit relay selection to the
+    /// Tier 2 (docs/plans/circuit-speed-plan.md): restrict middle/exit relay selection to the
     /// upper `min_bandwidth_percentile`-th percentile of consensus bandwidth. `0` (default)
     /// disables the floor -- stock, bandwidth-weighted-but-unrestricted selection. Trades
     /// anonymity (a smaller candidate pool) for fewer slow hops.
@@ -850,7 +850,7 @@ fn build_config(settings: &Settings) -> Result<TorClientConfig> {
             .state_dir(join("state"));
     }
 
-    // Tier 2 (docs/circuit-speed-plan.md): the default floor is zero, so this is a no-op
+    // Tier 2 (docs/plans/circuit-speed-plan.md): the default floor is zero, so this is a no-op
     // unless explicitly opted into.
     builder
         .path_rules()
@@ -914,7 +914,7 @@ fn build_config(settings: &Settings) -> Result<TorClientConfig> {
             // stale/shared arti state dir (a persisted netdir guard sample
             // + cached consensus from prior runs) keeping arti in direct
             // mode. Pinning `Settings::state_dir` to an app-local directory
-            // (see above) fixed it. See docs/webtunnel.md.
+            // (see above) fixed it. See docs/guide/webtunnel.md.
         }
     }
 

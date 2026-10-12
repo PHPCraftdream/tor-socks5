@@ -843,7 +843,7 @@ pub(crate) fn get_current_tunnel() -> Option<TorTunnel> {
 
 /// Bridges `persist_and_rank_probe` has pruned (crossed `max_fails`/`max_circuit_fails`)
 /// since the last time Kotlin drained them via `nativeTakePrunedBridges`
-/// (docs/android-bridge-freshness-plan.md's Phase 1). `Prefs.bridgesList` on the Kotlin side
+/// (docs/plans/android-bridge-freshness-plan.md's Phase 1). `Prefs.bridgesList` on the Kotlin side
 /// is the actual source of truth for what gets probed/bootstrapped next -- this is just the
 /// handoff channel, mirroring `CURRENT_TUNNEL`'s pattern.
 pub(super) static PRUNED_BRIDGES: OnceLock<Mutex<Vec<BridgeLine>>> = OnceLock::new();
@@ -868,7 +868,7 @@ pub(crate) fn take_pruned_bridges() -> Vec<BridgeLine> {
     std::mem::take(&mut *lock.lock().unwrap_or_else(|p| p.into_inner()))
 }
 
-/// Bridges `stall_watchdog`'s auto-fetch has found (docs/android-bridge-freshness-plan.md's
+/// Bridges `stall_watchdog`'s auto-fetch has found (docs/plans/android-bridge-freshness-plan.md's
 /// Phase 2) since the last time Kotlin drained them via `nativeTakeAutoFetchedBridges`. Same
 /// handoff pattern as [`PRUNED_BRIDGES`] -- `stall_watchdog` has no access to
 /// `Prefs.bridgesList`, only Kotlin does.

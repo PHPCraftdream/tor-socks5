@@ -33,7 +33,7 @@
 //! select guard ... N/M as unsuitable to purpose"` is not per-guard
 //! structured). That class of rejection — typically a descriptor/
 //! fingerprint mismatch — is invisible to this layer; the TCP-probe
-//! failure counter remains the only signal for it. See `docs/bridges.md`.
+//! failure counter remains the only signal for it. See `docs/guide/bridges.md`.
 //!
 //! **Known limitation — channel & PT-handshake timeouts.** A bridge whose
 //! TCP works but whose obfs4/webtunnel handshake times out (the live

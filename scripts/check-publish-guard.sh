@@ -8,9 +8,9 @@
 # forever), and the vendor/* forks live under upstream-owned crates.io names,
 # so publishing one would hijack another project's crate. The single future
 # exception is the consolidated `tor-socks5` package
-# (docs/sdk-package-design.md): a manifest may drop `publish = false` only
+# (docs/project/sdk-package-design.md): a manifest may drop `publish = false` only
 # after its package name is added to scripts/publishable-crates.sh — see
-# docs/publishing.md.
+# docs/project/publishing.md.
 #
 # The root Cargo.toml is a pure [workspace] manifest; files without a
 # [package] section are silently skipped by the content test below.
@@ -64,13 +64,13 @@ EOF
 
 # Allowlist hygiene: every entry must have a matching manifest that actually
 # dropped `publish = false`; stale entries fail, so the list can only move
-# deliberately (docs/publishing.md).
+# deliberately (docs/project/publishing.md).
 while IFS= read -r name; do
     [ -n "$name" ] || continue
     if printf '%s\n' "$allowlisted_ok" | grep -Fxq -- "$name"; then
         continue
     fi
-    printf "publish-guard: ERROR: scripts/publishable-crates.sh lists '%s', but its manifest is missing, still carries 'publish = false', or has no readable [package] name; keep the allowlist and the manifests in sync (docs/publishing.md)\n" "$name"
+    printf "publish-guard: ERROR: scripts/publishable-crates.sh lists '%s', but its manifest is missing, still carries 'publish = false', or has no readable [package] name; keep the allowlist and the manifests in sync (docs/project/publishing.md)\n" "$name"
     status=1
 done <<EOF
 $publishable

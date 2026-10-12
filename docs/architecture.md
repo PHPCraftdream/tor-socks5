@@ -4,7 +4,7 @@ A local same-port SOCKS5 / HTTP CONNECT → Tor gateway built on `arti-client`, 
 **obfs4 + webtunnel** pluggable-transport support. The user-facing
 artifact is a single binary (the `socks5-proxy` crate): it acts as the
 SOCKS5 proxy when invoked normally and as the PT process when re-invoked
-by arti's `tor-ptmgr` (see `docs/bridges.md` for the busybox dispatch).
+by arti's `tor-ptmgr` (see `docs/guide/bridges.md` for the busybox dispatch).
 
 ## Workspace layout
 
@@ -56,7 +56,7 @@ passes `current_exe()` as `pt_binary` so arti spawns *us* for the PT
 child (busybox dispatch). `Settings::state_dir` pins arti's on-disk
 state and cache under an app-local directory so a stale guard sample
 or cached consensus from another arti instance can never shadow the
-configured bridges — see `docs/webtunnel.md` for the failure mode this
+configured bridges — see `docs/guide/webtunnel.md` for the failure mode this
 prevents.
 
 ### `packages/auth`
@@ -80,7 +80,7 @@ listener (RFC 1929 USERNAME/PASSWORD). Mirrors the `resocks5` design:
 Consumed directly by both hosts, which implement `socks5_proto::PasswordVerifier`
 for their credential store. The adapter does not depend on `auth`. SDK framing
 supplies RFC 1929 or HTTP Basic credentials to the same verification path. See
-`docs/auth.md`, including the Android-specific `Config.auth` section.
+`docs/guide/auth.md`, including the Android-specific `Config.auth` section.
 
 ### `packages/proxy-config`
 
@@ -125,7 +125,7 @@ a second front end over the same engine pieces the CLI uses:
 * `lib.rs` — `nativeStart` / `nativeStop` / `nativeGetStatus`. `nativeStart`
   loads `proxy_config::Config` from the `configPath` argument (there is no
   env-var/CWD fallback on Android — an explicit path is required), resolves
-  local SOCKS5 authentication from `cfg.auth` (see `docs/auth.md`), builds
+  local SOCKS5 authentication from `cfg.auth` (see `docs/guide/auth.md`), builds
   `arti_wrapper::Settings`, and spawns a dedicated engine thread so the
   Android main/JNI-calling thread never blocks on Tor bootstrap.
 * `engine.rs` — the engine thread body: bridge probing, Tor bootstrap,
@@ -171,7 +171,7 @@ circuit. Modules: `server` (the UDP+TCP listeners), `doh_client`
 tunnel), `cache` (TTL-aware disk cache in a `.dns-cache` file next to
 the config). Requires the Tor egress — combined with an upstream SOCKS5
 proxy it is a fail-fast startup error. Wired into the binary by
-`apps/socks5-proxy/src/server/dns_wiring.rs`. See `docs/dns-server.md`.
+`apps/socks5-proxy/src/server/dns_wiring.rs`. See `docs/guide/dns-server.md`.
 
 ### `apps/socks5-proxy`
 
@@ -214,14 +214,14 @@ The user-facing binary. Source modules under `src/`:
 * `bridge_store.rs` — dedup-upsert log of bridges that completed a
   TCP probe, stored as `<config_stem>.alive-bridges.log` next to the
   active config. Carries the health counters (`fails`, `seen`,
-  `cfails`, …) described in `docs/bridges.md`.
+  `cfails`, …) described in `docs/guide/bridges.md`.
 * `candidate_pool.rs` / `fetch_merge.rs` — the candidate pool and the
   lazy drain-and-promote path backing `bridges fetch` and auto-fetch.
 * `bridges_cmd.rs` — the `tor-socks5 bridges fetch` subcommand.
 * `arti_observability.rs` — a passive `tracing_subscriber::Layer` on
   arti's `tor_guardmgr` events that feeds per-guard usability
   observations into the bridge health store (circuit-layer pruning;
-  see `docs/bridges.md`).
+  see `docs/guide/bridges.md`).
 * `tor_setup.rs` — parse configured bridges, probe them, persist the
   live ones, and assemble `arti_wrapper::Settings` (including pointing
   the PT manager at our own binary via `current_exe()`). The PT binary
@@ -333,8 +333,8 @@ dns_server.overrides: []
 No `pt_binary` field: the proxy uses its own `current_exe()` for the
 PT child. See `README.md` for the canonical complete configuration reference
 (every section and field with its default, for both the main config and the
-bridges file) and `docs/bridges.md` for the bridge-health knobs. See
-`docs/auth.md` for `auth.enabled` / `auth.users_file` — the
+bridges file) and `docs/guide/bridges.md` for the bridge-health knobs. See
+`docs/guide/auth.md` for `auth.enabled` / `auth.users_file` — the
 Android-facing knobs for RFC 1929 local authentication. The legacy
 scalar form `listen: addr` is still parsed for compatibility (a
 one-element list); an empty list parses but fails at startup.
@@ -395,4 +395,4 @@ is admission overload (SOCKS REP 1 / HTTP 503), not an egress-failure substitute
 * **utls TLS fingerprint emulation** for webtunnel (`utls=` bridge-line
   param) — accepted by the parser but ignored by the Rust PT client,
   which uses `tokio-rustls`'s default ClientHello. See
-  `docs/webtunnel.md`.
+  `docs/guide/webtunnel.md`.

@@ -25,7 +25,7 @@ egress through an upstream SOCKS5 proxy instead of Tor, and install itself as an
     merges the working ones into the config;
   - **active health observation** — a tracing layer on top of arti catches per-guard usability
     events and prunes bridges that pass TCP but fail at the circuit layer (descriptor or
-    fingerprint mismatch). See [`docs/bridges.md`](docs/bridges.md).
+    fingerprint mismatch). See [`docs/guide/bridges.md`](docs/guide/bridges.md).
 - **obfs4 + webtunnel** pluggable transports, run in-process (the binary re-execs itself as the
   PT — no second executable to ship).
 - **User authentication** (RFC 1929 or HTTP Proxy-Authorization Basic), Argon2id-hashed, with an HMAC success
@@ -44,7 +44,7 @@ egress through an upstream SOCKS5 proxy instead of Tor, and install itself as an
   persist popular names and observed types/classes; startup/two-hour background
   refresh uses existing routes with foreground headroom and never counts itself.
   Statistics are sensitive local browsing metadata; protect the cache directory.
-  See [`docs/dns-server.md`](docs/dns-server.md).
+  See [`docs/guide/dns-server.md`](docs/guide/dns-server.md).
 - **Install as a service** — systemd, OpenRC, launchd, Windows SCM, BSD `rc.d`.
 - **Non-blocking logging** to stderr / stdout / file, configurable level and per-target filters.
 
@@ -186,7 +186,7 @@ upstream.password:
 
 ## Local proxy authentication (RFC 1929 / HTTP Basic). The CLI needs neither field
 ## set — it auto-detects tor-socks5.users.ktav next to this config.
-## Both exist mainly for the Android JNI FFI crate. See docs/auth.md.
+## Both exist mainly for the Android JNI FFI crate. See docs/guide/auth.md.
 auth.enabled: true
 auth.users_file:
 
@@ -235,7 +235,7 @@ dns_server.custom_doh_providers: [
 ## or one plain DNS server (resolver: dns + server ip:port). One entry
 ## takes a whole list of masks (a lone string is read as a one-element
 ## list). First match wins, in list order. A matching host LEAVES the
-## Tor tunnel — see the warning in docs/dns-server.md.
+## Tor tunnel — see the warning in docs/guide/dns-server.md.
 dns_server.overrides: [
     {
         patterns: [
@@ -341,13 +341,13 @@ These manuals are also embedded in the binary — run `tor-socks5 help` to
 list them, `tor-socks5 help <topic>` for one, or `tor-socks5 help --all`
 to print them all. See [`docs/`](docs/) for the source:
 
-- [bridges](docs/bridges.md) — transports, health, candidate pool, sources, `bridges fetch`
-- [webtunnel](docs/webtunnel.md) — the webtunnel transport
-- [authentication](docs/auth.md) — users, trust-on-first-use, `.onion` gating
-- [upstream SOCKS5](docs/upstream.md) — chaining through another proxy
-- [local DNS server](docs/dns-server.md) — DNS-over-Tor resolver for client queries
-- [service](docs/service.md) — install/start/stop/status on each OS
-- [logging](docs/logging.md) — sinks, levels, non-blocking writer
+- [bridges](docs/guide/bridges.md) — transports, health, candidate pool, sources, `bridges fetch`
+- [webtunnel](docs/guide/webtunnel.md) — the webtunnel transport
+- [authentication](docs/guide/auth.md) — users, trust-on-first-use, `.onion` gating
+- [upstream SOCKS5](docs/guide/upstream.md) — chaining through another proxy
+- [local DNS server](docs/guide/dns-server.md) — DNS-over-Tor resolver for client queries
+- [service](docs/guide/service.md) — install/start/stop/status on each OS
+- [logging](docs/guide/logging.md) — sinks, levels, non-blocking writer
 - [architecture](docs/architecture.md) — workspace layout and data flow
 
 ## Authentication (optional)
@@ -363,7 +363,7 @@ tor-socks5 users disable alice
 When at least one user exists, the CLI listener requires RFC 1929 username/password
 or HTTP Proxy-Authorization Basic, with no anonymous downgrade. The authenticated
 username drives CLI account policy; JNI uses the global destination policy. See
-[docs/auth.md](docs/auth.md).
+[docs/guide/auth.md](docs/guide/auth.md).
 
 Inbound framing and replies belong to `resocks5-net`; `socks5_proto` supplies the
 shared host authentication adapter. Each handshake has one absolute 30-second
@@ -386,7 +386,7 @@ tor-socks5 --upstream 127.0.0.1:9050 --upstream-user u --upstream-pass p
 tor-socks5 --no-upstream            # force the Tor egress even if enabled in config
 ```
 
-When active, Tor is **not** started. See [docs/upstream.md](docs/upstream.md).
+When active, Tor is **not** started. See [docs/guide/upstream.md](docs/guide/upstream.md).
 
 ## Run as a service
 
@@ -399,7 +399,7 @@ tor-socks5 service uninstall
 tor-socks5 service install --user   # per-user service where supported
 ```
 
-See [docs/service.md](docs/service.md).
+See [docs/guide/service.md](docs/guide/service.md).
 
 ## Development
 

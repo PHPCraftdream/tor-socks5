@@ -38,7 +38,7 @@ upstream.password:
 
 ## Local SOCKS5 (RFC 1929) authentication. The CLI auto-detects
 ## tor-socks5.users.ktav next to this config without either field set;
-## these mainly matter for the Android JNI FFI crate. See docs/auth.md.
+## these mainly matter for the Android JNI FFI crate. See docs/guide/auth.md.
 auth.enabled: true
 auth.users_file:
 
@@ -80,7 +80,7 @@ warm_pool.refresh_interval_secs: 60
 ##
 ## Per-mask resolver overrides: hosts matching a glob mask skip the DoH pool and
 ## are resolved OUTSIDE the Tor tunnel (plain DNS or the OS resolver) — a
-## deliberate, operator-opted exception. Full manual: docs/dns-server.md.
+## deliberate, operator-opted exception. Full manual: docs/guide/dns-server.md.
 ## One entry takes a list of masks (`patterns`); first match wins, in list order.
 ## dns_server.overrides: [
 ##     {

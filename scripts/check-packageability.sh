@@ -3,7 +3,7 @@
 # the same single source the publish-guard enforces. Enforced by CI
 # (.github/workflows/ci.yml, packageability job); locally, crate names may
 # also be passed as arguments instead: `sh scripts/check-packageability.sh
-# <crate> ...` (docs/publishing.md).
+# <crate> ...` (docs/project/publishing.md).
 #
 # Uses `cargo package`, not `cargo publish --dry-run`: every current manifest
 # carries `publish = false`, which makes `--dry-run` fail by construction,

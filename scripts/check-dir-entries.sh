@@ -22,7 +22,6 @@ set -u
 MAX_ENTRIES=7
 
 BASELINE="
-48 docs
 15 .
 11 packages
 "

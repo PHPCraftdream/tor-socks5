@@ -544,7 +544,7 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
 /// actual source of truth for what gets probed/bootstrapped next -- this call is purely the
 /// handoff so Kotlin can remove these specific lines from that list (subject to its own "never
 /// prune below a floor" check) and log the removal to the connect-screen journal. See
-/// docs/android-bridge-freshness-plan.md's Phase 1.
+/// docs/plans/android-bridge-freshness-plan.md's Phase 1.
 ///
 /// - **Threading:** May be called from any thread. Cheap (a mutex lock and a `mem::take`), safe
 ///   to call on every `start()`.
@@ -579,7 +579,7 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
 /// `engine::stall_watchdog`) since the last call, newline-joined one `BridgeLine` per line, or
 /// an empty string if none. Same shape and same "only helps the *next* start" caveat as
 /// `nativeRefreshBridges`'s manual equivalent, just triggered automatically. See
-/// docs/android-bridge-freshness-plan.md's Phase 2.
+/// docs/plans/android-bridge-freshness-plan.md's Phase 2.
 ///
 /// - **Threading:** May be called from any thread. Cheap (a mutex lock and a `mem::take`), safe
 ///   to call on every `start()` alongside `nativeTakePrunedBridges`.

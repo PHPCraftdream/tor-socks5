@@ -362,7 +362,7 @@ pub(super) const VERIFY_BRIDGE_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs
 /// returns as soon as the *shared* cache's consensus looks fresh -- it does
 /// not wait for this specific bridge's own descriptor. That fetch (see
 /// `vendor/tor-dirmgr/src/bridgedesc.rs`'s 30s timeout, raised there after
-/// `docs/known-issues/android-bridge-bootstrap-regression.md`) plus the
+/// `docs/android/known-issues/android-bridge-bootstrap-regression.md`) plus the
 /// actual PT/circuit build both land inside this probe's budget, not
 /// bootstrap's, so it must clear 30s with real headroom -- and a single
 /// failed descriptor fetch is routine, not fatal: `tor_dirmgr::bridgedesc`

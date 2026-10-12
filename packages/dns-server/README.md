@@ -39,8 +39,8 @@ bypasses fresh cache hits, and retains valid cache entries on failure. One
 sequential background exchange shares the 64 backend slots while reserving
 foreground headroom; prefetch itself never counts as client traffic. Statistics
 are sensitive local browsing metadata; protect the cache directory. Store schema,
-loss accounting and inspection format are documented in `docs/dns-server.md`.
+loss accounting and inspection format are documented in `docs/guide/dns-server.md`.
 
 The crate publishes as `tor-socks5-dns`, while the library target keeps the in-tree name `dns_server` — in code it is `use dns_server::…`.
 
-The crate is fully implemented: an on-disk TTL-aware cache, a DoH-over-Tor client with a fixed-order provider pool (36 built-ins plus operator entries), and the UDP/TCP listener. Operator docs: `docs/dns-server.md` (or `tor-socks5 help dns-server`).
+The crate is fully implemented: an on-disk TTL-aware cache, a DoH-over-Tor client with a fixed-order provider pool (36 built-ins plus operator entries), and the UDP/TCP listener. Operator docs: `docs/guide/dns-server.md` (or `tor-socks5 help dns-server`).

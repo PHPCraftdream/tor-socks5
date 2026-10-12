@@ -1,6 +1,6 @@
 #!/bin/sh
 # Single source of truth for the set of crates this repository is allowed to
-# publish to crates.io (docs/publishing.md). Consumed by BOTH
+# publish to crates.io (docs/project/publishing.md). Consumed by BOTH
 # scripts/check-publish-guard.sh and the CI packageability job
 # (.github/workflows/ci.yml), so the two can never drift apart.
 #
@@ -10,10 +10,10 @@
 # scripts/check-publish-guard.sh.
 #
 # The only crate ever expected on this list is the single consolidated
-# `tor-socks5` package created by the SDK-01 merge (docs/sdk-package-design.md,
+# `tor-socks5` package created by the SDK-01 merge (docs/project/sdk-package-design.md,
 # §1/§6). vendor/* forks, apps/* and packages/android-ffi never go to crates.io
-# (docs/publishing.md, "Что публикуется и что нет"). Publication itself stays
-# blocked until the vendor gate of docs/sdk-package-design.md §4 is open.
+# (docs/project/publishing.md, "Что публикуется и что нет"). Publication itself stays
+# blocked until the vendor gate of docs/project/sdk-package-design.md §4 is open.
 #
 # To make a crate publishable, do BOTH in the same change:
 #   1. add its package name to PUBLISHABLE below;

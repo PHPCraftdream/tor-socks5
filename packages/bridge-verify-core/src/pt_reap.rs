@@ -13,7 +13,7 @@
 //! identifiable by name alone, and the post-check sweep kills only own
 //! children whose name matches a registered marker via [`kill_targets`].
 //! A restarted main-engine PT child carries the normal binary name and can
-//! never match a marker. See `docs/stability-review-2026-09-08.md` section 2.
+//! never match a marker. See `docs/reviews/2026-09-07-08/stability-review-2026-09-08.md` section 2.
 //!
 //! The registry never shrinks mid-process so children that escaped their own
 //! call's kill keep getting reaped by later calls (capped at
@@ -99,7 +99,7 @@ pub fn current_markers() -> HashSet<String> {
 ///   after caller-side normalization. Deliberately name-verified, NOT
 ///   time-of-appearance-verified: the main engine's PT child -- however
 ///   freshly restarted -- carries the normal binary name and can never match
-///   a marker. See docs/stability-review-2026-09-08.md section 2.
+///   a marker. See docs/reviews/2026-09-07-08/stability-review-2026-09-08.md section 2.
 pub fn kill_targets(
     children: impl IntoIterator<Item = (u32, u32, Vec<u8>)>,
     my_pid: u32,

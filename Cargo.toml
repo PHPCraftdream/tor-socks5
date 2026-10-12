@@ -110,7 +110,7 @@ tor-guardmgr = { path = "vendor/tor-guardmgr" }
 ## Wire guard readiness and recovery APIs into the client.
 arti-client = { path = "vendor/arti-client" }
 ## tor-circmgr 0.43.0: vendored for the circuit-speed tiers
-## (docs/circuit-speed-plan.md): Tier 2 — an opt-in bandwidth floor for
+## (docs/plans/circuit-speed-plan.md): Tier 2 — an opt-in bandwidth floor for
 ## middle/exit relay selection (`min_bandwidth_percentile`, default 0 =
 ## stock behaviour; falls back to the unfiltered pool rather than ever
 ## shrinking the candidate set below a safety floor). This is a
