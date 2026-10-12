@@ -88,7 +88,7 @@ dependencies = [
 
 [[package]]
 name = "android-ffi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arti-wrapper",
@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "arti-wrapper"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arti-client",
@@ -733,7 +733,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-fetcher"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arti-wrapper",
@@ -756,7 +756,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-probe"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "futures",
@@ -775,7 +775,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bridge-probe",
@@ -787,7 +787,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-verify-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rusqlite",
  "tempfile",
@@ -3787,7 +3787,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "persist-lock"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
 ]
@@ -4151,7 +4151,7 @@ dependencies = [
 
 [[package]]
 name = "pt-helper"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "ptrs-gesher-lyrebird",
@@ -4575,7 +4575,7 @@ dependencies = [
 
 [[package]]
 name = "resocks5-net"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "socket2",
@@ -5280,7 +5280,7 @@ dependencies = [
 
 [[package]]
 name = "socks5-proxy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arti-wrapper",
@@ -7068,7 +7068,7 @@ dependencies = [
 
 [[package]]
 name = "tor-socks5-auth"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -7088,7 +7088,7 @@ dependencies = [
 
 [[package]]
 name = "tor-socks5-config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bridge-probe",
@@ -7101,7 +7101,7 @@ dependencies = [
 
 [[package]]
 name = "tor-socks5-dns"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arti-wrapper",
@@ -7126,7 +7126,7 @@ dependencies = [
 
 [[package]]
 name = "tor-socks5-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "resocks5-net",
  "tokio",

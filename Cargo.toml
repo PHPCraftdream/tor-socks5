@@ -79,7 +79,7 @@ criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 proptest = "1"
 rusqlite = { version = "0.39", features = ["backup"] }
 # Use the local SDK until its server API is published.
-resocks5-net = { path = "../resocks5/crates/resocks5-net", version = "0.2", default-features = false }
+resocks5-net = { path = "../resocks5/crates/resocks5-net", version = "0.3", default-features = false }
 
 [profile.release]
 lto = "thin"

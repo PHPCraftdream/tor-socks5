@@ -1,12 +1,12 @@
 name: Set up local resocks5 SDK
-description: Check out the unpublished server API at the workspace's sibling dependency path.
+description: Check out the resocks5 SDK release that carries the server API at the workspace's sibling dependency path.
 runs:
   using: composite
   steps:
     - uses: actions/checkout@v7
       with:
         repository: PHPCraftdream/resocks5
-        ref: 6bbacb078810e6ae016be89de81e58b1a0f3793b
+        ref: v0.3.0
         path: .ci-deps/resocks5
         persist-credentials: false
     - shell: bash

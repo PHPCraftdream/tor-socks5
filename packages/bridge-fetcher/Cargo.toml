@@ -3,7 +3,7 @@ name = "bridge-fetcher"
 # Not published: the release artifact is the single `tor-socks5` package;
 # workspace crates are its internal modules (docs/project/sdk-package-design.md).
 publish = false
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 description = "Fetch Tor bridge lines over HTTPS-via-Tor from configurable collectors."
@@ -20,9 +20,9 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-arti-wrapper = { path = "../arti-wrapper", version = "0.1.0" }
+arti-wrapper = { path = "../arti-wrapper", version = "0.2.0" }
 bridge-line.workspace = true
-bridge-probe = { path = "../bridge-probe", version = "0.1.0" }
+bridge-probe = { path = "../bridge-probe", version = "0.2.0" }
 
 tokio.workspace = true
 tokio-util.workspace = true

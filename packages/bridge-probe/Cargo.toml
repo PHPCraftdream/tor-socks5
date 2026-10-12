@@ -3,7 +3,7 @@ name = "bridge-probe"
 # Not published: the release artifact is the single `tor-socks5` package;
 # workspace crates are its internal modules (docs/project/sdk-package-design.md).
 publish = false
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 description = "Parallel reachability probing and latency sort for Tor bridge lines."
@@ -21,7 +21,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 bridge-line.workspace = true
-persist-lock = { path = "../persist-lock", version = "0.1.0" }
+persist-lock = { path = "../persist-lock", version = "0.2.0" }
 
 tokio = { workspace = true, features = ["net", "time", "macros", "rt", "io-util"] }
 # TS5-02: the DoH wave race owns an admission token that stops still-queued
