@@ -1,6 +1,6 @@
 //! Periodic circuit-level bridge verification (background task).
 //!
-//! CLI counterpart of `packages/android-ffi/src/engine.rs`'s background
+//! CLI counterpart of `packages/android-ffi/src/engine/engine.rs`'s background
 //! circuit-verify tick (engine.rs:1203-1266): every
 //! [`CIRCUIT_VERIFY_INTERVAL`] it picks a small batch of channel-proven
 //! bridges (`BridgeStore::needing_circuit_verification` — oldest/never

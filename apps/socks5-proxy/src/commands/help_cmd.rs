@@ -10,47 +10,47 @@ const TOPICS: &[(&str, &str, &str)] = &[
     (
         "overview",
         "What tor-socks5 is and how to start",
-        include_str!("../../../README.md"),
+        include_str!("../../../../README.md"),
     ),
     (
         "bridges",
         "Bridges, transports, health, candidate pool, sources",
-        include_str!("../../../docs/bridges.md"),
+        include_str!("../../../../docs/bridges.md"),
     ),
     (
         "webtunnel",
         "The webtunnel pluggable transport",
-        include_str!("../../../docs/webtunnel.md"),
+        include_str!("../../../../docs/webtunnel.md"),
     ),
     (
         "auth",
         "User accounts, passwords, and .onion gating",
-        include_str!("../../../docs/auth.md"),
+        include_str!("../../../../docs/auth.md"),
     ),
     (
         "upstream",
         "Egress through an upstream SOCKS5 proxy",
-        include_str!("../../../docs/upstream.md"),
+        include_str!("../../../../docs/upstream.md"),
     ),
     (
         "dns-server",
         "Optional local DNS server resolving every query via DoH over Tor",
-        include_str!("../../../docs/dns-server.md"),
+        include_str!("../../../../docs/dns-server.md"),
     ),
     (
         "logging",
         "Log sinks, levels, non-blocking writer",
-        include_str!("../../../docs/logging.md"),
+        include_str!("../../../../docs/logging.md"),
     ),
     (
         "service",
         "Install/start/stop as an OS service",
-        include_str!("../../../docs/service.md"),
+        include_str!("../../../../docs/service.md"),
     ),
     (
         "architecture",
         "Workspace layout and data flow",
-        include_str!("../../../docs/architecture.md"),
+        include_str!("../../../../docs/architecture.md"),
     ),
 ];
 

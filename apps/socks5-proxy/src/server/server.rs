@@ -909,5 +909,5 @@ mod binding;
 mod listen_tests;
 
 #[cfg(test)]
-#[path = "server_tests.rs"]
+#[path = "listen/server_tests.rs"]
 mod tests;

@@ -18,6 +18,7 @@ use crate::arti_observability::ObservationSink;
 use crate::config::Config;
 use crate::tor_watchdog::TorHandle;
 
+#[path = "bridge_maintenance/channel_probe.rs"]
 mod channel_probe;
 
 const CONNECTION_REFRESH_INTERVAL: Duration = Duration::from_secs(60);

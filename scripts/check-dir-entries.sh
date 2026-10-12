@@ -23,7 +23,6 @@ MAX_ENTRIES=7
 
 BASELINE="
 48 docs
-34 apps/socks5-proxy/src
 15 .
 11 packages
 "

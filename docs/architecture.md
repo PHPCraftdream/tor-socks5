@@ -171,7 +171,7 @@ circuit. Modules: `server` (the UDP+TCP listeners), `doh_client`
 tunnel), `cache` (TTL-aware disk cache in a `.dns-cache` file next to
 the config). Requires the Tor egress — combined with an upstream SOCKS5
 proxy it is a fail-fast startup error. Wired into the binary by
-`apps/socks5-proxy/src/dns_wiring.rs`. See `docs/dns-server.md`.
+`apps/socks5-proxy/src/server/dns_wiring.rs`. See `docs/dns-server.md`.
 
 ### `apps/socks5-proxy`
 
