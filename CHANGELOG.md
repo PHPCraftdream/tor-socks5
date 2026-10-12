@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directories already over the limit are recorded with their current size as a
   ratchet: they cannot grow, no new directory may exceed the limit, and entries
   are lowered as directories are split.
+- Comma shorthand `host1,host2:port` for scalar/list `listen` and
+  `dns_server.listen` values, with bracketed IPv6 hosts. Expansion deduplicates
+  addresses keeping the first occurrence; config writeback uses expanded lists.
+- Skip-unavailable binding for proxy listeners and atomic DNS UDP+TCP pairs:
+  `AddrInUse`, `PermissionDenied` and `AddrNotAvailable` log WARN with a reason;
+  at least one successful listener/pair serves, all failing returns an error,
+  and other bind errors remain hard failures. DNS never serves a half-bound pair;
+  local policy and recursion guards use only successfully bound endpoints.
 
 - Persistent, payload-free DNS query statistics and startup/two-hour refresh of
   observed popular name/type/class tuples. Background work uses existing routes
@@ -66,6 +74,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Listener binding no longer fails on the first unbindable address for the
+  skip-unavailable error kinds above. Occupied ports are never taken over;
+  no automatic retry is currently implemented (LST-05), including for in-use
+  or permission-denied addresses.
 - `socks5_proto::accept` is the shared host authentication adapter over the SDK,
   with one absolute 30-second deadline and 256 cancellation-retained blocking
   verification slots. CLI account policy and JNI global destination policy

@@ -10,6 +10,7 @@ mod config;
 mod conn_health;
 mod daemon;
 mod dns_wiring;
+#[path = "fetch_merge/fetch_merge.rs"]
 mod fetch_merge;
 mod help_cmd;
 mod seed;

@@ -27,6 +27,7 @@ pub mod server;
 
 mod error;
 mod popular_prefetch;
+#[path = "statistics/query_statistics.rs"]
 mod query_statistics;
 mod types;
 

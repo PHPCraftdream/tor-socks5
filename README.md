@@ -115,7 +115,15 @@ default shown here.
 ## Any key you omit keeps the default shown here.
 
 ## Addresses to listen on — one SOCKS5 + HTTP CONNECT listener per address.
-## A single scalar (`listen: 127.0.0.1:1080`) is also accepted.
+## Accepts a scalar or list; each value also accepts host1,host2:port.
+## Example: listen: 127.0.0.1,[::1]:1080 (IPv6 must be bracketed).
+## Expanded addresses are deduplicated, keeping the first occurrence;
+## config writeback uses the expanded list.
+## AddrInUse, PermissionDenied and AddrNotAvailable are skipped with
+## WARN and a reason. At least one bound listener serves; all failing
+## is an error. Other bind errors remain hard failures.
+## Occupied ports are never taken over. No automatic retry is implemented
+## (LST-05), including for in-use or permission-denied addresses.
 listen: [
     127.0.0.1:1080
 ]
@@ -242,8 +250,14 @@ dns.system_fallback: false
 ## .dns-cache file next to this config. Details: tor-socks5 help
 ## dns-server.
 dns_server.enabled: false
-## Bind addresses; one UDP+TCP listener pair per address. Deliberately
-## not 53 (privileged). A single scalar is also accepted, as with listen.
+## Bind addresses; one atomic UDP+TCP pair per successful address.
+## Deliberately not 53 (privileged). Accepts a scalar or list, as with listen.
+## Each value accepts host1,host2:port; IPv6 must be bracketed:
+## dns_server.listen: 127.0.0.1,[::1]:15353
+## Expand/deduplicate keeping the first occurrence; writeback uses a list.
+## The same skip-unavailable and no-automatic-retry rules above apply.
+## At least one complete pair must bind; never serve a half-bound pair.
+## Local policy and recursion guards use only successfully bound endpoints.
 dns_server.listen: [
     127.0.0.1:15353
 ]

@@ -281,18 +281,21 @@ async fn real_tcp_partial_frame_timeout_releases_connection_without_backend() {
     }
     assert_eq!(connections.available_permits(), 1);
     assert_eq!(backend.available_permits(), 64);
+    // Handler completion and permit reclamation are established above. Resume
+    // before observing real socket EOF: paused time can auto-advance a guard
+    // before the OS delivers readiness, despite the server stream being closed.
+    tokio::time::resume();
     let mut byte = [0];
     assert_eq!(
-        timeout(Duration::from_secs(1), peer.read(&mut byte))
+        timeout(CASE_BUDGET, peer.read(&mut byte))
             .await
             .expect("timed-out connection did not close")
             .unwrap(),
         0
     );
 
-    // Real I/O setup runs with the clock resumed; the same production listener
-    // must admit and answer another connection using the reclaimed capacity.
-    tokio::time::resume();
+    // The same production listener must admit and answer another connection
+    // using the reclaimed capacity, also with real I/O and the clock resumed.
     tokio::select! {
         _ = &mut service => panic!("listener ended"),
         result = timeout(CASE_BUDGET, async {

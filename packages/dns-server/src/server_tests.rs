@@ -14,6 +14,8 @@ const CASE_BUDGET: Duration = Duration::from_secs(30);
 
 #[path = "server_contract_tests.rs"]
 mod contracts;
+#[path = "server_multi_listen_tests.rs"]
+mod multi_listen;
 #[path = "server_prefetch_tests.rs"]
 mod prefetch;
 #[path = "server_resource_tests.rs"]
@@ -37,9 +39,13 @@ fn request(host: &str, kind: RecordType, id: u16) -> Message {
 #[tokio::test]
 async fn ephemeral_bind_pair_retries_only_tcp_port_collisions() {
     let mut calls = 0;
+    let mut injected_failures = 0;
     let (udp, tcp) = bind_pair_with("127.0.0.1:0", |bound| {
         calls += 1;
-        let refuse = calls <= 3;
+        let refuse = injected_failures < 3;
+        if refuse {
+            injected_failures += 1;
+        }
         async move {
             if refuse {
                 Err(std::io::ErrorKind::PermissionDenied.into())
@@ -50,10 +56,21 @@ async fn ephemeral_bind_pair_retries_only_tcp_port_collisions() {
     })
     .await
     .unwrap();
-    // Three injected refusals, then a real bind that may itself hit a reserved
-    // port and be retried: at least four calls, and in the end one shared port.
-    assert!(calls >= 4, "refusals must be retried, got {calls} calls");
-    assert_eq!(udp.local_addr().unwrap(), tcp.local_addr().unwrap());
+    assert_eq!(
+        injected_failures, 3,
+        "all three injected collisions retried"
+    );
+    // Subsequent real TCP binds may hit reserved OS bands, independently of
+    // the exact injected-failure count. All calls share the production budget.
+    assert!(
+        (injected_failures + 1..=EPHEMERAL_BIND_ATTEMPTS).contains(&calls),
+        "injected failures plus bounded real bind attempts, got {calls}"
+    );
+    let bound = udp.local_addr().unwrap();
+    assert_ne!(bound.port(), 0, "the pair exposes the actual selected port");
+    assert_eq!(bound.ip(), std::net::Ipv4Addr::LOCALHOST);
+    assert_eq!(bound, tcp.local_addr().unwrap());
+    assert_eq!(listener_endpoints(&udp, &tcp).unwrap(), vec![bound, bound]);
 
     let mut calls = 0;
     let error = bind_pair_with("127.0.0.1:0", |_| {

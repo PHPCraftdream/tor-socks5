@@ -19,6 +19,9 @@ use bridge_probe::{bridge_identity, usable_for_tor, BridgeIdentity};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
+mod listen_addresses;
+use listen_addresses::listen_addresses;
+
 const ENV_VAR: &str = "TOR_SOCKS5_CONFIG";
 const DEFAULT_FILE: &str = "tor-socks5.ktav";
 static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -42,9 +45,16 @@ pub struct Config {
     /// ```
     ///
     /// For compatibility a single scalar string (`listen:
-    /// 127.0.0.1:1080`) is also accepted and wrapped into a one-element
-    /// vector. An empty list parses but is rejected when the server
-    /// starts (fail fast).
+    /// 127.0.0.1:1080`) is also accepted. In either form, an entry such as
+    /// `127.0.0.1,localhost:1080` expands to both hosts with the final port.
+    /// Shorthand requires nonempty hosts and a decimal port in 1..=65535;
+    /// IPv6 hosts must be bracketed (`[::1],127.0.0.1:1080`). Use Ktav's
+    /// literal-string marker for entries starting with `[` (`listen::
+    /// [::1],127.0.0.1:1080`, or `:: [::1],127.0.0.1:1080` in a list).
+    /// Ordinary entries without commas are unchanged, including port 0. Exact
+    /// duplicates are removed after expansion, keeping the first address.
+    /// Serialization always writes the expanded list. An empty list parses
+    /// but is rejected when the server starts (fail fast).
     #[serde(deserialize_with = "listen_addresses")]
     pub listen: Vec<String>,
     /// Logging configuration.
@@ -128,10 +138,11 @@ pub struct DnsServerConfig {
     /// ```
     ///
     /// For compatibility a single scalar string (`dns_server.listen:
-    /// 127.0.0.1:15353`) is also accepted and wrapped into a one-element
-    /// vector — the same rule as [`Config::listen`]. Default
-    /// `127.0.0.1:15353` — deliberately not 53, a privileged port that
-    /// needs root/administrator to bind.
+    /// 127.0.0.1:15353`) is also accepted. Comma shorthand uses the final
+    /// port for every host (`127.0.0.1,[::1]:15353`); validation, stable
+    /// deduplication and expanded-list serialization follow [`Config::listen`].
+    /// Default `127.0.0.1:15353` — deliberately not 53, a privileged port
+    /// that needs root/administrator to bind.
     #[serde(deserialize_with = "listen_addresses")]
     pub listen: Vec<String>,
     /// When `true`, the built-in DoH provider list is dropped from the pool
@@ -804,41 +815,6 @@ impl Default for Config {
             dns_server: DnsServerConfig::default(),
         }
     }
-}
-
-/// Deserialize `listen` from either the new list form (`listen: [ ... ]`)
-/// or the legacy scalar form (`listen: 127.0.0.1:1080`), which is wrapped
-/// into a single-element vector so existing Ktav configs keep parsing.
-fn listen_addresses<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    struct ListenAddresses;
-
-    impl<'de> serde::de::Visitor<'de> for ListenAddresses {
-        type Value = Vec<String>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("an address string or a list of address strings")
-        }
-
-        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
-            Ok(vec![value.to_owned()])
-        }
-
-        fn visit_seq<A: serde::de::SeqAccess<'de>>(
-            self,
-            mut seq: A,
-        ) -> Result<Self::Value, A::Error> {
-            let mut addrs = Vec::new();
-            while let Some(addr) = seq.next_element::<String>()? {
-                addrs.push(addr);
-            }
-            Ok(addrs)
-        }
-    }
-
-    deserializer.deserialize_any(ListenAddresses)
 }
 
 impl Default for LogConfig {

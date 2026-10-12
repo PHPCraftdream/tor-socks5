@@ -86,20 +86,7 @@ where
     T: Fn() -> F + Send + Clone + 'static,
     F: Future<Output = Option<TorTunnel>> + Send + 'static,
 {
-    if listen.is_empty() {
-        bail!("no listen addresses configured for the DNS server");
-    }
-    let mut udp_sockets = Vec::with_capacity(listen.len());
-    let mut tcp_listeners = Vec::with_capacity(listen.len());
-    let mut endpoints = Vec::with_capacity(listen.len() * 2);
-    for addr in listen {
-        let (udp, tcp) = bind_pair(addr).await?;
-        let bound = udp.local_addr()?;
-        endpoints.extend(listener_endpoints(&udp, &tcp)?);
-        info!(listen_addr = %bound, "DNS server listening (UDP + TCP)");
-        udp_sockets.push(Arc::new(udp));
-        tcp_listeners.push(tcp);
-    }
+    let (udp_sockets, tcp_listeners, endpoints) = bind_listeners(listen).await?;
     let (statistics, worker) = match StatisticsWorker::open(StatisticsPaths::from_cache_path(
         &cache_path,
     ))
@@ -229,6 +216,70 @@ where
         // The lifecycle above owns cancellation and must drain before final save.
         CancellationToken::new(),
     ).await
+}
+
+type BoundListeners = (Vec<Arc<UdpSocket>>, Vec<TcpListener>, Vec<SocketAddr>);
+
+/// cancel-safe: yes — every bind owns its pair; errors/cancellation drop all
+/// accumulated sockets, and a failed TCP bind releases its UDP half.
+async fn bind_listeners(listen: &[String]) -> Result<BoundListeners> {
+    if listen.is_empty() {
+        bail!("no listen addresses configured for the DNS server");
+    }
+    let mut udp_sockets = Vec::with_capacity(listen.len());
+    let mut tcp_listeners = Vec::with_capacity(listen.len());
+    let mut endpoints = Vec::with_capacity(listen.len() * 2);
+    let mut skipped = Vec::new();
+    for addr in listen {
+        let (udp, tcp) = match bind_pair(addr).await {
+            Ok(pair) => pair,
+            Err(error) => match skipped_bind_reason(&error) {
+                Some((protocol, reason)) => {
+                    warn!(listen_addr = %addr, protocol, kind = ?reason.kind(),
+                        os_error = ?reason.raw_os_error(), os_reason = %reason,
+                        "skipping unavailable DNS listener pair");
+                    skipped.push(format!("{addr}: {error:#} (kind: {:?})", reason.kind()));
+                    continue;
+                }
+                None => return Err(error),
+            },
+        };
+        let bound = udp.local_addr()?;
+        endpoints.extend(listener_endpoints(&udp, &tcp)?);
+        info!(listen_addr = %bound, "DNS server listening (UDP + TCP)");
+        udp_sockets.push(Arc::new(udp));
+        tcp_listeners.push(tcp);
+    }
+    if udp_sockets.is_empty() {
+        bail!(
+            "no DNS listener pairs could be bound: {}",
+            skipped.join("; ")
+        );
+    }
+    Ok((udp_sockets, tcp_listeners, endpoints))
+}
+
+// Only bind failures are eligible, never address parsing or option/getter errors.
+// Keep bind_pair's existing anyhow context and wording intact for hard failures.
+fn skipped_bind_reason(error: &anyhow::Error) -> Option<(&'static str, &std::io::Error)> {
+    let reason = error.downcast_ref::<std::io::Error>()?;
+    if !matches!(
+        reason.kind(),
+        std::io::ErrorKind::AddrInUse
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::AddrNotAvailable
+    ) {
+        return None;
+    }
+    let context = error.to_string();
+    let protocol = if context.starts_with("failed to bind UDP DNS listener on ") {
+        "UDP"
+    } else if context.starts_with("failed to bind TCP DNS listener on ") {
+        "TCP"
+    } else {
+        return None;
+    };
+    Some((protocol, reason))
 }
 
 /// Bind attempts for an ephemeral (port 0) UDP+TCP pair.

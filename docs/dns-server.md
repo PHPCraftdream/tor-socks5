@@ -35,14 +35,37 @@ dns_server.custom_doh_providers: [
 ]
 ```
 
-- `listen` also accepts a single scalar string (`dns_server.listen: 127.0.0.1:15353`),
-  the same rule as the SOCKS5 `listen` option.
+- `dns_server.listen` and the SOCKS5/HTTP CONNECT `listen` option both accept
+  a scalar string or a list. Each scalar/list entry also accepts comma shorthand
+  `host1,host2:port`: `dns_server.listen: 127.0.0.1,[::1]:15353` expands to
+  `127.0.0.1:15353` and `[::1]:15353`. IPv6 hosts must be bracketed.
+  The equivalent proxy example is `listen: 127.0.0.1,[::1]:1080`.
+  Expansion deduplicates addresses in order, keeping the first occurrence;
+  config writeback uses the expanded list for both options.
 - `ip` — the IPv4/IPv6 literal the DoH TCP connection is opened to **through Tor**;
   the hostname is never resolved locally.
 - `hostname` — used only for TLS SNI and the HTTP `Host` header.
 - `path` — the DoH endpoint path, usually `/dns-query`.
 
 A custom entry whose `ip` does not parse as an IP literal is logged and skipped, not fatal.
+
+### Binding and unavailable addresses
+
+Both `listen` and `dns_server.listen` skip bind failures of kind `AddrInUse`,
+`PermissionDenied` or `AddrNotAvailable`, logging each skipped address at WARN
+with its reason. Serving continues when at least one proxy listener or, for DNS,
+one complete UDP+TCP pair binds. If all addresses fail, binding returns an error;
+any other bind error remains a hard failure rather than being skipped.
+
+Each DNS address binds an **atomic UDP+TCP pair**: if either socket fails, the
+other is released and the address is not served. There is never a half-bound
+DNS listener. Only successfully bound endpoints enter local policy and override
+recursion guards, including their actual ports for port-zero binds.
+
+Occupied ports are **never taken over**. There is currently **no automatic
+retry** of skipped addresses (LST-05 is not implemented), including in-use or
+permission-denied addresses. A skipped address does not become a listener just
+because the port is later freed or permissions change.
 
 ## Query popularity and background refresh
 

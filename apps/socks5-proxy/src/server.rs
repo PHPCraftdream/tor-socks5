@@ -313,26 +313,10 @@ pub(crate) async fn run_server(
     let conn_health = ConnHealthCounters::default();
     spawn_conn_health_logger(conn_health.clone(), cfg.conn_health);
 
-    // Fail fast on an empty listen list (the deserializer accepts it, but
-    // a proxy listening on nothing would silently serve no one).
-    if cfg.listen.is_empty() {
-        bail!(
-            "no listen addresses configured — set `listen` in the config \
-             (a single address or a list)"
-        );
-    }
-
-    // Bind every configured address, fail on the first error: a partial
-    // bind ("listening on only part of what was configured") is a silent
-    // degradation, harder to diagnose than a clean refusal to start.
-    let mut listeners = Vec::with_capacity(cfg.listen.len());
-    for addr in &cfg.listen {
-        let listener = TcpListener::bind(addr)
-            .await
-            .with_context(|| format!("failed to bind {addr}"))?;
-        info!(listen_addr = %addr, "SOCKS5 proxy is listening");
-        listeners.push(listener);
-    }
+    // Skip only local availability failures, visibly; fail fast if none bind
+    // or an unexpected error occurs. Every successful listener shares admission.
+    let binding = binding::bind_listeners(&cfg.listen).await?;
+    let listeners = binding.listeners;
 
     // One accept loop per listener, polled concurrently. The futures are
     // kept on this task (FuturesUnordered) rather than spawned per
@@ -913,6 +897,13 @@ pub(crate) fn compute_deficit(min_alive: usize, tcp_alive: usize, circuit_health
     let effective_healthy = tcp_alive.min(circuit_healthy);
     min_alive.saturating_sub(effective_healthy)
 }
+
+#[path = "listen/server_binding.rs"]
+mod binding;
+
+#[cfg(test)]
+#[path = "listen/server_listen_tests.rs"]
+mod listen_tests;
 
 #[cfg(test)]
 #[path = "server_tests.rs"]

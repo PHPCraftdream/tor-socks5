@@ -7,8 +7,15 @@
 ## A single # is content. No inline or trailing comments.
 ## Everything after the colon is value verbatim until end of line.
 
-## Listen addresses — one SOCKS5 listener per address. A single scalar
-## line (`listen: 127.0.0.1:1080`) is also accepted for compatibility.
+## Listen addresses — one SOCKS5 + HTTP CONNECT listener per address.
+## Accepts a scalar or list; each value accepts host1,host2:port shorthand,
+## e.g. listen: 127.0.0.1,[::1]:1080 (IPv6 must be bracketed).
+## Expand/deduplicate keeping the first occurrence; writeback uses a list.
+## AddrInUse, PermissionDenied and AddrNotAvailable are skipped with
+## WARN and a reason. At least one bound listener serves; all failing
+## is an error. Other bind errors remain hard failures.
+## Occupied ports are never taken over. No automatic retry is implemented
+## (LST-05), including for in-use or permission-denied addresses.
 listen: [
     127.0.0.1:1080
 ]
@@ -70,6 +77,13 @@ warm_pool.refresh_interval_secs: 60
 ## Tor tunnel. Requires the Tor egress (incompatible with upstream.*);
 ## the cache lands in a .dns-cache file next to this config. Full
 ## manual: tor-socks5 help dns-server. To enable, uncomment:
+## dns_server.listen accepts a scalar/list and host1,host2:port shorthand,
+## e.g. 127.0.0.1,[::1]:15353 (IPv6 must be bracketed). Expansion keeps
+## the first occurrence of each address; writeback uses the expanded list.
+## The skip-unavailable and no-automatic-retry rules above also apply.
+## Each address binds an atomic UDP+TCP pair: never serve a half-bound pair.
+## At least one complete pair must bind. Local policy and recursion guards
+## use only successfully bound endpoints.
 ## dns_server.enabled: true
 ## dns_server.listen: [
 ##     127.0.0.1:15353
