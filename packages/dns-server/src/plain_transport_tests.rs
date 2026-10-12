@@ -518,11 +518,13 @@ async fn partial_tcp_frame_deadline_closes_owned_stream() {
         tokio::time::pause();
         tokio::time::advance(PLAIN_DNS_TIMEOUT).await;
         let mut byte = [0];
-        assert_eq!(
-            stream.read(&mut byte).await.unwrap(),
-            0,
-            "deadline must close connection"
-        );
+        // Closing with the unread partial prefix still queued is a reset
+        // (macOS), without it a clean FIN: both prove the client closed.
+        match stream.read(&mut byte).await {
+            Ok(0) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("deadline must close connection, got {other:?}"),
+        }
     };
     let (result, ()) = tokio::join!(exchange, peer);
     assert!(result.is_err());
