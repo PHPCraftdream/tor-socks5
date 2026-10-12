@@ -52,14 +52,15 @@ egress through an upstream SOCKS5 proxy instead of Tor, and install itself as an
 
 Requires a recent stable Rust toolchain (edition 2021).
 
-Until the new `resocks5-net` server API is published, this workspace uses the
-local SDK at `../resocks5/crates/resocks5-net`. Keep a sibling `resocks5`
-checkout beside `tor-socks5`. After publication, remove the dependency's
-`path` and set `version` to the release containing that API.
+The workspace needs `resocks5-net` 0.3 (the inbound server API) and takes it from
+the local SDK at `../resocks5/crates/resocks5-net`. Keep a sibling `resocks5`
+checkout at tag `v0.3.0` or newer beside `tor-socks5`. To build without the
+checkout, remove the `path` from the `resocks5-net` dependency in the root
+`Cargo.toml` so that Cargo takes the crates.io release.
 
 CI and release builds provision the sibling SDK with
-`.github/actions/setup-local-sdk/action.yml`, pinned to commit
-`6bbacb078810e6ae016be89de81e58b1a0f3793b` rather than a moving branch.
+`.github/actions/setup-local-sdk/action.yml`, pinned to the `v0.3.0` tag rather
+than a moving branch.
 
 ```bash
 cargo build --release

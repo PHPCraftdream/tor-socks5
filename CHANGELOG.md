@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-12
+
+**Upgrading from 0.1.0:** the configuration layout changed. Stop the service and run
+`tor-socks5 config migrate --config <path>` once; it moves the bridge pool into its own
+file, rewrites `pattern` as `patterns`, and keeps the old file as a backup (see the
+first section). A config in the old layout is refused at start with a message that
+names every difference and this command.
+
 ### Changed (breaking: config layout)
 
 - **The bridge pool moved to its own file.** `lines`, `sources` and the health
@@ -22,100 +30,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in list order, sharing the entry's resolver.
 - A config in the old layout (a `bridges` section in the main file, or
   `pattern`) is **rejected at start** with an error naming every difference and
-  the fix. New command `tor-socks5 config migrate [--config <path>]` converts it:
-  moves the pool into the bridges file, rewrites `pattern` as `patterns`, keeps
-  the old file as `<name>.ktav.bak-N`, writes nothing unless the converted result
-  is valid, and leaves a config that is already current untouched. Run it with
-  the service stopped.
+  the fix. The new command `tor-socks5 config migrate [--config <path>]` converts
+  it: moves the pool into the bridges file, rewrites `pattern` as `patterns`,
+  keeps the old file as `<name>.ktav.bak-N`, writes nothing unless the converted
+  result is valid, and leaves a config that is already current untouched. Run it
+  with the service stopped. `--config` is accepted before or after any
+  subcommand.
 
 ### Added
 
-- **Directory-size rule in CI**: a first-party directory may hold at most 7
-  entries (files and sub-directories together), next to the existing limit of
-  1000 lines per Rust file. `scripts/check-dir-entries.sh` counts what git
-  tracks and runs in the new `dir-entries` CI job; `vendor/` is exempt. The
-  directories over the limit are recorded with their current size as a ratchet:
-  they cannot grow, no new directory may exceed the limit, and entries are
-  lowered as directories are split. The application and four package source
-  trees and `docs/` are now within the limit; only the repository root and
-  `packages/` remain on the list.
+- **Several listen addresses.** Comma shorthand `host1,host2:port` for scalar and
+  list `listen` and `dns_server.listen` values, with bracketed IPv6 hosts;
+  expansion deduplicates addresses keeping the first occurrence, and config
+  writeback uses the expanded lists. Binding skips what cannot be bound:
+  `AddrInUse`, `PermissionDenied` and `AddrNotAvailable` log a WARN with the
+  reason, at least one successful listener (or DNS pair) serves, all failing is an
+  error, and other bind errors stay hard failures. Occupied ports are never taken
+  over. DNS never serves a half-bound UDP+TCP pair; local policy and recursion
+  guards use only successfully bound endpoints. There is no automatic retry for
+  an address that appears later.
+- **DNS query statistics and popular-name refresh.** Persistent, payload-free
+  statistics of incoming queries; observed popular name/type/class tuples are
+  refreshed at startup and every two hours over the existing routes, with
+  foreground headroom. Shutdown drains accepted statistics and publishes the final
+  popularity before saving the answer cache.
+- **Same-port SOCKS5 CONNECT and HTTP CONNECT** for the CLI and the Android JNI
+  listeners (ordinary HTTP forwarding stays unsupported). Framing and protocol
+  replies come from `resocks5-net`; consumer wire regressions cover BIND,
+  UDP ASSOCIATE, unknown address type and invalid request version in anonymous and
+  password modes, using buffered I/O and bounded per-case timeouts.
+- **Directory-size rule in CI**: a first-party directory may hold at most 7 entries
+  (files and sub-directories together), next to the existing limit of 1000 lines per
+  Rust file. `scripts/check-dir-entries.sh` counts what git tracks and runs in the
+  new `dir-entries` job; `vendor/` is exempt. Directories over the limit are
+  recorded with their current size as a ratchet that can only shrink. The
+  application and four package source trees and `docs/` are within the limit; only
+  the repository root and `packages/` remain on the list.
 - **Documentation moved into sub-directories**: the manuals are in `docs/guide/`
   (`bridges.md`, `webtunnel.md`, `auth.md`, `upstream.md`, `dns-server.md`,
-  `service.md`, `logging.md`), and `docs/architecture.md` stays. Design notes,
-  plans, Android material and review records live in `docs/project/`,
-  `docs/plans/`, `docs/android/` and `docs/reviews/`. Links in the README, the
-  examples and the built-in `tor-socks5 help` topics follow the new paths.
-- Comma shorthand `host1,host2:port` for scalar/list `listen` and
-  `dns_server.listen` values, with bracketed IPv6 hosts. Expansion deduplicates
-  addresses keeping the first occurrence; config writeback uses expanded lists.
-- Skip-unavailable binding for proxy listeners and atomic DNS UDP+TCP pairs:
-  `AddrInUse`, `PermissionDenied` and `AddrNotAvailable` log WARN with a reason;
-  at least one successful listener/pair serves, all failing returns an error,
-  and other bind errors remain hard failures. DNS never serves a half-bound pair;
-  local policy and recursion guards use only successfully bound endpoints.
-
-- Persistent, payload-free DNS query statistics and startup/two-hour refresh of
-  observed popular name/type/class tuples. Background work uses existing routes
-  with foreground headroom; shutdown drains accepted statistics and publishes
-  final popularity before saving the answer cache.
-
-- Same-port SOCKS5 CONNECT and HTTP CONNECT for CLI and Android JNI listeners;
-  ordinary HTTP forwarding is unsupported. Framing and protocol replies are
-  provided by `resocks5-net`.
-- Consumer adapter wire regressions for BIND, UDP ASSOCIATE, unknown address type,
-  and invalid request version in anonymous and password modes, using buffered I/O
-  and bounded whole-case timeouts.
-
-### Fixed
-
-- DNS listener preserves typed full packets and terminal NXDOMAIN/NODATA,
-  answers localhost/loopback and own-address PTR locally, and passes actual bound
-  endpoints to override recursion guards. Local/cache responses bypass a shared
-  64-backend cap; overload returns SERVFAIL. One absolute 30-second miss deadline
-  includes tunnel acquisition and provider traversal. TCP admission, framing,
-  writes and connection lifetime are bounded; shutdown drops scoped work.
-  Periodic cache publication no longer blocks listeners; only one save is
-  outstanding and shutdown drains it before the serialized final publication.
-- Windows IPv6 listener coverage reads `IPV6_V6ONLY` into initialized storage,
-  accepting the observed one-byte boolean and the DWORD form without socket2's
-  short-result panic or uninitialized tail read.
-- CI and release builds now provision the pinned sibling `resocks5` checkout
-  before Cargo and cache metadata resolution. The local dependency remains in use.
-- Split proxy and JNI regression tests into modules below the existing 1000-line
-  CI limit without changing their assertions or production behavior.
-- The abandoned `scriptzteam/Tor-Bridges-Collector` `bridges-obfs4` source (no
-  commits since 2026-07-29) is migrated to the regenerated v2 `obfs4.txt` list,
-  the same way the legacy webtunnel source already is: a config that still lists
-  the old URL is rewritten under its lock on the next refresh.
-- The two Tor Browser built-in bridge sources (`tor-browser-obfs4`,
-  `tor-browser-webtunnel`) are retired: their path no longer exists upstream
-  (HTTP 404; through Tor GitLab answers 403), so they only produced a warning on
-  every refresh. They are removed from the default source list, never fetched, and
-  deleted from a config that still names them at the next refresh, under the same
-  config lock as the other source migrations. The `tor-socks5.example.ktav`
-  template now lists the current WebTunnel-first set (the three collectors'
-  `webtunnel_tested` lists, about 150 tested bridges together, plus the v2 obfs4
-  list); all collectors read the Tor Project's own distribution, so they overlap.
-- Android authentication rustdoc now describes the existing fail-closed startup:
-  enabled authentication with an empty or missing registry raises
-  `java.lang.RuntimeException` before engine-thread spawn; anonymous access requires
-  `auth.enabled: false`. Implementation is unchanged.
+  `service.md`, `logging.md`) and `docs/architecture.md` stays. Design notes, plans,
+  Android material and review records live in `docs/project/`, `docs/plans/`,
+  `docs/android/` and `docs/reviews/`. Links in the README, the examples and the
+  built-in `tor-socks5 help` topics follow the new paths.
 
 ### Changed
 
-- Listener binding no longer fails on the first unbindable address for the
-  skip-unavailable error kinds above. Occupied ports are never taken over;
-  no automatic retry is currently implemented (LST-05), including for in-use
-  or permission-denied addresses.
+- Success is sent only after egress is connected; buffered HTTP payload is forwarded
+  exactly once, before unread bytes. General failures keep SOCKS REP 1 and return
+  HTTP 502. JNI keeps its Tor owner throughout the relay.
 - `socks5_proto::accept` is the shared host authentication adapter over the SDK,
   with one absolute 30-second deadline and 256 cancellation-retained blocking
-  verification slots. CLI account policy and JNI global destination policy
-  apply to both protocols.
-- Success is sent only after egress is connected; buffered HTTP payload is
-  forwarded exactly once before unread bytes. General failures preserve SOCKS
-  REP 1 and return HTTP 502. JNI retains its Tor owner throughout relay.
-- `resocks5-net` is consumed from the sibling filesystem checkout until the new
-  API is published; dependency versions and MSRV are unchanged.
+  verification slots. CLI account policy and the JNI global destination policy apply
+  to both protocols.
+- Requires `resocks5-net` 0.3 (the inbound server API). CI and release builds check
+  out the sibling `resocks5` at tag `v0.3.0` before Cargo resolves metadata; the
+  local path dependency stays in use.
+- The application sources (`apps/socks5-proxy/src`, the DNS server, android-ffi,
+  bridge-fetcher and bridge-probe tests) and the large proxy and JNI regression tests
+  were regrouped into sub-directories and modules to meet the size rules. Module
+  names, paths and assertions are unchanged.
+
+### Fixed
+
+- DNS listener: typed full packets and terminal NXDOMAIN/NODATA are preserved;
+  localhost, loopback and own-address PTR queries are answered locally; the actual
+  bound endpoints are passed to the override recursion guards. Local and cache
+  responses bypass the shared 64-backend cap, and overload returns SERVFAIL. One
+  absolute 30-second miss deadline covers tunnel acquisition and provider traversal.
+  TCP admission, framing, writes and connection lifetime are bounded, and shutdown
+  drops scoped work. Periodic cache publication no longer blocks the listeners: one
+  save is outstanding at a time and shutdown drains it before the final serialized
+  publication.
+- Windows IPv6 listener coverage reads `IPV6_V6ONLY` into initialized storage and
+  accepts both the one-byte boolean and the DWORD form, without socket2's
+  short-result panic or an uninitialized tail read.
+- Bridge sources: the abandoned `scriptzteam/Tor-Bridges-Collector` `bridges-obfs4`
+  source (no commits since 2026-07-29) is migrated to the regenerated v2 `obfs4.txt`
+  list, the same way the legacy webtunnel source already is; a config that still
+  lists the old URL is rewritten under its lock on the next refresh. The two Tor
+  Browser built-in sources (`tor-browser-obfs4`, `tor-browser-webtunnel`) are
+  retired: their path no longer exists upstream (HTTP 404; through Tor GitLab
+  answers 403), so they only produced a warning on every refresh. They are removed
+  from the default list, never fetched, and deleted from a config that still names
+  them, under the same config lock as the other source migrations. The
+  `tor-socks5.example.ktav` template lists the current WebTunnel-first set (the
+  three collectors' `webtunnel_tested` lists, about 150 tested bridges together,
+  plus the v2 obfs4 list); the collectors all read the Tor Project's own
+  distribution, so they overlap.
+- Android authentication rustdoc now describes the existing fail-closed startup:
+  enabled authentication with an empty or missing registry raises
+  `java.lang.RuntimeException` before the engine thread is spawned, and anonymous
+  access requires `auth.enabled: false`. The implementation is unchanged.
 
 ## [0.1.0] - 2026-10-02
 
