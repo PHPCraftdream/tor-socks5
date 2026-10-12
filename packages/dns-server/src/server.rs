@@ -231,47 +231,78 @@ where
     ).await
 }
 
-/// Fresh-port retries when the OS-chosen UDP port is unusable for TCP.
+/// Bind attempts for an ephemeral (port 0) UDP+TCP pair.
 const EPHEMERAL_BIND_ATTEMPTS: usize = 32;
 
+/// First port of the IANA dynamic range and its size.
+const DYNAMIC_PORT_START: u16 = 49152;
+const DYNAMIC_PORT_COUNT: u64 = 16384;
+
 /// cancel-safe: yes — a failed/cancelled TCP bind drops the already bound UDP socket.
-async fn bind_pair(addr: &str) -> Result<(UdpSocket, TcpListener)> {
+pub(crate) async fn bind_pair(addr: &str) -> Result<(UdpSocket, TcpListener)> {
     bind_pair_with(addr, TcpListener::bind).await
 }
 
-/// A requested port of 0 lets the OS pick the UDP port, but TCP and UDP keep
-/// separate reserved port ranges (e.g. Hyper-V on Windows), so the same number
-/// can be refused for TCP (`WSAEACCES`, i.e. `PermissionDenied`) or already be
-/// in use. Only that collision on an ephemeral request is retried on a fresh
-/// port; a fixed port and any other error fail at once.
+fn port_collision(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+    )
+}
+
+/// An unpredictable port of the dynamic range. The OS hands out ephemeral
+/// ports almost sequentially, so inside a wide reserved band (Windows excludes
+/// whole 100-port blocks per protocol, UDP and TCP differently) retrying port 0
+/// keeps landing in the same band.
+fn random_dynamic_port() -> u16 {
+    use std::hash::BuildHasher;
+    let random = std::collections::hash_map::RandomState::new().hash_one(());
+    DYNAMIC_PORT_START + (random % DYNAMIC_PORT_COUNT) as u16
+}
+
+/// Bind a UDP socket and a TCP listener on the same address. For a requested
+/// port of 0 the first attempt lets the OS choose; a port collision on either
+/// protocol (`AddrInUse`, or `PermissionDenied` for a reserved port, i.e.
+/// `WSAEACCES`) is retried on a random dynamic port. A fixed port and any other
+/// error fail at once.
 /// cancel-safe: yes — each attempt owns its sockets and drops them on failure.
 async fn bind_pair_with<B, Fut>(addr: &str, mut bind_tcp: B) -> Result<(UdpSocket, TcpListener)>
 where
     B: FnMut(SocketAddr) -> Fut,
     Fut: Future<Output = std::io::Result<TcpListener>>,
 {
-    let ephemeral = addr.parse::<SocketAddr>().is_ok_and(|a| a.port() == 0);
-    let mut attempt = 1;
-    loop {
-        let udp = UdpSocket::bind(addr)
-            .await
-            .with_context(|| format!("failed to bind UDP DNS listener on {addr}"))?;
+    let requested = addr.parse::<SocketAddr>().ok();
+    let ephemeral = requested.is_some_and(|a| a.port() == 0);
+    let mut target = addr.to_owned();
+    for attempt in 1..=EPHEMERAL_BIND_ATTEMPTS {
+        let retry = ephemeral && attempt < EPHEMERAL_BIND_ATTEMPTS;
+        let retry_with_random_port = |target: &mut String| {
+            if let Some(requested) = requested {
+                *target = SocketAddr::new(requested.ip(), random_dynamic_port()).to_string();
+            }
+        };
+        let udp = match UdpSocket::bind(&target).await {
+            Ok(udp) => udp,
+            Err(error) if retry && port_collision(&error) => {
+                retry_with_random_port(&mut target);
+                continue;
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error)
+                    .context(format!("failed to bind UDP DNS listener on {target}")))
+            }
+        };
         let bound = udp.local_addr()?;
         match bind_tcp(bound).await {
             Ok(tcp) => return Ok((udp, tcp)),
+            Err(error) if retry && port_collision(&error) => retry_with_random_port(&mut target),
             Err(error) => {
-                let collision = matches!(
-                    error.kind(),
-                    std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
-                );
-                if !(ephemeral && collision && attempt < EPHEMERAL_BIND_ATTEMPTS) {
-                    return Err(anyhow::Error::new(error)
-                        .context(format!("failed to bind TCP DNS listener on {bound}")));
-                }
-                attempt += 1;
+                return Err(anyhow::Error::new(error)
+                    .context(format!("failed to bind TCP DNS listener on {bound}")))
             }
         }
     }
+    unreachable!("the last attempt returns its own error")
 }
 
 /// Keep backend SocketAddr APIs while recording actual per-socket coverage.
