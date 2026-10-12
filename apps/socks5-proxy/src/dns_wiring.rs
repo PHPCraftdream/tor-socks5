@@ -73,52 +73,68 @@ pub(crate) fn convert_custom_doh_providers(configs: &[DohProviderConfig]) -> Vec
 pub(crate) fn convert_dns_overrides(
     configs: &[DnsOverrideConfig],
 ) -> Vec<dns_server::overrides::DnsOverride> {
-    configs
+    configs.iter().flat_map(convert_dns_override).collect()
+}
+
+/// One config entry becomes one runtime override per usable mask, in list
+/// order, all sharing the entry's resolver (first-match order is unchanged).
+fn convert_dns_override(entry: &DnsOverrideConfig) -> Vec<DnsOverride> {
+    let patterns: Vec<&str> = entry
+        .patterns
         .iter()
-        .filter_map(|entry| {
-            // An empty pattern would match only the empty host under the
+        .map(String::as_str)
+        .filter(|pattern| {
+            // An empty mask would match only the empty host under the
             // `dns_server::overrides::matches` semantics (matches("", host)
             // is true just when host is empty, e.g. a root-zone query), so
-            // the entry could never do useful work: an operator typo, and
+            // it could never do useful work: an operator typo, and
             // skipping keeps the override list meaningful — same convention
             // as the unparseable-server case below.
-            if entry.pattern.is_empty() {
+            if pattern.is_empty() {
                 warn!(
                     server = %entry.server,
-                    "skipping dns_server.overrides entry with an empty pattern"
+                    "skipping an empty mask in a dns_server.overrides entry"
                 );
-                return None;
             }
-            match entry.resolver {
-                DnsOverrideKind::System => {
-                    if !entry.server.is_empty() {
-                        warn!(
-                            pattern = %entry.pattern,
-                            server = %entry.server,
-                            "system resolver override ignores non-empty server, treating as system"
-                        );
-                    }
-                    Some(DnsOverride {
-                        pattern: entry.pattern.clone(),
-                        resolver: OverrideResolver::System,
-                    })
-                }
-                DnsOverrideKind::Dns => match entry.server.parse::<SocketAddr>() {
-                    Ok(server) => Some(DnsOverride {
-                        pattern: entry.pattern.clone(),
-                        resolver: OverrideResolver::Dns { server },
-                    }),
-                    Err(error) => {
-                        warn!(
-                            pattern = %entry.pattern,
-                            server = %entry.server,
-                            %error,
-                            "skipping dns_server.overrides entry with an unparseable server"
-                        );
-                        None
-                    }
-                },
+            !pattern.is_empty()
+        })
+        .collect();
+    if patterns.is_empty() {
+        warn!(
+            server = %entry.server,
+            "skipping dns_server.overrides entry without a usable mask"
+        );
+        return Vec::new();
+    }
+    let resolver = match entry.resolver {
+        DnsOverrideKind::System => {
+            if !entry.server.is_empty() {
+                warn!(
+                    patterns = ?patterns,
+                    server = %entry.server,
+                    "system resolver override ignores non-empty server, treating as system"
+                );
             }
+            OverrideResolver::System
+        }
+        DnsOverrideKind::Dns => match entry.server.parse::<SocketAddr>() {
+            Ok(server) => OverrideResolver::Dns { server },
+            Err(error) => {
+                warn!(
+                    patterns = ?patterns,
+                    server = %entry.server,
+                    %error,
+                    "skipping dns_server.overrides entry with an unparseable server"
+                );
+                return Vec::new();
+            }
+        },
+    };
+    patterns
+        .into_iter()
+        .map(|pattern| DnsOverride {
+            pattern: pattern.to_owned(),
+            resolver: resolver.clone(),
         })
         .collect()
 }
@@ -177,7 +193,7 @@ mod tests {
     #[test]
     fn converts_a_valid_system_override() {
         let configs = vec![DnsOverrideConfig {
-            pattern: "*.lan".to_owned(),
+            patterns: vec!["*.lan".to_owned()],
             resolver: DnsOverrideKind::System,
             server: String::new(),
         }];
@@ -189,7 +205,7 @@ mod tests {
     #[test]
     fn converts_a_valid_dns_override() {
         let configs = vec![DnsOverrideConfig {
-            pattern: "ns.home.arpa".to_owned(),
+            patterns: vec!["ns.home.arpa".to_owned()],
             resolver: DnsOverrideKind::Dns,
             server: "192.0.2.53:53".to_owned(),
         }];
@@ -207,17 +223,17 @@ mod tests {
     fn skips_dns_override_with_unparseable_server() {
         let configs = vec![
             DnsOverrideConfig {
-                pattern: "a.lan".to_owned(),
+                patterns: vec!["a.lan".to_owned()],
                 resolver: DnsOverrideKind::Dns,
                 server: "192.0.2.53:53".to_owned(),
             },
             DnsOverrideConfig {
-                pattern: "broken.lan".to_owned(),
+                patterns: vec!["broken.lan".to_owned()],
                 resolver: DnsOverrideKind::Dns,
                 server: "not-addr".to_owned(),
             },
             DnsOverrideConfig {
-                pattern: "b.lan".to_owned(),
+                patterns: vec!["b.lan".to_owned()],
                 resolver: DnsOverrideKind::Dns,
                 server: "192.0.2.54:53".to_owned(),
             },
@@ -235,7 +251,7 @@ mod tests {
         // operator typo, but dropping the entry would lose the whole
         // exception, so it degrades to plain system resolution.
         let configs = vec![DnsOverrideConfig {
-            pattern: "*.lan".to_owned(),
+            patterns: vec!["*.lan".to_owned()],
             resolver: DnsOverrideKind::System,
             server: "192.0.2.9:53".to_owned(),
         }];
@@ -247,10 +263,75 @@ mod tests {
     #[test]
     fn skips_empty_pattern_override() {
         let configs = vec![DnsOverrideConfig {
-            pattern: String::new(),
+            patterns: vec![String::new()],
             resolver: DnsOverrideKind::System,
             server: String::new(),
         }];
         assert!(convert_dns_overrides(&configs).is_empty());
+    }
+
+    #[test]
+    fn expands_every_mask_of_an_entry_in_order_with_the_shared_resolver() {
+        let configs = vec![
+            DnsOverrideConfig {
+                patterns: vec!["*.ru".to_owned(), "*.рф".to_owned(), "exact.lan".to_owned()],
+                resolver: DnsOverrideKind::Dns,
+                server: "192.0.2.53:53".to_owned(),
+            },
+            DnsOverrideConfig {
+                patterns: vec!["*.lan".to_owned()],
+                resolver: DnsOverrideKind::System,
+                server: String::new(),
+            },
+        ];
+        let overrides = convert_dns_overrides(&configs);
+        let masks: Vec<&str> = overrides.iter().map(|o| o.pattern.as_str()).collect();
+        assert_eq!(masks, ["*.ru", "*.рф", "exact.lan", "*.lan"]);
+        let shared = OverrideResolver::Dns {
+            server: "192.0.2.53:53".parse().unwrap(),
+        };
+        assert!(overrides[..3].iter().all(|o| o.resolver == shared));
+        assert_eq!(overrides[3].resolver, OverrideResolver::System);
+    }
+
+    #[test]
+    fn drops_only_the_empty_masks_of_an_entry() {
+        let configs = vec![DnsOverrideConfig {
+            patterns: vec![String::new(), "*.ru".to_owned(), String::new()],
+            resolver: DnsOverrideKind::System,
+            server: String::new(),
+        }];
+        let overrides = convert_dns_overrides(&configs);
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[0].pattern, "*.ru");
+    }
+
+    #[test]
+    fn skips_entry_with_an_empty_mask_list() {
+        let configs = vec![DnsOverrideConfig {
+            patterns: Vec::new(),
+            resolver: DnsOverrideKind::System,
+            server: String::new(),
+        }];
+        assert!(convert_dns_overrides(&configs).is_empty());
+    }
+
+    #[test]
+    fn unparseable_server_drops_every_mask_of_the_entry() {
+        let configs = vec![
+            DnsOverrideConfig {
+                patterns: vec!["a.lan".to_owned(), "b.lan".to_owned()],
+                resolver: DnsOverrideKind::Dns,
+                server: "not-addr".to_owned(),
+            },
+            DnsOverrideConfig {
+                patterns: vec!["ok.lan".to_owned()],
+                resolver: DnsOverrideKind::System,
+                server: String::new(),
+            },
+        ];
+        let overrides = convert_dns_overrides(&configs);
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[0].pattern, "ok.lan");
     }
 }

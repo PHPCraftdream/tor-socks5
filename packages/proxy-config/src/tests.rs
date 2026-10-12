@@ -888,7 +888,7 @@ fn parses_dns_server_override_with_system_resolver() {
     let src = "listen: 127.0.0.1:1080\n\
                dns_server.overrides: [\n\
                \t{\n\
-               \t\tpattern: *.example.com\n\
+               \t\tpatterns: *.example.com\n\
                \t\tresolver: system\n\
                \t\tserver: \n\
                \t}\n\
@@ -896,7 +896,7 @@ fn parses_dns_server_override_with_system_resolver() {
     let cfg: Config = ktav::from_str(src).expect("ktav parses dns_server section");
     assert_eq!(cfg.dns_server.overrides.len(), 1);
     let o = &cfg.dns_server.overrides[0];
-    assert_eq!(o.pattern, "*.example.com");
+    assert_eq!(o.patterns, ["*.example.com"]);
     assert_eq!(o.resolver, DnsOverrideKind::System);
     assert_eq!(o.server, "");
 }
@@ -906,7 +906,7 @@ fn parses_dns_server_override_with_specific_dns_server() {
     let src = "listen: 127.0.0.1:1080\n\
                dns_server.overrides: [\n\
                \t{\n\
-               \t\tpattern: *.example.org\n\
+               \t\tpatterns: *.example.org\n\
                \t\tresolver: dns\n\
                \t\tserver: 192.0.2.53:53\n\
                \t}\n\
@@ -914,7 +914,7 @@ fn parses_dns_server_override_with_specific_dns_server() {
     let cfg: Config = ktav::from_str(src).expect("ktav parses dns_server section");
     assert_eq!(cfg.dns_server.overrides.len(), 1);
     let o = &cfg.dns_server.overrides[0];
-    assert_eq!(o.pattern, "*.example.org");
+    assert_eq!(o.patterns, ["*.example.org"]);
     assert_eq!(o.resolver, DnsOverrideKind::Dns);
     assert_eq!(o.server, "192.0.2.53:53");
 }
@@ -926,12 +926,12 @@ fn dns_server_overrides_roundtrip_preserves_entries_exactly() {
     let mut cfg = Config::default();
     cfg.dns_server.overrides = vec![
         DnsOverrideConfig {
-            pattern: "*.example.com".into(),
+            patterns: vec!["*.example.com".into()],
             resolver: DnsOverrideKind::System,
             server: String::new(),
         },
         DnsOverrideConfig {
-            pattern: "exact.example.net".into(),
+            patterns: vec!["exact.example.net".into()],
             resolver: DnsOverrideKind::Dns,
             server: "192.0.2.53:53".into(),
         },
@@ -952,7 +952,7 @@ fn dns_server_unknown_field_inside_override_is_rejected() {
     let src = "listen: 127.0.0.1:1080\n\
                dns_server.overrides: [\n\
                \t{\n\
-               \t\tpattern: *.example.com\n\
+               \t\tpatterns: *.example.com\n\
                \t\tresolver: system\n\
                \t\tserver: \n\
                \t\tproxy: tor\n\
@@ -971,7 +971,7 @@ fn dns_server_override_requires_explicit_resolver() {
     let src = "listen: 127.0.0.1:1080\n\
                dns_server.overrides: [\n\
                \t{\n\
-               \t\tpattern: *.example.com\n\
+               \t\tpatterns: *.example.com\n\
                \t\tserver: \n\
                \t}\n\
                ]\n";

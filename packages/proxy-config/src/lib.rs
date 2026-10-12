@@ -20,7 +20,9 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 mod listen_addresses;
+mod override_patterns;
 use listen_addresses::listen_addresses;
+use override_patterns::override_patterns;
 
 const ENV_VAR: &str = "TOR_SOCKS5_CONFIG";
 const DEFAULT_FILE: &str = "tor-socks5.ktav";
@@ -215,10 +217,15 @@ pub enum DnsOverrideKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DnsOverrideConfig {
-    /// Hostname glob: `*` matches any run of characters (including none),
-    /// matched case-insensitively against the whole queried hostname.
-    /// No `*` present => exact-hostname match.
-    pub pattern: String,
+    /// Hostname globs sharing this entry's resolver: `*` matches any run of
+    /// characters (including none), matched case-insensitively against the
+    /// whole queried hostname. No `*` present => exact-hostname match. The
+    /// canonical form is a list (`patterns: [*.ru, *.example.com]`); a lone
+    /// string is read as a one-element list. The old single-mask key
+    /// `pattern` is gone: a config that still uses it is rejected at load.
+    /// Masks are checked in list order and serialization writes the list.
+    #[serde(deserialize_with = "override_patterns")]
+    pub patterns: Vec<String>,
     /// Where this host's resolution goes instead of the default
     /// DoH-over-Tor pool: `system` (OS resolver) or `dns` (a specific
     /// plain DNS server). Required in every entry — there is no default.
