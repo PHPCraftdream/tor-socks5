@@ -50,7 +50,9 @@ async fn ephemeral_bind_pair_retries_only_tcp_port_collisions() {
     })
     .await
     .unwrap();
-    assert_eq!(calls, 4);
+    // Three injected refusals, then a real bind that may itself hit a reserved
+    // port and be retried: at least four calls, and in the end one shared port.
+    assert!(calls >= 4, "refusals must be retried, got {calls} calls");
     assert_eq!(udp.local_addr().unwrap(), tcp.local_addr().unwrap());
 
     let mut calls = 0;
@@ -66,7 +68,14 @@ async fn ephemeral_bind_pair_retries_only_tcp_port_collisions() {
         (EPHEMERAL_BIND_ATTEMPTS / 2..=EPHEMERAL_BIND_ATTEMPTS).contains(&calls),
         "bounded retries, got {calls}"
     );
-    assert!(format!("{error:#}").contains("failed to bind TCP DNS listener"));
+    // The last attempt may fail on the UDP side of a random port instead, so
+    // either protocol's bind error is a correct surfaced failure.
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("failed to bind TCP DNS listener")
+            || text.contains("failed to bind UDP DNS listener"),
+        "{text}"
+    );
 
     let mut calls = 0;
     bind_pair_with("127.0.0.1:0", |_| {
