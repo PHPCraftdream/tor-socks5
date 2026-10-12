@@ -543,7 +543,7 @@ async fn actual_ipv6_socket_options_define_udp_tcp_local_coverage() {
                     assert_eq!(backend.available_permits(), 0);
                 }
             };
-            timeout(Duration::from_secs(5), async {
+            timeout(CASE_BUDGET, async {
                 tokio::select! { _ = &mut service => panic!("listener ended"), _ = cases => {} }
             })
             .await
@@ -644,7 +644,7 @@ async fn wildcard_routed_remote_and_explicit_override_retain_cached_answers() {
                     .unwrap();
             }
         };
-        timeout(Duration::from_secs(5), async {
+        timeout(CASE_BUDGET, async {
             tokio::select! {
                 _ = &mut service => panic!("listener ended"),
                 _ = upstream_loop => panic!("upstream ended"),

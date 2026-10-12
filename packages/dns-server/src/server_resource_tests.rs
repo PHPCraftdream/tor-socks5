@@ -295,7 +295,7 @@ async fn real_tcp_partial_frame_timeout_releases_connection_without_backend() {
     tokio::time::resume();
     tokio::select! {
         _ = &mut service => panic!("listener ended"),
-        result = timeout(Duration::from_secs(5), async {
+        result = timeout(CASE_BUDGET, async {
             let mut next_peer = TcpStream::connect(addr).await.unwrap();
             let req = request("localhost.", RecordType::A, 33);
             let reply = tcp_exchange(&mut next_peer, &req).await;

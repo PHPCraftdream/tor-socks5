@@ -126,6 +126,8 @@ impl Drop for Admission<'_> {
 fn add(counter: &AtomicU64, amount: u64) {
     // Standalone telemetry, not a publication flag. Saturation is explicit
     // rather than wraparound; durable telemetry is limited to SQLite i64.
+    // `try_update` is newer than our MSRV; `fetch_update` is its older name.
+    #[allow(deprecated)]
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
         Some(n.saturating_add(amount).min(i64::MAX as u64))
     });

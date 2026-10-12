@@ -26,7 +26,7 @@ pub(super) async fn store() -> (
 /// terminal REFUSED packets; counting retry attempts would inflate requests.
 #[tokio::test]
 async fn real_upstream_terminal_refused_counts_udp_and_tcp_requests() {
-    timeout(Duration::from_secs(5), async {
+    timeout(CASE_BUDGET, async {
         let (dir, mut worker, handle) = store().await;
         let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server = upstream.local_addr().unwrap();
@@ -73,7 +73,7 @@ async fn real_upstream_terminal_refused_counts_udp_and_tcp_requests() {
 /// This checks both outputs, not their relative publication order.
 #[tokio::test]
 async fn run_precancelled_republishes_restored_statistics_and_saves_cache() {
-    timeout(Duration::from_secs(5), async {
+    timeout(CASE_BUDGET, async {
         let (dir, worker, handle) = store().await;
         let cache_path = dir.join("cache.bin");
         let q = question("persist.example.", RecordType::A);
@@ -112,7 +112,7 @@ async fn run_precancelled_republishes_restored_statistics_and_saves_cache() {
 /// Real sockets remain active until cancellation; no sleep/paused socket clock.
 #[tokio::test]
 async fn owned_lifecycle_stops_network_then_drains_statistics_before_cache_save() {
-    timeout(Duration::from_secs(5), async {
+    timeout(CASE_BUDGET, async {
         use tokio::io::AsyncReadExt;
         use tokio::sync::oneshot;
 
@@ -258,7 +258,7 @@ async fn owned_lifecycle_stops_network_then_drains_statistics_before_cache_save(
 /// supported questions before terminal disconnect enter the ledger.
 #[tokio::test]
 async fn malformed_tcp_is_terminal_and_not_counted() {
-    timeout(Duration::from_secs(5), async {
+    timeout(CASE_BUDGET, async {
         let (dir, mut worker, handle) = store().await;
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = tcp.local_addr().unwrap();
@@ -297,7 +297,7 @@ async fn malformed_tcp_is_terminal_and_not_counted() {
 /// counting backend requests also incorrectly counts background refreshes.
 #[tokio::test]
 async fn udp_tcp_count_first_supported_question_once_before_cache_and_overload() {
-    timeout(Duration::from_secs(5), async {
+    timeout(CASE_BUDGET, async {
         let (dir, mut worker, handle) = store().await;
         let (udp, tcp) = bind_pair("127.0.0.1:0").await.unwrap();
         let udp = Arc::new(udp);

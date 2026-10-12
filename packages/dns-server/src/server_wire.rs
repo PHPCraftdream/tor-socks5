@@ -122,9 +122,13 @@ pub(super) async fn write_framed_message<W: AsyncWrite + Unpin>(
             "dns message exceeds 65535 bytes",
         )
     })?;
+    // One contiguous write: a separate 2-byte prefix write lets Nagle hold the
+    // body until the peer's delayed ACK (about 40 ms on Linux) per response.
+    let mut frame = Vec::with_capacity(2 + body.len());
+    frame.extend_from_slice(&length.to_be_bytes());
+    frame.extend_from_slice(body);
     timeout(budget, async {
-        writer.write_all(&length.to_be_bytes()).await?;
-        writer.write_all(body).await?;
+        writer.write_all(&frame).await?;
         writer.flush().await
     })
     .await

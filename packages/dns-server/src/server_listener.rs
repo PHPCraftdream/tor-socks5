@@ -146,6 +146,8 @@ pub(super) async fn tcp_loop_gated<T, F, MakeGate, Gate, G, Completed>(
                 };
                 if work.len() >= MAX_TCP_CONNECTIONS { continue; }
                 let Ok(permit) = connections.clone().try_acquire_owned() else { continue; };
+                // Small request/response frames: never wait for a delayed ACK.
+                let _ = stream.set_nodelay(true);
                 let ctx = ctx.clone();
                 let backend = backend.clone();
                 let gate = make_gate();

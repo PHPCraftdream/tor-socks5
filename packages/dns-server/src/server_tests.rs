@@ -7,6 +7,11 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
+/// Whole-case hang guard for the real-socket tests. Each case takes about a
+/// second alone, but dozens run in parallel and every statistics worker fsyncs
+/// SQLite and snapshot files, so a tight budget only measures machine load.
+const CASE_BUDGET: Duration = Duration::from_secs(30);
+
 #[path = "server_contract_tests.rs"]
 mod contracts;
 #[path = "server_prefetch_tests.rs"]
@@ -96,7 +101,10 @@ async fn udp_exchange(socket: &UdpSocket, addr: SocketAddr, message: &Message) -
 }
 async fn tcp_exchange(stream: &mut TcpStream, message: &Message) -> Message {
     let bytes = message.to_vec().unwrap();
-    // Deliberately split the length prefix and body, using real TCP.
+    // Deliberately split the length prefix and body, using real TCP. NODELAY
+    // keeps every fragment its own segment; with Nagle on, each tiny write would
+    // wait for the server's delayed ACK (about 40 ms each on Linux).
+    stream.set_nodelay(true).unwrap();
     let prefix = u16::try_from(bytes.len()).unwrap().to_be_bytes();
     stream.write_all(&prefix[..1]).await.unwrap();
     stream.write_all(&prefix[1..]).await.unwrap();

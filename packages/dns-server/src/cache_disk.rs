@@ -18,6 +18,8 @@ static SAVE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub(super) fn save(path: &Path, entries: &[Entry]) -> io::Result<()> {
     // Standalone uniqueness counter, not a publication flag. Overflow is an
     // error rather than permitting temp-name reuse.
+    // `try_update` is newer than our MSRV; `fetch_update` is its older name.
+    #[allow(deprecated)]
     let sequence = SAVE_SEQUENCE
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             value.checked_add(1)

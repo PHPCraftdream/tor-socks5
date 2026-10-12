@@ -66,7 +66,7 @@ fn changed_reply(req: &Message) -> Message {
 /// or deleting valid entries on failure changes the explicit foreground reply.
 #[tokio::test]
 async fn real_udp_tcp_refresh_replaces_fresh_typed_alias_and_negative_answers() {
-    timeout(Duration::from_secs(5), async {
+    timeout(CASE_BUDGET, async {
         let (upstream_udp, upstream_tcp) = bind_pair("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream_udp.local_addr().unwrap();
         let (udp, tcp) = bind_pair("127.0.0.1:0").await.unwrap();
@@ -202,7 +202,7 @@ async fn real_udp_tcp_refresh_replaces_fresh_typed_alias_and_negative_answers() 
 /// background resolution retains its slot after cancellation.
 #[tokio::test]
 async fn gated_background_leaves_foreground_responsive_and_cancel_releases_permit() {
-    timeout(Duration::from_secs(5), async {
+    timeout(CASE_BUDGET, async {
         let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream.local_addr().unwrap();
         let (udp, tcp) = bind_pair("127.0.0.1:0").await.unwrap();
@@ -312,7 +312,7 @@ async fn expired_refresh_deadline_drops_pending_acquisition_and_preserves_cache(
 /// refresh through cache prevents a later recovered upstream from being used.
 #[tokio::test]
 async fn unavailable_tor_and_expired_admission_keep_cache_then_next_refresh_recovers() {
-    timeout(Duration::from_secs(5), async {
+    timeout(CASE_BUDGET, async {
         let req = request("recover.example.", RecordType::A, 1);
         let context = QueryCtx {
             tunnel: || std::future::ready(None),
