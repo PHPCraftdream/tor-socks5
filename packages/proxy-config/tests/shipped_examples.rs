@@ -5,13 +5,16 @@ use std::path::PathBuf;
 
 use proxy_config::{BridgesConfig, Config};
 
-/// A file of the repository checkout, or `None` when the crate is built
-/// outside it (for example from a published package).
+/// A file of the repository checkout (line endings normalised, since a Windows
+/// checkout may convert them), or `None` when the crate is built outside it
+/// (for example from a published package).
 fn repo_file(name: &str) -> Option<String> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join(name);
-    std::fs::read_to_string(path).ok()
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|text| text.replace("\r\n", "\n"))
 }
 
 fn ktav_blocks(markdown: &str) -> Vec<String> {
