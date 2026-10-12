@@ -27,8 +27,19 @@ legacy 512-byte TC/TCP fallback; EDNS is not implemented.
 
 Positive and negative cache lifetimes survive restarts without rejuvenation.
 Periodic saves run concurrently with listeners, at most one outstanding, and
-explicit shutdown drains publication before the serialized final save. Only
+explicit shutdown stops owned networking and joins cancelled prefetch, drains
+accepted statistics/final popularity, then drains active cache publication before
+the serialized final save. Only
 SERVFAIL is a temporary DNS failure; other valid terminal rcodes are forwarded.
+
+The listener also persists payload-free query popularity and refreshes observed
+popular question tuples at startup and every two hours. Background resolution
+uses the same local policy, overrides, Tor provider pool and recursion guards,
+bypasses fresh cache hits, and retains valid cache entries on failure. One
+sequential background exchange shares the 64 backend slots while reserving
+foreground headroom; prefetch itself never counts as client traffic. Statistics
+are sensitive local browsing metadata; protect the cache directory. Store schema,
+loss accounting and inspection format are documented in `docs/dns-server.md`.
 
 The crate publishes as `tor-socks5-dns`, while the library target keeps the in-tree name `dns_server` — in code it is `use dns_server::…`.
 

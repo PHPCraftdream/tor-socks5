@@ -24,6 +24,7 @@ use crate::error::DnsServerError;
 use crate::overrides::{
     find_override, resolve_via_dns_server, resolve_via_system, DnsOverride, OverrideResolver,
 };
+use crate::query_statistics::{QueryStatistics, RecordOutcome, StatisticsPaths, StatisticsWorker};
 use crate::types::{DohProvider, ResolvedAnswer};
 
 #[path = "server_listener.rs"]
@@ -50,6 +51,7 @@ struct QueryCtx<T> {
     /// Actual UDP and TCP endpoints, never configured port-zero placeholders.
     endpoints: Arc<Vec<SocketAddr>>,
     route_probe: local::RouteProbe,
+    statistics: Option<QueryStatistics>,
 }
 
 impl<T: Clone> Clone for QueryCtx<T> {
@@ -61,14 +63,16 @@ impl<T: Clone> Clone for QueryCtx<T> {
             overrides: self.overrides.clone(),
             endpoints: self.endpoints.clone(),
             route_probe: self.route_probe.clone(),
+            statistics: self.statistics.clone(),
         }
     }
 }
 
 /// Serve DNS on all requested UDP/TCP endpoints until cancellation.
-/// cancel-safe: socket work is scoped and dropped on cancellation. Explicit
-/// shutdown drains any active cache publication before the final save; forced
-/// cancellation inherits DnsCache::save's blocking-worker publication contract.
+/// cancel-safe: NO for forced cancellation during persistence: socket work is
+/// scoped and dropped, but statistics/cache publication can outlive this future.
+/// Explicit shutdown stops networking, joins prefetch and drains statistics,
+/// then drains active cache publication before the final save.
 pub async fn run<T, F>(
     listen: &[String],
     tunnel: T,
@@ -96,6 +100,17 @@ where
         udp_sockets.push(Arc::new(udp));
         tcp_listeners.push(tcp);
     }
+    let (statistics, worker) = match StatisticsWorker::open(StatisticsPaths::from_cache_path(
+        &cache_path,
+    ))
+    .await
+    {
+        Ok((handle, worker)) => (Some(handle), Some(worker)),
+        Err(error) => {
+            warn!(%error, "DNS query accounting degraded: statistics unavailable; prefetch disabled");
+            (None, None)
+        }
+    };
     let ctx = QueryCtx {
         tunnel,
         cache: cache.clone(),
@@ -103,7 +118,49 @@ where
         overrides: Arc::new(overrides),
         endpoints: Arc::new(endpoints),
         route_probe: local::route_probe(),
+        statistics,
     };
+    serve_owned_lifecycle(
+        (udp_sockets, tcp_listeners),
+        ctx,
+        worker,
+        shutdown,
+        |worker| async move {
+            if let Some(worker) = worker {
+                worker.shutdown().await?;
+            }
+            Ok(())
+        },
+        || {},
+        || cache.save(&cache_path),
+    )
+    .await
+}
+
+/// Own the production listeners, scheduler, statistics drain and cache saves.
+/// The per-instance drain/observer seams expose shutdown IO, not an alternative
+/// ordering implementation. Neither the tunnel factory nor these closures need Sync.
+/// cancel-safe: NO — forced drop cannot await statistics or cache publication;
+/// explicit cancellation stops networking, joins prefetch, then awaits the drain.
+async fn serve_owned_lifecycle<T, F, Drain, Drained, Stopped, Make, Save>(
+    listeners: (Vec<Arc<UdpSocket>>, Vec<TcpListener>),
+    ctx: QueryCtx<T>,
+    worker: Option<StatisticsWorker>,
+    shutdown: CancellationToken,
+    drain: Drain,
+    networking_stopped: Stopped,
+    save: Make,
+) -> Result<()>
+where
+    T: Fn() -> F + Send + Clone + 'static,
+    F: Future<Output = Option<TorTunnel>> + Send + 'static,
+    Drain: FnOnce(Option<StatisticsWorker>) -> Drained,
+    Drained: Future<Output = Result<()>>,
+    Stopped: FnOnce(),
+    Make: FnMut() -> Save,
+    Save: Future<Output = Result<(), DnsServerError>>,
+{
+    let (udp_sockets, tcp_listeners) = listeners;
     let backend = Arc::new(Semaphore::new(MAX_DNS_CONCURRENT_QUERIES));
     let connections = Arc::new(Semaphore::new(listener::MAX_TCP_CONNECTIONS));
     let mut udp_loops = udp_sockets
@@ -114,28 +171,107 @@ where
         .into_iter()
         .map(|socket| listener::tcp_loop(socket, ctx.clone(), backend.clone(), connections.clone()))
         .collect::<FuturesUnordered<_>>();
+    let refresh_ctx = ctx.clone();
+    let refresh_backend = backend.clone();
     serve_with_saves(
         async move {
-            tokio::select! {
-                _ = udp_loops.next() => Err(anyhow::anyhow!("UDP DNS listener loop exited unexpectedly")),
-                _ = tcp_loops.next() => Err(anyhow::anyhow!("TCP DNS listener loop exited unexpectedly")),
+            let networking = async move {
+                tokio::select! {
+                    _ = udp_loops.next() => Err(anyhow::anyhow!("UDP DNS listener loop exited unexpectedly")),
+                    _ = tcp_loops.next() => Err(anyhow::anyhow!("TCP DNS listener loop exited unexpectedly")),
+                }
+            };
+            let mut networking = Box::pin(networking);
+            let stop_prefetch = CancellationToken::new();
+            let mut worker = worker;
+            {
+                let mut scheduler_done = worker.is_none();
+                let scheduler = async {
+                    if let Some(worker) = worker.as_mut() {
+                        crate::popular_prefetch::run(worker, move |question| {
+                            refresh_question(refresh_ctx.clone(), question, refresh_backend.clone())
+                        }, stop_prefetch.clone()).await
+                    } else {
+                        std::future::pending::<Result<()>>().await
+                    }
+                };
+                let mut scheduler = Box::pin(scheduler);
+                let result = loop {
+                    tokio::select! {
+                        biased;
+                        () = shutdown.cancelled() => break Ok(()),
+                        result = &mut networking => break result,
+                        result = &mut scheduler, if !scheduler_done => {
+                            scheduler_done = true;
+                            if let Err(error) = result {
+                                warn!(%error, "DNS statistics/prefetch worker degraded; foreground continues");
+                            }
+                        }
+                    }
+                };
+                // Stop every producer before closing/draining the accepted statistics.
+                drop(networking);
+                networking_stopped();
+                stop_prefetch.cancel();
+                if !scheduler_done {
+                    if let Err(error) = scheduler.as_mut().await {
+                        warn!(%error, "DNS prefetch failed during cancellation");
+                    }
+                }
+                drop(scheduler);
+                if let Err(error) = drain(worker.take()).await {
+                    warn!(%error, "DNS accounting degraded: final statistics drain/publication failed");
+                }
+                result
             }
         },
-        || cache.save(&cache_path),
-        shutdown,
+        save,
+        // The lifecycle above owns cancellation and must drain before final save.
+        CancellationToken::new(),
     ).await
 }
 
+/// Fresh-port retries when the OS-chosen UDP port is unusable for TCP.
+const EPHEMERAL_BIND_ATTEMPTS: usize = 32;
+
 /// cancel-safe: yes — a failed/cancelled TCP bind drops the already bound UDP socket.
 async fn bind_pair(addr: &str) -> Result<(UdpSocket, TcpListener)> {
-    let udp = UdpSocket::bind(addr)
-        .await
-        .with_context(|| format!("failed to bind UDP DNS listener on {addr}"))?;
-    let bound = udp.local_addr()?;
-    let tcp = TcpListener::bind(bound)
-        .await
-        .with_context(|| format!("failed to bind TCP DNS listener on {bound}"))?;
-    Ok((udp, tcp))
+    bind_pair_with(addr, TcpListener::bind).await
+}
+
+/// A requested port of 0 lets the OS pick the UDP port, but TCP and UDP keep
+/// separate reserved port ranges (e.g. Hyper-V on Windows), so the same number
+/// can be refused for TCP (`WSAEACCES`, i.e. `PermissionDenied`) or already be
+/// in use. Only that collision on an ephemeral request is retried on a fresh
+/// port; a fixed port and any other error fail at once.
+/// cancel-safe: yes — each attempt owns its sockets and drops them on failure.
+async fn bind_pair_with<B, Fut>(addr: &str, mut bind_tcp: B) -> Result<(UdpSocket, TcpListener)>
+where
+    B: FnMut(SocketAddr) -> Fut,
+    Fut: Future<Output = std::io::Result<TcpListener>>,
+{
+    let ephemeral = addr.parse::<SocketAddr>().is_ok_and(|a| a.port() == 0);
+    let mut attempt = 1;
+    loop {
+        let udp = UdpSocket::bind(addr)
+            .await
+            .with_context(|| format!("failed to bind UDP DNS listener on {addr}"))?;
+        let bound = udp.local_addr()?;
+        match bind_tcp(bound).await {
+            Ok(tcp) => return Ok((udp, tcp)),
+            Err(error) => {
+                let collision = matches!(
+                    error.kind(),
+                    std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                );
+                if !(ephemeral && collision && attempt < EPHEMERAL_BIND_ATTEMPTS) {
+                    return Err(anyhow::Error::new(error)
+                        .context(format!("failed to bind TCP DNS listener on {bound}")));
+                }
+                attempt += 1;
+            }
+        }
+    }
 }
 
 /// Keep backend SocketAddr APIs while recording actual per-socket coverage.
@@ -305,6 +441,94 @@ where
         }
         Err(_) => None,
     }
+}
+
+fn record_question<T>(ctx: &QueryCtx<T>, question: &Query) {
+    if let Some(statistics) = &ctx.statistics {
+        match statistics.record(question) {
+            RecordOutcome::Accepted => {}
+            RecordOutcome::DroppedFull => {
+                let status = statistics.status();
+                // Log at exponentially spaced loss counts, never question data.
+                if status.dropped_full.is_power_of_two() {
+                    warn!(
+                        dropped = status.dropped_full,
+                        "DNS query accounting degraded: bounded ingress full"
+                    );
+                }
+            }
+            // The worker reports the root persistence/closure failure. Do not
+            // amplify it into a warning for every foreground query.
+            RecordOutcome::Closed => {}
+        }
+    }
+}
+
+/// Refresh uses the same local policy and miss routes as foreground, but never
+/// reads a fresh cached answer or records a client observation.
+/// cancel-safe: yes — local probe, admission retry and exchange are scoped under
+/// one deadline; dropping the future releases the owned backend permit.
+async fn refresh_question<T, F>(
+    ctx: QueryCtx<T>,
+    question: Query,
+    backend: Arc<Semaphore>,
+) -> Option<ResolvedAnswer>
+where
+    T: Fn() -> F + Send + Clone + 'static,
+    F: Future<Output = Option<TorTunnel>> + Send + 'static,
+{
+    refresh_question_until(ctx, question, backend, Instant::now() + RESOLUTION_TIMEOUT).await
+}
+
+/// cancel-safe: yes — no detached work; all awaits are within the same terminal
+/// timeout and permit release is RAII on success, failure and cancellation.
+async fn refresh_question_until<T, F>(
+    ctx: QueryCtx<T>,
+    question: Query,
+    backend: Arc<Semaphore>,
+    deadline: Instant,
+) -> Option<ResolvedAnswer>
+where
+    T: Fn() -> F + Send + Clone + 'static,
+    F: Future<Output = Option<TorTunnel>> + Send + 'static,
+{
+    timeout_at(deadline, async move {
+        let host = wire::hostname_of(&question);
+        let explicit_override = find_override(&ctx.overrides, &host).is_some();
+        let probe = ctx.route_probe.clone();
+        if let Some(answer) = local::preflight_with_probe(
+            &question,
+            &host,
+            &ctx.endpoints,
+            explicit_override,
+            move |ip| probe(ip),
+        )
+        .await
+        {
+            return Some(answer);
+        }
+        // Atomically require two available slots, then immediately return one:
+        // background owns one and never consumes the last foreground slot.
+        let permit = loop {
+            if backend.available_permits() > 1 {
+                if let Ok(mut reserved) = backend.clone().try_acquire_many_owned(2) {
+                    let permit = reserved.split(1)?;
+                    drop(reserved);
+                    break permit;
+                }
+            }
+            if backend.is_closed() {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let answer = resolve_miss(ctx, question, deadline).await;
+        drop(permit);
+        answer
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 fn response(request: &Message, answer: Option<ResolvedAnswer>) -> Message {

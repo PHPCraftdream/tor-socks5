@@ -62,6 +62,7 @@ pub(super) async fn udp_loop_observed<T, F, Observe>(
                     wire::send_udp_response(&socket, peer, wire::formerr(&request)).await;
                     continue;
                 };
+                super::record_question(&ctx, &question);
                 if let Some(answer) = inline_answer(&ctx, &question).await {
                     wire::send_udp_response(&socket, peer, response(&request, Some(answer))).await;
                     continue;
@@ -189,6 +190,7 @@ async fn handle_tcp_gated<T, F, Gate, G>(
         let reply = if let Some(reply) = wire::unsupported_response(&request) {
             reply
         } else if let Some(question) = request.queries.first().cloned() {
+            super::record_question(&ctx, &question);
             let answer = if let Some(answer) = inline_answer(&ctx, &question).await {
                 Some(answer)
             } else {

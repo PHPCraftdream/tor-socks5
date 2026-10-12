@@ -44,6 +44,112 @@ dns_server.custom_doh_providers: [
 
 A custom entry whose `ip` does not parse as an IP literal is logged and skipped, not fatal.
 
+## Query popularity and background refresh
+
+When the DNS listener is enabled, it opens a separate payload-free statistics
+store before receiving queries. Each supported, parsed request with a question
+counts its **first** question once, before local policy, cache, backend admission
+or overload handling. Case and the DNS root spelling are normalized; name/type/
+class remain distinct observations. Malformed packets, response packets, missing
+questions, unsupported opcodes and AXFR/IXFR do not count. Prefetch does not count.
+
+Popularity sums all observed types/classes for a domain over the precise rolling
+30-day window `(highwater - 2,592,000 seconds, highwater]`; a domain qualifies only
+when its total is **greater than 100**. The persisted clock high-water mark never
+moves backwards. Trusted live receipt timestamps can advance that high-water
+mark even if the worker's current UTC has rolled back before processing them;
+these receipts are not untrusted restored rows. During live clock rollback,
+observations retain their original UTC seconds and count only when those seconds
+remain inside the trusted high-water window; they are never restamped to its end.
+On reopen, a persisted
+high-water mark ahead of current UTC causes restore to fail without pruning
+history. Genuine rollback and plausible future tampering cannot be distinguished;
+correct the clock before reopening rather than resetting the high-water mark.
+Each qualifying domain's observed type/class tuples are refreshed,
+not an invented A/AAAA-only set. Startup evaluates stored observations before
+prefetch; evaluation repeats every two hours independently of a running cycle.
+One sequential cycle is active at a time, paging immutable generations in groups
+of at most 128 tuples rather than collecting the entire history in memory.
+
+Refresh repeats current local preflight, then bypasses even a fresh cache entry
+and uses the ordinary miss route: first matching override or the current Tor
+provider pool, with actual listener endpoints in recursion guards. It copies no
+provider configuration, override table or packet history into statistics. One
+background exchange uses the same 64 backend slots, only admitting when more than
+one slot is available; foreground local/cache replies remain admission-free and
+UDP misses never queue. A single 30-second deadline covers local preflight,
+background admission, tunnel acquisition and exchanges. Failed/unavailable Tor,
+invalid packets and deadlines do not evict valid cache entries or extend TTLs.
+Successful positive/alias/negative answers retain ordinary packet-cache semantics.
+
+Statistics contain **sensitive browsing metadata** (normalized names, types,
+classes, timestamps and counts), though no client address, full query/answer
+packet or answer data is stored. Protect the operator-owned cache directory;
+this is not encryption or protection against another user who can modify that
+directory. Ingress is bounded (4096 messages), nonblocking and drop-newest
+(queue-full), with 256-event SQL batches on one dedicated thread. Slow healthy
+maintenance/publication can also fill the queue; pressure drops do not necessarily
+mean a disk fault. Acceptance means queued, **not
+already durable**. Accounting failures are logged; foreground service continues
+in an explicitly degraded mode. Inspect loss/unsaved counters rather than treating
+popular output as lossless traffic measurement. Explicit shutdown stops socket
+producers and cancels background networking, drains accepted statistics and
+publishes final popularity, then drains cache publication and performs the final
+answer-cache save.
+
+### Local inspection schema (version 2)
+
+Version 1 stores are migrated by adding `expired=0`; historical insertion versus
+expiry cannot be reconstructed after pruning, so legacy `saved` totals are
+preserved rather than retrospectively reclassified.
+
+For the normal `*.dns-cache` answer-cache path, sibling files are
+`*.dns-query-statistics.sqlite3` and `*.dns-popular`. The SQLite store uses WAL
+and can have `-wal`/`-shm` companions. It is separate from the answer-cache binary.
+
+- `meta`: singleton `id=1`; `schema_version`, `highwater`, `generation`,
+  `refreshed_at`, `accepted`, `saved`, `expired`, `dropped_full`, `unsaved`,
+  `invalid_restored`, `last_error`.
+- `query_seconds`: `domain`, numeric `rr_type`, numeric `class`, UTC Unix
+  `second`, integer `count`; primary key `(domain,rr_type,class,second)`.
+- `domain_summary`: primary-key `domain`, summed `count`, UTC Unix `refreshed_at` and
+  `last_seen` (maximum accepted observation second).
+- `popular_targets`: `generation`, `domain`, `rr_type`, `class`, `count`;
+  primary key `(generation,domain,rr_type,class)`. Tuple counts are not domain totals.
+
+The atomically replaced UTF-8 `.dns-popular` file is tab-separated, ordered by
+normalized absolute domain (including trailing dot); its exact header is
+`domain\tcount\trefreshed_at`. Each row contains a qualifying domain's total and
+an RFC 3339 UTC refresh timestamp. It is a publication, not an input work queue:
+editing it does not seed prefetch. SQLite is the authoritative ledger. Do not
+modify a live ledger. Stable accounting is
+`accepted = saved + expired + unsaved + pending`. Pending counts are
+`accepted - saved - expired - unsaved` (clamped at zero for concurrent inspection).
+`saved` is cumulative inserted observations at their original receipt seconds,
+including rows subsequently pruned; it is **not** the current-window population.
+`expired` counts valid accepted receipts already outside the logical window when
+processed, not later pruning of previously inserted rows. `unsaved` represents
+accepted events discarded after persistence/validation failure, while
+`dropped_full` represents rejected ingress. Queue-pressure drop-newest behavior
+is unchanged by expiry classification.
+
+History has no arbitrary top-N/popular-domain cap: disk usage grows with accepted
+`domain/type/class/second` cardinality within the rolling window. Expired-row
+`DELETE` permits SQLite free-page reuse; it does not physically compact the file.
+A persistent SQL fault latches accounting degradation for that worker lifetime;
+restart the listener after correcting the storage fault. Publication-only errors
+can be retried by later evaluation. No silent top-N truncation is applied.
+
+With the listener stopped (or for read-only inspection of a live WAL database),
+use SQLite's CLI and quote the operator path; replace this example with your
+actual cache sibling path:
+
+```sh
+sqlite3 -readonly "tor-socks5.dns-query-statistics.sqlite3" "SELECT schema_version, highwater, refreshed_at, accepted, saved, expired, dropped_full, unsaved, last_error FROM meta WHERE id=1;"
+sqlite3 -readonly "tor-socks5.dns-query-statistics.sqlite3" "SELECT domain, count, last_seen, refreshed_at FROM domain_summary WHERE count>100 ORDER BY domain;"
+sqlite3 -readonly "tor-socks5.dns-query-statistics.sqlite3" "SELECT domain, rr_type, class, SUM(count) AS observations FROM query_seconds GROUP BY domain, rr_type, class ORDER BY domain, rr_type, class;"
+```
+
 ## Pointing a client at it
 
 The default port is deliberately non-standard, so use a stub resolver or forwarder that
@@ -113,7 +219,15 @@ stem, fixed `.dns-cache` suffix (`/etc/tor-socks5.ktav` → `/etc/tor-socks5.dns
 a fresh hit is answered inline in the receive loop, with no Tor round-trip. It is flushed
 every 5 minutes and saved once more, best-effort, at shutdown. Periodic publication
 is polled concurrently with listeners, with at most one save outstanding; shutdown
-closes socket work, drains that publication, then performs the serialized final save.
+closes socket work and joins cancelled prefetch, drains accepted statistics and
+final popularity publication, drains any active cache publication, then performs
+the serialized final save. The synchronized owned-lifecycle regression drives
+101 real UDP/TCP queries, observes network drop and TCP EOF/listener closure,
+and holds the statistics-drain gate while asserting the final cache-save callback
+has not started. It then releases the gate and observes durable counts/popularity
+and the real cache save through the production save helper. The separate
+precancelled-startup regression checks restored popularity and cache output only,
+not their relative publication order.
 Positive answers and
 SOA-backed NXDOMAIN/NODATA results are cached with their remaining lifetimes;
 failures are not negative DNS answers. Legacy address-only cache data is not a

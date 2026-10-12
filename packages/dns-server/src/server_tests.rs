@@ -9,8 +9,12 @@ use tokio::time::timeout;
 
 #[path = "server_contract_tests.rs"]
 mod contracts;
+#[path = "server_prefetch_tests.rs"]
+mod prefetch;
 #[path = "server_resource_tests.rs"]
 mod resources;
+#[path = "server_statistics_tests.rs"]
+mod statistics;
 
 fn question(host: &str, kind: RecordType) -> Query {
     Query::query(Name::from_ascii(host).unwrap(), kind)
@@ -21,6 +25,49 @@ fn request(host: &str, kind: RecordType, id: u16) -> Message {
     message.add_query(question(host, kind));
     message
 }
+
+/// Counterfactual: without the retry roughly 8% of ephemeral binds on Windows
+/// fail with `PermissionDenied` (ports reserved for TCP only); retrying every
+/// error or a fixed port would mask real faults instead.
+#[tokio::test]
+async fn ephemeral_bind_pair_retries_only_tcp_port_collisions() {
+    let mut calls = 0;
+    let (udp, tcp) = bind_pair_with("127.0.0.1:0", |bound| {
+        calls += 1;
+        let refuse = calls <= 3;
+        async move {
+            if refuse {
+                Err(std::io::ErrorKind::PermissionDenied.into())
+            } else {
+                TcpListener::bind(bound).await
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(calls, 4);
+    assert_eq!(udp.local_addr().unwrap(), tcp.local_addr().unwrap());
+
+    let mut calls = 0;
+    let error = bind_pair_with("127.0.0.1:0", |_| {
+        calls += 1;
+        async { Err(std::io::ErrorKind::PermissionDenied.into()) }
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(calls, EPHEMERAL_BIND_ATTEMPTS);
+    assert!(format!("{error:#}").contains("failed to bind TCP DNS listener"));
+
+    let mut calls = 0;
+    bind_pair_with("127.0.0.1:0", |_| {
+        calls += 1;
+        async { Err(std::io::ErrorKind::InvalidInput.into()) }
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(calls, 1, "only port collisions are retried");
+}
+
 fn ctx(
     overrides: Vec<DnsOverride>,
     endpoints: Vec<SocketAddr>,
@@ -32,6 +79,7 @@ fn ctx(
         overrides: Arc::new(overrides),
         endpoints: Arc::new(endpoints),
         route_probe: local::route_probe(),
+        statistics: None,
     }
 }
 async fn udp_exchange(socket: &UdpSocket, addr: SocketAddr, message: &Message) -> Message {
@@ -66,9 +114,9 @@ async fn tcp_exchange(stream: &mut TcpStream, message: &Message) -> Message {
 /// external work, mixed families, wrong PTR, or a nonempty unsupported answer.
 #[tokio::test]
 async fn local_udp_tcp_bypasses_tunnel_and_wildcard_override() {
-    let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let (udp, tcp) = bind_pair("127.0.0.1:0").await.unwrap();
+    let udp = Arc::new(udp);
     let addr = udp.local_addr().unwrap();
-    let tcp = TcpListener::bind(addr).await.unwrap();
     let ctx = ctx(
         vec![DnsOverride {
             pattern: "*".into(),
@@ -244,9 +292,9 @@ fn upstream_reply(req: &Message) -> Message {
 async fn real_upstream_udp_tcp_typed_packets_and_negative_cache() {
     let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let server = upstream.local_addr().unwrap();
-    let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let (udp, tcp) = bind_pair("127.0.0.1:0").await.unwrap();
+    let udp = Arc::new(udp);
     let addr = udp.local_addr().unwrap();
-    let tcp = TcpListener::bind(addr).await.unwrap();
     let ctx = ctx(
         vec![DnsOverride {
             pattern: "*".into(),
@@ -463,6 +511,7 @@ async fn expired_total_deadline_cancels_tunnel_acquisition() {
         overrides: Arc::new(vec![]),
         endpoints: Arc::new(vec![]),
         route_probe: local::route_probe(),
+        statistics: None,
     };
     let deadline = Instant::now();
     assert!(
@@ -497,6 +546,7 @@ async fn scoped_cancellation_releases_pending_tunnel_and_unavailable_tor_servfai
         overrides: Arc::new(vec![]),
         endpoints: Arc::new(vec![addr]),
         route_probe: local::route_probe(),
+        statistics: None,
     };
     let mut service = Box::pin(listener::udp_loop(udp, ctx, backend.clone()));
     let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -520,6 +570,7 @@ async fn scoped_cancellation_releases_pending_tunnel_and_unavailable_tor_servfai
         overrides: Arc::new(vec![]),
         endpoints: Arc::new(vec![]),
         route_probe: local::route_probe(),
+        statistics: None,
     };
     let req = request("unavailable.example.", RecordType::TXT, 902);
     let answer = resolve_miss(

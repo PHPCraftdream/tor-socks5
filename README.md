@@ -40,7 +40,10 @@ egress through an upstream SOCKS5 proxy instead of Tor, and install itself as an
   Local/cache answers bypass the shared
   64-miss admission cap; TCP has a separate 64-connection cap. System resolver
   callers wait for bounded capacity within the query budget; overload and the
-  absolute 30-second miss deadline produce SERVFAIL.
+  absolute 30-second miss deadline produce SERVFAIL. Payload-free query statistics
+  persist popular names and observed types/classes; startup/two-hour background
+  refresh uses existing routes with foreground headroom and never counts itself.
+  Statistics are sensitive local browsing metadata; protect the cache directory.
   See [`docs/dns-server.md`](docs/dns-server.md).
 - **Install as a service** — systemd, OpenRC, launchd, Windows SCM, BSD `rc.d`.
 - **Non-blocking logging** to stderr / stdout / file, configurable level and per-target filters.

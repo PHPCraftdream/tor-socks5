@@ -37,6 +37,7 @@ hickory-resolver.workspace = true
 anyhow.workspace = true
 futures.workspace = true
 httparse.workspace = true
+rusqlite.workspace = true
 rustls.workspace = true
 serde.workspace = true
 thiserror.workspace = true

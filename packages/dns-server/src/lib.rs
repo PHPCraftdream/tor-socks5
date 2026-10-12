@@ -26,6 +26,8 @@ pub mod providers;
 pub mod server;
 
 mod error;
+mod popular_prefetch;
+mod query_statistics;
 mod types;
 
 pub use error::DnsServerError;
