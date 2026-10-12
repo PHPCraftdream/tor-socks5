@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Persistent, payload-free DNS query statistics and startup/two-hour refresh of
+  observed popular name/type/class tuples. Background work uses existing routes
+  with foreground headroom; shutdown drains accepted statistics and publishes
+  final popularity before saving the answer cache.
+
 - Same-port SOCKS5 CONNECT and HTTP CONNECT for CLI and Android JNI listeners;
   ordinary HTTP forwarding is unsupported. Framing and protocol replies are
   provided by `resocks5-net`.
@@ -33,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before Cargo and cache metadata resolution. The local dependency remains in use.
 - Split proxy and JNI regression tests into modules below the existing 1000-line
   CI limit without changing their assertions or production behavior.
+- The abandoned `scriptzteam/Tor-Bridges-Collector` `bridges-obfs4` source (no
+  commits since 2026-07-29) is migrated to the regenerated v2 `obfs4.txt` list,
+  the same way the legacy webtunnel source already is: a config that still lists
+  the old URL is rewritten under its lock on the next refresh.
 - Android authentication rustdoc now describes the existing fail-closed startup:
   enabled authentication with an empty or missing registry raises
   `java.lang.RuntimeException` before engine-thread spawn; anonymous access requires
@@ -50,6 +59,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `resocks5-net` is consumed from the sibling filesystem checkout until the new
   API is published; dependency versions and MSRV are unchanged.
 
+## [0.1.0] - 2026-10-02
+
+First versioned release: versioning starts here, everything below is what
+0.1.0 contains.
+
 ### Added
 
 - **Local DNS server (DNS-over-Tor)** (opt-in, default OFF): a new
@@ -64,8 +78,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   minutes and at shutdown), so a restart keeps serving still-fresh
   answers without paying a new Tor round-trip. Deliberate limitations:
   no EDNS0 (UDP answers capped at the legacy 512-byte payload with the
-  TC=1 TCP fallback), and answers carry all known addresses for the
-  host (A + AAAA) regardless of the queried type. Requires the Tor
+  TC=1 TCP fallback). Answers preserve the queried name/type/class and
+  full typed packets, including aliases and proven negative answers;
+  A and AAAA questions are cached separately. Requires the Tor
   egress — enabling it together with `upstream.*` is a startup error
   rather than a silent plaintext-DNS leak. Documented in
   `docs/dns-server.md` (`tor-socks5 help dns-server`).
@@ -187,6 +202,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   automatically.
 
 ### Changed
+
+- **The upstream SOCKS5 egress is now driven by `resocks5-net` 0.2**
+  (`apps/socks5-proxy/src/upstream.rs`, `dial_plain`): the hand-written
+  RFC 1928 / RFC 1929 client (~230 lines) is gone; the module keeps only the
+  endpoint, the credentials, the 30 s whole-setup budget and the mapping of
+  the library's typed `ConnectError` into the existing `anyhow` error chain
+  (the socket `io::Error` stays reachable, so `classify_conn_failure` is
+  unchanged; messages keep their wording and the SOCKS5 REP code now carries
+  its RFC 1928 meaning, e.g. `REP 0x5: connection refused`). The wire
+  dialogue is identical: with credentials exactly the `USER/PASS` method is
+  offered, without them exactly `NO AUTH`, and a domain target is resolved by
+  the upstream. Per-stage connect/handshake budgets sit above the total one,
+  so the 30 s setup deadline is always the one that fires. **Behavior
+  change:** `upstream.address` is parsed once at startup, so a value that is
+  not a plain `HOST:PORT` (for instance `user:pass@host:port`, which was
+  never supported) is now a startup error instead of failing the first
+  client's CONNECT. The `GeneralFailure` reply to the client on an upstream
+  error is unchanged.
+
+- **`ktav` 0.6.4 → 0.8.0** (workspace dependency; the former pin 0.6.0 is
+  yanked on crates.io). The one breaking change of 0.8.0 is that a base-10
+  number with a leading zero (`01234`) now parses as a string; neither the
+  shipped configuration examples nor the documented keys use such values.
+
+- **CI is kept green on the newest stable toolchain** (rustc 1.99):
+  `bridge-probe` allows the `fetch_update` deprecation at its single call
+  site (`try_update` is newer than the 1.89 MSRV), and the vendored
+  `tor-circmgr` allows `clippy::double_must_use`, which fires on the
+  `#[async_trait]` expansion. No behavior change.
 
 - **Every crate manifest in the repo is now marked `publish = false`** (all
   20 workspace and vendored crates): an accidental `cargo publish` from any
