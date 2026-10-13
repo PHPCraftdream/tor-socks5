@@ -78,28 +78,46 @@ if [ -n "$files_from" ]; then
 else
 	if [ -z "$base_ref" ]; then
 		base_ref=""
-		for cand in '@{upstream}' 'origin/main' 'main'; do
-			if git rev-parse --verify --quiet "$cand" >/dev/null 2>&1; then
-				base_ref=$cand
-				break
-			fi
-		done
-		if [ -n "$base_ref" ]; then
-			mb=$(git merge-base HEAD "$base_ref" 2>/dev/null) || mb=""
-			if [ -n "$mb" ]; then
-				base_ref=$mb
-			fi
+		base_note=""
+		if [ "$(git rev-parse --is-inside-work-tree 2>/dev/null)" = true ] && [ -z "$(git symbolic-ref -q HEAD 2>/dev/null)" ]; then
+			base_note="detached HEAD"
+		elif [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = true ]; then
+			base_note="shallow repository"
 		else
-			base_ref=HEAD
+			for cand in '@{upstream}' 'origin/main' 'main'; do
+				if git rev-parse --verify --quiet "$cand" >/dev/null 2>&1; then
+					mb=$(git merge-base HEAD "$cand" 2>/dev/null) || mb=""
+					if [ -n "$mb" ]; then base_ref=$mb; else base_note="merge-base with $cand failed"; fi
+					break
+				fi
+			done
+			if [ -z "$base_ref" ] && [ -z "$base_note" ]; then base_note="no upstream/origin/main/main ref found"; fi
+		fi
+	else
+		base_note=""
+		if ! git rev-parse --verify --quiet "$base_ref^{commit}" >/dev/null 2>&1; then
+			base_note="explicit base '$base_ref' is not a locally resolvable commit"
 		fi
 	fi
 	# A failed git call must never read as "nothing changed": the sentinel
-	# makes the selection fail safe to FULL.
+	# makes the selection fail safe to FULL. --no-renames lists both sides of
+	# a rename; -z + quotePath=false keeps spaces/non-ASCII paths intact. NUL
+	# output goes through a temp file: command substitution silently drops
+	# NUL bytes.
+	diff_tmp=$(mktemp) || exit 1
+	read_git_z() { # $@ = git args; NUL-delimited output -> newlines, "__GIT_FAILED__" on error
+		if git -c core.quotePath=false "$@" >"$diff_tmp" 2>/dev/null; then
+			tr '\0' '\n' <"$diff_tmp"
+		else
+			echo "__GIT_FAILED__"
+		fi
+	}
 	changed_files=$( {
-		git diff --name-only "$base_ref" || echo "__GIT_FAILED__"
-		git diff --name-only --cached "$base_ref" || echo "__GIT_FAILED__"
-		git ls-files --others --exclude-standard || echo "__GIT_FAILED__"
-	} 2>/dev/null)
+		read_git_z diff --name-only --no-renames -z "$base_ref"
+		read_git_z diff --name-only --no-renames --cached -z "$base_ref"
+		read_git_z ls-files --others --exclude-standard -z
+	} )
+	rm -f "$diff_tmp"
 fi
 
 # Deduplicate, skip empty lines, normalize backslashes to forward slashes.
@@ -123,8 +141,17 @@ meta=$(cargo metadata --offline --no-deps --format-version 1 2>/dev/null) || {
 }
 
 # "name<TAB>member_dir_abs" (dir of manifest_path, forward slashes).
+# A jq failure or empty member table must not yield a silently empty plan:
+# exit non-zero so hook/CI fall back to FULL.
 members=$(printf '%s' "$meta" | jq -r '
-	.packages[] | [ .name, (.manifest_path | gsub("\\\\"; "/") | sub("/Cargo\\.toml$"; "")) ] | @tsv')
+	.packages[] | [ .name, (.manifest_path | gsub("\\\\"; "/") | sub("/Cargo\\.toml$"; "")) ] | @tsv') || {
+	echo "$progname: jq failed on cargo metadata output" >&2
+	exit 1
+}
+if [ -z "$members" ]; then
+	echo "$progname: no workspace members in cargo metadata output" >&2
+	exit 1
+fi
 
 # member-dir-relative table: "dir_rel<TAB>name"
 dir_to_name=$(printf '%s\n' "$members" | awk -F'\t' -v OFS='\t' -v root="$root" '
@@ -145,7 +172,10 @@ rdeps=$(printf '%s' "$meta" | jq -r '
 	 then select([.dep_kinds[].kind] | any(. == null or . == "dev"))
 	 else select(.kind == null or .kind == "dev")
 	 end) |
-	[$dn, $p.name] | @tsv')
+	[$dn, $p.name] | @tsv') || {
+	echo "$progname: jq failed building the reverse-dependency table" >&2
+	exit 1
+}
 
 # ---------------------------------------------------------------- selection
 
@@ -162,14 +192,18 @@ add_seed() { # $1 = package name
 	esac
 }
 
-mark_full() { # $1 = triggering file
+mark_full() { # $1 = triggering file or reason
 	if [ "$full" -eq 0 ]; then
 		full=1
 		full_trigger=$1
 	fi
 }
 
-vendor_members=$(printf '%s\n' "$dir_to_name" | awk -F'\t' '$1 ~ /^vendor\// { split($1, a, "/"); print a[2] }' | sort -u)
+# Undeterminable base must not degrade to "compare with HEAD" (an empty,
+# silently passing selection): force FULL with the reason.
+if [ -n "${base_note:-}" ]; then
+	mark_full "cannot determine base: $base_note"
+fi
 
 map_data_file() { # $1 = file
 	case "$1" in
@@ -183,7 +217,8 @@ map_data_file() { # $1 = file
 	esac
 }
 
-for f in $files; do
+while IFS= read -r f || [ -n "$f" ]; do
+	[ -n "$f" ] || continue
 	# FULL triggers (checked before member mapping).
 	case "$f" in
 		__GIT_FAILED__) mark_full "git diff failed (fail-safe)"; continue ;;
@@ -192,13 +227,11 @@ for f in $files; do
 		.cargo/*|.config/*|scripts/testing/*) mark_full "$f"; continue ;;
 		scripts/testing/test-affected.sh) mark_full "$f"; continue ;;
 		vendor/*)
-			rest=${f#vendor/}
-			vdir=${rest%%/*}
-			case "$nl$vendor_members$nl" in
-			*"$nl$vdir$nl"*) ;; # member crate: map by prefix below
-			*) mark_full "$f"; continue ;;
-			esac
-			;;
+			# ANY edit under vendor/ goes FULL: vendored crates reach the
+			# workspace through registry coordinates too (e.g. saturating-time
+			# -> tor-netdoc -> tor-circmgr), so member-prefix mapping alone
+			# would miss those dependents.
+			mark_full "$f"; continue ;;
 	esac
 
 	# Member prefix mapping: longest matching member dir.
@@ -222,7 +255,9 @@ EOF
 	else
 		map_data_file "$f"
 	fi
-done
+done <<EOF
+$files
+EOF
 
 if [ "$force_full" -eq 1 ] && [ "$full" -eq 0 ]; then
 	full=1

@@ -60,23 +60,62 @@ run_full() {
 full=0
 full_reason=""
 base_remote_sha=""
+new_ref=0
+zero_sha=0000000000000000000000000000000000000000
+push_local_sha=""
+push_mismatch=0
+base_seen=""
+updates=0
 
-while read -r _local_ref _local_sha remote_ref remote_sha; do
-	if [ -z "$remote_ref" ]; then
-		:
-	else
-		case "$remote_ref" in
-		refs/heads/main|refs/heads/upstream-*|refs/tags/*)
-			full=1
-			full_reason="push to $remote_ref"
-			;;
-		esac
-		case "$remote_sha" in
-		0000000000000000000000000000000000000000|"") ;;
-		*) base_remote_sha=$remote_sha ;;
-		esac
-	fi
+while read -r _local_ref local_sha remote_ref remote_sha; do
+	case "$local_sha" in
+	$zero_sha|"") continue ;;
+	esac
+	[ -n "$remote_ref" ] || continue
+	updates=$((updates + 1))
+	# An annotated tag object differs from the commit it points at.
+	local_commit=$(git rev-parse --verify --quiet "$local_sha^{commit}" 2>/dev/null) || local_commit=$local_sha
+	if [ -z "$push_local_sha" ]; then push_local_sha=$local_commit; elif [ "$push_local_sha" != "$local_commit" ]; then push_mismatch=1; fi
+	case "$remote_ref" in
+	refs/heads/main|refs/heads/upstream-*|refs/tags/*) full=1; full_reason="push to $remote_ref" ;;
+	esac
+	case "$remote_sha" in
+	$zero_sha|"") new_ref=1 ;;
+	*)
+		if ! git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+			full=1; full_reason="remote sha $remote_sha is not available locally"
+		fi
+		if [ -z "$base_seen" ]; then base_seen=$remote_sha; elif [ "$base_seen" != "$remote_sha" ]; then full=1; full_reason="multiple remote bases in one push"; fi
+		base_remote_sha=$remote_sha
+		;;
+	esac
 done
+
+if [ "$updates" -eq 0 ]; then
+	echo "pre-push: deletion-only push; no checks"
+	exit 0
+fi
+head_sha=$(git rev-parse HEAD 2>/dev/null) || head_sha=""
+if [ "$push_mismatch" -eq 1 ]; then
+	echo "pre-push: ERROR: refs target different commits; push one at a time or use --no-verify" >&2
+	exit 1
+fi
+if [ -n "$push_local_sha" ] && [ "$push_local_sha" != "$head_sha" ]; then
+	echo "pre-push: WARNING: проверяется рабочее дерево, отправляемый коммит отличается" >&2
+	echo "pre-push: run 'git switch <branch>' or bypass with --no-verify" >&2
+	exit 1
+fi
+if [ "$new_ref" -eq 1 ] && [ "$full" -eq 0 ]; then
+	base_remote_sha=""
+	base_seen=""
+	if git rev-parse --verify --quiet origin/main >/dev/null 2>&1 && [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" != true ]; then
+		base_seen=$(git merge-base HEAD origin/main 2>/dev/null) || base_seen=""
+		base_remote_sha=$base_seen
+		if [ -z "$base_remote_sha" ]; then full=1; full_reason="no merge-base with origin/main"; fi
+	else
+		full=1; full_reason="origin/main unavailable or repository shallow"
+	fi
+fi
 
 if [ "$full" -eq 0 ] && [ "${FULL:-0}" = "1" ]; then
 	full=1
@@ -99,12 +138,18 @@ fi
 # ---------------------------------------------------------------- tier: T1
 
 base_args=""
-if [ -n "$base_remote_sha" ]; then
-	if git cat-file -e "$base_remote_sha^{commit}" 2>/dev/null; then
-		base_args="--base $base_remote_sha"
-	else
-		echo "pre-push: remote sha $base_remote_sha not found locally, using script default base" >&2
-	fi
+if [ "$full" -eq 0 ] && [ -n "$base_remote_sha" ]; then
+	base_args="--base $base_remote_sha"
+fi
+if [ "$full" -eq 0 ] && [ -z "$base_args" ]; then
+	full=1
+	full_reason="no remote base available"
+fi
+if [ "$full" -eq 1 ]; then
+	echo "pre-push: tier T2 (FULL): $full_reason; all workspace packages"
+	run_full
+	sweep_old_builds
+	exit 0
 fi
 
 plan=$(sh scripts/testing/test-affected.sh --mode list $base_args) && plan_rc=0 || plan_rc=$?

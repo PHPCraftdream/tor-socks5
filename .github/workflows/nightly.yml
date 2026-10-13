@@ -81,10 +81,9 @@ jobs:
           -p tor-socks5-dns -p tor-circmgr -p tor-guardmgr -p socks5-proxy
           --locked
         shell: bash
-      # .config/nextest.toml defines no [profile.flaky-hunt.junit], so
-      # target/nextest/flaky-hunt/junit.xml does not exist today; the upload
-      # is kept (ignore-if-missing) so adding the junit section later needs
-      # no workflow change.
+      # .config/nextest.toml defines [profile.flaky-hunt.junit] with
+      # target/nextest/flaky-hunt/junit.xml, so the upload publishes the
+      # report like the ci profile does.
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -172,6 +171,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           failed_jobs=""
+          all_success=true
           for entry in "full=${{ needs.full.result }}" \
                        "flaky-hunt=${{ needs.flaky-hunt.result }}" \
                        "vendor-extra=${{ needs.vendor-extra.result }}" \
@@ -180,6 +180,10 @@ jobs:
             result="${entry#*=}"
             if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
               failed_jobs="${failed_jobs:+$failed_jobs, }$job"
+              all_success=false
+            elif [ "$result" != "success" ]; then
+              # skipped or unexpected value: treat the run as incomplete.
+              all_success=false
             fi
           done
 
@@ -195,9 +199,14 @@ jobs:
               num=$(gh issue list --search "$search" --json number --jq '.[0].number')
               gh issue comment "$num" --body "$body"
             fi
-          elif [ "$existing" -gt 0 ]; then
+          elif [ "$all_success" = "true" ] && [ "$existing" -gt 0 ]; then
+            # Close as recovered only on a fully green run: every job must
+            # have succeeded (skipped jobs mean an incomplete run).
             num=$(gh issue list --search "$search" --json number --jq '.[0].number')
             gh issue comment "$num" --body "recovered: $run_url"
             gh issue close "$num"
+          elif [ "$all_success" != "true" ]; then
+            echo "Incomplete run: some jobs were skipped or returned unexpected results;" >> "$GITHUB_STEP_SUMMARY"
+            echo "the tracking issue (if any) is left untouched, no false 'recovered'." >> "$GITHUB_STEP_SUMMARY"
           fi
         shell: bash

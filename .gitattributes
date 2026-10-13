@@ -1,0 +1,5 @@
+# Normalize line endings for the tiered-testing scripts: sh and git hooks
+# must stay LF even on Windows checkouts, or `sh`/git fail on CRLF.
+*.sh text eol=lf
+.githooks/* text eol=lf
+*.yml text eol=lf
