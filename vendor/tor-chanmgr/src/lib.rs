@@ -371,6 +371,18 @@ impl<R: Runtime> ChanMgr<R> {
         self.mgr.expire_channels()
     }
 
+    // tor-socks5 local patch: public channel recovery API
+    /// Unconditionally terminate and remove all currently open channels,
+    /// including channels in use. Existing references observe shutdown.
+    ///
+    /// Pending builds are left untouched and may subsequently finish; this is
+    /// not a shutdown barrier. A later request can build a fresh channel using
+    /// the same manager. Intended for explicit stale-network recovery, not
+    /// periodic expiry.
+    pub fn terminate_all_channels(&self) {
+        self.mgr.terminate_all_channels();
+    }
+
     /// Notifies the chanmgr to be dormant like dormancy
     pub fn set_dormancy(
         &self,

@@ -230,6 +230,9 @@ impl<RT: Runtime> AbstractTunnelBuilder<RT> for FakeBuilder<RT> {
 }
 
 impl<RT: Runtime> FakeBuilder<RT> {
+    // tor-socks5 local patch: allow needed for clippy -D warnings
+    // (newer clippy than upstream CI).
+    #[allow(clippy::needless_pass_by_value)]
     pub(crate) fn new<S>(rt: &RT, state_mgr: S, guard_config: &TestConfig) -> Self
     where
         S: StateMgr + Send + Sync + 'static,

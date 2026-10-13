@@ -680,6 +680,22 @@ impl<C: AbstractChannelFactory> MgrState<C> {
         ret
     }
 
+    // tor-socks5 local patch: unconditional open-channel termination
+    /// Terminate every open entry before removing it; preserve pending bookkeeping.
+    pub(crate) fn terminate_all_channels(&self) {
+        self.inner
+            .lock()
+            .expect("Poisoned lock")
+            .channels
+            .retain(|chan| match chan {
+                ChannelState::Open(ent) => {
+                    ent.channel.terminate();
+                    false
+                }
+                ChannelState::Building(_) => true,
+            });
+    }
+
     /// Helper: Return the default max unused duration for a channel.
     fn random_max_unused_duration() -> Duration {
         Duration::from_secs(
@@ -982,6 +998,8 @@ mod test {
     struct FakeChannel {
         ed_ident: Ed25519Identity,
         usable: bool,
+        // tor-socks5 local patch: termination call counter
+        termination_calls: Arc<std::sync::atomic::AtomicUsize>,
         unused_duration: Option<u64>,
         params_update: Arc<Mutex<Option<Arc<ChannelPaddingInstructionsUpdates>>>>,
     }
@@ -1009,6 +1027,10 @@ mod test {
             Ok(())
         }
         fn engage_padding_activities(&self) {}
+        // tor-socks5 local patch: observable state fake termination
+        fn terminate(&self) {
+            self.termination_calls.fetch_add(1, Ordering::SeqCst);
+        }
     }
     impl tor_linkspec::HasRelayIds for FakeChannel {
         fn identity(
@@ -1031,6 +1053,8 @@ mod test {
             ed_ident: str_to_ed(ident),
             usable: true,
             unused_duration: None,
+            // tor-socks5 local patch: initialize termination counter
+            termination_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             params_update: Arc::new(Mutex::new(None)),
         };
         ChannelState::Open(OpenEntry {
@@ -1047,6 +1071,8 @@ mod test {
             ed_ident: str_to_ed(ident),
             usable: true,
             unused_duration,
+            // tor-socks5 local patch: initialize termination counter
+            termination_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             params_update: Arc::new(Mutex::new(None)),
         };
         ChannelState::Open(OpenEntry {
@@ -1059,12 +1085,65 @@ mod test {
             ed_ident: str_to_ed(ident),
             usable: false,
             unused_duration: None,
+            // tor-socks5 local patch: initialize termination counter
+            termination_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             params_update: Arc::new(Mutex::new(None)),
         };
         ChannelState::Open(OpenEntry {
             channel: Arc::new(channel),
             max_unused_duration: Duration::from_secs(180),
         })
+    }
+
+    // tor-socks5 local patch: all open states and pending identity regression
+    #[test]
+    fn terminate_all_channels() -> Result<()> {
+        let state = new_test_state();
+        let mut retained = Vec::new();
+        let ids = RelayIds::from_relay_ids(ch("pending").unwrap_open());
+        let (pending, send, unique_id) = setup_launch(ids);
+        let pending_result = pending.pending.clone();
+        state.with_channels(|map| {
+            // Same identity twice: termination must visit entries, not only IDs.
+            for entry in [
+                ch("active"),
+                ch_with_details("active", Duration::from_secs(180), Some(0)),
+                ch_with_details("expired", Duration::from_secs(180), Some(181)),
+                closed("closed"),
+            ] {
+                if let ChannelState::Open(open) = &entry {
+                    retained.push(Arc::clone(&open.channel));
+                }
+                map.insert(entry);
+            }
+            map.insert(ChannelState::Building(pending));
+        })?;
+        state.terminate_all_channels();
+        for channel in &retained {
+            assert_eq!(channel.termination_calls.load(Ordering::SeqCst), 1);
+        }
+        state.with_channels(|map| {
+            assert_eq!(map.by_ed25519(&str_to_ed("a")).len(), 0);
+            assert_eq!(map.by_ed25519(&str_to_ed("e")).len(), 0);
+            assert_eq!(map.by_ed25519(&str_to_ed("c")).len(), 0);
+            let entries = map.by_ed25519(&str_to_ed("p")).collect::<Vec<_>>();
+            assert_eq!(entries.len(), 1);
+            match entries[0] {
+                ChannelState::Building(entry) => assert_eq!(entry.unique_id, unique_id),
+                ChannelState::Open(_) => panic!("pending entry replaced"),
+            }
+        })?;
+        state.terminate_all_channels();
+        for channel in &retained {
+            assert_eq!(channel.termination_calls.load(Ordering::SeqCst), 1);
+        }
+        // The original notification path still works after repeated termination.
+        send.send(Ok(())).unwrap();
+        assert!(matches!(
+            futures::executor::block_on(pending_result),
+            Ok(Ok(()))
+        ));
+        Ok(())
     }
 
     #[test]
