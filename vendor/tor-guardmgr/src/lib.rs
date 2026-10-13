@@ -111,7 +111,8 @@ use oneshot_fused_workaround as oneshot;
 
 pub use config::GuardMgrConfig;
 pub use err::{GuardMgrConfigError, GuardMgrError, PickGuardError};
-pub use events::ClockSkewEvents;
+// tor-socks5 local patch: usable events API
+pub use events::{ClockSkewEvents, GuardUsableEvents};
 pub use filter::GuardFilter;
 pub use ids::FirstHopId;
 pub use pending::{GuardMonitor, GuardStatus, GuardUsable};
@@ -213,6 +214,12 @@ struct GuardMgrInner {
     /// A receiver object to hand out to observers who want to know about
     /// changes in our estimated clock skew.
     recv_skew: events::ClockSkewEvents,
+
+    // tor-socks5 local patch: usable events watch
+    /// Publisher for active sample usability.
+    send_usable: postage::watch::Sender<bool>,
+    /// Receiver cloned for usability observers.
+    recv_usable: GuardUsableEvents,
 
     /// A netdir provider that we can use for adding new guards when
     /// insufficient guards are available.
@@ -347,6 +354,10 @@ impl<R: Runtime> GuardMgr<R> {
         let (send_skew, recv_skew) = postage::watch::channel();
         let recv_skew = ClockSkewEvents { inner: recv_skew };
 
+        // tor-socks5 local patch: usable events watch initialization
+        let (send_usable, recv_usable) = postage::watch::channel();
+        let recv_usable = GuardUsableEvents { inner: recv_usable };
+
         let inner = Arc::new(Mutex::new(GuardMgrInner {
             guards: state,
             filter: GuardFilter::unfiltered(),
@@ -359,6 +370,9 @@ impl<R: Runtime> GuardMgr<R> {
             storage,
             send_skew,
             recv_skew,
+            // tor-socks5 local patch: usable events watch storage
+            send_usable,
+            recv_usable,
             netdir_provider: None,
             #[cfg(feature = "bridge-client")]
             bridge_desc_provider: None,
@@ -513,6 +527,40 @@ impl<R: Runtime> GuardMgr<R> {
             .active_guards_mut()
             .n_primary_without_id_info_in(netdir)
             == 0
+    }
+
+    // tor-socks5 local patch: guard_is_disabled
+    /// Query disabled identities in all known guard samples.
+    pub fn guard_is_disabled<T: tor_linkspec::HasRelayIds + ?Sized>(&self, identity: &T) -> bool {
+        let inner = self.inner.lock().expect("Poisoned lock");
+        inner.lookup_ids(identity).iter().any(|hop| match &hop.0 {
+            FirstHopIdInner::Guard(sample, id) => {
+                let guards = match sample {
+                    GuardSetSelector::Default => &inner.guards.default,
+                    GuardSetSelector::Restricted => &inner.guards.restricted,
+                    #[cfg(feature = "bridge-client")]
+                    GuardSetSelector::Bridges => &inner.guards.bridges,
+                };
+                guards.guard_is_disabled(id)
+            }
+            FirstHopIdInner::Fallback(_) => false,
+        })
+    }
+
+    // tor-socks5 local patch: reset_disabled_guards
+    /// Manually recover disabled guards in the active sample, including persisted legacy state.
+    /// Returns the number reset; no automatic security-policy recovery is performed.
+    pub fn reset_disabled_guards(&self) -> usize {
+        let mut inner = self.inner.lock().expect("Poisoned lock");
+        inner.guards.active_guards_mut().reset_disabled_guards()
+    }
+
+    // tor-socks5 local patch: usable_guard_events
+    /// Observe whether the active sample has a usable guard with complete directory info.
+    /// Updates are lossy, like clock-skew events.
+    pub fn usable_guard_events(&self) -> GuardUsableEvents {
+        let inner = self.inner.lock().expect("Poisoned lock");
+        inner.recv_usable.clone()
     }
 
     /// Mark every guard as potentially retriable, regardless of how recently we
@@ -902,6 +950,8 @@ impl GuardMgrInner {
             #[cfg(not(feature = "bridge-client"))]
             let _ = now;
         });
+        // tor-socks5 local patch: republish on every sample refresh
+        self.update_guard_usability();
     }
 
     /// Replace our bridge configuration with the one from `new_config`.
@@ -934,6 +984,13 @@ impl GuardMgrInner {
                 return Ok(RetireCircuits::None); // nothing to do.
             }
             (_, true) => {
+                // tor-socks5 local patch: retry only newly re-enabled bridges
+                let previous = self.configured_bridges.as_deref();
+                let reenabled = new_config
+                    .bridges()
+                    .iter()
+                    .filter(|bridge| previous.is_none_or(|old| !old.contains(bridge)));
+                self.guards.bridges.retry_reenabled_bridges(reenabled);
                 self.configured_bridges = Some(new_config.bridges().into());
                 self.guards.active_set = GuardSetSelector::Bridges;
             }
@@ -1074,7 +1131,10 @@ impl GuardMgrInner {
             let desired: Vec<_> = self
                 .guards
                 .active_guards()
-                .descriptors_to_request(now, &self.params)
+                .descriptors_to_request(now, &self.params, |guard| {
+                    // tor-socks5 local patch: configured descriptor eligibility
+                    bridge_set.bridge_by_guard(guard).is_some()
+                })
                 .into_iter()
                 .flat_map(|guard| bridge_set.bridge_by_guard(guard))
                 .cloned()
@@ -1326,6 +1386,13 @@ impl GuardMgrInner {
             .chain(self.guards.active_guards().skew_observations())
     }
 
+    // tor-socks5 local patch: publish usable sample
+    /// Recompute and publish active sample usability on every refresh.
+    fn update_guard_usability(&mut self) {
+        let usable = self.guards.active_guards().any_guard_usable_for_traffic();
+        *self.send_usable.borrow_mut() = usable;
+    }
+
     /// Recalculate our estimated clock skew, and publish it to anybody who
     /// cares.
     fn update_skew(&mut self, now: Instant) {
@@ -1479,19 +1546,24 @@ impl GuardMgrInner {
             // need to call update() or update_active_set_and_filter(). This
             // call is sufficient to  extend the sample and recompute primary
             // guards.
-            let extended = Self::update_guardset_internal(
+            // tor-socks5 local patch: unconditional retry after guardset refresh
+            Self::update_guardset_internal(
                 &this.params,
                 wallclock,
                 this.guards.active_set.universe_type(),
                 this.guards.active_guards_mut(),
                 Some(univ),
             );
-            if extended == ExtendedStatus::Yes {
-                match this.select_guard_once(usage, now) {
-                    Ok(res) => return Some(res),
-                    Err(e) => {
-                        trace!("Couldn't select guard after update: {}", e);
-                    }
+            // Retry unconditionally: update_guardset_internal recomputes each
+            // guard's dir_info_missing / conforms_to_usage via
+            // update_from_universe, which can flip a descriptor-less bridge
+            // to "unsuitable for Data" even when the sample size is unchanged
+            // (ExtendedStatus::No). Gating the retry on sample growth (the
+            // old `== Yes` check) discarded that freshly-computed state.
+            match this.select_guard_once(usage, now) {
+                Ok(res) => return Some(res),
+                Err(e) => {
+                    trace!("Couldn't select guard after update: {}", e);
                 }
             }
             None
@@ -1536,9 +1608,22 @@ impl GuardMgrInner {
             first_hop.lookup_bridge_circ_target(&bridges);
 
             if usage.kind == GuardUsageKind::Data && !first_hop.contains_circ_target() {
-                return Err(PickGuardError::Internal(internal!(
-                    "Tried to return a non-circtarget guard with Data usage!"
-                )));
+                // tor-socks5 local patch: a missing bridge descriptor is a
+                // transient, recoverable condition (the descriptor is fetched
+                // asynchronously by BridgeDescProvider), not a programming
+                // bug. Return AllGuardsDown so HasRetryTime yields
+                // RetryTime::AfterWaiting and the caller retries instead of
+                // aborting the whole request after one attempt. The precise
+                // per-reason rejection counts are computed inside
+                // pick_guard_id and aren't available here, so report zeroed
+                // FilterCounts — the retry_at: None semantics are what matter.
+                return Err(PickGuardError::AllGuardsDown {
+                    retry_at: None,
+                    running: tor_basic_utils::iter::FilterCount::default(),
+                    pending: tor_basic_utils::iter::FilterCount::default(),
+                    suitable: tor_basic_utils::iter::FilterCount::default(),
+                    filtered: tor_basic_utils::iter::FilterCount::default(),
+                });
             }
         }
         Ok((list_kind, first_hop))
@@ -2156,6 +2241,201 @@ mod test {
             // Now that the guard is working as a cache, asking for it should get us the same guard.
             let (g4, _mon, _usable) = guardmgr.select_guard(dir_usage).unwrap();
             assert_eq!(g4.ed_identity(), guard.ed_identity());
+        });
+    }
+
+    // tor-socks5 local patch: unchanged-backoff regression
+    #[cfg(feature = "bridge-client")]
+    #[test]
+    fn reenabled_bridge_is_retried_without_resetting_active_failures() {
+        tor_rtmock::MockRuntime::test_with_various(|rt| async move {
+            let statemgr = TestingStateMgr::new();
+            assert!(statemgr.try_lock().unwrap().held());
+            let bridges: Vec<bridge::BridgeConfig> = [
+                "192.0.2.1:443 1111111111111111111111111111111111111111",
+                "192.0.2.2:443 2222222222222222222222222222222222222222",
+            ]
+            .into_iter()
+            .map(|line| line.parse().unwrap())
+            .collect();
+            let config = TestConfig {
+                bridges: bridges.clone(),
+                ..Default::default()
+            };
+            let guardmgr = GuardMgr::new(rt, statemgr, &config).unwrap();
+            let usage = GuardUsageBuilder::default()
+                .kind(GuardUsageKind::OneHopDirectory)
+                .build()
+                .unwrap();
+            for _ in 0..2 {
+                let (_, monitor, _) = guardmgr.select_guard(usage.clone()).unwrap();
+                monitor.failed();
+                guardmgr.flush_msg_queue().await;
+            }
+            assert!(guardmgr.select_guard(usage.clone()).is_err());
+            guardmgr.reconfigure(&config).unwrap();
+            assert!(guardmgr.select_guard(usage.clone()).is_err());
+
+            let narrowed = TestConfig {
+                bridges: vec![bridges[0].clone()],
+                ..Default::default()
+            };
+            guardmgr.reconfigure(&narrowed).unwrap();
+            assert!(guardmgr.select_guard(usage.clone()).is_err());
+            guardmgr.reconfigure(&config).unwrap();
+            let (guard, monitor, _) = guardmgr.select_guard(usage.clone()).expect(
+                "re-enabling a bridge must allow a fresh attempt without restarting the client",
+            );
+            assert_eq!(guard.rsa_identity(), bridges[1].rsa_identity());
+            monitor.failed();
+            guardmgr.flush_msg_queue().await;
+            assert!(guardmgr.select_guard(usage).is_err());
+        });
+    }
+
+    // tor-socks5 local patch: persisted-disabled query and manual recovery regression
+    #[cfg(feature = "bridge-client")]
+    #[test]
+    fn disabled_identity_stays_blocked_after_bridge_reconfiguration() {
+        use tor_rtcompat::SleepProvider;
+        tor_rtmock::MockRuntime::test_with_various(|rt| async move {
+            let state = TestingStateMgr::new();
+            assert!(state.try_lock().unwrap().held());
+            let bridge: bridge::BridgeConfig =
+                "192.0.2.7:443 7777777777777777777777777777777777777777"
+                    .parse()
+                    .unwrap();
+            let config = TestConfig {
+                bridges: vec![bridge.clone()],
+                ..Default::default()
+            };
+            let manager = GuardMgr::new(rt, state, &config).unwrap();
+            assert!(!manager.guard_is_disabled(&bridge));
+            {
+                let mut inner = manager.inner.lock().unwrap();
+                let mut persisted = serde_json::to_value(&inner.guards.bridges).unwrap();
+                persisted["guards"][0]["disabled"] = serde_json::json!({
+                    "type": "TooManyIndeterminateFailures",
+                    "history": {"n_successes": 1, "n_failures": 0, "n_indeterminate": 14},
+                    "failure_ratio": 0.933, "threshold_ratio": 0.7
+                });
+                inner.guards.bridges = serde_json::from_value(persisted).unwrap();
+            }
+            assert!(manager.guard_is_disabled(&bridge));
+            manager.reconfigure(&TestConfig::default()).unwrap();
+            manager.reconfigure(&config).unwrap();
+            assert!(manager.guard_is_disabled(&bridge));
+            {
+                let inner = manager.inner.lock().unwrap();
+                assert!(
+                    inner
+                        .guards
+                        .bridges
+                        .descriptors_to_request(manager.runtime.now(), &inner.params, |_| true)
+                        .is_empty()
+                );
+            }
+            assert_eq!(manager.reset_disabled_guards(), 1);
+            assert!(!manager.guard_is_disabled(&bridge));
+            assert_eq!(manager.reset_disabled_guards(), 0);
+        });
+    }
+
+    // tor-socks5 local patch: watch refresh regression
+    #[test]
+    fn usable_guard_events_republish_sample_updates() {
+        use futures::StreamExt;
+        use tor_rtcompat::SleepProvider;
+        tor_rtmock::MockRuntime::test_with_various(|rt| async move {
+            let state = TestingStateMgr::new();
+            let manager = GuardMgr::new(rt, state, &TestConfig::default()).unwrap();
+            let mut events = manager.usable_guard_events();
+            assert!(!events.get());
+            manager.install_test_netdir(
+                &tor_netdir::testnet::construct_netdir()
+                    .unwrap_if_sufficient()
+                    .unwrap(),
+            );
+            assert!(events.get());
+            assert_eq!(events.next().await, Some(true));
+            {
+                let mut inner = manager.inner.lock().unwrap();
+                inner.update(manager.runtime.wallclock(), manager.runtime.now());
+            }
+            assert_eq!(events.next().await, Some(true));
+            {
+                let mut inner = manager.inner.lock().unwrap();
+                inner
+                    .guards
+                    .active_guards_mut()
+                    .set_all_guards_dir_info_missing_for_test(true);
+                inner.update_guard_usability();
+            }
+            assert_eq!(events.next().await, Some(false));
+        });
+    }
+
+    // tor-socks5 local patch: descriptorless guard is retriable
+    #[cfg(feature = "bridge-client")]
+    #[test]
+    fn bridge_descriptorless_guard_is_retriable_not_internal() {
+        // Regression test for the vendor patch: when a bridge guard is picked
+        // for Data usage but has no descriptor (circ-target), the error must be
+        // AllGuardsDown (→ RetryTime::AfterWaiting) not Internal (→
+        // RetryTime::Never). Additionally, select_guard_with_expand must retry
+        // unconditionally after update_guardset_internal recomputes the guard's
+        // dir_info_missing, not only when the sample grew (ExtendedStatus::Yes).
+        test_with_all_runtimes!(|rt| async move {
+            let statemgr = TestingStateMgr::new();
+            let have_lock = statemgr.try_lock().unwrap();
+            assert!(have_lock.held());
+
+            // A single configured bridge with NO descriptor fetched yet.
+            // A direct (non-PT) bridge line so pt-client isn't required.
+            let bridge: crate::bridge::BridgeConfig =
+                "38.229.33.83:80 0BAC39417268B96B9F514E7F63FA6FBA1A788955"
+                    .parse()
+                    .unwrap();
+            let config = TestConfig {
+                bridges: vec![bridge],
+                ..TestConfig::default()
+            };
+
+            let guardmgr = GuardMgr::new(rt, statemgr, &config).unwrap();
+
+            // The bridge must have been sampled during GuardMgr::new.
+            {
+                let inner = guardmgr.inner.lock().expect("Poisoned lock");
+                assert!(
+                    !inner.guards.bridges.guards_for_test().is_empty(),
+                    "bridge was not sampled; test setup needs fixing"
+                );
+            }
+
+            // Inject the production stale state that triggers the bug: a guard
+            // whose cached dir_info_missing is false (so pick_guard selects it)
+            // while the live descriptor is absent (so lookup_bridge_circ_target
+            // finds no circ-target). Without this injection, the freshly-
+            // sampled descriptor-less bridge is already filtered out by
+            // pick_guard (dir_info_missing=true from update_from_universe).
+            {
+                let mut inner = guardmgr.inner.lock().expect("Poisoned lock");
+                inner
+                    .guards
+                    .bridges
+                    .set_all_guards_dir_info_missing_for_test(false);
+            }
+
+            // GuardUsage::default() is GuardUsageKind::Data.
+            let res = guardmgr.select_guard(GuardUsage::default());
+
+            // Pre-fix: PickGuardError::Internal → RetryTime::Never (abort).
+            // Post-fix: PickGuardError::AllGuardsDown → RetryTime::AfterWaiting.
+            assert!(
+                matches!(res, Err(PickGuardError::AllGuardsDown { .. })),
+                "expected AllGuardsDown (retriable), got {:?}",
+                res
+            );
         });
     }
 

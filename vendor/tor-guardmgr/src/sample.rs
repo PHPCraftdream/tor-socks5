@@ -517,6 +517,54 @@ impl GuardSet {
         self.fix_consistency();
     }
 
+    // tor-socks5 local patch: any_guard_usable_for_traffic
+    /// Whether any listed, enabled, reachable, permitted guard has complete information.
+    pub(crate) fn any_guard_usable_for_traffic(&self) -> bool {
+        self.preference_order().any(|(_, g)| {
+            g.usable()
+                && g.reachable() != Reachable::Unreachable
+                && self.active_filter.permits(g)
+                && g.has_complete_dir_info()
+        })
+    }
+
+    // tor-socks5 local patch: guards_for_test (replaces n_sampled_for_test)
+    #[cfg(test)]
+    /// Expose the sample for regression tests.
+    pub(crate) fn guards_for_test(&self) -> &ByRelayIds<Guard> {
+        &self.guards
+    }
+
+    // tor-socks5 local patch: set_all_guards_dir_info_missing_for_test
+    #[cfg(test)]
+    /// Set missing-directory state for regression tests.
+    pub(crate) fn set_all_guards_dir_info_missing_for_test(&mut self, missing: bool) {
+        let old = std::mem::take(&mut self.guards);
+        self.guards = old
+            .into_values()
+            .map(|mut g| {
+                g.set_dir_info_missing_for_test(missing);
+                g
+            })
+            .collect();
+    }
+
+    // tor-socks5 local patch: set_guard_dir_info_missing_for_test
+    #[cfg(test)]
+    /// Set missing-directory state for regression tests.
+    pub(crate) fn set_guard_dir_info_missing_for_test(&mut self, id: &GuardId, missing: bool) {
+        let old = std::mem::take(&mut self.guards);
+        self.guards = old
+            .into_values()
+            .map(|mut g| {
+                if g.guard_id() == id {
+                    g.set_dir_info_missing_for_test(missing);
+                }
+                g
+            })
+            .collect();
+    }
+
     /// Re-build the list of primary guards.
     ///
     /// Primary guards are chosen according to preference order over all
@@ -702,6 +750,42 @@ impl GuardSet {
                 guard
             })
             .collect();
+    }
+
+    // tor-socks5 local patch: guard_is_disabled
+    /// Whether the known identity is security-disabled.
+    pub(crate) fn guard_is_disabled(&self, id: &GuardId) -> bool {
+        self.guards.by_all_ids(id).is_some_and(Guard::is_disabled)
+    }
+
+    // tor-socks5 local patch: retry_reenabled_bridges
+    #[cfg(feature = "bridge-client")]
+    /// Retry newly configured bridges without clearing security or circuit history.
+    pub(crate) fn retry_reenabled_bridges<'a>(
+        &mut self,
+        bridges: impl IntoIterator<Item = &'a crate::bridge::BridgeConfig>,
+    ) {
+        for bridge in bridges {
+            self.guards
+                .modify_by_all_ids(bridge, |guard| guard.mark_retriable());
+        }
+    }
+
+    // tor-socks5 local patch: reset_disabled_guards
+    /// Manually reset disabled guards and return the count.
+    pub(crate) fn reset_disabled_guards(&mut self) -> usize {
+        let old_guards = std::mem::take(&mut self.guards);
+        let mut n_reset = 0_usize;
+        self.guards = old_guards
+            .into_values()
+            .map(|mut guard| {
+                if guard.reset_disabled() {
+                    n_reset += 1;
+                }
+                guard
+            })
+            .collect();
+        n_reset
     }
 
     /// Record that an attempt has begun to use the guard with
@@ -970,7 +1054,13 @@ impl GuardSet {
     /// (The output of this function is not reasonable unless this is a Bridge
     /// sample.)
     #[cfg(feature = "bridge-client")]
-    pub(crate) fn descriptors_to_request(&self, now: Instant, params: &GuardParams) -> Vec<&Guard> {
+    // tor-socks5 local patch: adaptive configured descriptor recovery
+    pub(crate) fn descriptors_to_request(
+        &self,
+        now: Instant,
+        params: &GuardParams,
+        is_configured: impl Fn(&Guard) -> bool,
+    ) -> Vec<&Guard> {
         /// This constant is here to improve our odds that we can get a working
         /// bridge if we have any per-circuit filters that would prevent us from
         /// using our preferred bridge.
@@ -979,25 +1069,51 @@ impl GuardSet {
         let maximum = std::cmp::max(params.data_parallelism, MINIMUM);
         let data_usage = GuardUsage::default();
 
-        // Here we duplicate some but not all of the restrictions above in
-        // pick_guard_id.  We skip those restrictions that are specific to only
-        // certain kinds of circuits, and those that are temporary restrictions
-        // encouraging us to try more guards.
-        //
-        // TODO: we may want to refactor this code and the code in pick_guard_id
-        // above to share a single function.  Before we do that, however, I want
-        // to experiment with this logic a bit to make sure that it works and
-        // doesn't give us surprising results.
-        self.preference_order()
+        // A re-enabled bridge can remain unlisted until its descriptor confirms
+        // previously learned identities. It still needs a descriptor request.
+        // Data selection remains subject to the stricter usable() check.
+        let eligible: Vec<&Guard> = self
+            .preference_order()
             .filter(|(_, g)| {
-                g.usable()
+                !g.is_disabled()
+                    && is_configured(g)
                     && g.reachable() != Reachable::Unreachable
                     && g.ready_for_usage(&data_usage, now)
                     && self.active_filter.permits(*g)
             })
-            .take(maximum)
             .map(|(_, g)| g)
-            .collect()
+            .collect();
+
+        // An inactive guard's cached descriptor cannot support recovery.
+        // BridgeDescMgr still bounds concurrent downloads and retry frequency.
+        let take_n = if eligible
+            .iter()
+            .any(|g| g.usable() && g.has_complete_dir_info())
+        {
+            maximum
+        } else {
+            usize::MAX
+        };
+
+        if take_n >= eligible.len() {
+            return eligible;
+        }
+        let mut selected = eligible[..take_n].to_vec();
+
+        // Retain a usable descriptor outside the cutoff, avoiding a repeated
+        // download/forget cycle when the request set narrows after recovery.
+        if !selected
+            .iter()
+            .any(|g| g.usable() && g.has_complete_dir_info())
+        {
+            if let Some(extra) = eligible[take_n..]
+                .iter()
+                .find(|g| g.usable() && g.has_complete_dir_info())
+            {
+                selected.push(extra);
+            }
+        }
+        selected
     }
 }
 
@@ -1191,6 +1307,240 @@ mod test {
             let g2 = guards2.guards.by_all_ids(g.guard_id()).unwrap();
             assert_eq!(format!("{:?}", g), format!("{:?}", g2));
         }
+    }
+
+    // tor-socks5 local patch: any_guard_usable_for_traffic_aggregation
+    #[test]
+    fn any_guard_usable_for_traffic_aggregation() {
+        let netdir = netdir();
+        let params = GuardParams {
+            n_primary: 4,
+            ..GuardParams::default()
+        };
+        let mut guards = GuardSet::default();
+        guards.extend_sample_as_needed(SystemTime::get(), &params, &netdir);
+        guards.select_primary_guards(&params);
+
+        // Normal case: sampled guards carry complete directory information, so
+        // the active sample is usable for traffic.
+        assert!(guards.any_guard_usable_for_traffic());
+
+        // Guard-exhaustion spiral: every guard lacks a microdescriptor. The
+        // guards are still listed (usable()), but none can build data circuits,
+        // so the aggregate must be false — the exact condition that must keep
+        // BootstrapStatus::ready_for_traffic() reporting "not ready".
+        guards.set_all_guards_dir_info_missing_for_test(true);
+        assert!(!guards.any_guard_usable_for_traffic());
+
+        // Once guards regain their descriptors, the sample becomes usable again.
+        guards.set_all_guards_dir_info_missing_for_test(false);
+        assert!(guards.any_guard_usable_for_traffic());
+    }
+
+    // tor-socks5 local patch: descriptors_to_request_adaptive_parallelism
+    #[cfg(feature = "bridge-client")]
+    #[test]
+    fn descriptors_to_request_adaptive_parallelism() {
+        let netdir = netdir();
+        let params = GuardParams {
+            min_filtered_sample_size: 5,
+            // keep `data_parallelism` at its default of 1 so `maximum` is the
+            // MINIMUM floor of 2 — small enough to be observably narrower than
+            // the 5-guard sample.
+            ..GuardParams::default()
+        };
+        let now = Instant::get();
+        let mut guards = GuardSet::default();
+        guards.extend_sample_as_needed(SystemTime::get(), &params, &netdir);
+        guards.select_primary_guards(&params);
+
+        // `data_parallelism=1` ⇒ maximum = max(1, 2) = 2, well below the
+        // 5-guard sample, so the cap is observable.
+        let maximum = std::cmp::max(params.data_parallelism, 2);
+        assert_eq!(maximum, 2);
+        assert!(guards.guards.len() > maximum);
+
+        // Normal case: sampled guards carry complete directory information, so
+        // at least one is usable for traffic — the conservative cap applies.
+        assert!(guards.any_guard_usable_for_traffic());
+        assert_eq!(
+            guards.descriptors_to_request(now, &params, |_| true).len(),
+            maximum,
+            "conservative cap must bind when a usable guard exists"
+        );
+
+        // Guard-exhaustion spiral: every guard lacks a descriptor, so none is
+        // usable for traffic. The adaptive path must widen past the cap so the
+        // bridges beyond the top-2 also get descriptor requests.
+        guards.set_all_guards_dir_info_missing_for_test(true);
+        assert!(!guards.any_guard_usable_for_traffic());
+        let n_exhausted = guards.descriptors_to_request(now, &params, |_| true).len();
+        assert!(
+            n_exhausted > maximum,
+            "exhaustion must widen parallelism beyond the {maximum}-guard cap, got {n_exhausted}"
+        );
+
+        // Recovery: once a guard regains its descriptor, the conservative cap
+        // snaps back.
+        guards.set_all_guards_dir_info_missing_for_test(false);
+        assert!(guards.any_guard_usable_for_traffic());
+        assert_eq!(
+            guards.descriptors_to_request(now, &params, |_| true).len(),
+            maximum,
+            "conservative cap must return once a guard becomes usable"
+        );
+    }
+
+    // tor-socks5 local patch: inactive_descriptor_does_not_hide_untried_bridges
+    #[cfg(feature = "bridge-client")]
+    #[test]
+    fn inactive_descriptor_does_not_hide_untried_bridges() {
+        let params = GuardParams {
+            min_filtered_sample_size: 5,
+            ..GuardParams::default()
+        };
+        let now = Instant::get();
+        let mut guards = GuardSet::default();
+        guards.extend_sample_as_needed(SystemTime::get(), &params, &netdir());
+        guards.select_primary_guards(&params);
+        let failed = guards.primary[0].clone();
+        guards.set_all_guards_dir_info_missing_for_test(true);
+        guards.set_guard_dir_info_missing_for_test(&failed, false);
+        guards.record_failure(&failed, None, now);
+
+        let requested = guards.descriptors_to_request(now, &params, |_| true);
+        assert!(requested.iter().all(|guard| guard.guard_id() != &failed));
+        assert_eq!(
+            requested.len(),
+            guards.guards.len() - 1,
+            "a down guard's cached descriptor must not restrict recovery to two other bridges"
+        );
+    }
+
+    // tor-socks5 local patch: inactive_descriptor_does_not_report_traffic_readiness
+    #[test]
+    fn inactive_descriptor_does_not_report_traffic_readiness() {
+        let params = GuardParams {
+            min_filtered_sample_size: 5,
+            ..GuardParams::default()
+        };
+        let now = Instant::get();
+        let mut guards = GuardSet::default();
+        guards.extend_sample_as_needed(SystemTime::get(), &params, &netdir());
+        guards.select_primary_guards(&params);
+        let failed = guards.primary[0].clone();
+        guards.set_all_guards_dir_info_missing_for_test(true);
+        guards.set_guard_dir_info_missing_for_test(&failed, false);
+        guards.record_failure(&failed, None, now);
+        assert!(!guards.any_guard_usable_for_traffic());
+    }
+
+    // tor-socks5 local patch: reintroduced_guard_with_a_learned_identity_can_refetch_its_descriptor
+    #[cfg(feature = "bridge-client")]
+    #[test]
+    fn reintroduced_guard_with_a_learned_identity_can_refetch_its_descriptor() {
+        use tor_linkspec::HasAddrs;
+        let params = GuardParams {
+            min_filtered_sample_size: 5,
+            ..GuardParams::default()
+        };
+        let now = Instant::get();
+        let mut guards = GuardSet::default();
+        guards.extend_sample_as_needed(SystemTime::get(), &params, &netdir());
+        guards.select_primary_guards(&params);
+        let guard = guards.preference_order().next().unwrap().1;
+        assert!(guard.ed_identity().is_some());
+        let id = guard.guard_id().clone();
+        let bridge: crate::bridge::BridgeConfig = format!(
+            "{} {}",
+            guard.addrs().next().unwrap(),
+            guard.rsa_identity().unwrap()
+        )
+        .parse()
+        .unwrap();
+        let empty = crate::bridge::BridgeSet::new(Vec::new().into(), None);
+        guards.update_status_from_dir(&empty);
+        let configured = crate::bridge::BridgeSet::new(vec![bridge].into(), None);
+        guards.update_status_from_dir(&configured);
+        assert!(!guards.any_guard_usable_for_traffic());
+        let requested = guards.descriptors_to_request(now, &params, |guard| {
+            configured.bridge_by_guard(guard).is_some()
+        });
+        assert_eq!(requested.len(), 1);
+        assert_eq!(requested[0].guard_id(), &id);
+        assert!(!requested[0].has_complete_dir_info());
+        assert!(!requested[0].usable());
+        assert!(!requested[0].conforms_to_usage(&GuardUsage::default()));
+        assert!(
+            guards
+                .pick_guard(
+                    &GuardSetSelector::Bridges,
+                    &GuardUsage::default(),
+                    &params,
+                    now
+                )
+                .is_err()
+        );
+        assert!(!guards.any_guard_usable_for_traffic());
+    }
+
+    // tor-socks5 local patch: descriptors_to_request_retains_out_of_band_descriptor
+    #[cfg(feature = "bridge-client")]
+    #[test]
+    fn descriptors_to_request_retains_out_of_band_descriptor() {
+        let netdir = netdir();
+        let params = GuardParams {
+            min_filtered_sample_size: 5,
+            ..GuardParams::default()
+        };
+        let now = Instant::get();
+        let mut guards = GuardSet::default();
+        guards.extend_sample_as_needed(SystemTime::get(), &params, &netdir);
+        guards.select_primary_guards(&params);
+
+        let maximum = std::cmp::max(params.data_parallelism, 2);
+        assert_eq!(maximum, 2);
+        assert!(guards.guards.len() > maximum);
+
+        // Rank-`maximum` among *eligible* guards (same filter
+        // `descriptors_to_request` applies) -- i.e. the first guard just
+        // past the conservative cutoff. `usable()`/reachability/filter
+        // eligibility does not depend on `dir_info_missing`, so this rank is
+        // the same before and after exhausting descriptors below.
+        let data_usage = GuardUsage::default();
+        let recovered_id = guards
+            .preference_order()
+            .filter(|(_, g)| {
+                g.usable()
+                    && g.reachable() != Reachable::Unreachable
+                    && g.ready_for_usage(&data_usage, now)
+                    && guards.active_filter.permits(*g)
+            })
+            .nth(maximum)
+            .expect("sample has more than `maximum` eligible guards")
+            .1
+            .guard_id()
+            .clone();
+
+        // Exhaust every guard, then hand exactly the rank-`maximum` guard
+        // its descriptor back. That is the guard that must survive
+        // narrowing.
+        guards.set_all_guards_dir_info_missing_for_test(true);
+        guards.set_guard_dir_info_missing_for_test(&recovered_id, false);
+        assert!(
+            guards.any_guard_usable_for_traffic(),
+            "the one recovered guard must make the sample usable again"
+        );
+
+        // Narrow pass: the recovered guard must still be present even though
+        // its preference-order rank is `maximum` (i.e. one past the cutoff).
+        let requested = guards.descriptors_to_request(now, &params, |_| true);
+        assert!(
+            requested.iter().any(|g| g.guard_id() == &recovered_id),
+            "a guard with a complete descriptor must never be dropped from \
+                 the requested set, or set_bridges() will forget it and re-open \
+                 the oscillation"
+        );
     }
 
     #[test]
