@@ -145,6 +145,9 @@ impl AnonymousPathBuilder for ExitPathBuilder {
         netdir: &'a NetDir,
         guard_exclusion: RelayExclusion<'a>,
         rs_cfg: &RelaySelectionConfig<'_>,
+        // tor-socks5 local patch: carries the bandwidth floor for the
+        // final (exit) hop of an ordinary circuit.
+        config: &PathConfig,
     ) -> Result<(Relay<'a>, RelayUsage)> {
         let selector = match &self.inner {
             ExitPathBuilderInner::AnyExit { strict } => {
@@ -172,12 +175,17 @@ impl AnonymousPathBuilder for ExitPathBuilder {
             ),
         };
 
-        let (relay, info) = selector.select_relay(rng, netdir);
-        let relay = relay.ok_or_else(|| Error::NoRelay {
-            path_kind: self.path_kind(),
-            role: "final hop",
-            problem: info.to_string(),
-        })?;
+        // tor-socks5 local patch: the exit relay is optionally restricted
+        // to the upper band of the consensus bandwidth distribution.
+        let relay = super::select_relay_with_bandwidth_floor(
+            &selector,
+            rng,
+            netdir,
+            config.min_bandwidth_percentile(),
+            tor_netdir::WeightRole::Exit,
+            self.path_kind(),
+            "final hop",
+        )?;
         Ok((relay, RelayUsage::middle_relay(Some(selector.usage()))))
     }
 

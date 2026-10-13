@@ -193,6 +193,13 @@ impl AnonymousPathBuilder for HsPathBuilder {
         netdir: &'a NetDir,
         guard_exclusion: RelayExclusion<'a>,
         _rs_cfg: &RelaySelectionConfig<'_>,
+        // tor-socks5 local patch: added to `pick_exit` for the bandwidth
+        // floor. Deliberately unused here: the hidden-service terminal hop
+        // is neither a middle nor an exit selection (its usages map to the
+        // HsIntro/HsRend/Middle roles, not `WeightRole::Exit`), so the
+        // floor does not apply to it. The middle hop of an HS circuit stem
+        // still gets the floor via the shared `pick_path`.
+        _config: &PathConfig,
     ) -> Result<(Relay<'a>, RelayUsage)> {
         let selector =
             RelaySelector::new(hs_stem_terminal_hop_usage(self.circ_kind), guard_exclusion);

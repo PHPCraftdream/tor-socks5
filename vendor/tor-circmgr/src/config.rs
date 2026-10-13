@@ -26,6 +26,8 @@ use std::time::Duration;
 /// restrictive.
 #[derive(Debug, Clone, Eq, PartialEq, Deftly)]
 #[derive_deftly(TorConfig)]
+// tor-socks5 local patch: bandwidth-floor builder validation.
+#[deftly(tor_config(pre_build = "Self::validate_min_bandwidth_percentile"))]
 pub struct PathConfig {
     /// Set the length of a bit-prefix for a default IPv4 subnet-family.
     ///
@@ -48,11 +50,32 @@ pub struct PathConfig {
     /// The set of addresses to which we're willing to make direct connections.
     #[deftly(tor_config(list(element(clone)), default = "default_reachable_addrs()"))]
     pub(crate) reachable_addrs: Vec<AddrPortPattern>,
+
+    // tor-socks5 local patch (docs/circuit-speed-plan.md Tier 2): optional
+    // bandwidth floor for middle/exit relay selection. 0 (the default)
+    // keeps stock behaviour; 1..=100 excludes middle/exit candidates whose
+    // consensus role weight is below that percentile of the candidate pool
+    // the stock `RelaySelector` would draw from. Values above 100 are
+    // rejected by the builder. Enforced in `path.rs`'s
+    // `select_relay_with_bandwidth_floor`, which falls back to the
+    // unfiltered pool rather than ever shrinking the pool below a safety
+    // minimum. Hidden-service terminal hops are deliberately not filtered;
+    // only middle/exit selection on ordinary paths is affected.
+    // Latency-over-anonymity trade, personal-use fork only.
+    #[deftly(tor_config(default = "default_min_bandwidth_percentile()"))]
+    /// Optional bandwidth floor for middle and exit selection.
+    pub(crate) min_bandwidth_percentile: u8,
 }
 
 /// Return the default list of reachable addresses (namely, "*:*")
 fn default_reachable_addrs() -> Vec<AddrPortPattern> {
     vec![AddrPortPattern::new_all()]
+}
+
+/// tor-socks5 local patch: default for `min_bandwidth_percentile` (0 =
+/// bandwidth floor disabled, stock behaviour).
+fn default_min_bandwidth_percentile() -> u8 {
+    0
 }
 
 /// Default value for ipv4_subnet_family_prefix.
@@ -79,6 +102,12 @@ impl PathConfig {
         )
     }
 
+    /// tor-socks5 local patch: the configured middle/exit bandwidth-floor
+    /// percentile (0 = disabled). See the `min_bandwidth_percentile` field.
+    pub fn min_bandwidth_percentile(&self) -> u8 {
+        self.min_bandwidth_percentile
+    }
+
     /// Return true if this configuration is at least as permissive as `other`.
     ///
     /// In other words, in other words, return true if every circuit permitted
@@ -91,6 +120,10 @@ impl PathConfig {
         self.ipv4_subnet_family_prefix >= other.ipv4_subnet_family_prefix
             && self.ipv6_subnet_family_prefix >= other.ipv6_subnet_family_prefix
             && self.reachable_addrs == other.reachable_addrs
+            // tor-socks5 local patch: a higher bandwidth floor is strictly
+            // less permissive. Returning false here only causes circuits to
+            // be discarded on reconfigure, which is the safe direction.
+            && self.min_bandwidth_percentile <= other.min_bandwidth_percentile
     }
 
     /// Return a new [`GuardFilter`] reflecting the rules in this configuration.
@@ -106,6 +139,29 @@ impl PathConfig {
         RelaySelectionConfig {
             long_lived_ports: &self.long_lived_ports,
             subnet_config: self.subnet_config(),
+        }
+    }
+}
+
+// tor-socks5 local patch: builder validation for `min_bandwidth_percentile`:
+// only 0..=100 are meaningful; anything else is a configuration error rather
+// than something to clamp silently.
+impl PathConfigBuilder {
+    /// tor-socks5 local patch: reject out-of-range `min_bandwidth_percentile`.
+    #[allow(clippy::unnecessary_wraps)]
+    fn validate_min_bandwidth_percentile(
+        &self,
+    ) -> std::result::Result<(), tor_config::ConfigBuildError> {
+        let Some(pct) = self.min_bandwidth_percentile else {
+            return Ok(());
+        };
+        if pct <= 100 {
+            Ok(())
+        } else {
+            Err(tor_config::ConfigBuildError::Invalid {
+                field: "min_bandwidth_percentile".to_string(),
+                problem: format!("must be in range 0..=100, not {pct}"),
+            })
         }
     }
 }
@@ -350,6 +406,9 @@ pub(crate) mod test_config {
     #[derive(Default, derive_more::AsRef)]
     #[allow(clippy::exhaustive_structs)]
     #[allow(missing_docs)]
+    // tor-socks5 local patch: allow needed for clippy -D warnings
+    // (newer clippy than upstream CI).
+    #[allow(unreachable_pub)]
     #[cfg_attr(docsrs, doc(cfg(feature = "testing")))]
     pub struct TestConfig {
         pub path_rules: PathConfig,
@@ -428,5 +487,67 @@ mod test {
         assert!(!pc1.at_least_as_permissive_as(&pc2));
         assert!(!pc1.at_least_as_permissive_as(&pc3));
         assert!(!pc3.at_least_as_permissive_as(&pc2));
+    }
+
+    // tor-socks5 local patch: the bandwidth floor defaults to stock
+    // behaviour, round-trips through the builder, rejects out-of-range
+    // values, and compares conservatively in `at_least_as_permissive_as`.
+    #[test]
+    fn path_config_bandwidth_floor() {
+        let pc = PathConfig::default();
+        assert_eq!(pc.min_bandwidth_percentile(), 0);
+
+        let stricter = PathConfig::builder()
+            .min_bandwidth_percentile(75)
+            .build()
+            .unwrap();
+        assert_eq!(stricter.min_bandwidth_percentile(), 75);
+
+        // Explicit 0 is the same as the default.
+        let explicit_zero = PathConfig::builder()
+            .min_bandwidth_percentile(0)
+            .build()
+            .unwrap();
+        assert_eq!(explicit_zero.min_bandwidth_percentile(), 0);
+
+        // Values above 100 are rejected by the builder.
+        assert!(
+            PathConfig::builder()
+                .min_bandwidth_percentile(101)
+                .build()
+                .is_err()
+        );
+        assert!(
+            PathConfig::builder()
+                .min_bandwidth_percentile(255)
+                .build()
+                .is_err()
+        );
+        // The boundary 100 itself is fine.
+        assert_eq!(
+            PathConfig::builder()
+                .min_bandwidth_percentile(100)
+                .build()
+                .unwrap()
+                .min_bandwidth_percentile(),
+            100
+        );
+
+        // Equal floors are mutually permissive.
+        let same = PathConfig::builder()
+            .min_bandwidth_percentile(75)
+            .build()
+            .unwrap();
+        assert!(same.at_least_as_permissive_as(&stricter));
+        assert!(stricter.at_least_as_permissive_as(&same));
+
+        // A lower floor is more permissive than a higher one...
+        let lower_floor = PathConfig::builder()
+            .min_bandwidth_percentile(10)
+            .build()
+            .unwrap();
+        assert!(lower_floor.at_least_as_permissive_as(&stricter));
+        // ...and not the other way around.
+        assert!(!stricter.at_least_as_permissive_as(&lower_floor));
     }
 }

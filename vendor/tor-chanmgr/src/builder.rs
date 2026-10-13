@@ -180,6 +180,16 @@ where
     }
 }
 
+// tor-socks5 local patch: transport build budgets
+/// Total build budget: preserve direct 5s, allow every non-direct method 45s.
+fn connect_build_timeout(is_direct: bool) -> Duration {
+    if is_direct {
+        Duration::from_secs(5)
+    } else {
+        Duration::from_secs(45)
+    }
+}
+
 #[async_trait]
 impl<R: Runtime, H: TransportImplHelper> ChannelFactory for ChanBuilder<R, H>
 where
@@ -195,12 +205,10 @@ where
     ) -> crate::Result<Arc<tor_proto::channel::Channel>> {
         use tor_rtcompat::SleepProviderExt;
 
-        // TODO: make this an option.  And make a better value.
-        let delay = if target.chan_method().is_direct() {
-            std::time::Duration::new(5, 0)
-        } else {
-            std::time::Duration::new(10, 0)
-        };
+        // tor-socks5 local patch: non-direct total timeout
+        // The transport handshake is opaque: no progress callback for an idle timer.
+        // Keep one finite total around the entire TCP/transport/TLS/link build.
+        let delay = connect_build_timeout(target.chan_method().is_direct());
 
         self.runtime
             .timeout(delay, self.connect_no_timeout(target, reporter.0, memquota))
@@ -713,6 +721,10 @@ impl crate::mgr::AbstractChannel for tor_proto::channel::Channel {
     fn engage_padding_activities(&self) {
         tor_proto::channel::Channel::engage_padding_activities(self);
     }
+    // tor-socks5 local patch: concrete channel termination
+    fn terminate(&self) {
+        tor_proto::channel::Channel::terminate(self);
+    }
 }
 
 #[cfg(test)]
@@ -842,6 +854,18 @@ mod test {
             r2.unwrap();
             Ok(())
         })
+    }
+
+    // tor-socks5 local patch: direct budget regression
+    #[test]
+    fn connect_build_timeout_direct() {
+        assert_eq!(connect_build_timeout(true), Duration::from_secs(5));
+    }
+
+    // tor-socks5 local patch: non-direct budget regression
+    #[test]
+    fn connect_build_timeout_non_direct() {
+        assert_eq!(connect_build_timeout(false), Duration::from_secs(45));
     }
 
     // TODO: Write tests for timeout logic, once there is smarter logic.

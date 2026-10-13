@@ -28,7 +28,7 @@ use tor_error::{Bug, bad_api_usage, internal};
 use tor_geoip::{CountryCode, HasCountryCode};
 use tor_guardmgr::{GuardMgr, GuardMonitor, GuardUsable};
 use tor_linkspec::{HasAddrs, HasRelayIds, OwnedChanTarget, OwnedCircTarget, RelayIdSet};
-use tor_netdir::{FamilyRules, NetDir, Relay};
+use tor_netdir::{FamilyRules, NetDir, Relay, RelayWeight, WeightRole};
 use tor_relay_selection::{RelayExclusion, RelaySelectionConfig, RelaySelector, RelayUsage};
 use tor_rtcompat::Runtime;
 
@@ -290,12 +290,16 @@ trait AnonymousPathBuilder {
     ///
     /// Return the exit, along with the usage for a middle node corresponding
     /// to this exit.
+    ///
+    /// tor-socks5 local patch: the `PathConfig`, so that the bandwidth
+    /// floor can reach exit selection in the implementors.
     fn pick_exit<'a, R: Rng>(
         &self,
         rng: &mut R,
         netdir: &'a NetDir,
         guard_exclusion: RelayExclusion<'a>,
         rs_cfg: &RelaySelectionConfig<'_>,
+        config: &PathConfig,
     ) -> Result<(Relay<'a>, RelayUsage)>;
 }
 
@@ -355,7 +359,9 @@ fn pick_path<'a, B: AnonymousPathBuilder, R: Rng, RT: Runtime>(
 
     let mut exclusion = guard_exclusion.clone();
     exclusion.extend(&target_exclusion);
-    let (exit, middle_usage) = builder.pick_exit(rng, netdir, exclusion, &rs_cfg)?;
+    // tor-socks5 local patch: pass the PathConfig down so that the
+    // bandwidth floor can apply to exit selection.
+    let (exit, middle_usage) = builder.pick_exit(rng, netdir, exclusion, &rs_cfg, config)?;
 
     let mut family_exclusion =
         RelayExclusion::exclude_relays_in_same_family(&rs_cfg, vec![exit.clone()], family_rules);
@@ -364,12 +370,17 @@ fn pick_path<'a, B: AnonymousPathBuilder, R: Rng, RT: Runtime>(
     exclusion.extend(&target_exclusion);
 
     let selector = RelaySelector::new(middle_usage, exclusion);
-    let (middle, info) = selector.select_relay(rng, netdir);
-    let middle = middle.ok_or_else(|| Error::NoRelay {
-        path_kind: builder.path_kind(),
-        role: "middle relay",
-        problem: info.to_string(),
-    })?;
+    // tor-socks5 local patch: the middle relay is optionally restricted to
+    // the upper band of the consensus bandwidth distribution.
+    let middle = select_relay_with_bandwidth_floor(
+        &selector,
+        rng,
+        netdir,
+        config.min_bandwidth_percentile(),
+        WeightRole::Middle,
+        builder.path_kind(),
+        "middle relay",
+    )?;
 
     let hops = vec![
         guard,
@@ -380,6 +391,119 @@ fn pick_path<'a, B: AnonymousPathBuilder, R: Rng, RT: Runtime>(
     ensure_unique_hops(&hops)?;
 
     Ok((TorPath::new_multihop_from_maybe_owned(hops), mon, usable))
+}
+
+// tor-socks5 local patch (docs/circuit-speed-plan.md Tier 2): safety
+// minimum for the bandwidth-floor candidate pool. If applying the floor
+// would leave fewer than this many usable middle/exit candidates, we fall
+// back to the stock unfiltered selection instead — an over-aggressive
+// floor must degrade to "usually fast", never to "cannot build circuits".
+/// Minimum candidate count retained when applying a bandwidth floor.
+const MIN_FILTERED_POOL: usize = 20;
+
+/// tor-socks5 local patch (docs/circuit-speed-plan.md Tier 2): pick a
+/// relay with `selector`, additionally excluding candidates below the
+/// `floor_percentile`-th percentile of the consensus role-weight
+/// distribution of the candidates that `selector` itself permits.
+///
+/// `floor_percentile == 0` (the default) makes this exactly the stock
+/// `RelaySelector::select_relay` call — identical behaviour and RNG
+/// consumption.
+///
+/// We use the role weights from `NetDir::relay_weight` (the same weights
+/// `pick_relay` samples proportionally to) rather than the raw consensus
+/// `w Bandwidth=` figure, because the latter is only exposed behind
+/// tor-netdir's `experimental-api` feature. For a fixed role the weight is
+/// monotone in the relay's measured bandwidth, so the percentile ordering
+/// is preserved.
+///
+/// Never fails harder than the stock selection: if the floor would shrink
+/// the candidate pool below [`MIN_FILTERED_POOL`], or the filtered pick
+/// somehow finds nothing, we fall back to the unfiltered stock selection.
+pub(crate) fn select_relay_with_bandwidth_floor<'d, R: Rng>(
+    selector: &RelaySelector<'_>,
+    rng: &mut R,
+    netdir: &'d NetDir,
+    floor_percentile: u8,
+    role: WeightRole,
+    path_kind: &'static str,
+    role_name: &'static str,
+) -> Result<Relay<'d>> {
+    if floor_percentile == 0 {
+        return select_relay_stock(selector, rng, netdir, path_kind, role_name);
+    }
+
+    let candidates: Vec<Relay<'d>> = netdir
+        .relays()
+        .filter(|r| selector.permits_relay(r))
+        .collect();
+
+    // The unfiltered pool is already tiny (test networks, badly desynced
+    // directories): keep stock behaviour rather than filtering further.
+    if candidates.len() < MIN_FILTERED_POOL {
+        return select_relay_stock(selector, rng, netdir, path_kind, role_name);
+    }
+
+    let mut weights: Vec<_> = candidates
+        .iter()
+        .map(|r| netdir.relay_weight(r, role))
+        .collect();
+    weights.sort_unstable();
+    let threshold = bandwidth_percentile_threshold(&weights, floor_percentile);
+
+    let n_above = candidates
+        .iter()
+        .filter(|r| netdir.relay_weight(r, role) >= threshold)
+        .count();
+    if n_above < MIN_FILTERED_POOL {
+        // The floor would leave too few candidates to build circuits
+        // reliably: fall back to the unfiltered selection.
+        return select_relay_stock(selector, rng, netdir, path_kind, role_name);
+    }
+
+    match netdir.pick_relay(rng, role, |r| {
+        selector.permits_relay(r) && netdir.relay_weight(r, role) >= threshold
+    }) {
+        Some(relay) => Ok(relay),
+        // Unreachable in practice (the same predicate admitted at least
+        // MIN_FILTERED_POOL relays a moment ago), but a floor must never
+        // turn a would-be-successful build into a failure.
+        None => select_relay_stock(selector, rng, netdir, path_kind, role_name),
+    }
+}
+
+/// tor-socks5 local patch: the stock `select_relay` call plus its error
+/// mapping, factored out so that the default path of
+/// [`select_relay_with_bandwidth_floor`] is textually identical to the
+/// pre-patch code.
+fn select_relay_stock<'d, R: Rng>(
+    selector: &RelaySelector<'_>,
+    rng: &mut R,
+    netdir: &'d NetDir,
+    path_kind: &'static str,
+    role_name: &'static str,
+) -> Result<Relay<'d>> {
+    let (relay, info) = selector.select_relay(rng, netdir);
+    relay.ok_or_else(|| Error::NoRelay {
+        path_kind,
+        role: role_name,
+        problem: info.to_string(),
+    })
+}
+
+/// tor-socks5 local patch: return the `percentile`-th percentile
+/// (0 < percentile; values above 100 are treated as 100) of an
+/// ascendingly sorted, non-empty slice of weights. Relays at or above
+/// this value pass the floor.
+fn bandwidth_percentile_threshold(sorted: &[RelayWeight], percentile: u8) -> RelayWeight {
+    debug_assert!(!sorted.is_empty());
+    debug_assert!(percentile > 0);
+    // Nearest-lower-rank: the value at index floor(n * p / 100), clamped
+    // into range (p >= 100 selects only relays carrying the maximum
+    // weight). The product cannot overflow usize on any realistic
+    // consensus (n <= ~10_000 relays, p <= 255 → n * p <= ~2.55M).
+    let idx = (sorted.len().saturating_mul(percentile as usize) / 100).min(sorted.len() - 1);
+    sorted[idx]
 }
 
 /// Returns an error if the specified hop list contains duplicates.
@@ -464,6 +588,181 @@ fn assert_same_path_when_owned(path: &TorPath<'_>) {
         }
         (_, _) => {
             panic!("Mismatched path types.");
+        }
+    }
+}
+
+// tor-socks5 local patch (docs/circuit-speed-plan.md Tier 2): unit tests
+// for the bandwidth-floor selection helper.
+#[cfg(test)]
+mod bandwidth_floor_tests {
+    // @@ begin test lint list maintained by maint/add_warning @@
+    #![allow(clippy::bool_assert_comparison)]
+    #![allow(clippy::clone_on_copy)]
+    #![allow(clippy::dbg_macro)]
+    #![allow(clippy::mixed_attributes_style)]
+    #![allow(clippy::print_stderr)]
+    #![allow(clippy::print_stdout)]
+    #![allow(clippy::single_char_pattern)]
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unchecked_time_subtraction)]
+    #![allow(clippy::useless_vec)]
+    #![allow(clippy::needless_pass_by_value)]
+    //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
+
+    use tor_basic_utils::test_rng::{Config as TestRngConfig, testing_rng};
+    use tor_linkspec::HasRelayIds as _;
+    use tor_netdir::{RelayWeight, WeightRole, testnet};
+    use tor_relay_selection::{RelayExclusion, RelaySelector, RelayUsage};
+
+    use super::{
+        MIN_FILTERED_POOL, bandwidth_percentile_threshold, select_relay_with_bandwidth_floor,
+    };
+
+    fn middle_selector() -> RelaySelector<'static> {
+        RelaySelector::new(
+            RelayUsage::middle_relay(None),
+            RelayExclusion::no_relays_excluded(),
+        )
+    }
+
+    #[test]
+    fn percentile_threshold_indices() {
+        let weights: Vec<RelayWeight> = (1..=100_u64).map(RelayWeight::from).collect();
+        // 50th percentile of 100 values: index 50 (value 51).
+        assert_eq!(
+            bandwidth_percentile_threshold(&weights, 50),
+            RelayWeight::from(51)
+        );
+        // 1st percentile of 100 values: index 1 (value 2).
+        assert_eq!(
+            bandwidth_percentile_threshold(&weights, 1),
+            RelayWeight::from(2)
+        );
+        // 100th percentile: the maximum.
+        assert_eq!(
+            bandwidth_percentile_threshold(&weights, 100),
+            RelayWeight::from(100)
+        );
+        // Values above 100 clamp to the maximum.
+        assert_eq!(
+            bandwidth_percentile_threshold(&weights, 255),
+            RelayWeight::from(100)
+        );
+
+        let small = vec![RelayWeight::from(10), RelayWeight::from(20)];
+        // 50th percentile of 2 values: index 1.
+        assert_eq!(
+            bandwidth_percentile_threshold(&small, 50),
+            RelayWeight::from(20)
+        );
+        // 49th percentile of 2 values: index 0.
+        assert_eq!(
+            bandwidth_percentile_threshold(&small, 49),
+            RelayWeight::from(10)
+        );
+    }
+
+    #[test]
+    fn floor_excludes_low_bandwidth_candidates() {
+        let netdir = testnet::construct_netdir().unwrap_if_sufficient().unwrap();
+        let selector = middle_selector();
+
+        // The threshold the implementation should be enforcing: the 50th
+        // percentile of the Middle-role weights of the permitted pool.
+        let mut weights: Vec<_> = netdir
+            .relays()
+            .filter(|r| selector.permits_relay(r))
+            .map(|r| netdir.relay_weight(&r, WeightRole::Middle))
+            .collect();
+        assert!(
+            weights.len() >= MIN_FILTERED_POOL,
+            "testnet pool must be large enough for the floor to engage"
+        );
+        weights.sort_unstable();
+        let threshold = bandwidth_percentile_threshold(&weights, 50);
+        // The floor must actually bite on this network: some permitted
+        // relay must fall below it (otherwise this test would be vacuous).
+        assert!(weights[0] < threshold);
+
+        let mut rng = testing_rng();
+        for _ in 0..200 {
+            let relay = select_relay_with_bandwidth_floor(
+                &selector,
+                &mut rng,
+                &netdir,
+                50,
+                WeightRole::Middle,
+                "test circuit",
+                "middle relay",
+            )
+            .unwrap();
+            assert!(netdir.relay_weight(&relay, WeightRole::Middle) >= threshold);
+        }
+    }
+
+    #[test]
+    fn floor_falls_back_when_pool_is_tiny() {
+        let netdir = testnet::construct_netdir().unwrap_if_sufficient().unwrap();
+        // Shrink the permitted pool below MIN_FILTERED_POOL by excluding
+        // most of the network outright: with only a handful of candidates,
+        // even a 99th-percentile floor must behave like stock selection
+        // and still succeed.
+        let excluded: Vec<_> = netdir.relays().take(35).collect();
+        assert_eq!(excluded.len(), 35);
+        let selector = RelaySelector::new(
+            RelayUsage::middle_relay(None),
+            RelayExclusion::exclude_specific_relays(&excluded),
+        );
+
+        // With a pool below MIN_FILTERED_POOL the helper must take the
+        // exact stock code path: with two identically-seeded RNGs the
+        // floored call and a direct `select_relay` must pick the identical
+        // relay every time (this is what makes the fallback observable).
+        let mut rng_floored = TestRngConfig::Deterministic.into_rng();
+        let mut rng_stock = TestRngConfig::Deterministic.into_rng();
+        for _ in 0..50 {
+            let relay = select_relay_with_bandwidth_floor(
+                &selector,
+                &mut rng_floored,
+                &netdir,
+                99,
+                WeightRole::Middle,
+                "test circuit",
+                "middle relay",
+            )
+            .unwrap();
+            // Whatever was picked must still be one the selector permits...
+            assert!(selector.permits_relay(&relay));
+            // ...and must be exactly what the stock selection would pick.
+            let (stock, _) = selector.select_relay(&mut rng_stock, &netdir);
+            assert!(relay.same_relay_ids(&stock.unwrap()));
+        }
+    }
+
+    #[test]
+    fn floor_zero_matches_stock_selection_exactly() {
+        // A zero floor must take the exact stock code path: with two
+        // identically-seeded RNGs, the floored helper and a direct
+        // `select_relay` call must pick the identical relay every time.
+        let netdir = testnet::construct_netdir().unwrap_if_sufficient().unwrap();
+        let mut rng_floored = TestRngConfig::Deterministic.into_rng();
+        let mut rng_stock = TestRngConfig::Deterministic.into_rng();
+
+        for _ in 0..100 {
+            let floored = select_relay_with_bandwidth_floor(
+                &middle_selector(),
+                &mut rng_floored,
+                &netdir,
+                0,
+                WeightRole::Middle,
+                "test circuit",
+                "middle relay",
+            )
+            .unwrap();
+            let (stock, _) = middle_selector().select_relay(&mut rng_stock, &netdir);
+            let stock = stock.unwrap();
+            assert!(floored.same_relay_ids(&stock));
         }
     }
 }

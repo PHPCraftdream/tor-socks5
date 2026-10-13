@@ -63,6 +63,10 @@ pub(crate) trait AbstractChannel: HasRelayIds {
     ///
     /// [`Channel::engage_padding_activities`]: tor_proto::channel::Channel::engage_padding_activities
     fn engage_padding_activities(&self);
+
+    // tor-socks5 local patch: channel termination primitive
+    /// Force shutdown even when this channel is in use.
+    fn terminate(&self);
 }
 
 /// Trait to describe how channels-like objects are created.
@@ -716,6 +720,12 @@ impl<CF: AbstractChannelFactory + Clone> AbstractChanMgr<CF> {
         self.channels.expire_channels()
     }
 
+    // tor-socks5 local patch: manager termination forwarding
+    /// Terminate and remove open channels, leaving pending builds untouched.
+    pub(crate) fn terminate_all_channels(&self) {
+        self.channels.terminate_all_channels();
+    }
+
     /// Test only: return the open usable channels with a given `ident`.
     #[cfg(test)]
     pub(crate) fn get_nowait<'a, T>(&self, ident: T) -> Vec<Arc<CF::Channel>>
@@ -838,6 +848,10 @@ mod test {
             Ok(())
         }
         fn engage_padding_activities(&self) {}
+        // tor-socks5 local patch: observable fake termination
+        fn terminate(&self) {
+            self.start_closing();
+        }
     }
 
     impl HasRelayIds for FakeChannel {
@@ -971,6 +985,61 @@ mod test {
         ) -> Result<Arc<Self::Channel>> {
             unimplemented!()
         }
+    }
+
+    // tor-socks5 local patch: termination and fresh launch regression
+    #[test]
+    fn terminate_all_channels() {
+        test_with_one_runtime!(|runtime| async {
+            let (mgr, attempts) = new_test_abstract_chanmgr_and_build_attempts(runtime);
+            let target = FakeBuildSpec(7, 'a', u32_to_ed(7), ADDR_A);
+            let first = mgr
+                .get_or_launch(target.clone(), CU::UserTraffic)
+                .await
+                .unwrap()
+                .0;
+            let other = mgr
+                .get_or_launch(FakeBuildSpec(8, 'b', u32_to_ed(8), ADDR_A), CU::UserTraffic)
+                .await
+                .unwrap()
+                .0;
+            assert!(first.is_usable());
+            assert!(other.is_usable());
+            mgr.terminate_all_channels();
+            assert!(!first.is_usable());
+            assert!(!other.is_usable());
+            assert!(mgr.get_nowait(&u32_to_ed(7)).is_empty());
+            assert!(mgr.get_nowait(&u32_to_ed(8)).is_empty());
+            mgr.terminate_all_channels();
+            let fresh = mgr.get_or_launch(target, CU::UserTraffic).await.unwrap().0;
+            assert_ne!(first, fresh);
+            assert!(fresh.is_usable());
+            assert_eq!(attempts.load(Ordering::SeqCst), 3);
+            assert_eq!(mgr.get_nowait(&u32_to_ed(7)), vec![fresh]);
+        });
+    }
+
+    // tor-socks5 local patch: pending owner and waiter lifecycle regression
+    #[test]
+    fn terminate_all_channels_leaves_pending_alone() {
+        test_with_one_runtime!(|runtime| async {
+            let (mgr, attempts) = new_test_abstract_chanmgr_and_build_attempts(runtime);
+            let target = FakeBuildSpec(9, 'a', u32_to_ed(9), ADDR_A);
+            // The factory's first yield deterministically leaves a Building entry.
+            let mut owner = Box::pin(mgr.get_or_launch(target.clone(), CU::UserTraffic));
+            assert!(poll!(&mut owner).is_pending());
+            let mut waiter = Box::pin(mgr.get_or_launch(target, CU::UserTraffic));
+            assert!(poll!(&mut waiter).is_pending());
+            mgr.terminate_all_channels();
+            assert!(poll!(&mut waiter).is_pending());
+            let channel = owner.await.unwrap().0;
+            let waited = waiter.await.unwrap().0;
+            assert_eq!(channel, waited);
+            assert!(channel.is_usable());
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            mgr.terminate_all_channels();
+            assert!(!channel.is_usable());
+        });
     }
 
     #[test]

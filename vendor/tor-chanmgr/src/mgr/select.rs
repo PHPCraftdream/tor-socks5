@@ -287,6 +287,10 @@ mod test {
             Ok(())
         }
         fn engage_padding_activities(&self) {}
+        // tor-socks5 local patch: selection-only fake termination
+        fn terminate(&self) {
+            panic!("selection tests must not terminate channels");
+        }
     }
 
     impl HasRelayIds for FakeChannel {
