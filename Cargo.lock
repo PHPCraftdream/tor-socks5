@@ -1593,7 +1593,7 @@ checksum = "36e10ac4bd47bf8d24a4852f001df23b7acbbca6e59d0adec0c2e2c4409dfe5b"
 dependencies = [
  "heck",
  "indexmap 2.14.0",
- "itertools 0.14.0",
+ "itertools 0.15.0",
  "proc-macro-crate",
  "proc-macro2",
  "quote",
@@ -4221,14 +4221,14 @@ dependencies = [
 
 [[package]]
 name = "ptrs-gesher-bridge-line"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "ptrs-gesher-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "futures",
  "itertools 0.14.0",
@@ -4241,7 +4241,7 @@ dependencies = [
 
 [[package]]
 name = "ptrs-gesher-lyrebird"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4267,7 +4267,7 @@ dependencies = [
 
 [[package]]
 name = "ptrs-gesher-obfs4"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "base64",
  "bytes",
@@ -4305,7 +4305,7 @@ dependencies = [
 
 [[package]]
 name = "ptrs-gesher-webtunnel"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "base64",
  "getrandom 0.2.17",
