@@ -568,8 +568,16 @@ async fn upstream_setup_stall_releases_permit_at_deadline() {
         "permit must be held while the upstream setup stalls"
     );
 
-    tokio::time::sleep(upstream::UPSTREAM_SETUP_DEADLINE + Duration::from_secs(5)).await;
-    let _permit = tokio::time::timeout(Duration::from_secs(10), permits.acquire())
+    // The per-stage fallback timeouts sit 5s above the total deadline, so
+    // releasing inside this window proves the total deadline fired.
+    tokio::time::sleep(upstream::UPSTREAM_SETUP_DEADLINE - Duration::from_secs(1)).await;
+    assert_eq!(
+        permits.available_permits(),
+        0,
+        "permit must still be held before the setup deadline"
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let _permit = tokio::time::timeout(Duration::from_secs(2), permits.acquire())
         .await
         .expect("permit must be released by the upstream setup deadline");
     server.abort();

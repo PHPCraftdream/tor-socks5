@@ -26,8 +26,9 @@ against `tor-*` 0.47 is published.
 The root-cause fix for the bridge outage: `saturating_add`/`saturating_sub`
 eagerly forced a `LazyLock` min/max binary search that never terminates on
 Windows `SystemTime`, so bridge descriptors were never parsed and no circuit
-could be built. We ship a lazy `unwrap_or_else` limit, a `find_limit`
-termination watchdog, and regression tests. Upstream's !4414 merely imported
+could be built. We ship a lazy `unwrap_or_else` limit and regression tests (one with a
+test-only termination watchdog). A direct limit query or genuine overflow still
+runs the unbounded `find_limit` search on Windows. Upstream's !4414 merely imported
 the crate into arti without the lazy fix; crates.io 0.5.0 still has the eager
 `unwrap_or`.
 
@@ -107,7 +108,7 @@ One row per patch group. Marker names are the identifiers in the
 | Patch | Crate | File(s) | Purpose | Status in 0.47 |
 |---|---|---|---|---|
 | `lazy_add_limit` / `lazy_sub_limit` | saturating-time 0.5.0 | src/lib.rs | lazy limits instead of eager `unwrap_or` (Windows `SystemTime` hang) | carried (not upstream; 0.5.0 still eager) |
-| watchdog + test hygiene | saturating-time | src/lib.rs, src/internal.rs | `find_limit` termination watchdog; doctests off; 3 limit-forcing tests ignored | carried |
+| watchdog + test hygiene | saturating-time | src/lib.rs, src/internal.rs | test-only termination watchdog around `find_limit` (the search itself stays unbounded); doctests off; 3 limit-forcing tests ignored | carried |
 | `body_idle_timeout` / `reset_body_idle` | tor-dirclient | src/lib.rs | 90 s idle body timeout for slow PT consensus downloads | carried (upstream's 10 s header timeout is a different mechanism, kept) |
 | `RemainingTracker` / `TruncatedBody` | tor-dirclient | src/lib.rs, src/err.rs, src/local_test.rs | enforce `Content-Length`; distrust truncated bodies | carried |
 | descriptor-fetch total timeout | tor-dirmgr | src/bridgedesc.rs | hard 30 s total on bridge-descriptor fetch, `RequestFailed(DirTimeout)` | carried (0.47 has no overall fetch timeout) |
@@ -133,10 +134,8 @@ One row per patch group. Marker names are the identifiers in the
 
 * All seven forks set `publish = false`.
 * `arti-client` gains the tokio `test-util` dev feature.
-* Large upstream monolith files are locally decomposed into modules, e.g.
-  `arti-client/src/client/{bootstrap,operations,stream_retry}.rs`,
-  `tor-guardmgr/src/{api,management}.rs`, `tor-circmgr/src/manager.rs`,
-  `tor-dirmgr/src/bridgedesc/manager.rs`.
+* New local files: `arti-client/src/client/stream_retry.rs` and
+  `tor-dirclient/src/local_test.rs` (patch regression tests).
 
 ## Verifying a patch is present
 

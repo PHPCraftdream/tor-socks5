@@ -173,3 +173,34 @@ fn test_content_length_undercount_truncates_silently() {
         b"One fish Two fish Red fish Blue fish"
     );
 }
+
+/// A malformed or conflicting `Content-Length` is rejected, never ignored.
+// tor-socks5 local patch: content_length_strict_regression
+#[test]
+fn content_length_is_strict() {
+    let hdr = |value: &'static [u8]| httparse::Header {
+        name: "Content-Length",
+        value,
+    };
+    assert_eq!(parse_content_length(&[]).expect("absent"), None);
+    assert_eq!(parse_content_length(&[hdr(b" 42 ")]).expect("valid"), Some(42));
+    assert_eq!(
+        parse_content_length(&[hdr(b"7"), hdr(b"7")]).expect("same twice"),
+        Some(7)
+    );
+    for bad in [&b"invalid"[..], b"", b"-1", b"+5", b"1 2", b"99999999999999999999999"] {
+        assert!(
+            matches!(
+                parse_content_length(&[hdr(bad)]),
+                Err(RequestError::HttparseError(_))
+            ),
+            "{bad:?} must be rejected"
+        );
+    }
+    assert!(parse_content_length(&[hdr(b"7"), hdr(b"8")]).is_err());
+    // Wider than a 32-bit usize but valid: kept exactly.
+    assert_eq!(
+        parse_content_length(&[hdr(b"4294967296")]).expect("large"),
+        Some(4_294_967_296)
+    );
+}

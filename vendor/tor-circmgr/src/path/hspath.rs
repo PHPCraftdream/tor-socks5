@@ -411,7 +411,7 @@ pub(crate) fn hs_stem_terminal_hop_usage(kind: Option<HsCircKind>) -> RelayUsage
     }
 }
 
-// tor-socks5 local patch: тест требует features vanguards+hs-common, отсутствующих в нашем релизном наборе (сборка торчит только как клиент без hs/vanguards); код под тестом в этой конфигурации не компилируется.
+// tor-socks5 local patch: these tests need the vanguards and hs-common features, which our release feature set does not enable; the nightly all-features run covers them.
 #[cfg(all(test, feature = "vanguards", feature = "hs-common"))]
 mod test {
     // @@ begin test lint list maintained by maint/add_warning @@

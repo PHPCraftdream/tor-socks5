@@ -1163,7 +1163,10 @@ pub(crate) fn notify_fatal_protocol_error(
     error: &crate::Error,
 ) {
     if let Some(hook) = hook {
-        hook.on_fatal_protocol_error(error);
+        // A panicking hook must not cancel the shutdown that follows.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            hook.on_fatal_protocol_error(error);
+        }));
     }
 }
 
@@ -2820,6 +2823,16 @@ mod test {
             *recorded.lock().unwrap(),
             Some(ErrorKind::RemoteNetworkTimeout)
         );
+    }
+
+    // tor-socks5 local patch: a panicking hook must not escape the seam, or
+    // the `process::exit(1)` that follows it would be skipped.
+    #[test]
+    fn fatal_protocol_error_hook_panic_is_contained() {
+        let hook: Arc<dyn crate::FatalProtocolErrorHandler> =
+            Arc::new(|_: &crate::Error| panic!("hook failure"));
+        let err = crate::Error::from(crate::err::ErrorDetail::ExitTimeout);
+        notify_fatal_protocol_error(&Some(hook), &err);
     }
 
     // tor-socks5 local patch: contract tests for the guard-manager passthrough

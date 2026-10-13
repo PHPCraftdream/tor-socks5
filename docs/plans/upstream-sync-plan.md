@@ -55,6 +55,11 @@ retry and `initial_connect_timeout`; circmgr opt-in bandwidth floor.
 * Old persisted guard `disabled` state from the 0.43 era is not auto-cleared;
   `reset_disabled_guards` is the manual migration handle (0.47's !4426 made
   new automatic disables practically impossible).
+* Guard readiness recovers after a backoff only when something calls
+  `select_guard` (upstream runs `consider_all_retries` only there);
+  a consumer that waits for `any_guard_usable_for_traffic` before asking for
+  any circuit could wait indefinitely. Not observed in practice (bootstrap and
+  preemptive circuits keep selecting guards); revisit if it shows up.
 * Our 30 s descriptor-fetch total and 45 s channel-build total budgets are
   not mutually reconciled.
 * #2601 / TROVE-2026-027 applicability was never confirmed.

@@ -316,7 +316,7 @@ where
     let mut remaining_counter = None;
     let mut decoder = match header.length {
         Some(clen) => {
-            let tracker = RemainingTracker::new(buffered.take(clen as u64));
+            let tracker = RemainingTracker::new(buffered.take(clen));
             remaining_counter = Some(Arc::clone(&tracker.remaining));
             get_decoder(
                 BufReader::new(tracker),
@@ -439,12 +439,7 @@ where
                     None
                 };
                 // tor-socks5 local patch: parse_content_length
-                let length = response
-                    .headers
-                    .iter()
-                    .find(|h| h.name.eq_ignore_ascii_case("Content-Length"))
-                    .and_then(|h| std::str::from_utf8(h.value).ok())
-                    .and_then(|s| s.trim().parse::<usize>().ok());
+                let length = parse_content_length(response.headers)?;
                 assert!(n_parsed == buf.len());
                 return Ok(HeaderStatus {
                     status: Some(200),
@@ -472,7 +467,30 @@ struct HeaderStatus {
     encoding: Option<String>,
     /// Declared on-wire (compressed) body length, if valid.
     // tor-socks5 local patch: header_length
-    length: Option<usize>,
+    length: Option<u64>,
+}
+
+// tor-socks5 local patch: parse_content_length_strict
+/// Parse the `Content-Length` header: absent is `None`; a malformed value or
+/// conflicting duplicates are an error, never a silently unbounded body.
+fn parse_content_length(headers: &[httparse::Header<'_>]) -> RequestResult<Option<u64>> {
+    let mut length = None;
+    for h in headers
+        .iter()
+        .filter(|h| h.name.eq_ignore_ascii_case("Content-Length"))
+    {
+        let parsed = std::str::from_utf8(h.value)
+            .ok()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or(RequestError::HttparseError(httparse::Error::HeaderValue))?;
+        if length.is_some_and(|prev| prev != parsed) {
+            return Err(RequestError::HttparseError(httparse::Error::HeaderValue));
+        }
+        length = Some(parsed);
+    }
+    Ok(length)
 }
 
 /// Helper: download directory information from `stream` and
