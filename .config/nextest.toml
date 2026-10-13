@@ -32,6 +32,9 @@ retries = 0
 status-level = "all"           # print output of every test
 final-status-level = "all"     # full final summary with output
 
+[profile.flaky-hunt.junit]
+path = "junit.xml"   # relative to target/nextest/flaky-hunt/
+
 # Test groups: cap parallelism for suites with real sockets / paused clocks.
 # Cause of flakes: Windows port reuse, clock pause/resume races, RST instead of FIN.
 [test-groups.sockets-and-clocks]
