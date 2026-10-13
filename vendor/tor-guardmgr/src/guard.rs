@@ -368,6 +368,25 @@ impl Guard {
         self.unlisted_since.is_none() && self.disabled.is_none()
     }
 
+    // tor-socks5 local patch: is_disabled
+    /// Whether persisted security policy disables this guard.
+    pub(crate) fn is_disabled(&self) -> bool {
+        self.disabled.is_some()
+    }
+
+    // tor-socks5 local patch: has_complete_dir_info
+    /// Whether directory information is complete for Data usage.
+    pub(crate) fn has_complete_dir_info(&self) -> bool {
+        !self.dir_info_missing
+    }
+
+    // tor-socks5 local patch: set_dir_info_missing_for_test
+    #[cfg(test)]
+    /// Set missing-directory state for regression tests.
+    pub(crate) fn set_dir_info_missing_for_test(&mut self, missing: bool) {
+        self.dir_info_missing = missing;
+    }
+
     /// Return true if this guard is ready (with respect to any timeouts) for
     /// the given `usage` at `now`.
     pub(crate) fn ready_for_usage(&self, usage: &GuardUsage, now: Instant) -> bool {
@@ -804,6 +823,19 @@ impl Guard {
         }
     }
 
+    // tor-socks5 local patch: persisted-disabled recovery
+    /// Manually recover persisted disabled state; healthy guards are unchanged.
+    pub(crate) fn reset_disabled(&mut self) -> bool {
+        if self.disabled.take().is_some() {
+            self.circ_history = CircHistory::default();
+            self.suspicious_behavior_warned = false;
+            info!(guard=?self.id, "Re-enabling previously disabled guard (manual reset of indeterminate-failure history).");
+            true
+        } else {
+            false
+        }
+    }
+
     /// Return a [`FirstHop`](crate::FirstHop) object to represent this guard.
     pub(crate) fn get_external_rep(&self, selection: GuardSetSelector) -> crate::FirstHop {
         crate::FirstHop {
@@ -989,6 +1021,49 @@ mod test {
         let ports = vec!["127.0.0.7:7777".parse().unwrap()];
         let added = SystemTime::get();
         Guard::new(id, ports, None, added)
+    }
+
+    // tor-socks5 local patch: has_complete_dir_info_accessor
+    #[test]
+    fn has_complete_dir_info_accessor() {
+        let mut g = basic_guard();
+        assert!(g.usable());
+        // A freshly-created guard has no missing directory information.
+        assert!(g.has_complete_dir_info());
+        // Simulate the guard-exhaustion case: the guard is listed, but we lack
+        // its microdescriptor.
+        g.dir_info_missing = true;
+        assert!(!g.has_complete_dir_info());
+        g.dir_info_missing = false;
+        assert!(g.has_complete_dir_info());
+    }
+
+    // tor-socks5 local patch: persisted-disabled migration regression
+    #[test]
+    fn reset_disabled_persisted_state() {
+        let mut g = basic_guard();
+        g.record_indeterminate_result();
+        assert!(!g.reset_disabled());
+        assert_eq!(g.circ_history.n_indeterminate, 1);
+        let mut state = serde_json::to_value(&g).unwrap();
+        state["disabled"] = serde_json::json!({
+            "type": "TooManyIndeterminateFailures",
+            "history": {"n_successes": 1, "n_failures": 0, "n_indeterminate": 14},
+            "failure_ratio": 0.933, "threshold_ratio": 0.7
+        });
+        let mut g: Guard = serde_json::from_value(state).unwrap();
+        g.record_indeterminate_result();
+        g.suspicious_behavior_warned = true;
+        g.record_failure(Instant::get(), true);
+        let retry = g.retry_at;
+        assert!(g.is_disabled());
+        assert!(!g.usable());
+        assert!(g.reset_disabled());
+        assert!(!g.is_disabled());
+        assert_eq!(g.circ_history.n_indeterminate, 0);
+        assert!(!g.suspicious_behavior_warned);
+        assert_eq!(g.retry_at, retry);
+        assert!(!g.reset_disabled());
     }
 
     #[test]
