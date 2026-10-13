@@ -4,7 +4,7 @@
 по `cargo metadata` и статическому подсчёту тестов (без тяжёлых прогонов).
 
 Реализация: хук [`.githooks/pre-push`](../../.githooks/pre-push),
-выбор пакетов [`scripts/test-affected.sh`](../../scripts/test-affected.sh),
+выбор пакетов [`scripts/testing/test-affected.sh`](../../scripts/testing/test-affected.sh),
 профили nextest [`.config/nextest.toml`](../../.config/nextest.toml),
 CI [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml),
 ночной контур `.github/workflows/nightly.yml` (T3), пользовательская документация
@@ -66,7 +66,7 @@ CI [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml),
 | Уровень | Что запускается | Когда |
 |---|---|---|
 | **T0** | `fmt --all --check`; `clippy` затронутых пакетов; `check-line-limit`, `check-dir-entries`, `check-publish-guard` | всегда (дёшево) |
-| **T1** | T0 + тесты и doctests **затронутых пакетов и их обратных зависимостей** (`scripts/test-affected.sh`) | pre-push по умолчанию; PR и ветки в CI |
+| **T1** | T0 + тесты и doctests **затронутых пакетов и их обратных зависимостей** (`scripts/testing/test-affected.sh`) | pre-push по умолчанию; PR и ветки в CI |
 | **T2** | полный `cargo nextest run --workspace` + doctests + clippy workspace, все ОС | push в `main`/`upstream-*`, теги, `FULL=1`, `workflow_dispatch` |
 | **T3** | ночной: T2 + повторы нестабильных наборов (профиль `flaky-hunt`) + тесты невходящих в members vendor-крейтов + `cargo hack` по фичам выбранных крейтов + отчёт | `schedule` раз в сутки |
 

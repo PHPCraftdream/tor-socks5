@@ -1,5 +1,5 @@
 #!/bin/sh
-# Selftest for scripts/test-affected.sh. Run from the repo root.
+# Selftest for scripts/testing/test-affected.sh. Run from the repo root.
 # No cargo build/test/clippy is performed: only --files-from selection is exercised.
 set -u
 
@@ -7,7 +7,7 @@ repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || {
 	echo "test-affected-selftest: must run inside the repository" >&2
 	exit 1
 }
-target="$repo_root/scripts/test-affected.sh"
+target="$repo_root/scripts/testing/test-affected.sh"
 [ -f "$target" ] || { echo "test-affected-selftest: $target not found" >&2; exit 1; }
 
 export CARGO_BUILD_JOBS=2
@@ -108,8 +108,8 @@ run_case "docs/plans/x.md -> empty" \
 	""
 
 # 10. script itself -> FULL
-run_case "scripts/test-affected.sh -> FULL" \
-	"scripts/test-affected.sh" \
+run_case "scripts/testing/test-affected.sh -> FULL" \
+	"scripts/testing/test-affected.sh" \
 	"FULL"
 
 # 11. empty file list -> empty

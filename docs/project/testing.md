@@ -10,7 +10,7 @@ specification, decisions and data live in
 | Tier | What runs | When | Rough cost |
 |---|---|---|---|
 | **T0** | `cargo fmt --all -- --check`; `check-line-limit.sh`, `check-dir-entries.sh`, `check-publish-guard.sh`; packageability, MSRV, Android (CI only) | always, on every hook run and CI run | seconds |
-| **T1** | T0 + tests, doctests and clippy of **affected packages and their reverse dependencies** (`scripts/test-affected.sh`) | pre-push by default; PRs in CI (ubuntu + windows) | ~1 package: well under a minute after build |
+| **T1** | T0 + tests, doctests and clippy of **affected packages and their reverse dependencies** (`scripts/testing/test-affected.sh`) | pre-push by default; PRs in CI (ubuntu + windows) | ~1 package: well under a minute after build |
 | **T2** | full `cargo nextest run --workspace` (profile `ci`) + `cargo test --doc --workspace` + clippy `--workspace`, on all three OS | push to `main`, tags, `upstream-*`, `FULL=1`, `workflow_dispatch` with `full=true` | minutes on CI |
 | **T3** | T2 + flaky-hunt profile repeats + tests of the vendor crates that are **not** workspace members (`tor-chanmgr`, `tor-dirmgr`, `tor-dirclient`) + per-feature runs + a report | nightly schedule, see `.github/workflows/nightly.yml` | long; unattended |
 
@@ -24,7 +24,7 @@ git config core.hooksPath .githooks
 
 The hook (`.githooks/pre-push`) always runs fmt, then:
 
-- **T1 (default)** — asks `scripts/test-affected.sh` for the affected packages and runs
+- **T1 (default)** — asks `scripts/testing/test-affected.sh` for the affected packages and runs
   clippy + tests + doctests for them only.
 - **T2 (`FULL=1`)** — full workspace run. Also forced when pushing `main`,
   `upstream-*` or tags, or when the package selection fails (fail-safe: never
@@ -42,14 +42,14 @@ FULL=1 git push                # force the full T2 run
 
 ## Selecting affected packages
 
-`scripts/test-affected.sh` computes what to test:
+`scripts/testing/test-affected.sh` computes what to test:
 
 ```bash
-scripts/test-affected.sh --base origin/main                 # list affected packages
-scripts/test-affected.sh --mode args                        # print "-p a -p b ..."
-scripts/test-affected.sh --mode run --kind all              # test + doctests + clippy
-scripts/test-affected.sh --mode run --kind test             # tests only
-scripts/test-affected.sh --full                             # force T2
+scripts/testing/test-affected.sh --base origin/main                 # list affected packages
+scripts/testing/test-affected.sh --mode args                        # print "-p a -p b ..."
+scripts/testing/test-affected.sh --mode run --kind all              # test + doctests + clippy
+scripts/testing/test-affected.sh --mode run --kind test             # tests only
+scripts/testing/test-affected.sh --full                             # force T2
 ```
 
 Selection rules:
@@ -64,7 +64,7 @@ Selection rules:
    `docs/architecture.md` and `docs/guide/**` → `socks5-proxy`;
    `packages/proxy-config/examples/**` → `tor-socks5-config`.
 4. **Always FULL (T2):** root/member `Cargo.toml` or `Cargo.lock`, `rust-toolchain*`,
-   `.cargo/**`, `.config/**`, `scripts/test-affected.sh`, `scripts/tests/**`, and
+   `.cargo/**`, `.config/**`, `scripts/testing/test-affected.sh`, `scripts/testing/**`, and
    `vendor/**` crates that are not workspace members — one dependency/feature graph
    means such edits can break unrelated packages.
 5. `docs/**` not listed above, `.github/**`, `.githooks/**`, other `scripts/**`:
@@ -83,7 +83,7 @@ cargo test --doc -p tor-socks5-config
 
 `.github/workflows/ci.yml` mirrors the tiers:
 
-- **plan** — runs `scripts/test-affected.sh` (against the PR base sha) and publishes
+- **plan** — runs `scripts/testing/test-affected.sh` (against the PR base sha) and publishes
   the chosen tier and package list to the job summary; selection failure forces T2.
 - **fmt / clippy / test** — T1 jobs on PRs (ubuntu + windows, affected packages only),
   T2 jobs (ubuntu + macOS + windows, `--workspace`, profile `ci`) on pushes to `main`

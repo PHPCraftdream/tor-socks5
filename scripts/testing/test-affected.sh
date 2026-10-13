@@ -3,7 +3,7 @@
 # (transitively) their reverse dependencies, per docs/plans/test-tiers.md.
 #
 # Usage:
-#   scripts/test-affected.sh [--base <ref>] [--files-from <file|->]
+#   scripts/testing/test-affected.sh [--base <ref>] [--files-from <file|->]
 #                            [--mode list|args|run] [--kind test|clippy|all]
 #                            [--full]
 #
@@ -189,8 +189,8 @@ for f in $files; do
 		__GIT_FAILED__) mark_full "git diff failed (fail-safe)"; continue ;;
 		Cargo.toml|Cargo.lock|*/Cargo.toml|*/Cargo.lock) mark_full "$f"; continue ;;
 		rust-toolchain|rust-toolchain*) mark_full "$f"; continue ;;
-		.cargo/*|.config/*|scripts/tests/*) mark_full "$f"; continue ;;
-		scripts/test-affected.sh) mark_full "$f"; continue ;;
+		.cargo/*|.config/*|scripts/testing/*) mark_full "$f"; continue ;;
+		scripts/testing/test-affected.sh) mark_full "$f"; continue ;;
 		vendor/*)
 			rest=${f#vendor/}
 			vdir=${rest%%/*}

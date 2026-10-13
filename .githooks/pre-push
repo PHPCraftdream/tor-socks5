@@ -6,14 +6,14 @@
 #
 # Tiers:
 #   T1 (default)  fmt + clippy/tests of affected packages only
-#                 (scripts/test-affected.sh)
+#                 (scripts/testing/test-affected.sh)
 #   T2 (FULL)     fmt + clippy --workspace + full nextest/cargo test + doctests
 #
 # FULL is forced when:
 #   - FULL=1 is set in the environment, or
 #   - pushing refs/heads/main, refs/heads/upstream-*, or refs/tags/*, or
 #   - the affected-package selection fails (fail-safe), or
-#   - scripts/test-affected.sh itself reports FULL.
+#   - scripts/testing/test-affected.sh itself reports FULL.
 #
 # TEST_AFFECTED_DRY=1 prints the commands instead of running them.
 #
@@ -107,7 +107,7 @@ if [ -n "$base_remote_sha" ]; then
 	fi
 fi
 
-plan=$(sh scripts/test-affected.sh --mode list $base_args) && plan_rc=0 || plan_rc=$?
+plan=$(sh scripts/testing/test-affected.sh --mode list $base_args) && plan_rc=0 || plan_rc=$?
 if [ "$plan_rc" -ne 0 ]; then
 	echo "pre-push: WARNING: package selection failed (rc=$plan_rc), falling back to FULL (T2)" >&2
 	echo "pre-push: tier T2 (FULL): selection failure fail-safe; all workspace packages"
@@ -143,7 +143,7 @@ pargs=${pargs# }
 
 echo "pre-push: tier T1 (affected):$pargs"
 run_cmd cargo clippy $pargs --all-targets --locked -- -D warnings
-run_cmd sh scripts/test-affected.sh $base_args --mode run --kind all
+run_cmd sh scripts/testing/test-affected.sh $base_args --mode run --kind all
 
 echo "pre-push: OK (T1)"
 

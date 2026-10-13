@@ -435,7 +435,7 @@ packages/bridge-probe/    parallel TCP reachability probing + latency sort
 
 ## Security
 
-See [SECURITY.md](SECURITY.md) for vulnerability reporting.
+See [SECURITY.md](.github/SECURITY.md) for vulnerability reporting.
 
 ## License
 

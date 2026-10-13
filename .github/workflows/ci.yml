@@ -3,7 +3,7 @@
 # T0: cheap structural checks that always run (fmt, line-limit, dir-entries,
 #     publish-guard, packageability, msrv, android).
 # T1: affected packages only, on pull requests (computed by
-#     scripts/test-affected.sh --base <pr base sha>).
+#     scripts/testing/test-affected.sh --base <pr base sha>).
 # T2: full workspace run, on push to main and on workflow_dispatch with
 #     full=true.
 # T3: nightly full run — a separate scheduled workflow, deliberately not here.
@@ -93,7 +93,7 @@ jobs:
             fi
             # `|| script_rc=$?` keeps the runner's implicit `bash -e` from aborting
             # the step: a failing script must fall through to FULL below.
-            out=$(sh scripts/test-affected.sh $args --mode args --kind test) || script_rc=$?
+            out=$(sh scripts/testing/test-affected.sh $args --mode args --kind test) || script_rc=$?
           fi
           if [ "$script_rc" != "0" ]; then
             echo "::warning::test-affected.sh failed (rc=$script_rc); forcing FULL"
