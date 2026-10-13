@@ -16,6 +16,9 @@ use safelog::{Sensitive, sensitive};
 use tor_async_utils::{DropNotifyWatchSender, PostageWatchSenderExt};
 use tor_chanmgr::ChanMgrConfig;
 use tor_circmgr::ClientDataTunnel;
+// tor-socks5 local patch: exit-stream retry policy
+mod stream_retry;
+use stream_retry::{retry_exit_stream, retryable_stream_error, snapshot_exit_stream_timeouts};
 use tor_circmgr::isolation::{Isolation, StreamIsolation};
 use tor_circmgr::{IsolationToken, TargetPort, isolation::StreamIsolationBuilder};
 use tor_config::{BoolOrAuto, MutCfg};
@@ -232,6 +235,10 @@ struct NotConstructedInner<R: Runtime> {
 
     /// A (possibly user-provided) set of in-process extensions for our NetDirProvider.
     dirmgr_extensions: tor_dirmgr::config::DirMgrExtensions,
+
+    /// tor-socks5 local patch: optional observability hook invoked
+    /// immediately before Arti's intentional protocol-mismatch shutdown.
+    fatal_protocol_error_handler: Option<Arc<dyn crate::builder::FatalProtocolErrorHandler>>,
 }
 
 /// Data structures for a "running" client.
@@ -1015,6 +1022,8 @@ impl<R: Runtime> TorClient<R> {
         autobootstrap: BootstrapBehavior,
         dirmgr_builder: Arc<dyn crate::builder::DirProviderBuilder<R>>,
         dirmgr_extensions: tor_dirmgr::config::DirMgrExtensions,
+        // tor-socks5 local patch: observability hook for the fatal shutdown.
+        fatal_protocol_error_handler: Option<Arc<dyn crate::builder::FatalProtocolErrorHandler>>,
     ) -> StdResult<Arc<Self>, ErrorDetail> {
         if crate::util::running_as_setuid() {
             return Err(tor_error::bad_api_usage!(
@@ -1072,6 +1081,8 @@ impl<R: Runtime> TorClient<R> {
             bootstrap_setting_receiver,
             dirmgr_builder,
             dirmgr_extensions,
+            // tor-socks5 local patch: forward the observability hook.
+            fatal_protocol_error_handler,
         });
 
         let inner = Mutex::new(Inner::NotConstructed(inner));
@@ -1142,6 +1153,20 @@ impl<R: Runtime> TorClient<R> {
     }
 }
 
+/// Invoke the (optional) fatal-protocol-error hook
+/// with the public [`Error`](crate::Error) view of the fatal shutdown cause.
+// Separated from the inline `on_fatal` closure in [`RunningInner::new`] so the
+// hook-firing logic can be unit-tested without dragging in
+// `std::process::exit`.
+pub(crate) fn notify_fatal_protocol_error(
+    hook: &Option<Arc<dyn crate::builder::FatalProtocolErrorHandler>>,
+    error: &crate::Error,
+) {
+    if let Some(hook) = hook {
+        hook.on_fatal_protocol_error(error);
+    }
+}
+
 impl<R: Runtime> NotConstructedInner<R> {
     /// Replace the configuration for this unconstructed client.
     ///
@@ -1182,6 +1207,8 @@ impl<R: Runtime> RunningInner<R> {
             bootstrap_setting_receiver,
             dirmgr_builder,
             dirmgr_extensions,
+            // tor-socks5 local patch: observability hook for the fatal shutdown.
+            fatal_protocol_error_handler,
         } = pending;
 
         let runtime = client.runtime.clone();
@@ -1290,6 +1317,11 @@ impl<R: Runtime> RunningInner<R> {
         let conn_status = chanmgr.bootstrap_events();
         let dir_status = dirmgr.bootstrap_events();
         let skew_status = circmgr.skew_events();
+        // tor-socks5 local patch: aggregated "guards usable" signal from
+        // tor-guardmgr (true iff at least one usable guard has complete
+        // directory information), used to gate
+        // `BootstrapStatus::ready_for_traffic()`.
+        let guard_status = guardmgr.usable_guard_events();
 
         let rtclone = runtime.clone();
 
@@ -1307,12 +1339,19 @@ impl<R: Runtime> RunningInner<R> {
             // but that will take some work.
             |fatal| async move {
                 use tor_error::ErrorReport as _;
+                // tor-socks5 local patch: give the embedding application a
+                // chance to emit a structured marker (tracing::error!, an
+                // alert, ...) before the intentional, non-negotiable fatal
+                // shutdown, so the event is observable without an external
+                // supervisor. The shutdown itself is NOT altered.
+                let fatal_err = crate::err::Error::from(fatal.clone());
+                notify_fatal_protocol_error(&fatal_protocol_error_handler, &fatal_err);
                 // We already logged this error, but let's tell stderr too.
                 eprintln!(
                     "Shutting down because of unsupported software version.\nError was:\n{}",
                     fatal.report(),
                 );
-                if let Some(hint) = crate::err::Error::from(fatal).hint() {
+                if let Some(hint) = fatal_err.hint() {
                     eprintln!("{}", hint);
                 }
                 // Give the tracing module a while to flush everything, since it has no built-in
@@ -1329,6 +1368,8 @@ impl<R: Runtime> RunningInner<R> {
                 dir_status,
                 skew_status,
                 bootstrap_setting_receiver,
+                // tor-socks5 local patch: guards-usable signal.
+                guard_status,
             ))
             .map_err(|e| ErrorDetail::from_spawn("top-level status reporter", e))?;
 
@@ -1587,6 +1628,10 @@ impl<R: Runtime> TorClient<R> {
         target: A,
         prefs: &StreamPrefs,
     ) -> crate::Result<DataStream> {
+        // tor-socks5 local patch: exit-stream retry — snapshot timeout budgets;
+        // reconfiguration affects future requests, not this request's retry budget.
+        let timeout_cfg = self.client.timeoutcfg.get();
+        let (initial_timeout, ordinary_timeout) = snapshot_exit_stream_timeouts(&timeout_cfg);
         let addr = target.into_tor_addr().map_err(wrap_err)?;
         let mut stream_parameters = prefs.stream_parameters();
         // This macro helps prevent code duplication in the match below.
@@ -1619,15 +1664,45 @@ impl<R: Runtime> TorClient<R> {
                 port,
             } => {
                 let exit_ports = [prefs.wrap_target_port(port)];
-                let tunnel = self
-                    .get_or_launch_exit_tunnel(&exit_ports, prefs)
-                    .await
-                    .map_err(wrap_err)?;
-                debug!(
-                    tunnel_id = %tunnel.unique_id(),
-                    "Got a circuit for {}:{}", sensitive(&addr), port);
-
-                begin_stream!(tunnel, &addr, port, Some(stream_parameters))
+                // tor-socks5 local patch: exit-stream retry — one bounded retry
+                // on a fresh circuit before surfacing the error to the application.
+                retry_exit_stream(
+                    &self.client.runtime,
+                    initial_timeout,
+                    ordinary_timeout,
+                    || {
+                        let addr = addr.clone();
+                        let stream_parameters = stream_parameters.clone();
+                        async move {
+                            let tunnel = self.get_or_launch_exit_tunnel(&exit_ports, prefs).await?;
+                            let id = tunnel.unique_id();
+                            debug!(
+                                tunnel_id = %id,
+                                "Got a circuit for {}:{}",
+                                sensitive(&addr),
+                                port
+                            );
+                            let stream = async move {
+                                tunnel
+                                    .begin_stream(&addr, port, Some(stream_parameters))
+                                    .await
+                                    .map_err(|cause| ErrorDetail::StreamFailed {
+                                        cause,
+                                        kind: "data",
+                                    })
+                            };
+                            Ok((id, stream))
+                        }
+                    },
+                    |id| {
+                        if let Ok(running) =
+                            self.client.running_inner("retire failed stream circuit")
+                        {
+                            running.circmgr.retire_circ(id);
+                        }
+                    },
+                )
+                .await
             }
 
             #[cfg(not(feature = "onion-service-client"))]
@@ -1863,6 +1938,67 @@ impl<R: Runtime> TorClient<R> {
             .running_inner("access internal functionality")?
             .chanmgr
             .clone())
+    }
+
+    /// tor-socks5 local patch: re-enable every guard that the guard manager has
+    /// permanently disabled via its indeterminate-failure path-bias detection,
+    /// returning the number of guards that were re-enabled.
+    ///
+    /// Returns an error if the client is not yet running (dormant / under
+    /// construction); otherwise the count of guards that were disabled and are
+    /// now re-enabled. Guards that were already usable are left untouched.
+    ///
+    /// This function is unstable. It is only enabled if the crate was
+    /// built with the `experimental-api` feature.
+    #[cfg(feature = "experimental-api")]
+    pub fn reset_disabled_guards(&self) -> crate::Result<usize> {
+        let inner = self.client.running_inner("reset disabled guards")?;
+        Ok(inner.guardmgr.reset_disabled_guards())
+    }
+
+    /// tor-socks5 local patch: record that, _after_ a circuit was built through
+    /// a guard, some activity outside of `tor-guardmgr`'s own circuit-build
+    /// bookkeeping (identified by `identity`) failed in a way described by
+    /// `activity`.
+    ///
+    /// This exposes `tor_guardmgr::GuardMgr::note_external_failure()`, which
+    /// feeds directly into the same primary/confirmed/sample guard-state
+    /// machine (prop271) that circuit-build failures use.
+    ///
+    /// Returns an error if the client is not yet running (dormant / under
+    /// construction).
+    ///
+    /// This function is unstable. It is only enabled if the crate was
+    /// built with the `experimental-api` feature.
+    #[cfg(feature = "experimental-api")]
+    pub fn note_external_guard_failure<T>(
+        &self,
+        identity: &T,
+        activity: tor_guardmgr::ExternalActivity,
+    ) -> crate::Result<()>
+    where
+        T: tor_linkspec::HasRelayIds + ?Sized,
+    {
+        let inner = self.client.running_inner("note external guard failure")?;
+        inner.guardmgr.note_external_failure(identity, activity);
+        Ok(())
+    }
+
+    /// tor-socks5 local patch: whether guard security policy has disabled this
+    /// relay identity.
+    ///
+    /// Returns an error if the client is not yet running (dormant / under
+    /// construction).
+    ///
+    /// This function is unstable. It is only enabled if the crate was
+    /// built with the `experimental-api` feature.
+    #[cfg(feature = "experimental-api")]
+    pub fn guard_is_disabled<T: tor_linkspec::HasRelayIds + ?Sized>(
+        &self,
+        identity: &T,
+    ) -> crate::Result<bool> {
+        let inner = self.client.running_inner("query guard policy")?;
+        Ok(inner.guardmgr.guard_is_disabled(identity))
     }
 
     /// Return a reference to this client's circuit pool.
@@ -2649,6 +2785,83 @@ mod test {
     use super::*;
     use crate::config::TorClientConfigBuilder;
     use crate::{ErrorKind, HasKind};
+
+    // tor-socks5 local patch: contract tests for the fatal-protocol-error
+    // observability hook. A behavioral test that drives the full
+    // `on_fatal` closure would invoke `std::process::exit(1)` and is therefore
+    // impossible to run in-process; instead we unit-test the extracted seam
+    // (`notify_fatal_protocol_error`) that the closure calls immediately before
+    // exiting. The end-to-end wiring (builder -> NotConstructedInner ->
+    // RunningInner::new -> closure) is exercised by `cargo build`/`cargo test`.
+
+    #[test]
+    fn fatal_protocol_error_hook_none_is_noop() {
+        // With no hook installed, firing the seam must simply do nothing
+        // (Arti's default `eprintln!`-only behaviour is unchanged).
+        let hook: Option<Arc<dyn crate::FatalProtocolErrorHandler>> = None;
+        let err = crate::Error::from(crate::err::ErrorDetail::ExitTimeout);
+        notify_fatal_protocol_error(&hook, &err);
+    }
+
+    #[test]
+    fn fatal_protocol_error_hook_is_invoked_with_error() {
+        // With a hook installed, firing the seam must invoke it exactly once
+        // with the public `Error` view of the fatal cause, *before* the
+        // process would exit.
+        let recorded = Arc::new(Mutex::new(None::<ErrorKind>));
+        let recorded_inner = Arc::clone(&recorded);
+        let hook: Arc<dyn crate::FatalProtocolErrorHandler> =
+            Arc::new(move |error: &crate::Error| {
+                *recorded_inner.lock().unwrap() = Some(error.kind());
+            });
+        let err = crate::Error::from(crate::err::ErrorDetail::ExitTimeout);
+        notify_fatal_protocol_error(&Some(hook), &err);
+        assert_eq!(
+            *recorded.lock().unwrap(),
+            Some(ErrorKind::RemoteNetworkTimeout)
+        );
+    }
+
+    // tor-socks5 local patch: contract tests for the guard-manager passthrough
+    // methods (`note_external_guard_failure`, `guard_is_disabled`,
+    // `reset_disabled_guards`). Driving the full success path would require a
+    // bootstrapped client with an actual guard sample, which needs network
+    // access; instead we check the same "not running yet" contract that
+    // `unbootstrapped_client_unusable` already checks for other accessors
+    // (`connect`, etc.), which is the behavior any embedding application can
+    // rely on regardless of network conditions.
+
+    #[cfg(feature = "experimental-api")]
+    #[test]
+    fn guard_passthrough_methods_require_running_client() {
+        tor_rtcompat::test_with_one_runtime!(|rt| async {
+            let state_dir = tempfile::tempdir().unwrap();
+            let cache_dir = tempfile::tempdir().unwrap();
+            let cfg = TorClientConfigBuilder::from_directories(state_dir, cache_dir)
+                .build()
+                .unwrap();
+            let client = TorClient::with_runtime(rt)
+                .config(cfg)
+                .bootstrap_behavior(BootstrapBehavior::Manual)
+                .create_unbootstrapped()
+                .unwrap();
+
+            let identity = tor_linkspec::RelayIds::empty();
+
+            let result = client
+                .note_external_guard_failure(&identity, tor_guardmgr::ExternalActivity::DirCache);
+            assert!(result.is_err());
+            assert_eq!(result.err().unwrap().kind(), ErrorKind::BootstrapRequired);
+
+            let result = client.guard_is_disabled(&identity);
+            assert!(result.is_err());
+            assert_eq!(result.err().unwrap().kind(), ErrorKind::BootstrapRequired);
+
+            let result = client.reset_disabled_guards();
+            assert!(result.is_err());
+            assert_eq!(result.err().unwrap().kind(), ErrorKind::BootstrapRequired);
+        });
+    }
 
     #[test]
     fn create_unbootstrapped() {

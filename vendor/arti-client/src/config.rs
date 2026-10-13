@@ -147,6 +147,13 @@ pub struct StreamTimeoutConfig {
     #[deftly(tor_config(default = "default_connect_timeout()"))]
     pub(crate) connect_timeout: Duration,
 
+    // tor-socks5 local patch: initial_connect_timeout
+    /// Optional timeout for the first exit stream-open attempt. When set,
+    /// only the initial attempt made by the exit-stream retry policy uses
+    /// this budget; its one retry uses `connect_timeout`.
+    #[deftly(tor_config(no_magic, setter(skip), build = "Self::build_initial_connect_timeout"))]
+    pub(crate) initial_connect_timeout: Option<Duration>,
+
     /// How long should we wait before timing out when resolving a DNS record?
     #[deftly(tor_config(default = "default_dns_resolve_timeout()"))]
     pub(crate) resolve_timeout: Duration,
@@ -160,6 +167,32 @@ pub struct StreamTimeoutConfig {
 /// Return the default stream timeout
 fn default_connect_timeout() -> Duration {
     Duration::new(10, 0)
+}
+
+// tor-socks5 local patch: initial_connect_timeout builder + getters
+impl StreamTimeoutConfigBuilder {
+    /// Set or clear the optional fast first-attempt timeout.
+    pub fn initial_connect_timeout(&mut self, timeout: Option<Duration>) -> &mut Self {
+        self.initial_connect_timeout = Some(timeout);
+        self
+    }
+
+    /// Flatten the specialized builder's optional slot.
+    fn build_initial_connect_timeout(&self) -> Option<Duration> {
+        self.initial_connect_timeout.flatten()
+    }
+}
+
+impl StreamTimeoutConfig {
+    /// Return the optional timeout used for the first exit CONNECT attempt.
+    pub fn initial_connect_timeout(&self) -> Option<Duration> {
+        self.initial_connect_timeout
+    }
+
+    /// Return the ordinary timeout used for stream opens and retries.
+    pub fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
 }
 
 /// Return the default resolve timeout
@@ -769,6 +802,12 @@ impl TorClientConfig {
         self.storage.keystore()
     }
 
+    // tor-socks5 local patch: initial_connect_timeout accessor
+    /// Return stream-open timeout settings.
+    pub fn stream_timeouts(&self) -> &StreamTimeoutConfig {
+        &self.stream_timeouts
+    }
+
     /// Get the state directory and its corresponding
     /// [`Mistrust`] configuration.
     pub(crate) fn state_dir(&self) -> StdResult<(PathBuf, &fs_mistrust::Mistrust), ErrorDetail> {
@@ -870,6 +909,41 @@ mod test {
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
     use super::*;
+
+    #[test]
+    fn stream_timeout_builder_preserves_optional_initial_connect_budget() {
+        // tor-socks5 local patch: initial_connect_timeout
+        let timeout = std::time::Duration::from_secs(4);
+        let mut builder = TorClientConfig::builder();
+        builder
+            .stream_timeouts()
+            .initial_connect_timeout(Some(timeout));
+        let config = builder.build().unwrap();
+        assert_eq!(
+            config.stream_timeouts.initial_connect_timeout,
+            Some(timeout)
+        );
+        assert_eq!(
+            config.stream_timeouts.connect_timeout,
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(
+            TorClientConfig::default()
+                .stream_timeouts
+                .initial_connect_timeout,
+            None
+        );
+        assert_eq!(
+            TorClientConfig::default().stream_timeouts.resolve_timeout,
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(
+            TorClientConfig::default()
+                .stream_timeouts
+                .resolve_ptr_timeout,
+            std::time::Duration::from_secs(10)
+        );
+    }
 
     #[test]
     fn defaults() {

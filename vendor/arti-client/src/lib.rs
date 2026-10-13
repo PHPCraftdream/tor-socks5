@@ -63,7 +63,12 @@ pub mod config;
 pub mod status;
 
 pub use address::{DangerouslyIntoTorAddr, IntoTorAddr, TorAddr, TorAddrError};
-pub use builder::{MAX_LOCAL_RESOURCE_TIMEOUT, TorClientBuilder};
+pub use builder::{
+    // tor-socks5 local patch: FatalProtocolErrorHandler.
+    FatalProtocolErrorHandler,
+    MAX_LOCAL_RESOURCE_TIMEOUT,
+    TorClientBuilder,
+};
 pub use client::{BootstrapBehavior, DormantMode, InertTorClient, StreamPrefs, TorClient};
 pub use config::TorClientConfig;
 
@@ -92,6 +97,13 @@ pub use {
 
 #[cfg(feature = "geoip")]
 pub use tor_geoip::CountryCode;
+
+// tor-socks5 local patch: re-export the types needed to call
+// `TorClient::note_external_guard_failure()` so that callers don't have to
+// depend on `tor-guardmgr`/`tor-linkspec` directly or spell out the full path
+// names `ExternalActivity` and `HasRelayIds` at the call site.
+pub use tor_guardmgr::ExternalActivity;
+pub use tor_linkspec::HasRelayIds;
 
 /// Return a list of the protocols [supported](tor_protover::doc_supported) by this crate.
 ///

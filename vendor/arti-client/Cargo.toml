@@ -467,6 +467,8 @@ features = [
     "net",
     "time",
     "macros",
+    # tor-socks5 local patch: needed for start_paused in retry tests
+    "test-util",
 ]
 package = "tokio"
 
