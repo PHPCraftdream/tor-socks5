@@ -1,7 +1,14 @@
 # План: уровни тестирования — по задаче только связанное, полный прогон реже
 
-Статус: **дизайн** (задача TST-01). Реализация — TST-02 … TST-08. Данные получены
+Статус: **реализовано** (план TST-01, реализация TST-02 … TST-08). Данные получены
 по `cargo metadata` и статическому подсчёту тестов (без тяжёлых прогонов).
+
+Реализация: хук [`.githooks/pre-push`](../../.githooks/pre-push),
+выбор пакетов [`scripts/test-affected.sh`](../../scripts/test-affected.sh),
+профили nextest [`.config/nextest.toml`](../../.config/nextest.toml),
+CI [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml),
+ночной контур `.github/workflows/nightly.yml` (T3), пользовательская документация
+[`docs/project/testing.md`](../project/testing.md).
 
 ## Проблема
 

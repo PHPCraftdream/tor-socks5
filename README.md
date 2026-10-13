@@ -416,6 +416,12 @@ A git pre-push hook running the same checks lives in [`.githooks/`](.githooks/).
 git config core.hooksPath .githooks
 ```
 
+### Testing
+
+Tests are tiered: cheap structural checks always run, the pre-push hook and CI test
+only the packages affected by a change (plus their reverse dependencies), and the full
+workspace runs on `main`, tags and nightly. See [docs/project/testing.md](docs/project/testing.md).
+
 ### Layout
 
 ```
