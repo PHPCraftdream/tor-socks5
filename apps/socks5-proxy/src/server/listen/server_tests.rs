@@ -505,6 +505,19 @@ async fn wait_for_permit_taken(permits: &Arc<tokio::sync::Semaphore>) {
     );
 }
 
+/// Awaits real socket I/O without letting the paused clock auto-advance:
+/// parking on a not-yet-signalled socket would jump the clock to the next
+/// timer and fire a server deadline before the peer's bytes arrive.
+async fn without_auto_advance<F: std::future::Future>(fut: F) -> F::Output {
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        tokio::select! {
+            r = &mut fut => return r,
+            _ = tokio::task::yield_now() => {}
+        }
+    }
+}
+
 // -- upstream setup deadline ----------------------------------------------
 
 #[tokio::test(start_paused = true)]
@@ -515,6 +528,7 @@ async fn upstream_setup_stall_releases_permit_at_deadline() {
     // forever before any CONNECT reply.
     let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream_listener.local_addr().unwrap().to_string();
+    let (stalled_tx, stalled_rx) = tokio::sync::oneshot::channel::<()>();
     let upstream = tokio::spawn(async move {
         let (mut s, _) = upstream_listener.accept().await.unwrap();
         let mut head = [0u8; 2];
@@ -522,6 +536,7 @@ async fn upstream_setup_stall_releases_permit_at_deadline() {
         let mut methods = vec![0u8; head[1] as usize];
         s.read_exact(&mut methods).await.unwrap();
         s.write_all(&[0x05, 0x00]).await.unwrap();
+        stalled_tx.send(()).ok();
         std::future::pending::<()>().await;
     });
 
@@ -532,7 +547,9 @@ async fn upstream_setup_stall_releases_permit_at_deadline() {
     let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
     client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
     let mut sel = [0u8; 2];
-    client.read_exact(&mut sel).await.unwrap();
+    without_auto_advance(client.read_exact(&mut sel))
+        .await
+        .unwrap();
     assert_eq!(sel, [0x05, 0x00]);
     // CONNECT 93.184.216.34:443 (example.com, IP literal — no DNS).
     client
@@ -540,6 +557,10 @@ async fn upstream_setup_stall_releases_permit_at_deadline() {
         .await
         .unwrap();
 
+    // The dial (and its setup deadline) has started only once the upstream
+    // has seen the greeting; jumping the clock earlier would arm the
+    // deadline after the jump.
+    without_auto_advance(stalled_rx).await.unwrap();
     wait_for_permit_taken(&permits).await;
     assert_eq!(
         permits.available_permits(),
