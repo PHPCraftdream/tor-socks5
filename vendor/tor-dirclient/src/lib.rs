@@ -312,11 +312,34 @@ where
         ));
     }
 
-    let mut decoder =
-        get_decoder(buffered, header.encoding.as_deref(), anonymized).map_err(wrap_err)?;
+    // tor-socks5 local patch: bounded_body
+    let mut remaining_counter = None;
+    let mut decoder = match header.length {
+        Some(clen) => {
+            let tracker = RemainingTracker::new(buffered.take(clen as u64));
+            remaining_counter = Some(Arc::clone(&tracker.remaining));
+            get_decoder(
+                BufReader::new(tracker),
+                header.encoding.as_deref(),
+                anonymized,
+            )
+            .map_err(wrap_err)?
+        }
+        None => get_decoder(buffered, header.encoding.as_deref(), anonymized).map_err(wrap_err)?,
+    };
 
     let mut result = Vec::new();
-    let ok = read_and_decompress(runtime, &mut decoder, maxlen, &mut result).await;
+    let mut ok = read_and_decompress(runtime, &mut decoder, maxlen, &mut result).await;
+
+    // tor-socks5 local patch: check_wire_remainder
+    if ok.is_ok() {
+        if let Some(remaining) = remaining_counter {
+            let remaining = remaining.load(std::sync::atomic::Ordering::Acquire);
+            if remaining > 0 {
+                ok = Err(RequestError::TruncatedBody(remaining));
+            }
+        }
+    }
 
     let ok = match (partial_ok, ok, result.len()) {
         (true, Err(e), n) if n > 0 => {
@@ -402,6 +425,8 @@ where
                         status: response.code,
                         status_message: response.reason.map(str::to_owned),
                         encoding: None,
+                        // tor-socks5 local patch: non_success_length
+                        length: None,
                     });
                 }
                 let encoding = if let Some(enc) = response
@@ -413,17 +438,20 @@ where
                 } else {
                     None
                 };
-                /*
-                if let Some(clen) = response.headers.iter().find(|h| h.name == "Content-Length") {
-                    let clen = std::str::from_utf8(clen.value)?;
-                    length = Some(clen.parse()?);
-                }
-                 */
+                // tor-socks5 local patch: parse_content_length
+                let length = response
+                    .headers
+                    .iter()
+                    .find(|h| h.name.eq_ignore_ascii_case("Content-Length"))
+                    .and_then(|h| std::str::from_utf8(h.value).ok())
+                    .and_then(|s| s.trim().parse::<usize>().ok());
                 assert!(n_parsed == buf.len());
                 return Ok(HeaderStatus {
                     status: Some(200),
                     status_message: None,
                     encoding,
+                    // tor-socks5 local patch: success_length
+                    length,
                 });
             }
         }
@@ -442,6 +470,9 @@ struct HeaderStatus {
     status_message: Option<String>,
     /// The Content-Encoding header, if any.
     encoding: Option<String>,
+    /// Declared on-wire (compressed) body length, if valid.
+    // tor-socks5 local patch: header_length
+    length: Option<usize>,
 }
 
 /// Helper: download directory information from `stream` and
@@ -464,17 +495,18 @@ where
 {
     let buffer_window_size = 1024;
     let mut written_total: usize = 0;
-    // TODO(nickm): This should be an option, and is maybe too long.
-    // Though for some users it may be too short?
-    let read_timeout = Duration::from_secs(10);
-    let timer = runtime.sleep(read_timeout).fuse();
-    futures::pin_mut!(timer);
+    // tor-socks5 local patch: body_idle_timeout
+    let idle_timeout = Duration::from_secs(90);
 
     loop {
         // allocate buffer for next read
         result.resize(written_total + buffer_window_size, 0);
         let buf: &mut [u8] = &mut result[written_total..written_total + buffer_window_size];
 
+        // tor-socks5 local patch: reset_body_idle
+        // Cancellation ends this response; never resume a timed-out decoder.
+        let timer = runtime.sleep(idle_timeout).fuse();
+        futures::pin_mut!(timer);
         let status = futures::select! {
             status = stream.read(buf).fuse() => status,
             _ = timer => {
@@ -528,6 +560,41 @@ where
         &id, &error
     );
     circ_mgr.retire_circ(id);
+}
+
+/// Tracks the remaining wire bytes across a boxed decoder.
+// tor-socks5 local patch: remaining_tracker
+struct RemainingTracker<S> {
+    /// Length-bounded reader.
+    inner: futures::io::Take<S>,
+    /// Shared snapshot; Arc keeps the download future Send.
+    remaining: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl<S: AsyncRead + Unpin> RemainingTracker<S> {
+    /// Initialize the snapshot from the reader's limit.
+    // tor-socks5 local patch: remaining_tracker_new
+    fn new(inner: futures::io::Take<S>) -> Self {
+        let remaining = Arc::new(std::sync::atomic::AtomicU64::new(inner.limit()));
+        Self { inner, remaining }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for RemainingTracker<S> {
+    // tor-socks5 local patch: remaining_tracker_read
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let poll = std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(_)) = &poll {
+            this.remaining
+                .store(this.inner.limit(), std::sync::atomic::Ordering::Release);
+        }
+        poll
+    }
 }
 
 /// Memory limit of the LZMA dictionary we are willing to allocate.
@@ -589,6 +656,10 @@ fn get_decoder<'a, S: AsyncBufRead + Unpin + Send + 'a>(
         (Some(other), _) => Err(RequestError::ContentEncoding(other.into())),
     }
 }
+
+#[cfg(test)]
+// tor-socks5 local patch: regression_module
+mod local_test;
 
 #[cfg(test)]
 mod test {
@@ -771,7 +842,8 @@ mod test {
     ///
     /// Return the directory response (if any) and the request as encoded (if
     /// any.)
-    fn run_download_test<Req: request::Requestable>(
+    // tor-socks5 local patch: share_download_test_fixture
+    pub(super) fn run_download_test<Req: request::Requestable>(
         req: Req,
         response: &[u8],
     ) -> (Result<DirResponse>, RequestResult<Vec<u8>>) {

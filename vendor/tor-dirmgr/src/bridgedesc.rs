@@ -140,8 +140,10 @@ impl Default for BridgeDescDownloadConfig {
     fn default() -> Self {
         let secs = Duration::from_secs;
         BridgeDescDownloadConfig {
-            parallelism: 4.try_into().expect("parallelism is zero"),
-            retry: secs(30),
+            // tor-socks5 local patch: bridge_download_parallelism
+            parallelism: 12.try_into().expect("parallelism is zero"),
+            // tor-socks5 local patch: bridge_initial_retry
+            retry: secs(5),
             prefetch: secs(1000),
             min_refetch: secs(3600),
             max_refetch: secs(3600 * 3), // matches C Tor behaviour
@@ -203,25 +205,108 @@ impl<R: Runtime> mockable::MockableAPI<R> for () {
         bridge: &BridgeConfig,
         _if_modified_since: Option<SystemTime>,
     ) -> Result<Option<String>, Error> {
-        // TODO actually support _if_modified_since
-        let tunnel = circmgr.get_or_launch_dir_specific(bridge).await?;
-        let mut stream = tunnel
-            .begin_dir_stream()
-            .await
-            .map_err(Error::StreamFailed)?;
-        let request = tor_dirclient::request::RoutersOwnDescRequest::new();
-        let response = tor_dirclient::send_request(runtime, &request, &mut stream, None)
-            .await
-            .map_err(|dce| match dce {
-                tor_dirclient::Error::RequestFailed(re) => Error::RequestFailed(re),
-                _ => internal!(
-                    "tor_dirclient::send_request gave non-RequestFailed {:?}",
-                    dce
-                )
-                .into(),
-            })?;
-        let output = response.into_output_string()?;
-        Ok(Some(output))
+        // tor-socks5 local patch: bridge_download_hard_timeout
+        // Cancellation abandons this attempt and its stream, not directory state.
+        let fetch = async {
+            // TODO actually support _if_modified_since
+            let tunnel = circmgr.get_or_launch_dir_specific(bridge).await?;
+            let mut stream = tunnel
+                .begin_dir_stream()
+                .await
+                .map_err(Error::StreamFailed)?;
+            let request = tor_dirclient::request::RoutersOwnDescRequest::new();
+            let response = tor_dirclient::send_request(runtime, &request, &mut stream, None)
+                .await
+                .map_err(|dce| match dce {
+                    tor_dirclient::Error::RequestFailed(re) => Error::RequestFailed(re),
+                    _ => internal!(
+                        "tor_dirclient::send_request gave non-RequestFailed {:?}",
+                        dce
+                    )
+                    .into(),
+                })?;
+            let output = response.into_output_string()?;
+            Ok::<Option<String>, Error>(Some(output))
+        };
+        bridge_download_with_timeout(runtime, fetch).await
+    }
+}
+
+/// Bound all phases of one descriptor attempt, preserving its error type.
+// tor-socks5 local patch: bridge_download_timeout_wrapper
+async fn bridge_download_with_timeout<R, F>(runtime: &R, fetch: F) -> Result<Option<String>, Error>
+where
+    R: Runtime,
+    F: std::future::Future<Output = Result<Option<String>, Error>>,
+{
+    use tor_rtcompat::SleepProviderExt as _;
+    match runtime.timeout(Duration::from_secs(30), fetch).await {
+        Ok(result) => result,
+        Err(_) => Err(Error::RequestFailed(tor_dirclient::RequestFailedError {
+            source: None,
+            error: tor_dirclient::RequestError::DirTimeout,
+        })),
+    }
+}
+
+#[cfg(test)]
+// tor-socks5 local patch: bridge_budget_regressions
+mod local_test {
+    use super::*;
+    use tor_rtcompat::SleepProvider;
+
+    /// The deadline covers cumulative channel, stream and response phases.
+    // tor-socks5 local patch: bridge_total_timeout_regression
+    #[test]
+    fn bridge_download_hard_timeout() {
+        tor_rtmock::MockRuntime::test_with_various(|rt| async move {
+            let phases = std::sync::atomic::AtomicUsize::new(0);
+            let fetch = async {
+                for _ in 0..3 {
+                    rt.sleep(Duration::from_secs(12)).await;
+                    phases.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(Some("descriptor".to_owned()))
+            };
+            let attempt = bridge_download_with_timeout(&rt, fetch);
+            futures::pin_mut!(attempt);
+            assert!(futures::poll!(&mut attempt).is_pending());
+            for _ in 0..2 {
+                rt.advance_by(Duration::from_secs(12)).await;
+                assert!(futures::poll!(&mut attempt).is_pending());
+            }
+            rt.advance_by(Duration::from_secs(7)).await;
+            let result = attempt.await;
+            assert!(matches!(
+                result,
+                Err(Error::RequestFailed(tor_dirclient::RequestFailedError {
+                    source: None,
+                    error: tor_dirclient::RequestError::DirTimeout,
+                }))
+            ));
+            assert_eq!(phases.load(std::sync::atomic::Ordering::SeqCst), 2);
+            let complete = bridge_download_with_timeout(&rt, async {
+                rt.sleep(Duration::from_secs(29)).await;
+                Ok(Some("complete".to_owned()))
+            });
+            futures::pin_mut!(complete);
+            assert!(futures::poll!(&mut complete).is_pending());
+            rt.advance_by(Duration::from_secs(29)).await;
+            let result = complete.await.expect("attempt below budget completes");
+            assert_eq!(result.as_deref(), Some("complete"));
+        });
+    }
+
+    /// Pin the intentionally ported bridge policy, not upstream defaults.
+    // tor-socks5 local patch: bridge_defaults_regression
+    #[test]
+    fn bridge_download_defaults() {
+        let config = BridgeDescDownloadConfig::default();
+        assert_eq!(config.parallelism.get(), 12);
+        assert_eq!(config.retry, Duration::from_secs(5));
+        assert_eq!(config.prefetch, Duration::from_secs(1000));
+        assert_eq!(config.min_refetch, Duration::from_secs(3600));
+        assert_eq!(config.max_refetch, Duration::from_secs(3600 * 3));
     }
 }
 

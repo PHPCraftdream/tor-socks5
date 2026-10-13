@@ -79,6 +79,11 @@ pub enum RequestError {
     #[error("headers too long; gave up after {0} bytes")]
     HeadersTooLong(usize),
 
+    /// Body ended before its declared wire length; contains missing bytes.
+    // tor-socks5 local patch: truncated_body
+    #[error("response body shorter than declared Content-Length; {0} bytes missing")]
+    TruncatedBody(u64),
+
     /// Data received was not UTF-8 encoded.
     #[error("Couldn't decode data as UTF-8.")]
     Utf8Encoding(#[from] std::string::FromUtf8Error),
@@ -203,6 +208,8 @@ impl HasKind for RequestError {
             E::TruncatedHeaders => EK::TorProtocolViolation,
             E::ResponseTooLong(_) => EK::TorProtocolViolation,
             E::HeadersTooLong(_) => EK::TorProtocolViolation,
+            // tor-socks5 local patch: truncated_body_kind
+            E::TruncatedBody(_) => EK::TorProtocolViolation,
             E::Utf8Encoding(_) => EK::TorProtocolViolation,
             // TODO: it would be good to get more information out of the IoError
             // in this case, but that would require a bunch of gnarly
@@ -261,6 +268,8 @@ impl RequestError {
         use tor_proto::Error as PE;
         match self {
             RequestError::ResponseTooLong(_) => true,
+            // tor-socks5 local patch: truncated_body_suspicious
+            RequestError::TruncatedBody(_) => true,
             RequestError::HeadersTooLong(_) => true,
             RequestError::Proto(PE::ExcessInboundCells) => true,
             RequestError::Proto(_) => false,

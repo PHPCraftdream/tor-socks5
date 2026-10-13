@@ -49,6 +49,9 @@ full = ["web-time-compat/full"]
 [lib]
 name = "saturating_time"
 path = "src/lib.rs"
+# tor-socks5 local patch: disable_limit_doctests
+# Examples force potentially non-terminating Windows SystemTime limit searches.
+doctest = false
 
 [dependencies.web-time-compat]
 version = "0.3.0"

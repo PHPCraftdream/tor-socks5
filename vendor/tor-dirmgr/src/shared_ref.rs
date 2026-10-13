@@ -35,29 +35,23 @@ impl<T> SharedMutArc<T> {
 
     /// Replace the current value with `new_val`.
     pub fn replace(&self, new_val: T) {
-        let mut w = self
-            .dir
-            .write()
-            .expect("Poisoned lock for directory reference");
+        // tor-socks5 local patch: replace_poison_recovery
+        let mut w = self.dir.write().unwrap_or_else(|e| e.into_inner());
         *w = Some(Arc::new(new_val));
     }
 
     /// Remove the current value of this SharedMutArc.
     #[allow(unused)]
     pub(crate) fn clear(&self) {
-        let mut w = self
-            .dir
-            .write()
-            .expect("Poisoned lock for directory reference");
+        // tor-socks5 local patch: clear_poison_recovery
+        let mut w = self.dir.write().unwrap_or_else(|e| e.into_inner());
         *w = None;
     }
 
     /// Return a new reference to the current value, if there is one.
     pub fn get(&self) -> Option<Arc<T>> {
-        let r = self
-            .dir
-            .read()
-            .expect("Poisoned lock for directory reference");
+        // tor-socks5 local patch: get_poison_recovery
+        let r = self.dir.read().unwrap_or_else(|e| e.into_inner());
         r.as_ref().map(Arc::clone)
     }
 
@@ -71,8 +65,9 @@ impl<T> SharedMutArc<T> {
     ///
     /// # Limitation: No panic-safety
     ///
-    /// If `func` panics while it's running, this object will become invalid
-    /// and future attempts to use it will panic. (TODO: Fix this.)
+    /// A panic propagates, but later operations recover access. Partial mutations
+    /// are not rolled back; previously cloned Arc snapshots remain unchanged.
+    // tor-socks5 local patch: poison_recovery_contract
     // Note: If we decide to make this type public, we'll probably
     // want to fiddle with how we handle the return type.
     pub fn mutate<F, U>(&self, func: F) -> Result<U>
@@ -80,10 +75,8 @@ impl<T> SharedMutArc<T> {
         F: FnOnce(&mut T) -> Result<U>,
         T: Clone,
     {
-        let mut writeable = self
-            .dir
-            .write()
-            .expect("Poisoned lock for directory reference");
+        // tor-socks5 local patch: mutate_poison_recovery
+        let mut writeable = self.dir.write().unwrap_or_else(|e| e.into_inner());
         let dir = writeable.as_mut();
         match dir {
             None => Err(Error::DirectoryNotPresent), // Kinda bogus.
@@ -109,6 +102,41 @@ mod test {
     #![allow(clippy::string_slice)] // See arti#2571
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
     use super::*;
+    /// Recover all access paths while preserving copy-on-write snapshots.
+    // tor-socks5 local patch: poison_recovery_regression
+    #[test]
+    fn mutate_panic_does_not_poison_forever() {
+        let val = SharedMutArc::new();
+        val.replace(vec![1, 2, 3]);
+        let snapshot = val.get().expect("initial value");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            val.mutate(|v| -> Result<()> {
+                v.push(99);
+                panic!("intentional panic inside mutate closure");
+            })
+        }));
+        assert!(result.is_err());
+        assert_eq!(snapshot.as_slice(), [1, 2, 3]);
+        assert_eq!(val.get().expect("recovered get").as_slice(), [1, 2, 3, 99]);
+        val.mutate(|v| {
+            v.push(100);
+            Ok(())
+        })
+        .expect("recovered mutate");
+        assert_eq!(
+            val.get().expect("mutated value").as_slice(),
+            [1, 2, 3, 99, 100]
+        );
+        val.replace(vec![7]);
+        assert_eq!(val.get().expect("replaced value").as_slice(), [7]);
+        val.clear();
+        assert!(val.get().is_none());
+        assert!(matches!(
+            val.mutate(|_| Ok(())),
+            Err(Error::DirectoryNotPresent)
+        ));
+    }
+
     #[test]
     fn shared_mut_arc() {
         let val: SharedMutArc<Vec<u32>> = SharedMutArc::new();

@@ -406,11 +406,11 @@ fn sqlite_error_kind(e: &rusqlite::Error) -> ErrorKind {
             | RE::OperationInterrupted
             | RE::ReadOnly
             | RE::OperationAborted
-            | RE::DatabaseBusy
-            | RE::DatabaseLocked
             | RE::OutOfMemory
             | RE::InternalMalfunction => EK::Internal,
 
+            // tor-socks5 local patch: sqlite_contention_kind
+            RE::DatabaseBusy | RE::DatabaseLocked => EK::CacheAccessFailed,
             RE::FileLockingProtocolFailed
             | RE::AuthorizationForStatementDenied
             | RE::NotFound
@@ -426,6 +426,58 @@ fn sqlite_error_kind(e: &rusqlite::Error) -> ErrorKind {
         // possible database corruption (like UTF8Error.)  But I haven't
         // found a way to distinguish when.
         _ => EK::Internal,
+    }
+}
+
+#[cfg(test)]
+// tor-socks5 local patch: sqlite_regressions
+mod local_test {
+    use super::*;
+
+    /// Construct the same primary SQLite failure returned by rusqlite.
+    // tor-socks5 local patch: sqlite_failure_fixture
+    fn sqlite_failure(code: rusqlite::ErrorCode) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code,
+                extended_code: 0,
+            },
+            None,
+        )
+    }
+
+    /// Contention remains a cache-access error through both classification paths.
+    // tor-socks5 local patch: sqlite_contention_regression
+    #[test]
+    fn sqlite_busy_locked_are_transient_cache_access() {
+        for code in [
+            rusqlite::ErrorCode::DatabaseBusy,
+            rusqlite::ErrorCode::DatabaseLocked,
+        ] {
+            assert_eq!(
+                sqlite_error_kind(&sqlite_failure(code)),
+                ErrorKind::CacheAccessFailed
+            );
+            let error: Error = sqlite_failure(code).into();
+            assert!(matches!(error, Error::SqliteError(_)), "{error:?}");
+            assert_eq!(error.kind(), ErrorKind::CacheAccessFailed);
+        }
+    }
+
+    /// Preserve surrounding IO and cancellation classifications.
+    // tor-socks5 local patch: sqlite_neighbor_regression
+    #[test]
+    fn sqlite_classification_unchanged_around_the_patch() {
+        use rusqlite::ErrorCode as RE;
+        for (code, expected) in [
+            (RE::SystemIoFailure, ErrorKind::CacheAccessFailed),
+            (RE::FileLockingProtocolFailed, ErrorKind::CacheAccessFailed),
+            (RE::OperationInterrupted, ErrorKind::Internal),
+            (RE::OperationAborted, ErrorKind::Internal),
+            (RE::InternalMalfunction, ErrorKind::Internal),
+        ] {
+            assert_eq!(sqlite_error_kind(&sqlite_failure(code)), expected);
+        }
     }
 }
 
