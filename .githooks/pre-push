@@ -1,10 +1,23 @@
 #!/bin/sh
-# Pre-push gate: formatting, lints, and tests must all pass before a push.
+# Pre-push gate: formatting always; tests tiered per docs/plans/test-tiers.md.
 #
 # Enable once per clone:
 #     git config core.hooksPath .githooks
 #
-# Bypass in an emergency with `git push --no-verify`.
+# Tiers:
+#   T1 (default)  fmt + clippy/tests of affected packages only
+#                 (scripts/test-affected.sh)
+#   T2 (FULL)     fmt + clippy --workspace + full nextest/cargo test + doctests
+#
+# FULL is forced when:
+#   - FULL=1 is set in the environment, or
+#   - pushing refs/heads/main, refs/heads/upstream-*, or refs/tags/*, or
+#   - the affected-package selection fails (fail-safe), or
+#   - scripts/test-affected.sh itself reports FULL.
+#
+# TEST_AFFECTED_DRY=1 prints the commands instead of running them.
+#
+# Bypass in an emergency only: `git push --no-verify`.
 set -e
 
 # Bound compiler memory; callers can override these defaults.
@@ -12,16 +25,126 @@ set -e
 : "${CARGO_PROFILE_DEV_DEBUG:=0}"
 : "${CARGO_PROFILE_TEST_DEBUG:=0}"
 export CARGO_BUILD_JOBS CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG
+export TEST_AFFECTED_DRY
 
-echo "pre-push: cargo fmt --all --check"
-cargo fmt --all -- --check
+dry="${TEST_AFFECTED_DRY:-0}"
+run_cmd() {
+	if [ "$dry" = "1" ]; then
+		echo "dry-run: $*"
+	else
+		echo "pre-push: running: $*"
+		"$@"
+	fi
+}
 
-echo "pre-push: cargo clippy --workspace --all-targets -- -D warnings"
-cargo clippy --locked --workspace --all-targets -- -D warnings
+# Housekeeping only; skipped in the dry run.
+sweep_old_builds() {
+	[ "$dry" = "1" ] && return 0
+	cargo sweep --time 7 2>/dev/null || true
+}
 
-echo "pre-push: cargo test --workspace"
-cargo test --locked --workspace
+# Full T2 run shared by all FULL paths.
+run_full() {
+	run_cmd cargo clippy --locked --workspace --all-targets -- -D warnings
+	if command -v cargo-nextest >/dev/null 2>&1 || cargo nextest --version >/dev/null 2>&1; then
+		run_cmd cargo nextest run --workspace --locked
+	else
+		run_cmd cargo test --locked --workspace
+	fi
+	run_cmd cargo test --doc --workspace --locked
+	echo "pre-push: OK (T2)"
+}
 
-echo "pre-push: OK"
+# ---------------------------------------------------------------- stdin: refs
 
-cargo sweep --time 7 2>/dev/null || true
+full=0
+full_reason=""
+base_remote_sha=""
+
+while read -r _local_ref _local_sha remote_ref remote_sha; do
+	if [ -z "$remote_ref" ]; then
+		:
+	else
+		case "$remote_ref" in
+		refs/heads/main|refs/heads/upstream-*|refs/tags/*)
+			full=1
+			full_reason="push to $remote_ref"
+			;;
+		esac
+		case "$remote_sha" in
+		0000000000000000000000000000000000000000|"") ;;
+		*) base_remote_sha=$remote_sha ;;
+		esac
+	fi
+done
+
+if [ "$full" -eq 0 ] && [ "${FULL:-0}" = "1" ]; then
+	full=1
+	full_reason="FULL=1"
+fi
+
+# ---------------------------------------------------------------- fmt (always)
+
+run_cmd cargo fmt --all -- --check
+
+# ---------------------------------------------------------------- tier: T2
+
+if [ "$full" -eq 1 ]; then
+	echo "pre-push: tier T2 (FULL): $full_reason; all workspace packages"
+	run_full
+	sweep_old_builds
+	exit 0
+fi
+
+# ---------------------------------------------------------------- tier: T1
+
+base_args=""
+if [ -n "$base_remote_sha" ]; then
+	if git cat-file -e "$base_remote_sha^{commit}" 2>/dev/null; then
+		base_args="--base $base_remote_sha"
+	else
+		echo "pre-push: remote sha $base_remote_sha not found locally, using script default base" >&2
+	fi
+fi
+
+plan=$(sh scripts/test-affected.sh --mode list $base_args) && plan_rc=0 || plan_rc=$?
+if [ "$plan_rc" -ne 0 ]; then
+	echo "pre-push: WARNING: package selection failed (rc=$plan_rc), falling back to FULL (T2)" >&2
+	echo "pre-push: tier T2 (FULL): selection failure fail-safe; all workspace packages"
+	run_full
+	sweep_old_builds
+	exit 0
+fi
+
+if [ "$plan" = "FULL" ]; then
+	echo "pre-push: tier T2 (FULL): test-affected.sh reports FULL; all workspace packages"
+	run_full
+	sweep_old_builds
+	exit 0
+fi
+
+if [ -z "$plan" ]; then
+	echo "pre-push: tier T1: nothing to test (no affected packages)"
+	echo "pre-push: OK (T1, empty)"
+	sweep_old_builds
+	exit 0
+fi
+
+# Build -p args from the package list (one per line).
+pargs=""
+while IFS= read -r p; do
+	if [ -n "$p" ]; then
+		pargs="$pargs -p $p"
+	fi
+done <<HOOK_EOF
+$plan
+HOOK_EOF
+pargs=${pargs# }
+
+echo "pre-push: tier T1 (affected):$pargs"
+run_cmd cargo clippy $pargs --all-targets --locked -- -D warnings
+run_cmd sh scripts/test-affected.sh $base_args --mode run --kind all
+
+echo "pre-push: OK (T1)"
+
+sweep_old_builds
