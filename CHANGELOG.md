@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Vendored crates rebased from the Arti 0.43 line to 0.47.0 (arti 2.7.0)**
+  (`vendor/`, see its README for the full patch table); `saturating-time`
+  0.3.0 → 0.5.0. All local vendor patches carried: saturating-time lazy
+  limits; dirclient idle-body timeout and Content-Length bound; dirmgr
+  descriptor-fetch timeout, pool parallelism/retry, poison recovery and
+  sqlite lock classification; chanmgr `terminate_all_channels` and the 45 s
+  non-direct channel-build timeout; guardmgr guard-readiness signal, bridge
+  recovery corrections and `reset_disabled_guards`; arti-client
+  guards-usable readiness, fatal-protocol-error hook, external guard failure
+  passthrough, exit-stream retry and `initial_connect_timeout`; circmgr
+  opt-in bandwidth floor. None were accepted upstream in 0.47.
+  `reset_disabled_guards` is re-scoped as a manual migration handle for old
+  persisted state: 0.47 (!4426) made new automatic guard disables
+  practically impossible.
+- **MSRV 1.89 → 1.92** (workspace and vendored crates).
+- `ptrs-gesher` (obfs4/webtunnel PT client, `bridge-line` parser) is
+  temporarily wired from a sibling ptrs-gesher checkout via
+  `[patch.crates-io]`, until its crates.io release targets `tor-*` 0.47.
+
 ## [0.2.0] - 2026-10-12
 
 **Upgrading from 0.1.0:** the configuration layout changed. Stop the service and run
