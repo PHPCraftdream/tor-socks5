@@ -349,9 +349,9 @@ async fn unavailable_tor_and_expired_admission_keep_cache_then_next_refresh_reco
             context.cache.get(&req.queries[0]).unwrap().message.answers[1].data,
             upstream_data(RecordType::A)
         );
-        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // A UDP-chosen port can lie in a TCP-only reserved band (WSAEACCES).
+        let (upstream, failed_tcp) = bind_pair("127.0.0.1:0").await.unwrap();
         let server = upstream.local_addr().unwrap();
-        let failed_tcp = TcpListener::bind(server).await.unwrap();
         let mut recovered = context;
         recovered.overrides = Arc::new(vec![DnsOverride {
             pattern: "*".into(),

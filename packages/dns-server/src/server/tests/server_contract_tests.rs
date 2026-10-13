@@ -423,26 +423,40 @@ async fn normalized_first_override_and_local_before_cached_poison() {
     );
 }
 
-// UDP selects the endpoint first. Retry only the matching TCP bind collision:
-// Windows WSAEACCES may indicate an exclusive/reserved TCP port at that endpoint.
-// Option setters, UDP bind, listen, conversion and all other errors propagate.
+// UDP selects the endpoint first. Retry only a port collision, on a random
+// dynamic port: the OS hands out ephemeral ports almost sequentially, so
+// retrying port 0 stays inside one reserved band (Windows WSAEACCES on a
+// TCP-only block). Option setters, listen, conversion and all other errors
+// propagate.
 fn explicit_ipv6_pair(udp_only: bool, tcp_only: bool) -> std::io::Result<(UdpSocket, TcpListener)> {
     use socket2::{Domain, Protocol, Socket, Type};
+    let collision = |error: &std::io::Error| {
+        error.kind() == std::io::ErrorKind::AddrInUse
+            || (cfg!(windows) && error.raw_os_error() == Some(10013))
+    };
+    let mut port = 0;
     for attempt in 0..16 {
+        let last = attempt == 15;
         let udp = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
         udp.set_only_v6(udp_only)?;
-        udp.bind(&"[::]:0".parse::<SocketAddr>().unwrap().into())?;
+        let want = SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
+        if let Err(error) = udp.bind(&want.into()) {
+            if port == 0 || !collision(&error) || last {
+                return Err(error);
+            }
+            port = random_dynamic_port();
+            continue;
+        }
         udp.set_nonblocking(true)?;
         let udp = UdpSocket::from_std(udp.into())?;
         let bound = udp.local_addr()?;
         let tcp = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
         tcp.set_only_v6(tcp_only)?;
         if let Err(error) = tcp.bind(&bound.into()) {
-            let collision = error.kind() == std::io::ErrorKind::AddrInUse
-                || (cfg!(windows) && error.raw_os_error() == Some(10013));
-            if !collision || attempt == 15 {
+            if !collision(&error) || last {
                 return Err(error);
             }
+            port = random_dynamic_port();
             continue;
         }
         tcp.listen(8)?;

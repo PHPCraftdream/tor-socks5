@@ -285,14 +285,18 @@ async fn real_tcp_partial_frame_timeout_releases_connection_without_backend() {
     // before observing real socket EOF: paused time can auto-advance a guard
     // before the OS delivers readiness, despite the server stream being closed.
     tokio::time::resume();
+    // Closing with the partial byte still unread yields RST instead of FIN;
+    // whether the server read it before the virtual deadline depends on when
+    // the OS readiness reached the driver. Both prove the server closed.
     let mut byte = [0];
-    assert_eq!(
-        timeout(CASE_BUDGET, peer.read(&mut byte))
-            .await
-            .expect("timed-out connection did not close")
-            .unwrap(),
-        0
-    );
+    match timeout(CASE_BUDGET, peer.read(&mut byte))
+        .await
+        .expect("timed-out connection did not close")
+    {
+        Ok(0) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => panic!("timed-out connection was not closed: {other:?}"),
+    }
 
     // The same production listener must admit and answer another connection
     // using the reclaimed capacity, also with real I/O and the clock resumed.
