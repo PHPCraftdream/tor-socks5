@@ -117,3 +117,10 @@ arti-client = { path = "vendor/arti-client" }
 ## latency-over-anonymity trade acceptable only in this personal-use fork;
 ## the default keeps behaviour identical to upstream.
 tor-circmgr = { path = "vendor/tor-circmgr" }
+## TEMPORARY (until ptrs-gesher is released against tor-* 0.47): the sibling
+## ptrs-gesher checkout, which already requires tor-* 0.47 / derive-deftly 1.12.
+ptrs-gesher-core = { path = "../ptrs-gesher/crates/core" }
+ptrs-gesher-obfs4 = { path = "../ptrs-gesher/crates/obfs4" }
+ptrs-gesher-webtunnel = { path = "../ptrs-gesher/crates/webtunnel" }
+ptrs-gesher-lyrebird = { path = "../ptrs-gesher/crates/lyrebird" }
+ptrs-gesher-bridge-line = { path = "../ptrs-gesher/crates/bridge-line" }
