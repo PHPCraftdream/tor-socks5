@@ -286,9 +286,13 @@ async fn signal_bridge_failure_conversion_succeeds_for_plain_bridge_without_tran
 
 #[test]
 fn emit_bootstrap_event_maps_default_status_to_progress() {
-    // `BootstrapStatus::default()` is documented by the vendored crate's
-    // own tests to never be ready for traffic, so `emit_bootstrap_event`
-    // must emit a `Progress` event and return `false`.
+    // In Arti 0.47, `BootstrapStatus::default()` carries
+    // `BootstrapSetting::default()` = `BootstrapBehavior::Manual` with no
+    // running-inner, so `status.blocked()` reports `Some(Blockage { kind:
+    // Disabled })`. `emit_bootstrap_event` therefore emits `Progress(0.0)`
+    // *and* a `Blocked` event, and must still return `false`. A real
+    // on-demand client never sees this Disabled blockage, so this only
+    // pins the default-status mapping.
     use std::sync::Mutex;
     let events = Arc::new(Mutex::new(Vec::new()));
     let callback: BootstrapEventCallback = Arc::new({
@@ -299,11 +303,16 @@ fn emit_bootstrap_event_maps_default_status_to_progress() {
     let ready = emit_bootstrap_event(&status, &callback);
     assert!(!ready, "default status is not ready for traffic");
     let collected = events.lock().unwrap();
-    assert_eq!(collected.len(), 1, "should emit exactly one event");
+    assert_eq!(collected.len(), 2, "Progress(0.0) + Blocked(Disabled)");
     assert!(
         matches!(collected[0], BootstrapEvent::Progress(f, _) if f == 0.0),
         "default status should emit Progress(0.0), got: {:?}",
         collected[0]
+    );
+    assert!(
+        matches!(collected[1], BootstrapEvent::Blocked(_)),
+        "Manual default should emit Blocked(Disabled), got: {:?}",
+        collected[1]
     );
 }
 
@@ -500,4 +509,24 @@ mod endpoint_proof {
             &pluggable("webtunnel", "192.0.2.1:443")
         ));
     }
+}
+
+#[test]
+fn validate_min_bandwidth_percentile_accepts_disabled_and_valid_range() {
+    // 0 = disabled (default), accepted, matching the vendored tor-circmgr
+    // builder validation (`pct <= 100` is ok).
+    assert!(super::validate_min_bandwidth_percentile(0).is_ok());
+    assert!(super::validate_min_bandwidth_percentile(1).is_ok());
+    assert!(super::validate_min_bandwidth_percentile(50).is_ok());
+    assert!(super::validate_min_bandwidth_percentile(100).is_ok());
+}
+
+#[test]
+fn validate_min_bandwidth_percentile_rejects_above_100() {
+    // >100 used to be silently clamped by older tor-circmgr; the vendored
+    // 0.47 tor-circmgr rejects it at config build, so we reject it early
+    // with a clear message.
+    let err = super::validate_min_bandwidth_percentile(101).unwrap_err();
+    assert!(err.contains("min_bandwidth_percentile must be in 0..=100, got 101"));
+    assert!(super::validate_min_bandwidth_percentile(255).is_err());
 }

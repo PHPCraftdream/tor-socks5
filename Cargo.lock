@@ -6137,6 +6137,7 @@ dependencies = [
  "tor-basic-utils",
  "tor-cell",
  "tor-chanmgr",
+ "tor-circmgr",
  "tor-config",
  "tor-dircommon",
  "tor-error",

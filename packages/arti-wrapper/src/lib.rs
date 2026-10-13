@@ -802,7 +802,20 @@ fn fatal_protocol_error_hook(error: &arti_client::Error) {
     );
 }
 
+fn validate_min_bandwidth_percentile(pct: u8) -> std::result::Result<(), String> {
+    if pct <= 100 {
+        Ok(())
+    } else {
+        Err(format!(
+            "min_bandwidth_percentile must be in 0..=100, got {pct}"
+        ))
+    }
+}
+
 fn build_config(settings: &Settings) -> Result<TorClientConfig> {
+    validate_min_bandwidth_percentile(settings.min_bandwidth_percentile)
+        .map_err(TorError::BuildConfig)?;
+
     let mut builder: TorClientConfigBuilder = TorClientConfig::builder();
 
     builder
