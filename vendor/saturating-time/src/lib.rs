@@ -1,5 +1,56 @@
 #![doc = include_str!("../README.md")]
+// @@ begin lint list maintained by maint/add_warning @@
+#![allow(renamed_and_removed_lints)] // @@REMOVE_WHEN(ci_arti_stable)
+#![allow(unknown_lints)] // @@REMOVE_WHEN(ci_arti_nightly)
+#![warn(missing_docs)]
+#![warn(noop_method_call)]
+#![warn(unreachable_pub)]
+#![warn(clippy::all)]
+#![deny(clippy::await_holding_lock)]
+#![deny(clippy::cargo_common_metadata)]
+#![deny(clippy::cast_lossless)]
+#![deny(clippy::checked_conversions)]
+#![allow(clippy::cognitive_complexity)] // See arti#2556
+#![deny(clippy::debug_assert_with_mut_call)]
+#![deny(clippy::exhaustive_enums)]
+#![deny(clippy::exhaustive_structs)]
+#![deny(clippy::expl_impl_clone_on_copy)]
+#![deny(clippy::fallible_impl_from)]
+#![deny(clippy::implicit_clone)]
+#![deny(clippy::large_stack_arrays)]
+#![warn(clippy::manual_ok_or)]
+#![deny(clippy::missing_docs_in_private_items)]
+#![warn(clippy::needless_borrow)]
+#![warn(clippy::needless_pass_by_value)]
+#![warn(clippy::option_option)]
+#![deny(clippy::print_stderr)]
+#![deny(clippy::print_stdout)]
+#![warn(clippy::rc_buffer)]
+#![deny(clippy::ref_option_ref)]
+#![warn(clippy::semicolon_if_nothing_returned)]
+#![warn(clippy::trait_duplication_in_bounds)]
+#![deny(clippy::unchecked_time_subtraction)]
+#![deny(clippy::unnecessary_wraps)]
+#![warn(clippy::unseparated_literal_suffix)]
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::mod_module_files)]
+#![allow(clippy::let_unit_value)] // This can reasonably be done for explicitness
+#![allow(clippy::uninlined_format_args)]
+#![allow(clippy::significant_drop_in_scrutinee)] // arti/-/merge_requests/588/#note_2812945
+#![allow(clippy::result_large_err)] // temporary workaround for arti#587
+#![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
+#![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
+#![allow(clippy::collapsible_if)] // See arti#2342
+#![deny(clippy::unused_async)]
+#![deny(clippy::string_slice)] // See arti#2571
+//! <!-- @@ end lint list maintained by maint/add_warning @@ -->
+#![allow(unexpected_cfgs)]
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    saturating_time_nightly,
+    feature(time_systemtime_limits, time_saturating_systemtime)
+)]
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -98,17 +149,8 @@ pub trait SaturatingTime: internal::SaturatingTime {
     /// assert_eq!(max.saturating_add(Duration::new(0, 1)), max);
     /// ```
     fn saturating_add(self, duration: Duration) -> Self {
-        // tor-socks5 local patch: `unwrap_or(max_value())` EAGERLY evaluates
-        // `max_value()` on every call, even when `checked_add` succeeds.
-        // `max_value()` forces the `MAX_SYSTEM_TIME`/`MAX_INSTANT` `LazyLock`,
-        // whose `find_max` binary-search (internal.rs) does not terminate on
-        // some platforms (observed: Windows `SystemTime`), spinning at 100%
-        // CPU forever. That hung `RouterDesc::parse` (the only consumer that
-        // adds a duration to a parsed time), so embedded arti could never use
-        // a bridge. Use `unwrap_or_else` so the limit is only computed on a
-        // genuine overflow.
         self.checked_add(duration)
-            .unwrap_or_else(SaturatingTime::max_value)
+            .unwrap_or(SaturatingTime::max_value())
     }
 
     /// Performs a saturating subtraction of a [`Duration`].
@@ -131,10 +173,8 @@ pub trait SaturatingTime: internal::SaturatingTime {
     /// assert_eq!(min.saturating_sub(Duration::new(0, 1)), min);
     /// ```
     fn saturating_sub(self, duration: Duration) -> Self {
-        // See `saturating_add`: avoid eagerly forcing the (possibly
-        // non-terminating) min/max limit search on every call.
         self.checked_sub(duration)
-            .unwrap_or_else(SaturatingTime::min_value)
+            .unwrap_or(SaturatingTime::min_value())
     }
 
     /// Performs a saturating time difference calculation between two points.
@@ -163,6 +203,32 @@ pub trait SaturatingTime: internal::SaturatingTime {
     }
 }
 
+// Use nightly implementation if compiled with the nightly feature.
+#[cfg(saturating_time_nightly)]
+impl SaturatingTime for SystemTime {
+    fn max_value() -> Self {
+        Self::MAX
+    }
+
+    fn min_value() -> Self {
+        Self::MIN
+    }
+
+    fn saturating_add(self, duration: Duration) -> Self {
+        Self::saturating_add(&self, duration)
+    }
+
+    fn saturating_sub(self, duration: Duration) -> Self {
+        Self::saturating_sub(&self, duration)
+    }
+
+    fn saturating_duration_since(&self, earlier: Self) -> Duration {
+        Self::saturating_duration_since(&self, earlier)
+    }
+}
+
+// Otherwise, use the default one.
+#[cfg(not(saturating_time_nightly))]
 impl SaturatingTime for SystemTime {}
 
 impl SaturatingTime for Instant {
@@ -174,6 +240,21 @@ impl SaturatingTime for Instant {
 
 #[cfg(test)]
 mod tests {
+    // @@ begin test lint list maintained by maint/add_warning @@
+    #![allow(clippy::bool_assert_comparison)]
+    #![allow(clippy::clone_on_copy)]
+    #![allow(clippy::dbg_macro)]
+    #![allow(clippy::mixed_attributes_style)]
+    #![allow(clippy::print_stderr)]
+    #![allow(clippy::print_stdout)]
+    #![allow(clippy::single_char_pattern)]
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unchecked_time_subtraction)]
+    #![allow(clippy::useless_vec)]
+    #![allow(clippy::needless_pass_by_value)]
+    #![allow(clippy::string_slice)] // See arti#2571
+    //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
+
     use super::*;
     use crate::internal;
     use std::{
@@ -243,10 +324,7 @@ mod tests {
     }
 
     /// Calls [`min_max()`] using [`SystemTime`].
-    // tor-socks5: forces the SystemTime limit search, non-terminating on
-    // Windows (see internal::find_limit); ignored so it doesn't hang the suite.
     #[test]
-    #[ignore = "forces non-terminating SystemTime limit search on Windows (see find_limit)"]
     fn system_time_min_max() {
         min_max::<SystemTime>();
     }
@@ -258,12 +336,7 @@ mod tests {
     }
 
     /// Calls [`saturating_add_sub()`] and [`saturating_duration()`] using [`SystemTime`].
-    // tor-socks5: forces `SystemTime::max_value()`/`min_value()`, whose limit
-    // search does not terminate on Windows (see internal::find_limit). Our fix
-    // makes production code never reach that path; this upstream test exercises
-    // it directly, so it is ignored rather than left to hang `cargo test`.
     #[test]
-    #[ignore = "forces non-terminating SystemTime limit search on Windows (see find_limit)"]
     fn system_time_saturating() {
         saturating_add_sub::<SystemTime>();
         saturating_duration::<SystemTime>();
@@ -274,31 +347,5 @@ mod tests {
     fn instant_saturating() {
         saturating_add_sub::<Instant>();
         saturating_duration::<Instant>();
-    }
-
-    /// Regression (tor-socks5): a plain, non-overflowing `saturating_add` /
-    /// `saturating_sub` must return promptly and must NOT spin forever forcing
-    /// the platform min/max search. On Windows the original eager
-    /// `unwrap_or(max_value())` made every call drive a non-terminating
-    /// `find_max`, hanging `RouterDesc::parse` (and thus arti's use of bridges)
-    /// at 100% CPU. A watchdog thread turns any such hang into a failure.
-    #[test]
-    fn saturating_add_sub_does_not_hang() {
-        use std::sync::mpsc;
-
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_000_000); // ~2026
-            // Neither of these overflows, so with the lazy `unwrap_or_else` fix
-            // the (possibly non-terminating) limit search is never reached.
-            let later = base.saturating_add(Duration::from_secs(5 * 86400));
-            let earlier = base.saturating_sub(Duration::from_secs(86400));
-            let _ = tx.send(later > earlier);
-        });
-
-        match rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(ok) => assert!(ok, "saturating_add should be after saturating_sub"),
-            Err(_) => panic!("saturating arithmetic hung (>10s) — eager limit search regression"),
-        }
     }
 }

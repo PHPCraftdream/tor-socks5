@@ -11,7 +11,7 @@
 #![deny(clippy::cargo_common_metadata)]
 #![deny(clippy::cast_lossless)]
 #![deny(clippy::checked_conversions)]
-#![warn(clippy::cognitive_complexity)]
+#![allow(clippy::cognitive_complexity)] // See arti#2556
 #![deny(clippy::debug_assert_with_mut_call)]
 #![deny(clippy::exhaustive_enums)]
 #![deny(clippy::exhaustive_structs)]
@@ -44,6 +44,7 @@
 #![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 #![allow(clippy::collapsible_if)] // See arti#2342
 #![deny(clippy::unused_async)]
+#![deny(clippy::string_slice)] // See arti#2571
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
 // TODO probably remove this at some point - see tpo/core/arti#1060
@@ -73,7 +74,6 @@ use futures::FutureExt;
 use futures::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
-use memchr::memchr;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, instrument};
@@ -298,8 +298,9 @@ where
     let mut buffered = BufReader::new(stream);
 
     // Handle the response
-    // TODO: should there be a separate timeout here?
-    let header = read_headers(&mut buffered).await.map_err(wrap_err)?;
+    let header = read_headers(runtime, &mut buffered)
+        .await
+        .map_err(wrap_err)?;
     if header.status != Some(200) {
         return Ok(DirResponse::new(
             method,
@@ -311,55 +312,11 @@ where
         ));
     }
 
-    // tor-socks5 local patch: when the server gave us a Content-Length,
-    // bound the (compressed) body read with `.take(len)` so the decoder
-    // sees a clean EOF after exactly that many bytes — instead of blocking
-    // until a stream-level RELAY_END that may never arrive over a slow
-    // obfs4 circuit (the cause of spurious "Partial response" / DirTimeout).
-    //
-    // IMPORTANT: `AsyncReadExt::take(n)` reports EOF (`Ok(0)`) both when the
-    // *declared* length is exhausted and when the *underlying* stream hits a
-    // real EOF early. Those two are not the same thing: the second one means
-    // the server promised `clen` bytes and delivered fewer, i.e. the body is
-    // truncated. `read_and_decompress`'s `written_in_this_loop == 0 =>
-    // return Ok(())` branch cannot tell them apart from inside the loop, so
-    // we wrap the `Take` in `RemainingTracker` here and check its remaining
-    // count after the read completes: a nonzero remainder means the stream
-    // stopped short of the declared Content-Length, which must be treated as
-    // an error, not a clean success (this was previously silently accepted —
-    // see the `TruncatedBody` regression test for the "line truncated before
-    // newline" symptom this produced in tor_netdoc for a full consensus
-    // fetched over a PT bridge). `Arc<AtomicU64>` (not `Rc<Cell<_>>`) because
-    // this future must stay `Send` -- dirmgr's bootstrap runs it inside a
-    // spawned tokio task.
-    use futures::io::AsyncReadExt as _;
-    let mut remaining_counter: Option<Arc<std::sync::atomic::AtomicU64>> = None;
-    let mut decoder = match header.length {
-        Some(clen) => {
-            let taken = buffered.take(clen as u64);
-            let tracker = RemainingTracker::new(taken);
-            remaining_counter = Some(tracker.remaining.clone());
-            let bounded = BufReader::new(tracker);
-            get_decoder(bounded, header.encoding.as_deref(), anonymized).map_err(wrap_err)?
-        }
-        None => get_decoder(buffered, header.encoding.as_deref(), anonymized).map_err(wrap_err)?,
-    };
+    let mut decoder =
+        get_decoder(buffered, header.encoding.as_deref(), anonymized).map_err(wrap_err)?;
 
     let mut result = Vec::new();
-    let mut ok = read_and_decompress(runtime, &mut decoder, maxlen, &mut result).await;
-
-    // If we had a declared Content-Length and the body reader stopped
-    // (cleanly, from the decoder's point of view) before consuming all of
-    // it, the underlying stream gave us fewer bytes than promised: that's a
-    // truncated body, not a complete document.
-    if ok.is_ok() {
-        if let Some(remaining) = &remaining_counter {
-            let remaining = remaining.load(std::sync::atomic::Ordering::Acquire);
-            if remaining > 0 {
-                ok = Err(RequestError::TruncatedBody(remaining));
-            }
-        }
-    }
+    let ok = read_and_decompress(runtime, &mut decoder, maxlen, &mut result).await;
 
     let ok = match (partial_ok, ok, result.len()) {
         (true, Err(e), n) if n > 0 => {
@@ -388,17 +345,39 @@ where
 const MAX_HEADERS_LEN: usize = 16384;
 
 /// Read and parse HTTP/1 headers from `stream`.
-async fn read_headers<S>(stream: &mut S) -> RequestResult<HeaderStatus>
+///
+/// Wraps around [`read_headers_internal()`] with a timeout.
+async fn read_headers<S, SP>(runtime: &SP, stream: &mut S) -> RequestResult<HeaderStatus>
+where
+    S: AsyncBufRead + Unpin,
+    SP: SleepProvider,
+{
+    // Just like with the other timeouts in this code, this should probably be
+    // configurable and may even be too much.
+    let read_timeout = Duration::from_secs(10);
+    runtime
+        .timeout(read_timeout, read_headers_internal(stream))
+        .await
+        .map_err(|_| RequestError::DirTimeout)
+        .flatten()
+}
+
+/// Internal version of [`read_headers()`] without a timeout.
+async fn read_headers_internal<S>(stream: &mut S) -> RequestResult<HeaderStatus>
 where
     S: AsyncBufRead + Unpin,
 {
     let mut buf = Vec::with_capacity(1024);
 
+    // Note: Using `take` here will ensure that we will get an EOF if the header length
+    // would exceed the maximum.  No extra bytes will actually be extracted.
+    let mut limited_stream = stream.take(MAX_HEADERS_LEN as u64);
+
     loop {
         // TODO: it's inefficient to do this a line at a time; it would
         // probably be better to read until the CRLF CRLF ending of the
         // response.  But this should be fast enough.
-        let n = read_until_limited(stream, b'\n', 2048, &mut buf).await?;
+        let n = limited_stream.read_until(b'\n', &mut buf).await?;
 
         // TODO(nickm): Better maximum and/or let this expand.
         let mut headers = [httparse::EMPTY_HEADER; 32];
@@ -423,7 +402,6 @@ where
                         status: response.code,
                         status_message: response.reason.map(str::to_owned),
                         encoding: None,
-                        length: None,
                     });
                 }
                 let encoding = if let Some(enc) = response
@@ -435,21 +413,17 @@ where
                 } else {
                     None
                 };
-                // tor-socks5 local patch: parse Content-Length (arti upstream
-                // leaves this commented out). Used to bound the body read.
-                let length = if let Some(clen) =
-                    response.headers.iter().find(|h| h.name == "Content-Length")
-                {
-                    std::str::from_utf8(clen.value).ok().and_then(|s| s.trim().parse::<usize>().ok())
-                } else {
-                    None
-                };
+                /*
+                if let Some(clen) = response.headers.iter().find(|h| h.name == "Content-Length") {
+                    let clen = std::str::from_utf8(clen.value)?;
+                    length = Some(clen.parse()?);
+                }
+                 */
                 assert!(n_parsed == buf.len());
                 return Ok(HeaderStatus {
                     status: Some(200),
                     status_message: None,
                     encoding,
-                    length,
                 });
             }
         }
@@ -468,11 +442,6 @@ struct HeaderStatus {
     status_message: Option<String>,
     /// The Content-Encoding header, if any.
     encoding: Option<String>,
-    /// The Content-Length header, if any (on-wire / compressed body length).
-    /// tor-socks5 local patch: arti upstream ignores this; we use it to bound
-    /// the body read so it terminates cleanly instead of waiting for a stream
-    /// EOF that may never arrive over a slow obfs4 circuit.
-    length: Option<usize>,
 }
 
 /// Helper: download directory information from `stream` and
@@ -495,21 +464,17 @@ where
 {
     let buffer_window_size = 1024;
     let mut written_total: usize = 0;
-    // tor-socks5 local patch: this used to be a single TOTAL timeout armed
-    // once before the loop, which truncated big-but-healthy downloads (e.g.
-    // a ~3MB consensus over a slow obfs4 bridge) into a DirTimeout /
-    // "Partial response". Switched to an IDLE (inter-read) timeout: the
-    // timer is rebuilt every iteration, so it only fires when no byte has
-    // arrived for `idle_timeout` — a true stall, not merely a slow stream.
-    let idle_timeout = Duration::from_secs(90);
+    // TODO(nickm): This should be an option, and is maybe too long.
+    // Though for some users it may be too short?
+    let read_timeout = Duration::from_secs(10);
+    let timer = runtime.sleep(read_timeout).fuse();
+    futures::pin_mut!(timer);
 
     loop {
         // allocate buffer for next read
         result.resize(written_total + buffer_window_size, 0);
         let buf: &mut [u8] = &mut result[written_total..written_total + buffer_window_size];
 
-        let timer = runtime.sleep(idle_timeout).fuse();
-        futures::pin_mut!(timer);
         let status = futures::select! {
             status = stream.read(buf).fuse() => status,
             _ = timer => {
@@ -565,94 +530,37 @@ where
     circ_mgr.retire_circ(id);
 }
 
-/// As AsyncBufReadExt::read_until, but stops after reading `max` bytes.
+/// Memory limit of the LZMA dictionary we are willing to allocate.
 ///
-/// Note that this function might not actually read any byte of value
-/// `byte`, since EOF might occur, or we might fill the buffer.
+/// Without it, it may lead to an allocation of 4GiB, which is a bit overkill.
 ///
-/// A return value of 0 indicates an end-of-file.
-async fn read_until_limited<S>(
-    stream: &mut S,
-    byte: u8,
-    max: usize,
-    buf: &mut Vec<u8>,
-) -> std::io::Result<usize>
-where
-    S: AsyncBufRead + Unpin,
-{
-    let mut n_added = 0;
-    loop {
-        let data = stream.fill_buf().await?;
-        if data.is_empty() {
-            // End-of-file has been reached.
-            return Ok(n_added);
-        }
-        debug_assert!(n_added < max);
-        let remaining_space = max - n_added;
-        let (available, found_byte) = match memchr(byte, data) {
-            Some(idx) => (idx + 1, true),
-            None => (data.len(), false),
-        };
-        debug_assert!(available >= 1);
-        let n_to_copy = std::cmp::min(remaining_space, available);
-        buf.extend(&data[..n_to_copy]);
-        stream.consume_unpin(n_to_copy);
-        n_added += n_to_copy;
-        if found_byte || n_added == max {
-            return Ok(n_added);
-        }
-    }
-}
-
-/// tor-socks5 local patch: wraps a [`futures::io::Take`] and mirrors its
-/// remaining-byte count into a shared, externally-readable counter.
+/// Right now, we use 16 MiB, as the spec limits the compression quality to
+/// "6", meaning 9 MiB of decompression memory, which rounds up to 16 MiB in
+/// terms of base 2.
 ///
-/// `Take::limit()` is only reachable through the concrete `Take<S>` type; by
-/// the time the reader is behind `get_decoder`'s `Box<dyn AsyncRead>` there is
-/// no way to ask "did the declared `Content-Length` actually get fully
-/// consumed, or did the stream stop early?" from outside. This wrapper keeps
-/// that answer available via a cheap `Arc<AtomicU64>` snapshot updated after
-/// every read, without needing to downcast the trait object.
-///
-/// `S` must be `Unpin` (true for every stream this crate uses `Take` over):
-/// that lets this be a plain, non-pin-projected `AsyncRead` impl.
-struct RemainingTracker<S> {
-    /// The length-bounded inner reader.
-    inner: futures::io::Take<S>,
-    /// Bytes not yet consumed from `inner`'s original limit. Updated after
-    /// every successful read; read by the caller once the response is fully
-    /// processed to detect a stream that stopped before the declared
-    /// `Content-Length` was reached.
-    remaining: Arc<std::sync::atomic::AtomicU64>,
-}
-
-impl<S: AsyncRead + Unpin> RemainingTracker<S> {
-    /// Wrap `inner`, initializing the shared counter from its current limit.
-    fn new(inner: futures::io::Take<S>) -> Self {
-        let remaining = Arc::new(std::sync::atomic::AtomicU64::new(inner.limit()));
-        Self { inner, remaining }
-    }
-}
-
-impl<S: AsyncRead + Unpin> AsyncRead for RemainingTracker<S> {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut [u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-        let inner = std::pin::Pin::new(&mut this.inner);
-        let poll = inner.poll_read(cx, buf);
-        if let std::task::Poll::Ready(Ok(_)) = &poll {
-            this.remaining
-                .store(this.inner.limit(), std::sync::atomic::Ordering::Release);
-        }
-        poll
-    }
-}
+/// From the xz(1) manual page:
+/// ```text
+/// Preset   DictSize   CompCPU   CompMem   DecMem
+///  -0e     256 KiB       8        4 MiB    1 MiB
+///  -1e       1 MiB       8       13 MiB    2 MiB
+///  -2e       2 MiB       8       25 MiB    3 MiB
+///  -3e       4 MiB       7       48 MiB    5 MiB
+///  -4e       4 MiB       8       48 MiB    5 MiB
+///  -5e       8 MiB       7       94 MiB    9 MiB
+///  -6e       8 MiB       8       94 MiB    9 MiB
+///  -7e      16 MiB       8      186 MiB   17 MiB
+///  -8e      32 MiB       8      370 MiB   33 MiB
+///  -9e      64 MiB       8      674 MiB   65 MiB
+/// ```
+const LZMA_DICT_MEM_LIMIT: u64 = 1 << 24; // 16 MiB
 
 /// Helper: Return a boxed decoder object that wraps the stream  $s.
 macro_rules! decoder {
+    (XzDecoder, $s:expr) => {{
+        let mut decoder = XzDecoder::with_mem_limit($s, LZMA_DICT_MEM_LIMIT);
+        decoder.multiple_members(true);
+        Ok(Box::new(decoder))
+    }};
     ($dec:ident, $s:expr) => {{
         let mut decoder = $dec::new($s);
         decoder.multiple_members(true);
@@ -683,5 +591,372 @@ fn get_decoder<'a, S: AsyncBufRead + Unpin + Send + 'a>(
 }
 
 #[cfg(test)]
-#[path = "tests.rs"]
-mod test;
+mod test {
+    // @@ begin test lint list maintained by maint/add_warning @@
+    #![allow(clippy::bool_assert_comparison)]
+    #![allow(clippy::clone_on_copy)]
+    #![allow(clippy::dbg_macro)]
+    #![allow(clippy::mixed_attributes_style)]
+    #![allow(clippy::print_stderr)]
+    #![allow(clippy::print_stdout)]
+    #![allow(clippy::single_char_pattern)]
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unchecked_time_subtraction)]
+    #![allow(clippy::useless_vec)]
+    #![allow(clippy::needless_pass_by_value)]
+    #![allow(clippy::string_slice)] // See arti#2571
+    //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
+    use super::*;
+    use tor_rtmock::io::stream_pair;
+
+    use tor_rtmock::simple_time::SimpleMockTimeProvider;
+    use web_time_compat::{SystemTime, SystemTimeExt};
+
+    use futures_await_test::async_test;
+
+    // Basic decompression wrapper.
+    async fn decomp_basic(
+        encoding: Option<&str>,
+        data: &[u8],
+        maxlen: usize,
+    ) -> (RequestResult<()>, Vec<u8>) {
+        // We don't need to do anything fancy here, since we aren't simulating
+        // a timeout.
+        #[allow(deprecated)] // TODO #1885
+        let mock_time = SimpleMockTimeProvider::from_wallclock(SystemTime::get());
+
+        let mut output = Vec::new();
+        let mut stream = match get_decoder(data, encoding, AnonymizedRequest::Direct) {
+            Ok(s) => s,
+            Err(e) => return (Err(e), output),
+        };
+
+        let r = read_and_decompress(&mock_time, &mut stream, maxlen, &mut output).await;
+
+        (r, output)
+    }
+
+    #[async_test]
+    async fn decompress_identity() -> RequestResult<()> {
+        let mut text = Vec::new();
+        for _ in 0..1000 {
+            text.extend(b"This is a string with a nontrivial length that we'll use to make sure that the loop is executed more than once.");
+        }
+
+        let limit = 10 << 20;
+        let (s, r) = decomp_basic(None, &text[..], limit).await;
+        s?;
+        assert_eq!(r, text);
+
+        let (s, r) = decomp_basic(Some("identity"), &text[..], limit).await;
+        s?;
+        assert_eq!(r, text);
+
+        // Try truncated result
+        let limit = 100;
+        let (s, r) = decomp_basic(Some("identity"), &text[..], limit).await;
+        assert!(s.is_err());
+        assert_eq!(r, &text[..100]);
+
+        Ok(())
+    }
+
+    #[async_test]
+    async fn decomp_zlib() -> RequestResult<()> {
+        let compressed =
+            hex::decode("789cf3cf4b5548cb2cce500829cf8730825253200ca79c52881c00e5970c88").unwrap();
+
+        let limit = 10 << 20;
+        let (s, r) = decomp_basic(Some("deflate"), &compressed, limit).await;
+        s?;
+        assert_eq!(r, b"One fish Two fish Red fish Blue fish");
+
+        Ok(())
+    }
+
+    #[cfg(feature = "zstd")]
+    #[async_test]
+    async fn decomp_zstd() -> RequestResult<()> {
+        let compressed = hex::decode("28b52ffd24250d0100c84f6e6520666973682054776f526564426c756520666973680a0200600c0e2509478352cb").unwrap();
+        let limit = 10 << 20;
+        let (s, r) = decomp_basic(Some("x-zstd"), &compressed, limit).await;
+        s?;
+        assert_eq!(r, b"One fish Two fish Red fish Blue fish\n");
+
+        Ok(())
+    }
+
+    #[cfg(feature = "xz")]
+    #[async_test]
+    async fn decomp_xz() -> RequestResult<()> {
+        // echo "One fish Two fish Red fish Blue fish" | xz -6 | xxd -p
+        let compressed = hex::decode("fd377a585a000004e6d6b44604c02525210116000000000000000000bfdbca33e00024001d5d00279b88a202ca8612cfb3c19c87c34248a570451e4851d3323d34ab8000000000000901af64854c91f600014125281fe0821fb6f37d010000000004595a").unwrap();
+        let limit = LZMA_DICT_MEM_LIMIT as usize;
+        let (s, r) = decomp_basic(Some("x-tor-lzma"), &compressed, limit).await;
+        s?;
+        assert_eq!(r, b"One fish Two fish Red fish Blue fish\n");
+
+        Ok(())
+    }
+
+    #[cfg(feature = "xz")]
+    #[async_test]
+    async fn decomp_xz_bad() -> RequestResult<()> {
+        // Not so good at tiny files...
+        let compressed = hex::decode("fd377a585a000004e6d6b446020021011c00000010cf58cce00024001d5d00279b88a202ca8612cfb3c19c87c34248a570451e4851d3323d34ab8000000000000901af64854c91f600013925d6ec06651fb6f37d010000000004595a").unwrap();
+        let limit = 10 << 20;
+        let (s, _) = decomp_basic(Some("x-tor-lzma"), &compressed, limit).await;
+        assert!(matches!(s, Err(RequestError::IoError(_))));
+
+        Ok(())
+    }
+
+    #[async_test]
+    async fn decomp_unknown() {
+        let compressed = hex::decode("28b52ffd24250d0100c84f6e6520666973682054776f526564426c756520666973680a0200600c0e2509478352cb").unwrap();
+        let limit = 10 << 20;
+        let (s, _r) = decomp_basic(Some("x-proprietary-rle"), &compressed, limit).await;
+
+        assert!(matches!(s, Err(RequestError::ContentEncoding(_))));
+    }
+
+    #[async_test]
+    async fn decomp_bad_data() {
+        let compressed = b"This is not good zlib data";
+        let limit = 10 << 20;
+        let (s, _r) = decomp_basic(Some("deflate"), compressed, limit).await;
+
+        // This should possibly be a different type in the future.
+        assert!(matches!(s, Err(RequestError::IoError(_))));
+    }
+
+    #[test]
+    fn headers_ok() -> RequestResult<()> {
+        let text = b"HTTP/1.0 200 OK\r\nDate: ignored\r\nContent-Encoding: Waffles\r\n\r\n";
+
+        let mut s = &text[..];
+        let h = tor_rtcompat::test_with_one_runtime!(async |rt| read_headers(&rt, &mut s).await)?;
+
+        assert_eq!(h.status, Some(200));
+        assert_eq!(h.encoding.as_deref(), Some("Waffles"));
+
+        // now try truncated
+        let mut s = &text[..15];
+        let h = tor_rtcompat::test_with_one_runtime!(async |rt| read_headers(&rt, &mut s).await);
+        assert!(matches!(h, Err(RequestError::TruncatedHeaders)));
+
+        // now try with no encoding.
+        let text = b"HTTP/1.0 404 Not found\r\n\r\n";
+        let mut s = &text[..];
+        let h = tor_rtcompat::test_with_one_runtime!(async |rt| read_headers(&rt, &mut s).await)?;
+
+        assert_eq!(h.status, Some(404));
+        assert!(h.encoding.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn headers_bogus() {
+        let text = b"HTTP/999.0 WHAT EVEN\r\n\r\n";
+        let mut s = &text[..];
+        let h = tor_rtcompat::test_with_one_runtime!(async |rt| read_headers(&rt, &mut s).await);
+
+        assert!(h.is_err());
+        assert!(matches!(h, Err(RequestError::HttparseError(_))));
+    }
+
+    /// Run a trivial download example with a response provided as a binary
+    /// string.
+    ///
+    /// Return the directory response (if any) and the request as encoded (if
+    /// any.)
+    fn run_download_test<Req: request::Requestable>(
+        req: Req,
+        response: &[u8],
+    ) -> (Result<DirResponse>, RequestResult<Vec<u8>>) {
+        let (mut s1, s2) = stream_pair();
+        let (mut s2_r, mut s2_w) = s2.split();
+
+        tor_rtcompat::test_with_one_runtime!(|rt| async move {
+            let rt2 = rt.clone();
+            let (v1, v2, v3): (
+                Result<DirResponse>,
+                RequestResult<Vec<u8>>,
+                RequestResult<()>,
+            ) = futures::join!(
+                async {
+                    // Run the download function.
+                    let r = send_request(&rt, &req, &mut s1, None).await;
+                    s1.close().await.map_err(|error| {
+                        Error::RequestFailed(RequestFailedError {
+                            source: None,
+                            error: error.into(),
+                        })
+                    })?;
+                    r
+                },
+                async {
+                    // Take the request from the client, and return it in "v2"
+                    let mut v = Vec::new();
+                    s2_r.read_to_end(&mut v).await?;
+                    Ok(v)
+                },
+                async {
+                    // Send back a response.
+                    s2_w.write_all(response).await?;
+                    // We wait a moment to give the other side time to notice it
+                    // has data.
+                    //
+                    // (Tentative diagnosis: The `async-compress` crate seems to
+                    // be behave differently depending on whether the "close"
+                    // comes right after the incomplete data or whether it comes
+                    // after a delay.  If there's a delay, it notices the
+                    // truncated data and tells us about it. But when there's
+                    // _no_delay, it treats the data as an error and doesn't
+                    // tell our code.)
+
+                    // TODO: sleeping in tests is not great.
+                    rt2.sleep(Duration::from_millis(50)).await;
+                    s2_w.close().await?;
+                    Ok(())
+                }
+            );
+
+            assert!(v3.is_ok());
+
+            (v1, v2)
+        })
+    }
+
+    #[test]
+    fn test_send_request() -> RequestResult<()> {
+        let req: request::MicrodescRequest = vec![[9; 32]].into_iter().collect();
+
+        let (response, request) = run_download_test(
+            req,
+            b"HTTP/1.0 200 OK\r\n\r\nThis is where the descs would go.",
+        );
+
+        let request = request?;
+        assert!(request[..].starts_with(
+            b"GET /tor/micro/d/CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk HTTP/1.0\r\n"
+        ));
+
+        let response = response.unwrap();
+        assert_eq!(response.status_code(), 200);
+        assert!(!response.is_partial());
+        assert!(response.error().is_none());
+        assert!(response.source().is_none());
+        let out_ref = response.output_unchecked();
+        assert_eq!(out_ref, b"This is where the descs would go.");
+        let out = response.into_output_unchecked();
+        assert_eq!(&out, b"This is where the descs would go.");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_download_truncated() {
+        // Request only one md, so "partial ok" will not be set.
+        let req: request::MicrodescRequest = vec![[9; 32]].into_iter().collect();
+        let mut response_text: Vec<u8> =
+            (*b"HTTP/1.0 200 OK\r\nContent-Encoding: deflate\r\n\r\n").into();
+        // "One fish two fish" as above twice, but truncated the second time
+        response_text.extend(
+            hex::decode("789cf3cf4b5548cb2cce500829cf8730825253200ca79c52881c00e5970c88").unwrap(),
+        );
+        response_text.extend(
+            hex::decode("789cf3cf4b5548cb2cce500829cf8730825253200ca79c52881c00e5").unwrap(),
+        );
+        let (response, request) = run_download_test(req, &response_text);
+        assert!(request.is_ok());
+        assert!(response.is_err()); // The whole download should fail, since partial_ok wasn't set.
+
+        // request two microdescs, so "partial_ok" will be set.
+        let req: request::MicrodescRequest = vec![[9; 32]; 2].into_iter().collect();
+
+        let (response, request) = run_download_test(req, &response_text);
+        assert!(request.is_ok());
+
+        let response = response.unwrap();
+        assert_eq!(response.status_code(), 200);
+        assert!(response.error().is_some());
+        assert!(response.is_partial());
+        assert!(response.output_unchecked().len() < 37 * 2);
+        assert!(response.output_unchecked().starts_with(b"One fish"));
+    }
+
+    #[test]
+    fn test_404() {
+        let req: request::MicrodescRequest = vec![[9; 32]].into_iter().collect();
+        let response_text = b"HTTP/1.0 418 I'm a teapot\r\n\r\n";
+        let (response, _request) = run_download_test(req, response_text);
+
+        assert_eq!(response.unwrap().status_code(), 418);
+    }
+
+    #[test]
+    fn test_headers_truncated() {
+        let req: request::MicrodescRequest = vec![[9; 32]].into_iter().collect();
+        let response_text = b"HTTP/1.0 404 truncation happens here\r\n";
+        let (response, _request) = run_download_test(req, response_text);
+
+        assert!(matches!(
+            response,
+            Err(Error::RequestFailed(RequestFailedError {
+                error: RequestError::TruncatedHeaders,
+                ..
+            }))
+        ));
+
+        // Try a completely empty response.
+        let req: request::MicrodescRequest = vec![[9; 32]].into_iter().collect();
+        let response_text = b"";
+        let (response, _request) = run_download_test(req, response_text);
+
+        assert!(matches!(
+            response,
+            Err(Error::RequestFailed(RequestFailedError {
+                error: RequestError::TruncatedHeaders,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn test_headers_too_long() {
+        let req: request::MicrodescRequest = vec![[9; 32]].into_iter().collect();
+        let mut response_text: Vec<u8> = (*b"HTTP/1.0 418 I'm a teapot\r\nX-Too-Many-As: ").into();
+        response_text.resize(16384, b'A');
+        let (response, _request) = run_download_test(req, &response_text);
+
+        assert!(response.as_ref().unwrap_err().should_retire_circ());
+        assert!(matches!(
+            response,
+            Err(Error::RequestFailed(RequestFailedError {
+                error: RequestError::HeadersTooLong(_),
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn test_bad_utf8() {
+        let req: request::MicrodescRequest = vec![[9; 32]].into_iter().collect();
+        let faulty_utf8 = vec![0, 159, 146, 150];
+
+        let mut response_text: Vec<u8> = b"HTTP/1.0 200 OK\r\n\r\n".into();
+        response_text.extend(faulty_utf8);
+
+        let (response, _request) = run_download_test(req, &response_text);
+
+        assert!(matches!(
+            response.unwrap().into_output_string().unwrap_err(),
+            RequestFailedError {
+                error: RequestError::Utf8Encoding(_),
+                ..
+            }
+        ));
+    }
+}

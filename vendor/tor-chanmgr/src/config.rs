@@ -419,7 +419,7 @@ pub struct ChannelConfig {
     /// Outbound proxy to use for all direct connections
     #[deftly(tor_config(
         default,
-        serde = r#" deserialize_with = "deserialize_outbound_proxy" "#
+        attr = serde(deserialize_with = "deserialize_outbound_proxy"),
     ))]
     pub(crate) outbound_proxy: Option<ProxyProtocol>,
 }
@@ -453,6 +453,7 @@ mod test {
     #![allow(clippy::unchecked_time_subtraction)]
     #![allow(clippy::useless_vec)]
     #![allow(clippy::needless_pass_by_value)]
+    #![allow(clippy::string_slice)] // See arti#2571
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
     use super::*;
 

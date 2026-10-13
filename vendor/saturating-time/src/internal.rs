@@ -73,7 +73,8 @@ impl SaturatingTime for SystemTime {
 
 impl SaturatingTime for Instant {
     fn anchor() -> Self {
-        Self::now()
+        use web_time_compat::InstantExt;
+        Self::get()
     }
 
     fn max_value() -> Self {
@@ -133,15 +134,7 @@ where
     const INITIAL_STEP: Duration = Duration::new(1_000_000_000_000_000_000, 0);
     const ONE_NS: Duration = Duration::new(0, 1);
 
-    // NOTE (tor-socks5): this search does NOT terminate on every platform — on
-    // Windows `SystemTime::checked_add` does not report overflow with `None`
-    // for the 10^18s initial step, so `None` is never reached, `step` never
-    // shrinks, and this spins forever at 100% CPU. We do not "fix" the search
-    // (a wrong/approximate limit would be worse than not having one); instead
-    // the public `saturating_add`/`saturating_sub` were changed to call this
-    // only on a genuine overflow (lazy `unwrap_or_else`), which never happens
-    // for real wall-clock values. The two tests that force this path directly
-    // are `#[ignore]`d on that basis.
+    // (1) Set step to INITIAL_STEP and res to T::anchor().
     let mut step = INITIAL_STEP;
     let mut res = T::anchor();
 
@@ -151,7 +144,7 @@ where
         match next {
             Some(st) => {
                 // (2.1) If Some, set res to the returned value and continue.
-                res = st
+                res = st;
             }
             None => {
                 if step == ONE_NS {
@@ -168,6 +161,21 @@ where
 
 #[cfg(test)]
 mod tests {
+    // @@ begin test lint list maintained by maint/add_warning @@
+    #![allow(clippy::bool_assert_comparison)]
+    #![allow(clippy::clone_on_copy)]
+    #![allow(clippy::dbg_macro)]
+    #![allow(clippy::mixed_attributes_style)]
+    #![allow(clippy::print_stderr)]
+    #![allow(clippy::print_stdout)]
+    #![allow(clippy::single_char_pattern)]
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unchecked_time_subtraction)]
+    #![allow(clippy::useless_vec)]
+    #![allow(clippy::needless_pass_by_value)]
+    #![allow(clippy::string_slice)] // See arti#2571
+    //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
+
     use std::{
         fmt::Debug,
         ops::{Add, Sub},
@@ -215,10 +223,7 @@ mod tests {
 
     /// Verifies [`SystemTime::min_value()`] and [`SystemTime::max_value()`] are
     /// correct.
-    // tor-socks5: forces the SystemTime limit search, which does not terminate
-    // on Windows (see `find_limit`); ignored so it doesn't hang `cargo test`.
     #[test]
-    #[ignore = "forces non-terminating SystemTime limit search on Windows (see find_limit)"]
     fn system_time_min_max() {
         min_max::<SystemTime>();
     }

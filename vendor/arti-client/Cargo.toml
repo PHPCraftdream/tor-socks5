@@ -11,12 +11,9 @@
 
 [package]
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.92"
 name = "arti-client"
-# Upstream-owned crates.io name; this is a locally-patched fork — publishing
-# it would hijack another project's crate.
-publish = false
-version = "0.43.0"
+version = "0.47.0"
 authors = [
     "The Tor Project, Inc.",
     "Nick Mathewson <nickm@torproject.org>",
@@ -64,15 +61,6 @@ bridge-client = [
     "tor-dirmgr/bridge-client",
 ]
 compression = ["tor-dirmgr/compression"]
-counter-galois-onion = [
-    "tor-proto/counter-galois-onion",
-    "flowctl-cc",
-    "__is_experimental",
-]
-ctor-keystore = [
-    "tor-keymgr/ctor-keystore",
-    "__is_experimental",
-]
 default = [
     "tokio",
     "native-tls",
@@ -90,7 +78,8 @@ error_detail = ["__is_experimental"]
 experimental = [
     "dirfilter",
     "ephemeral-keystore",
-    "ctor-keystore",
+    "hsc-negotiate-extensions",
+    "hss-negotiate-extensions",
     "experimental-api",
     "error_detail",
     "geoip",
@@ -106,11 +95,9 @@ experimental = [
     "tor-keymgr/experimental",
     "restricted-discovery",
     "onion-service-cli-extra",
-    "counter-galois-onion",
     "smol",
 ]
 experimental-api = ["__is_experimental"]
-flowctl-cc = ["tor-circmgr/flowctl-cc"]
 full = [
     "anyhow",
     "keymgr",
@@ -125,7 +112,6 @@ full = [
     "bridge-client",
     "pt-client",
     "rpc",
-    "flowctl-cc",
     "tor-rtcompat/full",
     "tor-proto/full",
     "tor-netdoc/full",
@@ -167,6 +153,14 @@ hs-pow-full = [
     "tor-hsservice?/hs-pow-full",
     "__is_experimental",
 ]
+hsc-negotiate-extensions = [
+    "tor-hsclient?/negotiate-extensions",
+    "__is_experimental",
+]
+hss-negotiate-extensions = [
+    "tor-hsservice?/negotiate-extensions",
+    "__is_experimental",
+]
 keymgr = [
     "tor-keymgr/keymgr",
     "tor-hsclient/keymgr",
@@ -200,7 +194,7 @@ restricted-discovery = [
 ]
 rpc = [
     "dyn-clone",
-    "tor-rpcbase",
+    "dep:tor-rpcbase",
 ]
 rustls = [
     "tor-rtcompat/rustls",
@@ -229,6 +223,7 @@ testing = [
     "visibility",
 ]
 tokio = [
+    "tor-async-utils/tokio",
     "tor-rtcompat/tokio",
     "tor-proto/tokio",
 ]
@@ -280,7 +275,7 @@ version = "0.1.54"
 version = "1.0.0"
 
 [dependencies.derive-deftly]
-version = "~1.11.0"
+version = "~1.12.0"
 features = [
     "full",
     "beta",
@@ -302,7 +297,7 @@ optional = true
 version = "0.4.22"
 
 [dependencies.fs-mistrust]
-version = "0.14.2"
+version = "0.16.0"
 features = ["serde"]
 
 [dependencies.futures]
@@ -332,7 +327,7 @@ default-features = false
 version = "0.10.1"
 
 [dependencies.safelog]
-version = "0.8.2"
+version = "0.10.0"
 
 [dependencies.serde]
 version = "1.0.103"
@@ -349,93 +344,93 @@ features = [
 ]
 
 [dependencies.tor-async-utils]
-version = "0.43.0"
+version = "0.47.0"
 
 [dependencies.tor-basic-utils]
-version = "0.43.0"
+version = "0.47.0"
 
 [dependencies.tor-chanmgr]
-version = "0.43.0"
+version = "0.47.0"
 
 [dependencies.tor-circmgr]
-version = "0.43.0"
+version = "0.47.0"
 
 [dependencies.tor-config]
-version = "0.43.0"
+version = "0.47.0"
 
 [dependencies.tor-config-path]
-version = "0.43.0"
+version = "0.47.0"
 features = ["arti-client"]
 
 [dependencies.tor-dircommon]
-version = "0.43.0"
+version = "0.47.0"
 
 [dependencies.tor-dirmgr]
-version = "0.43.0"
+version = "0.47.0"
 features = ["mmap"]
 default-features = false
 
 [dependencies.tor-error]
-version = "0.43.0"
+version = "0.47.0"
 features = ["tracing"]
 
 [dependencies.tor-geoip]
-version = "0.43.0"
+version = "0.47.0"
 optional = true
 
 [dependencies.tor-guardmgr]
-version = "0.43.0"
+version = "0.47.0"
 
 [dependencies.tor-hsclient]
-version = "0.43.0"
+version = "0.47.0"
 optional = true
 
 [dependencies.tor-hscrypto]
-version = "0.43.0"
+version = "0.47.0"
 optional = true
 
 [dependencies.tor-hsservice]
-version = "0.43.0"
+version = "0.47.0"
 optional = true
 
 [dependencies.tor-keymgr]
-version = "0.43.0"
+version = "0.47.0"
 default-features = false
 
 [dependencies.tor-linkspec]
-version = "0.43.0"
+version = "0.47.0"
 
 [dependencies.tor-llcrypto]
-version = "0.43.0"
+version = "0.47.0"
 
 [dependencies.tor-memquota]
-version = "0.43.0"
+version = "0.47.0"
 
 [dependencies.tor-netdir]
-version = "0.43.0"
+version = "0.47.0"
 
 [dependencies.tor-netdoc]
-version = "0.43.0"
+version = "0.47.0"
 
 [dependencies.tor-persist]
-version = "0.43.0"
+version = "0.47.0"
 
 [dependencies.tor-proto]
-version = "0.43.0"
+version = "0.47.0"
 
 [dependencies.tor-protover]
-version = "0.43.0"
+version = "0.47.0"
 
 [dependencies.tor-ptmgr]
-version = "0.43.0"
+version = "0.47.0"
 optional = true
 
 [dependencies.tor-rpcbase]
-version = "0.43.0"
+version = "0.47.0"
 optional = true
 
 [dependencies.tor-rtcompat]
-version = "0.43.0"
+version = "0.47.0"
 
 [dependencies.tracing]
 version = "0.1.36"
@@ -448,7 +443,7 @@ optional = true
 version = "1"
 
 [dependencies.web-time-compat]
-version = "0.1.0"
+version = "0.3.0"
 
 [dev-dependencies.anyhow]
 version = "1.0.23"
@@ -464,7 +459,7 @@ version = "0.28.0"
 features = ["derive"]
 
 [dev-dependencies.tokio-crate]
-version = "1.7"
+version = "1.47.1"
 features = [
     "rt",
     "rt-multi-thread",
@@ -472,7 +467,6 @@ features = [
     "net",
     "time",
     "macros",
-    "test-util",
 ]
 package = "tokio"
 
@@ -480,10 +474,10 @@ package = "tokio"
 version = "1.0.3"
 
 [dev-dependencies.tor-relay-selection]
-version = "0.43.0"
+version = "0.47.0"
 
 [dev-dependencies.tor-rtcompat]
-version = "0.43.0"
+version = "0.47.0"
 features = [
     "tokio",
     "native-tls",
@@ -496,7 +490,7 @@ version = "0.3.20"
 version = "0.2.4"
 
 [target.'cfg(all(target_arch="wasm32", target_os="unknown"))'.dependencies.tor-persist]
-version = "0.43.0"
+version = "0.47.0"
 features = ["testing"]
 
 [target.'cfg(not(all(target_arch="wasm32", target_os="unknown")))'.dependencies.tempfile]

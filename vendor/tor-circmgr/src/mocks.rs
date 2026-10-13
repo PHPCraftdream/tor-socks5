@@ -230,7 +230,6 @@ impl<RT: Runtime> AbstractTunnelBuilder<RT> for FakeBuilder<RT> {
 }
 
 impl<RT: Runtime> FakeBuilder<RT> {
-    #[cfg_attr(not(feature = "vanguards"), allow(clippy::needless_pass_by_value))]
     pub(crate) fn new<S>(rt: &RT, state_mgr: S, guard_config: &TestConfig) -> Self
     where
         S: StateMgr + Send + Sync + 'static,

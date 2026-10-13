@@ -20,17 +20,17 @@ readme = "README.md"
 authors = ["PHPCraftdream <noreply@users.noreply.github.com>"]
 keywords = ["tor", "socks5", "proxy", "bridges", "anonymity"]
 categories = ["network-programming", "command-line-utilities"]
-rust-version = "1.89"
+rust-version = "1.92"
 
 [workspace.dependencies]
-arti-client = { version = "0.43", default-features = false, features = ["tokio", "rustls", "onion-service-client", "static-sqlite", "bridge-client", "pt-client", "experimental-api"] }
-tor-rtcompat = { version = "0.43", default-features = false, features = ["tokio", "rustls"] }
-tor-error = "0.43"
-tor-chanmgr = { version = "0.43", default-features = false, features = ["pt-client"] }
-tor-guardmgr = { version = "0.43", default-features = false, features = ["bridge-client", "pt-client"] }
+arti-client = { version = "0.47", default-features = false, features = ["tokio", "rustls", "onion-service-client", "static-sqlite", "bridge-client", "pt-client", "experimental-api"] }
+tor-rtcompat = { version = "0.47", default-features = false, features = ["tokio", "rustls"] }
+tor-error = "0.47"
+tor-chanmgr = { version = "0.47", default-features = false, features = ["pt-client"] }
+tor-guardmgr = { version = "0.47", default-features = false, features = ["bridge-client", "pt-client"] }
 # Already in the dependency graph (arti pulls it); declared directly so
 # arti-wrapper can compare a channel's actual ChanMethod with the requested one.
-tor-linkspec = { version = "0.43", default-features = false, features = ["pt-client"] }
+tor-linkspec = { version = "0.47", default-features = false, features = ["pt-client"] }
 
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 

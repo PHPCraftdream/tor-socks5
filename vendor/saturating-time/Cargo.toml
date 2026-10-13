@@ -11,13 +11,13 @@
 
 [package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.92"
 name = "saturating-time"
-# Upstream-owned crates.io name; this is a locally-patched fork — publishing
-# it would hijack another project's crate.
-publish = false
-version = "0.3.0"
-authors = ["Clara Engler"]
+version = "0.5.0"
+authors = [
+    "The Tor Project, Inc.",
+    "Clara Engler <cve@torproject.org>",
+]
 build = false
 autolib = false
 autobins = false
@@ -38,13 +38,17 @@ categories = [
     "rust-patterns",
 ]
 license = "MIT OR Apache-2.0"
-repository = "https://codeberg.org/cve/saturating-time"
+repository = "https://gitlab.torproject.org/tpo/core/arti.git"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+full = ["web-time-compat/full"]
 
 [lib]
 name = "saturating_time"
 path = "src/lib.rs"
-# tor-socks5: the upstream doc examples call `SystemTime::max_value()` /
-# `min_value()`, whose limit search does not terminate on Windows (see
-# internal::find_limit). They would hang `cargo test`, so doctests are disabled
-# for this vendored copy.
-doctest = false
+
+[dependencies.web-time-compat]
+version = "0.3.0"
