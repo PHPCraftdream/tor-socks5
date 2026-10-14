@@ -363,7 +363,9 @@ if [ "$kind" = "test" ] || [ "$kind" = "all" ]; then
 		run_cmd cargo test $args || rc=$?
 	fi
 	if [ "$rc" -eq 0 ]; then
-		run_cmd cargo test --doc $args || rc=$?
+		doc_args=$(printf '%s' "$args" | sed 's/-p saturating-time//g')
+		[ -n "${doc_args// /}" ] || doc_args="--workspace --exclude saturating-time"
+		run_cmd cargo test --doc $doc_args || rc=$?
 	fi
 fi
 if { [ "$kind" = "clippy" ] || [ "$kind" = "all" ]; } && [ "$rc" -eq 0 ]; then

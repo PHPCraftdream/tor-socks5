@@ -51,7 +51,7 @@ run_full() {
 	else
 		run_cmd cargo test --locked --workspace
 	fi
-	run_cmd cargo test --doc --workspace --locked
+	run_cmd cargo test --doc --workspace --exclude saturating-time --locked
 	echo "pre-push: OK (T2)"
 }
 

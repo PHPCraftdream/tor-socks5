@@ -105,6 +105,8 @@ cargo nextest run -p tor-socks5-config
 cargo test --doc -p tor-socks5-config
 ```
 
+`saturating-time` is excluded from doctest runs: its examples call `SystemTime::max_value()`, whose limit search never terminates on Windows (`doctest = false` in its manifest, but `cargo test --doc` ignores that flag and would hang).
+
 ## CI
 
 `.github/workflows/ci.yml` mirrors the tiers:
