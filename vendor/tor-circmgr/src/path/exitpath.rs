@@ -189,6 +189,11 @@ impl AnonymousPathBuilder for ExitPathBuilder {
         Ok((relay, RelayUsage::middle_relay(Some(selector.usage()))))
     }
 
+    // tor-socks5 local patch: ordinary exit builders honor circuit_hops.
+    fn circuit_hops(&self, config: &PathConfig) -> u8 {
+        config.circuit_hops()
+    }
+
     fn path_kind(&self) -> &'static str {
         use ExitPathBuilderInner::*;
         match &self.inner {
@@ -278,6 +283,41 @@ mod test {
         assert!(r1.can_share_circuit(r2, subnet_config, family_rules));
         assert!(r2.can_share_circuit(r3, subnet_config, family_rules));
         assert!(r1.can_share_circuit(r3, subnet_config, family_rules));
+    }
+
+    // tor-socks5 local patch: two-hop ordinary exit paths contain a guard and usable exit.
+    #[test]
+    fn two_hop_exit_path() {
+        tor_rtcompat::test_with_all_runtimes!(|rt| async move {
+            let netdir = testnet::construct_netdir().unwrap_if_sufficient().unwrap();
+            let family_rules = FamilyRules::all_family_info();
+            let mut rng = testing_rng();
+            let dirinfo = (&netdir).into();
+            let statemgr = TestingStateMgr::new();
+            let guards =
+                tor_guardmgr::GuardMgr::new(rt.clone(), statemgr, &TestConfig::default()).unwrap();
+            guards.install_test_netdir(&netdir);
+            let config = PathConfig::builder().circuit_hops(2).build().unwrap();
+            let (path, _, _) = ExitPathBuilder::from_target_ports(vec![TargetPort::ipv4(443)])
+                .pick_path(&mut rng, dirinfo, &guards, &config, rt.wallclock())
+                .unwrap();
+            assert_eq!(path.len(), 2);
+            if let TorPathInner::Path(p) = path.inner {
+                assert_eq!(p.len(), 2);
+                if let MaybeOwnedRelay::Relay(guard) = &p[0] {
+                    assert!(guard.low_level_details().is_suitable_as_guard());
+                }
+                assert!(!p[0].same_relay_ids(&p[1]));
+                assert!(p[0].can_share_circuit(&p[1], SubnetConfig::default(), family_rules));
+                let exit = match &p[1] {
+                    MaybeOwnedRelay::Relay(r) => r,
+                    MaybeOwnedRelay::Owned(_) => panic!("unexpected owned exit"),
+                };
+                assert!(exit.low_level_details().ipv4_policy().allows_port(443));
+            } else {
+                panic!("Wrong kind of path");
+            }
+        });
     }
 
     #[test]

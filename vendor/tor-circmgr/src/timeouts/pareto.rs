@@ -564,8 +564,23 @@ impl super::TimeoutEstimator for ParetoTimeoutEstimator {
     }
 
     fn note_hop_completed(&mut self, hop: u8, delay: Duration, is_last: bool) {
-        if hop == self.p.significant_hop {
-            let time = MsecDuration::new_saturating(&delay);
+        let time = if hop == self.p.significant_hop {
+            Some(delay)
+        } else if is_last && hop > 0 && hop < self.p.significant_hop {
+            // tor-socks5 local patch: normalize short-path observations to canonical three-hop work.
+            // Histograms persist canonical three-hop units; v1 history remains compatible, with no version bump.
+            // Existing timeout minimums are intentionally unchanged.
+            let significant_len = f64::from(self.p.significant_hop) + 1.0;
+            let observed_len = f64::from(hop) + 1.0;
+            Some(super::mul_duration_f64_saturating(
+                delay,
+                significant_len * (significant_len + 1.0) / (observed_len * (observed_len + 1.0)),
+            ))
+        } else {
+            None
+        };
+        if let Some(time) = time {
+            let time = MsecDuration::new_saturating(&time);
             self.history.add_time(time);
             self.timeouts.take();
         }
@@ -921,6 +936,103 @@ mod test {
         assert!((q99 - 724.841) < 0.001);
     }
 
+    /// tor-socks5 local patch: canonical 3-hop samples; short completed paths normalized to this scale.
+    #[test]
+    fn two_hop_completion_is_normalized_and_invalidates_cache() {
+        let mut est = ParetoTimeoutEstimator::default();
+        est.p.min_observations = 1;
+        est.p.n_modes_for_xm = 1;
+        est.history.add_time(MsecDuration(100));
+        let cached = est.base_timeouts();
+        est.note_hop_completed(1, Duration::from_millis(100), true);
+        assert_eq!(est.history.n_times(), 2);
+        assert_eq!(
+            est.history.time_history.inner.back(),
+            Some(&MsecDuration(200))
+        );
+        assert_ne!(est.timeouts, Some(cached));
+        assert!(!est.learning_timeouts());
+    }
+
+    // tor-socks5 local patch: zero-index hop zero must not supply timing samples, even if last.
+    #[test]
+    fn hop_zero_is_never_sampled() {
+        let mut est = ParetoTimeoutEstimator::default();
+        est.note_hop_completed(0, Duration::from_secs(1), false);
+        est.note_hop_completed(0, Duration::from_secs(1), true);
+        assert_eq!(est.history.n_times(), 0);
+    }
+
+    // tor-socks5 local patch: short completions count toward the minimum observation threshold.
+    #[test]
+    fn short_path_learning_obeys_min_observations() {
+        let mut est = ParetoTimeoutEstimator::default();
+        est.p.min_observations = 6;
+        est.p.n_modes_for_xm = 1;
+        for _ in 0..5 {
+            est.note_hop_completed(1, Duration::from_millis(100), true);
+        }
+        assert_eq!(est.history.n_times(), 5);
+        assert!(est.learning_timeouts());
+        est.note_hop_completed(1, Duration::from_millis(150), true);
+        assert_eq!(est.history.n_times(), 6);
+        assert!(!est.learning_timeouts());
+        assert_ne!(
+            est.timeouts(&b3()),
+            (Duration::from_secs(60), Duration::from_secs(60))
+        );
+    }
+    // tor-socks5 local patch: mixed canonical samples and v1 history remain compatible.
+    #[test]
+    fn mixed_lengths_preserve_v1_persisted_history() {
+        let mut est = ParetoTimeoutEstimator::default();
+        for _ in 0..50 {
+            est.note_hop_completed(1, Duration::from_millis(100), true);
+            est.note_hop_completed(2, Duration::from_millis(200), true);
+        }
+        // Existing version-1 histograms already use canonical three-hop build-time units.
+        let old_state = ParetoTimeoutState {
+            version: 1,
+            histogram: vec![(MsecDuration(205), 7)],
+            current_timeout: None,
+            unknown_fields: Default::default(),
+        };
+        let loaded = ParetoTimeoutEstimator::from_state(old_state);
+        assert_eq!(
+            loaded.history.sparse_histogram().collect::<Vec<_>>(),
+            vec![(MsecDuration(205), 7)]
+        );
+        assert_eq!(est.history.n_times(), 100);
+        assert!(
+            est.history
+                .time_history
+                .iter()
+                .all(|d| *d == MsecDuration(200))
+        );
+        let expected: Vec<_> = est.history.sparse_histogram().collect();
+        assert_eq!(expected, vec![(MsecDuration(205), 100)]);
+        let state = est.build_state().unwrap();
+        assert_eq!(state.histogram, expected);
+        let reloaded = ParetoTimeoutEstimator::from_state(state);
+        assert_eq!(
+            reloaded.history.sparse_histogram().collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    // tor-socks5 local patch: longer HS paths retain the one significant-hop sample, no final-hop duplicate.
+    #[test]
+    fn longer_completion_samples_only_significant_hop() {
+        let mut est = ParetoTimeoutEstimator::default();
+        est.note_hop_completed(2, Duration::from_millis(100), false);
+        est.note_hop_completed(3, Duration::from_millis(200), false);
+        est.note_hop_completed(4, Duration::from_millis(300), true);
+        assert_eq!(est.history.n_times(), 1);
+        assert_eq!(
+            est.history.time_history.inner.front(),
+            Some(&MsecDuration(100))
+        );
+    }
     #[test]
     fn pareto_estimate_timeout() {
         let mut est = ParetoTimeoutEstimator::default();
