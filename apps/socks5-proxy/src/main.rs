@@ -28,7 +28,7 @@ mod fetch_merge;
 #[path = "commands/help_cmd.rs"]
 mod help_cmd;
 #[cfg(feature = "onion-service")]
-#[path = "onion/mod.rs"]
+#[path = "commands/onion/mod.rs"]
 mod onion;
 #[path = "fetch/seed.rs"]
 mod seed;

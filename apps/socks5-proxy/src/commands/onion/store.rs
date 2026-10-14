@@ -143,8 +143,13 @@ pub(crate) fn remove_all(keystore_dir: &Path, nick: &HsNickname) -> Result<()> {
 /// expanded ed25519 keypair is rejected.
 pub(crate) fn parse_identity_file(bytes: &[u8], nick: &HsNickname) -> Result<HsIdKeypair> {
     let staging = tempfile::tempdir().context("creating a staging keystore")?;
-    let store = ArtiNativeKeystore::from_path_and_mistrust(staging.path(), &Mistrust::new())
-        .context("creating a staging keystore")?;
+    // Throwaway directory we just created: its parent (e.g. a shared /tmp) must
+    // not fail the permission check.
+    let store = ArtiNativeKeystore::from_path_and_mistrust(
+        staging.path(),
+        &Mistrust::new_dangerously_trust_everyone(),
+    )
+    .context("creating a staging keystore")?;
     let rel = format!("hss/{}/ks_hs_id.{EXPANDED_PRIVATE_EXT}", nick);
     let path = staging.path().join(&rel);
     std::fs::create_dir_all(path.parent().expect("keystaging parent"))?;
