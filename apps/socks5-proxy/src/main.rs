@@ -27,6 +27,9 @@ mod dns_wiring;
 mod fetch_merge;
 #[path = "commands/help_cmd.rs"]
 mod help_cmd;
+// Vanity v3 onion address core; wired into the CLI by follow-up work.
+#[allow(dead_code)]
+mod onion;
 #[path = "fetch/seed.rs"]
 mod seed;
 #[path = "server/server.rs"]
