@@ -27,7 +27,8 @@ mod dns_wiring;
 mod fetch_merge;
 #[path = "commands/help_cmd.rs"]
 mod help_cmd;
-#[cfg(feature = "onion-service")]
+// Onion helpers: the address/vanity core is not wired into the CLI yet.
+#[allow(dead_code)]
 #[path = "commands/onion/mod.rs"]
 mod onion;
 #[path = "fetch/seed.rs"]

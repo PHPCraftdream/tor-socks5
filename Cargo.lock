@@ -5355,6 +5355,8 @@ dependencies = [
  "clap",
  "criterion",
  "daemonize",
+ "data-encoding",
+ "ed25519-dalek",
  "fs-mistrust",
  "futures",
  "getrandom 0.2.17",
@@ -5371,6 +5373,8 @@ dependencies = [
  "serde",
  "serde_json",
  "service-manager",
+ "sha2",
+ "sha3 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "time",
@@ -5390,6 +5394,7 @@ dependencies = [
  "tracing-subscriber",
  "windows-service",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
