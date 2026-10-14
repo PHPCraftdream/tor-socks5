@@ -131,8 +131,12 @@ a shorter, ready-to-edit subset of the same defaults; any key you omit keeps the
 ## AddrInUse, PermissionDenied and AddrNotAvailable are skipped with
 ## WARN and a reason. At least one bound listener serves; all failing
 ## is an error. Other bind errors remain hard failures.
-## Occupied ports are never taken over. No automatic retry is implemented
-## (LST-05), including for in-use or permission-denied addresses.
+## An address skipped because it was unavailable at startup is retried
+## every fixed 30 seconds; if it binds, it serves SOCKS5 and HTTP CONNECT.
+## Occupied or permission-denied addresses are not retried periodically;
+## ports are never seized or reused. Retry is server-scoped and stops at
+## shutdown. Startup still fails if every address fails. Already-bound
+## addresses are not monitored or rebound.
 listen: [
     127.0.0.1:1080
 ]
@@ -213,8 +217,11 @@ dns_server.enabled: false
 ## Each value accepts host1,host2:port; IPv6 must be bracketed:
 ## dns_server.listen: 127.0.0.1,[::1]:15353
 ## Expand/deduplicate keeping the first occurrence; writeback uses a list.
-## The same skip-unavailable and no-automatic-retry rules above apply.
-## At least one complete pair must bind; never serve a half-bound pair.
+## An unavailable address is retried every fixed 30 seconds; if it binds,
+## serve an atomic UDP+TCP pair. Occupied or permission-denied addresses
+## are not periodically retried. No port seizure or reuse tricks; retry is
+## server-scoped and stops at shutdown. Startup still fails if every address
+## fails. Already-bound addresses are not monitored or rebound.
 ## Local policy and recursion guards use only successfully bound endpoints.
 dns_server.listen: [
     127.0.0.1:15353

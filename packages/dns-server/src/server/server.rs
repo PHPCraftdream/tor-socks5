@@ -4,7 +4,7 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -16,7 +16,7 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::Semaphore;
 use tokio::time::{interval, timeout_at, Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::cache::DnsCache;
 use crate::doh_client::resolve_with_pool;
@@ -42,6 +42,7 @@ mod wire;
 const MAX_DNS_CONCURRENT_QUERIES: usize = 64;
 const RESOLUTION_TIMEOUT: Duration = Duration::from_secs(30);
 const CACHE_SAVE_INTERVAL: Duration = Duration::from_secs(300);
+const LISTENER_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 struct QueryCtx<T> {
     tunnel: T,
@@ -49,7 +50,7 @@ struct QueryCtx<T> {
     providers: Arc<Vec<DohProvider>>,
     overrides: Arc<Vec<DnsOverride>>,
     /// Actual UDP and TCP endpoints, never configured port-zero placeholders.
-    endpoints: Arc<Vec<SocketAddr>>,
+    endpoints: Arc<RwLock<Vec<SocketAddr>>>,
     route_probe: local::RouteProbe,
     statistics: Option<QueryStatistics>,
 }
@@ -86,7 +87,13 @@ where
     T: Fn() -> F + Send + Clone + 'static,
     F: Future<Output = Option<TorTunnel>> + Send + 'static,
 {
-    let (udp_sockets, tcp_listeners, endpoints) = bind_listeners(listen).await?;
+    let bound = bind_listeners(listen).await?;
+    let BoundListeners {
+        udp: udp_sockets,
+        tcp: tcp_listeners,
+        endpoints,
+        retry,
+    } = bound;
     let (statistics, worker) = match StatisticsWorker::open(StatisticsPaths::from_cache_path(
         &cache_path,
     ))
@@ -103,12 +110,12 @@ where
         cache: cache.clone(),
         providers: Arc::new(providers),
         overrides: Arc::new(overrides),
-        endpoints: Arc::new(endpoints),
+        endpoints: Arc::new(RwLock::new(endpoints)),
         route_probe: local::route_probe(),
         statistics,
     };
     serve_owned_lifecycle(
-        (udp_sockets, tcp_listeners),
+        (udp_sockets, tcp_listeners, retry),
         ctx,
         worker,
         shutdown,
@@ -130,7 +137,7 @@ where
 /// cancel-safe: NO — forced drop cannot await statistics or cache publication;
 /// explicit cancellation stops networking, joins prefetch, then awaits the drain.
 async fn serve_owned_lifecycle<T, F, Drain, Drained, Stopped, Make, Save>(
-    listeners: (Vec<Arc<UdpSocket>>, Vec<TcpListener>),
+    listeners: (Vec<Arc<UdpSocket>>, Vec<TcpListener>, Vec<String>),
     ctx: QueryCtx<T>,
     worker: Option<StatisticsWorker>,
     shutdown: CancellationToken,
@@ -147,27 +154,21 @@ where
     Make: FnMut() -> Save,
     Save: Future<Output = Result<(), DnsServerError>>,
 {
-    let (udp_sockets, tcp_listeners) = listeners;
+    let (udp_sockets, tcp_listeners, retry) = listeners;
     let backend = Arc::new(Semaphore::new(MAX_DNS_CONCURRENT_QUERIES));
     let connections = Arc::new(Semaphore::new(listener::MAX_TCP_CONNECTIONS));
-    let mut udp_loops = udp_sockets
-        .into_iter()
-        .map(|socket| listener::udp_loop(socket, ctx.clone(), backend.clone()))
-        .collect::<FuturesUnordered<_>>();
-    let mut tcp_loops = tcp_listeners
-        .into_iter()
-        .map(|socket| listener::tcp_loop(socket, ctx.clone(), backend.clone(), connections.clone()))
-        .collect::<FuturesUnordered<_>>();
     let refresh_ctx = ctx.clone();
     let refresh_backend = backend.clone();
+    let networking = run_networking(
+        udp_sockets,
+        tcp_listeners,
+        retry.into_iter().map(retry_listener_pair),
+        ctx,
+        backend,
+        connections,
+    );
     serve_with_saves(
         async move {
-            let networking = async move {
-                tokio::select! {
-                    _ = udp_loops.next() => Err(anyhow::anyhow!("UDP DNS listener loop exited unexpectedly")),
-                    _ = tcp_loops.next() => Err(anyhow::anyhow!("TCP DNS listener loop exited unexpectedly")),
-                }
-            };
             let mut networking = Box::pin(networking);
             let stop_prefetch = CancellationToken::new();
             let mut worker = worker;
@@ -218,7 +219,54 @@ where
     ).await
 }
 
-type BoundListeners = (Vec<Arc<UdpSocket>>, Vec<TcpListener>, Vec<SocketAddr>);
+/// Owns networking under the lifecycle's cancellation select.
+/// cancel-safe: yes — dropping it drops all listener and retry futures.
+async fn run_networking<T, F, R, I>(
+    udp_sockets: Vec<Arc<UdpSocket>>,
+    tcp_listeners: Vec<TcpListener>,
+    retry: I,
+    ctx: QueryCtx<T>,
+    backend: Arc<Semaphore>,
+    connections: Arc<Semaphore>,
+) -> Result<()>
+where
+    T: Fn() -> F + Send + Clone + 'static,
+    F: Future<Output = Option<TorTunnel>> + Send + 'static,
+    R: Future<Output = ListenerPair>,
+    I: IntoIterator<Item = R>,
+{
+    let mut udp_loops: FuturesUnordered<_> = udp_sockets
+        .into_iter()
+        .map(|socket| listener::udp_loop(socket, ctx.clone(), backend.clone()))
+        .collect::<FuturesUnordered<_>>();
+    let mut tcp_loops: FuturesUnordered<_> = tcp_listeners
+        .into_iter()
+        .map(|socket| listener::tcp_loop(socket, ctx.clone(), backend.clone(), connections.clone()))
+        .collect::<FuturesUnordered<_>>();
+    let mut retries: FuturesUnordered<R> = retry.into_iter().collect();
+    loop {
+        tokio::select! {
+            _ = udp_loops.next() => return Err(anyhow::anyhow!("UDP DNS listener loop exited unexpectedly")),
+            _ = tcp_loops.next() => return Err(anyhow::anyhow!("TCP DNS listener loop exited unexpectedly")),
+            pair = retries.next(), if !retries.is_empty() => {
+                if let Some((addr, udp, tcp)) = pair {
+                    publish_listener_endpoints(&ctx, &udp, &tcp)?;
+                    info!(listen_addr = %addr, "DNS listener pair recovered");
+                    udp_loops.push(listener::udp_loop(Arc::new(udp), ctx.clone(), backend.clone()));
+                    tcp_loops.push(listener::tcp_loop(tcp, ctx.clone(), backend.clone(), connections.clone()));
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BoundListeners {
+    udp: Vec<Arc<UdpSocket>>,
+    tcp: Vec<TcpListener>,
+    endpoints: Vec<SocketAddr>,
+    retry: Vec<String>,
+}
 
 /// cancel-safe: yes — every bind owns its pair; errors/cancellation drop all
 /// accumulated sockets, and a failed TCP bind releases its UDP half.
@@ -230,6 +278,7 @@ async fn bind_listeners(listen: &[String]) -> Result<BoundListeners> {
     let mut tcp_listeners = Vec::with_capacity(listen.len());
     let mut endpoints = Vec::with_capacity(listen.len() * 2);
     let mut skipped = Vec::new();
+    let mut retry = Vec::new();
     for addr in listen {
         let (udp, tcp) = match bind_pair(addr).await {
             Ok(pair) => pair,
@@ -239,6 +288,9 @@ async fn bind_listeners(listen: &[String]) -> Result<BoundListeners> {
                         os_error = ?reason.raw_os_error(), os_reason = %reason,
                         "skipping unavailable DNS listener pair");
                     skipped.push(format!("{addr}: {error:#} (kind: {:?})", reason.kind()));
+                    if reason.kind() == std::io::ErrorKind::AddrNotAvailable {
+                        retry.push(addr.clone());
+                    }
                     continue;
                 }
                 None => return Err(error),
@@ -256,7 +308,12 @@ async fn bind_listeners(listen: &[String]) -> Result<BoundListeners> {
             skipped.join("; ")
         );
     }
-    Ok((udp_sockets, tcp_listeners, endpoints))
+    Ok(BoundListeners {
+        udp: udp_sockets,
+        tcp: tcp_listeners,
+        endpoints,
+        retry,
+    })
 }
 
 // Only bind failures are eligible, never address parsing or option/getter errors.
@@ -280,6 +337,45 @@ fn skipped_bind_reason(error: &anyhow::Error) -> Option<(&'static str, &std::io:
         return None;
     };
     Some((protocol, reason))
+}
+
+type ListenerPair = (String, UdpSocket, TcpListener);
+
+/// Retries only startup-skipped addresses and stays owned by networking.
+/// cancel-safe: yes — dropping this future drops its delay/bind_pair future and
+/// any partially bound UDP half, while `bind_pair` owns both pair resources.
+async fn retry_listener_pair(addr: String) -> ListenerPair {
+    let delay = || tokio::time::sleep(LISTENER_RETRY_INTERVAL);
+    let bind_addr = addr.clone();
+    let (addr, (udp, tcp)) = retry_listener_pair_with(addr, delay, move |_| {
+        let bind_addr = bind_addr.clone();
+        async move { bind_pair(&bind_addr).await }
+    })
+    .await;
+    (addr, udp, tcp)
+}
+
+/// Test seam for owned retry timing and pair binding.
+/// cancel-safe: yes — dropping it drops both pending operations and their owned
+/// resources; no retry task is detached.
+async fn retry_listener_pair_with<B, BF, D, DF, T>(
+    addr: String,
+    mut delay: D,
+    mut bind: B,
+) -> (String, T)
+where
+    B: FnMut(&str) -> BF,
+    BF: Future<Output = Result<T>>,
+    D: FnMut() -> DF,
+    DF: Future<Output = ()>,
+{
+    loop {
+        delay().await;
+        match bind(&addr).await {
+            Ok(value) => return (addr, value),
+            Err(error) => debug!(listen_addr = %addr, %error, "DNS listener retry failed"),
+        }
+    }
 }
 
 /// Bind attempts for an ephemeral (port 0) UDP+TCP pair.
@@ -340,7 +436,7 @@ where
             }
             Err(error) => {
                 return Err(anyhow::Error::new(error)
-                    .context(format!("failed to bind UDP DNS listener on {target}")))
+                    .context(format!("failed to bind UDP DNS listener on {target}")));
             }
         };
         let bound = udp.local_addr()?;
@@ -349,11 +445,24 @@ where
             Err(error) if retry && port_collision(&error) => retry_with_random_port(&mut target),
             Err(error) => {
                 return Err(anyhow::Error::new(error)
-                    .context(format!("failed to bind TCP DNS listener on {bound}")))
+                    .context(format!("failed to bind TCP DNS listener on {bound}")));
             }
         }
     }
     unreachable!("the last attempt returns its own error")
+}
+
+fn publish_listener_endpoints<T>(
+    ctx: &QueryCtx<T>,
+    udp: &UdpSocket,
+    tcp: &TcpListener,
+) -> Result<()> {
+    let endpoints = listener_endpoints(udp, tcp)?;
+    ctx.endpoints
+        .write()
+        .expect("DNS endpoints lock poisoned")
+        .extend(endpoints);
+    Ok(())
 }
 
 /// Keep backend SocketAddr APIs while recording actual per-socket coverage.
@@ -432,7 +541,11 @@ fn inline_answer<'a, T>(
     let explicit_override = find_override(&ctx.overrides, &host).is_some();
     // Snapshot only local-policy/cache state before constructing the future:
     // borrowing QueryCtx across await would require the tunnel factory to be Sync.
-    let endpoints = Arc::clone(&ctx.endpoints);
+    let endpoints = ctx
+        .endpoints
+        .read()
+        .expect("DNS endpoints lock poisoned")
+        .clone();
     let cache = Arc::clone(&ctx.cache);
     let probe = ctx.route_probe.clone();
     async move {
@@ -456,14 +569,19 @@ where
     T: Fn() -> F + Send + Clone + 'static,
     F: Future<Output = Option<TorTunnel>> + Send + 'static,
 {
+    let endpoints = ctx
+        .endpoints
+        .read()
+        .expect("DNS endpoints lock poisoned")
+        .clone();
     finish_miss(deadline, async move {
         let host = wire::hostname_of(&question);
         let answer = if let Some(entry) = find_override(&ctx.overrides, &host) {
             match &entry.resolver {
                 OverrideResolver::Dns { server } => {
-                    resolve_via_dns_server(&question, *server, &ctx.endpoints).await?
+                    resolve_via_dns_server(&question, *server, &endpoints).await?
                 }
-                OverrideResolver::System => resolve_via_system(&question, &ctx.endpoints).await?,
+                OverrideResolver::System => resolve_via_system(&question, &endpoints).await?,
             }
         } else {
             let Some(answer) = acquire_then_resolve(ctx.tunnel, |tor| {
@@ -578,10 +696,15 @@ where
         let host = wire::hostname_of(&question);
         let explicit_override = find_override(&ctx.overrides, &host).is_some();
         let probe = ctx.route_probe.clone();
+        let endpoints = ctx
+            .endpoints
+            .read()
+            .expect("DNS endpoints lock poisoned")
+            .clone();
         if let Some(answer) = local::preflight_with_probe(
             &question,
             &host,
-            &ctx.endpoints,
+            &endpoints,
             explicit_override,
             move |ip| probe(ip),
         )

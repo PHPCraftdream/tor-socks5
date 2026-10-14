@@ -20,6 +20,8 @@ mod multi_listen;
 mod prefetch;
 #[path = "server_resource_tests.rs"]
 mod resources;
+#[path = "retry/mod.rs"]
+mod retry;
 #[path = "server_statistics_tests.rs"]
 mod statistics;
 
@@ -113,7 +115,7 @@ fn ctx(
         cache: Arc::new(DnsCache::new()),
         providers: Arc::new(vec![]),
         overrides: Arc::new(overrides),
-        endpoints: Arc::new(endpoints),
+        endpoints: Arc::new(RwLock::new(endpoints)),
         route_probe: local::route_probe(),
         statistics: None,
     }
@@ -548,7 +550,7 @@ async fn expired_total_deadline_cancels_tunnel_acquisition() {
         cache: Arc::new(DnsCache::new()),
         providers: Arc::new(vec![]),
         overrides: Arc::new(vec![]),
-        endpoints: Arc::new(vec![]),
+        endpoints: Arc::new(RwLock::new(vec![])),
         route_probe: local::route_probe(),
         statistics: None,
     };
@@ -583,7 +585,7 @@ async fn scoped_cancellation_releases_pending_tunnel_and_unavailable_tor_servfai
         cache: Arc::new(DnsCache::new()),
         providers: Arc::new(vec![]),
         overrides: Arc::new(vec![]),
-        endpoints: Arc::new(vec![addr]),
+        endpoints: Arc::new(RwLock::new(vec![addr])),
         route_probe: local::route_probe(),
         statistics: None,
     };
@@ -607,7 +609,7 @@ async fn scoped_cancellation_releases_pending_tunnel_and_unavailable_tor_servfai
         cache: Arc::new(DnsCache::new()),
         providers: Arc::new(vec![]),
         overrides: Arc::new(vec![]),
-        endpoints: Arc::new(vec![]),
+        endpoints: Arc::new(RwLock::new(vec![])),
         route_probe: local::route_probe(),
         statistics: None,
     };

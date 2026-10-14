@@ -97,6 +97,9 @@ pub(super) async fn bind_listeners(addresses: &[String]) -> Result<BoundListener
     Ok(bound)
 }
 
+#[path = "retry.rs"]
+pub(super) mod retry;
+
 #[cfg(test)]
 #[path = "server_binding_tests.rs"]
 mod tests;

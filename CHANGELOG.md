@@ -66,10 +66,14 @@ names every difference and this command.
   writeback uses the expanded lists. Binding skips what cannot be bound:
   `AddrInUse`, `PermissionDenied` and `AddrNotAvailable` log a WARN with the
   reason, at least one successful listener (or DNS pair) serves, all failing is an
-  error, and other bind errors stay hard failures. Occupied ports are never taken
-  over. DNS never serves a half-bound UDP+TCP pair; local policy and recursion
-  guards use only successfully bound endpoints. There is no automatic retry for
-  an address that appears later.
+  error, and other bind errors stay hard failures. Addresses skipped as unavailable
+  at startup are retried every fixed 30 seconds; recovered proxy listeners serve
+  both SOCKS5 and HTTP CONNECT, and recovered DNS listeners bind an atomic UDP+TCP
+  pair. Initially occupied or permission-denied addresses are not periodically
+  retried; there are no port seizure or reuse tricks. Retry is server-scoped and
+  stops at shutdown. All-failing startup still fails. DNS never serves a half-bound
+  UDP+TCP pair; local policy and recursion guards use only successfully bound
+  endpoints. Already-bound addresses are not monitored or rebound.
 - **DNS query statistics and popular-name refresh.** Persistent, payload-free
   statistics of incoming queries; observed popular name/type/class tuples are
   refreshed at startup and every two hours over the existing routes, with
