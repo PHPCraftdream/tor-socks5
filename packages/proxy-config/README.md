@@ -4,7 +4,7 @@ The Ktav startup configuration schema for the tor-socks5 proxy: a typed `Config`
 
 For hosts of the proxy — the CLI daemon and the Android JNI engine share this crate — and for any tool that needs to read or rewrite the same configuration format: bridge lists, DNS policy, watchdog, warm pool, upstream chaining, SOCKS5 user accounts, security toggles.
 
-The main configuration includes `tor.circuit_hops`, permitted values `2` and `3` (default `3`). Two-hop circuits go directly from guard to exit with no middle relay, reducing anonymity; intended for censorship circumvention, not anonymity. This chunk wires storage and Settings plumbing only; circuit-length activation is deferred to CLH-03b.
+The main configuration includes `tor.circuit_hops`, permitted values `2` and `3` (default `3`). Two-hop circuits go directly from guard to exit with no middle relay, reducing anonymity; intended for censorship circumvention, not anonymity. This setting applies to ordinary circuits; onion-service circuits remain unaffected pending CLH-04.
 
 ## Usage
 
