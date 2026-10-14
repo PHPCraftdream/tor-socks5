@@ -322,6 +322,12 @@ pub(crate) async fn run_server(
     // Skip only local availability failures, visibly; fail fast if none bind
     // or an unexpected error occurs. Every successful listener shares admission.
     let binding = binding::bind_listeners(&cfg.listen).await?;
+    let retry_addresses = binding
+        .skipped
+        .iter()
+        .filter(|skipped| skipped.error.kind() == std::io::ErrorKind::AddrNotAvailable)
+        .map(|skipped| skipped.address.clone())
+        .collect::<Vec<_>>();
     let listeners = binding.listeners;
 
     // One accept loop per listener, polled concurrently. The futures are
@@ -336,30 +342,50 @@ pub(crate) async fn run_server(
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     // Shared across all listeners so log-correlation conn_ids stay unique.
     let next_conn_id = Arc::new(AtomicU64::new(1));
-    let mut accept_loops = listeners
+    let mut accept_loops = futures::stream::FuturesUnordered::new();
+    for listener in listeners {
+        accept_loops.push(accept_loop(
+            listener,
+            egress.clone(),
+            auth_state.clone(),
+            permits.clone(),
+            conn_health.clone(),
+            next_conn_id.clone(),
+            cfg.security.block_onion,
+        ));
+    }
+    let mut retries = retry_addresses
         .into_iter()
-        .map(|listener| {
-            accept_loop(
-                listener,
-                egress.clone(),
-                auth_state.clone(),
-                permits.clone(),
-                conn_health.clone(),
-                next_conn_id.clone(),
-                cfg.security.block_onion,
-            )
-        })
+        .map(|address| binding::retry::retry_address_with(address, TcpListener::bind))
         .collect::<futures::stream::FuturesUnordered<_>>();
 
-    tokio::select! {
-        biased;
-        () = shutdown => {}
-        _ = accept_loops.next() => {
-            // The accept loops retry accept errors internally with a
-            // backoff, so this branch means a loop itself ended.
-            warn!("accept loop exited unexpectedly");
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            biased;
+            () = &mut shutdown => break,
+            _ = accept_loops.next(), if !accept_loops.is_empty() => {
+                warn!("accept loop exited unexpectedly");
+                break;
+            }
+            recovered = retries.next(), if !retries.is_empty() => {
+                if let Some((address, listener)) = recovered {
+                    info!(listen_addr = %address, "SOCKS5 proxy listener recovered");
+                    accept_loops.push(accept_loop(
+                        listener,
+                        egress.clone(),
+                        auth_state.clone(),
+                        permits.clone(),
+                        conn_health.clone(),
+                        next_conn_id.clone(),
+                        cfg.security.block_onion,
+                    ));
+                }
+            }
         }
     }
+    drop(retries);
+    drop(accept_loops);
 
     // For the Tor egress, draining the handle takes the tunnel out of the
     // shared slot; dropping it triggers `tor-ptmgr` to terminate PT
@@ -468,7 +494,9 @@ fn pick_upstream(
         .map(str::to_string)
         .unwrap_or_else(|| cfg.address.clone());
     if address.trim().is_empty() {
-        bail!("upstream proxy is enabled but no address is set (config `upstream.address` or --upstream HOST:PORT)");
+        bail!(
+            "upstream proxy is enabled but no address is set (config `upstream.address` or --upstream HOST:PORT)"
+        );
     }
 
     // A username from either source switches on auth; the password

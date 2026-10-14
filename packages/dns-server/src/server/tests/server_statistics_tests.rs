@@ -131,7 +131,7 @@ async fn owned_lifecycle_stops_network_then_drains_statistics_before_cache_save(
         let (cache_tx, mut cache_rx) = oneshot::channel();
         let mut cache_tx = Some(cache_tx);
         let service = serve_owned_lifecycle(
-            (vec![Arc::new(udp)], vec![tcp]),
+            (vec![Arc::new(udp)], vec![tcp], vec![]),
             context,
             Some(worker),
             shutdown.clone(),

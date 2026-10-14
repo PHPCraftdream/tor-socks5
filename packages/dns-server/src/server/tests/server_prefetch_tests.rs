@@ -14,7 +14,7 @@ fn run_and_refresh_remain_send_with_non_sync_factory() {
         cache: Arc::new(DnsCache::new()),
         providers: Arc::new(vec![]),
         overrides: Arc::new(vec![]),
-        endpoints: Arc::new(vec![]),
+        endpoints: Arc::new(RwLock::new(vec![])),
         route_probe: local::route_probe(),
         statistics: None,
     };
@@ -220,7 +220,7 @@ async fn gated_background_leaves_foreground_responsive_and_cancel_releases_permi
             cache: Arc::new(DnsCache::new()),
             providers: Arc::new(vec![]),
             overrides: Arc::new(vec![DnsOverride { pattern: "foreground.example".into(), resolver: OverrideResolver::Dns { server: upstream_addr } }]),
-            endpoints: Arc::new(vec![addr]),
+            endpoints: Arc::new(RwLock::new(vec![addr])),
             route_probe: local::route_probe(),
             statistics: None,
         };
@@ -276,7 +276,7 @@ async fn expired_refresh_deadline_drops_pending_acquisition_and_preserves_cache(
             cache: Arc::new(DnsCache::new()),
             providers: Arc::new(vec![]),
             overrides: Arc::new(vec![]),
-            endpoints: Arc::new(vec![]),
+            endpoints: Arc::new(RwLock::new(vec![])),
             route_probe: local::route_probe(),
             statistics: None,
         };
@@ -319,7 +319,7 @@ async fn unavailable_tor_and_expired_admission_keep_cache_then_next_refresh_reco
             cache: Arc::new(DnsCache::new()),
             providers: Arc::new(vec![]),
             overrides: Arc::new(vec![]),
-            endpoints: Arc::new(vec![]),
+            endpoints: Arc::new(RwLock::new(vec![])),
             route_probe: local::route_probe(),
             statistics: None,
         };

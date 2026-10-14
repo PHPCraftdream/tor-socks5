@@ -3,10 +3,10 @@ use super::*;
 
 /// cancel-safe: yes — scoped networking and clients drop together on the guard.
 async fn answers_on_pairs(bound: BoundListeners, expected: &[SocketAddr]) {
-    let context = ctx(vec![], bound.2.clone());
+    let context = ctx(vec![], bound.endpoints.clone());
     let shutdown = CancellationToken::new();
     let serving = serve_owned_lifecycle(
-        (bound.0, bound.1),
+        (bound.udp, bound.tcp, vec![]),
         context,
         None,
         shutdown.clone(),
@@ -46,18 +46,18 @@ async fn two_pairs_both_protocols_answer_and_publish_actual_endpoints() {
         let bound = bind_listeners(&["127.0.0.1:0".into(), "127.0.0.1:0".into()])
             .await
             .unwrap();
-        assert_eq!(bound.0.len(), 2);
-        assert_eq!(bound.1.len(), 2);
-        let addresses: Vec<_> = bound.0.iter().map(|s| s.local_addr().unwrap()).collect();
+        assert_eq!(bound.udp.len(), 2);
+        assert_eq!(bound.tcp.len(), 2);
+        let addresses: Vec<_> = bound.udp.iter().map(|s| s.local_addr().unwrap()).collect();
         assert_ne!(addresses[0], addresses[1]);
         let mut expected = Vec::new();
-        for (udp, tcp) in bound.0.iter().zip(&bound.1) {
+        for (udp, tcp) in bound.udp.iter().zip(&bound.tcp) {
             let addr = udp.local_addr().unwrap();
             assert_ne!(addr.port(), 0);
             assert_eq!(tcp.local_addr().unwrap(), addr);
             expected.extend([addr, addr]);
         }
-        assert_eq!(bound.2, expected);
+        assert_eq!(bound.endpoints, expected);
         answers_on_pairs(bound, &addresses).await;
     })
     .await
@@ -84,10 +84,10 @@ async fn occupied_udp_and_tcp_skip_pairs_release_halves_and_remaining_serves() {
         ])
         .await
         .unwrap();
-        assert_eq!(bound.0.len(), 1);
-        assert_eq!(bound.1.len(), 1);
-        let serving_addr = bound.0[0].local_addr().unwrap();
-        assert_eq!(bound.2, vec![serving_addr, serving_addr]);
+        assert_eq!(bound.udp.len(), 1);
+        assert_eq!(bound.tcp.len(), 1);
+        let serving_addr = bound.udp[0].local_addr().unwrap();
+        assert_eq!(bound.endpoints, vec![serving_addr, serving_addr]);
         // Verify neither skipped pair retained its otherwise available half.
         let rebound_tcp = TcpListener::bind(udp_addr).await.unwrap();
         let rebound_udp = UdpSocket::bind(tcp_addr).await.unwrap();

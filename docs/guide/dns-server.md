@@ -62,10 +62,14 @@ other is released and the address is not served. There is never a half-bound
 DNS listener. Only successfully bound endpoints enter local policy and override
 recursion guards, including their actual ports for port-zero binds.
 
-Occupied ports are **never taken over**. There is currently **no automatic
-retry** of skipped addresses (LST-05 is not implemented), including in-use or
-permission-denied addresses. A skipped address does not become a listener just
-because the port is later freed or permissions change.
+Occupied ports are **never taken over**. Addresses skipped because they are
+unavailable at startup are retried every fixed 30 seconds. If a DNS address
+becomes bindable, it serves as an atomic UDP+TCP pair; if either bind fails,
+no half-bound listener is retained. Occupied or permission-denied addresses
+are not periodically retried. There are no port seizure or reuse tricks.
+Retry is scoped to this server and stops at shutdown. If every configured
+address fails at startup, startup still fails. Already-bound addresses are
+not monitored or rebound.
 
 ## Query popularity and background refresh
 
