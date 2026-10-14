@@ -358,6 +358,24 @@ if ! git -C "$hookrepo" update-ref refs/remotes/origin/main "$hook_head"; then e
 hook_rc=$?
 if [ "$hook_rc" -eq 0 ] && grep -q 'OK (T1, empty)' "$tmpdir/hook-out.$case_no" && ! grep -q 'tier T2' "$tmpdir/hook-out.$case_no"; then echo "PASS: case $case_no: new ref uses origin/main (rc=0, T1 empty)"; else failures=$((failures + 1)); echo "FAIL: case $case_no: expected rc=0 and T1 empty"; echo "  stdout=$(cat "$tmpdir/hook-out.$case_no") stderr=$(cat "$tmpdir/hook-err.$case_no")"; fi
 
+# Doctests must skip binary-only packages and still cover library ones.
+case_no=$((case_no + 1))
+infile="$tmpdir/in.$case_no"
+printf 'apps/socks5-proxy/src/main.rs
+' > "$infile"
+doc_bin=$(TEST_AFFECTED_DRY=1 sh "$target" --files-from "$infile" --mode run --kind test 2>/dev/null)
+printf 'packages/auth/src/lib.rs
+' > "$infile"
+doc_lib=$(TEST_AFFECTED_DRY=1 sh "$target" --files-from "$infile" --mode run --kind test 2>/dev/null)
+if ! printf '%s' "$doc_bin" | grep -q -- '--doc' && printf '%s' "$doc_lib" | grep -q -- '--doc -p tor-socks5-auth'; then
+	echo "PASS: case $case_no: doctests skip binary-only packages, keep library ones"
+else
+	failures=$((failures + 1))
+	echo "FAIL: case $case_no: doctest selection"
+	echo "  bin-only: $doc_bin"
+	echo "  library:  $doc_lib"
+fi
+
 if [ "$failures" -eq 0 ]; then
 	echo "test-affected-selftest: all $case_no cases passed"
 	exit 0
