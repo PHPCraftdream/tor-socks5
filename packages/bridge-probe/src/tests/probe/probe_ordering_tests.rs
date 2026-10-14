@@ -235,11 +235,19 @@ async fn reports_alive_bridge_as_reachable() {
     assert!(reports[0].latency().unwrap() < Duration::from_secs(2));
 }
 
+/// A loopback address that refuses connections and cannot be taken by another
+/// test: the socket stays bound but never listens. Releasing a listener
+/// instead leaves a window in which a parallel test can bind the same port.
+fn refusing_addr() -> (tokio::net::TcpSocket, std::net::SocketAddr) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = socket.local_addr().unwrap();
+    (socket, addr)
+}
+
 #[tokio::test]
 async fn reports_closed_port_as_unreachable() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
+    let (_guard, addr) = refusing_addr();
 
     let reports = probe_all(vec![bridge_for(addr)], Duration::from_secs(2)).await;
     assert_eq!(reports.len(), 1);
@@ -254,9 +262,7 @@ async fn probe_and_sort_orders_by_latency_and_drops_dead() {
         let _ = live.accept().await;
     });
 
-    let dead_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let dead_addr = dead_listener.local_addr().unwrap();
-    drop(dead_listener);
+    let (_guard, dead_addr) = refusing_addr();
 
     let alive = probe_and_sort(
         vec![bridge_for(dead_addr), bridge_for(live_addr)],
@@ -298,9 +304,7 @@ async fn probe_until_stops_at_target() {
 async fn probe_until_respects_max_attempts() {
     // One dead addr repeated; max_attempts=2 caps the work and yields
     // zero live without walking the whole (longer) list.
-    let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let dead_addr = dead.local_addr().unwrap();
-    drop(dead);
+    let (_guard, dead_addr) = refusing_addr();
     let candidates = vec![
         bridge_for(dead_addr),
         bridge_for(dead_addr),
