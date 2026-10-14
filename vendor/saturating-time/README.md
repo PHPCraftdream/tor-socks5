@@ -32,10 +32,13 @@ However, this crate implements this trait for two structures:
 
 ## Example
 
-Add the following to your `Cargo.toml`:
+Add `saturating-time` to your `Cargo.toml`.
+
+If you use Rust nightly, you may want to additionally configure the following
+in your `.cargo/config.toml`:
 ```toml
-[dependencies]
-saturating-time = "0.3.0"
+[build]
+rustflags = ["--cfg", "saturating_time_nightly"]
 ```
 
 Now, you can use `saturating-time` in your code:
@@ -60,13 +63,19 @@ The eventual goal is to get this functionality into the Rust standard library.
 
 #### `SystemTime::MIN` and `SystemTime::MAX`
 
-There is an ACP that has been approved in November 2025.[^3]
-Please follow the tracking issue[^4] for more information about this in
-particular.
+In December 2025, `SystemTime::MIN` and `SystemTime::MAX` got merged
+into nightly.[^3]
 
-#### `SystemTime::saturating_add()` and `SystemTime::saturating_sub()`
+This feature is guarded behind `time_systemtime_limits` and a tracking
+issue regarding the stabilization of it exists.[^4]
 
-None yet.
+#### `SystemTime::saturating_add()`, et, al.
+
+In January 2025, `SystemTime::saturating_add()`, `SystemTime::saturating_sub()`,
+and `SystemTime::saturating_duration_since()` got merged into nightly.[^5]
+
+This feature is guarded behind `time_saturating_systemtime` and a tracking
+issue regarding the stabilization of it exists.[^6]
 
 ### `Instant`
 
@@ -74,10 +83,24 @@ None yet.
 
 [^1]: This is an effort the maintainers are actively working upon.
 [^2]: Assuming the name, signature, and behavior does not change.
-[^3]: <https://github.com/rust-lang/libs-team/issues/692>
+      Unfortunately, we likely have to change the signature for the parameters
+      because we currently use `self` whereas the standard library uses `&self`.
+      It should not be a big problem though, because both `Instant` and
+      `SystemTime` implement `Copy`.
+[^3]: <https://github.com/rust-lang/rust/pull/149979>
 [^4]: <https://github.com/rust-lang/rust/issues/149067>
+[^5]: <https://github.com/rust-lang/rust/pull/151200>
+[^6]: <https://github.com/rust-lang/rust/issues/151199>
+
+## History
+
+Up until (and including) version 0.4.0, `saturating-time` was maintained as an
+independent project hosted on [Codeberg](https://codeberg.org/cve/saturating-time).
+
+Starting with version 0.5.0, it has been incorporated into the
+[Arti](https://arti.torproject.org) and is therefore maintained by
+*The Tor Project, Inc.*
 
 ## License and Copyright
 
 This crate is licensed under `MIT OR Apache-2.0`.
-See the respective `LICENSE-*` files in the repository for more information.

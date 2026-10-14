@@ -19,6 +19,7 @@ use crate::{GuardParams, GuardRestriction, GuardUsage, ids::GuardId};
 #[cfg(feature = "bridge-client")]
 use safelog::Redactable as _;
 
+use tor_basic_utils::onionperf_types::{OnionperfEvent, OnionperfGuardStatus};
 use tor_linkspec::{
     ChanTarget, ChannelMethod, HasAddrs, HasChanMethod, HasRelayIds, PtTarget, RelayIds,
 };
@@ -367,25 +368,21 @@ impl Guard {
         self.unlisted_since.is_none() && self.disabled.is_none()
     }
 
-    /// Whether guard security policy has disabled this identity.
+    // tor-socks5 local patch: is_disabled
+    /// Whether persisted security policy disables this guard.
     pub(crate) fn is_disabled(&self) -> bool {
         self.disabled.is_some()
     }
 
-    /// tor-socks5 local patch: return true if we have complete directory
-    /// information (a microdescriptor) for this guard — i.e. its
-    /// `dir_info_missing` flag is false, so it is eligible for multi-hop data
-    /// circuits. Exposed crate-visible so the aggregated guard-usable signal
-    /// (`GuardSet::any_guard_usable_for_traffic`) can inspect it directly
-    /// instead of synthesizing a `GuardUsage`.
+    // tor-socks5 local patch: has_complete_dir_info
+    /// Whether directory information is complete for Data usage.
     pub(crate) fn has_complete_dir_info(&self) -> bool {
         !self.dir_info_missing
     }
 
-    /// tor-socks5 local patch: test-only setter to drive the aggregated
-    /// guard-usable signal in unit tests without standing up a full NetDir that
-    /// omits microdescriptors.
+    // tor-socks5 local patch: set_dir_info_missing_for_test
     #[cfg(test)]
+    /// Set missing-directory state for regression tests.
     pub(crate) fn set_dir_info_missing_for_test(&mut self, missing: bool) {
         self.dir_info_missing = missing;
     }
@@ -459,7 +456,6 @@ impl Guard {
     }
 
     /// Change the reachability status for this guard.
-    #[allow(clippy::cognitive_complexity)]
     fn set_reachable(&mut self, r: Reachable) {
         use Reachable as R;
 
@@ -753,6 +749,7 @@ impl Guard {
             // TODO-SPEC: The "max" above isn't specified by guard-spec,
             // but I think it's wise.
             trace!(guard_id = ?self.id, "Newly confirmed");
+            trace!(onionperf = true, event = ?OnionperfEvent::Guard(OnionperfGuardStatus::Up));
             NewlyConfirmed::Yes
         } else {
             NewlyConfirmed::No
@@ -783,14 +780,33 @@ impl Guard {
         self.circ_history.n_indeterminate += 1;
 
         if let Some(ratio) = self.circ_history.indeterminate_ratio() {
-            // TODO: These should not be hardwired, and they may be set
-            // too high.
+            // TODO: These should not be hardwired.
+
             /// If this fraction of circs are suspicious, we should disable
             /// the guard.
-            const DISABLE_THRESHOLD: f64 = 0.7;
+            ///
+            /// (We may lower this in the future, but see discussion in arti#2752
+            /// and analysis in proposal 344.  It's currently set to 2.0 while we
+            /// wait to get more network simulation and testing; 2.0 is impossible,
+            /// since the ratio will be in range `0.0..=1.0`.)
+            ///
+            /// (Choosing `DISABLE_THRESHOLD = 1.0` would have the same effect,
+            /// since we compare `ratio > DISABLE_THRESHOLD`, but using 2.0 makes it more
+            /// clear that we will never disable a guard.)
+            const DISABLE_THRESHOLD: f64 = 2.0;
+
             /// If this fraction of circuits are suspicious, we should
             /// warn.
-            const WARN_THRESHOLD: f64 = 0.5;
+            ///
+            /// (This value is deliberately _lower_ than recommended on arti#2752,
+            /// under the theory that warnings don't hurt anybody.  If we start to see
+            /// excessive warnings, we should investigate.)
+            ///
+            /// Generally speaking, we would expect an adversary who controls fraction
+            /// X of the network to succeed in a path bias attack with probability X^2.
+            /// Therefore, if we set this value to 1.0-X^2, we should catch about half
+            /// of the attempts by such an attacker to mount a path-bias attack.)
+            const WARN_THRESHOLD: f64 = 0.91;
 
             if ratio > DISABLE_THRESHOLD {
                 let reason = GuardDisabled::TooManyIndeterminateFailures {
@@ -807,32 +823,8 @@ impl Guard {
         }
     }
 
-    /// tor-socks5 local patch: clear this guard's `disabled` state and give it
-    /// a fresh start, also resetting the circuit-failure history that produced
-    /// the disable.
-    ///
-    /// Returns `true` if the guard was disabled (and is now re-enabled), `false`
-    /// if it was already usable — in which case nothing is touched: we never
-    /// wipe the observed history of a healthy guard.
-    ///
-    /// # Why this exists
-    ///
-    /// [`record_indeterminate_result`](Self::record_indeterminate_result)
-    /// permanently sets `disabled` once the lifetime indeterminate-failure
-    /// ratio crosses `0.7`. The `disabled` field is persisted (serialized to
-    /// the state file) and nothing else in this crate ever clears it, so once a
-    /// guard is disabled it stays disabled until it drops out of the sample for
-    /// an unrelated reason. In a bridge-only deployment with only a handful of
-    /// configured bridges, a single transient second-hop/exit failure storm
-    /// (which is exactly what `GuardStatus::Indeterminate` counts) can take a
-    /// bridge out of rotation for good, with no automatic recovery path.
-    ///
-    /// This is the manual escape hatch an application-level watchdog can invoke
-    /// on its own policy — e.g. "too few usable bridges remain, do not let this
-    /// one stay permanently disabled". The history is reset rather than only
-    /// `disabled`, because the accumulated `n_indeterminate` would otherwise
-    /// immediately re-trip the disable threshold on the very next
-    /// indeterminate result.
+    // tor-socks5 local patch: persisted-disabled recovery
+    /// Manually recover persisted disabled state; healthy guards are unchanged.
     pub(crate) fn reset_disabled(&mut self) -> bool {
         if self.disabled.take().is_some() {
             self.circ_history = CircHistory::default();
@@ -981,7 +973,7 @@ impl CircHistory {
         // TODO: This should probably not be hardwired
 
         /// Don't try to give a ratio unless we've seen this many observations.
-        const MIN_OBSERVATIONS: u32 = 15;
+        const MIN_OBSERVATIONS: u32 = 100;
 
         let total = self.n_successes + self.n_indeterminate;
         if total < MIN_OBSERVATIONS {
@@ -993,5 +985,544 @@ impl CircHistory {
 }
 
 #[cfg(test)]
-#[path = "guard/tests.rs"]
-mod test;
+mod test {
+    // @@ begin test lint list maintained by maint/add_warning @@
+    #![allow(clippy::bool_assert_comparison)]
+    #![allow(clippy::clone_on_copy)]
+    #![allow(clippy::dbg_macro)]
+    #![allow(clippy::mixed_attributes_style)]
+    #![allow(clippy::print_stderr)]
+    #![allow(clippy::print_stdout)]
+    #![allow(clippy::single_char_pattern)]
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unchecked_time_subtraction)]
+    #![allow(clippy::useless_vec)]
+    #![allow(clippy::needless_pass_by_value)]
+    #![allow(clippy::string_slice)] // See arti#2571
+    //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
+    use super::*;
+    use crate::ids::FirstHopId;
+    use tor_linkspec::{HasRelayIds, RelayId};
+    use tor_llcrypto::pk::ed25519::Ed25519Identity;
+    use web_time_compat::SystemTimeExt;
+
+    #[test]
+    fn crate_id() {
+        let id = CrateId::this_crate().unwrap();
+        assert_eq!(&id.crate_name, "tor-guardmgr");
+        assert_eq!(Some(id.version.as_ref()), option_env!("CARGO_PKG_VERSION"));
+    }
+
+    fn basic_id() -> GuardId {
+        GuardId::new([13; 32].into(), [37; 20].into())
+    }
+    fn basic_guard() -> Guard {
+        let id = basic_id();
+        let ports = vec!["127.0.0.7:7777".parse().unwrap()];
+        let added = SystemTime::get();
+        Guard::new(id, ports, None, added)
+    }
+
+    // tor-socks5 local patch: has_complete_dir_info_accessor
+    #[test]
+    fn has_complete_dir_info_accessor() {
+        let mut g = basic_guard();
+        assert!(g.usable());
+        // A freshly-created guard has no missing directory information.
+        assert!(g.has_complete_dir_info());
+        // Simulate the guard-exhaustion case: the guard is listed, but we lack
+        // its microdescriptor.
+        g.dir_info_missing = true;
+        assert!(!g.has_complete_dir_info());
+        g.dir_info_missing = false;
+        assert!(g.has_complete_dir_info());
+    }
+
+    // tor-socks5 local patch: persisted-disabled migration regression
+    #[test]
+    fn reset_disabled_persisted_state() {
+        let mut g = basic_guard();
+        g.record_indeterminate_result();
+        assert!(!g.reset_disabled());
+        assert_eq!(g.circ_history.n_indeterminate, 1);
+        let mut state = serde_json::to_value(&g).unwrap();
+        state["disabled"] = serde_json::json!({
+            "type": "TooManyIndeterminateFailures",
+            "history": {"n_successes": 1, "n_failures": 0, "n_indeterminate": 14},
+            "failure_ratio": 0.933, "threshold_ratio": 0.7
+        });
+        let mut g: Guard = serde_json::from_value(state).unwrap();
+        g.record_indeterminate_result();
+        g.suspicious_behavior_warned = true;
+        g.record_failure(Instant::get(), true);
+        let retry = g.retry_at;
+        assert!(g.is_disabled());
+        assert!(!g.usable());
+        assert!(g.reset_disabled());
+        assert!(!g.is_disabled());
+        assert_eq!(g.circ_history.n_indeterminate, 0);
+        assert!(!g.suspicious_behavior_warned);
+        assert_eq!(g.retry_at, retry);
+        assert!(!g.reset_disabled());
+    }
+
+    #[test]
+    fn simple_accessors() {
+        fn ed(id: [u8; 32]) -> RelayId {
+            RelayId::Ed25519(id.into())
+        }
+        let id = basic_id();
+        let g = basic_guard();
+
+        assert_eq!(g.guard_id(), &id);
+        assert!(g.same_relay_ids(&FirstHopId::in_sample(GuardSetSelector::Default, id)));
+        assert_eq!(
+            g.addrs().collect_vec(),
+            &["127.0.0.7:7777".parse().unwrap()]
+        );
+        assert_eq!(g.reachable(), Reachable::Untried);
+        assert_eq!(g.reachable(), Reachable::default());
+
+        use crate::GuardUsageBuilder;
+        let mut usage1 = GuardUsageBuilder::new();
+
+        usage1
+            .restrictions()
+            .push(GuardRestriction::AvoidId(ed([22; 32])));
+        let usage1 = usage1.build().unwrap();
+        let mut usage2 = GuardUsageBuilder::new();
+        usage2
+            .restrictions()
+            .push(GuardRestriction::AvoidId(ed([13; 32])));
+        let usage2 = usage2.build().unwrap();
+        let usage3 = GuardUsage::default();
+        let mut usage4 = GuardUsageBuilder::new();
+        usage4
+            .restrictions()
+            .push(GuardRestriction::AvoidId(ed([22; 32])));
+        usage4
+            .restrictions()
+            .push(GuardRestriction::AvoidId(ed([13; 32])));
+        let usage4 = usage4.build().unwrap();
+        let mut usage5 = GuardUsageBuilder::new();
+        usage5.restrictions().push(GuardRestriction::AvoidAllIds(
+            vec![ed([22; 32]), ed([13; 32])].into_iter().collect(),
+        ));
+        let usage5 = usage5.build().unwrap();
+        let mut usage6 = GuardUsageBuilder::new();
+        usage6.restrictions().push(GuardRestriction::AvoidAllIds(
+            vec![ed([99; 32]), ed([100; 32])].into_iter().collect(),
+        ));
+        let usage6 = usage6.build().unwrap();
+
+        assert!(g.conforms_to_usage(&usage1));
+        assert!(!g.conforms_to_usage(&usage2));
+        assert!(g.conforms_to_usage(&usage3));
+        assert!(!g.conforms_to_usage(&usage4));
+        assert!(!g.conforms_to_usage(&usage5));
+        assert!(g.conforms_to_usage(&usage6));
+    }
+
+    #[allow(clippy::redundant_clone)]
+    #[test]
+    fn trickier_usages() {
+        let g = basic_guard();
+        use crate::{GuardUsageBuilder, GuardUsageKind};
+        let data_usage = GuardUsageBuilder::new()
+            .kind(GuardUsageKind::Data)
+            .build()
+            .unwrap();
+        let dir_usage = GuardUsageBuilder::new()
+            .kind(GuardUsageKind::OneHopDirectory)
+            .build()
+            .unwrap();
+        assert!(g.conforms_to_usage(&data_usage));
+        assert!(g.conforms_to_usage(&dir_usage));
+
+        let mut g2 = g.clone();
+        g2.dir_info_missing = true;
+        assert!(!g2.conforms_to_usage(&data_usage));
+        assert!(g2.conforms_to_usage(&dir_usage));
+
+        let mut g3 = g.clone();
+        g3.is_dir_cache = false;
+        assert!(g3.conforms_to_usage(&data_usage));
+        assert!(!g3.conforms_to_usage(&dir_usage));
+    }
+
+    #[test]
+    fn record_attempt() {
+        let t1 = Instant::get() - Duration::from_secs(10);
+        let t2 = Instant::get() - Duration::from_secs(5);
+        let t3 = Instant::get();
+
+        let mut g = basic_guard();
+
+        assert!(g.last_tried_to_connect_at.is_none());
+        g.record_attempt(t1);
+        assert_eq!(g.last_tried_to_connect_at, Some(t1));
+        g.record_attempt(t3);
+        assert_eq!(g.last_tried_to_connect_at, Some(t3));
+        g.record_attempt(t2);
+        assert_eq!(g.last_tried_to_connect_at, Some(t3));
+    }
+
+    #[test]
+    fn record_failure() {
+        let t1 = Instant::get() - Duration::from_secs(10);
+        let t2 = Instant::get();
+
+        let mut g = basic_guard();
+        g.record_failure(t1, true);
+        assert!(g.retry_schedule.is_some());
+        assert_eq!(g.reachable(), Reachable::Unreachable);
+        let retry1 = g.retry_at.unwrap();
+        assert_eq!(retry1, t1 + Duration::from_secs(30));
+
+        g.record_failure(t2, true);
+        let retry2 = g.retry_at.unwrap();
+        assert!(retry2 >= t2 + Duration::from_secs(30));
+        assert!(retry2 <= t2 + Duration::from_secs(200));
+    }
+
+    #[test]
+    fn record_success() {
+        let t1 = Instant::get() - Duration::from_secs(10);
+        // has to be in the future, since the guard's "added_at" time is based on now.
+        let now = SystemTime::get();
+        let t2 = now + Duration::from_secs(300 * 86400);
+        let t3 = Instant::get() + Duration::from_secs(310 * 86400);
+        let t4 = now + Duration::from_secs(320 * 86400);
+
+        let mut g = basic_guard();
+        g.record_failure(t1, true);
+        assert_eq!(g.reachable(), Reachable::Unreachable);
+
+        let conf = g.record_success(t2, &GuardParams::default());
+        assert_eq!(g.reachable(), Reachable::Reachable);
+        assert_eq!(conf, NewlyConfirmed::Yes);
+        assert!(g.retry_at.is_none());
+        assert!(g.confirmed_at.unwrap() <= t2);
+        assert!(g.confirmed_at.unwrap() >= t2 - Duration::from_secs(12 * 86400));
+        let confirmed_at_orig = g.confirmed_at;
+
+        g.record_failure(t3, true);
+        assert_eq!(g.reachable(), Reachable::Unreachable);
+
+        let conf = g.record_success(t4, &GuardParams::default());
+        assert_eq!(conf, NewlyConfirmed::No);
+        assert_eq!(g.reachable(), Reachable::Reachable);
+        assert!(g.retry_at.is_none());
+        assert_eq!(g.confirmed_at, confirmed_at_orig);
+    }
+
+    #[test]
+    fn retry() {
+        let t1 = Instant::get();
+        let mut g = basic_guard();
+
+        g.record_failure(t1, true);
+        assert!(g.retry_at.is_some());
+        assert_eq!(g.reachable(), Reachable::Unreachable);
+
+        // Not yet retriable.
+        g.consider_retry(t1);
+        assert!(g.retry_at.is_some());
+        assert_eq!(g.reachable(), Reachable::Unreachable);
+
+        // Not retriable right before the retry time.
+        g.consider_retry(g.retry_at.unwrap() - Duration::from_secs(1));
+        assert!(g.retry_at.is_some());
+        assert_eq!(g.reachable(), Reachable::Unreachable);
+
+        // Retriable right after the retry time.
+        g.consider_retry(g.retry_at.unwrap() + Duration::from_secs(1));
+        assert!(g.retry_at.is_none());
+        assert_eq!(g.reachable(), Reachable::Retriable);
+    }
+
+    #[test]
+    fn expiration() {
+        const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+        let params = GuardParams::default();
+        let now = SystemTime::get();
+
+        let g = basic_guard();
+        assert!(!g.is_expired(&params, now));
+        assert!(!g.is_expired(&params, now + 10 * DAY));
+        assert!(!g.is_expired(&params, now + 25 * DAY));
+        assert!(!g.is_expired(&params, now + 70 * DAY));
+        assert!(g.is_expired(&params, now + 200 * DAY)); // lifetime_unconfirmed.
+
+        let mut g = basic_guard();
+        let _ = g.record_success(now, &params);
+        assert!(!g.is_expired(&params, now));
+        assert!(!g.is_expired(&params, now + 10 * DAY));
+        assert!(!g.is_expired(&params, now + 25 * DAY));
+        assert!(g.is_expired(&params, now + 70 * DAY)); // lifetime_confirmed.
+
+        let mut g = basic_guard();
+        g.mark_unlisted(now);
+        assert!(!g.is_expired(&params, now));
+        assert!(!g.is_expired(&params, now + 10 * DAY));
+        assert!(g.is_expired(&params, now + 25 * DAY)); // lifetime_unlisted
+    }
+
+    #[test]
+    fn netdir_integration() {
+        use tor_netdir::testnet;
+        let netdir = testnet::construct_netdir().unwrap_if_sufficient().unwrap();
+        let params = GuardParams::default();
+        let now = SystemTime::get();
+
+        // Construct a guard from a relay from the netdir.
+        let relay22 = netdir.by_id(&Ed25519Identity::from([22; 32])).unwrap();
+        let guard22 = Guard::from_chan_target(&relay22, now, &params);
+        assert!(guard22.same_relay_ids(&relay22));
+        assert!(Some(guard22.added_at) <= Some(now));
+
+        // Can we still get the relay back?
+        let id = FirstHopId::in_sample(GuardSetSelector::Default, guard22.id);
+        let r = id.get_relay(&netdir).unwrap();
+        assert!(r.same_relay_ids(&relay22));
+
+        // Now try a guard that isn't in the netdir.
+        let guard255 = Guard::new(
+            GuardId::new([255; 32].into(), [255; 20].into()),
+            vec![],
+            None,
+            now,
+        );
+        let id = FirstHopId::in_sample(GuardSetSelector::Default, guard255.id);
+        assert!(id.get_relay(&netdir).is_none());
+    }
+
+    #[test]
+    fn update_from_netdir() {
+        use tor_netdir::testnet;
+        let netdir = testnet::construct_netdir().unwrap_if_sufficient().unwrap();
+        // Same as above but omit [22]
+        let netdir2 = testnet::construct_custom_netdir(|idx, node, _| {
+            if idx == 22 {
+                node.omit_rs = true;
+            }
+        })
+        .unwrap()
+        .unwrap_if_sufficient()
+        .unwrap();
+        // Same as above but omit [22] as well as MD for [23].
+        let netdir3 = testnet::construct_custom_netdir(|idx, node, _| {
+            if idx == 22 {
+                node.omit_rs = true;
+            } else if idx == 23 {
+                node.omit_md = true;
+            }
+        })
+        .unwrap()
+        .unwrap_if_sufficient()
+        .unwrap();
+
+        //let params = GuardParams::default();
+        let now = SystemTime::get();
+
+        // Try a guard that isn't in the netdir at all.
+        let mut guard255 = Guard::new(
+            GuardId::new([255; 32].into(), [255; 20].into()),
+            vec!["8.8.8.8:53".parse().unwrap()],
+            None,
+            now,
+        );
+        assert_eq!(guard255.unlisted_since, None);
+        assert_eq!(guard255.listed_in(&netdir), Some(false));
+        guard255.update_from_universe(&netdir);
+        assert_eq!(
+            guard255.unlisted_since,
+            Some(netdir.lifetime().valid_after())
+        );
+        assert!(!guard255.orports.is_empty());
+
+        // Try a guard that is in netdir, but not netdir2.
+        let mut guard22 = Guard::new(
+            GuardId::new([22; 32].into(), [22; 20].into()),
+            vec![],
+            None,
+            now,
+        );
+        let id22: FirstHopId = FirstHopId::in_sample(GuardSetSelector::Default, guard22.id.clone());
+        let relay22 = id22.get_relay(&netdir).unwrap();
+        assert_eq!(guard22.listed_in(&netdir), Some(true));
+        guard22.update_from_universe(&netdir);
+        assert_eq!(guard22.unlisted_since, None); // It's listed.
+        assert_eq!(guard22.orports, relay22.addrs().collect_vec()); // Addrs are set.
+        assert_eq!(guard22.listed_in(&netdir2), Some(false));
+        guard22.update_from_universe(&netdir2);
+        assert_eq!(
+            guard22.unlisted_since,
+            Some(netdir2.lifetime().valid_after())
+        );
+        assert_eq!(guard22.orports, relay22.addrs().collect_vec()); // Addrs still set.
+        assert!(!guard22.dir_info_missing);
+
+        // Now see what happens for a guard that's in the consensus, but missing an MD.
+        let mut guard23 = Guard::new(
+            GuardId::new([23; 32].into(), [23; 20].into()),
+            vec![],
+            None,
+            now,
+        );
+        assert_eq!(guard23.listed_in(&netdir2), Some(true));
+        assert_eq!(guard23.listed_in(&netdir3), None);
+        guard23.update_from_universe(&netdir3);
+        assert!(guard23.dir_info_missing);
+        assert!(guard23.is_dir_cache);
+    }
+
+    #[test]
+    fn pending() {
+        let mut g = basic_guard();
+        let t1 = Instant::get();
+        let t2 = t1 + Duration::from_secs(100);
+        let t3 = t1 + Duration::from_secs(200);
+
+        assert!(!g.exploratory_attempt_after(t1));
+        assert!(!g.exploratory_circ_pending());
+
+        g.note_exploratory_circ(true);
+        g.record_attempt(t2);
+        assert!(g.exploratory_circ_pending());
+        assert!(g.exploratory_attempt_after(t1));
+        assert!(!g.exploratory_attempt_after(t3));
+
+        g.note_exploratory_circ(false);
+        assert!(!g.exploratory_circ_pending());
+        assert!(!g.exploratory_attempt_after(t1));
+        assert!(!g.exploratory_attempt_after(t3));
+    }
+
+    #[test]
+    fn circ_history() {
+        let mut h = CircHistory {
+            n_successes: 3,
+            n_failures: 4,
+            n_indeterminate: 3,
+        };
+        assert!(h.indeterminate_ratio().is_none());
+
+        h.n_successes = 100;
+        assert!((h.indeterminate_ratio().unwrap() - 3.0 / 103.0).abs() < 0.0001);
+    }
+
+    // This test is skipped for now, since DISABLE_THRESHOLD is deliberately set
+    // to be >= 1.0
+    #[test]
+    #[ignore]
+    fn disable_on_failure() {
+        let mut g = basic_guard();
+
+        // Disabled for now, since DISABLE_THRESHOLD is 2.0
+        //let params = GuardParams::default();
+        //let now = SystemTime::get();
+        //let _ignore = g.record_success(now, &params);
+
+        for _ in 0..99 {
+            g.record_indeterminate_result();
+        }
+        // We're still under the observation threshold.
+        assert!(g.disabled.is_none());
+
+        // This crosses the threshold.
+        g.record_indeterminate_result();
+        assert!(g.disabled.is_some());
+
+        #[allow(unreachable_patterns)]
+        match g.disabled.unwrap().into_option().unwrap() {
+            GuardDisabled::TooManyIndeterminateFailures {
+                history: _,
+                failure_ratio,
+                threshold_ratio,
+            } => {
+                assert!((failure_ratio - 1.0).abs() < 0.01);
+                assert!((threshold_ratio - 1.0).abs() < 0.01);
+            }
+            other => {
+                panic!("Wrong variant: {:?}", other);
+            }
+        }
+    }
+
+    #[test]
+    fn mark_retriable() {
+        let mut g = basic_guard();
+        use super::Reachable::*;
+
+        assert_eq!(g.reachable(), Untried);
+
+        for (pre, post) in &[
+            (Untried, Untried),
+            (Unreachable, Retriable),
+            (Reachable, Reachable),
+        ] {
+            g.reachable = *pre;
+            g.mark_retriable();
+            assert_eq!(g.reachable(), *post);
+        }
+    }
+
+    #[test]
+    fn dir_status() {
+        // We're going to see how directory failures interact with circuit
+        // failures.
+
+        use crate::GuardUsageBuilder;
+        let mut g = basic_guard();
+        let inst = Instant::get();
+        let st = SystemTime::get();
+        let sec = Duration::from_secs(1);
+        let params = GuardParams::default();
+        let dir_usage = GuardUsageBuilder::new()
+            .kind(GuardUsageKind::OneHopDirectory)
+            .build()
+            .unwrap();
+        let data_usage = GuardUsage::default();
+
+        // Record a circuit success.
+        let _ = g.record_success(st, &params);
+        assert_eq!(g.next_retry(&dir_usage), None);
+        assert!(g.ready_for_usage(&dir_usage, inst));
+        assert_eq!(g.next_retry(&data_usage), None);
+        assert!(g.ready_for_usage(&data_usage, inst));
+
+        // Record a dircache failure.  This does not influence data usage.
+        g.record_external_failure(ExternalActivity::DirCache, inst);
+        assert_eq!(g.next_retry(&data_usage), None);
+        assert!(g.ready_for_usage(&data_usage, inst));
+        let next_dir_retry = g.next_retry(&dir_usage).unwrap();
+        assert!(next_dir_retry >= inst + GUARD_DIR_RETRY_FLOOR);
+        assert!(!g.ready_for_usage(&dir_usage, inst));
+        assert!(g.ready_for_usage(&dir_usage, next_dir_retry));
+
+        // Record a circuit success again.  This does not make the guard usable
+        // as a directory cache.
+        let _ = g.record_success(st, &params);
+        assert!(g.ready_for_usage(&data_usage, inst));
+        assert!(!g.ready_for_usage(&dir_usage, inst));
+
+        // Record a circuit failure.
+        g.record_failure(inst + sec * 10, true);
+        let next_circ_retry = g.next_retry(&data_usage).unwrap();
+        assert!(!g.ready_for_usage(&data_usage, inst + sec * 10));
+        assert!(!g.ready_for_usage(&dir_usage, inst + sec * 10));
+        assert_eq!(
+            g.next_retry(&dir_usage).unwrap(),
+            std::cmp::max(next_circ_retry, next_dir_retry)
+        );
+
+        // Record a directory success.  This won't supersede the circuit
+        // failure.
+        g.record_external_success(ExternalActivity::DirCache);
+        assert_eq!(g.next_retry(&data_usage).unwrap(), next_circ_retry);
+        assert_eq!(g.next_retry(&dir_usage).unwrap(), next_circ_retry);
+        assert!(!g.ready_for_usage(&dir_usage, inst + sec * 10));
+        assert!(!g.ready_for_usage(&data_usage, inst + sec * 10));
+    }
+}

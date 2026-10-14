@@ -12,6 +12,8 @@ use tor_dirmgr::{DirBlockage, DirBootstrapStatus};
 use tracing::debug;
 use web_time_compat::{SystemTime, SystemTimeExt};
 
+use crate::client::BootstrapSetting;
+
 /// Information about how ready a [`crate::TorClient`] is to handle requests.
 ///
 /// Note that this status does not change monotonically: a `TorClient` can
@@ -26,6 +28,8 @@ use web_time_compat::{SystemTime, SystemTimeExt};
 // its data.
 #[derive(Debug, Clone, Default)]
 pub struct BootstrapStatus {
+    /// Setting for whether we're _trying_ to bootstrap.
+    bootstrap_setting: BootstrapSetting,
     /// Status for our connection to the tor network
     conn_status: ConnStatus,
     /// Status for our directory information.
@@ -41,6 +45,14 @@ pub struct BootstrapStatus {
 }
 
 impl BootstrapStatus {
+    /// Create a new `BootstrapStatus` from a given `BootstrapSetting`
+    pub(crate) fn from_setting(bootstrap_setting: BootstrapSetting) -> Self {
+        Self {
+            bootstrap_setting,
+            ..Default::default()
+        }
+    }
+
     /// Return a rough fraction (from 0.0 to 1.0) representing how far along
     /// the client's bootstrapping efforts are.
     ///
@@ -82,7 +94,14 @@ impl BootstrapStatus {
     /// can't make connections to the internet" rather than "You are
     /// not on the internet."
     pub fn blocked(&self) -> Option<Blockage> {
-        if let Some(b) = self.conn_status.blockage() {
+        if self.bootstrap_setting.blocked() {
+            Some(Blockage {
+                kind: BlockageKind::Disabled,
+                message: "Client is waiting to be told to bootstrap"
+                    .to_string()
+                    .into(),
+            })
+        } else if let Some(b) = self.conn_status.blockage() {
             let message = b.to_string().into();
             let kind = b.into();
             if matches!(kind, BlockageKind::ClockSkewed) && self.skew_is_noteworthy() {
@@ -116,6 +135,11 @@ impl BootstrapStatus {
     /// Adjust this status based on new estimated clock skew information.
     fn apply_skew_estimate(&mut self, status: Option<SkewEstimate>) {
         self.skew = status;
+    }
+
+    /// Adjust this status based on new bootstrap settings.
+    pub(crate) fn apply_bootstrap_setting(&mut self, setting: BootstrapSetting) {
+        self.bootstrap_setting = setting;
     }
 
     /// tor-socks5 local patch: adjust this status based on a new aggregated
@@ -159,6 +183,12 @@ impl Blockage {
 #[derive(Clone, Debug, derive_more::Display)]
 #[non_exhaustive]
 pub enum BlockageKind {
+    /// The client has been disabled.
+    ///
+    /// This happens is the client was built with `BootstrapBehavior::Manual`,
+    /// and the client has not yet been told that it can bootstrap.
+    #[display("Client has been disabled")]
+    Disabled,
     /// There is some kind of problem with connecting to the network.
     #[display("We seem to be offline")]
     Offline,
@@ -232,7 +262,8 @@ pub(crate) async fn report_status(
     conn_status: ConnStatusEvents,
     dir_status: impl Stream<Item = DirBootstrapStatus> + Send + Unpin,
     skew_status: ClockSkewEvents,
-    // tor-socks5 local patch: fourth stream — the aggregated "guards usable"
+    setting_status: impl Stream<Item = BootstrapSetting> + Send + Unpin,
+    // tor-socks5 local patch: fifth stream — the aggregated "guards usable"
     // signal from tor-guardmgr.
     guards_usable: impl Stream<Item = bool> + Send + Unpin,
 ) {
@@ -245,6 +276,8 @@ pub(crate) async fn report_status(
         Dir(DirBootstrapStatus),
         /// A clock skew change
         Skew(Option<SkewEstimate>),
+        /// A change in boostrap settings
+        Setting(BootstrapSetting),
         /// tor-socks5 local patch: a guards-usable change
         Guard(bool),
     }
@@ -252,6 +285,7 @@ pub(crate) async fn report_status(
         conn_status.map(Event::Conn).boxed(),
         dir_status.map(Event::Dir).boxed(),
         skew_status.map(Event::Skew).boxed(),
+        setting_status.map(Event::Setting).boxed(),
         guards_usable.map(Event::Guard).boxed(),
     ]);
 
@@ -261,6 +295,7 @@ pub(crate) async fn report_status(
             Event::Conn(e) => b.apply_conn_status(e),
             Event::Dir(e) => b.apply_dir_status(e),
             Event::Skew(e) => b.apply_skew_estimate(e),
+            Event::Setting(e) => b.apply_bootstrap_setting(e),
             Event::Guard(e) => b.apply_guards_usable(e),
         }
         debug!("{}", *b);
@@ -318,6 +353,16 @@ mod test {
         let s = BootstrapStatus::default();
         assert!(!s.guards_usable);
         // Consequently a freshly-constructed status is never ready for traffic.
+        assert!(!s.ready_for_traffic());
+    }
+
+    #[test]
+    fn from_setting_defaults_guards_usable_false() {
+        // tor-socks5 local patch: adapted to 0.47, where a status is seeded
+        // from a `BootstrapSetting`: the guard signal must still start out
+        // false there.
+        let s = BootstrapStatus::from_setting(BootstrapSetting::default());
+        assert!(!s.guards_usable);
         assert!(!s.ready_for_traffic());
     }
 

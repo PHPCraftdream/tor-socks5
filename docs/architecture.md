@@ -25,18 +25,23 @@ tor-socks5/
 │   └── socks5-proto/           # shared host auth adapter over resocks5-net framing
 ├── apps/
 │   └── socks5-proxy/           # the binary (SOCKS5 proxy + busybox PT dispatch)
-└── vendor/                     # locally-patched forks of 3 upstream crates
-    ├── saturating-time/        # 0.3.0 — see [patch.crates-io] for the why
-    ├── tor-dirclient/          # 0.43.0
-    └── tor-dirmgr/             # 0.43.0
+└── vendor/                     # locally-patched forks of 7 upstream crates
+    ├── arti-client/            # 0.47.0
+    ├── saturating-time/        # 0.5.0
+    ├── tor-chanmgr/            # 0.47.0
+    ├── tor-circmgr/            # 0.47.0
+    ├── tor-dirclient/          # 0.47.0
+    ├── tor-dirmgr/             # 0.47.0
+    └── tor-guardmgr/           # 0.47.0
 ```
 
 The torrc `Bridge` line grammar is parsed by the external
-`ptrs-gesher-bridge-line` crate (`bridge-line = { version = "0.6",
-package = "ptrs-gesher-bridge-line" }` in `Cargo.toml`) — there is no
-local `bridge-line` package. Likewise the obfs4 + webtunnel PT client
-comes from the published `ptrs-gesher-lyrebird` crate (`lyrebird` 0.6);
-it is **not** vendored.
+`ptrs-gesher-bridge-line` crate — there is no local `bridge-line`
+package, and `ptrs-gesher` is **not** vendored. It is currently consumed
+temporarily from a sibling ptrs-gesher checkout via `[patch.crates-io]`
+(see `Cargo.toml`), because its crates.io release does not yet target
+`tor-*` 0.47. Likewise the obfs4 + webtunnel PT client comes from the
+`ptrs-gesher-lyrebird` crate from that same checkout.
 
 ## Crates and their responsibilities
 
@@ -244,30 +249,28 @@ The user-facing binary. Source modules under `src/`:
 
 ### `vendor/` — locally-patched forks
 
-Three upstream crates are vendored as full source copies and wired in
+Seven upstream crates (the Arti 0.47.0 / arti 2.7.0 line, plus
+`saturating-time` 0.5.0) are vendored as full source copies and wired in
 via `[patch.crates-io]` in the workspace `Cargo.toml`, so the build is
 self-contained and does **not** depend on these fixes being accepted
-upstream. Same-version overrides of the exact crates.io releases we
-depend on — bump alongside any arti upgrade.
+upstream. The full patch table, per-crate rationale and the next-sync
+procedure live in `vendor/README.md`. In short:
 
-* **`saturating-time` (0.3.0)** — the root-cause fix.
-  `saturating_add`/`saturating_sub` eagerly forced a non-terminating
-  min/max search on Windows `SystemTime` — the cause of an infinite
-  loop in `tor_netdoc::RouterDesc::parse` (used only for bridge
-  descriptors), which left every bridge "unsuitable to purpose" so no
-  circuit could be built. Vendored with a lazy unwrap + a
-  `find_limit` termination guard.
-* **`tor-dirclient` (0.43.0)** — idle (not total) read timeout for
-  slow obfs4 bridges, so a healthy-but-slow consensus download is not
-  truncated.
-* **`tor-dirmgr` (0.43.0)** — hard timeout on the bridge-descriptor
-  fetch (it used to hang forever) plus patient, gentle
-  retry/parallelism for the bridge pool.
+* **`saturating-time` (0.5.0)** — the root-cause fix:
+  lazy `saturating_add`/`saturating_sub` limits instead of the eager
+  non-terminating min/max search on Windows `SystemTime`, which left every
+  bridge "unsuitable to purpose" so no circuit could be built.
+* **`arti-client`, `tor-chanmgr`, `tor-circmgr`, `tor-dirclient`,
+  `tor-dirmgr`, `tor-guardmgr` (all 0.47.0)** — the full seven-fork set,
+  carrying our local stability/observability patches (idle body timeouts,
+  descriptor-fetch and channel-build budgets, poison recovery, channel
+  termination, guard readiness signals, exit-stream retry, opt-in
+  bandwidth floor, and more — see `vendor/README.md`).
 
 The obfs4 + webtunnel PT client is **not** vendored. It comes from the
-published `ptrs-gesher` crates on crates.io (`lyrebird` =
-`ptrs-gesher-lyrebird` 0.6); our obfs4 fixes (handshake-residual,
-decode-eof, TCP keepalive) are part of that published release.
+`ptrs-gesher` crates — currently temporarily from a sibling ptrs-gesher
+checkout via `[patch.crates-io]`, until a crates.io release targeting
+`tor-*` 0.47 exists.
 
 ## Pluggable-transport dispatch (busybox)
 

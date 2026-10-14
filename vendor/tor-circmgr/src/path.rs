@@ -290,8 +290,9 @@ trait AnonymousPathBuilder {
     ///
     /// Return the exit, along with the usage for a middle node corresponding
     /// to this exit.
-    /// tor-socks5 local patch: the `PathConfig`, so that the Tier 2
-    /// bandwidth floor can reach exit selection in the implementors.
+    ///
+    /// tor-socks5 local patch: the `PathConfig`, so that the bandwidth
+    /// floor can reach exit selection in the implementors.
     fn pick_exit<'a, R: Rng>(
         &self,
         rng: &mut R,
@@ -358,6 +359,8 @@ fn pick_path<'a, B: AnonymousPathBuilder, R: Rng, RT: Runtime>(
 
     let mut exclusion = guard_exclusion.clone();
     exclusion.extend(&target_exclusion);
+    // tor-socks5 local patch: pass the PathConfig down so that the
+    // bandwidth floor can apply to exit selection.
     let (exit, middle_usage) = builder.pick_exit(rng, netdir, exclusion, &rs_cfg, config)?;
 
     let mut family_exclusion =
@@ -367,17 +370,18 @@ fn pick_path<'a, B: AnonymousPathBuilder, R: Rng, RT: Runtime>(
     exclusion.extend(&target_exclusion);
 
     let selector = RelaySelector::new(middle_usage, exclusion);
-    // Tier 2: the middle relay is optionally restricted to the upper
-    // band of the consensus bandwidth distribution.
+    // tor-socks5 local patch: the middle relay is optionally restricted to
+    // the upper band of the consensus bandwidth distribution.
     let middle = select_relay_with_bandwidth_floor(
         &selector,
         rng,
         netdir,
-        config.min_bandwidth_percentile,
+        config.min_bandwidth_percentile(),
         WeightRole::Middle,
         builder.path_kind(),
         "middle relay",
     )?;
+
     let hops = vec![
         guard,
         MaybeOwnedRelay::from(middle),
@@ -387,24 +391,6 @@ fn pick_path<'a, B: AnonymousPathBuilder, R: Rng, RT: Runtime>(
     ensure_unique_hops(&hops)?;
 
     Ok((TorPath::new_multihop_from_maybe_owned(hops), mon, usable))
-}
-
-/// Returns an error if the specified hop list contains duplicates.
-fn ensure_unique_hops<'a>(hops: &'a [MaybeOwnedRelay<'a>]) -> StdResult<(), Bug> {
-    for (i, hop) in hops.iter().enumerate() {
-        if let Some(hop2) = hops
-            .iter()
-            .skip(i + 1)
-            .find(|hop2| hop.clone().has_any_relay_id_from(*hop2))
-        {
-            return Err(internal!(
-                "invalid path: the IDs of hops {} and {} overlap?!",
-                hop.display_relay_ids(),
-                hop2.display_relay_ids()
-            ));
-        }
-    }
-    Ok(())
 }
 
 // tor-socks5 local patch (docs/circuit-speed-plan.md Tier 2): safety
@@ -518,6 +504,24 @@ fn bandwidth_percentile_threshold(sorted: &[RelayWeight], percentile: u8) -> Rel
     // consensus (n <= ~10_000 relays, p <= 255 → n * p <= ~2.55M).
     let idx = (sorted.len().saturating_mul(percentile as usize) / 100).min(sorted.len() - 1);
     sorted[idx]
+}
+
+/// Returns an error if the specified hop list contains duplicates.
+fn ensure_unique_hops<'a>(hops: &'a [MaybeOwnedRelay<'a>]) -> StdResult<(), Bug> {
+    for (i, hop) in hops.iter().enumerate() {
+        if let Some(hop2) = hops
+            .iter()
+            .skip(i + 1)
+            .find(|hop2| hop.clone().has_any_relay_id_from(*hop2))
+        {
+            return Err(internal!(
+                "invalid path: the IDs of hops {} and {} overlap?!",
+                hop.display_relay_ids(),
+                hop2.display_relay_ids()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Try to select a guard corresponding to the requirements of
@@ -711,11 +715,16 @@ mod bandwidth_floor_tests {
             RelayExclusion::exclude_specific_relays(&excluded),
         );
 
-        let mut rng = testing_rng();
+        // With a pool below MIN_FILTERED_POOL the helper must take the
+        // exact stock code path: with two identically-seeded RNGs the
+        // floored call and a direct `select_relay` must pick the identical
+        // relay every time (this is what makes the fallback observable).
+        let mut rng_floored = TestRngConfig::Deterministic.into_rng();
+        let mut rng_stock = TestRngConfig::Deterministic.into_rng();
         for _ in 0..50 {
             let relay = select_relay_with_bandwidth_floor(
                 &selector,
-                &mut rng,
+                &mut rng_floored,
                 &netdir,
                 99,
                 WeightRole::Middle,
@@ -723,8 +732,11 @@ mod bandwidth_floor_tests {
                 "middle relay",
             )
             .unwrap();
-            // Whatever was picked must still be one the selector permits.
+            // Whatever was picked must still be one the selector permits...
             assert!(selector.permits_relay(&relay));
+            // ...and must be exactly what the stock selection would pick.
+            let (stock, _) = selector.select_relay(&mut rng_stock, &netdir);
+            assert!(relay.same_relay_ids(&stock.unwrap()));
         }
     }
 

@@ -30,8 +30,7 @@ pub trait DirProviderBuilder<R: Runtime>: Send + Sync {
 
 // tor-socks5 local patch: observability hook for arti's intentional
 // protocol-mismatch shutdown (Tor proposal 266). See the matching change in
-// `RunningInner::new`'s `on_fatal` closure (`client.rs`) and the application
-// wiring in `packages/arti-wrapper`.
+// `RunningInner::new`'s `on_fatal` closure (`client.rs`).
 
 /// A hook invoked immediately before Arti performs a fatal shutdown because
 /// the running software version is missing a subprotocol that the live Tor
@@ -45,7 +44,7 @@ pub trait DirProviderBuilder<R: Runtime>: Send + Sync {
 /// **observability**: it lets an embedding application emit a structured
 /// `tracing::error!` marker (or fire an alert) *before* the process dies, so
 /// that in deployment models with no external supervisor to notice the exit
-/// (e.g. a manually-replaced binary on a desktop) the event is not silent.
+/// the event is not silent.
 ///
 /// The hook is invoked exactly once, synchronously inside the fatal-shutdown
 /// task, before Arti flushes its logs and calls `std::process::exit(1)`. It is
@@ -146,6 +145,7 @@ impl<R: Runtime> TorClientBuilder<R> {
             bootstrap_behavior: BootstrapBehavior::default(),
             dirmgr_builder: Arc::new(DirMgrBuilder {}),
             local_resource_timeout: None,
+            // tor-socks5 local patch.
             fatal_protocol_error_handler: None,
             #[cfg(feature = "dirfilter")]
             dirfilter: None,
@@ -169,25 +169,6 @@ impl<R: Runtime> TorClientBuilder<R> {
         self
     }
 
-    /// Install a hook invoked immediately before Arti performs its intentional
-    /// fatal shutdown (see [`FatalProtocolErrorHandler`]).
-    ///
-    /// The shutdown is deliberate — a required Tor subprotocol is missing (Tor
-    /// proposal 266) — and is **not** disabled by installing a hook; this only
-    /// adds an observability seam that fires *before* the process exits. If no
-    /// hook is installed, Arti's default `eprintln!`-to-stderr behaviour is
-    /// unchanged.
-    ///
-    /// tor-socks5 local patch.
-    pub fn fatal_protocol_error_handler<H>(mut self, hook: H) -> Self
-    where
-        H: FatalProtocolErrorHandler + 'static,
-    {
-        let arc: Arc<dyn FatalProtocolErrorHandler> = Arc::new(hook);
-        self.fatal_protocol_error_handler = Some(arc);
-        self
-    }
-
     /// Set a timeout that we should allow when trying to acquire our local resources
     /// (including lock files.)
     ///
@@ -204,6 +185,25 @@ impl<R: Runtime> TorClientBuilder<R> {
     /// The provided timeout value may not be larger than [`MAX_LOCAL_RESOURCE_TIMEOUT`].
     pub fn local_resource_timeout(mut self, timeout: Duration) -> Self {
         self.local_resource_timeout = Some(timeout);
+        self
+    }
+
+    /// Install a hook invoked immediately before Arti performs its intentional
+    /// fatal shutdown (see [`FatalProtocolErrorHandler`]).
+    ///
+    /// The shutdown is deliberate — a required Tor subprotocol is missing (Tor
+    /// proposal 266) — and is **not** disabled by installing a hook; this only
+    /// adds an observability seam that fires *before* the process exits. If no
+    /// hook is installed, Arti's default `eprintln!`-to-stderr behaviour is
+    /// unchanged.
+    ///
+    /// tor-socks5 local patch.
+    pub fn fatal_protocol_error_handler<H>(mut self, hook: H) -> Self
+    where
+        H: FatalProtocolErrorHandler + 'static,
+    {
+        let arc: Arc<dyn FatalProtocolErrorHandler> = Arc::new(hook);
+        self.fatal_protocol_error_handler = Some(arc);
         self
     }
 

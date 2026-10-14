@@ -68,6 +68,7 @@ pub struct GuardUsableEvents {
     pub(crate) inner: postage::watch::Receiver<bool>,
 }
 
+// tor-socks5 local patch: usable events stream
 impl Stream for GuardUsableEvents {
     type Item = bool;
 
@@ -78,6 +79,7 @@ impl Stream for GuardUsableEvents {
         self.inner.poll_next_unpin(cx)
     }
 }
+// tor-socks5 local patch: usable events snapshot
 impl GuardUsableEvents {
     /// Return whether the active guard sample is currently usable for traffic
     /// (true iff at least one usable guard has complete directory information).

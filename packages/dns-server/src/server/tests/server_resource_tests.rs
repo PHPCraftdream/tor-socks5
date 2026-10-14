@@ -287,14 +287,20 @@ async fn real_tcp_partial_frame_timeout_releases_connection_without_backend() {
     tokio::time::resume();
     // Closing with the partial byte still unread yields RST instead of FIN;
     // whether the server read it before the virtual deadline depends on when
-    // the OS readiness reached the driver. Both prove the server closed.
+    // the OS readiness reached the driver (Windows reports the RST as
+    // ConnectionAborted, other platforms as ConnectionReset). All prove the
+    // server closed.
     let mut byte = [0];
     match timeout(CASE_BUDGET, peer.read(&mut byte))
         .await
         .expect("timed-out connection did not close")
     {
         Ok(0) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            ) => {}
         other => panic!("timed-out connection was not closed: {other:?}"),
     }
 

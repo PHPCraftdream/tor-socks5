@@ -79,15 +79,8 @@ pub enum RequestError {
     #[error("headers too long; gave up after {0} bytes")]
     HeadersTooLong(usize),
 
-    /// tor-socks5 local patch: the response declared a `Content-Length`, but
-    /// the length-bounding `.take(len)` body reader hit `Ok(0)` (EOF) before
-    /// that many bytes were actually delivered. `Take::poll_read` returns
-    /// `Ok(0)` both when its byte budget is exhausted *and* when the
-    /// underlying stream hits a real EOF early — those look identical to the
-    /// caller, so a short body used to be silently accepted as a complete,
-    /// successful document. For a compressed directory document, that could
-    /// decompress into a plausible-looking but truncated document (e.g. a
-    /// consensus cut off mid-line for `tor_netdoc`'s line-oriented parser).
+    /// Body ended before its declared wire length; contains missing bytes.
+    // tor-socks5 local patch: truncated_body
     #[error("response body shorter than declared Content-Length; {0} bytes missing")]
     TruncatedBody(u64),
 
@@ -215,6 +208,7 @@ impl HasKind for RequestError {
             E::TruncatedHeaders => EK::TorProtocolViolation,
             E::ResponseTooLong(_) => EK::TorProtocolViolation,
             E::HeadersTooLong(_) => EK::TorProtocolViolation,
+            // tor-socks5 local patch: truncated_body_kind
             E::TruncatedBody(_) => EK::TorProtocolViolation,
             E::Utf8Encoding(_) => EK::TorProtocolViolation,
             // TODO: it would be good to get more information out of the IoError
@@ -274,8 +268,9 @@ impl RequestError {
         use tor_proto::Error as PE;
         match self {
             RequestError::ResponseTooLong(_) => true,
-            RequestError::HeadersTooLong(_) => true,
+            // tor-socks5 local patch: truncated_body_suspicious
             RequestError::TruncatedBody(_) => true,
+            RequestError::HeadersTooLong(_) => true,
             RequestError::Proto(PE::ExcessInboundCells) => true,
             RequestError::Proto(_) => false,
             RequestError::DirTimeout => false,

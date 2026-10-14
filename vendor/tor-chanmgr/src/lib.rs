@@ -11,7 +11,7 @@
 #![deny(clippy::cargo_common_metadata)]
 #![deny(clippy::cast_lossless)]
 #![deny(clippy::checked_conversions)]
-#![warn(clippy::cognitive_complexity)]
+#![allow(clippy::cognitive_complexity)] // See arti#2556
 #![deny(clippy::debug_assert_with_mut_call)]
 #![deny(clippy::exhaustive_enums)]
 #![deny(clippy::exhaustive_structs)]
@@ -44,6 +44,7 @@
 #![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 #![allow(clippy::collapsible_if)] // See arti#2342
 #![deny(clippy::unused_async)]
+#![deny(clippy::string_slice)] // See arti#2571
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
 pub mod builder;
@@ -311,15 +312,19 @@ impl<R: Runtime> ChanMgr<R> {
     /// need to pass them so they can be sent in the NETINFO cell.
     ///
     /// The channel may or may not be authenticated. This method will wait until the channel is
-    /// usable, and may return an error if we already have an existing channel to this peer, or if
-    /// there are already too many open connections with this peer or subnet (as a dos defence).
+    /// usable, and may return an error if we already have an existing channel to this peer.
     #[cfg(feature = "relay")]
     pub async fn handle_incoming(
         &self,
         src: Sensitive<std::net::SocketAddr>,
         stream: <R as tor_rtcompat::NetStreamProvider>::Stream,
     ) -> Result<Arc<Channel>> {
-        self.mgr.handle_incoming(src, stream).await
+        let result = self.mgr.handle_incoming(src, stream).await;
+
+        #[cfg(feature = "metrics")]
+        self.mgr.metrics.increment_inbound_channels_built(&result);
+
+        result
     }
 
     /// Try to get a suitable channel to the provided `target`,
@@ -366,26 +371,14 @@ impl<R: Runtime> ChanMgr<R> {
         self.mgr.expire_channels()
     }
 
-    // tor-socks5 local patch: expose `AbstractChanMgr::terminate_all_channels()`
-    // (mgr.rs) as a public API. See `vendor/README.md`'s `tor-chanmgr` section
-    // for the full rationale: this is the primitive that lets a caller force
-    // every tracked channel closed after detecting a stale post-network-change
-    // condition, instead of waiting for `expire_channels()`'s idle-duration
-    // check (which never fires while a stuck circuit keeps retrying against a
-    // dead channel).
-    /// Unconditionally terminate every channel currently tracked by this
-    /// manager, regardless of whether it is in use, and remove them from the
-    /// internal map.
+    // tor-socks5 local patch: public channel recovery API
+    /// Unconditionally terminate and remove all currently open channels,
+    /// including channels in use. Existing references observe shutdown.
     ///
-    /// Existing references to a terminated channel (e.g. held by an in-flight
-    /// circuit builder) will observe it fail the same way they would after a
-    /// real network-level disconnection; [`ChanMgr::get_or_launch`] will
-    /// transparently build a fresh channel the next time one is requested.
-    ///
-    /// Unlike [`expire_channels`](Self::expire_channels), this does not wait
-    /// for channels to become idle: it is meant to be called explicitly by a
-    /// caller that has already detected that its channels are stale (for
-    /// example, after a host network change), not on a periodic schedule.
+    /// Pending builds are left untouched and may subsequently finish; this is
+    /// not a shutdown barrier. A later request can build a fresh channel using
+    /// the same manager. Intended for explicit stale-network recovery, not
+    /// periodic expiry.
     pub fn terminate_all_channels(&self) {
         self.mgr.terminate_all_channels();
     }

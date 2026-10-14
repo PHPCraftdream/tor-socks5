@@ -20,17 +20,17 @@ readme = "README.md"
 authors = ["PHPCraftdream <noreply@users.noreply.github.com>"]
 keywords = ["tor", "socks5", "proxy", "bridges", "anonymity"]
 categories = ["network-programming", "command-line-utilities"]
-rust-version = "1.89"
+rust-version = "1.92"
 
 [workspace.dependencies]
-arti-client = { version = "0.43", default-features = false, features = ["tokio", "rustls", "onion-service-client", "static-sqlite", "bridge-client", "pt-client", "experimental-api"] }
-tor-rtcompat = { version = "0.43", default-features = false, features = ["tokio", "rustls"] }
-tor-error = "0.43"
-tor-chanmgr = { version = "0.43", default-features = false, features = ["pt-client"] }
-tor-guardmgr = { version = "0.43", default-features = false, features = ["bridge-client", "pt-client"] }
+arti-client = { version = "0.47", default-features = false, features = ["tokio", "rustls", "onion-service-client", "static-sqlite", "bridge-client", "pt-client", "experimental-api"] }
+tor-rtcompat = { version = "0.47", default-features = false, features = ["tokio", "rustls"] }
+tor-error = "0.47"
+tor-chanmgr = { version = "0.47", default-features = false, features = ["pt-client"] }
+tor-guardmgr = { version = "0.47", default-features = false, features = ["bridge-client", "pt-client"] }
 # Already in the dependency graph (arti pulls it); declared directly so
 # arti-wrapper can compare a channel's actual ChanMethod with the requested one.
-tor-linkspec = { version = "0.43", default-features = false, features = ["pt-client"] }
+tor-linkspec = { version = "0.47", default-features = false, features = ["pt-client"] }
 
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 
@@ -73,8 +73,8 @@ httparse = "1"
 base64 = "0.22"
 getrandom = "0.2"
 url = "2"
-bridge-line = { version = "0.6", package = "ptrs-gesher-bridge-line" }
-lyrebird = { version = "0.6", package = "ptrs-gesher-lyrebird" }
+bridge-line = { version = "0.7", package = "ptrs-gesher-bridge-line" }
+lyrebird = { version = "0.7", package = "ptrs-gesher-lyrebird" }
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 proptest = "1"
 rusqlite = { version = "0.39", features = ["backup"] }
@@ -92,9 +92,9 @@ codegen-units = 1
 ## fixes being accepted upstream. Same-version overrides of the exact crates.io
 ## releases we depend on — bump alongside any arti upgrade.
 ##
-## tor-dirclient 0.43.0: idle (not total) read timeout for slow obfs4 bridges.
+## tor-dirclient 0.47.0: idle (not total) read timeout for slow obfs4 bridges.
 tor-dirclient = { path = "vendor/tor-dirclient" }
-## tor-dirmgr 0.43.0: hard timeout on the bridge-descriptor fetch (it used to
+## tor-dirmgr 0.47.0: hard timeout on the bridge-descriptor fetch (it used to
 ## hang forever) + patient, gentle retry/parallelism for the bridge pool.
 tor-dirmgr = { path = "vendor/tor-dirmgr" }
 ## FIX: saturating-time 0.3.0 `saturating_add`/`saturating_sub` eagerly force a
@@ -109,7 +109,7 @@ tor-chanmgr = { path = "vendor/tor-chanmgr" }
 tor-guardmgr = { path = "vendor/tor-guardmgr" }
 ## Wire guard readiness and recovery APIs into the client.
 arti-client = { path = "vendor/arti-client" }
-## tor-circmgr 0.43.0: vendored for the circuit-speed tiers
+## tor-circmgr 0.47.0: vendored for the circuit-speed tiers
 ## (docs/plans/circuit-speed-plan.md): Tier 2 — an opt-in bandwidth floor for
 ## middle/exit relay selection (`min_bandwidth_percentile`, default 0 =
 ## stock behaviour; falls back to the unfiltered pool rather than ever

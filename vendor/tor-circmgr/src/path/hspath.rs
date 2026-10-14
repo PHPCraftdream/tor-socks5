@@ -193,14 +193,12 @@ impl AnonymousPathBuilder for HsPathBuilder {
         netdir: &'a NetDir,
         guard_exclusion: RelayExclusion<'a>,
         _rs_cfg: &RelaySelectionConfig<'_>,
-        // tor-socks5 local patch: added to
-        // `AnonymousPathBuilder::pick_exit` for the Tier 2 middle/exit
-        // bandwidth floor. Deliberately unused here: the hidden-service
-        // terminal hop is neither a middle nor an exit selection (its
-        // usages map to the HsIntro/HsRend/Middle roles, not
-        // `WeightRole::Exit`), so the floor does not apply to it. The
-        // middle hop of an HS circuit stem still gets the floor via the
-        // shared `pick_path`.
+        // tor-socks5 local patch: added to `pick_exit` for the bandwidth
+        // floor. Deliberately unused here: the hidden-service terminal hop
+        // is neither a middle nor an exit selection (its usages map to the
+        // HsIntro/HsRend/Middle roles, not `WeightRole::Exit`), so the
+        // floor does not apply to it. The middle hop of an HS circuit stem
+        // still gets the floor via the shared `pick_path`.
         _config: &PathConfig,
     ) -> Result<(Relay<'a>, RelayUsage)> {
         let selector =
@@ -413,7 +411,8 @@ pub(crate) fn hs_stem_terminal_hop_usage(kind: Option<HsCircKind>) -> RelayUsage
     }
 }
 
-#[cfg(test)]
+// tor-socks5 local patch: these tests need the vanguards and hs-common features, which our release feature set does not enable; the nightly all-features run covers them.
+#[cfg(all(test, feature = "vanguards", feature = "hs-common"))]
 mod test {
     // @@ begin test lint list maintained by maint/add_warning @@
     #![allow(clippy::bool_assert_comparison)]
@@ -427,14 +426,12 @@ mod test {
     #![allow(clippy::unchecked_time_subtraction)]
     #![allow(clippy::useless_vec)]
     #![allow(clippy::needless_pass_by_value)]
+    #![allow(clippy::string_slice)] // See arti#2571
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
 
     use std::sync::Arc;
 
     use super::*;
-    use crate::path::OwnedPath;
-    use tor_basic_utils::test_rng::testing_rng;
-    use tor_netdir::testnet::construct_custom_netdir;
 
     use tor_linkspec::{ChannelMethod, OwnedCircTarget};
     use tor_netdir::{NetDirProvider, testnet::NodeBuilders, testprovider::TestNetDirProvider};
@@ -444,7 +441,10 @@ mod test {
     use tor_rtmock::MockRuntime;
 
     #[cfg(all(feature = "vanguards", feature = "hs-common"))]
-    use tor_guardmgr::VanguardMgrError;
+    use {
+        crate::path::OwnedPath, tor_basic_utils::test_rng::testing_rng,
+        tor_guardmgr::VanguardMgrError, tor_netdir::testnet::construct_custom_netdir,
+    };
 
     /// The maximum number of relays in a test network.
     const MAX_NET_SIZE: usize = 40;
@@ -588,7 +588,6 @@ mod test {
     }
 
     /// Helper for calling `HsPathBuilder::pick_path_with_vanguards`.
-    #[cfg(all(feature = "vanguards", feature = "hs-common"))]
     async fn pick_vanguard_path<'a>(
         runtime: &MockRuntime,
         netdir: &'a NetDir,

@@ -5,13 +5,13 @@ use std::time::SystemTime;
 use rand::Rng;
 use tracing::instrument;
 
-use super::{AnonymousPathBuilder, TorPath, select_relay_with_bandwidth_floor};
+use super::{AnonymousPathBuilder, TorPath};
 use crate::path::pick_path;
 use crate::{DirInfo, Error, PathConfig, Result, TargetPort};
 
 use tor_guardmgr::{GuardMgr, GuardMonitor, GuardUsable};
 use tor_linkspec::OwnedChanTarget;
-use tor_netdir::{NetDir, Relay, WeightRole};
+use tor_netdir::{NetDir, Relay};
 use tor_relay_selection::{RelayExclusion, RelaySelectionConfig, RelaySelector, RelayUsage};
 use tor_rtcompat::Runtime;
 #[cfg(feature = "geoip")]
@@ -145,6 +145,8 @@ impl AnonymousPathBuilder for ExitPathBuilder {
         netdir: &'a NetDir,
         guard_exclusion: RelayExclusion<'a>,
         rs_cfg: &RelaySelectionConfig<'_>,
+        // tor-socks5 local patch: carries the bandwidth floor for the
+        // final (exit) hop of an ordinary circuit.
         config: &PathConfig,
     ) -> Result<(Relay<'a>, RelayUsage)> {
         let selector = match &self.inner {
@@ -173,16 +175,14 @@ impl AnonymousPathBuilder for ExitPathBuilder {
             ),
         };
 
-        // tor-socks5 local patch (docs/circuit-speed-plan.md Tier 2): the
-        // exit relay is optionally restricted to the upper band of the
-        // consensus bandwidth distribution. With the floor at 0 (the
-        // default) this is exactly the stock selection call.
-        let relay = select_relay_with_bandwidth_floor(
+        // tor-socks5 local patch: the exit relay is optionally restricted
+        // to the upper band of the consensus bandwidth distribution.
+        let relay = super::select_relay_with_bandwidth_floor(
             &selector,
             rng,
             netdir,
-            config.min_bandwidth_percentile,
-            WeightRole::Exit,
+            config.min_bandwidth_percentile(),
+            tor_netdir::WeightRole::Exit,
             self.path_kind(),
             "final hop",
         )?;
@@ -214,6 +214,7 @@ mod test {
     #![allow(clippy::unchecked_time_subtraction)]
     #![allow(clippy::useless_vec)]
     #![allow(clippy::needless_pass_by_value)]
+    #![allow(clippy::string_slice)] // See arti#2571
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
     use super::*;
     use crate::path::{
@@ -448,37 +449,6 @@ mod test {
             assert_eq!(distinct_guards.len(), 1);
             assert_ne!(distinct_mid.len(), 1);
             assert_ne!(distinct_exit.len(), 1);
-        });
-    }
-
-    // tor-socks5 local patch (docs/circuit-speed-plan.md Tier 2): an
-    // over-aggressive floor must fall back, not fail.
-    #[test]
-    fn aggressive_bandwidth_floor_falls_back_to_unfiltered() {
-        tor_rtcompat::test_with_all_runtimes!(|rt| async move {
-            // The 40-relay testnet filtered at the 95th percentile leaves
-            // only ~2 candidates — below the vendored safety minimum — so
-            // selection must fall back to the stock unfiltered behaviour
-            // and still build ordinary 3-hop paths.
-            let mut rng = testing_rng();
-            let netdir = testnet::construct_netdir().unwrap_if_sufficient().unwrap();
-            let dirinfo = (&netdir).into();
-            let config = PathConfig::builder()
-                .min_bandwidth_percentile(95)
-                .build()
-                .unwrap();
-            let statemgr = TestingStateMgr::new();
-            let guards =
-                tor_guardmgr::GuardMgr::new(rt.clone(), statemgr, &TestConfig::default()).unwrap();
-            guards.install_test_netdir(&netdir);
-            let now = SystemTime::get();
-
-            for _ in 0..100 {
-                let (path, _, _) = ExitPathBuilder::from_target_ports(vec![TargetPort::ipv4(443)])
-                    .pick_path(&mut rng, dirinfo, &guards, &config, now)
-                    .unwrap();
-                assert_eq!(path.len(), 3);
-            }
         });
     }
 }

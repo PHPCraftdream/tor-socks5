@@ -295,15 +295,15 @@ jobs:
         run: sh scripts/check-packageability.sh
 
   msrv:
-    name: MSRV (1.89)
+    name: MSRV (1.92)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-local-sdk
-      - uses: dtolnay/rust-toolchain@1.89
+      - uses: dtolnay/rust-toolchain@1.92
       - uses: Swatinem/rust-cache@v2
         with:
-          key: msrv-1.89
+          key: msrv-1.92
       - run: cargo check --locked --workspace --all-targets
 
   android:

@@ -11,7 +11,7 @@
 #![deny(clippy::cargo_common_metadata)]
 #![deny(clippy::cast_lossless)]
 #![deny(clippy::checked_conversions)]
-#![warn(clippy::cognitive_complexity)]
+#![allow(clippy::cognitive_complexity)] // See arti#2556
 #![deny(clippy::debug_assert_with_mut_call)]
 #![deny(clippy::exhaustive_enums)]
 #![deny(clippy::exhaustive_structs)]
@@ -44,6 +44,7 @@
 #![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 #![allow(clippy::collapsible_if)] // See arti#2342
 #![deny(clippy::unused_async)]
+#![deny(clippy::string_slice)] // See arti#2571
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
 // TODO #1645 (either remove this, or decide to have it everywhere)
@@ -62,7 +63,12 @@ pub mod config;
 pub mod status;
 
 pub use address::{DangerouslyIntoTorAddr, IntoTorAddr, TorAddr, TorAddrError};
-pub use builder::{FatalProtocolErrorHandler, MAX_LOCAL_RESOURCE_TIMEOUT, TorClientBuilder};
+pub use builder::{
+    // tor-socks5 local patch: FatalProtocolErrorHandler.
+    FatalProtocolErrorHandler,
+    MAX_LOCAL_RESOURCE_TIMEOUT,
+    TorClientBuilder,
+};
 pub use client::{BootstrapBehavior, DormantMode, InertTorClient, StreamPrefs, TorClient};
 pub use config::TorClientConfig;
 
@@ -94,11 +100,9 @@ pub use tor_geoip::CountryCode;
 
 // tor-socks5 local patch: re-export the types needed to call
 // `TorClient::note_external_guard_failure()` so that callers don't have to
-// add a direct `tor-guardmgr`/`tor-linkspec` dependency of their own just to
-// name `ExternalActivity` and `HasRelayIds` at the call site.
-#[cfg(feature = "experimental-api")]
+// depend on `tor-guardmgr`/`tor-linkspec` directly or spell out the full path
+// names `ExternalActivity` and `HasRelayIds` at the call site.
 pub use tor_guardmgr::ExternalActivity;
-#[cfg(feature = "experimental-api")]
 pub use tor_linkspec::HasRelayIds;
 
 /// Return a list of the protocols [supported](tor_protover::doc_supported) by this crate.
@@ -168,9 +172,8 @@ mod test {
     #![allow(clippy::unchecked_time_subtraction)]
     #![allow(clippy::useless_vec)]
     #![allow(clippy::needless_pass_by_value)]
+    #![allow(clippy::string_slice)] // See arti#2571
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
-
-    use cfg_if::cfg_if;
 
     use super::*;
 
@@ -196,7 +199,6 @@ mod test {
             assert!(unsupported.is_empty(), "{} not supported", unsupported);
         }
 
-        // TODO: Revise this once congestion control is fully implemented and always-on.
         {
             // Recommended by c-tor main-branch authorities as of 2024-04-02
             let rec: tor_protover::Protocols =
@@ -205,16 +207,8 @@ mod test {
                     .parse()
                     .unwrap();
 
-            // Although this is recommended, it isn't always-on in Arti yet.
-            cfg_if! {
-                if #[cfg(feature="flowctl-cc")] {
-                     let permitted_missing: tor_protover::Protocols =
-                        [].into_iter().collect();
-                } else {
-                    let permitted_missing: tor_protover::Protocols =
-                        [tor_protover::named::FLOWCTRL_CC].into_iter().collect();
-                }
-            }
+            // Here we list any recommended protocols that are not yet always-on.
+            let permitted_missing: tor_protover::Protocols = [].into_iter().collect();
             let unsupported = rec.difference(&pr);
             assert!(unsupported.difference(&permitted_missing).is_empty());
         }
