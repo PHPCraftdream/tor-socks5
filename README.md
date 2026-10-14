@@ -125,8 +125,8 @@ a shorter, ready-to-edit subset of the same defaults; any key you omit keeps the
 
 ## Circuit length: only 2 or 3 hops are permitted. The secure default is 3.
 ## 2-hop circuits go directly from guard to exit, with no middle relay, reducing
-## anonymity. Intended for censorship circumvention, not anonymity. Setting is
-## stored here; circuit-length activation is deferred to CLH-03b.
+## anonymity. Intended for censorship circumvention, not anonymity. Applies to ordinary circuits;
+## onion-service circuits are unaffected pending CLH-04.
 tor.circuit_hops: 3
 
 ## Addresses to listen on — one SOCKS5 + HTTP CONNECT listener per address.

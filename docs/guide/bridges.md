@@ -9,10 +9,10 @@ candidates for promotion — both **obfs4** and **webtunnel**, used together.
 ## Circuit length (`tor.circuit_hops`)
 
 The main configuration accepts `tor.circuit_hops: 2` or `3` (default `3`).
-Two hops go directly from guard to exit with no middle relay, reducing
-anonymity; this is intended for censorship circumvention, not anonymity.
-This release stores the setting and carries it through configuration/Settings
-plumbing only; circuit-length activation is deferred to CLH-03b.
+Two-hop circuits go directly from guard to exit with no middle relay, reducing
+anonymity; this is intended for censorship circumvention, not anonymity. The
+setting applies to ordinary circuits; onion-service circuits remain unaffected
+pending CLH-04.
 
 ## Single binary, two modes (busybox dispatch)
 

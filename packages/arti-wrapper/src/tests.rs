@@ -1,4 +1,5 @@
 use super::*;
+use arti_client::config::circ::CircMgrConfig;
 use std::path::PathBuf;
 use std::sync::Once;
 
@@ -68,14 +69,20 @@ fn settings_with_bridges_is_not_default() {
 }
 
 #[test]
-fn build_config_accepts_two_hops_without_applying_it_to_builder() {
-    let settings = Settings {
-        circuit_hops: 2,
-        ..Default::default()
-    };
-    let default_path_config = build_config(&Settings::default()).expect("default config");
-    let two_hop_path_config = build_config(&settings).expect("two-hop setting accepted");
-    assert_eq!(two_hop_path_config, default_path_config);
+fn build_config_applies_circuit_hops_to_path_config() {
+    for (hops, settings) in [
+        (
+            2,
+            Settings {
+                circuit_hops: 2,
+                ..Default::default()
+            },
+        ),
+        (3, Settings::default()),
+    ] {
+        let config = build_config(&settings).expect("valid circuit hop setting builds");
+        assert_eq!(config.path_rules().circuit_hops(), hops);
+    }
 }
 
 #[test]

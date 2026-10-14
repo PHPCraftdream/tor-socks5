@@ -9,7 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `tor.circuit_hops` config plumbing (permitted values 2 or 3, default 3) for CLI and Android settings, with a startup warning about the anonymity tradeoff. Two-hop circuit activation remains deferred to CLH-03b.
+- `tor.circuit_hops` now applies to ordinary circuits (2 or 3 hops; default 3). Onion-service circuits remain unaffected pending CLH-04.
+
+- `tor.circuit_hops` config plumbing (permitted values 2 or 3, default 3) for CLI and Android settings, with a startup warning about the anonymity tradeoff.
 
 ### Changed
 
