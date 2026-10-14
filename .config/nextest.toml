@@ -1,0 +1,54 @@
+# cargo-nextest config (checked with nextest 0.9.137).
+# Docs: `cargo nextest show-config --help`, profile keys via `cargo nextest run --help`.
+#
+# Notes:
+# - nextest does NOT run doctests; run `cargo test --doc` separately (see test-tiers plan).
+# - vendor crates tor-chanmgr / tor-dirmgr / tor-dirclient are NOT workspace members,
+#   so workspace runs never include them (covered by the nightly T3 contour).
+
+# Quick local profile: stop on first failure, warn on slow tests but never kill them.
+[profile.default]
+fail-fast = true
+# Print a warning every 60s for a still-running test; no terminate-after on purpose
+# (slow-but-alive tests, e.g. paused-clock suites, must not be murdered locally).
+slow-timeout = { period = "60s" }
+
+# CI profile: no fail-fast, NO retries (flakes must not be masked), JUnit report.
+[profile.ci]
+fail-fast = false
+retries = 0
+status-level = "slow"          # per-test lines incl. slow marks, good enough for CI logs
+final-status-level = "flaky"   # summary lists slow/flaky/fail/leaked outcomes
+
+[profile.ci.junit]
+path = "junit.xml"   # relative to target/nextest/ci/
+
+# Flaky hunt: no masking, maximal verbosity. Repeat runs:
+#   cargo nextest run --profile flaky-hunt --stress-count N   (repeat the whole run N times)
+# or bound by time instead: `--stress-duration 1h` (nextest 0.9.137 syntax, see run --help).
+[profile.flaky-hunt]
+fail-fast = false
+retries = 0
+status-level = "all"           # print output of every test
+final-status-level = "all"     # full final summary with output
+
+[profile.flaky-hunt.junit]
+path = "junit.xml"   # relative to target/nextest/flaky-hunt/
+
+# Test groups: cap parallelism for suites with real sockets / paused clocks.
+# Cause of flakes: Windows port reuse, clock pause/resume races, RST instead of FIN.
+[test-groups.sockets-and-clocks]
+max-threads = 4
+
+# Apply the cap in every profile via overrides (filters use package ids, not paths).
+[[profile.default.overrides]]
+filter = "package(tor-socks5-dns) or package(tor-circmgr) or package(tor-guardmgr) or package(socks5-proxy)"
+test-group = "sockets-and-clocks"
+
+[[profile.ci.overrides]]
+filter = "package(tor-socks5-dns) or package(tor-circmgr) or package(tor-guardmgr) or package(socks5-proxy)"
+test-group = "sockets-and-clocks"
+
+[[profile.flaky-hunt.overrides]]
+filter = "package(tor-socks5-dns) or package(tor-circmgr) or package(tor-guardmgr) or package(socks5-proxy)"
+test-group = "sockets-and-clocks"

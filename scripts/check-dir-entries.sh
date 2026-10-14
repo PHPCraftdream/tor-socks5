@@ -21,8 +21,11 @@ set -u
 
 MAX_ENTRIES=7
 
+# The root baseline is 16: 15 at the introduction of the check, +1 for
+# .gitattributes (eol normalization for *.sh, .githooks/*, *.yml).
+
 BASELINE="
-15 .
+16 .
 11 packages
 "
 
