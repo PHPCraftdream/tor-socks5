@@ -191,7 +191,7 @@ pub enum BootstrapEvent {
 pub type BootstrapEventCallback = Arc<dyn Fn(BootstrapEvent) + Send + Sync>;
 
 /// Bootstrap-time settings for [`TorTunnel`].
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct Settings {
     /// Bridges to use. When non-empty, the client will go through these
     /// instead of public guards.
@@ -228,6 +228,9 @@ pub struct Settings {
     /// disables the floor -- stock, bandwidth-weighted-but-unrestricted selection. Trades
     /// anonymity (a smaller candidate pool) for fewer slow hops.
     pub min_bandwidth_percentile: u8,
+    /// Requested number of relays in a Tor circuit. Defaults to `3`; only `2` and `3` are valid.
+    /// This setting is retained for later path wiring and is not applied here.
+    pub circuit_hops: u8,
     /// Override the `iat-mode` parameter on every obfs4 bridge line before
     /// handing it to arti. `iat-mode` is a *client-side* obfs4 knob: `0`
     /// sends cells as they come (fastest, but leaves obfs4's packet-size and
@@ -257,6 +260,23 @@ pub struct Settings {
     pub initial_connect_timeout: Option<Duration>,
 }
 
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            bridges: Vec::new(),
+            pt_binary: None,
+            extra_pt_protocols: Vec::new(),
+            state_dir: None,
+            cache_dir: None,
+            min_bandwidth_percentile: 0,
+            circuit_hops: 3,
+            obfs4_iat_mode: None,
+            disable_preemptive_circuits: false,
+            initial_connect_timeout: None,
+        }
+    }
+}
+
 impl Settings {
     /// Whether every behavioural field equals [`Settings::default`]: no
     /// bridges, no pluggable transport, no obfs4 override, stock circuit
@@ -268,6 +288,7 @@ impl Settings {
             && self.pt_binary.is_none()
             && self.extra_pt_protocols.is_empty()
             && self.min_bandwidth_percentile == 0
+            && self.circuit_hops == 3
             && self.obfs4_iat_mode.is_none()
             && !self.disable_preemptive_circuits
             && self.initial_connect_timeout.is_none()
@@ -812,7 +833,16 @@ fn validate_min_bandwidth_percentile(pct: u8) -> std::result::Result<(), String>
     }
 }
 
+fn validate_circuit_hops(hops: u8) -> std::result::Result<(), String> {
+    if matches!(hops, 2 | 3) {
+        Ok(())
+    } else {
+        Err(format!("tor.circuit_hops must be 2 or 3, got {hops}"))
+    }
+}
+
 fn build_config(settings: &Settings) -> Result<TorClientConfig> {
+    validate_circuit_hops(settings.circuit_hops).map_err(TorError::BuildConfig)?;
     validate_min_bandwidth_percentile(settings.min_bandwidth_percentile)
         .map_err(TorError::BuildConfig)?;
 

@@ -39,6 +39,7 @@ fn main_example_parses_as_the_current_layout() {
     let Some(text) = repo_file("tor-socks5.example.ktav") else {
         return;
     };
+    assert!(text.lines().any(|line| line == "tor.circuit_hops: 3"));
     let config: Config = ktav::from_str(&text).expect("main example parses");
     assert_eq!(config.listen, ["127.0.0.1:1080"]);
 }
@@ -58,6 +59,7 @@ fn readme_reference_blocks_parse() {
         config.dns_server.overrides[0].patterns,
         ["*.lan", "*.home.arpa"]
     );
+    assert!(main.lines().any(|line| line == "tor.circuit_hops: 3"));
     assert!(
         !main.lines().any(|line| line.starts_with("bridges.")),
         "the bridge pool is not part of the main config"

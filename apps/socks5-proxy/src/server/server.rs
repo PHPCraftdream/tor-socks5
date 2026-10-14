@@ -153,6 +153,9 @@ pub(crate) async fn run_server(
             Egress::Upstream(Arc::new(up))
         }
         None => {
+            if cfg.tor.circuit_hops == 2 {
+                warn!("tor.circuit_hops=2 reduces anonymity: circuits go from guard to exit with no middle relay. Intended for censorship circumvention, not anonymity; circuit-length activation is deferred to CLH-03b.");
+            }
             let settings = build_tor_settings(&cfg, config_path.as_deref()).await?;
             if settings.bridges.is_empty() {
                 bail!(
