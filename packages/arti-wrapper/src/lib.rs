@@ -228,7 +228,7 @@ pub struct Settings {
     /// disables the floor -- stock, bandwidth-weighted-but-unrestricted selection. Trades
     /// anonymity (a smaller candidate pool) for fewer slow hops.
     pub min_bandwidth_percentile: u8,
-    /// Requested number of relays in ordinary Tor circuits. Defaults to `3`; only `2` and `3` are valid.
+    /// Number of relays in the client onion-service circuits (rendezvous, introduction, HsDir). Defaults to `3`; only `2` and `3` are valid. Ordinary exit circuits always use three.
     pub circuit_hops: u8,
     /// Override the `iat-mode` parameter on every obfs4 bridge line before
     /// handing it to arti. `iat-mode` is a *client-side* obfs4 knob: `0`

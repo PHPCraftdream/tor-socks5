@@ -201,7 +201,7 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
         ensure_crypto_provider();
         ensure_tracing_subscriber(cfg);
         if cfg.tor.circuit_hops == 2 {
-            tracing::warn!("tor.circuit_hops=2 reduces anonymity: ordinary circuits go from guard to exit with no middle relay. Intended for censorship circumvention, not anonymity.");
+            tracing::warn!("tor.circuit_hops=2 reduces anonymity: onion-service circuits have no middle relay. Ordinary exit circuits stay at 3 hops. Intended for censorship circumvention, not anonymity.");
         }
 
         // 4. Parse bridges
