@@ -95,7 +95,7 @@ pub struct Config {
     pub security: SecurityConfig,
     /// Name-resolution policy used by bridge reachability probes.
     pub dns: DnsConfig,
-    /// Desired Tor circuit length. Only 2 or 3 hops are supported; defaults to 3.
+    /// Onion-service circuit length (2 or 3 hops, default 3). Ordinary exit circuits are always 3 hops.
     pub tor: TorConfig,
     /// Optional local DNS server (plain UDP/TCP wire format) answering
     /// client queries through public DoH providers reached over the live

@@ -7,7 +7,7 @@ use tracing::instrument;
 
 use super::{AnonymousPathBuilder, TorPath};
 use crate::path::pick_path;
-use crate::{DirInfo, Error, PathConfig, Result, TargetPort};
+use crate::{DirInfo, PathConfig, Result, TargetPort};
 
 use tor_guardmgr::{GuardMgr, GuardMonitor, GuardUsable};
 use tor_linkspec::OwnedChanTarget;
@@ -189,11 +189,6 @@ impl AnonymousPathBuilder for ExitPathBuilder {
         Ok((relay, RelayUsage::middle_relay(Some(selector.usage()))))
     }
 
-    // tor-socks5 local patch: ordinary exit builders honor circuit_hops.
-    fn circuit_hops(&self, config: &PathConfig) -> u8 {
-        config.circuit_hops()
-    }
-
     fn path_kind(&self) -> &'static str {
         use ExitPathBuilderInner::*;
         match &self.inner {
@@ -222,6 +217,7 @@ mod test {
     #![allow(clippy::string_slice)] // See arti#2571
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
     use super::*;
+    use crate::Error;
     use crate::path::{
         MaybeOwnedRelay, OwnedPath, TorPath, TorPathInner, assert_same_path_when_owned,
     };
@@ -285,9 +281,11 @@ mod test {
         assert!(r1.can_share_circuit(r3, subnet_config, family_rules));
     }
 
-    // tor-socks5 local patch: two-hop ordinary exit paths contain a guard and usable exit.
+    // tor-socks5 local patch: ordinary exit paths stay at three hops whatever
+    // `circuit_hops` says; exits refuse streams from a two-hop circuit that
+    // starts at a bridge (END/TORPROTOCOL), so the option is onion-only.
     #[test]
-    fn two_hop_exit_path() {
+    fn exit_path_ignores_circuit_hops() {
         tor_rtcompat::test_with_all_runtimes!(|rt| async move {
             let netdir = testnet::construct_netdir().unwrap_if_sufficient().unwrap();
             let family_rules = FamilyRules::all_family_info();
@@ -301,15 +299,15 @@ mod test {
             let (path, _, _) = ExitPathBuilder::from_target_ports(vec![TargetPort::ipv4(443)])
                 .pick_path(&mut rng, dirinfo, &guards, &config, rt.wallclock())
                 .unwrap();
-            assert_eq!(path.len(), 2);
+            assert_eq!(path.len(), 3);
             if let TorPathInner::Path(p) = path.inner {
-                assert_eq!(p.len(), 2);
+                assert_eq!(p.len(), 3);
                 if let MaybeOwnedRelay::Relay(guard) = &p[0] {
                     assert!(guard.low_level_details().is_suitable_as_guard());
                 }
-                assert!(!p[0].same_relay_ids(&p[1]));
-                assert!(p[0].can_share_circuit(&p[1], SubnetConfig::default(), family_rules));
-                let exit = match &p[1] {
+                assert!(!p[0].same_relay_ids(&p[2]));
+                assert!(p[0].can_share_circuit(&p[2], SubnetConfig::default(), family_rules));
+                let exit = match &p[2] {
                     MaybeOwnedRelay::Relay(r) => r,
                     MaybeOwnedRelay::Owned(_) => panic!("unexpected owned exit"),
                 };

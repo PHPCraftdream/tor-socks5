@@ -123,10 +123,10 @@ a shorter, ready-to-edit subset of the same defaults; any key you omit keeps the
 ## at its built-in default (mirrors packages/proxy-config/src/lib.rs).
 ## Any key you omit keeps the default shown here.
 
-## Circuit length: only 2 or 3 hops are permitted. The secure default is 3.
-## 2-hop circuits go directly from guard to exit, with no middle relay, reducing
-## anonymity. Intended for censorship circumvention, not anonymity. Applies to ordinary circuits;
-## onion-service circuits are unaffected pending CLH-04.
+## Onion-service circuit length: 2 or 3 hops (default 3). Applies only to the
+## client's onion circuits (rendezvous, introduction, HsDir); 2 drops the middle
+## relay and reduces anonymity. Ordinary exit circuits are always 3 hops: exit
+## relays refuse streams from a 2-hop circuit that starts at a bridge.
 tor.circuit_hops: 3
 
 ## Addresses to listen on — one SOCKS5 + HTTP CONNECT listener per address.

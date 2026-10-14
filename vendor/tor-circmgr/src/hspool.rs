@@ -103,6 +103,8 @@ pub(crate) struct HsCircStem<C: AbstractTunnel> {
     pub(crate) circ: C,
     /// Whether the circuit is NAIVE  or GUARDED.
     pub(crate) kind: HsCircStemKind,
+    /// Actual number of relays in this stem.
+    pub(crate) n_hops: usize,
 }
 
 impl<C: AbstractTunnel> HsCircStem<C> {
@@ -186,25 +188,33 @@ pub(crate) enum HsCircStemKind {
 }
 
 impl HsCircStemKind {
-    /// Return the number of hops this `HsCircKind` ought to have when using the specified
-    /// [`VanguardMode`].
-    pub(crate) fn num_hops(&self, mode: VanguardMode) -> StdResult<usize, Bug> {
-        use HsCircStemKind::*;
-        use VanguardMode::*;
-
-        let len = match (mode, self) {
+    /// tor-socks5 local patch: role/mode/config determine HS stem length consistently.
+    pub(crate) fn num_hops(
+        &self,
+        mode: VanguardMode,
+        circ_kind: HsCircKind,
+        configured_hops: u8,
+    ) -> StdResult<usize, Bug> {
+        if !matches!(configured_hops, 2 | 3) {
+            return Err(internal!(
+                "invalid configured HS circuit length {configured_hops}"
+            ));
+        }
+        let len = match (mode, circ_kind, self) {
+            (
+                VanguardMode::Disabled,
+                HsCircKind::ClientHsDir | HsCircKind::ClientIntro | HsCircKind::ClientRend,
+                _,
+            ) => usize::from(configured_hops),
+            (VanguardMode::Disabled, _, _) => 3,
             #[cfg(all(feature = "vanguards", feature = "hs-common"))]
-            (Lite, _) => 3,
+            (VanguardMode::Lite, _, _) => 3,
             #[cfg(all(feature = "vanguards", feature = "hs-common"))]
-            (Full, Naive) => 3,
+            (VanguardMode::Full, _, HsCircStemKind::Naive) => 3,
             #[cfg(all(feature = "vanguards", feature = "hs-common"))]
-            (Full, Guarded) => 4,
-            (Disabled, _) => 3,
-            (_, _) => {
-                return Err(internal!("Unsupported vanguard mode {mode}"));
-            }
+            (VanguardMode::Full, _, HsCircStemKind::Guarded) => 4,
+            _ => return Err(internal!("Unsupported vanguard mode {mode}")),
         };
-
         Ok(len)
     }
 }
@@ -403,6 +413,8 @@ pub(crate) struct HsCircPoolInner<B: AbstractTunnelBuilder<R> + 'static, R: Runt
 struct Inner<C: AbstractTunnel> {
     /// A collection of pre-constructed circuits.
     pool: pool::Pool<C>,
+    /// Incremented whenever pool policy is retired, preventing late insertions.
+    epoch: u64,
 }
 
 impl<R: Runtime> HsCircPoolInner<TunnelBuilder<R>, R> {
@@ -420,7 +432,7 @@ impl<B: AbstractTunnelBuilder<R> + 'static, R: Runtime> HsCircPoolInner<B, R> {
         Self {
             circmgr,
             launcher_handle: OnceCell::new(),
-            inner: Mutex::new(Inner { pool }),
+            inner: Mutex::new(Inner { pool, epoch: 0 }),
         }
     }
 
@@ -609,13 +621,22 @@ impl<B: AbstractTunnelBuilder<R> + 'static, R: Runtime> HsCircPoolInner<B, R> {
         Ok(circ.circ)
     }
 
+    /// tor-socks5 local patch: role/mode/config determine expected stem length, matching the builder.
+    fn expected_stem_hops(
+        &self,
+        kind: HsCircKind,
+        stem_kind: HsCircStemKind,
+    ) -> StdResult<usize, Bug> {
+        let config = self.circmgr.builder().path_config();
+        stem_kind.num_hops(self.vanguard_mode(), kind, config.circuit_hops())
+    }
+
     /// Internal implementation for [`HsCircPool::retire_all_circuits`].
     pub(crate) fn retire_all_circuits(&self) -> StdResult<(), tor_config::ReconfigureError> {
-        self.inner
-            .lock()
-            .expect("poisoned lock")
-            .pool
-            .retire_all_circuits()?;
+        let mut inner = self.inner.lock().expect("poisoned lock");
+        inner.epoch = inner.epoch.wrapping_add(1);
+        inner.pool.set_short_targets(false);
+        inner.pool.retire_all_circuits()?;
 
         Ok(())
     }
@@ -650,6 +671,23 @@ impl<B: AbstractTunnelBuilder<R> + 'static, R: Runtime> HsCircPoolInner<B, R> {
 
         // First, look for a circuit that is already built, if any is suitable.
 
+        let expected_hops = self.expected_stem_hops(kind, stem_kind)?;
+        let policy_epoch = {
+            let mut inner = self.inner.lock().expect("lock poisoned");
+            let short_clients =
+                self.expected_stem_hops(HsCircKind::ClientIntro, HsCircStemKind::Guarded)? == 2;
+            inner.pool.set_short_targets(short_clients);
+            if inner.pool.take_policy_changed() {
+                inner.epoch = inner.epoch.wrapping_add(1);
+                // tor-socks5 local patch: convert the pool's ReconfigureError inline;
+                // err::Error has no From impl for it.
+                inner
+                    .pool
+                    .retire_all_circuits()
+                    .map_err(|e| internal!("retiring HS policy-incompatible stems: {e}"))?;
+            }
+            inner.epoch
+        };
         let target_exclusion = {
             let path_cfg = self.circmgr.builder().path_config();
             let cfg = path_cfg.relay_selection_config();
@@ -663,6 +701,11 @@ impl<B: AbstractTunnelBuilder<R> + 'static, R: Runtime> HsCircPoolInner<B, R> {
 
         let found_usable_circ = {
             let mut inner = self.inner.lock().expect("lock poisoned");
+            if inner.epoch != policy_epoch
+                || self.expected_stem_hops(kind, stem_kind)? != expected_hops
+            {
+                return Err(internal!("HS circuit pool policy changed during selection").into());
+            }
 
             let restrictions = |circ: &HsCircStem<B::Tunnel>| {
                 // If vanguards are enabled, we no longer apply same-family or same-subnet
@@ -699,7 +742,7 @@ impl<B: AbstractTunnelBuilder<R> + 'static, R: Runtime> HsCircPoolInner<B, R> {
             let found_usable_circ =
                 inner
                     .pool
-                    .take_one_where(&mut rand::rng(), restrictions, &prefs);
+                    .take_one_where(&mut rand::rng(), restrictions, &prefs, expected_hops);
 
             // Tell the background task to fire immediately if we have very few circuits
             // circuits left, or if we found nothing.
@@ -713,11 +756,34 @@ impl<B: AbstractTunnelBuilder<R> + 'static, R: Runtime> HsCircPoolInner<B, R> {
         };
         // Return the circuit we found before, if any.
         if let Some(circuit) = found_usable_circ {
-            let circuit = self
+            let circ = self
                 .maybe_extend_stem_circuit(netdir, circuit, avoid_target, stem_kind, kind)
                 .await?;
-            self.ensure_suitable_circuit(&circuit, avoid_target, stem_kind)?;
-            return Ok(circuit);
+            let current_epoch = self.inner.lock().expect("lock poisoned").epoch;
+            if current_epoch != policy_epoch
+                || self.expected_stem_hops(kind, stem_kind)? != expected_hops
+            {
+                return Err(
+                    internal!("HS circuit policy changed during pooled circuit extension").into(),
+                );
+            }
+            self.ensure_suitable_circuit(&circ, avoid_target, stem_kind, kind)?;
+            let actual_hops = circ.circ.n_hops().map_err(|error| Error::Protocol {
+                action: "validating selected HS circuit length",
+                peer: None,
+                unique_id: Some(circ.unique_id()),
+                error,
+            })?;
+            if circ.n_hops != actual_hops || actual_hops != expected_hops {
+                return Err(internal!(
+                    "HS pool stem length metadata mismatch (metadata {}, actual {}, expected {})",
+                    circ.n_hops,
+                    actual_hops,
+                    expected_hops
+                )
+                .into());
+            }
+            return Ok(circ);
         }
 
         // TODO: There is a possible optimization here. Instead of only waiting
@@ -731,11 +797,27 @@ impl<B: AbstractTunnelBuilder<R> + 'static, R: Runtime> HsCircPoolInner<B, R> {
             .launch_hs_unmanaged(avoid_target, netdir, stem_kind, Some(kind))
             .await?;
 
-        self.ensure_suitable_circuit(&circ, avoid_target, stem_kind)?;
+        self.ensure_suitable_circuit(&circ, avoid_target, stem_kind, kind)?;
+        let current_epoch = self.inner.lock().expect("lock poisoned").epoch;
+        if current_epoch != policy_epoch
+            || self.expected_stem_hops(kind, stem_kind)? != expected_hops
+        {
+            return Err(internal!("HS circuit policy changed during circuit construction").into());
+        }
+        let actual_hops = circ.n_hops().map_err(|error| Error::Protocol {
+            action: "validating newly built HS circuit length",
+            peer: None,
+            unique_id: Some(circ.unique_id()),
+            error,
+        })?;
+        if actual_hops != expected_hops {
+            return Err(internal!("new HS circuit length does not match expected policy").into());
+        }
 
         Ok(HsCircStem {
             circ,
             kind: stem_kind,
+            n_hops: actual_hops,
         })
     }
 
@@ -768,11 +850,16 @@ impl<B: AbstractTunnelBuilder<R> + 'static, R: Runtime> HsCircPoolInner<B, R> {
                 .await
             }
             _ => {
-                let HsCircStem { circ, kind: _ } = circuit;
+                let HsCircStem {
+                    circ,
+                    kind: _,
+                    n_hops: _,
+                } = circuit;
 
                 Ok(HsCircStem {
                     circ,
                     kind: stem_kind,
+                    n_hops: self.expected_stem_hops(circ_kind, stem_kind)?,
                 })
             }
         }
@@ -838,6 +925,7 @@ impl<B: AbstractTunnelBuilder<R> + 'static, R: Runtime> HsCircPoolInner<B, R> {
                 Ok(HsCircStem {
                     circ,
                     kind: stem_kind,
+                    n_hops: 4,
                 })
             }
             (HsCircStemKind::Guarded, HsCircStemKind::Naive) => {
@@ -856,37 +944,39 @@ impl<B: AbstractTunnelBuilder<R> + 'static, R: Runtime> HsCircPoolInner<B, R> {
         &self,
         circ: &B::Tunnel,
         target: Option<&T>,
-        kind: HsCircStemKind,
+        stem_kind: HsCircStemKind,
+        kind: HsCircKind,
     ) -> Result<()>
     where
         T: CircTarget + Sync,
     {
         Self::ensure_circuit_can_extend_to_target(circ, target)?;
-        self.ensure_circuit_length_valid(circ, kind)?;
+        self.ensure_circuit_length_valid(circ, stem_kind, kind)?;
 
         Ok(())
     }
 
     /// Ensure the specified circuit of type `kind` has the right length.
-    fn ensure_circuit_length_valid(&self, tunnel: &B::Tunnel, kind: HsCircStemKind) -> Result<()> {
-        let circ_path_len = tunnel.n_hops().map_err(|error| Error::Protocol {
+    fn ensure_circuit_length_valid(
+        &self,
+        tunnel: &B::Tunnel,
+        stem_kind: HsCircStemKind,
+        circ_kind: HsCircKind,
+    ) -> Result<()> {
+        let actual_len = tunnel.n_hops().map_err(|error| Error::Protocol {
             action: "validating circuit length",
             peer: None, // Either party could be to blame.
             unique_id: Some(tunnel.unique_id()),
             error,
         })?;
 
-        let mode = self.vanguard_mode();
+        let expected_len = self.expected_stem_hops(circ_kind, stem_kind)?;
 
-        // TODO(#1457): somehow unify the path length checks
-        let expected_len = kind.num_hops(mode)?;
-
-        if circ_path_len != expected_len {
+        if actual_len != expected_len {
             return Err(internal!(
-                "invalid path length for {} {mode}-vanguard circuit (expected {} hops, got {})",
-                kind,
+                "invalid path length for {circ_kind:?} circuit (expected {} hops, got {})",
                 expected_len,
-                circ_path_len
+                actual_len
             )
             .into());
         }
@@ -1151,9 +1241,25 @@ async fn launch_hs_circuits_as_needed<B: AbstractTunnelBuilder<R> + 'static, R: 
         let now = pool.circmgr.mgr.peek_runtime().now();
         pool.remove_closed();
         let mut circs_to_launch = {
-            let mut inner = pool.inner.lock().expect("poisioned_lock");
+            let short_clients =
+                match pool.expected_stem_hops(HsCircKind::ClientIntro, HsCircStemKind::Guarded) {
+                    Ok(hops) => hops == 2,
+                    Err(error) => {
+                        warn!("cannot determine HS pool target length: {error}");
+                        false
+                    }
+                };
+            let mut inner = pool.inner.lock().expect("poisoned lock");
+            inner.pool.set_short_targets(short_clients);
+            if inner.pool.take_policy_changed() {
+                inner.epoch = inner.epoch.wrapping_add(1);
+                inner
+                    .pool
+                    .retire_all_circuits()
+                    .expect("retiring HS policy-incompatible stems");
+            }
             inner.pool.update_target_size(now);
-            inner.pool.circs_to_launch()
+            inner.pool.circuits_to_launch(short_clients)
         };
         let n_to_launch = circs_to_launch.n_to_launch();
         let mut max_attempts = n_to_launch * 2;
@@ -1182,25 +1288,58 @@ async fn launch_hs_circuits_as_needed<B: AbstractTunnelBuilder<R> + 'static, R: 
                 // TODO: Possibly we should be doing this in a background task, and
                 // launching several of these in parallel.  If we do, we should think about
                 // whether taking the fastest will expose us to any attacks.
-                let no_target: Option<&OwnedCircTarget> = None;
                 let for_launch = circs_to_launch.for_launch();
-
-                // TODO HS: We should catch panics, here or in launch_hs_unmanaged.
-                match pool
+                let policy_epoch = pool.inner.lock().expect("poisoned lock").epoch;
+                let requested_hops = for_launch.hops();
+                let stem_kind = for_launch.kind();
+                let (kind, target_hops) = if requested_hops == 2 {
+                    (HsCircKind::ClientIntro, 2)
+                } else {
+                    (HsCircKind::SvcIntro, 3)
+                };
+                let no_target: Option<&OwnedCircTarget> = None;
+                let circ = match pool
                     .circmgr
-                    .launch_hs_unmanaged(no_target, &netdir, for_launch.kind(), None)
+                    .launch_hs_unmanaged(no_target, &netdir, stem_kind, Some(kind))
                     .await
                 {
-                    Ok(circ) => {
-                        let kind = for_launch.kind();
-                        let circ = HsCircStem { circ, kind };
-                        pool.inner.lock().expect("poisoned lock").pool.insert(circ);
-                        trace!("successfully launched {kind} circuit");
-                        for_launch.note_circ_launched();
-                    }
+                    Ok(circ) => circ,
                     Err(err) => {
                         debug_report!(err, "Unable to build preemptive circuit for onion services");
+                        continue;
                     }
+                };
+                let actual_hops = match circ.n_hops() {
+                    Ok(hops) => hops,
+                    Err(error) => {
+                        debug_report!(
+                            Error::Protocol {
+                                action: "validating preemptive circuit length",
+                                peer: None,
+                                unique_id: Some(circ.unique_id()),
+                                error,
+                            },
+                            "discarding preemptive onion circuit"
+                        );
+                        continue;
+                    }
+                };
+                if actual_hops != target_hops
+                    || pool.expected_stem_hops(kind, stem_kind).ok() != Some(target_hops)
+                {
+                    continue;
+                }
+                let mut inner = pool.inner.lock().expect("poisoned lock");
+                if inner.epoch == policy_epoch
+                    && pool.expected_stem_hops(kind, stem_kind).ok() == Some(target_hops)
+                {
+                    inner.pool.insert(HsCircStem {
+                        circ,
+                        kind: stem_kind,
+                        n_hops: actual_hops,
+                    });
+                    trace!("successfully launched {stem_kind} circuit of {actual_hops} hops");
+                    for_launch.note_circ_launched();
                 }
             } else {
                 // We'd like to launch a circuit, but we don't have a netdir that we
@@ -1272,7 +1411,7 @@ mod test {
     use tor_rtmock::MockRuntime;
 
     use super::*;
-    use crate::{CircMgrInner, TestConfig};
+    use crate::{CircMgrInner, PathConfig, TestConfig};
 
     /// Create a `CircMgr` with an underlying `VanguardMgr` that runs in the specified `mode`.
     fn circmgr_with_vanguards<R: Runtime>(
@@ -1318,6 +1457,96 @@ mod test {
     }
 
     // Prevents TROVE-2024-005 (arti#1424)
+    #[test]
+    fn expected_lengths_cover_disabled_lite_and_full_with_configured_two() {
+        let runtime = MockRuntime::new();
+        let disabled = circmgr_with_vanguards(runtime.clone(), VanguardMode::Disabled);
+        let disabled_pool = HsCircPoolInner::new_internal(&disabled);
+        disabled
+            .builder()
+            .set_path_config(PathConfig::builder().circuit_hops(2).build().unwrap());
+        for kind in [
+            HsCircKind::ClientHsDir,
+            HsCircKind::ClientIntro,
+            HsCircKind::ClientRend,
+        ] {
+            assert_eq!(
+                disabled_pool
+                    .expected_stem_hops(kind, kind.stem_kind())
+                    .unwrap(),
+                2
+            );
+        }
+        for kind in [
+            HsCircKind::SvcHsDir,
+            HsCircKind::SvcIntro,
+            HsCircKind::SvcRend,
+        ] {
+            assert_eq!(
+                disabled_pool
+                    .expected_stem_hops(kind, kind.stem_kind())
+                    .unwrap(),
+                3
+            );
+        }
+        #[cfg(all(feature = "vanguards", feature = "hs-common"))]
+        for mode in [VanguardMode::Lite, VanguardMode::Full] {
+            let cm = circmgr_with_vanguards(runtime.clone(), mode);
+            let hs_pool = HsCircPoolInner::new_internal(&cm);
+            cm.builder()
+                .set_path_config(PathConfig::builder().circuit_hops(2).build().unwrap());
+            for kind in [
+                HsCircKind::ClientHsDir,
+                HsCircKind::ClientIntro,
+                HsCircKind::ClientRend,
+                HsCircKind::SvcHsDir,
+                HsCircKind::SvcIntro,
+                HsCircKind::SvcRend,
+            ] {
+                let expected = hs_pool.expected_stem_hops(kind, kind.stem_kind()).unwrap();
+                assert_eq!(
+                    expected,
+                    if mode == VanguardMode::Lite || kind.stem_kind() == HsCircStemKind::Naive {
+                        3
+                    } else {
+                        4
+                    }
+                );
+            }
+        }
+    }
+    #[test]
+    fn pool_retirement_advances_epoch_without_aba() {
+        let runtime = MockRuntime::new();
+        let circmgr = circmgr_with_vanguards(runtime, VanguardMode::Disabled);
+        let pool = HsCircPoolInner::new_internal(&circmgr);
+        let epoch0 = pool.inner.lock().unwrap().epoch;
+        pool.retire_all_circuits().unwrap();
+        let epoch1 = pool.inner.lock().unwrap().epoch;
+        pool.retire_all_circuits().unwrap();
+        let epoch2 = pool.inner.lock().unwrap().epoch;
+        assert_ne!(epoch0, epoch1);
+        assert_ne!(epoch1, epoch2);
+        assert_ne!(epoch0, epoch2);
+    }
+
+    #[test]
+    fn preemptive_epoch_moves_forward_across_retirement() {
+        // Preemptive insertions capture the pool epoch before an await and must
+        // only land when the epoch is unchanged; retirement must move it forward.
+        let runtime = MockRuntime::new();
+        let circmgr = circmgr_with_vanguards(runtime, VanguardMode::Disabled);
+        let pool = HsCircPoolInner::new_internal(&circmgr);
+        let captured_epoch = pool.inner.lock().unwrap().epoch;
+        pool.retire_all_circuits().unwrap();
+        let inner = pool.inner.lock().unwrap();
+        // A stale insertion (epoch == captured_epoch) would be dropped by the
+        // background task; here we assert the guard it uses is false.
+        assert_ne!(inner.epoch, captured_epoch);
+        // Fresh targets: 3 NAIVE + 1 GUARDED standard-length stems.
+        assert_eq!(inner.pool.circuits_to_launch(false).n_to_launch(), 4);
+    }
+
     #[test]
     fn pool_with_vanguards_disabled() {
         MockRuntime::test_with_various(|runtime| async move {
