@@ -112,6 +112,8 @@ pub(crate) struct SearchOptions {
     pub(crate) time_limit: Option<Duration>,
     /// Cooperative cancel flag, checked between attempts.
     pub(crate) cancel: Arc<AtomicBool>,
+    /// Optional shared progress counter: total attempts across workers.
+    pub(crate) progress: Option<Arc<AtomicU64>>,
 }
 
 impl Default for SearchOptions {
@@ -120,6 +122,7 @@ impl Default for SearchOptions {
             threads: 0,
             time_limit: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            progress: None,
         }
     }
 }
@@ -172,6 +175,7 @@ pub(crate) fn search(target: &VanityTarget, opts: &SearchOptions) -> SearchOutco
         let attempts = Arc::clone(&attempts);
         let stop = Arc::clone(&stop);
         let cancel = Arc::clone(&opts.cancel);
+        let progress = opts.progress.clone();
         handles.push(thread::spawn(move || {
             let mut local = 0u64;
             loop {
@@ -185,17 +189,26 @@ pub(crate) fn search(target: &VanityTarget, opts: &SearchOptions) -> SearchOutco
                 if target.matches(kp.pubkey()) {
                     stop.store(true, Ordering::Relaxed);
                     attempts.fetch_add(local, Ordering::Relaxed);
+                    if let Some(p) = &progress {
+                        p.fetch_add(local, Ordering::Relaxed);
+                    }
                     return Some(kp);
                 }
                 if let Some(deadline) = deadline {
                     if Instant::now() >= deadline {
                         stop.store(true, Ordering::Relaxed);
                         attempts.fetch_add(local, Ordering::Relaxed);
+                        if let Some(p) = &progress {
+                            p.fetch_add(local, Ordering::Relaxed);
+                        }
                         return None;
                     }
                 }
             }
             attempts.fetch_add(local, Ordering::Relaxed);
+            if let Some(p) = &progress {
+                p.fetch_add(local, Ordering::Relaxed);
+            }
             None
         }));
     }
@@ -217,7 +230,7 @@ pub(crate) fn search(target: &VanityTarget, opts: &SearchOptions) -> SearchOutco
 }
 
 /// Resolve the configured thread count; 0 means all-but-one core, min 1.
-fn worker_count(requested: usize) -> usize {
+pub(crate) fn worker_count(requested: usize) -> usize {
     if requested > 0 {
         return requested;
     }
@@ -306,7 +319,7 @@ mod tests {
         let opts = SearchOptions {
             threads: 1,
             time_limit: Some(Duration::from_secs(30)),
-            cancel: Arc::new(AtomicBool::new(false)),
+            ..Default::default()
         };
         let outcome = search(&target, &opts);
         let SearchOutcome::Found(kp) = outcome else {
@@ -325,7 +338,7 @@ mod tests {
         let opts = SearchOptions {
             threads: 4,
             time_limit: Some(Duration::from_secs(120)),
-            cancel: Arc::new(AtomicBool::new(false)),
+            ..Default::default()
         };
         let outcome = search(&target, &opts);
         let SearchOutcome::Found(kp) = outcome else {
@@ -343,7 +356,7 @@ mod tests {
         let opts = SearchOptions {
             threads: 2,
             time_limit: Some(Duration::from_millis(200)),
-            cancel: Arc::new(AtomicBool::new(false)),
+            ..Default::default()
         };
         let outcome = search(&target, &opts);
         assert!(matches!(outcome, SearchOutcome::TimedOut { attempts } if attempts > 0));
@@ -357,6 +370,7 @@ mod tests {
             threads: 1,
             time_limit: None,
             cancel: Arc::clone(&cancel),
+            ..Default::default()
         };
         let outcome = search(&target, &opts);
         assert!(matches!(outcome, SearchOutcome::Cancelled { attempts } if attempts == 0));
@@ -373,6 +387,7 @@ mod tests {
             threads: 1,
             time_limit: None,
             cancel: Arc::clone(&cancel),
+            ..Default::default()
         };
         let flag = Arc::clone(&cancel);
         thread::spawn(move || {
@@ -400,7 +415,7 @@ mod tests {
         let opts = SearchOptions {
             threads: 1,
             time_limit: Some(Duration::from_secs(2)),
-            cancel: Arc::new(AtomicBool::new(false)),
+            ..Default::default()
         };
         let start = Instant::now();
         let outcome = search(&target, &opts);
