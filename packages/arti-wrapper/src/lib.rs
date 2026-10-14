@@ -228,8 +228,7 @@ pub struct Settings {
     /// disables the floor -- stock, bandwidth-weighted-but-unrestricted selection. Trades
     /// anonymity (a smaller candidate pool) for fewer slow hops.
     pub min_bandwidth_percentile: u8,
-    /// Requested number of relays in a Tor circuit. Defaults to `3`; only `2` and `3` are valid.
-    /// This setting is retained for later path wiring and is not applied here.
+    /// Requested number of relays in ordinary Tor circuits. Defaults to `3`; only `2` and `3` are valid.
     pub circuit_hops: u8,
     /// Override the `iat-mode` parameter on every obfs4 bridge line before
     /// handing it to arti. `iat-mode` is a *client-side* obfs4 knob: `0`
@@ -897,6 +896,7 @@ fn build_config(settings: &Settings) -> Result<TorClientConfig> {
     // unless explicitly opted into.
     builder
         .path_rules()
+        .circuit_hops(settings.circuit_hops)
         .min_bandwidth_percentile(settings.min_bandwidth_percentile);
 
     if settings.disable_preemptive_circuits {
