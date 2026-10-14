@@ -27,8 +27,9 @@ mod dns_wiring;
 mod fetch_merge;
 #[path = "commands/help_cmd.rs"]
 mod help_cmd;
-// Vanity v3 onion address core; wired into the CLI by follow-up work.
+// Onion helpers: the address/vanity core is not wired into the CLI yet.
 #[allow(dead_code)]
+#[path = "commands/onion/mod.rs"]
 mod onion;
 #[path = "fetch/seed.rs"]
 mod seed;
@@ -229,6 +230,10 @@ async fn async_main(cli: Cli) -> Result<()> {
         }
         Some(Command::Config { action }) => {
             return config_cmd::run(action, cli.config.as_deref());
+        }
+        #[cfg(feature = "onion-service")]
+        Some(Command::Onion { action }) => {
+            return crate::onion::commands::run(action, cli.config.as_deref());
         }
         Some(Command::Help { all, topic }) => {
             help_cmd::run(all, topic);

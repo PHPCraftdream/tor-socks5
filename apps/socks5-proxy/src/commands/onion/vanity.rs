@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::{generate, Keypair};
+use super::address::{generate, Keypair};
 
 /// Maximum supported vanity prefix length (base32 chars).
 ///
@@ -227,7 +227,7 @@ fn worker_count(requested: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{onion_address, parse_onion_address};
+    use super::super::address::{onion_address, parse_onion_address};
     use super::*;
 
     fn assert_invalid(ch: char) {

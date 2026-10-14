@@ -1,9 +1,7 @@
-//! v3 onion address generation and vanity search (rend-spec-v3).
+//! v3 onion address derivation and parsing (rend-spec-v3).
 //!
 //! Address format: base32(PUBKEY(32) || CHECKSUM(2) || 0x03) + ".onion",
 //! where CHECKSUM = SHA3-256(".onion checksum" || PUBKEY || 0x03)[0..2].
-
-mod vanity;
 
 use std::fmt;
 
@@ -13,13 +11,6 @@ use ed25519_dalek::VerifyingKey;
 use sha2::Digest as Sha2Digest;
 use sha3::Sha3_256;
 use zeroize::Zeroizing;
-
-// Re-exports for the pub(crate) onion API; consumed by upcoming CLI wiring.
-#[allow(unused_imports)]
-pub(crate) use vanity::{
-    estimate, expected_attempts, search, SearchOptions, SearchOutcome, VanityError, VanityTarget,
-    MAX_PREFIX_LEN,
-};
 
 /// Constant prepended to the pubkey before checksumming.
 const CHECKSUM_PREFIX: &[u8] = b".onion checksum";

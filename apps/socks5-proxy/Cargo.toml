@@ -15,6 +15,18 @@ keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["onion-service"]
+onion-service = [
+    "arti-wrapper/onion-service",
+    "dep:tor-hsservice",
+    "dep:tor-keymgr",
+    "dep:tor-hscrypto",
+    "dep:tor-llcrypto",
+    "dep:fs-mistrust",
+    "dep:safelog",
+]
+
 [dependencies]
 arti-wrapper = { path = "../../packages/arti-wrapper", version = "0.2.0" }
 auth = { path = "../../packages/auth", version = "0.2.0", package = "tor-socks5-auth" }
@@ -30,6 +42,15 @@ proxy-config = { path = "../../packages/proxy-config", version = "0.2.0", packag
 socks5-proto = { path = "../../packages/socks5-proto", version = "0.2.0", package = "tor-socks5-proto" }
 tor-error.workspace = true
 lyrebird.workspace = true
+
+# Onion-service identity keystore management (tor-socks5 onion ...),
+# behind the `onion-service` feature.
+tor-hsservice = { version = "0.47", optional = true }
+tor-keymgr = { version = "0.47", optional = true }
+tor-hscrypto = { version = "0.47", optional = true }
+tor-llcrypto = { version = "0.47", optional = true }
+fs-mistrust = { version = "0.16", optional = true }
+safelog = { version = "0.10", optional = true }
 
 ktav.workspace = true
 service-manager.workspace = true

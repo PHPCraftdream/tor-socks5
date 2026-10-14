@@ -19,6 +19,10 @@ rust-version.workspace = true
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+[features]
+# Server-side onion service support (arti-client/onion-service-service).
+onion-service = ["arti-client/onion-service-service"]
+
 [dependencies]
 arti-client.workspace = true
 tor-rtcompat.workspace = true

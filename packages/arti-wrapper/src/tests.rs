@@ -585,3 +585,14 @@ fn validate_min_bandwidth_percentile_rejects_above_100() {
     assert!(err.contains("min_bandwidth_percentile must be in 0..=100, got 101"));
     assert!(super::validate_min_bandwidth_percentile(255).is_err());
 }
+
+#[cfg(feature = "onion-service")]
+#[test]
+fn onion_service_server_api_is_available() {
+    // Proves the server-side API is compiled in; no network is touched.
+    // nickname requires tor_hsservice::HsNickname, so build() without one
+    // returns Err — that still proves the API is linked.
+    use arti_client::config::onion_service::OnionServiceConfigBuilder;
+    let cfg = OnionServiceConfigBuilder::default();
+    let _ = cfg.build();
+}
