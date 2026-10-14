@@ -92,9 +92,9 @@ codegen-units = 1
 ## fixes being accepted upstream. Same-version overrides of the exact crates.io
 ## releases we depend on — bump alongside any arti upgrade.
 ##
-## tor-dirclient 0.43.0: idle (not total) read timeout for slow obfs4 bridges.
+## tor-dirclient 0.47.0: idle (not total) read timeout for slow obfs4 bridges.
 tor-dirclient = { path = "vendor/tor-dirclient" }
-## tor-dirmgr 0.43.0: hard timeout on the bridge-descriptor fetch (it used to
+## tor-dirmgr 0.47.0: hard timeout on the bridge-descriptor fetch (it used to
 ## hang forever) + patient, gentle retry/parallelism for the bridge pool.
 tor-dirmgr = { path = "vendor/tor-dirmgr" }
 ## FIX: saturating-time 0.3.0 `saturating_add`/`saturating_sub` eagerly force a
@@ -109,7 +109,7 @@ tor-chanmgr = { path = "vendor/tor-chanmgr" }
 tor-guardmgr = { path = "vendor/tor-guardmgr" }
 ## Wire guard readiness and recovery APIs into the client.
 arti-client = { path = "vendor/arti-client" }
-## tor-circmgr 0.43.0: vendored for the circuit-speed tiers
+## tor-circmgr 0.47.0: vendored for the circuit-speed tiers
 ## (docs/plans/circuit-speed-plan.md): Tier 2 — an opt-in bandwidth floor for
 ## middle/exit relay selection (`min_bandwidth_percentile`, default 0 =
 ## stock behaviour; falls back to the unfiltered pool rather than ever
@@ -117,10 +117,3 @@ arti-client = { path = "vendor/arti-client" }
 ## latency-over-anonymity trade acceptable only in this personal-use fork;
 ## the default keeps behaviour identical to upstream.
 tor-circmgr = { path = "vendor/tor-circmgr" }
-## TEMPORARY (until ptrs-gesher is released against tor-* 0.47): the sibling
-## ptrs-gesher checkout, which already requires tor-* 0.47 / derive-deftly 1.12.
-ptrs-gesher-core = { path = "../ptrs-gesher/crates/core" }
-ptrs-gesher-obfs4 = { path = "../ptrs-gesher/crates/obfs4" }
-ptrs-gesher-webtunnel = { path = "../ptrs-gesher/crates/webtunnel" }
-ptrs-gesher-lyrebird = { path = "../ptrs-gesher/crates/lyrebird" }
-ptrs-gesher-bridge-line = { path = "../ptrs-gesher/crates/bridge-line" }
