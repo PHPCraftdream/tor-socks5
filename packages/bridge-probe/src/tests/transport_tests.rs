@@ -698,14 +698,16 @@ async fn a_hanging_ipv6_still_tries_the_ipv4_candidate() {
     );
 }
 
-#[tokio::test]
+// Paused clock: the budget cap is checked on virtual time, so scheduler
+// load cannot stretch it.
+#[tokio::test(start_paused = true)]
 async fn all_candidates_hanging_is_unreachable_within_the_budget() {
     let hanging1 = hanging_listener().await;
     let hanging2 = hanging_listener().await;
 
     let plan = webtunnel_plan("http://frontend.test/secret");
     let budget = Duration::from_secs(6);
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     let outcome = webtunnel_upgrade_probe(&[hanging1, hanging2], &plan, budget).await;
     let elapsed = started.elapsed();
 

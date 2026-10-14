@@ -1,8 +1,19 @@
-# CI — fmt, clippy, test across Linux / macOS / Windows; first-party line
-# limit and directory-size limit, publish guard, crate packageability, MSRV
-# 1.89 and Android arm64 cross-compile checks. fmt/clippy/test mirror the
-# local pre-push hook at .githooks/pre-push; line-limit/dir-entries/
-# publish-guard/packageability/msrv/android are CI-only.
+# CI — tiered test model.
+#
+# T0: cheap structural checks that always run (fmt, line-limit, dir-entries,
+#     publish-guard, packageability, msrv, android).
+# T1: affected packages only, on pull requests (computed by
+#     scripts/testing/test-affected.sh --base <pr base sha>).
+# T2: full workspace run, on push to main and on workflow_dispatch (always:
+# a manual dispatch has no reliable base to diff against, and an empty T1
+# plan would run no tests at all).
+# T3: nightly full run — a separate scheduled workflow, deliberately not here.
+#
+# See docs/plans/test-tiers.md for the full tier specification.
+#
+# fmt/clippy/test still mirror the local pre-push hook at .githooks/pre-push;
+# line-limit/dir-entries/publish-guard/packageability/msrv/android are
+# CI-only.
 
 name: CI
 
@@ -10,10 +21,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Never cancel on main pushes or manual dispatch; cancel superseded PR
+  # and non-main branch runs.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref != 'refs/heads/main') }}
 
 permissions:
   contents: read
@@ -25,6 +39,107 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
+  plan:
+    name: Plan (tier selection)
+    runs-on: ubuntu-latest
+    outputs:
+      full: ${{ steps.plan.outputs.full }}
+      packages: ${{ steps.plan.outputs.packages }}
+      empty: ${{ steps.plan.outputs.empty }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-local-sdk
+      - uses: dtolnay/rust-toolchain@stable
+      # Tier-selection selftest: pure sh + jq + cargo metadata, no cargo build.
+      - name: Selftest test-affected.sh
+        run: sh scripts/testing/selftest.sh
+      - name: Compute tier
+        id: plan
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          pr=false
+          force_full=false
+          reason=""
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            pr=true
+            if ! git cat-file -e "$PR_BASE_SHA^{commit}" 2>/dev/null; then
+              if ! git fetch --no-tags origin "$PR_BASE_SHA"; then
+                force_full=true
+                reason="could not fetch PR base commit"
+              fi
+            fi
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            # push events fire only on main (see `on:` above): full tier.
+            force_full=true
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Manual dispatch: FULL by default (no reliable base to diff against).
+            force_full=true
+          fi
+          if ! command -v jq >/dev/null 2>&1; then
+            force_full=true
+            reason="jq not found on runner"
+          fi
+          out=""
+          script_rc=0
+          if [ "$force_full" != "true" ]; then
+            if [ "$pr" = "true" ]; then
+              args="--base $PR_BASE_SHA"
+            else
+              args=""
+            fi
+            # `|| script_rc=$?` keeps the runner's implicit `bash -e` from aborting
+            # the step: a failing script must fall through to FULL below.
+            out=$(sh scripts/testing/test-affected.sh $args --mode args --kind test) || script_rc=$?
+          fi
+          if [ "$script_rc" != "0" ]; then
+            echo "::warning::test-affected.sh failed (rc=$script_rc); forcing FULL"
+            force_full=true
+            reason="test-affected.sh failed (rc=$script_rc)"
+          fi
+          full=false
+          packages=""
+          empty=false
+          if [ "$force_full" = "true" ]; then
+            full=true
+            packages=""
+            empty=false
+          elif [ "$out" = "--workspace" ]; then
+            full=true
+          elif [ -z "$out" ]; then
+            empty=true
+          else
+            packages="$out"
+          fi
+          {
+            echo "full=$full"
+            echo "packages=$packages"
+            echo "empty=$empty"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$full" = "true" ]; then
+            tier="T2 FULL"
+          elif [ "$empty" = "true" ]; then
+            tier="T0 nothing to test"
+          else
+            tier="T1 affected"
+          fi
+          if [ -n "$packages" ]; then
+            pkgs_line="Packages: \`$packages\`"
+          else
+            pkgs_line="Packages: —"
+          fi
+          {
+            echo "## CI plan"
+            echo "Tier: $tier"
+            echo "$pkgs_line"
+            if [ -n "$reason" ]; then
+              echo "Reason: $reason"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
@@ -36,8 +151,10 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
-  clippy:
-    name: Clippy (${{ matrix.os }})
+  clippy-full:
+    name: Clippy T2 (${{ matrix.os }})
+    needs: plan
+    if: needs.plan.outputs.full == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -51,9 +168,29 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        shell: bash
 
-  test:
-    name: Test (${{ matrix.os }})
+  clippy-affected:
+    name: Clippy T1 (ubuntu-latest)
+    needs: plan
+    if: needs.plan.outputs.full != 'true' && needs.plan.outputs.empty != 'true'
+    runs-on: ubuntu-latest
+    env:
+      PKGS: ${{ needs.plan.outputs.packages }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-local-sdk
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy $PKGS --all-targets --locked -- -D warnings
+        shell: bash
+
+  test-full:
+    name: Test T2 (${{ matrix.os }})
+    needs: plan
+    if: needs.plan.outputs.full == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -63,8 +200,50 @@ jobs:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-local-sdk
       - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked --workspace
+      - run: cargo nextest run --workspace --locked --profile ci
+        shell: bash
+      - run: cargo test --doc --workspace --exclude saturating-time --locked
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-t2-${{ matrix.os }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+
+  test-affected:
+    name: Test T1 (${{ matrix.os }})
+    needs: plan
+    if: needs.plan.outputs.full != 'true' && needs.plan.outputs.empty != 'true'
+    runs-on: ${{ matrix.os }}
+    env:
+      PKGS: ${{ needs.plan.outputs.packages }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-local-sdk
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo nextest run $PKGS --locked --profile ci
+        shell: bash
+      - run: cargo test --doc $PKGS --locked
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-t1-${{ matrix.os }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
 
   line-limit:
     name: First-party line limit (1000)

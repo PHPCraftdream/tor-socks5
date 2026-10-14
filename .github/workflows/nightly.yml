@@ -1,0 +1,212 @@
+# Nightly tests — T3 tier (docs/plans/test-tiers.md).
+#
+# T3 = T2 full run + flaky-hunt stress runs + vendored-crate tests +
+# cargo-hack each-feature checks + a consolidated report/issue.
+# Deliberately a separate scheduled workflow (see ci.yml header).
+#
+# Cron minute 17 is intentionally odd so it never collides with the
+# top-of-hour stampede of other repositories' scheduled workflows.
+
+name: Nightly tests
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-tests
+  # Nightly results are precious (they feed the report job and the issue
+  # trail); never cancel a running nightly.
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "2"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  # T2 equivalent: full workspace nextest run + doctests, all three OSes.
+  full:
+    name: Test T3 full (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-local-sdk
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo nextest run --workspace --locked --profile ci
+        shell: bash
+      - run: cargo test --doc --workspace --exclude saturating-time --locked
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-full-${{ matrix.os }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+
+  # Flaky hunt: repeat whole runs of the socket/clock-heavy suites with the
+  # flaky-hunt nextest profile (status-level: all, retries stay 0 — repeats,
+  # not masking). --stress-count verified against nextest 0.9.137
+  # (`cargo nextest run --help`, "Stress testing options").
+  flaky-hunt:
+    name: Flaky hunt (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-local-sdk
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - uses: Swatinem/rust-cache@v2
+      - run: >-
+          cargo nextest run --profile flaky-hunt --stress-count 10
+          -p tor-socks5-dns -p tor-circmgr -p tor-guardmgr -p socks5-proxy
+          --locked
+        shell: bash
+      # .config/nextest.toml defines [profile.flaky-hunt.junit] with
+      # target/nextest/flaky-hunt/junit.xml, so the upload publishes the
+      # report like the ci profile does.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-flaky-hunt-${{ matrix.os }}
+          path: target/nextest/flaky-hunt/junit.xml
+          if-no-files-found: ignore
+
+  # Vendored crates that are NOT workspace members (coverage gap in
+  # `cargo test --workspace`). The lockfile will change when the extra
+  # members are added, so no --locked here.
+  vendor-extra:
+    name: Vendored extras (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-local-sdk
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Root Cargo.toml members array ends with the "vendor/tor-guardmgr"
+      # line; append the three non-member vendor crates right after it.
+      - name: Add non-member vendor crates to workspace members
+        run: |
+          sed -i 's|^\(\s*"vendor/tor-guardmgr",\)$|\1\n    "vendor/tor-chanmgr",\n    "vendor/tor-dirmgr",\n    "vendor/tor-dirclient",|' Cargo.toml
+          grep -A7 '^members' Cargo.toml
+        shell: bash
+      # `static` is a feature of tor-dirmgr only (vendor/tor-dirmgr/Cargo.toml);
+      # per-package feature syntax avoids failing on crates without the feature.
+      - run: cargo test -p tor-chanmgr -p tor-dirclient -p tor-dirmgr --features tor-dirmgr/static
+        shell: bash
+      # hspath tests are gated on cfg(all(feature = "vanguards",
+      # feature = "hs-common")) in vendor/tor-circmgr (verified present in
+      # this tree: src/lib.rs:136, src/path/hspath.rs:35), so --all-features
+      # compiles and runs them.
+      - run: cargo test -p tor-circmgr --all-features
+        shell: bash
+
+  # Each-feature check of the config package and the arti wrapper.
+  # Package names verified via `cargo metadata --offline --no-deps`:
+  # tor-socks5-config (packages/proxy-config), arti-wrapper (packages/arti-wrapper).
+  features:
+    name: Feature matrix (ubuntu)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-local-sdk
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo hack check --each-feature --no-dev-deps -p tor-socks5-config -p arti-wrapper
+        shell: bash
+
+  # Consolidated report: step summary + at most one open "Nightly tests
+  # failed" issue (comment on existing instead of creating duplicates;
+  # auto-close with a "recovered" comment when green again).
+  report:
+    name: Report
+    needs: [full, flaky-hunt, vendor-extra, features]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # No checkout in this job, so gh needs the repository spelled out.
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Summarize and manage the failure issue
+        run: |
+          # NOTE: needs.<matrix-job>.result is the WORST outcome across the
+          # matrix (any failure/cancelled surfaces); per-OS detail is in the
+          # uploaded artifacts and run logs, not in needs.*.result.
+          {
+            echo "## Nightly tests results"
+            echo ""
+            echo "| Job | Result |"
+            echo "|-----|--------|"
+            echo "| full | \`${{ needs.full.result }}\` |"
+            echo "| flaky-hunt | \`${{ needs.flaky-hunt.result }}\` |"
+            echo "| vendor-extra | \`${{ needs.vendor-extra.result }}\` |"
+            echo "| features | \`${{ needs.features.result }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          failed_jobs=""
+          all_success=true
+          for entry in "full=${{ needs.full.result }}" \
+                       "flaky-hunt=${{ needs.flaky-hunt.result }}" \
+                       "vendor-extra=${{ needs.vendor-extra.result }}" \
+                       "features=${{ needs.features.result }}"; do
+            job="${entry%%=*}"
+            result="${entry#*=}"
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              failed_jobs="${failed_jobs:+$failed_jobs, }$job"
+              all_success=false
+            elif [ "$result" != "success" ]; then
+              # skipped or unexpected value: treat the run as incomplete.
+              all_success=false
+            fi
+          done
+
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          search="Nightly tests failed in:title,state:open"
+          existing=$(gh issue list --search "$search" --json number --jq 'length')
+
+          if [ -n "$failed_jobs" ]; then
+            body="Nightly run failed: $run_url"$'\n'"Failed jobs: $failed_jobs"
+            if [ "$existing" -eq 0 ]; then
+              gh issue create --title "Nightly tests failed" --body "$body"
+            else
+              num=$(gh issue list --search "$search" --json number --jq '.[0].number')
+              gh issue comment "$num" --body "$body"
+            fi
+          elif [ "$all_success" = "true" ] && [ "$existing" -gt 0 ]; then
+            # Close as recovered only on a fully green run: every job must
+            # have succeeded (skipped jobs mean an incomplete run).
+            num=$(gh issue list --search "$search" --json number --jq '.[0].number')
+            gh issue comment "$num" --body "recovered: $run_url"
+            gh issue close "$num"
+          elif [ "$all_success" != "true" ]; then
+            echo "Incomplete run: some jobs were skipped or returned unexpected results;" >> "$GITHUB_STEP_SUMMARY"
+            echo "the tracking issue (if any) is left untouched, no false 'recovered'." >> "$GITHUB_STEP_SUMMARY"
+          fi
+        shell: bash
