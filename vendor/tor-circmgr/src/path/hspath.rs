@@ -439,7 +439,7 @@ pub(crate) fn hs_stem_terminal_hop_usage(kind: Option<HsCircKind>) -> RelayUsage
 }
 
 // tor-socks5 local patch: hidden-service path test module requires hs-common.
-#[cfg(all(test, feature = "hs-common"))]
+#[cfg(all(test, feature = "vanguards", feature = "hs-common"))]
 mod test {
     // @@ begin test lint list maintained by maint/add_warning @@
     #![allow(clippy::bool_assert_comparison)]
