@@ -126,6 +126,10 @@ fi
 
 run_cmd cargo fmt --all -- --check
 
+# Structure rules CI enforces (tracked files only: commit new folders first).
+run_cmd sh scripts/check-dir-entries.sh
+run_cmd sh scripts/check-line-limit.sh
+
 # ---------------------------------------------------------------- tier: T2
 
 if [ "$full" -eq 1 ]; then

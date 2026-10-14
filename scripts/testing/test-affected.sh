@@ -364,8 +364,33 @@ if [ "$kind" = "test" ] || [ "$kind" = "all" ]; then
 	fi
 	if [ "$rc" -eq 0 ]; then
 		doc_args=$(printf '%s' "$args" | sed 's/-p saturating-time//g')
-		[ -n "${doc_args// /}" ] || doc_args="--workspace --exclude saturating-time"
-		run_cmd cargo test --doc $doc_args || rc=$?
+		case " $doc_args " in
+		*" --workspace "*) ;;
+		*)
+			# Doctests need a library target; a binary-only package makes
+			# `cargo test --doc -p <pkg>` fail with "no library targets".
+			libpkgs=$(printf '%s' "$meta" | jq -r '
+				.packages[] | select(any(.targets[].kind[]; . == "lib" or . == "rlib" or . == "proc-macro"))
+				| .name' | tr -d '\r' | tr '\n' ' ')
+			doc_args=""
+			set -- $args
+			while [ $# -gt 0 ]; do
+				if [ "$1" = "-p" ] && [ $# -ge 2 ]; then
+					case " $libpkgs " in
+					*" $2 "*) [ "$2" = saturating-time ] || doc_args="$doc_args -p $2" ;;
+					esac
+					shift 2
+				else
+					shift
+				fi
+			done
+			;;
+		esac
+		if [ -n "$(printf %s "$doc_args" | tr -d " ")" ]; then
+			run_cmd cargo test --doc $doc_args || rc=$?
+		elif [ "$full" -eq 1 ]; then
+			run_cmd cargo test --doc --workspace --exclude saturating-time || rc=$?
+		fi
 	fi
 fi
 if { [ "$kind" = "clippy" ] || [ "$kind" = "all" ]; } && [ "$rc" -eq 0 ]; then

@@ -27,6 +27,9 @@ mod dns_wiring;
 mod fetch_merge;
 #[path = "commands/help_cmd.rs"]
 mod help_cmd;
+#[cfg(feature = "onion-service")]
+#[path = "commands/onion/mod.rs"]
+mod onion;
 #[path = "fetch/seed.rs"]
 mod seed;
 #[path = "server/server.rs"]
@@ -226,6 +229,10 @@ async fn async_main(cli: Cli) -> Result<()> {
         }
         Some(Command::Config { action }) => {
             return config_cmd::run(action, cli.config.as_deref());
+        }
+        #[cfg(feature = "onion-service")]
+        Some(Command::Onion { action }) => {
+            return crate::onion::commands::run(action, cli.config.as_deref());
         }
         Some(Command::Help { all, topic }) => {
             help_cmd::run(all, topic);
