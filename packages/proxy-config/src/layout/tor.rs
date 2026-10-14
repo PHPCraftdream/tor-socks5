@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TorConfig {
-    /// Desired circuit length; only 2 or 3 are permitted. Default `3`.
+    /// Client onion-service circuit length; 2 or 3 are permitted. Default `3`. Exit circuits ignore it.
     #[serde(deserialize_with = "circuit_hops")]
     pub circuit_hops: u8,
 }

@@ -7,9 +7,10 @@
 ## A single # is content. No inline or trailing comments.
 ## Everything after the colon is value verbatim until end of line.
 
-## Circuit length: 2 or 3 hops (default 3). Two hops go directly from guard to
-## exit without a middle relay, reducing anonymity; intended for censorship
-## circumvention, not anonymity. Stored here; activation deferred to CLH-03b.
+## Onion-service circuit length: 2 or 3 hops (default 3). Applies only to the
+## client's onion circuits; 2 drops the middle relay and reduces anonymity.
+## Ordinary exit circuits are always 3 hops (exits refuse a 2-hop circuit that
+## starts at a bridge).
 tor.circuit_hops: 3
 
 ## Listen addresses — one SOCKS5 + HTTP CONNECT listener per address.

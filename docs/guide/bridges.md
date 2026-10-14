@@ -9,10 +9,18 @@ candidates for promotion — both **obfs4** and **webtunnel**, used together.
 ## Circuit length (`tor.circuit_hops`)
 
 The main configuration accepts `tor.circuit_hops: 2` or `3` (default `3`).
-Two hops go directly from guard to exit with no middle relay, reducing
-anonymity; this is intended for censorship circumvention, not anonymity.
-This release stores the setting and carries it through configuration/Settings
-plumbing only; circuit-length activation is deferred to CLH-03b.
+The setting applies **only to the client's onion-service circuits** (HsDir,
+introduction and rendezvous stems) when vanguards are disabled. With `2` these
+stems have no middle relay; with `3` they are unchanged. For intro/dir circuits
+the selected target is added after the stem is built, so the complete circuit
+has one additional hop. Service-side stems and Lite/Full vanguard lengths are
+unchanged. Fewer hops reduce anonymity; this is intended for censorship
+circumvention, not anonymity.
+
+Ordinary exit circuits always have three hops, whatever the setting. Exit
+relays refuse streams from a circuit whose first hop is a bridge and which has
+no middle relay (END cell, reason `TORPROTOCOL`), so a two-hop exit circuit
+cannot carry traffic when bridges are used.
 
 ## Single binary, two modes (busybox dispatch)
 

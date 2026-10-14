@@ -95,10 +95,10 @@ fast-first budget).
 
 ### `tor-circmgr` (0.47.0)
 
-Opt-in bandwidth floor for middle/exit relay selection:
-`PathConfig::min_bandwidth_percentile`, default 0 (stock behaviour), with
-validation and a safety-floor fallback. A latency-over-anonymity trade for
-personal use only.
+Opt-in bandwidth floor for middle/exit relay selection; client HS stems honor
+`PathConfig::circuit_hops` in Disabled mode; ordinary exit paths ignore it
+(always three hops: exits refuse a two-hop circuit that starts at a bridge);
+service stem lengths and vanguard modes retain upstream behavior.
 
 ## Patch table
 
@@ -127,6 +127,7 @@ One row per patch group. Marker names are the identifiers in the
 | exit-stream retry | arti-client | src/client.rs, src/client/stream_retry.rs | one bounded `begin_stream` retry, narrow retryable set, snapshot budgets | carried (0.47 Exit branch is single-attempt) |
 | `initial_connect_timeout` | arti-client | src/config.rs; packages/android-ffi | optional fast-first budget; Android sets 4 s; inactive when `None` | carried |
 | `min_bandwidth_percentile` | tor-circmgr | src/config.rs, src/path.rs, src/path/exitpath.rs, src/path/hspath.rs | opt-in bandwidth floor for middle/exit; default 0 = stock | carried |
+| `hs_circuit_hops` | tor-circmgr | src/hspool.rs, src/hspool/pool.rs, src/path.rs, src/path/hspath.rs | role-aware client lengths, exact-length pool targets, epoch-safe retirement | local |
 
 **None of the functional patches above were accepted upstream in 0.47.**
 

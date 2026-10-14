@@ -291,6 +291,11 @@ trait AnonymousPathBuilder {
         3
     }
 
+    /// tor-socks5 local patch: opt-in short client HS target-family exclusions, default false.
+    fn short_hs_target_exclusions(&self, _config: &PathConfig) -> bool {
+        false
+    }
+
     /// Find a suitable exit node from either the chosen exit or from the network directory.
     ///
     /// Return the exit, along with the usage for a middle node corresponding
@@ -364,6 +369,14 @@ fn pick_path<'a, B: AnonymousPathBuilder, R: Rng, RT: Runtime>(
 
     let mut exclusion = guard_exclusion.clone();
     exclusion.extend(&target_exclusion);
+    if builder.short_hs_target_exclusions(config) {
+        if let Some(target) = builder.compatible_with() {
+            let target_family =
+                RelayExclusion::exclude_channel_target_family(&rs_cfg, target, netdir);
+            exclusion.extend(&target_family);
+        }
+    }
+
     // tor-socks5 local patch: pass the PathConfig down so that the
     // bandwidth floor can apply to exit selection.
     let (exit, middle_usage) = builder.pick_exit(rng, netdir, exclusion, &rs_cfg, config)?;
@@ -373,6 +386,13 @@ fn pick_path<'a, B: AnonymousPathBuilder, R: Rng, RT: Runtime>(
     family_exclusion.extend(&guard_exclusion);
     let mut exclusion = family_exclusion;
     exclusion.extend(&target_exclusion);
+    if builder.short_hs_target_exclusions(config) {
+        if let Some(target) = builder.compatible_with() {
+            let target_family =
+                RelayExclusion::exclude_channel_target_family(&rs_cfg, target, netdir);
+            exclusion.extend(&target_family);
+        }
+    }
 
     let middle = if builder.circuit_hops(config) == 2 {
         None

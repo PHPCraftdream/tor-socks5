@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `tor.circuit_hops` config plumbing (permitted values 2 or 3, default 3) for CLI and Android settings, with a startup warning about the anonymity tradeoff. Two-hop circuit activation remains deferred to CLH-03b.
+- `tor.circuit_hops` (2 or 3, default 3) sets the length of the client's onion-service circuits. With `2`, the HsDir, introduction and rendezvous stems drop the middle relay (Disabled vanguard mode only); service stems and Lite/Full vanguard lengths are unchanged. Ordinary exit circuits always stay at 3 hops: exits refuse a 2-hop circuit that starts at a bridge. A startup warning notes the anonymity tradeoff when set to 2.
 
 ### Changed
 

@@ -172,6 +172,7 @@ impl HsPathBuilder {
             stem_kind: self.stem_kind,
             circ_kind: self.circ_kind,
             compatible_with: self.compatible_with.clone(),
+            config: config.clone(),
         };
 
         vanguard_path_builder.pick_path(rng, netdir, guards, vanguards)
@@ -179,6 +180,26 @@ impl HsPathBuilder {
 }
 
 impl AnonymousPathBuilder for HsPathBuilder {
+    // tor-socks5 local patch: client HS role selects configured Disabled-mode path length.
+    fn circuit_hops(&self, config: &PathConfig) -> u8 {
+        match self.circ_kind {
+            Some(HsCircKind::ClientHsDir | HsCircKind::ClientIntro | HsCircKind::ClientRend) => {
+                config.circuit_hops()
+            }
+            _ => 3,
+        }
+    }
+
+    // tor-socks5 local patch: apply target family/subnet exclusion only to configured short clients.
+    fn short_hs_target_exclusions(&self, config: &PathConfig) -> bool {
+        self.circ_kind.is_some_and(|kind| {
+            matches!(
+                kind,
+                HsCircKind::ClientHsDir | HsCircKind::ClientIntro | HsCircKind::ClientRend
+            )
+        }) && config.circuit_hops() == 2
+    }
+
     fn compatible_with(&self) -> Option<&OwnedChanTarget> {
         self.compatible_with.as_ref()
     }
@@ -228,6 +249,8 @@ struct VanguardHsPathBuilder {
     circ_kind: Option<HsCircKind>,
     /// The target we are about to extend the circuit to.
     compatible_with: Option<OwnedChanTarget>,
+    /// tor-socks5 local patch: path config, so the vanguard length check agrees with the builder.
+    config: PathConfig,
 }
 
 #[cfg(feature = "vanguards")]
@@ -283,7 +306,11 @@ impl VanguardHsPathBuilder {
         };
 
         let actual_len = path.len();
-        let expected_len = self.stem_kind.num_hops(mode)?;
+        let expected_len = self.stem_kind.num_hops(
+            mode,
+            self.circ_kind.unwrap_or(HsCircKind::SvcIntro),
+            self.config.circuit_hops(),
+        )?;
         if actual_len != expected_len {
             return Err(internal!(
                 "invalid path length for {} {mode}-vanguard circuit (expected {} hops, got {})",
@@ -411,8 +438,8 @@ pub(crate) fn hs_stem_terminal_hop_usage(kind: Option<HsCircKind>) -> RelayUsage
     }
 }
 
-// tor-socks5 local patch: these tests need the vanguards and hs-common features, which our release feature set does not enable; the nightly all-features run covers them.
-#[cfg(all(test, feature = "vanguards", feature = "hs-common"))]
+// tor-socks5 local patch: hidden-service path test module requires hs-common.
+#[cfg(all(test, feature = "hs-common"))]
 mod test {
     // @@ begin test lint list maintained by maint/add_warning @@
     #![allow(clippy::bool_assert_comparison)]
@@ -437,7 +464,7 @@ mod test {
     use tor_netdir::{NetDirProvider, testnet::NodeBuilders, testprovider::TestNetDirProvider};
     use tor_netdoc::doc::netstatus::RelayWeight;
     use tor_netdoc::types::relay_flags::RelayFlag;
-    use tor_rtcompat::SleepProvider as _;
+    use tor_rtcompat::{SleepProvider as _, ToplevelBlockOn as _};
     use tor_rtmock::MockRuntime;
 
     #[cfg(all(feature = "vanguards", feature = "hs-common"))]
@@ -447,14 +474,103 @@ mod test {
     };
 
     #[test]
-    fn configured_two_hops_do_not_shorten_hs_path() {
-        // tor-socks5 local patch: HS path length remains fixed at three hops.
+    fn configured_two_hops_shorten_client_hs_paths_only() {
+        // tor-socks5 local patch: all client roles produce two-hop Disabled stems.
         let netdir = construct_test_network(20, |pos, nb| {
             nb.md.family(hex::encode([pos as u8; 20]).parse().unwrap());
         });
-        let config = PathConfig::builder().circuit_hops(2).build().unwrap();
-        let path = pick_hs_path_no_vanguards_with_config(&netdir, None, None, config).unwrap();
-        assert_eq!(path.len(), 3);
+        for kind in [
+            HsCircKind::ClientHsDir,
+            HsCircKind::ClientIntro,
+            HsCircKind::ClientRend,
+        ] {
+            let config = PathConfig::builder().circuit_hops(2).build().unwrap();
+            let path =
+                pick_hs_path_no_vanguards_with_config(&netdir, None, Some(kind), config).unwrap();
+            assert_eq!(path.len(), 2, "{kind:?}");
+        }
+        for kind in [
+            HsCircKind::SvcHsDir,
+            HsCircKind::SvcIntro,
+            HsCircKind::SvcRend,
+        ] {
+            let config = PathConfig::builder().circuit_hops(2).build().unwrap();
+            let path =
+                pick_hs_path_no_vanguards_with_config(&netdir, None, Some(kind), config).unwrap();
+            assert_eq!(path.len(), 3, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn two_hop_client_target_family_excluded() {
+        // tor-socks5 local patch: short client stems exclude target family/subnet as well as identity.
+        let netdir = construct_test_network(20, |pos, nb| {
+            nb.md.family(hex::encode([pos as u8; 20]).parse().unwrap());
+        });
+        // One of the relays known to the test network (same as test_target()).
+        let target_owned = test_target();
+        let path = pick_hs_path_no_vanguards_with_config(
+            &netdir,
+            Some(&target_owned),
+            Some(HsCircKind::ClientIntro),
+            PathConfig::builder().circuit_hops(2).build().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            path_hops(&path)
+                .iter()
+                .all(|hop| !hop.has_any_relay_id_from(&target_owned))
+        );
+    }
+
+    #[test]
+    fn default_three_hops_for_all_hs_roles() {
+        let netdir = construct_test_network(20, |pos, nb| {
+            nb.md.family(hex::encode([pos as u8; 20]).parse().unwrap());
+        });
+        for kind in [
+            HsCircKind::ClientHsDir,
+            HsCircKind::ClientIntro,
+            HsCircKind::ClientRend,
+            HsCircKind::SvcHsDir,
+            HsCircKind::SvcIntro,
+            HsCircKind::SvcRend,
+        ] {
+            let path = pick_hs_path_no_vanguards_with_config(
+                &netdir,
+                None,
+                Some(kind),
+                PathConfig::default(),
+            )
+            .unwrap();
+            assert_eq!(path.len(), 3, "{kind:?}");
+        }
+    }
+
+    #[cfg(feature = "vanguards")]
+    #[test]
+    fn client_stem_config_does_not_change_vanguard_lengths() {
+        // tor-socks5 local patch: configured two hops must not change vanguard lengths.
+        let runtime = MockRuntime::new();
+        let netdir = construct_test_network(20, |pos, nb| {
+            nb.md.family(hex::encode([pos as u8; 20]).parse().unwrap());
+        });
+        let rt2 = runtime.clone();
+        rt2.block_on(async move {
+            for mode in [VanguardMode::Lite, VanguardMode::Full] {
+                let path = pick_vanguard_path(
+                    &runtime,
+                    &netdir,
+                    HsCircStemKind::Guarded,
+                    Some(HsCircKind::ClientIntro),
+                    mode,
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(path.len(), if mode == VanguardMode::Lite { 3 } else { 4 });
+            }
+        });
     }
 
     /// The maximum number of relays in a test network.
@@ -548,7 +664,7 @@ mod test {
 
         assert_eq!(
             path.len(),
-            stem_kind.num_hops(mode).unwrap(),
+            stem_kind.num_hops(mode, HsCircKind::SvcIntro, 3).unwrap(),
             "invalid path length for {stem_kind} {mode}-vanguards circuit"
         );
 
@@ -621,7 +737,7 @@ mod test {
         netdir_provider.set_netdir(netdir.clone());
         let netdir_provider: Arc<dyn NetDirProvider> = netdir_provider;
         guards.install_netdir_provider(&netdir_provider).unwrap();
-        // tor-socks5 local patch: HS vanguard paths retain stock 3/4-hop lengths regardless of config.
+        // tor-socks5 local patch: Lite/Full paths keep the existing 3/4-hop layout.
         let config = PathConfig::builder().circuit_hops(2).build().unwrap();
         let now = runtime.wallclock();
         let dirinfo = (netdir).into();
