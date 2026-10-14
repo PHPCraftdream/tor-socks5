@@ -12,6 +12,7 @@
 #![deny(clippy::cast_lossless)]
 #![deny(clippy::checked_conversions)]
 #![allow(clippy::cognitive_complexity)] // See arti#2556
+#![allow(clippy::double_must_use)] // tor-socks5 local patch: clippy_double_must_use (async_trait expansion trips it on Rust 1.99)
 #![deny(clippy::debug_assert_with_mut_call)]
 #![deny(clippy::exhaustive_enums)]
 #![deny(clippy::exhaustive_structs)]
