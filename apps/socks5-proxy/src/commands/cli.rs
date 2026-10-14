@@ -40,6 +40,7 @@ tor-socks5 users add alice              # add a SOCKS5 user (prompts for a passw
 tor-socks5 users add --init alice       # add a user whose first login sets the password\n  \
 tor-socks5 users add --allow-onion bob  # add a user permitted to reach .onion services\n  \
 tor-socks5 users allow-onion alice      # grant .onion access to an existing user\n  \
+tor-socks5 onion new myservice          # create a new onion service identity\n  \
 tor-socks5 bridges fetch                # fetch & merge fresh bridges over Tor\n  \
 tor-socks5 config migrate               # convert a config written in the old layout\n  \
 tor-socks5 --upstream 127.0.0.1:9050    # egress via an upstream SOCKS5 instead of Tor\n  \
@@ -99,6 +100,13 @@ pub(crate) enum Command {
     Bridges {
         #[command(subcommand)]
         action: BridgesAction,
+    },
+    /// Manage onion service identities (`onion new`, `onion list`,
+    /// `onion show`, `onion export`, `onion import`, `onion remove`).
+    #[cfg(feature = "onion-service")]
+    Onion {
+        #[command(subcommand)]
+        action: crate::onion::commands::OnionAction,
     },
     /// Maintain the config files (convert a config written in the old
     /// layout with `config migrate`).
