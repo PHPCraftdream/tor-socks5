@@ -286,6 +286,11 @@ trait AnonymousPathBuilder {
     /// for error reporting purposes.
     fn path_kind(&self) -> &'static str;
 
+    /// tor-socks5 local patch: only ordinary exit paths use configured length.
+    fn circuit_hops(&self, _config: &PathConfig) -> u8 {
+        3
+    }
+
     /// Find a suitable exit node from either the chosen exit or from the network directory.
     ///
     /// Return the exit, along with the usage for a middle node corresponding
@@ -369,24 +374,30 @@ fn pick_path<'a, B: AnonymousPathBuilder, R: Rng, RT: Runtime>(
     let mut exclusion = family_exclusion;
     exclusion.extend(&target_exclusion);
 
-    let selector = RelaySelector::new(middle_usage, exclusion);
-    // tor-socks5 local patch: the middle relay is optionally restricted to
-    // the upper band of the consensus bandwidth distribution.
-    let middle = select_relay_with_bandwidth_floor(
-        &selector,
-        rng,
-        netdir,
-        config.min_bandwidth_percentile(),
-        WeightRole::Middle,
-        builder.path_kind(),
-        "middle relay",
-    )?;
+    let middle = if builder.circuit_hops(config) == 2 {
+        None
+    } else {
+        let selector = RelaySelector::new(middle_usage, exclusion);
+        // tor-socks5 local patch: retain stock middle selection only for 3-hop circuits.
+        Some(select_relay_with_bandwidth_floor(
+            &selector,
+            rng,
+            netdir,
+            config.min_bandwidth_percentile(),
+            WeightRole::Middle,
+            builder.path_kind(),
+            "middle relay",
+        )?)
+    };
 
-    let hops = vec![
-        guard,
-        MaybeOwnedRelay::from(middle),
-        MaybeOwnedRelay::from(exit),
-    ];
+    let hops = match middle {
+        None => vec![guard, MaybeOwnedRelay::from(exit)],
+        Some(middle) => vec![
+            guard,
+            MaybeOwnedRelay::from(middle),
+            MaybeOwnedRelay::from(exit),
+        ],
+    };
 
     ensure_unique_hops(&hops)?;
 

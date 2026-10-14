@@ -446,6 +446,17 @@ mod test {
         tor_guardmgr::VanguardMgrError, tor_netdir::testnet::construct_custom_netdir,
     };
 
+    #[test]
+    fn configured_two_hops_do_not_shorten_hs_path() {
+        // tor-socks5 local patch: HS path length remains fixed at three hops.
+        let netdir = construct_test_network(20, |pos, nb| {
+            nb.md.family(hex::encode([pos as u8; 20]).parse().unwrap());
+        });
+        let config = PathConfig::builder().circuit_hops(2).build().unwrap();
+        let path = pick_hs_path_no_vanguards_with_config(&netdir, None, None, config).unwrap();
+        assert_eq!(path.len(), 3);
+    }
+
     /// The maximum number of relays in a test network.
     const MAX_NET_SIZE: usize = 40;
 
@@ -610,7 +621,8 @@ mod test {
         netdir_provider.set_netdir(netdir.clone());
         let netdir_provider: Arc<dyn NetDirProvider> = netdir_provider;
         guards.install_netdir_provider(&netdir_provider).unwrap();
-        let config = PathConfig::default();
+        // tor-socks5 local patch: HS vanguard paths retain stock 3/4-hop lengths regardless of config.
+        let config = PathConfig::builder().circuit_hops(2).build().unwrap();
         let now = runtime.wallclock();
         let dirinfo = (netdir).into();
         HsPathBuilder::new(target.cloned(), stem_kind, circ_kind)
@@ -624,8 +636,17 @@ mod test {
         target: Option<&OwnedChanTarget>,
         circ_kind: Option<HsCircKind>,
     ) -> Result<TorPath<'a>> {
+        pick_hs_path_no_vanguards_with_config(netdir, target, circ_kind, PathConfig::default())
+    }
+
+    // tor-socks5 local patch
+    fn pick_hs_path_no_vanguards_with_config<'a>(
+        netdir: &'a NetDir,
+        target: Option<&OwnedChanTarget>,
+        circ_kind: Option<HsCircKind>,
+        config: PathConfig,
+    ) -> Result<TorPath<'a>> {
         let mut rng = testing_rng();
-        let config = PathConfig::default();
         let runtime = MockRuntime::new();
         let now = runtime.wallclock();
         let dirinfo = (netdir).into();

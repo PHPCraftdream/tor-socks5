@@ -26,8 +26,8 @@ use std::time::Duration;
 /// restrictive.
 #[derive(Debug, Clone, Eq, PartialEq, Deftly)]
 #[derive_deftly(TorConfig)]
-// tor-socks5 local patch: bandwidth-floor builder validation.
-#[deftly(tor_config(pre_build = "Self::validate_min_bandwidth_percentile"))]
+// tor-socks5 local patch: builder validation combines circuit length and bandwidth floor.
+#[deftly(tor_config(pre_build = "Self::validate"))]
 pub struct PathConfig {
     /// Set the length of a bit-prefix for a default IPv4 subnet-family.
     ///
@@ -51,6 +51,12 @@ pub struct PathConfig {
     #[deftly(tor_config(list(element(clone)), default = "default_reachable_addrs()"))]
     pub(crate) reachable_addrs: Vec<AddrPortPattern>,
 
+    // tor-socks5 local patch: ordinary exit paths may omit the middle hop.
+    /// Number of hops in ordinary exit circuits. Supported values are 2 or 3;
+    /// the default is 3.
+    #[deftly(tor_config(default = "default_circuit_hops()"))]
+    pub(crate) circuit_hops: u8,
+
     // tor-socks5 local patch (docs/circuit-speed-plan.md Tier 2): optional
     // bandwidth floor for middle/exit relay selection. 0 (the default)
     // keeps stock behaviour; 1..=100 excludes middle/exit candidates whose
@@ -70,6 +76,12 @@ pub struct PathConfig {
 /// Return the default list of reachable addresses (namely, "*:*")
 fn default_reachable_addrs() -> Vec<AddrPortPattern> {
     vec![AddrPortPattern::new_all()]
+}
+
+/// tor-socks5 local patch: default ordinary circuit length.
+/// The default is three hops.
+fn default_circuit_hops() -> u8 {
+    3
 }
 
 /// tor-socks5 local patch: default for `min_bandwidth_percentile` (0 =
@@ -102,6 +114,11 @@ impl PathConfig {
         )
     }
 
+    /// tor-socks5 local patch: number of hops for ordinary exit circuits.
+    pub fn circuit_hops(&self) -> u8 {
+        self.circuit_hops
+    }
+
     /// tor-socks5 local patch: the configured middle/exit bandwidth-floor
     /// percentile (0 = disabled). See the `min_bandwidth_percentile` field.
     pub fn min_bandwidth_percentile(&self) -> u8 {
@@ -120,6 +137,8 @@ impl PathConfig {
         self.ipv4_subnet_family_prefix >= other.ipv4_subnet_family_prefix
             && self.ipv6_subnet_family_prefix >= other.ipv6_subnet_family_prefix
             && self.reachable_addrs == other.reachable_addrs
+            // tor-socks5 local patch: require an exact length match to discard circuits across policy changes.
+            && self.circuit_hops == other.circuit_hops
             // tor-socks5 local patch: a higher bandwidth floor is strictly
             // less permissive. Returning false here only causes circuits to
             // be discarded on reconfigure, which is the safe direction.
@@ -147,6 +166,29 @@ impl PathConfig {
 // only 0..=100 are meaningful; anything else is a configuration error rather
 // than something to clamp silently.
 impl PathConfigBuilder {
+    /// tor-socks5 local patch: invoke both checks from a single config hook.
+    #[allow(clippy::unnecessary_wraps)]
+    fn validate(&self) -> std::result::Result<(), tor_config::ConfigBuildError> {
+        self.validate_circuit_hops()?;
+        self.validate_min_bandwidth_percentile()
+    }
+
+    /// tor-socks5 local patch: only supported ordinary lengths are accepted.
+    #[allow(clippy::unnecessary_wraps)]
+    fn validate_circuit_hops(&self) -> std::result::Result<(), tor_config::ConfigBuildError> {
+        let Some(hops) = self.circuit_hops else {
+            return Ok(());
+        };
+        if (2..=3).contains(&hops) {
+            Ok(())
+        } else {
+            Err(tor_config::ConfigBuildError::Invalid {
+                field: "circuit_hops".to_string(),
+                problem: format!("must be in range 2..=3, not {hops}"),
+            })
+        }
+    }
+
     /// tor-socks5 local patch: reject out-of-range `min_bandwidth_percentile`.
     #[allow(clippy::unnecessary_wraps)]
     fn validate_min_bandwidth_percentile(
@@ -489,7 +531,38 @@ mod test {
         assert!(!pc3.at_least_as_permissive_as(&pc2));
     }
 
-    // tor-socks5 local patch: the bandwidth floor defaults to stock
+    // tor-socks5 local patch: circuit length settings invalidate incompatible built circuits.
+    // tor-socks5 local patch: these lengths must not compare permissibly in either direction.
+    #[test]
+    fn path_config_circuit_hops_permissiveness() {
+        let three = PathConfig::default();
+        let two = PathConfig::builder().circuit_hops(2).build().unwrap();
+        assert!(three.at_least_as_permissive_as(&three));
+        assert!(two.at_least_as_permissive_as(&two));
+        assert!(!three.at_least_as_permissive_as(&two));
+        assert!(!two.at_least_as_permissive_as(&three));
+    }
+
+    // tor-socks5 local patch: builder tests for `circuit_hops`.
+    #[test]
+    fn path_config_circuit_hops() {
+        // tor-socks5 local patch: length accepts 2..=3; existing circuits are reusable only if length policy matches.
+        assert_eq!(PathConfig::default().circuit_hops(), 3);
+        for hops in [2, 3] {
+            assert_eq!(
+                PathConfig::builder()
+                    .circuit_hops(hops)
+                    .build()
+                    .unwrap()
+                    .circuit_hops(),
+                hops
+            );
+        }
+        for hops in [0, 1, 4, 255] {
+            assert!(PathConfig::builder().circuit_hops(hops).build().is_err());
+        }
+    }
+
     // behaviour, round-trips through the builder, rejects out-of-range
     // values, and compares conservatively in `at_least_as_permissive_as`.
     #[test]
