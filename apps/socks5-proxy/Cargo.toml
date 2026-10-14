@@ -15,6 +15,10 @@ keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["onion-service"]
+onion-service = ["arti-wrapper/onion-service"]
+
 [dependencies]
 arti-wrapper = { path = "../../packages/arti-wrapper", version = "0.2.0" }
 auth = { path = "../../packages/auth", version = "0.2.0", package = "tor-socks5-auth" }

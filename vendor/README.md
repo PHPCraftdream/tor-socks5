@@ -19,6 +19,14 @@ Vendored crates (7): `arti-client`, `tor-chanmgr`, `tor-circmgr`,
 ptrs-gesher checkout. Switch these back to crates.io as soon as a release
 against `tor-*` 0.47 is published.
 
+### Onion-service server (not vendored)
+
+The `onion-service-service` feature is enabled via `arti-wrapper/onion-service`.
+`tor-hsservice`, `tor-keymgr` and `tor-hsrproxy` are **not** vendored: they
+come from crates.io 0.47.x. If a fork is ever needed (e.g. SVH hop
+shortening), it must be added as a new full vendor copy plus a
+`[patch.crates-io]` entry here.
+
 ## Why each crate is vendored
 
 ### `saturating-time` (0.5.0)
