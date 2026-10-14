@@ -32,6 +32,13 @@ pub(crate) const BRIDGE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// `MAX_ACTIVE_BRIDGES`.
 const MAX_ACTIVE_BRIDGES: usize = 30;
 
+fn settings_for_config(cfg: &Config) -> Settings {
+    Settings {
+        circuit_hops: cfg.tor.circuit_hops,
+        ..Default::default()
+    }
+}
+
 /// Parse the configured bridges, probe them for reachability, persist the
 /// live ones to the alive-bridges log, and assemble arti [`Settings`]
 /// (including pointing the PT manager at our own binary when needed).
@@ -229,7 +236,7 @@ pub(crate) async fn build_tor_settings_preserving_live(
         },
         state_dir: Some(arti_base),
         obfs4_iat_mode: cfg.bridges.iat_mode_override(),
-        ..Default::default()
+        ..settings_for_config(cfg)
     })
 }
 
@@ -589,6 +596,12 @@ pub(crate) fn resolve_pt_binary() -> anyhow::Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_for_config_forwards_circuit_hops() {
+        let cfg: Config = ktav::from_str("tor.circuit_hops: 2\n").expect("config parses");
+        assert_eq!(settings_for_config(&cfg).circuit_hops, 2);
+    }
 
     #[test]
     fn test_pt_binary_override_from_set() {

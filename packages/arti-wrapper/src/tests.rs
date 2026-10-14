@@ -27,6 +27,16 @@ fn settings_default_is_default() {
     assert!(s.bridges.is_empty());
     assert!(s.pt_binary.is_none());
     assert!(s.initial_connect_timeout.is_none());
+    assert_eq!(s.circuit_hops, 3);
+}
+
+#[test]
+fn settings_with_two_circuit_hops_is_not_default() {
+    let settings = Settings {
+        circuit_hops: 2,
+        ..Default::default()
+    };
+    assert!(!settings.is_default());
 }
 
 #[test]
@@ -55,6 +65,29 @@ fn settings_with_bridges_is_not_default() {
         ..Default::default()
     };
     assert!(!s.is_default());
+}
+
+#[test]
+fn build_config_accepts_two_hops_without_applying_it_to_builder() {
+    let settings = Settings {
+        circuit_hops: 2,
+        ..Default::default()
+    };
+    let default_path_config = build_config(&Settings::default()).expect("default config");
+    let two_hop_path_config = build_config(&settings).expect("two-hop setting accepted");
+    assert_eq!(two_hop_path_config, default_path_config);
+}
+
+#[test]
+fn build_config_rejects_invalid_circuit_hops() {
+    for hops in [0, 1, 4, u8::MAX] {
+        let settings = Settings {
+            circuit_hops: hops,
+            ..Default::default()
+        };
+        let error = build_config(&settings).expect_err("invalid hop count rejected");
+        assert!(error.to_string().contains("circuit_hops"), "{error}");
+    }
 }
 
 #[test]
@@ -508,6 +541,21 @@ mod endpoint_proof {
             &direct(&["192.0.2.1:443"]),
             &pluggable("webtunnel", "192.0.2.1:443")
         ));
+    }
+}
+
+#[test]
+fn validate_circuit_hops_accepts_two_and_three() {
+    assert!(super::validate_circuit_hops(2).is_ok());
+    assert!(super::validate_circuit_hops(3).is_ok());
+}
+
+#[test]
+fn validate_circuit_hops_rejects_other_values() {
+    for hops in [0, 1, 4, 255] {
+        let err = super::validate_circuit_hops(hops).unwrap_err();
+        assert!(err.contains("tor.circuit_hops"), "{err}");
+        assert!(err.contains("2 or 3"), "{err}");
     }
 }
 

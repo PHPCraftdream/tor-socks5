@@ -11,12 +11,14 @@ pub(crate) fn main_engine_settings(
     pt_binary: Option<std::path::PathBuf>,
     state_dir: std::path::PathBuf,
     obfs4_iat_mode: Option<u8>,
+    circuit_hops: u8,
 ) -> arti_wrapper::Settings {
     arti_wrapper::Settings {
         bridges,
         pt_binary,
         state_dir: Some(state_dir),
         obfs4_iat_mode,
+        circuit_hops,
         initial_connect_timeout: Some(Duration::from_secs(4)),
         ..Default::default()
     }
@@ -27,8 +29,16 @@ mod tests {
     use super::main_engine_settings;
 
     #[test]
+    fn main_engine_settings_forwards_circuit_hops_two_and_three() {
+        for hops in [2, 3] {
+            let settings = main_engine_settings(Vec::new(), None, "state".into(), None, hops);
+            assert_eq!(settings.circuit_hops, hops);
+        }
+    }
+
+    #[test]
     fn main_engine_settings_opts_into_fast_first_exit_attempt() {
-        let settings = main_engine_settings(Vec::new(), None, "state".into(), None);
+        let settings = main_engine_settings(Vec::new(), None, "state".into(), None, 3);
         assert_eq!(
             settings.initial_connect_timeout,
             Some(std::time::Duration::from_secs(4))
@@ -190,6 +200,9 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
         // unconditionally and synchronously".
         ensure_crypto_provider();
         ensure_tracing_subscriber(cfg);
+        if cfg.tor.circuit_hops == 2 {
+            tracing::warn!("tor.circuit_hops=2 reduces anonymity: circuits go from guard to exit with no middle relay. Intended for censorship circumvention, not anonymity; circuit-length activation is deferred to CLH-03b.");
+        }
 
         // 4. Parse bridges
         let parsed_bridges = cfg
@@ -327,6 +340,7 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
             pt_binary,
             state_dir,
             cfg.bridges.iat_mode_override(),
+            cfg.tor.circuit_hops,
         );
         let block_onion = cfg.security.block_onion;
         // Captured before `loaded`/`cfg` go out of scope: the engine thread

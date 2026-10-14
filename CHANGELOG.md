@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `tor.circuit_hops` config plumbing (permitted values 2 or 3, default 3) for CLI and Android settings, with a startup warning about the anonymity tradeoff. Two-hop circuit activation remains deferred to CLH-03b.
+
 ### Changed
 
 - **Vendored crates rebased from the Arti 0.43 line to 0.47.0 (arti 2.7.0)**

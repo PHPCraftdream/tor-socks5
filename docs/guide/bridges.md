@@ -6,6 +6,14 @@ reaches the Tor network through **bridges** with a pluggable transport
 them, tracks their health, fetches fresh ones over Tor, and stages
 candidates for promotion — both **obfs4** and **webtunnel**, used together.
 
+## Circuit length (`tor.circuit_hops`)
+
+The main configuration accepts `tor.circuit_hops: 2` or `3` (default `3`).
+Two hops go directly from guard to exit with no middle relay, reducing
+anonymity; this is intended for censorship circumvention, not anonymity.
+This release stores the setting and carries it through configuration/Settings
+plumbing only; circuit-length activation is deferred to CLH-03b.
+
 ## Single binary, two modes (busybox dispatch)
 
 The PT runs in-process — there is no second executable to ship. Tor's PT

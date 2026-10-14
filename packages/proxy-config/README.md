@@ -4,6 +4,8 @@ The Ktav startup configuration schema for the tor-socks5 proxy: a typed `Config`
 
 For hosts of the proxy — the CLI daemon and the Android JNI engine share this crate — and for any tool that needs to read or rewrite the same configuration format: bridge lists, DNS policy, watchdog, warm pool, upstream chaining, SOCKS5 user accounts, security toggles.
 
+The main configuration includes `tor.circuit_hops`, permitted values `2` and `3` (default `3`). Two-hop circuits go directly from guard to exit with no middle relay, reducing anonymity; intended for censorship circumvention, not anonymity. This chunk wires storage and Settings plumbing only; circuit-length activation is deferred to CLH-03b.
+
 ## Usage
 
 The crate publishes as `tor-socks5-config`, while the library target keeps the in-tree name `proxy_config`.
@@ -13,6 +15,7 @@ use proxy_config::{BridgesConfig, Config};
 
 let cfg = Config {
     listen: vec!["127.0.0.1:9050".into()],
+    tor: proxy_config::TorConfig { circuit_hops: 2 },
     bridges: BridgesConfig {
         lines: vec![
             "obfs4 1.2.3.4:80 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=ZZZ iat-mode=0"

@@ -123,6 +123,12 @@ a shorter, ready-to-edit subset of the same defaults; any key you omit keeps the
 ## at its built-in default (mirrors packages/proxy-config/src/lib.rs).
 ## Any key you omit keeps the default shown here.
 
+## Circuit length: only 2 or 3 hops are permitted. The secure default is 3.
+## 2-hop circuits go directly from guard to exit, with no middle relay, reducing
+## anonymity. Intended for censorship circumvention, not anonymity. Setting is
+## stored here; circuit-length activation is deferred to CLH-03b.
+tor.circuit_hops: 3
+
 ## Addresses to listen on — one SOCKS5 + HTTP CONNECT listener per address.
 ## Accepts a scalar or list; each value also accepts host1,host2:port.
 ## Example: listen: 127.0.0.1,[::1]:1080 (IPv6 must be bracketed).

@@ -33,10 +33,11 @@ mod listen_addresses;
 mod migrate;
 mod override_patterns;
 use listen_addresses::listen_addresses;
-use override_patterns::override_patterns;
-
 pub use migrate::{migrate_config, MigrationOutcome, MigrationReport};
-
+use override_patterns::override_patterns;
+#[path = "layout/tor.rs"]
+mod tor;
+pub use tor::TorConfig;
 const ENV_VAR: &str = "TOR_SOCKS5_CONFIG";
 const DEFAULT_FILE: &str = "tor-socks5.ktav";
 pub(crate) static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -94,6 +95,8 @@ pub struct Config {
     pub security: SecurityConfig,
     /// Name-resolution policy used by bridge reachability probes.
     pub dns: DnsConfig,
+    /// Desired Tor circuit length. Only 2 or 3 hops are supported; defaults to 3.
+    pub tor: TorConfig,
     /// Optional local DNS server (plain UDP/TCP wire format) answering
     /// client queries through public DoH providers reached over the live
     /// Tor tunnel. See [`DnsServerConfig`].
@@ -835,6 +838,7 @@ impl Default for Config {
             auth: AuthConfig::default(),
             security: SecurityConfig::default(),
             dns: DnsConfig::default(),
+            tor: TorConfig::default(),
             dns_server: DnsServerConfig::default(),
         }
     }
