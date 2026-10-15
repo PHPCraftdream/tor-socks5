@@ -19,7 +19,7 @@ dynamic linking against `/system/bin/linker(64)`, `for Android 21`, and
 
 - NDK r27c (27.2.12479018, latest 27.x LTS)
 - cargo-ndk 4.1.2
-- Rust 1.97.0
+- Rust 1.97.0 (tested environment; workspace MSRV is 1.92)
 - SDK: D:\system_artefact\android-sdk
 - Min API level: 21 (cargo-ndk default)
 
@@ -31,7 +31,7 @@ $env:ANDROID_HOME = 'D:\system_artefact\android-sdk'
 cargo ndk -t arm64-v8a build -p socks5-proxy --release
 ```
 
-The wrapper script `scripts/build-android.ps1` automates building all four ABIs.
+The wrapper script `scripts/build-android.ps1` automates building all four ABIs (or a selected ABI).
 
 ## Why no .cargo/config.toml
 

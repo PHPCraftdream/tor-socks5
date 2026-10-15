@@ -64,7 +64,7 @@ coalescing snapshot с понятным правилом свежести. Пу�
 **Место:** [сериализация sources](../../../packages/bridge-store/src/persistence.rs#L292-L304),
 [tokenization](../../../packages/bridge-store/src/persistence.rs#L65-L75),
 [чтение cfails и src](../../../packages/bridge-store/src/persistence.rs#L106-L115),
-[поступление label](../../../packages/android-ffi/src/engine_bridges.rs#L255-L285).
+[поступление label](../../../packages/android-ffi/src/engine/engine_bridges.rs#L255-L285).
 
 `note_source_at` принимает обычную строку. В файле sources объединяются
 запятыми без escaping, а reader сначала делит всю строку metadata по
@@ -79,7 +79,7 @@ whitespace и затем значение `src=` по запятым. Поэто
 В конфигурации label описан как
 [human-readable String](../../../packages/proxy-config/src/lib.rs#L438-L446).
 Потеря точного label также ломает сопоставление статистики с источником
-в [barren_sources](../../../packages/android-ffi/src/engine_bridges.rs#L232-L252).
+в [barren_sources](../../../packages/android-ffi/src/engine/engine_bridges.rs#L232-L252).
 Нынешние короткие labels в тестах эти разделители не проверяют.
 
 **Исправление:** ввести однозначное escaping/encoding с версией формата
@@ -93,9 +93,9 @@ whitespace и затем значение `src=` по запятым. Поэто
 
 ## TS6-03 — P2: dedup теряет альтернативный WebTunnel endpoint
 
-**Место:** [dedup_bridges](../../../packages/bridge-fetcher/src/dedup.rs#L7-L23),
-[ключ CandidatePool](../../../apps/socks5-proxy/src/candidate_pool.rs#L37-L47),
-[отбрасывание уже известного ключа](../../../apps/socks5-proxy/src/candidate_pool.rs#L101-L108),
+**Место:** [dedup_bridges](../../../packages/bridge-fetcher/src/fetch/dedup.rs#L7-L23),
+[ключ CandidatePool](../../../apps/socks5-proxy/src/bridges/candidate_pool.rs#L37-L47),
+[отбрасывание уже известного ключа](../../../apps/socks5-proxy/src/bridges/candidate_pool.rs#L101-L108),
 [реальный target probe](../../../packages/bridge-probe/src/probe/mod.rs#L320-L337).
 
 Ключ содержит только transport, `BridgeLine.addr` и fingerprint. Для
@@ -126,7 +126,7 @@ fingerprint остаются доступными отбору, точные д�
 
 ## TS6-04 — P3: защита от panic сделала глубокую копию обязательной
 
-**Место:** [clone, make_mut и замена snapshot](../../../apps/socks5-proxy/src/bridge_store_writer.rs#L352-L379).
+**Место:** [clone, make_mut и замена snapshot](../../../apps/socks5-proxy/src/bridges/bridge_store_writer.rs#L352-L379).
 
 Для исправления TS5-06 actor теперь сохраняет свой Arc и передаёт его
 clone в mutation job. Следовательно, `Arc::make_mut` всегда видит shared
@@ -191,7 +191,7 @@ IPs/TTL, после которого каждый caller применяет св
 
 Механизм выявлен статически. Вместо общего gate введён
 [writer, передаваемый одному вызову](../../../packages/bridge-probe/src/dns.rs#L472-L539).
-[Тест offload](../../../packages/bridge-probe/src/tests/dns_tests.rs#L599-L655)
+[Тест offload](../../../packages/bridge-probe/src/probe/dns_resolution.rs)
 использует свои channels: проверяет blocking thread, доступность cache и
 executor до release, затем фактическую запись файла. Закрытие sender и
 конечный receive timeout исключают бесконечное удержание blocking thread

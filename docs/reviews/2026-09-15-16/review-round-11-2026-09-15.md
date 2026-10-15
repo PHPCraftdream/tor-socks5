@@ -51,7 +51,7 @@ dedup отдельно, но и путь fetch → promote → запись → 
 
 Места: [BridgeStore key_of](../../../packages/bridge-store/src/lib.rs#L198),
 [запись наблюдений](../../../packages/bridge-store/src/observe.rs),
-[применение retirement](../../../apps/socks5-proxy/src/tor_setup.rs#L69).
+[применение retirement](../../../apps/socks5-proxy/src/tor/tor_setup.rs#L69).
 
 Дополнительная часть ключа BridgeStore есть для WebTunnel, но obfs4 cert
 отсутствует. Старый и новый ключ сервера поэтому разделяют одну запись.
@@ -74,7 +74,7 @@ retiring_old_also_retires_fresh=true
 
 ## TS11-03 — P2: pruning удаляет рабочий вариант вместе с отказавшим
 
-Место: [prune_bridges_from_config](../../../apps/socks5-proxy/src/tor_setup.rs#L477).
+Место: [prune_bridges_from_config](../../../apps/socks5-proxy/src/tor/tor_setup.rs#L477).
 
 `dead_keys` и сравнение внутри retain содержат только transport/address/
 fingerprint. Если в config есть `/old` и `/new` одного WebTunnel relay, а dead
@@ -107,9 +107,9 @@ flush; B получает и кеширует адрес новой сети; A 
 
 ## TS11-05 — P3: обработка больших probe-результатов квадратична
 
-Места: [probe_measured](../../../apps/socks5-proxy/src/tor_setup.rs#L286),
-[фильтрация alive](../../../apps/socks5-proxy/src/tor_setup.rs#L166),
-[ранжирование](../../../apps/socks5-proxy/src/tor_setup.rs#L180).
+Места: [probe_measured](../../../apps/socks5-proxy/src/tor/tor_setup.rs#L286),
+[фильтрация alive](../../../apps/socks5-proxy/src/tor/tor_setup.rs#L166),
+[ранжирование](../../../apps/socks5-proxy/src/tor/tor_setup.rs#L180).
 
 - Для N мостов `filter(!round.unmeasured.contains(bridge))` стоит O(N·U);
   при U=N — O(N²), например когда резолвер недоступен для всего списка.

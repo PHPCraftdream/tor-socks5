@@ -28,7 +28,7 @@ Tracked working tree обоих репозиториев на старте чи�
 
 **Срез:** новая реализация `2f9a160` и её существующие async-потребители.
 
-**Места:** [TempLock::acquire](../../../packages/persist-lock/src/temp.rs#L253), [cleanup canonical temp](../../../packages/persist-lock/src/temp.rs#L522), [cleanup orphan companion](../../../packages/persist-lock/src/temp.rs#L591), [Config::from_file](../../../packages/proxy-config/src/lib.rs#L758), [BridgeStore::load](../../../packages/bridge-store/src/persistence.rs#L240). Async call sites: [maintenance](../../../apps/socks5-proxy/src/bridge_maintenance.rs#L165), [background verifier](../../../apps/socks5-proxy/src/bridge_verifier.rs#L277), [Android engine startup](../../../packages/android-ffi/src/engine.rs#L370).
+**Места:** [TempLock::acquire](../../../packages/persist-lock/src/temp.rs#L253), [cleanup canonical temp](../../../packages/persist-lock/src/temp.rs#L522), [cleanup orphan companion](../../../packages/persist-lock/src/temp.rs#L591), [Config::from_file](../../../packages/proxy-config/src/lib.rs#L758), [BridgeStore::load](../../../packages/bridge-store/src/persistence.rs#L240). Async call sites: [maintenance](../../../apps/socks5-proxy/src/bridges/bridge_maintenance.rs#L165), [background verifier](../../../apps/socks5-proxy/src/bridges/bridge_verifier.rs#L277), [Android engine startup](../../../packages/android-ffi/src/engine/engine.rs#L370).
 
 **Механизм.** Стабильный `.templock` правильно сериализует создание и удаление имён. Однако reader-side cleanup теперь использует тот же блокирующий `File::lock()` без deadline, что writer. Обычное чтение Config/BridgeStore запускает cleanup синхронно. Перечисленные async-функции вызывают чтение непосредственно на Tokio worker.
 
@@ -44,7 +44,7 @@ Tracked working tree обоих репозиториев на старте чи�
 
 **Срез:** общий код вне последних исправлений.
 
-**Места:** [описание pins](../../../packages/bridge-fetcher/src/direct.rs#L20), [connect_direct](../../../packages/bridge-fetcher/src/direct.rs#L63), [ожидание resolver](../../../packages/bridge-fetcher/src/direct.rs#L78), [первый TCP dial](../../../packages/bridge-fetcher/src/direct.rs#L97), [общий timeout fetch](../../../packages/bridge-fetcher/src/http.rs), [две DoH-волны по четыре секунды](../../../packages/bridge-probe/src/dns.rs#L107).
+**Места:** [описание pins](../../../packages/bridge-fetcher/src/fetch/direct.rs#L20), [connect_direct](../../../packages/bridge-fetcher/src/fetch/direct.rs#L63), [ожидание resolver](../../../packages/bridge-fetcher/src/fetch/direct.rs#L78), [первый TCP dial](../../../packages/bridge-fetcher/src/fetch/direct.rs#L97), [общий timeout fetch](../../../packages/bridge-fetcher/src/http.rs), [две DoH-волны по четыре секунды](../../../packages/bridge-probe/src/dns.rs#L107).
 
 **Механизм.** `pinned_addrs` заполняет список сразу, но до попытки подключения код безусловно ожидает `resolve_addrs` для hostname. До цикла `TcpStream::connect` выполнение доходит только после результата DNS. Это отличается от описанного shortcuts-first поведения: pins первые лишь в готовом списке, а не по времени начала подключения.
 

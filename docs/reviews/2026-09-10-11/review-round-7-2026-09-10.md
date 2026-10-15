@@ -93,8 +93,8 @@ write завершается ошибкой. A успешно дописывае
 
 **Место:** [сокращение PreparedTarget до tuple](../../../packages/bridge-probe/src/probe/mod.rs#L261-L273),
 [поля target](../../../packages/bridge-probe/src/probe/mod.rs#L137-L153),
-[dedup](../../../packages/bridge-fetcher/src/dedup.rs#L16-L30),
-[ключ pool](../../../apps/socks5-proxy/src/candidate_pool.rs#L40-L54).
+[dedup](../../../packages/bridge-fetcher/src/fetch/dedup.rs#L16-L30),
+[ключ pool](../../../apps/socks5-proxy/src/bridges/candidate_pool.rs#L40-L54).
 
 Новый ключ содержит dial host, port и path/query. При этом probe реально
 использует ещё `sni`, `host_header` и `use_tls`. Эти поля выбрасываются.
@@ -135,7 +135,7 @@ Fetcher и CandidatePool теперь допускают `/old` и `/new` одн
 channel-proven выдаёт `/new`, хотя эти доказательства относятся к другому
 carrier. В обратном случае permanent failure старого варианта остаётся
 в `circuit_fails`: новый вариант считается retired ещё до собственной проверки.
-Этот фильтр применяется при [настройке Tor](../../../apps/socks5-proxy/src/tor_setup.rs#L65-L72).
+Этот фильтр применяется при [настройке Tor](../../../apps/socks5-proxy/src/tor/tor_setup.rs#L65-L72).
 
 Кроме того, success одного endpoint помещает общий ключ в `alive_keys`,
 поэтому failure другого в том же probe round пропускается. Это отдельная
@@ -183,7 +183,7 @@ hostname размер реестра возвращается к заданно�
 
 **Место:** [flush_dns_cache](../../../packages/bridge-probe/src/dns.rs#L291-L306),
 [присоединение к cell и кеширование ответа](../../../packages/bridge-probe/src/probe/dns_resolution.rs#L272-L295),
-[reset Android watchdog](../../../packages/android-ffi/src/engine_bootstrap.rs#L726-L745).
+[reset Android watchdog](../../../packages/android-ffi/src/engine/engine_bootstrap.rs#L726-L745).
 
 Flush очищает ответы и scores, но не меняет поколение lookup и не отделяет
 INFLIGHT_DOH. Если запрос host уже начался, вызов после flush находит его
@@ -231,7 +231,7 @@ host, затем завершить A. B должен искать в новом
 
 **Место:** [уникальный temp и cleanup ошибок write](../../../packages/bridge-probe/src/dns.rs#L572-L580),
 [возврат ошибки rename](../../../packages/bridge-probe/src/dns.rs#L599-L601),
-[периодический save](../../../packages/android-ffi/src/engine_bootstrap.rs#L428-L434).
+[периодический save](../../../packages/android-ffi/src/engine/engine_bootstrap.rs#L428-L434).
 
 После успешного write ошибка rename возвращается напрямую, оставляя temp.
 Например, destination занят несовместимым файловым handle на Windows или

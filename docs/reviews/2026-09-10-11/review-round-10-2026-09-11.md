@@ -43,7 +43,7 @@ P0/P1 в проверенном объёме не обнаружены. Откр
 ## TS10-01 — P2: тест пропускает исходную перестановку check/lock
 
 Места: [store_cached_if_generation](../../../packages/bridge-probe/src/dns.rs#L352),
-[тесты flush](../../../packages/bridge-probe/src/tests/probe_coalesce_tests.rs#L561),
+[тесты flush](../../../packages/bridge-probe/src/tests/probe/probe_coalesce_tests.rs#L561),
 [пауза](../../../packages/bridge-probe/src/dns_publish_pause.rs#L60).
 
 Пауза перенесена внутрь функции, но всё ещё стоит перед mutex И проверкой
@@ -90,10 +90,10 @@ insert(answer)
 
 ## TS10-03 — P2: ключ obfs4 не включает серверный cert
 
-Места: [key_of](../../../apps/socks5-proxy/src/candidate_pool.rs#L52),
-[merge/exclude](../../../apps/socks5-proxy/src/candidate_pool.rs#L124),
-[dedup fetcher](../../../packages/bridge-fetcher/src/dedup.rs#L15),
-[исключение working set](../../../apps/socks5-proxy/src/fetch_merge.rs#L146).
+Места: [key_of](../../../apps/socks5-proxy/src/bridges/candidate_pool.rs#L52),
+[merge/exclude](../../../apps/socks5-proxy/src/bridges/candidate_pool.rs#L124),
+[dedup fetcher](../../../packages/bridge-fetcher/src/fetch/dedup.rs#L15),
+[исключение working set](../../../apps/socks5-proxy/src/fetch/fetch_merge/fetch_merge.rs#L146).
 
 Для obfs4 ключ содержит transport/address/fingerprint, а дополнительная часть
 WebTunnel равна None. Два валидных cert с одинаковым node ID и разными

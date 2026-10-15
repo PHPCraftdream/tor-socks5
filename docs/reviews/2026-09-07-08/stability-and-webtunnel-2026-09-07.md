@@ -98,7 +98,7 @@ Tor открыл тот же сайт. Эти запросы могли испо
 повторно. Проверены порядок retirement перед повтором и предел двух попыток.
 
 Код: [arti-client/client.rs](../../../vendor/arti-client/src/client.rs),
-[открытие потоков](../../../vendor/arti-client/src/client/operations.rs).
+[открытие потоков](../../../vendor/arti-client/src/client.rs).
 Сверка с механизмом `connection_ap_detach_retriable` в
 [C Tor](https://tpo.pages.torproject.net/core/doc/tor/connection__edge_8c.html).
 
@@ -128,9 +128,9 @@ Obfs4 разрешён при отсутствии пригодных WT. Нов
 Уже открытые сессии сохраняются. Ошибка поиска не отменяет применённый
 запасной маршрут; пустой результат не включает прямой Tor без мостов.
 
-Код: [bridge_maintenance.rs](../../../apps/socks5-proxy/src/bridge_maintenance.rs),
-[fetch_merge.rs](../../../apps/socks5-proxy/src/fetch_merge.rs),
-[tor_setup.rs](../../../apps/socks5-proxy/src/tor_setup.rs).
+Код: [bridge_maintenance.rs](../../../apps/socks5-proxy/src/bridges/bridge_maintenance.rs),
+[fetch_merge.rs](../../../apps/socks5-proxy/src/fetch/fetch_merge/fetch_merge.rs),
+[tor_setup.rs](../../../apps/socks5-proxy/src/tor/tor_setup.rs).
 
 ## Проверки мостов не должны мешать рабочему клиенту
 
@@ -143,8 +143,8 @@ Obfs4 разрешён при отсутствии пригодных WT. Нов
   пулом. Глобальная история obfs4 не вытесняет WT при ранжировании.
 - Для каждого неуспешного фонового теста теперь записывается его причина.
 
-Код: [arti_observability.rs](../../../apps/socks5-proxy/src/arti_observability.rs),
-[bridge_verifier.rs](../../../apps/socks5-proxy/src/bridge_verifier.rs),
+Код: [arti_observability.rs](../../../apps/socks5-proxy/src/tor/arti_observability.rs),
+[bridge_verifier.rs](../../../apps/socks5-proxy/src/bridges/bridge_verifier.rs),
 [bridge-store](../../../packages/bridge-store/src/lib.rs).
 
 ## Проверка и состав изменений

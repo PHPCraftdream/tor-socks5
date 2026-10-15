@@ -43,7 +43,7 @@ publish_failed=true
 
 ### TS18-02 — P2: early return сохраняет явно мёртвую пачку навсегда
 
-Места: [накопление dead](../../../apps/socks5-proxy/src/fetch_merge.rs#L449), [early return](../../../apps/socks5-proxy/src/fetch_merge.rs#L475), [недостижимый для этого случая confirm](../../../apps/socks5-proxy/src/fetch_merge.rs#L547).
+Места: [накопление dead](../../../apps/socks5-proxy/src/fetch/fetch_merge/fetch_merge.rs#L449), [early return](../../../apps/socks5-proxy/src/fetch/fetch_merge/fetch_merge.rs#L475), [недостижимый для этого случая confirm](../../../apps/socks5-proxy/src/fetch/fetch_merge/fetch_merge.rs#L547).
 
 **Механизм.** После проверки pool snapshot больше не сохраняется. Удаления публикует поздний confirm. Но `if promoted.is_empty() { return Ok(0); }` остался перед ним. Поэтому `dead` не применяется, когда ни один мост не прошёл admission.
 
@@ -55,7 +55,7 @@ publish_failed=true
 
 ### TS18-03 — P2: deferred-кандидаты больше не переходят в конец очереди
 
-Места: [ограниченный отбор](../../../apps/socks5-proxy/src/fetch_merge.rs#L396), [unmeasured/timeout](../../../apps/socks5-proxy/src/fetch_merge.rs#L421), [неуспешный admission](../../../apps/socks5-proxy/src/fetch_merge.rs#L445), [take_transport](../../../apps/socks5-proxy/src/candidate_pool.rs#L178).
+Места: [ограниченный отбор](../../../apps/socks5-proxy/src/fetch/fetch_merge/fetch_merge.rs#L396), [unmeasured/timeout](../../../apps/socks5-proxy/src/fetch/fetch_merge/fetch_merge.rs#L421), [неуспешный admission](../../../apps/socks5-proxy/src/fetch/fetch_merge/fetch_merge.rs#L445), [take_transport](../../../apps/socks5-proxy/src/bridges/candidate_pool.rs#L178).
 
 **Механизм.** Новая схема оставляет deferred и unmeasured в прежних позициях on-disk pool. Следующий drain снова берёт тот же prefix. В предыдущей схеме их собирали отдельно и возвращали через `pool.merge(deferred, ...)` после оставшихся кандидатов. `shuffle` меняет порядок только уже взятой пачки.
 

@@ -9,7 +9,7 @@ specification, decisions and data live in
 
 | Tier | What runs | When | Rough cost |
 |---|---|---|---|
-| **T0** | `cargo fmt --all -- --check`; `check-line-limit.sh`, `check-dir-entries.sh`, `check-publish-guard.sh`; packageability, MSRV, Android (CI only) | always, on every hook run and CI run | seconds |
+| **T0** | `cargo fmt --all -- --check`; dir-entries and line-limit; CI-only: publish-guard, packageability, MSRV 1.92, Android arm64 build | always, on every hook run and CI run | seconds |
 | **T1** | T0 + tests, doctests and clippy of **affected packages and their reverse dependencies** (`scripts/testing/test-affected.sh`) | pre-push by default; PRs in CI (ubuntu + windows) | ~1 package: well under a minute after build |
 | **T2** | full `cargo nextest run --workspace` (profile `ci`) + `cargo test --doc --workspace` + clippy `--workspace`, on all three OS | push to `main`, tags, `upstream-*`, `FULL=1`, any `workflow_dispatch` | minutes on CI |
 | **T3** | T2 + flaky-hunt profile repeats + tests of the vendor crates that are **not** workspace members (`tor-chanmgr`, `tor-dirmgr`, `tor-dirclient`) + per-feature runs + a report | nightly schedule, see `.github/workflows/nightly.yml` | long; unattended |
@@ -105,8 +105,8 @@ from stdin and compares each pushed `local_sha` with `git rev-parse HEAD`:
 - branch deletions (null local sha) are skipped; a deletion-only push exits before fmt/tests;
 - emergencies: `git push --no-verify` only.
 
-`cargo nextest` does not run doctests — the hook, the script and CI run
-`cargo test --doc` separately. To test one package by hand:
+`cargo nextest` does not run doctests; the hook, CI and the test script run them separately with
+`cargo test --doc`. To test one package by hand:
 
 ```bash
 cargo nextest run -p tor-socks5-config
@@ -127,7 +127,7 @@ cargo test --doc -p tor-socks5-config
   separate step. The plan job also runs `scripts/testing/selftest.sh` (no cargo build).
 - Test jobs upload JUnit reports as artifacts `junit-t1-<os>` / `junit-t2-<os>`.
 - CI-only structural jobs: line-limit, dir-entries, publish-guard, packageability,
-  MSRV 1.89, Android arm64 build.
+  MSRV 1.92, Android arm64 build.
 
 The nightly contour (`.github/workflows/nightly.yml`) runs T3 on a schedule and, on
 failure, updates a single tracking issue **Nightly tests failed** instead of opening

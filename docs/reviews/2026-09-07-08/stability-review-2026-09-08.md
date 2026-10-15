@@ -16,10 +16,10 @@ fast-socks5 0.10.0. Зависимости при проверке не обно
 
 ### 1. P1 — конкурирующие записи состояния мостов
 
-Места: [BridgeStore::save](../../../packages/bridge-store/src/lib.rs#L663),
-[maintenance](../../../apps/socks5-proxy/src/bridge_maintenance.rs#L262),
-[warmer](../../../apps/socks5-proxy/src/bridge_warmer.rs#L250),
-[verifier](../../../apps/socks5-proxy/src/bridge_verifier.rs#L493).
+Места: [BridgeStore::save](../../../packages/bridge-store/src/lib.rs),
+[maintenance](../../../apps/socks5-proxy/src/bridges/bridge_maintenance.rs#L262),
+[warmer](../../../apps/socks5-proxy/src/bridges/bridge_warmer.rs#L250),
+[verifier](../../../apps/socks5-proxy/src/bridges/bridge_verifier.rs#L493).
 
 Каждая задача независимо читает файл, меняет собственный снимок и целиком
 перезаписывает файл. Общей транзакции нет. Временное имя включает только
@@ -53,9 +53,9 @@ save через `?`. При ошибке записи наблюдения те�
 
 ### 2. P1 — очистка проверки может завершить основной PT
 
-Места: [Windows kill_new_children](../../../apps/socks5-proxy/src/bridge_verifier.rs#L328),
-[границы проверки](../../../apps/socks5-proxy/src/bridge_verifier.rs#L429),
-[Android kill_new_children](../../../packages/android-ffi/src/jni_verify.rs#L369).
+Места: [Windows kill_new_children](../../../apps/socks5-proxy/src/bridges/bridge_verifier.rs#L328),
+[границы проверки](../../../apps/socks5-proxy/src/bridges/bridge_verifier.rs#L429),
+[Android kill_new_children](../../../packages/android-ffi/src/jni/jni_verify.rs#L369).
 
 Принадлежность процесса проверке определяется разностью списков дочерних
 PID до и после проверки. Это определяет время появления, но не владельца.
@@ -73,9 +73,9 @@ PID до и после проверки. Это определяет время 
 
 ### 3. P1 — незавершённый SOCKS5 handshake удерживает место бессрочно
 
-Места: [приём соединения](../../../apps/socks5-proxy/src/server.rs#L301),
-[handshake CLI](../../../apps/socks5-proxy/src/server.rs#L402),
-[handshake Android](../../../packages/android-ffi/src/engine_bridges.rs#L503),
+Места: [приём соединения](../../../apps/socks5-proxy/src/server/server.rs#L301),
+[handshake CLI](../../../apps/socks5-proxy/src/server/server.rs#L402),
+[handshake Android](../../../packages/android-ffi/src/engine/engine_bridges.rs#L503),
 [чтение протокола](../../../packages/socks5-proto/src/lib.rs#L85).
 
 Разрешение семафора захватывается до handshake. Сам handshake содержит
@@ -119,10 +119,10 @@ PID до и после проверки. Это определяет время 
 
 ### 5. P2 — метрики и ошибки не показывают результат передачи данных
 
-Места: [snapshot_and_reset](../../../apps/socks5-proxy/src/conn_health.rs#L117),
-[пропуск интервала](../../../apps/socks5-proxy/src/conn_health.rs#L159),
-[классификация](../../../apps/socks5-proxy/src/server.rs#L362),
-[relay](../../../apps/socks5-proxy/src/server.rs#L459).
+Места: [snapshot_and_reset](../../../apps/socks5-proxy/src/tor/conn_health.rs#L117),
+[пропуск интервала](../../../apps/socks5-proxy/src/tor/conn_health.rs#L159),
+[классификация](../../../apps/socks5-proxy/src/server/server.rs#L362),
+[relay](../../../apps/socks5-proxy/src/server/server.rs#L459).
 
 После обнуления счётчиков интервал пропускается, если attempted=0, даже если
 в нём завершились или оборвались старые соединения. Эти события исчезают
@@ -186,8 +186,8 @@ JoinSet также различает только внешний JoinError, п�
 
 ### 8. P2 — файловая копия работающего SQLite-кеша не является согласованным снимком
 
-Места: [CLI snapshot_cache_dir](../../../apps/socks5-proxy/src/bridge_verifier.rs#L214),
-[Android snapshot_cache_dir](../../../packages/android-ffi/src/jni_verify.rs#L125).
+Места: [CLI snapshot_cache_dir](../../../apps/socks5-proxy/src/bridges/bridge_verifier.rs#L214),
+[Android snapshot_cache_dir](../../../packages/android-ffi/src/jni/jni_verify.rs#L125).
 
 Файлы кеша копируются по одному, пока основной Arti продолжает запись.
 Для SQLite это допускает несогласованную копию, в том числе несовпадение
@@ -204,7 +204,7 @@ integrity_check и открывается проверочным клиенто�
 
 ### 9. P2 — наблюдения guard неоднозначно приписываются endpoint
 
-Место: [ObservationSink::drain_into_store](../../../apps/socks5-proxy/src/arti_observability.rs#L196).
+Место: [ObservationSink::drain_into_store](../../../apps/socks5-proxy/src/tor/arti_observability.rs#L196).
 
 HashMap fingerprint → &BridgeLine оставляет последний BridgeLine с данным
 RSA fingerprint. Несколько URL/адресов одного guard различаются для BridgeStore,

@@ -20,8 +20,8 @@ tor.circuit_hops: 3
 ## AddrInUse, PermissionDenied and AddrNotAvailable are skipped with
 ## WARN and a reason. At least one bound listener serves; all failing
 ## is an error. Other bind errors remain hard failures.
-## Occupied ports are never taken over. No automatic retry is implemented
-## (LST-05), including for in-use or permission-denied addresses.
+## Occupied ports are never taken over. AddrNotAvailable is retried
+## every 30s; AddrInUse and PermissionDenied are not retried. Shutdown ends retries; already-bound addresses are not rebound.
 listen: [
     127.0.0.1:1080
 ]
@@ -67,7 +67,7 @@ warm_pool.refresh_interval_secs: 60
 ## dns_server.listen accepts a scalar/list and host1,host2:port shorthand,
 ## e.g. 127.0.0.1,[::1]:15353 (IPv6 must be bracketed). Expansion keeps
 ## the first occurrence of each address; writeback uses the expanded list.
-## The skip-unavailable and no-automatic-retry rules above also apply.
+## The skip-unavailable and retry rules above also apply.
 ## Each address binds an atomic UDP+TCP pair: never serve a half-bound pair.
 ## At least one complete pair must bind. Local policy and recursion guards
 ## use only successfully bound endpoints.
