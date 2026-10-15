@@ -282,8 +282,8 @@ dns_server.overrides: [
 ## unique. `enabled` defaults to true. The service's v3 key lives in
 ## the keystore, which is locked against CLI mutations while the server
 ## runs. `circuit_hops` (2..=4, default 4) sets the length of the
-## server-side onion circuits; all enabled services must use the same
-## value. Example (not part of the default):
+## server-side onion circuits (HsDir uploads never go below 3); all
+## enabled services must use the same value. Example (not part of the default):
 ## onion_services: [
 ##     {
 ##         nickname: web
@@ -346,9 +346,14 @@ onion_services: [
         ports: [ 80=127.0.0.1:8080, 443=127.0.0.1:8443 ]
     }
 ]
-``` Setting `circuit_hops` (2..=4, default `4`) shortens all server-side
+```
+
+Setting `circuit_hops` (2..=4, default `4`) shortens the server-side
 onion circuits — a latency-for-anonymity trade intended for censorship
-circumvention; all enabled services must use the same value.
+circumvention; all enabled services must use the same value. With `2`,
+introduction and rendezvous circuits are `[bridge, target]`; descriptor
+uploads keep three hops, because HsDirs reject posts from a bridge-adjacent
+circuit.
 
 ```ktav
 onion_services: [

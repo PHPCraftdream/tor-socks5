@@ -167,7 +167,7 @@ pub(crate) async fn run_server(
                 .unwrap_or(4);
             if service_circuit_hops < 4 {
                 let chain = if service_circuit_hops == 2 {
-                    "[bridge, target]"
+                    "[bridge, target] (descriptor uploads keep a middle relay)"
                 } else {
                     "[bridge, middle, target]"
                 };

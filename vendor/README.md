@@ -108,7 +108,8 @@ Opt-in bandwidth floor for middle/exit relay selection; client HS stems honor
 (always three hops: exits refuse a two-hop circuit that starts at a bridge);
 service stems honor `PathConfig::service_circuit_hops` (2..=4, default 4 =
 stock; stem = value − 1, a 1-hop stem is guard-only) in Disabled mode; vanguard
-modes retain upstream behavior.
+modes retain upstream behavior. SvcHsDir stems never drop below 2 hops: C-tor
+HsDirs reject descriptor posts whose previous hop is a client (a bridge).
 
 ## Patch table
 

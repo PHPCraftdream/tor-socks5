@@ -188,8 +188,8 @@ impl AnonymousPathBuilder for HsPathBuilder {
             }
             // tor-socks5 local patch: service stem is one hop shorter than
             // the total service circuit (the target relay is appended).
-            Some(HsCircKind::SvcHsDir | HsCircKind::SvcIntro | HsCircKind::SvcRend) => {
-                config.service_circuit_hops() - 1
+            Some(kind @ (HsCircKind::SvcHsDir | HsCircKind::SvcIntro | HsCircKind::SvcRend)) => {
+                kind.svc_stem_hops(config.service_circuit_hops())
             }
             _ => 3,
         }
@@ -529,6 +529,12 @@ mod test {
                     .unwrap();
                 let path = pick_hs_path_no_vanguards_with_config(&netdir, None, Some(kind), config)
                     .unwrap();
+                // HsDirs reject descriptor posts from a non-anonymous hop.
+                let expected = if kind == HsCircKind::SvcHsDir {
+                    expected.max(2)
+                } else {
+                    expected
+                };
                 assert_eq!(path.len(), expected, "{kind:?} setting {setting}");
             }
         }
@@ -706,9 +712,7 @@ mod test {
                         .unwrap();
                         assert_eq!(
                             path.len(),
-                            if mode == VanguardMode::Lite {
-                                3
-                            } else if stem_kind == HsCircStemKind::Naive {
+                            if mode == VanguardMode::Lite || stem_kind == HsCircStemKind::Naive {
                                 3
                             } else {
                                 4

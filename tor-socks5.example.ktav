@@ -120,7 +120,8 @@ warm_pool.refresh_interval_secs: 60
 ## be unique. The services' v3 keys live in the keystore, which is
 ## locked against CLI mutations while the server runs. `circuit_hops`
 ## (2..=4, default 4) sets the length of the server-side onion
-## circuits; all enabled services must use the same value.
+## circuits (HsDir uploads never go below 3); all enabled services
+## must use the same value.
 onion_services: []
 ## Example (uncomment and edit to publish a service):
 ## onion_services: [

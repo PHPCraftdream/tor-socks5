@@ -91,6 +91,19 @@ impl HsCircKind {
             }
         }
     }
+
+    /// tor-socks5 local patch: Disabled-mode service stem length for
+    /// `service_circuit_hops`. HsDirs reject descriptor posts from a
+    /// non-anonymous previous hop ("Rejecting single hop HS descriptor
+    /// post"; a bridge counts as a client), so SvcHsDir stems never drop
+    /// below 2 hops.
+    pub(crate) fn svc_stem_hops(&self, service_circuit_hops: u8) -> u8 {
+        let len = service_circuit_hops.saturating_sub(1);
+        match self {
+            HsCircKind::SvcHsDir => len.max(2),
+            _ => len,
+        }
+    }
 }
 
 /// A hidden service circuit stem.
@@ -214,7 +227,9 @@ impl HsCircStemKind {
             ) => usize::from(configured_hops),
             // tor-socks5 local patch: service stem is one hop shorter than
             // the total service circuit (the target relay is appended).
-            (VanguardMode::Disabled, _, _) => usize::from(service_circuit_hops) - 1,
+            (VanguardMode::Disabled, _, _) => {
+                usize::from(circ_kind.svc_stem_hops(service_circuit_hops))
+            }
             #[cfg(all(feature = "vanguards", feature = "hs-common"))]
             (VanguardMode::Lite, _, _) => 3,
             #[cfg(all(feature = "vanguards", feature = "hs-common"))]
@@ -1607,6 +1622,12 @@ mod test {
                     .unwrap(),
             );
             for kind in svc_kinds {
+                // HsDirs reject descriptor posts from a non-anonymous hop.
+                let expected = if kind == HsCircKind::SvcHsDir {
+                    expected.max(2)
+                } else {
+                    expected
+                };
                 assert_eq!(
                     pool.expected_stem_hops(kind, kind.stem_kind()).unwrap(),
                     expected,
