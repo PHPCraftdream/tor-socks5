@@ -25,6 +25,8 @@ onion-service = [
     "dep:tor-llcrypto",
     "dep:fs-mistrust",
     "dep:safelog",
+    "dep:tor-cell",
+    "dep:tor-proto",
 ]
 
 [dependencies]
@@ -51,6 +53,11 @@ tor-hscrypto = { version = "0.47", optional = true }
 tor-llcrypto = { version = "0.47", optional = true }
 fs-mistrust = { version = "0.16", optional = true }
 safelog = { version = "0.10", optional = true }
+# Relay cells (`Connected`/`End`) and `IncomingStreamRequest` for the
+# server-side onion-service forwarder. Same arti 0.47 stack as Cargo.lock;
+# optional so `--no-default-features` stays light.
+tor-cell = { version = "0.47", optional = true }
+tor-proto = { version = "0.47", optional = true }
 
 ktav.workspace = true
 service-manager.workspace = true

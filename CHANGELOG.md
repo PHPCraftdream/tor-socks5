@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Build now supports the server side of onion services behind the `onion-service` cargo feature (on by default in the CLI, off for Android; no user-facing functionality yet).
 - New `tor-socks5 onion` subcommands (`new`, `list`, `show`, `export`, `import`, `remove`) manage onion-service identity keys in the Arti keystore; `new`/`import`/`remove` refuse to destroy an existing address without an explicit confirmation flag.
+- Onion service launching from config: a new top-level `onion_services` section (see the canonical reference in `README.md`) starts one onion service per entry and forwards its ports to local `host:port` targets (`ports: [ 80=127.0.0.1:8080 ]`). The keystore is locked against CLI mutations while the server runs.
 - `tor.circuit_hops` (2 or 3, default 3) sets the length of the client's onion-service circuits. With `2`, the HsDir, introduction and rendezvous stems drop the middle relay (Disabled vanguard mode only); service stems and Lite/Full vanguard lengths are unchanged. Ordinary exit circuits always stay at 3 hops: exits refuse a 2-hop circuit that starts at a bridge. A startup warning notes the anonymity tradeoff when set to 2.
 
 ### Changed

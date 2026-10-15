@@ -21,14 +21,19 @@ use std::{env, fs};
 use anyhow::{Context, Result};
 use bridge_line::BridgeLine;
 use bridge_probe::{bridge_identity, usable_for_tor, BridgeIdentity};
-use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 #[path = "layout/bridges_file.rs"]
 mod bridges_file;
 #[path = "layout/legacy.rs"]
 mod legacy;
+#[path = "layout/log.rs"]
+mod log;
+pub use log::{LogConfig, LogOutput};
 mod listen_addresses;
+mod onion_services;
+use onion_services::onion_services;
+pub use onion_services::{OnionServiceEntry, OnionServicePort};
 #[path = "layout/migrate.rs"]
 mod migrate;
 mod override_patterns;
@@ -101,6 +106,9 @@ pub struct Config {
     /// client queries through public DoH providers reached over the live
     /// Tor tunnel. See [`DnsServerConfig`].
     pub dns_server: DnsServerConfig,
+    /// Onion services published by this proxy (see [`OnionServiceEntry`]). Default empty.
+    #[serde(default, deserialize_with = "onion_services")]
+    pub onion_services: Vec<OnionServiceEntry>,
 }
 
 /// Name-resolution policy for bridge probes. DoH is deliberately the default:
@@ -468,49 +476,6 @@ impl Default for ConnHealthConfig {
     }
 }
 
-/// Where log lines are written.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum LogOutput {
-    /// Standard error (default).
-    #[default]
-    Stderr,
-    /// Standard output.
-    Stdout,
-    /// The file named by [`LogConfig::file`]. Falls back to stderr when
-    /// the path is empty or cannot be opened.
-    File,
-}
-
-/// Logging configuration (`log.*` keys in the Ktav file): default level,
-/// per-target overrides in insertion order, output sink, and ANSI coloring.
-/// [`LogConfig::to_filter`] renders it as a `tracing-subscriber` env-filter
-/// directive.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct LogConfig {
-    /// Default log level for everything not matched by `targets`.
-    pub default: String,
-    /// Per-target overrides, e.g. `socks5_proxy => debug`. The map preserves
-    /// insertion order, so the resulting filter directive is stable.
-    pub targets: IndexMap<String, String>,
-    /// Sink for log lines: `stderr` (default), `stdout`, or `file`.
-    pub output: LogOutput,
-    /// Path used when `output: file`. Empty falls back to stderr.
-    pub file: String,
-    /// Colorize output with ANSI escapes when writing to a real terminal.
-    /// Set to `false` to force plain text even on a terminal. Has no effect
-    /// when the actual output is not a terminal (redirected to a file/pipe):
-    /// colors are then always disabled regardless of this setting, so raw
-    /// `\x1b[...m` bytes never pollute redirected log files. Ignored (forced
-    /// off) for `file` output. Default `true`. The same stderr-based
-    /// decision is propagated to the pluggable-transport child process via
-    /// the `NO_COLOR` env var, so its independent logging layer (which
-    /// always writes to the inherited stderr) stays plain under the same
-    /// conditions.
-    pub ansi: bool,
-}
-
 /// Bridge pool configuration (`bridges.*` keys): raw bridge lines plus
 /// fetch sources, seed/auto-fetch behavior, and the TCP- and circuit-layer
 /// health thresholds that drive pruning. Raw `lines` are parsed and
@@ -840,40 +805,8 @@ impl Default for Config {
             dns: DnsConfig::default(),
             tor: TorConfig::default(),
             dns_server: DnsServerConfig::default(),
+            onion_services: Vec::new(),
         }
-    }
-}
-
-impl Default for LogConfig {
-    fn default() -> Self {
-        let mut targets = IndexMap::new();
-        targets.insert("socks5_proxy".to_string(), "debug".to_string());
-        targets.insert("arti_wrapper".to_string(), "debug".to_string());
-        targets.insert("bridge_line".to_string(), "debug".to_string());
-        targets.insert("tor_".to_string(), "warn".to_string());
-        targets.insert("arti_".to_string(), "warn".to_string());
-        Self {
-            default: "info".to_string(),
-            targets,
-            output: LogOutput::Stderr,
-            file: String::new(),
-            ansi: true,
-        }
-    }
-}
-
-impl LogConfig {
-    /// Build a `tracing-subscriber` env-filter directive from the structured
-    /// settings.
-    pub fn to_filter(&self) -> String {
-        let mut out = self.default.clone();
-        for (target, level) in &self.targets {
-            out.push(',');
-            out.push_str(target);
-            out.push('=');
-            out.push_str(level);
-        }
-        out
     }
 }
 

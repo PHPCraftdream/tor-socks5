@@ -11,6 +11,7 @@
 //! algorithm — that file *is* the portable export format).
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use fs_mistrust::Mistrust;
@@ -43,14 +44,20 @@ pub(crate) fn nickname(s: &str) -> Result<HsNickname> {
 
 /// Cross-process mutation lock (sibling `<keystore>.lock`).
 ///
-/// Serialises concurrent `tor-socks5 onion` mutations with each other. Note:
-/// a *running* proxy does not hold this lock (arti guards its own state via
-/// sqlite), so this does not exclude a live server — it exists so that two
-/// CLI invocations cannot interleave, matching how the other CLI commands
-/// use `persist_lock`.
+/// Serialises `tor-socks5 onion` mutations with each other AND with the
+/// running server: the server holds this lock for the whole time its
+/// configured onion services are published, so key mutations cannot race a
+/// live service. If the server is running, stop it first (`stop tor-socks5`)
+/// or the CLI command fails with the busy-lock error.
 pub(crate) fn lock(dir: &Path) -> Result<persist_lock::PathLock> {
-    persist_lock::PathLock::acquire_bounded(dir, persist_lock::CLI_LOCK_WAIT)
-        .context("onion keystore lock is busy (another onion command may be running)")
+    lock_with(dir, persist_lock::CLI_LOCK_WAIT)
+}
+
+/// [`lock`] with an explicit wait bound (tests use a short one).
+pub(crate) fn lock_with(dir: &Path, wait: Duration) -> Result<persist_lock::PathLock> {
+    persist_lock::PathLock::acquire_bounded(dir, wait).context(
+        "onion keystore lock is busy (the running tor-socks5 server or another onion command holds it; stop tor-socks5 first)",
+    )
 }
 
 /// Open (creating if absent) the Arti native keystore at `dir`.

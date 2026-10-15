@@ -267,10 +267,67 @@ dns_server.overrides: [
         server: 192.168.1.1:53
     }
 ]
+
+## Onion services published by this proxy (default empty). Each entry
+## launches one onion service at startup: `nickname` names it (only
+## A-Z a-z 0-9 _ -, max 25 chars) and every `ports` entry maps an onion
+## port to a local target as `onion_port=host:port` (an IPv6 target
+## be bracketed; because Ktav reads `[` as an inline compound, an IPv6
+## target needs the block-list form with the `::` literal marker:
+## ports: [
+##     80=127.0.0.1:8080
+##     :: 443=[::1]:8443
+## ]). At least one port per entry; an
+## onion port may not repeat within one entry and nicknames must be
+## unique. `enabled` defaults to true. The service's v3 key lives in
+## the keystore, which is locked against CLI mutations while the server
+## runs. Example (not part of the default):
+## onion_services: [
+##     {
+##         nickname: web
+##         enabled: true
+##         ports: [ 80=127.0.0.1:8080, 443=127.0.0.1:8443 ]
+##     }
+## ]
+onion_services: []
 ```
 
 > **Ktav comments are `##` at the start of a line** (a single `#` is content, and there are no
 > trailing/inline comments — a value runs verbatim to end of line).
+
+
+### Onion services
+
+The optional `onion_services` section publishes onion services through the running proxy. Each
+entry launches one service at startup and forwards its onion ports to local `host:port`
+targets — for example `ports: [ 80=127.0.0.1:8080 ]` publishes an onion address whose port 80
+reaches a local web server. `nickname` must match `A-Za-z0-9_-` (max 25 chars); `enabled`
+defaults to `true`, so a service can be paused by setting it to `false`. An IPv6 target must be
+bracketed (`443=[::1]:8443`), and because Ktav reads an unquoted `[` as the start of an inline
+compound, such a mapping needs the block-list form with the `::` literal marker:
+
+```ktav
+onion_services: [
+    {
+        nickname: web6
+        ports: [
+            80=127.0.0.1:8080
+            :: 443=[::1]:8443
+        ]
+    }
+]
+``` The services' v3 keys
+are kept in the keystore, which is locked against CLI mutations while the server runs.
+
+```ktav
+onion_services: [
+    {
+        nickname: web
+        enabled: true
+        ports: [ 80=127.0.0.1:8080, 443=127.0.0.1:8443 ]
+    }
+]
+```
 
 
 ### The bridges file
