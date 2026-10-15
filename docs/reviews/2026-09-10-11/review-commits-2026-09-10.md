@@ -35,7 +35,7 @@ insert_capped(&mut cache, host, answer);
 
 Места: [store_cached_if_generation](../../../packages/bridge-probe/src/dns.rs),
 [расположение паузы](../../../packages/bridge-probe/src/probe/dns_resolution.rs),
-[два новых теста](../../../packages/bridge-probe/src/tests/probe_coalesce_tests.rs).
+[два новых теста](../../../packages/bridge-probe/src/tests/probe/probe_coalesce_tests.rs).
 
 ## ptrs-gesher c8a87ad
 

@@ -53,7 +53,7 @@ vendored tor-chanmgr. Фокус — корректность границ по�
 **Критерий проверки:** управляемо остановить A после получения ответа перед
 публикацией, выполнить flush и публикацию B, затем продолжить A. Старый ответ
 и старая ошибка не меняют кеш B. Имеющиеся
-[тесты flush](../../../packages/bridge-probe/src/tests/probe_coalesce_tests.rs#L362-L542)
+[тесты flush](../../../packages/bridge-probe/src/tests/probe/probe_coalesce_tests.rs#L362-L542)
 останавливают A внутри wave search, до проверки поколения, и этот разрыв
 не проверяют.
 
@@ -62,8 +62,8 @@ vendored tor-chanmgr. Фокус — корректность границ по�
 **Место:** [warm_bridge](../../../packages/arti-wrapper/src/lib.rs#L387-L406),
 [контракт get_or_launch](../../../vendor/tor-chanmgr/src/lib.rs#L324-L351),
 [выбор открытого канала](../../../vendor/tor-chanmgr/src/mgr/select.rs#L9-L29),
-[запись успеха CLI](../../../apps/socks5-proxy/src/bridge_warmer.rs#L318-L324),
-[публикация health](../../../apps/socks5-proxy/src/bridge_warmer.rs#L345-L352).
+[запись успеха CLI](../../../apps/socks5-proxy/src/bridges/bridge_warmer.rs#L318-L324),
+[публикация health](../../../apps/socks5-proxy/src/bridges/bridge_warmer.rs#L345-L352).
 
 BridgeStore теперь правильно разделяет записи разных carriers. Но их
 производитель по-прежнему трактует `warm_bridge(B) == Ok(())` как доказательство
@@ -78,8 +78,8 @@ fingerprint может вернуть канал A вообще без соед�
 `channel_ok_count` у B. После исчезновения A или перезапуска B остаётся
 channel-proven в файле, хотя его собственная конфигурация могла никогда
 не проходить Tor handshake. Аналогичен путь
-[Android warm pool](../../../packages/android-ffi/src/engine_bootstrap.rs#L184-L197)
-и [сохранения результата](../../../packages/android-ffi/src/engine_bridges.rs#L379-L397).
+[Android warm pool](../../../packages/android-ffi/src/engine/engine_bootstrap.rs#L184-L197)
+и [сохранения результата](../../../packages/android-ffi/src/engine/engine_bridges.rs#L379-L397).
 
 TS7-04 исправлен на уровне ключа хранилища; здесь другой источник смешивания:
 само наблюдение подписывается запрошенным endpoint вместо фактически
@@ -98,9 +98,9 @@ channel-unproven, в том числе после save/load. Обычный пр
 
 ## TS8-03 — P2: сортировка очереди использует прежнюю идентичность
 
-**Место:** [сокращённый RefKey](../../../apps/socks5-proxy/src/candidate_pool.rs#L62-L66),
-[prioritize](../../../apps/socks5-proxy/src/candidate_pool.rs#L190-L198),
-[вызов при миграции источника](../../../apps/socks5-proxy/src/fetch_merge.rs#L145-L167).
+**Место:** [сокращённый RefKey](../../../apps/socks5-proxy/src/bridges/candidate_pool.rs#L62-L66),
+[prioritize](../../../apps/socks5-proxy/src/bridges/candidate_pool.rs#L190-L198),
+[вызов при миграции источника](../../../apps/socks5-proxy/src/fetch/fetch_merge/fetch_merge.rs#L145-L167).
 
 Основной `Key` содержит полный `WebtunnelEndpointIdentity`, а `RefKey`
 всё ещё состоит только из transport, ORPort и fingerprint. Приоритет

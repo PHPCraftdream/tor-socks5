@@ -1,9 +1,9 @@
 # vendor/ — locally-patched forks of upstream arti crates
 
 This directory holds **full source copies** of upstream crates from the
-[arti](https://gitlab.torproject.org/tpo/core/arti) workspace, wired into the
-build via `[patch.crates-io]` in the workspace `Cargo.toml`. The build is
-self-contained: none of our fixes need to be accepted upstream.
+[arti](https://gitlab.torproject.org/tpo/core/arti) workspace. The root
+`Cargo.toml` applies `[patch.crates-io]` overrides to the seven crates under
+`vendor/`; the build does not depend on these fixes being accepted upstream.
 
 **Base line: Arti 0.47.0 (arti 2.7.0), synced 2026-10-13.**
 Workspace MSRV is 1.92 (up from 1.89 on the 0.43 line).
@@ -13,19 +13,20 @@ Vendored crates (7): `arti-client`, `tor-chanmgr`, `tor-circmgr`,
 `saturating-time` at **0.5.0**.
 
 `ptrs-gesher` (the obfs4/webtunnel PT client and `bridge-line` parser) is
-**not** vendored here. Its crates.io release does not yet target `tor-*`
-0.47, so the root `Cargo.toml` currently carries a **TEMPORARY**
-`[patch.crates-io]` section pointing the `ptrs-gesher-*` crates at a sibling
-ptrs-gesher checkout. Switch these back to crates.io as soon as a release
-against `tor-*` 0.47 is published.
+not vendored here. The root `Cargo.toml` declares its crates.io packages
+(`ptrs-gesher-bridge-line` and `ptrs-gesher-lyrebird`) as workspace
+dependencies; there is no sibling-checkout `[patch.crates-io]` override.
 
 ### Onion-service server (not vendored)
 
-The `onion-service-service` feature is enabled via `arti-wrapper/onion-service`.
-`tor-hsservice`, `tor-keymgr` and `tor-hsrproxy` are **not** vendored: they
-come from crates.io 0.47.x. If a fork is ever needed (e.g. SVH hop
-shortening), it must be added as a new full vendor copy plus a
-`[patch.crates-io]` entry here.
+The app's `onion-service` feature enables `arti-wrapper/onion-service`
+(which enables `arti-client/onion-service-service`) and optional
+`tor-hsservice`/`tor-keymgr` dependencies. `tor-hsservice`, `tor-keymgr`,
+`tor-hscrypto`, `tor-llcrypto`, `fs-mistrust`, `safelog`, `tor-cell`,
+`tor-proto`, and `tor-hsrproxy` are not vendored. SVH hop shortening is
+implemented in the vendored `tor-circmgr`; `tor-hsrproxy` is not a direct
+application dependency. A new fork, if needed, must be added under `vendor/`
+and patched in the root `Cargo.toml`.
 
 ## Why each crate is vendored
 
@@ -138,8 +139,9 @@ One row per patch group. Marker names are the identifiers in the
 | exit-stream retry | arti-client | src/client.rs, src/client/stream_retry.rs | one bounded `begin_stream` retry, narrow retryable set, snapshot budgets | carried (0.47 Exit branch is single-attempt) |
 | `initial_connect_timeout` | arti-client | src/config.rs; packages/android-ffi | optional fast-first budget; Android sets 4 s; inactive when `None` | carried |
 | `min_bandwidth_percentile` | tor-circmgr | src/config.rs, src/path.rs, src/path/exitpath.rs, src/path/hspath.rs | opt-in bandwidth floor for middle/exit; default 0 = stock | carried |
-| `hs_circuit_hops` | tor-circmgr | src/hspool.rs, src/hspool/pool.rs, src/path.rs, src/path/hspath.rs | role-aware client lengths, exact-length pool targets, epoch-safe retirement | local |
-| service stem length | tor-circmgr | src/config.rs, src/hspool.rs, src/hspool/pool.rs, src/path.rs, src/path/hspath.rs | `service_circuit_hops` for Svc stems (Disabled mode), guard-only 1-hop path, pool retargeting on change | local |
+| `hs_circuit_hops` | tor-circmgr | src/config.rs, src/hspool.rs, src/hspool/pool.rs, src/path.rs, src/path/exitpath.rs, src/path/hspath.rs | role-aware client lengths, exact-length pool targets, epoch-safe retirement | local |
+| service stem length | tor-circmgr | src/config.rs, src/hspool.rs, src/hspool/pool.rs, src/path.rs, src/path/exitpath.rs, src/path/hspath.rs | `service_circuit_hops` for Svc stems (Disabled mode), guard-only 1-hop path, pool retargeting on change | local |
+| Pareto timeout normalization | tor-circmgr | src/timeouts/pareto.rs | normalize completed short-path observations to canonical three-hop work so timeout estimates remain comparable | local |
 
 **None of the functional patches above were accepted upstream in 0.47.**
 
@@ -147,6 +149,9 @@ One row per patch group. Marker names are the identifiers in the
 
 * All seven forks set `publish = false`.
 * `arti-client` gains the tokio `test-util` dev feature.
+* The vendored source also carries cross-cutting lint allowances where upstream
+  code would otherwise fail the workspace lint configuration; these are build
+  compatibility adjustments, not functional patches.
 * New local files: `arti-client/src/client/stream_retry.rs` and
   `tor-dirclient/src/local_test.rs` (patch regression tests).
 

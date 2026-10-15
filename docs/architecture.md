@@ -37,11 +37,9 @@ tor-socks5/
 
 The torrc `Bridge` line grammar is parsed by the external
 `ptrs-gesher-bridge-line` crate — there is no local `bridge-line`
-package, and `ptrs-gesher` is **not** vendored. It is currently consumed
-temporarily from a sibling ptrs-gesher checkout via `[patch.crates-io]`
-(see `Cargo.toml`), because its crates.io release does not yet target
-`tor-*` 0.47. Likewise the obfs4 + webtunnel PT client comes from the
-`ptrs-gesher-lyrebird` crate from that same checkout.
+package, and `ptrs-gesher` is **not** vendored. The workspace consumes
+`ptrs-gesher-bridge-line` and `ptrs-gesher-lyrebird` 0.7 through the root
+`Cargo.toml` workspace dependencies; no sibling checkout is patched in.
 
 ## Crates and their responsibilities
 
@@ -193,59 +191,62 @@ The user-facing binary. Source modules under `src/`:
      parsing because arti passes weird argv to PT subprocesses.
   3. **Normal startup**: parse clap, optionally `--daemon`-ise (Unix
      only), build the multi-thread Tokio runtime, dispatch a
-     subcommand (`users` / `bridges` / `service` / `help`) or run the
-     foreground server.
-* `cli.rs` — clap derive. Global flags: `--config`, `--upstream` /
+     subcommand (`users` / `bridges` / `service` / `config` / `help`, and
+     `onion` when built with `onion-service`) or run the foreground server.
+* `commands/cli.rs` — clap derive. Global flags: `--config`, `--upstream` /
   `--upstream-user` / `--upstream-pass` / `--no-upstream`, `--daemon` /
   `--pid-file`. Subcommands: `users`, `bridges` (with `fetch`),
-  `service`, `help`.
+  `service`, `config` (including `migrate`), `help`, and (when built with
+  `onion-service`) `onion`.
 * `config.rs` — Ktav loader over the shared `proxy_config::Config`
   schema (see `packages/proxy-config` and the canonical reference in
   `README.md`). Writes a default `tor-socks5.ktav` on first run.
-* `server.rs` — the same-port SOCKS5/HTTP CONNECT listener runtime: egress
+* `commands/config_cmd.rs` — the `config` subcommands, including legacy-layout
+  migration.
+* `server/server.rs` — the same-port SOCKS5/HTTP CONNECT listener runtime: egress
   selection (Tor vs. upstream), bounded accept loop (256 connections), host
   authentication and destination policy, SDK replies, and byte forwarding.
 * `auth` integration — when at least one user exists in
   `tor-socks5.users.ktav`, the CLI requires RFC 1929 or HTTP Basic credentials;
   otherwise it permits anonymous access.
-* `upstream.rs` — optional upstream SOCKS5 egress
+* `server/upstream.rs` — optional upstream SOCKS5 egress
   (`client → tor-socks5 → upstream → target`). When active, Tor is not
   started.
-* `dns_wiring.rs` — startup glue for the optional local DNS server
+* `server/dns_wiring.rs` — startup glue for the optional local DNS server
   (`dns_server.*`): converts the config into the resolver pool plus
   the per-mask override engine and binds the UDP/TCP listeners.
   Requires the Tor egress; a DNS-listener runtime error is logged,
   not fatal — the SOCKS5 proxy path keeps running.
-* `bridge_store.rs` — dedup-upsert log of bridges that completed a
+* `bridges/bridge_store_writer.rs` — dedup-upsert log of bridges that completed a
   TCP probe, stored as `<config_stem>.alive-bridges.log` next to the
   active config. Carries the health counters (`fails`, `seen`,
   `cfails`, …) described in `docs/guide/bridges.md`.
-* `candidate_pool.rs` / `fetch_merge.rs` — the candidate pool and the
+* `bridges/candidate_pool.rs` / `fetch/fetch_merge/fetch_merge.rs` — the candidate pool and the
   lazy drain-and-promote path backing `bridges fetch` and auto-fetch.
-* `bridges_cmd.rs` — the `tor-socks5 bridges fetch` subcommand.
-* `arti_observability.rs` — a passive `tracing_subscriber::Layer` on
+* `fetch/bridges_cmd.rs` — the `tor-socks5 bridges fetch` subcommand.
+* `tor/arti_observability.rs` — a passive `tracing_subscriber::Layer` on
   arti's `tor_guardmgr` events that feeds per-guard usability
   observations into the bridge health store (circuit-layer pruning;
   see `docs/guide/bridges.md`).
-* `tor_setup.rs` — parse configured bridges, probe them, persist the
+* `tor/tor_setup.rs` — parse configured bridges, probe them, persist the
   live ones, and assemble `arti_wrapper::Settings` (including pointing
   the PT manager at our own binary via `current_exe()`). The PT binary
   defaults to our own executable (busybox dispatch) but the `TOR_PT_BINARY`
   env var overrides it, for embedding hosts (Android JNI) where
   `current_exe()` is the app process.
-* `seed.rs` — bundled seed bridges (`*.seeds`), the fallback when no
+* `fetch/seed.rs` — bundled seed bridges (`*.seeds`), the fallback when no
   configured bridge is reachable at startup and `use_seeds`
   is on.
-* `service.rs` — install/start/stop/status/uninstall across systemd,
+* `commands/service.rs` — install/start/stop/status/uninstall across systemd,
   OpenRC, launchd, Windows SCM, BSD `rc.d` (via `service-manager`).
-* `daemon.rs` — `--daemon` mode (Unix only): double-fork via the
+* `commands/daemon.rs` — `--daemon` mode (Unix only): double-fork via the
   `daemonize` crate, stdio to `/dev/null`, optional PID file.
-* `shutdown.rs` — Windows Job Object (`KILL_ON_JOB_CLOSE`) so the PT
+* `server/shutdown.rs` — Windows Job Object (`KILL_ON_JOB_CLOSE`) so the PT
   child dies with us, plus cross-platform Ctrl+C / SIGTERM handling.
-* `users_cli.rs` — the `tor-socks5 users` subcommand (add / set-password
+* `commands/users_cli.rs` — the `tor-socks5 users` subcommand (add / set-password
   / list / disable / allow-onion).
-* `help_cmd.rs` — the `tor-socks5 help` subcommand; prints the
-  `docs/` manuals that are embedded in the binary at build time.
+* `server/startup.rs` — server startup orchestration.
+* `bridges/bridge_maintenance.rs` — bridge maintenance and verification.
 
 ### `vendor/` — locally-patched forks
 
@@ -268,9 +269,8 @@ procedure live in `vendor/README.md`. In short:
   bandwidth floor, and more — see `vendor/README.md`).
 
 The obfs4 + webtunnel PT client is **not** vendored. It comes from the
-`ptrs-gesher` crates — currently temporarily from a sibling ptrs-gesher
-checkout via `[patch.crates-io]`, until a crates.io release targeting
-`tor-*` 0.47 exists.
+`ptrs-gesher-lyrebird` 0.7 workspace dependency declared in the root
+`Cargo.toml`.
 
 ## Pluggable-transport dispatch (busybox)
 

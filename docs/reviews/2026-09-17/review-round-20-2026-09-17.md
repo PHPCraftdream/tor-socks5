@@ -28,7 +28,7 @@ P0 — критическая общая неисправность; P1 — вы
 
 **Срез:** общий путь direct HTTPS fetch; дефект существовал до `5377002` и сохранился в изменённом connector. Не является регрессией самого переноса DNS после pins.
 
-**Места:** [ранний возврат pin stream](../../../packages/bridge-fetcher/src/direct.rs#L116), [вызов connector и единственная TLS-попытка](../../../packages/bridge-fetcher/src/http.rs#L297), [fetch_one_direct с общим timeout](../../../packages/bridge-fetcher/src/http.rs#L218).
+**Места:** [ранний возврат pin stream](../../../packages/bridge-fetcher/src/fetch/direct.rs#L116), [вызов connector и единственная TLS-попытка](../../../packages/bridge-fetcher/src/http.rs#L297), [fetch_one_direct с общим timeout](../../../packages/bridge-fetcher/src/http.rs#L218).
 
 **Механизм.** `connect_dialing_pins` считает кандидата выбранным сразу после успешного `TcpStream::connect`. Контроль над перебором адресов на этом заканчивается. TLS handshake выполняется выше, в `fetch_one_inner`; его ошибка возвращается через `?` из fetch, а не обратно в цикл адресов. Оставшиеся pins и динамические адреса не проверяются. При зависании TLS их также не успевают попробовать: истекает общий timeout.
 

@@ -58,7 +58,7 @@ P2 — следующая очередь: функциональный дефе�
 ## TS3-02 — P1: credentials источника уходят на другой origin при редиректе
 
 **Место:** [запрос и переход:225–270](../../../packages/bridge-fetcher/src/http.rs#L225-L270),
-[контракт Source:15–37](../../../packages/bridge-fetcher/src/fetch.rs#L15-L37).
+[контракт Source:15–37](../../../packages/bridge-fetcher/src/fetch/fetch.rs#L15-L37).
 
 Каждый hop вызывает `build_get_request` с исходными `headers` и `cookies`.
 При абсолютном HTTPS `Location` host и port могут измениться, но проверки
@@ -83,10 +83,10 @@ port, относительный переход и явно разрешённы
 
 ## TS3-03 — P2: Android сохраняет независимые снимки одного BridgeStore
 
-**Место:** [probe:155–180](../../../packages/android-ffi/src/engine_bridges.rs#L155-L180),
-[warm и circuit:371–425](../../../packages/android-ffi/src/engine_bridges.rs#L371-L425),
-[JNI source attribution:638–647](../../../packages/android-ffi/src/jni_engine.rs#L638-L647),
-[отдельная задача проверки:569–598](../../../packages/android-ffi/src/engine_bootstrap.rs#L569-L598).
+**Место:** [probe:155–180](../../../packages/android-ffi/src/engine/engine_bridges.rs#L155-L180),
+[warm и circuit:371–425](../../../packages/android-ffi/src/engine/engine_bridges.rs#L371-L425),
+[JNI source attribution:638–647](../../../packages/android-ffi/src/jni/jni_engine.rs#L638-L647),
+[отдельная задача проверки:569–598](../../../packages/android-ffi/src/engine/engine_bootstrap.rs#L569-L598).
 
 Writer приложения socks5-proxy не обслуживает Android FFI. Здесь probe,
 warm, circuit verification и JNI source attribution самостоятельно делают
@@ -110,10 +110,10 @@ warm, circuit verification и JNI source attribution самостоятельн�
 
 ## TS3-04 — P2: удаление Tor из слота не останавливает производителей writer
 
-**Место:** [shutdown:246–260](../../../apps/socks5-proxy/src/server.rs#L246-L260),
-[clone и drain:280–325](../../../apps/socks5-proxy/src/tor_watchdog_health.rs#L280-L325),
-[warmer:263–324](../../../apps/socks5-proxy/src/bridge_warmer.rs#L263-L324),
-[verifier:120–128](../../../apps/socks5-proxy/src/bridge_verifier.rs#L120-L128).
+**Место:** [shutdown:246–260](../../../apps/socks5-proxy/src/server/server.rs#L246-L260),
+[clone и drain:280–325](../../../apps/socks5-proxy/src/tor/tor_watchdog/tor_watchdog_health.rs#L280-L325),
+[warmer:263–324](../../../apps/socks5-proxy/src/bridges/bridge_warmer.rs#L263-L324),
+[verifier:120–128](../../../apps/socks5-proxy/src/bridges/bridge_verifier.rs#L120-L128).
 
 Сервер вызывает `drain`, ждёт 500 ms и закрывает writer, предполагая, что
 производители прекратили работу. `drain` лишь забирает ссылку из слота.
@@ -140,10 +140,10 @@ flush и join writer. Для blocking-проверок предусмотрет�
 
 ## TS3-05 — P2: nativeStart может обогнать завершение nativeStop
 
-**Место:** [проверка запуска:29–44](../../../packages/android-ffi/src/jni_engine.rs#L29-L44),
-[остановка:313–358](../../../packages/android-ffi/src/jni_engine.rs#L313-L358),
-[финальный статус:267–293](../../../packages/android-ffi/src/engine.rs#L267-L293),
-[очистка tunnel:660–668](../../../packages/android-ffi/src/engine.rs#L660-L668).
+**Место:** [проверка запуска:29–44](../../../packages/android-ffi/src/jni/jni_engine.rs#L29-L44),
+[остановка:313–358](../../../packages/android-ffi/src/jni/jni_engine.rs#L313-L358),
+[финальный статус:267–293](../../../packages/android-ffi/src/engine/engine.rs#L267-L293),
+[очистка tunnel:660–668](../../../packages/android-ffi/src/engine/engine.rs#L660-L668).
 
 `nativeStop` забирает handle через `guard.take()` и освобождает ENGINE lock
 до отправки stop и ожидания потока. `nativeStart` проверяет наличие handle,
@@ -167,8 +167,8 @@ start; новый запуск отклоняется до join. После time
 
 ## TS3-06 — P2: неудачная circuit verification не продвигает Android-очередь
 
-**Место:** [выбор batch:533–541](../../../packages/android-ffi/src/engine_bootstrap.rs#L533-L541),
-[сохранение результатов:418–424](../../../packages/android-ffi/src/engine_bridges.rs#L418-L424),
+**Место:** [выбор batch:533–541](../../../packages/android-ffi/src/engine/engine_bootstrap.rs#L533-L541),
+[сохранение результатов:418–424](../../../packages/android-ffi/src/engine/engine_bridges.rs#L418-L424),
 [ключ очереди:393–398](../../../packages/bridge-store/src/stats.rs#L393-L398).
 
 Рейтинг due использует `last_verification_attempt`, а при его отсутствии —
@@ -193,7 +193,7 @@ CLI уже записывает факт каждой попытки. Перен
 
 **Место:** [разбор заголовков:111–135](../../../packages/bridge-fetcher/src/http.rs#L111-L135),
 [чтение тела:333–377](../../../packages/bridge-fetcher/src/http.rs#L333-L377),
-[парсер мостов](../../../packages/bridge-fetcher/src/parse.rs).
+[парсер мостов](../../../packages/bridge-fetcher/src/parse/parse.rs).
 
 `Transfer-Encoding` не разбирается. Ответ `200` с `Transfer-Encoding: chunked`
 и без `Content-Length` читается до EOF, после чего размеры chunks, CRLF и
@@ -239,8 +239,8 @@ transport и параметра, отдельно разрезаны чтени�
 
 ## TS3-09 — P3: offload публикации оставляет глубокий clone на async worker
 
-**Место:** [обычная публикация:458–466](../../../apps/socks5-proxy/src/bridge_store_writer.rs#L458-L466),
-[финальная публикация:253–257](../../../apps/socks5-proxy/src/bridge_store_writer.rs#L253-L257),
+**Место:** [обычная публикация:458–466](../../../apps/socks5-proxy/src/bridges/bridge_store_writer.rs#L458-L466),
+[финальная публикация:253–257](../../../apps/socks5-proxy/src/bridges/bridge_store_writer.rs#L253-L257),
 [структуры хранилища](../../../packages/bridge-store/src/lib.rs).
 
 `store.clone()` выполняется до `spawn_blocking`. BridgeStore содержит
@@ -267,7 +267,7 @@ O(Q·S); объединение мутаций уменьшает Q, но не �
 **Место:** [due:218–229](../../../packages/bridge-store/src/stats.rs#L218-L229),
 [healthy и ranking:275–324](../../../packages/bridge-store/src/stats.rs#L275-L324),
 [take_best:407–435](../../../packages/bridge-store/src/stats.rs#L407-L435),
-[verifier caller:134–144](../../../apps/socks5-proxy/src/bridge_verifier.rs#L134-L144).
+[verifier caller:134–144](../../../apps/socks5-proxy/src/bridges/bridge_verifier.rs#L134-L144).
 
 Bounded heap ограничивает число выбранных элементов, но получает уже
 собранный `Vec` всех N кандидатов. Пути ranking также собирают owning

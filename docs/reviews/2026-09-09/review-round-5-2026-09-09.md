@@ -57,9 +57,9 @@ scratch для строки. Сохранить непрочитанный хв�
 
 ## TS5-02 — P2: отмена DNS lookup не снимает ожидающие работы
 
-**Место:** [создание detached tasks](../../../packages/bridge-probe/src/probe.rs#L616-L650),
-[ожидание permit и timeout](../../../packages/bridge-probe/src/probe.rs#L563-L599),
-[внешний DNS deadline](../../../packages/bridge-probe/src/probe.rs#L309-L322).
+**Место:** [создание detached tasks](../../../packages/bridge-probe/src/probe/batch.rs),
+[ожидание permit и timeout](../../../packages/bridge-probe/src/probe/batch.rs),
+[внешний DNS deadline](../../../packages/bridge-probe/src/probe/mod.rs#L309-L322).
 
 `race_first_answer` теперь своевременно возвращает первый ответ: задержка
 TS4-04 устранена. Однако handles всех spawned attempts теряются. При
@@ -89,9 +89,9 @@ TS4-04 устранена. Однако handles всех spawned attempts тер
 
 ## TS5-03 — P2: наличие IPv6-кандидата ещё не гарантирует его проверку
 
-**Место:** [WebTunnel attempt loop](../../../packages/bridge-probe/src/probe.rs#L379-L406),
-[TCP и TLS handshake](../../../packages/bridge-probe/src/probe.rs#L428-L443),
-[обычный TCP probe](../../../packages/bridge-probe/src/probe.rs#L752-L765).
+**Место:** [WebTunnel attempt loop](../../../packages/bridge-probe/src/probe/mod.rs#L379-L406),
+[TCP и TLS handshake](../../../packages/bridge-probe/src/probe/mod.rs#L428-L443),
+[обычный TCP probe](../../../packages/bridge-probe/src/probe/batch.rs).
 
 Для WebTunnel один `timeout(budget, attempt)` охватывает весь цикл адресов.
 Внутренние TCP, TLS и чтение Upgrade-ответа отдельного лимита попытки не
@@ -139,13 +139,13 @@ window** может оставаться резидентной и попаст�
 
 **Критерий проверки:** resident live entry за пределами stale window не
 попадает в save/load; пригодный disk entry того же host сохраняется.
-Нынешний [тест истечения disk entry](../../../packages/bridge-probe/src/tests/dns_tests.rs#L365-L396)
+Нынешний [тест истечения disk entry](../../../packages/bridge-probe/src/probe/dns_resolution.rs)
 этот случай не покрывает.
 
 ## TS5-05 — P2: HTTPS URL с IP не работает при отключённом DNS
 
-**Место:** [connect_direct](../../../packages/bridge-fetcher/src/direct.rs#L63-L86),
-[resolve_addrs](../../../packages/bridge-probe/src/probe.rs#L678-L747),
+**Место:** [connect_direct](../../../packages/bridge-fetcher/src/fetch/direct.rs#L63-L86),
+[resolve_addrs](../../../packages/bridge-probe/src/probe/dns_resolution.rs),
 [настройки resolver](../../../packages/proxy-config/src/lib.rs#L51-L78).
 
 `connect_direct` всегда вызывает `resolve_addrs`, даже если `host` уже
@@ -169,9 +169,9 @@ IPv6 host и port через двоеточие.
 
 ## TS5-06 — P2: восстановление после panic теряет ранее принятые изменения
 
-**Место:** [передача store и обработка panic](../../../apps/socks5-proxy/src/bridge_store_writer.rs#L350-L406),
-[shutdown при отсутствии store](../../../apps/socks5-proxy/src/bridge_store_writer.rs#L265-L297),
-[нынешняя регрессия panic](../../../apps/socks5-proxy/src/bridge_store_writer_tests.rs#L859-L905).
+**Место:** [передача store и обработка panic](../../../apps/socks5-proxy/src/bridges/bridge_store_writer.rs#L350-L406),
+[shutdown при отсутствии store](../../../apps/socks5-proxy/src/bridges/bridge_store_writer.rs#L265-L297),
+[нынешняя регрессия panic](../../../apps/socks5-proxy/src/bridges/bridge_store_writer.rs).
 
 TS4-09 перенёс COW и мутацию на blocking thread. Теперь `store.take()`
 перемещает единственное актуальное состояние в closure. Если следующая
@@ -185,7 +185,7 @@ TS4-09 перенёс COW и мутацию на blocking thread. Теперь `
 может сообщить успешное завершение при оставшемся `retry.dirty`.
 
 Кроме того, при `store=None` retry не может запустить публикацию. После
-истечения сохранённого `retry_at` [timer](../../../apps/socks5-proxy/src/bridge_store_writer.rs#L437-L448)
+истечения сохранённого `retry_at` [timer](../../../apps/socks5-proxy/src/bridges/bridge_store_writer.rs#L437-L448)
 повторно становится немедленно готовым, а срок новой попытки не меняется.
 Это ещё одно следствие несогласованного recovery state.
 Текущий тест паникует на первой мутации, когда терять предыдущую A нечего.
@@ -202,7 +202,7 @@ close возвращает ошибку, а actor не крутится на п�
 ## TS5-07 — P3: DNS persistence занимает общие mutex форматированием
 
 **Место:** [сериализация и запись](../../../packages/bridge-probe/src/dns.rs#L439-L471),
-[вызов из async watchdog](../../../packages/android-ffi/src/engine_bootstrap.rs#L423-L440).
+[вызов из async watchdog](../../../packages/android-ffi/src/engine/engine_bootstrap.rs#L423-L440).
 
 Под mutex live cache клонируются IP-массивы, создаются строки IP и строки
 записей. Затем, всё ещё удерживая первый mutex, функция берёт mutex disk
@@ -226,7 +226,7 @@ thread. Замедление на конкретном устройстве в �
 ## TS5-08 — P3: channel-proven top-k полностью сортирует кандидатов
 
 **Место:** [channel_proven_bridges](../../../packages/bridge-store/src/stats.rs#L19-L34),
-[Android export](../../../packages/android-ffi/src/jni_engine.rs#L785-L795),
+[Android export](../../../packages/android-ffi/src/jni/jni_engine.rs#L785-L795),
 [существующий bounded selector](../../../packages/bridge-store/src/stats.rs#L416-L433).
 
 Метод собирает все N подходящих `&Entry`, стабильно сортирует их и только

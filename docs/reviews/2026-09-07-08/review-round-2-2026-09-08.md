@@ -29,8 +29,8 @@ P0 в проверенных участках не найдено; это не �
 
 ## TS2-01 — P1: writer сохраняет устаревший снимок после изменений CLI
 
-**Место:** [bridge_store_writer.rs:165–184](../../../apps/socks5-proxy/src/bridge_store_writer.rs#L165-L184),
-[сброс состояния retry:82–95](../../../apps/socks5-proxy/src/bridge_store_writer.rs#L82-L95).
+**Место:** [bridge_store_writer.rs:165–184](../../../apps/socks5-proxy/src/bridges/bridge_store_writer.rs#L165-L184),
+[сброс состояния retry:82–95](../../../apps/socks5-proxy/src/bridges/bridge_store_writer.rs#L82-L95).
 
 После первой успешной загрузки `store` остаётся `Some` навсегда. Успешный
 publish сбрасывает `dirty`, но не инвалидирует снимок; следующая мутация
@@ -54,7 +54,7 @@ CLI завершил запись S2 с новым мостом или мета�
 
 ## TS2-02 — P2: полная синхронная запись на каждую мутацию
 
-**Место:** [actor:141–189](../../../apps/socks5-proxy/src/bridge_store_writer.rs#L141-L189),
+**Место:** [actor:141–189](../../../apps/socks5-proxy/src/bridges/bridge_store_writer.rs#L141-L189),
 [save:242–323](../../../packages/bridge-store/src/persistence.rs#L242-L323).
 
 Actor работает через `tokio::spawn`, но вызывает синхронные `load` и `save`.
@@ -82,9 +82,9 @@ Actor работает через `tokio::spawn`, но вызывает синх
 
 ## TS2-03 — P2: финальная публикация недостижима при shutdown
 
-**Место:** [ветка закрытия очереди:152–164](../../../apps/socks5-proxy/src/bridge_store_writer.rs#L152-L164),
-[глобальный владелец:209–226](../../../apps/socks5-proxy/src/bridge_store_writer.rs#L209-L226),
-[завершение сервера:229–255](../../../apps/socks5-proxy/src/server.rs#L229-L255).
+**Место:** [ветка закрытия очереди:152–164](../../../apps/socks5-proxy/src/bridges/bridge_store_writer.rs#L152-L164),
+[глобальный владелец:209–226](../../../apps/socks5-proxy/src/bridges/bridge_store_writer.rs#L209-L226),
+[завершение сервера:229–255](../../../apps/socks5-proxy/src/server/server.rs#L229-L255).
 
 Финальная попытка сохранить грязный снимок выполняется только при
 `rx.recv() == None`. Однако `OnceLock<StoreWriter>` постоянно удерживает
@@ -110,7 +110,7 @@ sender. Статическая переменная не уничтожаетс�
 
 **Место:** [alive_count:116–124](../../../packages/bridge-store/src/stats.rs#L116-L124),
 [note_source_at:165–181](../../../packages/bridge-store/src/observe.rs#L165-L181),
-[условие watchdog:534–539](../../../apps/socks5-proxy/src/tor_watchdog_runtime.rs#L534-L539).
+[условие watchdog:534–539](../../../apps/socks5-proxy/src/tor/tor_watchdog/tor_watchdog_runtime.rs#L534-L539).
 
 `alive_count` проверяет только `fails == 0`. Новая запись, созданная при
 атрибуции источника, сразу имеет `fails=0`, `ok_count=0`, `last_ok=None`.
@@ -133,7 +133,7 @@ Watchdog интерпретирует ненулевой результат ка
 
 ## TS2-05 — P3: повторные поиски и аллокации ключа здоровья
 
-**Место:** [candidates_with_health:139–159](../../../apps/socks5-proxy/src/bridge_warmer.rs#L139-L159),
+**Место:** [candidates_with_health:139–159](../../../apps/socks5-proxy/src/bridges/bridge_warmer.rs#L139-L159),
 [key_of:160–162](../../../packages/bridge-store/src/lib.rs#L160-L162),
 [healthiest_among:271–280](../../../packages/bridge-store/src/stats.rs#L271-L280).
 
@@ -157,7 +157,7 @@ lookup или иной внутренний индекс с сохранение
 
 **Место:** [rank_and_take:284–301](../../../packages/bridge-store/src/stats.rs#L284-L301),
 [очередь verification:198–217](../../../packages/bridge-store/src/stats.rs#L198-L217),
-[select_top_n:87–102](../../../apps/socks5-proxy/src/bridge_warmer.rs#L87-L102).
+[select_top_n:87–102](../../../apps/socks5-proxy/src/bridges/bridge_warmer.rs#L87-L102).
 
 Все подходящие записи собираются в `Vec` и полностью сортируются, после
 чего возвращаются первые k. Для большого пула и небольшого лимита остаются
@@ -176,9 +176,9 @@ k=0, k=1 и k≥N. Измеренного выигрыша этот отчёт �
 
 ## TS2-07 — P3: лишние копии и полный проход очереди кандидатов
 
-**Место:** [take_transport:134–151](../../../apps/socks5-proxy/src/candidate_pool.rs#L134-L151),
-[prioritize:154–161](../../../apps/socks5-proxy/src/candidate_pool.rs#L154-L161),
-[потребитель batch:318–325](../../../apps/socks5-proxy/src/fetch_merge.rs#L318-L325).
+**Место:** [take_transport:134–151](../../../apps/socks5-proxy/src/bridges/candidate_pool.rs#L134-L151),
+[prioritize:154–161](../../../apps/socks5-proxy/src/bridges/candidate_pool.rs#L154-L161),
+[потребитель batch:318–325](../../../apps/socks5-proxy/src/fetch/fetch_merge/fetch_merge.rs#L318-L325).
 
 `retain` проходит весь пул даже после набора требуемого batch. Каждый
 выбранный `BridgeLine` сначала глубоко клонируется в результат, а исходный
@@ -204,8 +204,8 @@ drain стоимость проходов — `O(Σ N_i)`; это один пр�
 ## TS2-08 — P3: лимит размера файлов пока имеет бессрочные исключения
 
 **Место:** [check-line-limit.sh](../../../scripts/check-line-limit.sh),
-[server.rs](../../../apps/socks5-proxy/src/server.rs),
-[arti_observability.rs](../../../apps/socks5-proxy/src/arti_observability.rs).
+[server.rs](../../../apps/socks5-proxy/src/server/server.rs),
+[arti_observability.rs](../../../apps/socks5-proxy/src/tor/arti_observability.rs).
 
 На проверенном commit `server.rs` содержит **1251**, а
 `arti_observability.rs` — **1028** физических строк. Оба файла включены

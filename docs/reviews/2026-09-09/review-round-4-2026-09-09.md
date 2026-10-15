@@ -31,9 +31,9 @@ P2 — функциональный дефект, потеря состояни�
 
 ## TS4-01 — P2: таймаут входящего handshake не покрывает upstream setup
 
-**Место:** [Upstream::connect:64–70](../../../apps/socks5-proxy/src/upstream.rs#L64-L70),
-[ожидание метода:82–89](../../../apps/socks5-proxy/src/upstream.rs#L82-L89),
-[handle_client](../../../apps/socks5-proxy/src/server.rs#L600).
+**Место:** [Upstream::connect:64–70](../../../apps/socks5-proxy/src/server/upstream.rs#L64-L70),
+[ожидание метода:82–89](../../../apps/socks5-proxy/src/server/upstream.rs#L82-L89),
+[handle_client](../../../apps/socks5-proxy/src/server/server.rs#L600).
 
 30-секундный `HANDSHAKE_DEADLINE` ограничивает обмен с входящим клиентом.
 После его завершения upstream-ветка вызывает `up.connect().await` без
@@ -58,7 +58,7 @@ upstream socket и возвращать ошибку клиенту; устан�
 
 ## TS4-02 — P2: принимается NO_AUTH, которого не было в greeting
 
-**Место:** [negotiate_method:74–98](../../../apps/socks5-proxy/src/upstream.rs#L74-L98).
+**Место:** [negotiate_method:74–98](../../../apps/socks5-proxy/src/server/upstream.rs#L74-L98).
 
 При заданных credentials greeting содержит ровно один метод: `05 01 02`.
 Однако ответ upstream `05 00` попадает в безусловное `M_NO_AUTH => Ok(())`.
@@ -80,9 +80,9 @@ Authentication, включённая конфигурацией, фактиче�
 
 ## TS4-03 — P2: probe не воспроизводит настройки WebTunnel
 
-**Место:** [выбор target:101–125](../../../packages/bridge-probe/src/probe.rs#L101-L125),
-[вызов probe:188–202](../../../packages/bridge-probe/src/probe.rs#L188-L202),
-[TLS и Host:287–325](../../../packages/bridge-probe/src/probe.rs#L287-L325).
+**Место:** [выбор target:101–125](../../../packages/bridge-probe/src/probe/mod.rs#L101-L125),
+[вызов probe:188–202](../../../packages/bridge-probe/src/probe/mod.rs#L188-L202),
+[TLS и Host:287–325](../../../packages/bridge-probe/src/probe/mod.rs#L287-L325).
 
 Для проверки передаются только адреса, host и URL. Параметр `servername`
 теряется: SNI и HTTP Host всегда берутся из URL. Кроме того, probe всегда
@@ -107,8 +107,8 @@ WebTunnel handshake: отдельно HTTP endpoint, отличный `servernam
 
 ## TS4-04 — P2: первый ответ DoH ждёт всю волну запросов
 
-**Место:** [race_doh_wave:401–452](../../../packages/bridge-probe/src/probe.rs#L401-L452),
-[внешний DNS timeout:175–183](../../../packages/bridge-probe/src/probe.rs#L175-L183).
+**Место:** [race_doh_wave:401–452](../../../packages/bridge-probe/src/probe/mod.rs#L401-L452),
+[внешний DNS timeout:175–183](../../../packages/bridge-probe/src/probe/mod.rs#L175-L183).
 
 Первый пригодный ответ сохраняется в `answer`, но функция продолжает
 `attempts.next().await` до завершения всех запросов. `answer.is_some()`
@@ -135,8 +135,8 @@ WebTunnel handshake: отдельно HTTP endpoint, отличный `servernam
 
 **Место:** [load/save:379–415](../../../packages/bridge-probe/src/dns.rs#L379-L415),
 [disk fallback:422–431](../../../packages/bridge-probe/src/dns.rs#L422-L431),
-[его использование](../../../packages/bridge-probe/src/probe.rs#L496),
-[периодическая запись Android](../../../packages/android-ffi/src/engine_bootstrap.rs#L427).
+[его использование](../../../packages/bridge-probe/src/probe/mod.rs#L496),
+[периодическая запись Android](../../../packages/android-ffi/src/engine/engine_bootstrap.rs#L427).
 
 Загрузка файла помещает ответы в `disk_fallback_store`. `save_persisted_dns_cache`
 сериализует только положительные записи другой структуры, `doh_cache`.
@@ -187,7 +187,7 @@ Timestamp принимается как произвольный `u64`. В merge
 
 ## TS4-07 — P2: адрес TLS и HTTP authority используют одно представление
 
-**Место:** [UrlTarget:20–38](../../../packages/bridge-fetcher/src/url_parse.rs#L20-L38),
+**Место:** [UrlTarget:20–38](../../../packages/bridge-fetcher/src/parse/url_parse.rs#L20-L38),
 [TLS и построение запроса:296–312](../../../packages/bridge-fetcher/src/http.rs#L296-L312),
 [Host:77–88](../../../packages/bridge-fetcher/src/http.rs#L77-L88).
 
@@ -213,7 +213,7 @@ IP-значением для TLS ServerName. Даже если connector сум�
 
 ## TS4-08 — P2: три IPv4-ответа вытесняют все IPv6-кандидаты
 
-**Место:** [MAX_PROBE_ADDRS и order_candidates:375–395](../../../packages/bridge-probe/src/probe.rs#L375-L395).
+**Место:** [MAX_PROBE_ADDRS и order_candidates:375–395](../../../packages/bridge-probe/src/probe/mod.rs#L375-L395).
 
 Адреса сначала сортируются так, чтобы все IPv4 шли первыми, затем берутся
 первые три. При ответе `A1, A2, A3, AAAA1` ни один IPv6 не попадёт
@@ -236,9 +236,9 @@ IPv4-адресов достаточно для заполнения лимит�
 
 ## TS4-09 — P3: глубокая COW-копия всё ещё выполняется на async worker
 
-**Место:** [actor:216–219](../../../apps/socks5-proxy/src/bridge_store_writer.rs#L216-L219),
-[мутация:342–348](../../../apps/socks5-proxy/src/bridge_store_writer.rs#L342-L348),
-[publisher](../../../apps/socks5-proxy/src/bridge_store_writer.rs#L465),
+**Место:** [actor:216–219](../../../apps/socks5-proxy/src/bridges/bridge_store_writer.rs#L216-L219),
+[мутация:342–348](../../../apps/socks5-proxy/src/bridges/bridge_store_writer.rs#L342-L348),
+[publisher](../../../apps/socks5-proxy/src/bridges/bridge_store_writer.rs#L465),
 [BridgeStore](../../../packages/bridge-store/src/lib.rs#L194).
 
 В TS3-09 исправлена стоимость получения publish snapshot: clone Arc дешёв.
