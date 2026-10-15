@@ -209,8 +209,7 @@ pub(crate) async fn log_status_events(
         };
         let state = status.state();
         // A freshly launched service reports Shutdown before Bootstrapping.
-        let initial_shutdown =
-            last.is_none() && state == tor_hsservice::status::State::Shutdown;
+        let initial_shutdown = last.is_none() && state == tor_hsservice::status::State::Shutdown;
         if last == Some(state) || initial_shutdown {
             last = Some(state);
             continue;
