@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- New documentation: `docs/guide/ops/onion-service.md` (publishing a local site through Tor: quick start, key management, vanity mining, security, diagnostics) is bundled as the `tor-socks5 help onion-service` topic; `docs/guide/logging.md` moved to `docs/guide/ops/logging.md`.
 - Build now supports the server side of onion services behind the `onion-service` cargo feature (on by default in the CLI, off for Android; no user-facing functionality yet).
 - New `tor-socks5 onion` subcommands (`new`, `list`, `show`, `export`, `import`, `remove`) manage onion-service identity keys in the Arti keystore; `new`/`import`/`remove` refuse to destroy an existing address without an explicit confirmation flag.
 - Onion service launching from config: a new top-level `onion_services` section (see the canonical reference in `README.md`) starts one onion service per entry and forwards its ports to local `host:port` targets (`ports: [ 80=127.0.0.1:8080 ]`). The keystore is locked against CLI mutations while the server runs.
