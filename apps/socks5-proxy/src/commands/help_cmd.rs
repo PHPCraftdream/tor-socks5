@@ -40,7 +40,12 @@ const TOPICS: &[(&str, &str, &str)] = &[
     (
         "logging",
         "Log sinks, levels, non-blocking writer",
-        include_str!("../../../../docs/guide/logging.md"),
+        include_str!("../../../../docs/guide/ops/logging.md"),
+    ),
+    (
+        "onion-service",
+        "Onion services: publish a local site through Tor",
+        include_str!("../../../../docs/guide/ops/onion-service.md"),
     ),
     (
         "service",
@@ -114,6 +119,20 @@ mod tests {
             assert!(!name.is_empty());
             assert!(!summary.is_empty());
             assert!(!body.trim().is_empty(), "topic {name} has empty docs");
+        }
+    }
+
+    #[test]
+    fn onion_service_topic_exists_and_covers_the_basics() {
+        let (_, _, body) = TOPICS
+            .iter()
+            .find(|(n, _, _)| *n == "onion-service")
+            .expect("onion-service topic present");
+        for needle in ["keystore", "vanity"] {
+            assert!(
+                body.to_lowercase().contains(needle),
+                "onion-service doc should mention {needle:?}"
+            );
         }
     }
 

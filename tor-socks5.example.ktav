@@ -109,7 +109,7 @@ warm_pool.refresh_interval_secs: 60
 ## Onion services published by this proxy (default empty). Each entry
 ## launches one onion service at startup: `nickname` names it (only
 ## A-Z a-z 0-9 _ -, max 25 chars) and every `ports` entry maps an onion
-## port to a local target as `onion_port=host:port` (an IPv6 target
+## port to a local target as `onion_port=host:port` (an IPv6 target must
 ## be bracketed; because Ktav reads `[` as an inline compound, an IPv6 target
 ## needs the block-list form with the `::` literal marker:
 ## ports: [

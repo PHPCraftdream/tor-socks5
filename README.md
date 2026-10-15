@@ -271,7 +271,7 @@ dns_server.overrides: [
 ## Onion services published by this proxy (default empty). Each entry
 ## launches one onion service at startup: `nickname` names it (only
 ## A-Z a-z 0-9 _ -, max 25 chars) and every `ports` entry maps an onion
-## port to a local target as `onion_port=host:port` (an IPv6 target
+## port to a local target as `onion_port=host:port` (an IPv6 target must
 ## be bracketed; because Ktav reads `[` as an inline compound, an IPv6
 ## target needs the block-list form with the `::` literal marker:
 ## ports: [
@@ -318,6 +318,22 @@ onion_services: [
 ]
 ``` The services' v3 keys
 are kept in the keystore, which is locked against CLI mutations while the server runs.
+
+Keys are managed from the CLI (stop the server first — it holds the keystore lock while
+services run):
+
+```bash
+tor-socks5 onion new <NICK> [--vanity PREFIX] [--threads N] [--timeout DURATION]
+tor-socks5 onion list
+tor-socks5 onion show <NICK>
+tor-socks5 onion export <NICK> --out <FILE>
+tor-socks5 onion import <NICK> <FILE>
+tor-socks5 onion remove <NICK> --yes
+```
+
+`--vanity` mines an address starting with the given base32 prefix (a-z, 2-7, up to 8 chars);
+the full guide — quick start, vanity tables, security and diagnostics — is in
+[docs/guide/ops/onion-service.md](docs/guide/ops/onion-service.md).
 
 ```ktav
 onion_services: [
@@ -418,7 +434,8 @@ to print them all. See [`docs/`](docs/) for the source:
 - [upstream SOCKS5](docs/guide/upstream.md) — chaining through another proxy
 - [local DNS server](docs/guide/dns-server.md) — DNS-over-Tor resolver for client queries
 - [service](docs/guide/service.md) — install/start/stop/status on each OS
-- [logging](docs/guide/logging.md) — sinks, levels, non-blocking writer
+- [onion services](docs/guide/ops/onion-service.md) — publish a local site through Tor
+- [logging](docs/guide/ops/logging.md) — sinks, levels, non-blocking writer
 - [architecture](docs/architecture.md) — workspace layout and data flow
 
 ## Authentication (optional)
