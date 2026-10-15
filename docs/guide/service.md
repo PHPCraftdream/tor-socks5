@@ -55,7 +55,7 @@ log.output: file
 log.file: /var/log/tor-socks5.log
 ```
 
-See [logging](logging.md).
+See [logging](ops/logging.md).
 
 ## Daemon mode (Unix only)
 
