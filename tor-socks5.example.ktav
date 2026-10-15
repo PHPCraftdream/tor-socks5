@@ -118,7 +118,9 @@ warm_pool.refresh_interval_secs: 60
 ## ]). At least one port per entry; the
 ## same onion port may not repeat within one entry and nicknames must
 ## be unique. The services' v3 keys live in the keystore, which is
-## locked against CLI mutations while the server runs.
+## locked against CLI mutations while the server runs. `circuit_hops`
+## (2..=4, default 4) sets the length of the server-side onion
+## circuits; all enabled services must use the same value.
 onion_services: []
 ## Example (uncomment and edit to publish a service):
 ## onion_services: [
@@ -126,5 +128,6 @@ onion_services: []
 ##         nickname: web
 ##         enabled: true
 ##         ports: [ 80=127.0.0.1:8080 ]
+##         circuit_hops: 4
 ##     }
 ## ]

@@ -13,6 +13,9 @@ use std::collections::HashSet;
 /// Maximum nickname length in bytes (same cap as `tor_hsservice::HsNickname`).
 const MAX_NICKNAME_LEN: usize = 25;
 
+/// Default server-side onion circuit length.
+const DEFAULT_CIRCUIT_HOPS: u8 = 4;
+
 /// One onion service published by this proxy (see [`crate::Config::onion_services`]).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct OnionServiceEntry {
@@ -21,8 +24,19 @@ pub struct OnionServiceEntry {
     pub nickname: String,
     /// Whether the service is launched at startup. Default `true`.
     pub enabled: bool,
+    /// Server-side onion circuit length in hops (relays from the service
+    /// to the introduction point, including the bridge). One length per
+    /// process: all enabled services must agree. Default `4`, only
+    /// `2 | 3 | 4` are permitted. Omitted when `4` on serialization.
+    #[serde(skip_serializing_if = "circuit_hops_is_default")]
+    pub circuit_hops: u8,
     /// Port mappings, at least one: `onion_port=host:port`.
     pub ports: Vec<OnionServicePort>,
+}
+
+/// Serde skip predicate: the default hop count is not written back.
+fn circuit_hops_is_default(circuit_hops: &u8) -> bool {
+    *circuit_hops == DEFAULT_CIRCUIT_HOPS
 }
 
 /// One `onion_port=host:port` mapping of an [`OnionServiceEntry`].
@@ -53,6 +67,26 @@ impl<'de> Deserialize<'de> for OnionServicePort {
 /// Serde default for `enabled` (`#[serde(default = "true_fn")]`).
 fn true_fn() -> bool {
     true
+}
+
+/// Serde default for `circuit_hops`.
+fn default_circuit_hops() -> u8 {
+    DEFAULT_CIRCUIT_HOPS
+}
+
+/// Parse `circuit_hops` following the `tor.circuit_hops` deserializer in
+/// `layout/tor.rs`: an integer with a type-agnostic message; the 2..=4
+/// range check happens in [`validate_entries`] so the error can carry
+/// the entry path.
+fn parse_circuit_hops<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    u8::deserialize(deserializer).map_err(|_| {
+        serde::de::Error::custom(
+            "onion_services[i].circuit_hops must be an integer; permitted values are 2, 3, or 4",
+        )
+    })
 }
 
 /// Lightweight nickname check (tor-hsservice re-validates at launch):
@@ -142,6 +176,11 @@ struct OnionServiceEntryRaw {
     nickname: String,
     #[serde(default = "true_fn")]
     enabled: bool,
+    #[serde(
+        default = "default_circuit_hops",
+        deserialize_with = "parse_circuit_hops"
+    )]
+    circuit_hops: u8,
     ports: Vec<String>,
 }
 
@@ -166,6 +205,12 @@ fn validate_entries<E: serde::de::Error>(
                 entry.nickname
             )));
         }
+        if !matches!(entry.circuit_hops, 2..=4) {
+            return Err(E::custom(format!(
+                "{path}.circuit_hops: circuit_hops must be 2, 3, or 4 (got {})",
+                entry.circuit_hops
+            )));
+        }
         if entry.ports.is_empty() {
             return Err(E::custom(format!(
                 "{path}.ports: at least one port mapping is required"
@@ -187,8 +232,30 @@ fn validate_entries<E: serde::de::Error>(
         entries.push(OnionServiceEntry {
             nickname: entry.nickname,
             enabled: entry.enabled,
+            circuit_hops: entry.circuit_hops,
             ports,
         });
+    }
+    // One server circuit length per process (an Arti limitation): all
+    // enabled services must use the same hop count.
+    let mut reference: Option<(usize, u8)> = None;
+    for (idx, entry) in entries.iter().enumerate() {
+        if !entry.enabled {
+            continue;
+        }
+        match reference {
+            None => reference = Some((idx, entry.circuit_hops)),
+            Some((ref_idx, hops)) if hops != entry.circuit_hops => {
+                return Err(E::custom(format!(
+                    "onion_services: all enabled services must use the same circuit_hops \
+                     (one circuit length per process): \
+                     onion_services[{ref_idx}].circuit_hops: {hops} != \
+                     onion_services[{idx}].circuit_hops: {}",
+                    entry.circuit_hops
+                )));
+            }
+            _ => {}
+        }
     }
     Ok(entries)
 }

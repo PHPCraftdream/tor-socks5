@@ -309,6 +309,7 @@ mod tests {
         let entry = OnionServiceEntry {
             nickname: "not a nickname".to_owned(),
             enabled: true,
+            circuit_hops: 4,
             ports: Vec::new(),
         };
         // The manager returns without launching when the nickname is invalid;

@@ -186,18 +186,27 @@ impl AnonymousPathBuilder for HsPathBuilder {
             Some(HsCircKind::ClientHsDir | HsCircKind::ClientIntro | HsCircKind::ClientRend) => {
                 config.circuit_hops()
             }
+            // tor-socks5 local patch: service stem is one hop shorter than
+            // the total service circuit (the target relay is appended).
+            Some(HsCircKind::SvcHsDir | HsCircKind::SvcIntro | HsCircKind::SvcRend) => {
+                config.service_circuit_hops() - 1
+            }
             _ => 3,
         }
     }
 
-    // tor-socks5 local patch: apply target family/subnet exclusion only to configured short clients.
+    // tor-socks5 local patch: apply target family/subnet exclusion only to short stems.
     fn short_hs_target_exclusions(&self, config: &PathConfig) -> bool {
-        self.circ_kind.is_some_and(|kind| {
-            matches!(
-                kind,
-                HsCircKind::ClientHsDir | HsCircKind::ClientIntro | HsCircKind::ClientRend
-            )
-        }) && config.circuit_hops() == 2
+        match self.circ_kind {
+            Some(HsCircKind::ClientHsDir | HsCircKind::ClientIntro | HsCircKind::ClientRend) => {
+                config.circuit_hops() == 2
+            }
+            // tor-socks5 local patch: short service stems (length 2 or 1).
+            Some(HsCircKind::SvcHsDir | HsCircKind::SvcIntro | HsCircKind::SvcRend) => {
+                config.service_circuit_hops() <= 3
+            }
+            _ => false,
+        }
     }
 
     fn compatible_with(&self) -> Option<&OwnedChanTarget> {
@@ -310,6 +319,7 @@ impl VanguardHsPathBuilder {
             mode,
             self.circ_kind.unwrap_or(HsCircKind::SvcIntro),
             self.config.circuit_hops(),
+            self.config.service_circuit_hops(),
         )?;
         if actual_len != expected_len {
             return Err(internal!(
@@ -501,6 +511,97 @@ mod test {
         }
     }
 
+    // tor-socks5 local patch: Disabled Svc stems follow service_circuit_hops.
+    #[test]
+    fn service_circuit_hops_sets_disabled_svc_stem_lengths() {
+        let netdir = construct_test_network(20, |pos, nb| {
+            nb.md.family(hex::encode([pos as u8; 20]).parse().unwrap());
+        });
+        for (setting, expected) in [(4, 3), (3, 2), (2, 1)] {
+            for kind in [
+                HsCircKind::SvcHsDir,
+                HsCircKind::SvcIntro,
+                HsCircKind::SvcRend,
+            ] {
+                let config = PathConfig::builder()
+                    .service_circuit_hops(setting)
+                    .build()
+                    .unwrap();
+                let path = pick_hs_path_no_vanguards_with_config(&netdir, None, Some(kind), config)
+                    .unwrap();
+                assert_eq!(path.len(), expected, "{kind:?} setting {setting}");
+            }
+        }
+    }
+
+    // tor-socks5 local patch: client stems ignore service_circuit_hops and vice versa.
+    #[test]
+    fn service_and_client_lengths_are_independent() {
+        let netdir = construct_test_network(20, |pos, nb| {
+            nb.md.family(hex::encode([pos as u8; 20]).parse().unwrap());
+        });
+        // Client stems stay 2-hop regardless of the service setting.
+        for setting in [2, 3, 4] {
+            let config = PathConfig::builder()
+                .circuit_hops(2)
+                .service_circuit_hops(setting)
+                .build()
+                .unwrap();
+            let path = pick_hs_path_no_vanguards_with_config(
+                &netdir,
+                None,
+                Some(HsCircKind::ClientIntro),
+                config,
+            )
+            .unwrap();
+            assert_eq!(path.len(), 2, "client setting {setting}");
+        }
+        // Service stems ignore the client setting.
+        for setting in [2, 3] {
+            let config = PathConfig::builder()
+                .circuit_hops(setting)
+                .service_circuit_hops(4)
+                .build()
+                .unwrap();
+            let path = pick_hs_path_no_vanguards_with_config(
+                &netdir,
+                None,
+                Some(HsCircKind::SvcIntro),
+                config,
+            )
+            .unwrap();
+            assert_eq!(path.len(), 3, "client circuit_hops {setting}");
+        }
+    }
+
+    // tor-socks5 local patch: short service stems exclude the target family too.
+    #[test]
+    fn short_service_target_family_excluded() {
+        let netdir = construct_test_network(20, |pos, nb| {
+            nb.md.family(hex::encode([pos as u8; 20]).parse().unwrap());
+        });
+        let target_owned = test_target();
+        for setting in [2, 3] {
+            let config = PathConfig::builder()
+                .service_circuit_hops(setting)
+                .build()
+                .unwrap();
+            let path = pick_hs_path_no_vanguards_with_config(
+                &netdir,
+                Some(&target_owned),
+                Some(HsCircKind::SvcIntro),
+                config,
+            )
+            .unwrap();
+            assert!(
+                path_hops(&path)
+                    .iter()
+                    .all(|hop| !hop.has_any_relay_id_from(&target_owned)),
+                "setting {setting}"
+            );
+        }
+    }
+
     #[test]
     fn two_hop_client_target_family_excluded() {
         // tor-socks5 local patch: short client stems exclude target family/subnet as well as identity.
@@ -569,6 +670,53 @@ mod test {
                 .await
                 .unwrap();
                 assert_eq!(path.len(), if mode == VanguardMode::Lite { 3 } else { 4 });
+            }
+        });
+    }
+
+    // tor-socks5 local patch: service_circuit_hops must not change vanguard lengths.
+    #[cfg(all(feature = "vanguards", feature = "hs-common"))]
+    #[test]
+    fn service_stem_config_does_not_change_vanguard_lengths() {
+        let runtime = MockRuntime::new();
+        let netdir = construct_test_network(20, |pos, nb| {
+            nb.md.family(hex::encode([pos as u8; 20]).parse().unwrap());
+        });
+        let rt2 = runtime.clone();
+        rt2.block_on(async move {
+            for setting in [2, 4] {
+                let config = PathConfig::builder()
+                    .service_circuit_hops(setting)
+                    .build()
+                    .unwrap();
+                for mode in [VanguardMode::Lite, VanguardMode::Full] {
+                    for (stem_kind, circ_kind) in [
+                        (HsCircStemKind::Naive, Some(HsCircKind::SvcIntro)),
+                        (HsCircStemKind::Guarded, Some(HsCircKind::SvcRend)),
+                    ] {
+                        let path = pick_vanguard_path_with_config(
+                            &runtime,
+                            &netdir,
+                            stem_kind,
+                            circ_kind,
+                            mode,
+                            config.clone(),
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(
+                            path.len(),
+                            if mode == VanguardMode::Lite {
+                                3
+                            } else if stem_kind == HsCircStemKind::Naive {
+                                3
+                            } else {
+                                4
+                            },
+                            "setting {setting}, mode {mode}, stem {stem_kind}"
+                        );
+                    }
+                }
             }
         });
     }
@@ -664,7 +812,9 @@ mod test {
 
         assert_eq!(
             path.len(),
-            stem_kind.num_hops(mode, HsCircKind::SvcIntro, 3).unwrap(),
+            stem_kind
+                .num_hops(mode, HsCircKind::SvcIntro, 3, 4)
+                .unwrap(),
             "invalid path length for {stem_kind} {mode}-vanguards circuit"
         );
 
@@ -742,6 +892,37 @@ mod test {
         let now = runtime.wallclock();
         let dirinfo = (netdir).into();
         HsPathBuilder::new(target.cloned(), stem_kind, circ_kind)
+            .pick_path_with_vanguards(&mut rng, dirinfo, &guards, &vanguardmgr, &config, now)
+            .map(|res| res.0)
+    }
+
+    // tor-socks5 local patch: pick a vanguard path with an explicit PathConfig.
+    #[cfg(feature = "vanguards")]
+    async fn pick_vanguard_path_with_config<'a>(
+        runtime: &MockRuntime,
+        netdir: &'a NetDir,
+        stem_kind: HsCircStemKind,
+        circ_kind: Option<HsCircKind>,
+        mode: VanguardMode,
+        config: PathConfig,
+    ) -> Result<TorPath<'a>> {
+        let vanguardmgr = VanguardMgr::new_testing(runtime, mode).unwrap();
+        let _provider = vanguardmgr.init_vanguard_sets(netdir).await.unwrap();
+
+        let mut rng = testing_rng();
+        let guards = tor_guardmgr::GuardMgr::new(
+            runtime.clone(),
+            tor_persist::TestingStateMgr::new(),
+            &tor_guardmgr::TestConfig::default(),
+        )
+        .unwrap();
+        let netdir_provider = Arc::new(TestNetDirProvider::new());
+        netdir_provider.set_netdir(netdir.clone());
+        let netdir_provider: Arc<dyn NetDirProvider> = netdir_provider;
+        guards.install_netdir_provider(&netdir_provider).unwrap();
+        let now = runtime.wallclock();
+        let dirinfo = (netdir).into();
+        HsPathBuilder::new(None, stem_kind, circ_kind)
             .pick_path_with_vanguards(&mut rng, dirinfo, &guards, &vanguardmgr, &config, now)
             .map(|res| res.0)
     }

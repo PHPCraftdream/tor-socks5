@@ -156,6 +156,25 @@ pub(crate) async fn run_server(
             if cfg.tor.circuit_hops == 2 {
                 warn!("tor.circuit_hops=2 reduces anonymity: onion-service circuits have no middle relay. Ordinary exit circuits stay at 3 hops. Intended for censorship circumvention, not anonymity.");
             }
+            // Vanguards are compiled out (no `vanguards` feature anywhere in the
+            // workspace), so Disabled mode is always in effect and the per-service
+            // field fully controls the server circuit length.
+            let service_circuit_hops = cfg
+                .onion_services
+                .iter()
+                .find(|svc| svc.enabled)
+                .map(|svc| svc.circuit_hops)
+                .unwrap_or(4);
+            if service_circuit_hops < 4 {
+                let chain = if service_circuit_hops == 2 {
+                    "[bridge, target]"
+                } else {
+                    "[bridge, middle, target]"
+                };
+                warn!(
+                    "onion_services.circuit_hops={service_circuit_hops} reduces anonymity: server onion circuits are {chain}. Intended for censorship circumvention, not anonymity."
+                );
+            }
             let settings = build_tor_settings(&cfg, config_path.as_deref()).await?;
             if settings.bridges.is_empty() {
                 bail!(

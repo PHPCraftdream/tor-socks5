@@ -281,12 +281,15 @@ dns_server.overrides: [
 ## onion port may not repeat within one entry and nicknames must be
 ## unique. `enabled` defaults to true. The service's v3 key lives in
 ## the keystore, which is locked against CLI mutations while the server
-## runs. Example (not part of the default):
+## runs. `circuit_hops` (2..=4, default 4) sets the length of the
+## server-side onion circuits; all enabled services must use the same
+## value. Example (not part of the default):
 ## onion_services: [
 ##     {
 ##         nickname: web
 ##         enabled: true
 ##         ports: [ 80=127.0.0.1:8080, 443=127.0.0.1:8443 ]
+##         circuit_hops: 4
 ##     }
 ## ]
 onion_services: []
@@ -325,6 +328,19 @@ onion_services: [
         nickname: web
         enabled: true
         ports: [ 80=127.0.0.1:8080, 443=127.0.0.1:8443 ]
+    }
+]
+``` Setting `circuit_hops` (2..=4, default `4`) shortens all server-side
+onion circuits — a latency-for-anonymity trade intended for censorship
+circumvention; all enabled services must use the same value.
+
+```ktav
+onion_services: [
+    {
+        nickname: web
+        enabled: true
+        ports: [ 80=127.0.0.1:8080, 443=127.0.0.1:8443 ]
+        circuit_hops: 2
     }
 ]
 ```

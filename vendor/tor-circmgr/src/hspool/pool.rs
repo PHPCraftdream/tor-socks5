@@ -24,6 +24,10 @@ pub(super) struct Pool<C: AbstractTunnel> {
     short_stem_target: usize,
     /// Target number of short GUARDED circuits (zero except Disabled/2).
     short_guarded_stem_target: usize,
+    /// tor-socks5 local patch: current standard service stem length
+    /// (service_circuit_hops - 1). Stems of other lengths are retired when
+    /// this changes.
+    svc_len: usize,
     /// Set when short-target mode flips, so callers can retire old stems.
     policy_changed: bool,
     /// True if we have exhausted our pool since the last time we decided
@@ -64,6 +68,8 @@ pub(super) struct ForLaunch<'a> {
     /// This is a mutable reference to one of the target values from [`CircsToLaunch`];
     /// we decrement it when we have launched a circuit of this type.
     count: &'a mut usize,
+    /// tor-socks5 local patch: true when this is a short (client) launch target.
+    short: bool,
 }
 
 impl<'a> ForLaunch<'a> {
@@ -81,10 +87,17 @@ impl<'a> ForLaunch<'a> {
     pub(super) fn kind(&self) -> HsCircStemKind {
         self.kind
     }
+
+    /// tor-socks5 local patch: true if this launch target is for short client stems.
+    pub(super) fn is_short(&self) -> bool {
+        self.short
+    }
 }
 
 /// The circuits we need to launch.
 pub(super) struct CircsToLaunch {
+    /// tor-socks5 local patch: standard service stem length to launch.
+    svc_len: usize,
     /// The number of NAIVE standard-length circuits to launch.
     stem_target: usize,
     /// The number of GUARDED standard-length circuits to launch.
@@ -104,25 +117,29 @@ impl CircsToLaunch {
         if self.stem_target > 0 {
             ForLaunch {
                 kind: HsCircStemKind::Naive,
-                n_hops: 3,
+                n_hops: self.svc_len,
+                short: false,
                 count: &mut self.stem_target,
             }
         } else if self.short_stem_target > 0 {
             ForLaunch {
                 kind: HsCircStemKind::Naive,
                 n_hops: 2,
+                short: true,
                 count: &mut self.short_stem_target,
             }
         } else if self.guarded_stem_target > 0 {
             ForLaunch {
                 kind: HsCircStemKind::Guarded,
-                n_hops: 3,
+                n_hops: self.svc_len,
+                short: false,
                 count: &mut self.guarded_stem_target,
             }
         } else {
             ForLaunch {
                 kind: HsCircStemKind::Guarded,
                 n_hops: 2,
+                short: true,
                 count: &mut self.short_guarded_stem_target,
             }
         }
@@ -161,6 +178,7 @@ impl<C: AbstractTunnel> Default for Pool<C> {
             guarded_stem_target: DEFAULT_GUARDED_STEM_TARGET,
             short_stem_target: 0,
             short_guarded_stem_target: 0,
+            svc_len: 3,
             policy_changed: false,
             have_been_exhausted: false,
             have_been_under_highwater: false,
@@ -188,21 +206,32 @@ impl<C: AbstractTunnel> Pool<C> {
         self.circuits.len() <= self.target() / 3
     }
 
-    /// Enable/disable short-client targets, dropping incompatible stems.
-    pub(super) fn set_short_targets(&mut self, enabled: bool) {
-        let was_enabled = self.short_stem_target != 0;
-        if was_enabled != enabled {
-            self.circuits.retain(|circ| (circ.n_hops == 2) == enabled);
+    /// tor-socks5 local patch: set the standard service stem length and
+    /// short-client targets, retiring stems that are incompatible with the
+    /// new policy (wrong standard length, or wrong short/standard class).
+    pub(super) fn set_policy(&mut self, svc_len: usize, short_targets: bool) {
+        if self.svc_len != svc_len {
+            self.svc_len = svc_len;
+            // Different standard length: no existing stem is reusable.
+            self.circuits.clear();
             self.policy_changed = true;
             self.have_been_exhausted = true;
             self.have_been_under_highwater = true;
         }
-        self.short_stem_target = if enabled {
+        let was_enabled = self.short_stem_target != 0;
+        if was_enabled != short_targets {
+            self.circuits
+                .retain(|circ| (circ.n_hops == 2) == short_targets);
+            self.policy_changed = true;
+            self.have_been_exhausted = true;
+            self.have_been_under_highwater = true;
+        }
+        self.short_stem_target = if short_targets {
             DEFAULT_NAIVE_STEM_TARGET
         } else {
             0
         };
-        self.short_guarded_stem_target = if enabled {
+        self.short_guarded_stem_target = if short_targets {
             DEFAULT_GUARDED_STEM_TARGET
         } else {
             0
@@ -215,6 +244,9 @@ impl<C: AbstractTunnel> Pool<C> {
     }
 
     /// Return the stems we would like to launch under the current policy.
+    ///
+    /// tor-socks5 local patch: standard-length stems are counted at the
+    /// configured service stem length rather than a hardcoded 3.
     pub(super) fn circuits_to_launch(&self, short_clients: bool) -> CircsToLaunch {
         let count = |kind, hops| {
             self.circuits
@@ -223,13 +255,14 @@ impl<C: AbstractTunnel> Pool<C> {
                 .count()
         };
         CircsToLaunch {
+            svc_len: self.svc_len,
             policy_changed: false,
             stem_target: self
                 .stem_target
-                .saturating_sub(count(HsCircStemKind::Naive, 3)),
+                .saturating_sub(count(HsCircStemKind::Naive, self.svc_len)),
             guarded_stem_target: self
                 .guarded_stem_target
-                .saturating_sub(count(HsCircStemKind::Guarded, 3)),
+                .saturating_sub(count(HsCircStemKind::Guarded, self.svc_len)),
             short_stem_target: if short_clients {
                 DEFAULT_NAIVE_STEM_TARGET.saturating_sub(count(HsCircStemKind::Naive, 2))
             } else {
@@ -423,7 +456,7 @@ mod test {
     #[test]
     fn selection_requires_exact_length() {
         let mut pool = Pool::<crate::mocks::FakeCirc>::default();
-        pool.set_short_targets(true);
+        pool.set_policy(3, true);
         pool.take_policy_changed();
         pool.insert(HsCircStem {
             circ: crate::mocks::FakeCirc {

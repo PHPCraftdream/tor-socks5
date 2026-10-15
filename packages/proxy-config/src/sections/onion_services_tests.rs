@@ -20,6 +20,7 @@ fn parses_minimal_onion_service() {
     let svc = &cfg.onion_services[0];
     assert_eq!(svc.nickname, "web");
     assert!(svc.enabled);
+    assert_eq!(svc.circuit_hops, 4);
     assert_eq!(svc.ports.len(), 1);
     assert_eq!(svc.ports[0].onion_port, 80);
     assert_eq!(svc.ports[0].target, "127.0.0.1:8080");
@@ -260,6 +261,7 @@ fn onion_services_roundtrip_through_write() {
         onion_services: vec![OnionServiceEntry {
             nickname: "web".into(),
             enabled: false,
+            circuit_hops: 4,
             ports: vec![
                 OnionServicePort {
                     onion_port: 80,
@@ -280,6 +282,158 @@ fn onion_services_roundtrip_through_write() {
     // Port mappings must keep the compact scalar spelling.
     assert!(serialized.contains("80=127.0.0.1:8080"));
     assert!(serialized.contains("[::1]:8443"));
+}
+
+#[test]
+fn circuit_hops_is_skipped_in_serialized_output_when_default() {
+    let cfg = Config {
+        onion_services: vec![OnionServiceEntry {
+            nickname: "web".into(),
+            enabled: true,
+            circuit_hops: 4,
+            ports: vec![OnionServicePort {
+                onion_port: 80,
+                target: "127.0.0.1:8080".into(),
+            }],
+        }],
+        ..Default::default()
+    };
+    let serialized = ktav::to_string(&cfg).expect("serialize");
+    assert!(
+        !serialized.contains("circuit_hops: 4"),
+        "default hop count must be omitted:\n{serialized}"
+    );
+    let entry = serialized.split("onion_services:").last().expect("section");
+    assert!(!entry.contains("circuit_hops"), "{entry}");
+    let deserialized: Config = ktav::from_str(&serialized).expect("deserialize");
+    assert_eq!(deserialized.onion_services, cfg.onion_services);
+}
+
+#[test]
+fn non_default_circuit_hops_is_serialized_and_roundtrips() {
+    let cfg = Config {
+        onion_services: vec![OnionServiceEntry {
+            nickname: "web".into(),
+            enabled: true,
+            circuit_hops: 2,
+            ports: vec![OnionServicePort {
+                onion_port: 80,
+                target: "127.0.0.1:8080".into(),
+            }],
+        }],
+        ..Default::default()
+    };
+    let serialized = ktav::to_string(&cfg).expect("serialize");
+    assert!(serialized.contains("circuit_hops: 2"), "{serialized}");
+    let deserialized: Config = ktav::from_str(&serialized).expect("deserialize");
+    assert_eq!(deserialized.onion_services, cfg.onion_services);
+    assert_eq!(deserialized.onion_services[0].circuit_hops, 2);
+}
+
+#[test]
+fn circuit_hops_defaults_to_four_and_accepts_two_three_four() {
+    for (value, expected) in [("2", 2), ("3", 3), ("4", 4)] {
+        let src = format!(
+            "listen: 127.0.0.1:1080\n\
+             onion_services: [\n\
+             \t{{\n\
+             \t\tnickname: web\n\
+             \t\tcircuit_hops: {value}\n\
+             \t\tports: [ 80=127.0.0.1:8080 ]\n\
+             \t}}\n\
+             ]\n"
+        );
+        let cfg = parse(&src).expect("valid circuit_hops parses");
+        assert_eq!(cfg.onion_services[0].circuit_hops, expected);
+    }
+}
+
+#[test]
+fn invalid_circuit_hops_values_are_rejected_with_key_path() {
+    for value in ["1", "5", "0", "255"] {
+        let src = format!(
+            "listen: 127.0.0.1:1080\n\
+             onion_services: [\n\
+             \t{{\n\
+             \t\tnickname: web\n\
+             \t\tcircuit_hops: {value}\n\
+             \t\tports: [ 80=127.0.0.1:8080 ]\n\
+             \t}}\n\
+             ]\n"
+        );
+        let err = parse(&src).expect_err("invalid circuit_hops must fail");
+        assert!(
+            err.contains("onion_services[0].circuit_hops"),
+            "circuit_hops {value:?}: {err}"
+        );
+        assert!(err.contains("2, 3, or 4"), "circuit_hops {value:?}: {err}");
+    }
+    // Values that do not fit u8 (or are not integers) fail in the field
+    // deserializer before the entry index is known, so the message
+    // carries the generic path.
+    for value in ["256", "-1", "\"3\"", "abc"] {
+        let src = format!(
+            "listen: 127.0.0.1:1080\n\
+             onion_services: [\n\
+             \t{{\n\
+             \t\tnickname: web\n\
+             \t\tcircuit_hops: {value}\n\
+             \t\tports: [ 80=127.0.0.1:8080 ]\n\
+             \t}}\n\
+             ]\n"
+        );
+        let err = parse(&src).expect_err("invalid circuit_hops must fail");
+        assert!(
+            err.contains("circuit_hops"),
+            "circuit_hops {value:?}: {err}"
+        );
+        assert!(err.contains("2, 3, or 4"), "circuit_hops {value:?}: {err}");
+    }
+}
+
+#[test]
+fn enabled_services_with_identical_circuit_hops_are_accepted() {
+    let src = config_with_services(&format!(
+        "{}{}",
+        service_with_hops("web", 3, "80=127.0.0.1:8080"),
+        service_with_hops("api", 3, "443=127.0.0.1:8443")
+    ));
+    let cfg = parse(&src).expect("parses");
+    assert!(cfg.onion_services.iter().all(|svc| svc.circuit_hops == 3));
+}
+
+#[test]
+fn enabled_services_with_conflicting_circuit_hops_are_rejected() {
+    let src = config_with_services(&format!(
+        "{}{}",
+        service_with_hops("web", 3, "80=127.0.0.1:8080"),
+        service_with_hops("api", 2, "443=127.0.0.1:8443")
+    ));
+    let err = parse(&src).expect_err("rejected");
+    assert!(
+        err.contains("all enabled services must use the same circuit_hops"),
+        "{err}"
+    );
+    assert!(err.contains("onion_services[0].circuit_hops: 3"), "{err}");
+    assert!(err.contains("onion_services[1].circuit_hops: 2"), "{err}");
+}
+
+#[test]
+fn disabled_service_may_differ_from_enabled_ones() {
+    let src = config_with_services(&format!(
+        "{}{}",
+        service_with_hops("web", 3, "80=127.0.0.1:8080"),
+        "\t{\n\t\tnickname: off\n\t\tenabled: false\n\t\tcircuit_hops: 2\n\t\tports: [ 443=127.0.0.1:8443 ]\n\t}\n"
+    ));
+    let cfg = parse(&src).expect("parses");
+    assert_eq!(cfg.onion_services[1].circuit_hops, 2);
+}
+
+fn service_with_hops(nickname: &str, circuit_hops: u8, ports: &str) -> String {
+    format!(
+        "\t{{\n\t\tnickname: {nickname}\n\t\tenabled: true\n\
+         \t\tcircuit_hops: {circuit_hops}\n\t\tports: [{ports}]\n\t}}\n"
+    )
 }
 
 #[test]

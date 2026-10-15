@@ -57,6 +57,14 @@ pub struct PathConfig {
     #[deftly(tor_config(default = "default_circuit_hops()"))]
     pub(crate) circuit_hops: u8,
 
+    // tor-socks5 local patch: configurable server-side (onion service) circuit length.
+    /// Total number of hops in a server-side onion-service circuit, including
+    /// the target relay that is appended to the stem. Supported values are
+    /// 2..=4; the default is 4. The circuit stem is one hop shorter than
+    /// this value.
+    #[deftly(tor_config(default = "default_service_circuit_hops()"))]
+    pub(crate) service_circuit_hops: u8,
+
     // tor-socks5 local patch (docs/circuit-speed-plan.md Tier 2): optional
     // bandwidth floor for middle/exit relay selection. 0 (the default)
     // keeps stock behaviour; 1..=100 excludes middle/exit candidates whose
@@ -82,6 +90,11 @@ fn default_reachable_addrs() -> Vec<AddrPortPattern> {
 /// The default is three hops.
 fn default_circuit_hops() -> u8 {
     3
+}
+
+/// tor-socks5 local patch: default total server-side onion-service circuit length.
+fn default_service_circuit_hops() -> u8 {
+    4
 }
 
 /// tor-socks5 local patch: default for `min_bandwidth_percentile` (0 =
@@ -119,6 +132,12 @@ impl PathConfig {
         self.circuit_hops
     }
 
+    /// tor-socks5 local patch: total number of hops in server-side
+    /// onion-service circuits (the stem is one hop shorter).
+    pub fn service_circuit_hops(&self) -> u8 {
+        self.service_circuit_hops
+    }
+
     /// tor-socks5 local patch: the configured middle/exit bandwidth-floor
     /// percentile (0 = disabled). See the `min_bandwidth_percentile` field.
     pub fn min_bandwidth_percentile(&self) -> u8 {
@@ -139,6 +158,9 @@ impl PathConfig {
             && self.reachable_addrs == other.reachable_addrs
             // tor-socks5 local patch: require an exact length match to discard circuits across policy changes.
             && self.circuit_hops == other.circuit_hops
+            // tor-socks5 local patch: require an exact service length match
+            // to discard circuits across policy changes.
+            && self.service_circuit_hops == other.service_circuit_hops
             // tor-socks5 local patch: a higher bandwidth floor is strictly
             // less permissive. Returning false here only causes circuits to
             // be discarded on reconfigure, which is the safe direction.
@@ -170,6 +192,7 @@ impl PathConfigBuilder {
     #[allow(clippy::unnecessary_wraps)]
     fn validate(&self) -> std::result::Result<(), tor_config::ConfigBuildError> {
         self.validate_circuit_hops()?;
+        self.validate_service_circuit_hops()?;
         self.validate_min_bandwidth_percentile()
     }
 
@@ -185,6 +208,24 @@ impl PathConfigBuilder {
             Err(tor_config::ConfigBuildError::Invalid {
                 field: "circuit_hops".to_string(),
                 problem: format!("must be in range 2..=3, not {hops}"),
+            })
+        }
+    }
+
+    /// tor-socks5 local patch: only supported service circuit lengths are accepted.
+    #[allow(clippy::unnecessary_wraps)]
+    fn validate_service_circuit_hops(
+        &self,
+    ) -> std::result::Result<(), tor_config::ConfigBuildError> {
+        let Some(hops) = self.service_circuit_hops else {
+            return Ok(());
+        };
+        if (2..=4).contains(&hops) {
+            Ok(())
+        } else {
+            Err(tor_config::ConfigBuildError::Invalid {
+                field: "service_circuit_hops".to_string(),
+                problem: format!("must be in range 2..=4, not {hops}"),
             })
         }
     }
@@ -561,6 +602,45 @@ mod test {
         for hops in [0, 1, 4, 255] {
             assert!(PathConfig::builder().circuit_hops(hops).build().is_err());
         }
+    }
+
+    // tor-socks5 local patch: builder tests for `service_circuit_hops`.
+    #[test]
+    fn path_config_service_circuit_hops() {
+        // Default is 4; accepts the closed range 2..=4.
+        assert_eq!(PathConfig::default().service_circuit_hops(), 4);
+        for hops in [2, 3, 4] {
+            assert_eq!(
+                PathConfig::builder()
+                    .service_circuit_hops(hops)
+                    .build()
+                    .unwrap()
+                    .service_circuit_hops(),
+                hops
+            );
+        }
+        for hops in [0, 1, 5, 255] {
+            assert!(
+                PathConfig::builder()
+                    .service_circuit_hops(hops)
+                    .build()
+                    .is_err()
+            );
+        }
+    }
+
+    // tor-socks5 local patch: service length settings invalidate incompatible built circuits.
+    #[test]
+    fn path_config_service_circuit_hops_permissiveness() {
+        let four = PathConfig::default();
+        let two = PathConfig::builder()
+            .service_circuit_hops(2)
+            .build()
+            .unwrap();
+        assert!(four.at_least_as_permissive_as(&four));
+        assert!(two.at_least_as_permissive_as(&two));
+        assert!(!four.at_least_as_permissive_as(&two));
+        assert!(!two.at_least_as_permissive_as(&four));
     }
 
     // behaviour, round-trips through the builder, rejects out-of-range

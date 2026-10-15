@@ -35,6 +35,14 @@ const MAX_ACTIVE_BRIDGES: usize = 30;
 fn settings_for_config(cfg: &Config) -> Settings {
     Settings {
         circuit_hops: cfg.tor.circuit_hops,
+        // proxy-config validation guarantees all enabled services agree on
+        // the value, so any enabled entry is representative.
+        service_circuit_hops: cfg
+            .onion_services
+            .iter()
+            .find(|svc| svc.enabled)
+            .map(|svc| svc.circuit_hops)
+            .unwrap_or(4),
         ..Default::default()
     }
 }
@@ -601,6 +609,40 @@ mod tests {
     fn settings_for_config_forwards_circuit_hops() {
         let cfg: Config = ktav::from_str("tor.circuit_hops: 2\n").expect("config parses");
         assert_eq!(settings_for_config(&cfg).circuit_hops, 2);
+    }
+
+    #[test]
+    fn settings_for_config_forwards_service_circuit_hops() {
+        let cfg: Config = ktav::from_str(
+            "onion_services: [\n\
+             \t{\n\
+             \t\tnickname: web\n\
+             \t\tenabled: true\n\
+             \t\tports: [ 80=127.0.0.1:8080 ]\n\
+             \t\tcircuit_hops: 2\n\
+             \t}\n\
+             ]\n",
+        )
+        .expect("config parses");
+        assert_eq!(settings_for_config(&cfg).service_circuit_hops, 2);
+    }
+
+    #[test]
+    fn settings_for_config_defaults_service_circuit_hops_without_enabled_services() {
+        let disabled: Config = ktav::from_str(
+            "onion_services: [\n\
+             \t{\n\
+             \t\tnickname: web\n\
+             \t\tenabled: false\n\
+             \t\tports: [ 80=127.0.0.1:8080 ]\n\
+             \t\tcircuit_hops: 2\n\
+             \t}\n\
+             ]\n",
+        )
+        .expect("config parses");
+        assert_eq!(settings_for_config(&disabled).service_circuit_hops, 4);
+        let empty: Config = ktav::from_str("onion_services: []\n").expect("config parses");
+        assert_eq!(settings_for_config(&empty).service_circuit_hops, 4);
     }
 
     #[test]
