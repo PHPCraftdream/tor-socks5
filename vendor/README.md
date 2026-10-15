@@ -106,7 +106,10 @@ fast-first budget).
 Opt-in bandwidth floor for middle/exit relay selection; client HS stems honor
 `PathConfig::circuit_hops` in Disabled mode; ordinary exit paths ignore it
 (always three hops: exits refuse a two-hop circuit that starts at a bridge);
-service stem lengths and vanguard modes retain upstream behavior.
+service stems honor `PathConfig::service_circuit_hops` (2..=4, default 4 =
+stock; stem = value − 1, a 1-hop stem is guard-only) in Disabled mode; vanguard
+modes retain upstream behavior. SvcHsDir stems never drop below 2 hops: C-tor
+HsDirs reject descriptor posts whose previous hop is a client (a bridge).
 
 ## Patch table
 
@@ -136,6 +139,7 @@ One row per patch group. Marker names are the identifiers in the
 | `initial_connect_timeout` | arti-client | src/config.rs; packages/android-ffi | optional fast-first budget; Android sets 4 s; inactive when `None` | carried |
 | `min_bandwidth_percentile` | tor-circmgr | src/config.rs, src/path.rs, src/path/exitpath.rs, src/path/hspath.rs | opt-in bandwidth floor for middle/exit; default 0 = stock | carried |
 | `hs_circuit_hops` | tor-circmgr | src/hspool.rs, src/hspool/pool.rs, src/path.rs, src/path/hspath.rs | role-aware client lengths, exact-length pool targets, epoch-safe retirement | local |
+| service stem length | tor-circmgr | src/config.rs, src/hspool.rs, src/hspool/pool.rs, src/path.rs, src/path/hspath.rs | `service_circuit_hops` for Svc stems (Disabled mode), guard-only 1-hop path, pool retargeting on change | local |
 
 **None of the functional patches above were accepted upstream in 0.47.**
 

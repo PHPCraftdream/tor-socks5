@@ -379,44 +379,54 @@ fn pick_path<'a, B: AnonymousPathBuilder, R: Rng, RT: Runtime>(
 
     // tor-socks5 local patch: pass the PathConfig down so that the
     // bandwidth floor can apply to exit selection.
-    let (exit, middle_usage) = builder.pick_exit(rng, netdir, exclusion, &rs_cfg, config)?;
-
-    let mut family_exclusion =
-        RelayExclusion::exclude_relays_in_same_family(&rs_cfg, vec![exit.clone()], family_rules);
-    family_exclusion.extend(&guard_exclusion);
-    let mut exclusion = family_exclusion;
-    exclusion.extend(&target_exclusion);
-    if builder.short_hs_target_exclusions(config) {
-        if let Some(target) = builder.compatible_with() {
-            let target_family =
-                RelayExclusion::exclude_channel_target_family(&rs_cfg, target, netdir);
-            exclusion.extend(&target_family);
-        }
-    }
-
-    let middle = if builder.circuit_hops(config) == 2 {
-        None
+    // tor-socks5 local patch: support guard-only 1-hop service stems:
+    // no exit or middle relay is selected at all.
+    let target_path_len = builder.circuit_hops(config);
+    let hops = if target_path_len == 1 {
+        vec![guard]
     } else {
-        let selector = RelaySelector::new(middle_usage, exclusion);
-        // tor-socks5 local patch: retain stock middle selection only for 3-hop circuits.
-        Some(select_relay_with_bandwidth_floor(
-            &selector,
-            rng,
-            netdir,
-            config.min_bandwidth_percentile(),
-            WeightRole::Middle,
-            builder.path_kind(),
-            "middle relay",
-        )?)
-    };
+        let (exit, middle_usage) = builder.pick_exit(rng, netdir, exclusion, &rs_cfg, config)?;
 
-    let hops = match middle {
-        None => vec![guard, MaybeOwnedRelay::from(exit)],
-        Some(middle) => vec![
-            guard,
-            MaybeOwnedRelay::from(middle),
-            MaybeOwnedRelay::from(exit),
-        ],
+        let mut family_exclusion = RelayExclusion::exclude_relays_in_same_family(
+            &rs_cfg,
+            vec![exit.clone()],
+            family_rules,
+        );
+        family_exclusion.extend(&guard_exclusion);
+        let mut exclusion = family_exclusion;
+        exclusion.extend(&target_exclusion);
+        if builder.short_hs_target_exclusions(config) {
+            if let Some(target) = builder.compatible_with() {
+                let target_family =
+                    RelayExclusion::exclude_channel_target_family(&rs_cfg, target, netdir);
+                exclusion.extend(&target_family);
+            }
+        }
+
+        let middle = if target_path_len == 2 {
+            None
+        } else {
+            let selector = RelaySelector::new(middle_usage, exclusion);
+            // tor-socks5 local patch: retain stock middle selection only for 3-hop circuits.
+            Some(select_relay_with_bandwidth_floor(
+                &selector,
+                rng,
+                netdir,
+                config.min_bandwidth_percentile(),
+                WeightRole::Middle,
+                builder.path_kind(),
+                "middle relay",
+            )?)
+        };
+
+        match middle {
+            None => vec![guard, MaybeOwnedRelay::from(exit)],
+            Some(middle) => vec![
+                guard,
+                MaybeOwnedRelay::from(middle),
+                MaybeOwnedRelay::from(exit),
+            ],
+        }
     };
 
     ensure_unique_hops(&hops)?;

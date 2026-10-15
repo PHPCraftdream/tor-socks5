@@ -29,12 +29,22 @@ fn settings_default_is_default() {
     assert!(s.pt_binary.is_none());
     assert!(s.initial_connect_timeout.is_none());
     assert_eq!(s.circuit_hops, 3);
+    assert_eq!(s.service_circuit_hops, 4);
 }
 
 #[test]
 fn settings_with_two_circuit_hops_is_not_default() {
     let settings = Settings {
         circuit_hops: 2,
+        ..Default::default()
+    };
+    assert!(!settings.is_default());
+}
+
+#[test]
+fn settings_with_shorter_service_circuit_hops_is_not_default() {
+    let settings = Settings {
+        service_circuit_hops: 2,
         ..Default::default()
     };
     assert!(!settings.is_default());
@@ -82,6 +92,38 @@ fn build_config_applies_circuit_hops_to_path_config() {
     ] {
         let config = build_config(&settings).expect("valid circuit hop setting builds");
         assert_eq!(config.path_rules().circuit_hops(), hops);
+    }
+}
+
+#[test]
+fn build_config_applies_service_circuit_hops_to_path_config() {
+    for (hops, settings) in [
+        (
+            2,
+            Settings {
+                service_circuit_hops: 2,
+                ..Default::default()
+            },
+        ),
+        (4, Settings::default()),
+    ] {
+        let config = build_config(&settings).expect("valid service circuit hop setting builds");
+        assert_eq!(config.path_rules().service_circuit_hops(), hops);
+    }
+}
+
+#[test]
+fn build_config_rejects_invalid_service_circuit_hops() {
+    for hops in [0, 1, 5, u8::MAX] {
+        let settings = Settings {
+            service_circuit_hops: hops,
+            ..Default::default()
+        };
+        let error = build_config(&settings).expect_err("invalid hop count rejected");
+        assert!(
+            error.to_string().contains("service_circuit_hops"),
+            "{error}"
+        );
     }
 }
 

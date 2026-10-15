@@ -91,6 +91,19 @@ impl HsCircKind {
             }
         }
     }
+
+    /// tor-socks5 local patch: Disabled-mode service stem length for
+    /// `service_circuit_hops`. HsDirs reject descriptor posts from a
+    /// non-anonymous previous hop ("Rejecting single hop HS descriptor
+    /// post"; a bridge counts as a client), so SvcHsDir stems never drop
+    /// below 2 hops.
+    pub(crate) fn svc_stem_hops(&self, service_circuit_hops: u8) -> u8 {
+        let len = service_circuit_hops.saturating_sub(1);
+        match self {
+            HsCircKind::SvcHsDir => len.max(2),
+            _ => len,
+        }
+    }
 }
 
 /// A hidden service circuit stem.
@@ -194,10 +207,16 @@ impl HsCircStemKind {
         mode: VanguardMode,
         circ_kind: HsCircKind,
         configured_hops: u8,
+        service_circuit_hops: u8,
     ) -> StdResult<usize, Bug> {
         if !matches!(configured_hops, 2 | 3) {
             return Err(internal!(
                 "invalid configured HS circuit length {configured_hops}"
+            ));
+        }
+        if !(2..=4).contains(&service_circuit_hops) {
+            return Err(internal!(
+                "invalid configured HS service circuit length {service_circuit_hops}"
             ));
         }
         let len = match (mode, circ_kind, self) {
@@ -206,7 +225,11 @@ impl HsCircStemKind {
                 HsCircKind::ClientHsDir | HsCircKind::ClientIntro | HsCircKind::ClientRend,
                 _,
             ) => usize::from(configured_hops),
-            (VanguardMode::Disabled, _, _) => 3,
+            // tor-socks5 local patch: service stem is one hop shorter than
+            // the total service circuit (the target relay is appended).
+            (VanguardMode::Disabled, _, _) => {
+                usize::from(circ_kind.svc_stem_hops(service_circuit_hops))
+            }
             #[cfg(all(feature = "vanguards", feature = "hs-common"))]
             (VanguardMode::Lite, _, _) => 3,
             #[cfg(all(feature = "vanguards", feature = "hs-common"))]
@@ -628,14 +651,28 @@ impl<B: AbstractTunnelBuilder<R> + 'static, R: Runtime> HsCircPoolInner<B, R> {
         stem_kind: HsCircStemKind,
     ) -> StdResult<usize, Bug> {
         let config = self.circmgr.builder().path_config();
-        stem_kind.num_hops(self.vanguard_mode(), kind, config.circuit_hops())
+        stem_kind.num_hops(
+            self.vanguard_mode(),
+            kind,
+            config.circuit_hops(),
+            config.service_circuit_hops(),
+        )
+    }
+
+    /// tor-socks5 local patch: expected standard service stem length for the
+    /// current config (used to parameterize the preemptive pool).
+    fn expected_svc_stem_hops(&self) -> StdResult<usize, Bug> {
+        self.expected_stem_hops(HsCircKind::SvcIntro, HsCircKind::SvcIntro.stem_kind())
     }
 
     /// Internal implementation for [`HsCircPool::retire_all_circuits`].
     pub(crate) fn retire_all_circuits(&self) -> StdResult<(), tor_config::ReconfigureError> {
         let mut inner = self.inner.lock().expect("poisoned lock");
         inner.epoch = inner.epoch.wrapping_add(1);
-        inner.pool.set_short_targets(false);
+        // tor-socks5 local patch: service stems are retired unless the
+        // configured standard length is unchanged.
+        let svc_len = self.expected_svc_stem_hops().unwrap_or(3);
+        inner.pool.set_policy(svc_len, false);
         inner.pool.retire_all_circuits()?;
 
         Ok(())
@@ -676,7 +713,10 @@ impl<B: AbstractTunnelBuilder<R> + 'static, R: Runtime> HsCircPoolInner<B, R> {
             let mut inner = self.inner.lock().expect("lock poisoned");
             let short_clients =
                 self.expected_stem_hops(HsCircKind::ClientIntro, HsCircStemKind::Guarded)? == 2;
-            inner.pool.set_short_targets(short_clients);
+            // tor-socks5 local patch: track the configured service stem
+            // length; a change retires incompatible stems.
+            let svc_len = self.expected_svc_stem_hops()?;
+            inner.pool.set_policy(svc_len, short_clients);
             if inner.pool.take_policy_changed() {
                 inner.epoch = inner.epoch.wrapping_add(1);
                 // tor-socks5 local patch: convert the pool's ReconfigureError inline;
@@ -1249,8 +1289,17 @@ async fn launch_hs_circuits_as_needed<B: AbstractTunnelBuilder<R> + 'static, R: 
                         false
                     }
                 };
+            // tor-socks5 local patch: use the configured service stem length
+            // for preemptive service stems.
+            let svc_len = match pool.expected_svc_stem_hops() {
+                Ok(hops) => hops,
+                Err(error) => {
+                    warn!("cannot determine HS pool service target length: {error}");
+                    3
+                }
+            };
             let mut inner = pool.inner.lock().expect("poisoned lock");
-            inner.pool.set_short_targets(short_clients);
+            inner.pool.set_policy(svc_len, short_clients);
             if inner.pool.take_policy_changed() {
                 inner.epoch = inner.epoch.wrapping_add(1);
                 inner
@@ -1290,13 +1339,15 @@ async fn launch_hs_circuits_as_needed<B: AbstractTunnelBuilder<R> + 'static, R: 
                 // whether taking the fastest will expose us to any attacks.
                 let for_launch = circs_to_launch.for_launch();
                 let policy_epoch = pool.inner.lock().expect("poisoned lock").epoch;
-                let requested_hops = for_launch.hops();
-                let stem_kind = for_launch.kind();
-                let (kind, target_hops) = if requested_hops == 2 {
-                    (HsCircKind::ClientIntro, 2)
+                // tor-socks5 local patch: the target length comes from the
+                // launch request itself; short requests are for client stems.
+                let target_hops = for_launch.hops();
+                let kind = if for_launch.is_short() {
+                    HsCircKind::ClientIntro
                 } else {
-                    (HsCircKind::SvcIntro, 3)
+                    HsCircKind::SvcIntro
                 };
+                let stem_kind = for_launch.kind();
                 let no_target: Option<&OwnedCircTarget> = None;
                 let circ = match pool
                     .circmgr
@@ -1545,6 +1596,87 @@ mod test {
         assert_ne!(inner.epoch, captured_epoch);
         // Fresh targets: 3 NAIVE + 1 GUARDED standard-length stems.
         assert_eq!(inner.pool.circuits_to_launch(false).n_to_launch(), 4);
+    }
+
+    // tor-socks5 local patch: Disabled Svc stem lengths follow service_circuit_hops.
+    #[test]
+    fn service_lengths_cover_disabled_and_ignore_clients() {
+        let runtime = MockRuntime::new();
+        let svc_kinds = [
+            HsCircKind::SvcHsDir,
+            HsCircKind::SvcIntro,
+            HsCircKind::SvcRend,
+        ];
+        let client_kinds = [
+            HsCircKind::ClientHsDir,
+            HsCircKind::ClientIntro,
+            HsCircKind::ClientRend,
+        ];
+        for (setting, expected) in [(4, 3), (3, 2), (2, 1)] {
+            let circmgr = circmgr_with_vanguards(runtime.clone(), VanguardMode::Disabled);
+            let pool = HsCircPoolInner::new_internal(&circmgr);
+            circmgr.builder().set_path_config(
+                PathConfig::builder()
+                    .service_circuit_hops(setting)
+                    .build()
+                    .unwrap(),
+            );
+            for kind in svc_kinds {
+                // HsDirs reject descriptor posts from a non-anonymous hop.
+                let expected = if kind == HsCircKind::SvcHsDir {
+                    expected.max(2)
+                } else {
+                    expected
+                };
+                assert_eq!(
+                    pool.expected_stem_hops(kind, kind.stem_kind()).unwrap(),
+                    expected,
+                    "{kind:?} setting {setting}"
+                );
+            }
+            // Client stems are unaffected by the service setting.
+            for kind in client_kinds {
+                assert_eq!(
+                    pool.expected_stem_hops(kind, kind.stem_kind()).unwrap(),
+                    3,
+                    "{kind:?} setting {setting}"
+                );
+            }
+        }
+    }
+
+    // tor-socks5 local patch: changing service_circuit_hops retires old stems
+    // and retargets the preemptive pool (pool-level test, mocks only).
+    #[test]
+    fn service_length_change_retires_and_retargets_pool() {
+        let mut pool = pool::Pool::<crate::mocks::FakeCirc>::default();
+        pool.insert(HsCircStem {
+            circ: crate::mocks::FakeCirc {
+                id: crate::mocks::FakeId::next(),
+            },
+            kind: HsCircStemKind::Naive,
+            n_hops: 3,
+        });
+        // Switch to service_circuit_hops = 2 (stem length 1).
+        pool.set_policy(1, false);
+        // The stale 3-hop stem must have been retired.
+        let mut rng = tor_basic_utils::test_rng::testing_rng();
+        assert!(
+            pool.take_one_where(&mut rng, |_| true, &HsCircPrefs::default(), 3)
+                .is_none()
+        );
+        assert!(pool.take_policy_changed());
+        // Standard targets now count 1-hop stems.
+        assert_eq!(pool.circuits_to_launch(false).n_to_launch(), 4);
+        pool.insert(HsCircStem {
+            circ: crate::mocks::FakeCirc {
+                id: crate::mocks::FakeId::next(),
+            },
+            kind: HsCircStemKind::Naive,
+            n_hops: 1,
+        });
+        // 1-hop NAIVE stems count against the standard NAIVE target.
+        assert_eq!(pool.circuits_to_launch(false).stem(), 2);
     }
 
     #[test]

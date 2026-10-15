@@ -230,6 +230,10 @@ pub struct Settings {
     pub min_bandwidth_percentile: u8,
     /// Number of relays in the client onion-service circuits (rendezvous, introduction, HsDir). Defaults to `3`; only `2` and `3` are valid. Ordinary exit circuits always use three.
     pub circuit_hops: u8,
+    /// Number of relays in the server-side (published onion service) circuits, including the
+    /// appended target relay. Defaults to `4`; only `2..=4` are valid. Ignored under
+    /// Lite/Full vanguard modes.
+    pub service_circuit_hops: u8,
     /// Override the `iat-mode` parameter on every obfs4 bridge line before
     /// handing it to arti. `iat-mode` is a *client-side* obfs4 knob: `0`
     /// sends cells as they come (fastest, but leaves obfs4's packet-size and
@@ -269,6 +273,7 @@ impl Default for Settings {
             cache_dir: None,
             min_bandwidth_percentile: 0,
             circuit_hops: 3,
+            service_circuit_hops: 4,
             obfs4_iat_mode: None,
             disable_preemptive_circuits: false,
             initial_connect_timeout: None,
@@ -288,6 +293,7 @@ impl Settings {
             && self.extra_pt_protocols.is_empty()
             && self.min_bandwidth_percentile == 0
             && self.circuit_hops == 3
+            && self.service_circuit_hops == 4
             && self.obfs4_iat_mode.is_none()
             && !self.disable_preemptive_circuits
             && self.initial_connect_timeout.is_none()
@@ -822,26 +828,14 @@ fn fatal_protocol_error_hook(error: &arti_client::Error) {
     );
 }
 
-fn validate_min_bandwidth_percentile(pct: u8) -> std::result::Result<(), String> {
-    if pct <= 100 {
-        Ok(())
-    } else {
-        Err(format!(
-            "min_bandwidth_percentile must be in 0..=100, got {pct}"
-        ))
-    }
-}
-
-fn validate_circuit_hops(hops: u8) -> std::result::Result<(), String> {
-    if matches!(hops, 2 | 3) {
-        Ok(())
-    } else {
-        Err(format!("tor.circuit_hops must be 2 or 3, got {hops}"))
-    }
-}
+mod validate;
+use validate::{
+    validate_circuit_hops, validate_min_bandwidth_percentile, validate_service_circuit_hops,
+};
 
 fn build_config(settings: &Settings) -> Result<TorClientConfig> {
     validate_circuit_hops(settings.circuit_hops).map_err(TorError::BuildConfig)?;
+    validate_service_circuit_hops(settings.service_circuit_hops).map_err(TorError::BuildConfig)?;
     validate_min_bandwidth_percentile(settings.min_bandwidth_percentile)
         .map_err(TorError::BuildConfig)?;
 
@@ -897,6 +891,7 @@ fn build_config(settings: &Settings) -> Result<TorClientConfig> {
     builder
         .path_rules()
         .circuit_hops(settings.circuit_hops)
+        .service_circuit_hops(settings.service_circuit_hops)
         .min_bandwidth_percentile(settings.min_bandwidth_percentile);
 
     if settings.disable_preemptive_circuits {
