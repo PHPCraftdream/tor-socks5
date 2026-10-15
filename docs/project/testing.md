@@ -27,10 +27,6 @@ The hook (`.githooks/pre-push`) always runs fmt, then:
 - **T1 (default)** — asks `scripts/testing/test-affected.sh` for the affected packages and runs
   clippy + tests + doctests for them only. A new ref uses `merge-base HEAD origin/main`;
   missing `origin/main`, unavailable remote SHA, shallow history or multiple remote bases
-  force T2. A new ref uses `merge-base HEAD origin/main`;
-  missing `origin/main`, unavailable remote SHA, shallow history or multiple remote bases
-  force T2. A new ref uses `merge-base HEAD origin/main`;
-  missing `origin/main`, unavailable remote SHA, shallow history or multiple remote bases
   force T2.
 - **T2 (`FULL=1`)** — full workspace run. Also forced when pushing `main`,
   `upstream-*` or tags, or when the package selection fails (fail-safe: never
@@ -45,6 +41,18 @@ Useful variables:
 TEST_AFFECTED_DRY=1 git push   # print the commands instead of running them
 FULL=1 git push                # force the full T2 run
 ```
+
+### `--all-features` and vendored crates
+
+Run `--all-features` for a vendored crate in its own cargo invocation, e.g.
+`cargo test -p tor-circmgr --all-features` (as the nightly job does). Never
+combine it with an app package (`cargo clippy -p tor-circmgr -p socks5-proxy
+--all-features`): `--all-features` applies only to the listed packages, so
+`tor-circmgr` gets `vanguards`/`geoip` while `arti-client` does not, and
+`arti-client` fails to compile (`missing vanguard_config`, extra `country_code`
+argument). This is an upstream non-additive feature combination (see the
+`TODO GEOIP` note in `tor-circmgr`); `cargo check -p socks5-proxy --all-features`
+on its own builds fine.
 
 ## Selecting affected packages
 
