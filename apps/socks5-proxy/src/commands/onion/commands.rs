@@ -3,15 +3,26 @@
 //! Pure keystore management: nothing here starts Tor or opens the network.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
+use safelog::DisplayRedacted as _;
+use tor_hscrypto::pk::{HsIdKey, HsIdKeypair};
+use tor_llcrypto::pk::ed25519::ExpandedKeypair;
 
+use super::vanity;
 use crate::onion::store;
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum OnionAction {
     /// Create a new onion service identity (random key) and print its address.
+    ///
+    /// With `--vanity PREFIX`, mine a key whose address starts with PREFIX
+    /// (base32: a-z, 2-7; up to 8 chars) instead of using a random one.
     New {
         /// Service nickname (used as the keystore directory name).
         nick: String,
@@ -19,6 +30,15 @@ pub(crate) enum OnionAction {
         /// will be lost permanently.
         #[arg(long)]
         force: bool,
+        /// Search for an address starting with this prefix (a-z2-7, <= 8 chars).
+        #[arg(long)]
+        vanity: Option<String>,
+        /// Vanity search worker threads; 0 or omitted = all but one core.
+        #[arg(long)]
+        threads: Option<usize>,
+        /// Vanity search time budget, e.g. 30m or 2h (bare number = seconds).
+        #[arg(long)]
+        timeout: Option<String>,
     },
     /// List all onion services in the keystore (nickname and address).
     List,
@@ -63,7 +83,13 @@ pub(crate) enum OnionAction {
 
 pub(crate) fn run(action: OnionAction, config_path: Option<&Path>) -> Result<()> {
     match action {
-        OnionAction::New { nick, force } => cmd_new(config_path, &nick, force),
+        OnionAction::New {
+            nick,
+            force,
+            vanity,
+            threads,
+            timeout,
+        } => cmd_new(config_path, &nick, force, vanity, threads, timeout),
         OnionAction::List => cmd_list(config_path),
         OnionAction::Show { nick } => cmd_show(config_path, &nick),
         OnionAction::Export { nick, out, force } => cmd_export(config_path, &nick, &out, force),
@@ -72,7 +98,57 @@ pub(crate) fn run(action: OnionAction, config_path: Option<&Path>) -> Result<()>
     }
 }
 
-fn cmd_new(config_path: Option<&Path>, nick: &str, force: bool) -> Result<()> {
+fn cmd_new(
+    config_path: Option<&Path>,
+    nick: &str,
+    force: bool,
+    vanity: Option<String>,
+    threads: Option<usize>,
+    timeout: Option<String>,
+) -> Result<()> {
+    if vanity.is_none() {
+        if threads.is_some() || timeout.is_some() {
+            bail!("--threads/--timeout require --vanity");
+        }
+        return cmd_new_random(config_path, nick, force);
+    }
+    cmd_new_vanity(
+        config_path,
+        nick,
+        force,
+        vanity.as_deref().expect("checked above"),
+        threads,
+        timeout.as_deref(),
+    )
+}
+
+/// Parse a duration: a non-negative number plus unit s|m|h; a bare number
+/// means seconds. Zero and overflow are rejected.
+fn parse_duration(s: &str) -> Result<Duration> {
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (digits, unit) = s.split_at(split);
+    if digits.is_empty() {
+        bail!("invalid duration {s:?}: bad number");
+    }
+    let value: u64 = digits
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid duration {s:?}: bad number"))?;
+    let mult: u64 = match unit {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        _ => bail!("invalid duration {s:?}: unknown unit (use s, m or h)"),
+    };
+    let secs = value
+        .checked_mul(mult)
+        .ok_or_else(|| anyhow::anyhow!("invalid duration {s:?}: overflow"))?;
+    if secs == 0 {
+        bail!("invalid duration {s:?}: must be positive");
+    }
+    Ok(Duration::from_secs(secs))
+}
+
+fn cmd_new_random(config_path: Option<&Path>, nick: &str, force: bool) -> Result<()> {
     let nick = store::nickname(nick)?;
     let dir = store::keystore_dir(config_path);
     let _lock = store::lock(&dir)?;
@@ -92,6 +168,176 @@ fn cmd_new(config_path: Option<&Path>, nick: &str, force: bool) -> Result<()> {
         );
     }
     store::generate(&keymgr, &nick, force)?;
+    let address = store::address(&keymgr, &nick)?.context("address after generation")?;
+    let file = store::identity_file(&dir, &nick).context("identity file after generation")?;
+    println!("nickname: {}", nick);
+    println!("address:  {address}");
+    println!("keystore: {}", file.display());
+    Ok(())
+}
+
+/// Measure attempts/s over ~1s with `threads` worker threads.
+fn warmup_rate(threads: usize) -> Option<f64> {
+    let attempts = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut handles = Vec::new();
+    for _ in 0..threads {
+        let attempts = Arc::clone(&attempts);
+        let stop = Arc::clone(&stop);
+        handles.push(thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let _ = super::address::generate();
+                attempts.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+    let start = Instant::now();
+    thread::sleep(Duration::from_secs(1));
+    stop.store(true, Ordering::Relaxed);
+    for handle in handles {
+        let _ = handle.join();
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    (elapsed > 0.0).then(|| attempts.load(Ordering::Relaxed) as f64 / elapsed)
+}
+
+/// Spawn a detached thread that sets `cancel` on Ctrl-C.
+fn spawn_ctrl_c(cancel: Arc<AtomicBool>) {
+    thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        });
+    });
+}
+
+fn cmd_new_vanity(
+    config_path: Option<&Path>,
+    nick: &str,
+    force: bool,
+    vanity_str: &str,
+    threads: Option<usize>,
+    timeout_str: Option<&str>,
+) -> Result<()> {
+    let nick = store::nickname(nick)?;
+    let dir = store::keystore_dir(config_path);
+    let _lock = store::lock(&dir)?;
+    let keymgr = store::open(&dir)?;
+    if store::exists(&keymgr, &nick)? {
+        if !force {
+            bail!(
+                "nickname {:?} already exists; pass --force to replace it \
+                 (the old .onion address will be lost)",
+                nick.to_string()
+            );
+        }
+        eprintln!(
+            "warning: replacing the identity of {:?}: the old .onion address \
+             will be lost permanently",
+            nick.to_string()
+        );
+    }
+
+    let target = vanity::VanityTarget::new(vanity_str)?;
+
+    // Warm-up: measure the generation rate for a rough ETA.
+    let rate = warmup_rate(vanity::worker_count(threads.unwrap_or(0)));
+    let expected = vanity::expected_attempts(target.prefix().len());
+    let estimate = rate.map(|rate| vanity::estimate(target.prefix().len(), rate));
+    match estimate {
+        Some(eta) => eprintln!(
+            "vanity search: prefix {:?} needs ~{expected} attempts; \
+             measured {:.0} keys/s; mean time ~{:?} (~95% within 3x)",
+            target.prefix(),
+            rate.expect("estimate implies rate"),
+            eta,
+        ),
+        None => eprintln!(
+            "vanity search: prefix {:?} needs ~{expected} attempts; \
+             speed could not be measured, no ETA available",
+            target.prefix()
+        ),
+    }
+    let time_limit = match timeout_str {
+        Some(s) => Some(parse_duration(s)?),
+        None => {
+            if estimate.is_some_and(|eta| eta > Duration::from_secs(3600)) {
+                bail!(
+                    "expected vanity search time exceeds 1 hour; pass \
+                     --timeout (e.g. --timeout 2h) to confirm"
+                );
+            }
+            None
+        }
+    };
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    spawn_ctrl_c(Arc::clone(&cancel));
+    let progress = Arc::new(AtomicU64::new(0));
+    let done = Arc::new(AtomicBool::new(false));
+    {
+        let progress = Arc::clone(&progress);
+        let done = Arc::clone(&done);
+        let start = Instant::now();
+        thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_secs(10));
+                if done.load(Ordering::Relaxed) {
+                    break;
+                }
+                let attempts = progress.load(Ordering::Relaxed);
+                let secs = start.elapsed().as_secs_f64().max(1e-9);
+                eprintln!(
+                    "vanity search: {attempts} attempts, {:.0} keys/s, elapsed {:?}",
+                    attempts as f64 / secs,
+                    Duration::from_secs_f64(secs),
+                );
+            }
+        });
+    }
+    let outcome = vanity::search(
+        &target,
+        &vanity::SearchOptions {
+            threads: threads.unwrap_or(0),
+            time_limit,
+            cancel: Arc::clone(&cancel),
+            progress: Some(Arc::clone(&progress)),
+        },
+    );
+    done.store(true, Ordering::Relaxed);
+
+    let kp = match outcome {
+        vanity::SearchOutcome::Found(kp) => kp,
+        vanity::SearchOutcome::TimedOut { attempts } => {
+            eprintln!("vanity search: {attempts} attempts in total");
+            bail!(
+                "vanity search timed out; no key was saved \
+                 (retry with a longer --timeout or a shorter prefix)"
+            );
+        }
+        vanity::SearchOutcome::Cancelled { attempts } => {
+            eprintln!("vanity search: interrupted by Ctrl-C after {attempts} attempts");
+            bail!("vanity search interrupted; no key was saved");
+        }
+    };
+
+    let bytes = kp.to_expanded_bytes();
+    let ekp = ExpandedKeypair::from_secret_key_bytes(bytes)
+        .context("invalid expanded secret key from vanity search")?;
+    let key = HsIdKeypair::from(ekp);
+    let address = HsIdKey::from(&key).id().display_unredacted().to_string();
+    if address != kp.address() {
+        bail!("address mismatch; key not saved");
+    }
+
+    store::insert(&keymgr, key, &nick, force)?;
     let address = store::address(&keymgr, &nick)?.context("address after generation")?;
     let file = store::identity_file(&dir, &nick).context("identity file after generation")?;
     println!("nickname: {}", nick);
@@ -267,10 +513,24 @@ mod tests {
     }
 
     fn run_new(config: &Path, nick: &str, force: bool) -> Result<()> {
+        run_new_full(config, nick, force, None, None, None)
+    }
+
+    fn run_new_full(
+        config: &Path,
+        nick: &str,
+        force: bool,
+        vanity: Option<&str>,
+        threads: Option<usize>,
+        timeout: Option<&str>,
+    ) -> Result<()> {
         run(
             OnionAction::New {
                 nick: nick.to_owned(),
                 force,
+                vanity: vanity.map(str::to_owned),
+                threads,
+                timeout: timeout.map(str::to_owned),
             },
             Some(config),
         )
@@ -399,5 +659,89 @@ mod tests {
         cmd_export(Some(&config), "perm", &out, false).expect("export");
         let mode = std::fs::metadata(&out).expect("meta").permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn onion_new_vanity_flags_require_vanity() {
+        let (_tmp, config) = temp_setup();
+        let err = run_new_full(&config, "svc", false, None, Some(2), None)
+            .expect_err("threads without vanity");
+        assert!(err.to_string().contains("--vanity"), "{err}");
+        let err = run_new_full(&config, "svc", false, None, None, Some("30s"))
+            .expect_err("timeout without vanity");
+        assert!(err.to_string().contains("--vanity"), "{err}");
+        // Nothing was created for the failed runs.
+        assert!(!store::keystore_dir(Some(&config)).join("hss").exists());
+    }
+
+    #[test]
+    fn onion_new_vanity_parse_duration() {
+        for good in [("90", 90), ("90s", 90), ("30m", 1800), ("2h", 7200)] {
+            assert_eq!(
+                parse_duration(good.0).expect(good.0),
+                Duration::from_secs(good.1),
+                "{good:?}"
+            );
+        }
+        for bad in ["", "abc", "0", "1x", "-5s", "99999999999999999999s"] {
+            assert!(parse_duration(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn onion_new_vanity_keypair_roundtrip_to_hs_id() {
+        use safelog::DisplayRedacted as _;
+        use tor_hscrypto::pk::HsIdKey;
+        for _ in 0..4 {
+            let kp = super::super::address::generate();
+            let ekp = ExpandedKeypair::from_secret_key_bytes(kp.to_expanded_bytes())
+                .expect("expanded keypair");
+            let key = HsIdKeypair::from(ekp);
+            let address = HsIdKey::from(&key).id().display_unredacted().to_string();
+            assert_eq!(address, kp.address());
+        }
+    }
+
+    #[test]
+    fn onion_new_vanity_finds_prefix_end_to_end() {
+        let (_tmp, config) = temp_setup();
+        run_new_full(&config, "van", false, Some("a"), Some(2), Some("30s")).expect("vanity new");
+        let address = address_of(&config, "van");
+        assert!(address.starts_with('a'), "{address}");
+        cmd_show(Some(&config), "van").expect("show");
+        assert_eq!(address_of(&config, "van"), address);
+    }
+
+    #[test]
+    fn onion_new_vanity_times_out_saves_nothing() {
+        let (_tmp, config) = temp_setup();
+        let nick = store::nickname("slow").expect("nick");
+        let err = run_new_full(
+            &config,
+            "slow",
+            false,
+            Some("abcdefgh"),
+            Some(2),
+            Some("1s"),
+        )
+        .expect_err("8-char prefix must time out");
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(!store::keystore_dir(Some(&config))
+            .join("hss")
+            .join(nick.to_string())
+            .exists());
+    }
+
+    #[test]
+    fn onion_new_vanity_requires_timeout_for_long_estimate() {
+        let (_tmp, config) = temp_setup();
+        let nick = store::nickname("slow").expect("nick");
+        let err = run_new_full(&config, "slow", false, Some("abcdefgh"), Some(2), None)
+            .expect_err("long estimate without --timeout");
+        assert!(err.to_string().contains("--timeout"), "{err}");
+        assert!(!store::keystore_dir(Some(&config))
+            .join("hss")
+            .join(nick.to_string())
+            .exists());
     }
 }

@@ -74,6 +74,13 @@ tokio.workspace = true
 tokio-util.workspace = true
 futures.workspace = true
 
+# Vanity v3 onion address generation (see src/onion/).
+data-encoding = "2.11.0"
+ed25519-dalek = "2.2.0"
+sha2 = "0.10.9"
+sha3 = "0.10.9"
+zeroize = "1.9.1"
+
 anyhow.workspace = true
 thiserror.workspace = true
 getrandom.workspace = true

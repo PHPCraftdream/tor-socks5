@@ -236,8 +236,30 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo nextest run $PKGS --locked --profile ci
         shell: bash
-      - run: cargo test --doc $PKGS --locked
+      # Doctests need a library target: `cargo test --doc -p <bin-only>` fails.
+      - name: Doctests (library packages only)
         shell: bash
+        run: |
+          libs=$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(any(.targets[].kind[]; . == "lib" or . == "rlib" or . == "proc-macro")) | .name' \
+            | tr -d '\r')
+          args=""
+          set -- $PKGS
+          while [ $# -gt 0 ]; do
+            if [ "$1" = "-p" ] && [ $# -ge 2 ]; then
+              if [ "$2" != saturating-time ] && printf '%s\n' $libs | grep -qx -- "$2"; then
+                args="$args -p $2"
+              fi
+              shift 2
+            else
+              shift
+            fi
+          done
+          if [ -n "$args" ]; then
+            cargo test --doc $args --locked
+          else
+            echo "no library package selected; doctests skipped"
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
