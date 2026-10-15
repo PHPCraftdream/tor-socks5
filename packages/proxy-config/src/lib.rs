@@ -27,15 +27,18 @@ use serde::{Deserialize, Serialize};
 mod bridges_file;
 #[path = "layout/legacy.rs"]
 mod legacy;
-#[path = "layout/log.rs"]
+#[path = "sections/log.rs"]
 mod log;
 pub use log::{LogConfig, LogOutput};
+#[path = "sections/listen_addresses.rs"]
 mod listen_addresses;
+#[path = "sections/onion_services.rs"]
 mod onion_services;
 use onion_services::onion_services;
 pub use onion_services::{OnionServiceEntry, OnionServicePort};
 #[path = "layout/migrate.rs"]
 mod migrate;
+#[path = "sections/override_patterns.rs"]
 mod override_patterns;
 use listen_addresses::listen_addresses;
 pub use migrate::{migrate_config, MigrationOutcome, MigrationReport};
