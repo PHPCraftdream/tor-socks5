@@ -149,13 +149,40 @@ nickname:
 - **broken** — the service could not start or failed outright.
 
 The **first start is slow** by design: the service's descriptors must be
-uploaded to several HsDir relays. A cold first start has been observed to
-reach "reachable" about 5 minutes after "Tor is ready", with some uploads
-failing (→ `degraded`) until they retry. The first client request takes
-seconds (~5 s observed; introduction setup), repeat requests are fast
-(~0.5 s). If a service stays degraded or broken: wait (uploads retry
-automatically), check the logs for the failing HsDir uploads, and restart
-the server if it does not settle.
+uploaded to several HsDir relays. Observed through webtunnel bridges:
+
+| Scenario | Introduction points | First client page load |
+|---|---|---|
+| Cold start (empty Tor state, new key) | — | ~5 min after "Tor is ready" (some HsDir uploads time out → `degraded`) |
+| Warm Tor, new key | 3 in ~21 s | ~47 s |
+| Warm restart, same key | 3 in 5–7 s | ~52 s (descriptor upload rate limit) |
+
+The first client request takes seconds (~5–7 s observed; introduction
+setup), repeat requests are fast (~0.4–0.7 s). No safe speedup was found
+beyond keeping the Tor state directory between runs. If a service stays
+degraded or broken: wait (uploads retry automatically), check the logs for
+the failing HsDir uploads, and restart the server if it does not settle.
+
+## Circuit length
+
+Each `onion_services` entry accepts `circuit_hops` — the total number of
+relays from the server to the introduction point, rendezvous point or
+HsDir, the bridge included:
+
+| `circuit_hops` | Introduction / rendezvous | HsDir uploads |
+|---|---|---|
+| `4` (default) | bridge → 2 relays → target | same |
+| `3` | bridge → middle → target | same |
+| `2` | bridge → target | bridge → middle → HsDir |
+
+HsDir uploads never drop below three relays: HsDirs answer
+`Rejecting single hop HS descriptor post` when the previous hop is a
+client, and a bridge counts as one. Arti shares one onion-circuit pool per
+process, so all enabled services must use the same value. Values below `4`
+log a startup warning: a shorter chain trades anonymity for latency and is
+meant for censorship circumvention, not anonymity. Observed with a warm
+client: `2` → first request 7.4 s, repeats ~0.37 s; `3` → 4.7 s, repeats
+~0.7 s.
 
 ## Limitations
 
@@ -165,8 +192,8 @@ the server if it does not settle.
   the `::` literal marker (an unquoted `[` starts an inline compound) —
   see the `onion_services` section of the README for the exact wording.
 - **`tor.circuit_hops` (2 or 3) affects only client-side onion
-  circuits**; service-side circuits always use standard length. See
-  [bridges](../bridges.md).
+  circuits**; service-side length is the per-service `circuit_hops`
+  (see Circuit length above and [bridges](../bridges.md)).
 - **At most 256 concurrent streams per service**; each connect to the
   local target has a **10 s timeout**, and a refused or timed-out target
   closes that stream only. A service whose launch fails is retried with a
