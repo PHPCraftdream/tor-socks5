@@ -252,6 +252,31 @@ pub(crate) async fn run_server(
                 producer_token.clone(),
             ));
 
+            // Onion services from the config: one more producer (launches
+            // each enabled service, forwards its virtual ports to local
+            // targets, holds the onion keystore lock for their lifetime).
+            // Gated on the `onion-service` feature; a build without it only
+            // warns — missing support is not an error.
+            #[cfg(feature = "onion-service")]
+            crate::onion::service::spawn_services(
+                handle.clone(),
+                &cfg.onion_services,
+                config_path.as_deref(),
+                producer_token.clone(),
+                &mut producers,
+            );
+            #[cfg(not(feature = "onion-service"))]
+            {
+                let enabled = cfg
+                    .onion_services
+                    .iter()
+                    .filter(|service| service.enabled)
+                    .count();
+                if enabled > 0 {
+                    warn!("built without onion-service support; {enabled} onion service(s) not started");
+                }
+            }
+
             Egress::Tor(handle)
         }
     };

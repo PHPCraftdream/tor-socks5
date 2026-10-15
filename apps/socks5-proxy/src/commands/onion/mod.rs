@@ -5,5 +5,7 @@ pub(crate) mod address;
 #[cfg(feature = "onion-service")]
 pub(crate) mod commands;
 #[cfg(feature = "onion-service")]
+pub(crate) mod service;
+#[cfg(feature = "onion-service")]
 pub(crate) mod store;
 pub(crate) mod vanity;
