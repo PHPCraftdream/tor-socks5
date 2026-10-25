@@ -204,6 +204,12 @@ jobs:
         with:
           tool: nextest
       - uses: Swatinem/rust-cache@v2
+      # ACL-тесты биндят отдельный loopback source 127.0.0.2; на macOS он не
+      # назначен lo0 автоматически — назначаем явно перед тестами.
+      - name: Assign loopback alias 127.0.0.2 (macOS)
+        if: runner.os == 'macOS'
+        run: sudo ifconfig lo0 alias 127.0.0.2 up
+        shell: bash
       - run: cargo nextest run --workspace --locked --profile ci
         shell: bash
       # DNS stress на Windows: повторить весь DNS suite 10 раз в PR CI
@@ -246,6 +252,12 @@ jobs:
         with:
           tool: nextest
       - uses: Swatinem/rust-cache@v2
+      # ACL-тесты биндят отдельный loopback source 127.0.0.2; на macOS он не
+      # назначен lo0 автоматически — назначаем явно перед тестами.
+      - name: Assign loopback alias 127.0.0.2 (macOS)
+        if: runner.os == 'macOS'
+        run: sudo ifconfig lo0 alias 127.0.0.2 up
+        shell: bash
       - run: cargo nextest run $PKGS --locked --profile ci
         shell: bash
       # DNS stress на Windows: только если DNS package затронут изменениями
