@@ -424,6 +424,11 @@ jobs:
       - name: install.sh offline suite (real POSIX sh as child process)
         run: python3 -I .github/install/tests/test_install.py ShInstallTests
         shell: bash
+      # Live-update: реальная компиляция фикстур (cc/clang) + живой процесс
+      # под заменой бинарника (см. running/test_live_update.py)
+      - name: install.sh live-update suite (compiled fixtures)
+        run: python3 -I .github/install/tests/running/test_live_update.py ShLiveUpdateTests
+        shell: bash
 
   installer-windows:
     name: Installer PowerShell offline tests (5.1 + 7)
@@ -439,7 +444,9 @@ jobs:
         run: |
           $errors = $null
           foreach ($f in @('.github\install\install.ps1',
-                           '.github\install\tests\powershell_mock.ps1')) {
+                           '.github\install\tests\powershell_mock.ps1',
+                           '.github\install\tests\running\compile_windows.ps1',
+                           '.github\install\tests\running\hold_mutex.ps1')) {
             $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $f))
             if ($bytes.Length -lt 3 -or $bytes[0] -ne 0xEF -or
                 $bytes[1] -ne 0xBB -or $bytes[2] -ne 0xBF) {
@@ -458,7 +465,9 @@ jobs:
         run: |
           $errors = $null
           foreach ($f in @('.github\install\install.ps1',
-                           '.github\install\tests\powershell_mock.ps1')) {
+                           '.github\install\tests\powershell_mock.ps1',
+                           '.github\install\tests\running\compile_windows.ps1',
+                           '.github\install\tests\running\hold_mutex.ps1')) {
             $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $f))
             if ($bytes.Length -lt 3 -or $bytes[0] -ne 0xEF -or
                 $bytes[1] -ne 0xBB -or $bytes[2] -ne 0xBF) {
@@ -475,6 +484,11 @@ jobs:
       # Сьют сам прогоняет установщик под ОБОИМИ движками (powershell + pwsh)
       - name: install.ps1 offline suite (both engines)
         run: python -I .github/install/tests/test_install.py PowerShellInstallTests
+        shell: pwsh
+      # Live-update: compile_windows.ps1 (5.1, отдельный хост на компиляцию)
+      # собирает .NET Framework PE; сьют проверяет 2 движка сам
+      - name: install.ps1 live-update suite (both engines, compiled fixtures)
+        run: python -I .github/install/tests/running/test_live_update.py WindowsLiveUpdateTests
         shell: pwsh
 
   release-scripts:
