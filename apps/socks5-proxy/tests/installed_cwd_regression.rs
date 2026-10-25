@@ -307,8 +307,7 @@ fn cli_flag_overrides_cwd() {
     fs::write(&override_config, OLD_LAYOUT_CONFIG).unwrap();
 
     let stdout = assert_ok_output(&run_bounded(
-        &mut case
-            .command(&["config", "migrate", "--config"])
+        case.command(&["config", "migrate", "--config"])
             .arg(&override_config),
     ));
     assert!(
@@ -331,8 +330,7 @@ fn env_var_overrides_cwd() {
     fs::write(&env_config, OLD_LAYOUT_CONFIG).unwrap();
 
     let stdout = assert_ok_output(&run_bounded(
-        &mut case
-            .command(&["config", "migrate"])
+        case.command(&["config", "migrate"])
             .env("TOR_SOCKS5_CONFIG", &env_config),
     ));
     assert!(
@@ -355,8 +353,7 @@ fn cli_flag_beats_env_var() {
     fs::write(&flag_config, OLD_LAYOUT_CONFIG).unwrap();
 
     let stdout = assert_ok_output(&run_bounded(
-        &mut case
-            .command(&["config", "migrate", "--config"])
+        case.command(&["config", "migrate", "--config"])
             .arg(&flag_config)
             .env("TOR_SOCKS5_CONFIG", &env_config),
     ));
