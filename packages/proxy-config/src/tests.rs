@@ -976,3 +976,6 @@ fn dns_server_override_requires_explicit_resolver() {
         "override without resolver must be rejected"
     );
 }
+
+#[path = "tests/client_access.rs"]
+mod client_access;

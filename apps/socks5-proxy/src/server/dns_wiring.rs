@@ -14,7 +14,14 @@ use tracing::warn;
 use dns_server::overrides::{DnsOverride, OverrideResolver};
 use dns_server::DohProvider;
 
-use crate::config::{DnsOverrideConfig, DnsOverrideKind, DohProviderConfig};
+use crate::config::{
+    AllowedClients, Config, DnsOverrideConfig, DnsOverrideKind, DohProviderConfig,
+};
+
+/// Независимая DNS-политика (dns_server-инстанс), serde-валидация до старта.
+pub(crate) fn dns_client_access(cfg: &Config) -> AllowedClients {
+    cfg.dns_server.client_access.allowed_clients.clone()
+}
 
 /// Resolve the DNS-cache file path from the main config path. Mirrors
 /// `UsersConfig::resolve_path` (auth) and `BridgeStore::resolve_path`

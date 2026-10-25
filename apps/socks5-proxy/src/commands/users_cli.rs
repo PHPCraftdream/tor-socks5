@@ -169,6 +169,8 @@ fn cmd_add(
         hash,
         is_enabled: true,
         allowed_onion: allow_onion,
+        // Новые пользователи создаются без per-user ACL.
+        allowed_clients: None,
     });
     users.save(users_path)?;
     drop(lock);
@@ -193,6 +195,8 @@ fn cmd_add_init(users_path: &Path, name: &str, allow_onion: bool) -> Result<()> 
         hash: INIT_SENTINEL.to_string(),
         is_enabled: true,
         allowed_onion: allow_onion,
+        // Новые пользователи создаются без per-user ACL.
+        allowed_clients: None,
     });
     users.save(users_path)?;
     drop(lock);
@@ -611,12 +615,14 @@ mod tests {
                     hash: "$argon2id$v=19$m=5120,t=2,p=1$AAAAAAAAAAAAAAAAAAAA$BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into(),
                     is_enabled: true,
                     allowed_onion: false,
+                    allowed_clients: None,
                 },
                 User {
                     name: "alice".into(),
                     hash: "$argon2id$v=19$m=5120,t=2,p=1$CCCCCCCCCCCCCCCCCCCC$DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD".into(),
                     is_enabled: false,
                     allowed_onion: true,
+                    allowed_clients: None,
                 },
             ],
         };
@@ -669,6 +675,7 @@ mod tests {
                 hash: "$argon2id$v=19$m=5120,t=2,p=1$salt$hash_value_here".into(),
                 is_enabled: true,
                 allowed_onion: false,
+                allowed_clients: None,
             }],
         };
         let table = render_list(&users);
@@ -683,6 +690,7 @@ mod tests {
                 hash: "short".into(),
                 is_enabled: true,
                 allowed_onion: false,
+                allowed_clients: None,
             }],
         };
         let table = render_list(&users);
@@ -698,6 +706,7 @@ mod tests {
                 hash: "$argon2id$v=19$m=5120,t=2,p=1$AAAA$BBBB_enough_length_for_preview".into(),
                 is_enabled: false,
                 allowed_onion: false,
+                allowed_clients: None,
             }],
         };
         let table = render_list(&users);
@@ -740,6 +749,7 @@ mod tests {
                 hash: compute_hash("pw").unwrap(),
                 is_enabled: true,
                 allowed_onion: false,
+                allowed_clients: None,
             }],
         }
         .save(&path)
@@ -785,5 +795,35 @@ mod tests {
         // The failed transaction must not have touched the registry.
         let loaded = UsersConfig::load(&path).unwrap();
         assert!(verify_hash(&loaded.find("alice").unwrap().hash, "pw").unwrap());
+    }
+
+    #[test]
+    fn real_cli_writers_preserve_allowed_clients() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = tmp_users_path(dir.path());
+        let mut prompt = fixed_prompt("secret123");
+        cmd_add(&path, "alice", &mut prompt, false).unwrap();
+        // Ручная правка users.ktav: оператор задаёт per-user ACL.
+        let mut cfg = UsersConfig::load(&path).unwrap();
+        cfg.find_mut("alice").unwrap().allowed_clients =
+            Some("loopback".parse().expect("valid allow-list"));
+        cfg.save(&path).unwrap();
+        // Реальные CLI-мутации не должны терять поле.
+        cmd_set_onion(&path, "alice", true).unwrap();
+        cmd_set_password(&path, "alice", &mut fixed_prompt("newpass456")).unwrap();
+        cmd_disable(&path, "alice").unwrap();
+        let reloaded = UsersConfig::load(&path).unwrap();
+        let alice = reloaded.find("alice").unwrap();
+        assert_eq!(
+            alice
+                .allowed_clients
+                .as_ref()
+                .expect("ACL пережил CLI-мутации")
+                .as_str(),
+            "loopback"
+        );
+        assert!(alice.allowed_onion);
+        assert!(!alice.is_enabled);
+        assert!(verify_hash(&alice.hash, "newpass456").unwrap());
     }
 }

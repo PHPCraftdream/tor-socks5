@@ -3,7 +3,10 @@ use super::*;
 use hickory_proto::op::{MessageType, OpCode};
 use hickory_proto::rr::rdata::{A, AAAA, CNAME, HTTPS, MX, NULL, PTR, SOA, SVCB, TXT};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
-use tokio::io::AsyncWriteExt;
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
@@ -14,7 +17,7 @@ const CASE_BUDGET: Duration = Duration::from_secs(30);
 
 #[path = "server_contract_tests.rs"]
 mod contracts;
-#[path = "server_multi_listen_tests.rs"]
+#[path = "listeners/server_multi_listen_tests.rs"]
 mod multi_listen;
 #[path = "server_prefetch_tests.rs"]
 mod prefetch;
@@ -25,10 +28,10 @@ mod retry;
 #[path = "server_statistics_tests.rs"]
 mod statistics;
 
-fn question(host: &str, kind: RecordType) -> Query {
+pub(super) fn question(host: &str, kind: RecordType) -> Query {
     Query::query(Name::from_ascii(host).unwrap(), kind)
 }
-fn request(host: &str, kind: RecordType, id: u16) -> Message {
+pub(super) fn request(host: &str, kind: RecordType, id: u16) -> Message {
     let mut message = Message::new(id, MessageType::Query, OpCode::Query);
     message.metadata.recursion_desired = true;
     message.add_query(question(host, kind));
@@ -118,9 +121,14 @@ fn ctx(
         endpoints: Arc::new(RwLock::new(endpoints)),
         route_probe: local::route_probe(),
         statistics: None,
+        client_access: Arc::new(AllowedClients::default()),
     }
 }
-async fn udp_exchange(socket: &UdpSocket, addr: SocketAddr, message: &Message) -> Message {
+pub(super) async fn udp_exchange(
+    socket: &UdpSocket,
+    addr: SocketAddr,
+    message: &Message,
+) -> Message {
     socket
         .send_to(&message.to_vec().unwrap(), addr)
         .await
@@ -132,6 +140,39 @@ async fn udp_exchange(socket: &UdpSocket, addr: SocketAddr, message: &Message) -
         .unwrap();
     Message::from_vec(&bytes[..len]).unwrap()
 }
+/// Тестовый наблюдатель: считает успешно прочитанные через poll_read байты.
+/// Не дублирует framing, не считает ошибочные poll и не утверждает фактов
+/// о записи сервера.
+struct ReadObserver<'a, S> {
+    stream: &'a mut S,
+    read: usize,
+}
+
+impl<'a, S: AsyncRead + Unpin> ReadObserver<'a, S> {
+    fn new(stream: &'a mut S) -> Self {
+        Self { stream, read: 0 }
+    }
+
+    fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let result = Pin::new(&mut *self.stream).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &result {
+            self.read += buf.filled().len() - before;
+        }
+        result
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for ReadObserver<'_, S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.get_mut().poll_read(cx, buf)
+    }
+}
+
 async fn tcp_exchange(stream: &mut TcpStream, message: &Message) -> Message {
     let bytes = message.to_vec().unwrap();
     // Deliberately split the length prefix and body, using real TCP. NODELAY
@@ -144,11 +185,29 @@ async fn tcp_exchange(stream: &mut TcpStream, message: &Message) -> Message {
     for chunk in bytes.chunks(3) {
         stream.write_all(chunk).await.unwrap();
     }
-    let body = wire::read_framed_message(stream, Duration::from_secs(5))
-        .await
-        .unwrap()
-        .unwrap();
-    Message::from_vec(&body).unwrap()
+    // Диагностика Windows RST: production read_framed_message под наблюдателем;
+    // при сбое печатаем реально прочитанные байты, монотонное время и адреса.
+    let started = std::time::Instant::now();
+    let local = stream.local_addr().ok();
+    let peer = stream.peer_addr().ok();
+    let (frame, bytes_read) = {
+        let mut observed = ReadObserver::new(stream);
+        let frame = wire::read_framed_message(&mut observed, Duration::from_secs(5)).await;
+        (frame, observed.read)
+    };
+    match frame {
+        Ok(Some(body)) => Message::from_vec(&body).unwrap(),
+        Ok(None) => panic!(
+            "tcp response: EOF instead of reply: elapsed={:?}, bytes_read={bytes_read}, local={local:?}, peer={peer:?}",
+            started.elapsed()
+        ),
+        Err(error) => panic!(
+            "tcp response read failed: elapsed={:?}, bytes_read={bytes_read}, kind={:?}, raw_os_error={:?}, local={local:?}, peer={peer:?}, error={error}",
+            started.elapsed(),
+            error.kind(),
+            error.raw_os_error()
+        ),
+    }
 }
 
 /// Counterfactual: moving override/cache before local or merging A+AAAA gives
@@ -553,6 +612,7 @@ async fn expired_total_deadline_cancels_tunnel_acquisition() {
         endpoints: Arc::new(RwLock::new(vec![])),
         route_probe: local::route_probe(),
         statistics: None,
+        client_access: Arc::new(AllowedClients::default()),
     };
     let deadline = Instant::now();
     assert!(
@@ -588,6 +648,7 @@ async fn scoped_cancellation_releases_pending_tunnel_and_unavailable_tor_servfai
         endpoints: Arc::new(RwLock::new(vec![addr])),
         route_probe: local::route_probe(),
         statistics: None,
+        client_access: Arc::new(AllowedClients::default()),
     };
     let mut service = Box::pin(listener::udp_loop(udp, ctx, backend.clone()));
     let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -612,6 +673,7 @@ async fn scoped_cancellation_releases_pending_tunnel_and_unavailable_tor_servfai
         endpoints: Arc::new(RwLock::new(vec![])),
         route_probe: local::route_probe(),
         statistics: None,
+        client_access: Arc::new(AllowedClients::default()),
     };
     let req = request("unavailable.example.", RecordType::TXT, 902);
     let answer = resolve_miss(
@@ -699,4 +761,82 @@ async fn real_tcp_zero_partial_eof_and_oversized_write_guards() {
             .unwrap()
             .is_none()
     );
+}
+
+// Тесты самого наблюдателя чтения, не regression RST: детерминированные
+// reader'ы без сети. Cursor корректно отдаёт хвост чанка при малом буфере.
+#[tokio::test]
+async fn read_observer_counts_every_partial_poll_read_increment() {
+    let mut source = io::Cursor::new(vec![0u8, 3, 1, 2, 3]);
+    let mut observed = ReadObserver::new(&mut source);
+    let frame = wire::read_framed_message(&mut observed, Duration::from_secs(5))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(frame, vec![1, 2, 3]);
+    assert_eq!(
+        observed.read, 5,
+        "каждый успешный poll_read инкремент учитывается"
+    );
+}
+
+#[tokio::test]
+async fn read_observer_leaves_eof_uncounted() {
+    let mut source = io::Cursor::new(Vec::new());
+    let mut observed = ReadObserver::new(&mut source);
+    let frame = wire::read_framed_message(&mut observed, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(frame, None, "EOF остаётся EOF, не пустым ответом");
+    assert_eq!(observed.read, 0, "EOF не увеличивает счётчик");
+}
+
+// Терминальная ошибка после первого байта: счётчик сохраняется, Err не глотается.
+struct FailAfterFirstByte {
+    first: bool,
+}
+
+impl AsyncRead for FailAfterFirstByte {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.first {
+            this.first = false;
+            buf.put_slice(&[0]);
+            return Poll::Ready(Ok(()));
+        }
+        Poll::Ready(Err(io::Error::from(io::ErrorKind::ConnectionReset)))
+    }
+}
+
+#[tokio::test]
+async fn read_observer_keeps_bytes_before_terminal_read_error() {
+    let mut source = FailAfterFirstByte { first: true };
+    let mut observed = ReadObserver::new(&mut source);
+    let error = wire::read_framed_message(&mut observed, Duration::from_secs(5))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+    assert_eq!(
+        observed.read, 1,
+        "ошибочный poll не считается, успешный до него — считается"
+    );
+}
+
+// Ключевой случай: уже заполненный ReadBuf. Счётчик — только НОВЫЕ байты,
+// а не весь filled().len() (регрессия `read += buf.filled().len()` ловится здесь).
+#[tokio::test]
+async fn read_observer_counts_only_new_bytes_over_prefilled_buffer() {
+    let mut source = io::Cursor::new(vec![7u8]);
+    let mut observed = ReadObserver::new(&mut source);
+    let mut storage = [0u8; 4];
+    let mut buf = ReadBuf::new(&mut storage);
+    buf.advance(1);
+    let result = std::future::poll_fn(|cx| observed.poll_read(cx, &mut buf)).await;
+    result.expect("наблюдаемое чтение должно завершиться успешно");
+    assert_eq!(buf.filled().len(), 2, "1 заполненный байт + 1 новый");
+    assert_eq!(observed.read, 1, "считаются только новые байты");
 }

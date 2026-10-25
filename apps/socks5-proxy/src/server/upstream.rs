@@ -14,6 +14,8 @@ use resocks5_net::connect::{dial_plain, AnyUpstream, DialOptions, HostPort};
 use resocks5_net::types::ProxyConfig;
 use resocks5_net::{socks5_rep_description, ConnectError, Stage};
 
+use crate::config::UpstreamConfig;
+
 /// Whole-budget deadline for one upstream setup attempt: TCP connect
 /// (including DNS), method negotiation, RFC 1929 auth and the CONNECT
 /// reply. Armed once per `connect` call and never renewed. On expiry the
@@ -152,6 +154,56 @@ fn describe_connect_error(address: &str, err: ConnectError) -> anyhow::Error {
         _ => format!("connecting to upstream SOCKS5 {address}"),
     };
     anyhow::Error::new(err).context(context)
+}
+
+/// Decide whether to use an upstream SOCKS5 egress, applying the rule
+/// "CLI overrides config". Returns `Ok(None)` to fall back to Tor.
+pub(crate) fn pick_upstream(
+    cfg: &UpstreamConfig,
+    cli_address: Option<&str>,
+    cli_user: Option<&str>,
+    cli_pass: Option<&str>,
+    no_upstream: bool,
+) -> Result<Option<Upstream>> {
+    if no_upstream {
+        return Ok(None);
+    }
+    // Presence of `--upstream` enables it regardless of the config flag.
+    let enabled = cli_address.is_some() || cfg.enabled;
+    if !enabled {
+        return Ok(None);
+    }
+
+    let address = cli_address
+        .map(str::to_string)
+        .unwrap_or_else(|| cfg.address.clone());
+    if address.trim().is_empty() {
+        bail!(
+            "upstream proxy is enabled but no address is set (config `upstream.address` or --upstream HOST:PORT)"
+        );
+    }
+
+    // A username from either source switches on auth; the password
+    // follows from the same precedence (CLI over config).
+    let username = cli_user
+        .map(str::to_string)
+        .or_else(|| (!cfg.username.is_empty()).then(|| cfg.username.clone()));
+    let password = cli_pass
+        .map(str::to_string)
+        .or_else(|| (!cfg.password.is_empty()).then(|| cfg.password.clone()));
+    let credentials = username.map(|u| (u, password.unwrap_or_default()));
+
+    let up = Upstream::new(address, credentials);
+    // Fail fast at startup: the address is parsed once (into the
+    // library's `ProxyConfig`), so an unparsable one would otherwise
+    // only surface on the first client's CONNECT.
+    if !up.is_valid_address() {
+        bail!(
+            "upstream proxy address {:?} is not a valid HOST:PORT pair",
+            up.address()
+        );
+    }
+    Ok(Some(up))
 }
 
 #[cfg(test)]

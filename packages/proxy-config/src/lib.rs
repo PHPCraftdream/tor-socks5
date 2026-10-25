@@ -46,6 +46,10 @@ use override_patterns::override_patterns;
 #[path = "layout/tor.rs"]
 mod tor;
 pub use tor::TorConfig;
+
+/// Реэкспорт, чтобы обвязке auth/dns-server/CLI/FFI хватало одного пути
+/// импорта (`proxy_config::...`) для типов клиентского ACL.
+pub use client_acl::{AllowedClients, AllowedClientsError, ClientAccessConfig};
 const ENV_VAR: &str = "TOR_SOCKS5_CONFIG";
 const DEFAULT_FILE: &str = "tor-socks5.ktav";
 pub(crate) static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -192,6 +196,12 @@ pub struct DnsServerConfig {
     /// security posture ("queries leave the machine only inside the Tor
     /// tunnel") is unchanged unless an operator explicitly opts a host in.
     pub overrides: Vec<DnsOverrideConfig>,
+    /// Какие IP-адреса клиентов могут опрашивать локальный DNS-слушатель.
+    /// Ключ Ktav `dns_server.client_access.allowed_clients`: одна скалярная
+    /// строка в грамматике [`AllowedClients`]. По умолчанию `*` (разрешить
+    /// всё). Экземпляр независим от `security.client_access`: слушатели
+    /// ограничиваются раздельно и могут пускать разных клиентов.
+    pub client_access: ClientAccessConfig,
 }
 
 impl Default for DnsServerConfig {
@@ -202,6 +212,7 @@ impl Default for DnsServerConfig {
             disable_builtin_providers: false,
             custom_doh_providers: Vec::new(),
             overrides: Vec::new(),
+            client_access: ClientAccessConfig::default(),
         }
     }
 }
@@ -268,17 +279,28 @@ pub struct DnsOverrideConfig {
 }
 
 /// Security policy for destinations accepted by the local SOCKS5 listener.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct SecurityConfig {
     /// Reject `.onion` destinations before a Tor stream is opened. Enabled by default;
     /// set to `false` only when onion access is explicitly desired.
     pub block_onion: bool,
+    /// Какие IP-адреса клиентов могут подключаться к локальному SOCKS5-слушателю.
+    /// Ключ Ktav `security.client_access.allowed_clients`: одна скалярная
+    /// строка в грамматике [`AllowedClients`] (точные IP, wildcards,
+    /// `loopback`, `*`). По умолчанию `*` (разрешить всё) — старые конфиги
+    /// без ключа сохраняют поведение; явно пустая строка — ошибка загрузки.
+    /// Сериализация пишет исходную строку, орфография оператора сохраняется
+    /// при round-trip.
+    pub client_access: ClientAccessConfig,
 }
 
 impl Default for SecurityConfig {
     fn default() -> Self {
-        Self { block_onion: true }
+        Self {
+            block_onion: true,
+            client_access: ClientAccessConfig::default(),
+        }
     }
 }
 

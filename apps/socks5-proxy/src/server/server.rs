@@ -16,7 +16,7 @@ use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{Config, Loaded, UpstreamConfig};
+use crate::config::{Config, Loaded, SecurityConfig};
 use crate::conn_health::{spawn_conn_health_logger, ConnHealthCounters};
 use crate::dns_wiring::{convert_custom_doh_providers, convert_dns_overrides, dns_cache_path};
 use crate::startup::{init_tracing, install_crypto_provider};
@@ -325,10 +325,9 @@ pub(crate) async fn run_server(
             "starting DNS-over-Tor listener"
         );
         // One more producer beside the bridge-upkeep tasks: cancelled and
-        // joined by the same shutdown choreography below. `run` binds the
-        // UDP+TCP listeners itself; an error exit is logged, not fatal —
-        // the DNS listener is an auxiliary service next to the SOCKS5 path.
+        // joined by the same shutdown choreography; error exit is not fatal.
         let dns_listen = cfg.dns_server.listen.clone();
+        let dns_client_access = crate::dns_wiring::dns_client_access(&cfg);
         let producer_handle = handle.clone();
         let dns_token = producer_token.clone();
         producers.push(tokio::spawn(async move {
@@ -339,7 +338,7 @@ pub(crate) async fn run_server(
                 let handle = producer_handle.clone();
                 async move { handle.tunnel().await }
             };
-            if let Err(error) = dns_server::server::run(
+            if let Err(error) = dns_server::server::run_with_client_access(
                 &dns_listen,
                 tunnel,
                 cache,
@@ -347,6 +346,7 @@ pub(crate) async fn run_server(
                 overrides,
                 cache_path,
                 dns_token,
+                dns_client_access,
             )
             .await
             {
@@ -395,7 +395,7 @@ pub(crate) async fn run_server(
             permits.clone(),
             conn_health.clone(),
             next_conn_id.clone(),
-            cfg.security.block_onion,
+            cfg.security.clone(),
         ));
     }
     let mut retries = retry_addresses
@@ -422,7 +422,7 @@ pub(crate) async fn run_server(
                         permits.clone(),
                         conn_health.clone(),
                         next_conn_id.clone(),
-                        cfg.security.block_onion,
+                        cfg.security.clone(),
                     ));
                 }
             }
@@ -516,55 +516,9 @@ async fn shutdown_producers(
     }
 }
 
-/// Decide whether to use an upstream SOCKS5 egress, applying the rule
-/// "CLI overrides config". Returns `Ok(None)` to fall back to Tor.
-fn pick_upstream(
-    cfg: &UpstreamConfig,
-    cli_address: Option<&str>,
-    cli_user: Option<&str>,
-    cli_pass: Option<&str>,
-    no_upstream: bool,
-) -> Result<Option<upstream::Upstream>> {
-    if no_upstream {
-        return Ok(None);
-    }
-    // Presence of `--upstream` enables it regardless of the config flag.
-    let enabled = cli_address.is_some() || cfg.enabled;
-    if !enabled {
-        return Ok(None);
-    }
-
-    let address = cli_address
-        .map(str::to_string)
-        .unwrap_or_else(|| cfg.address.clone());
-    if address.trim().is_empty() {
-        bail!(
-            "upstream proxy is enabled but no address is set (config `upstream.address` or --upstream HOST:PORT)"
-        );
-    }
-
-    // A username from either source switches on auth; the password
-    // follows from the same precedence (CLI over config).
-    let username = cli_user
-        .map(str::to_string)
-        .or_else(|| (!cfg.username.is_empty()).then(|| cfg.username.clone()));
-    let password = cli_pass
-        .map(str::to_string)
-        .or_else(|| (!cfg.password.is_empty()).then(|| cfg.password.clone()));
-    let credentials = username.map(|u| (u, password.unwrap_or_default()));
-
-    let up = upstream::Upstream::new(address, credentials);
-    // Fail fast at startup: the address is parsed once (into the
-    // library's `ProxyConfig`), so an unparsable one would otherwise
-    // only surface on the first client's CONNECT.
-    if !up.is_valid_address() {
-        bail!(
-            "upstream proxy address {:?} is not a valid HOST:PORT pair",
-            up.address()
-        );
-    }
-    Ok(Some(up))
-}
+// Логика выбора upstream-egress ("CLI поверх конфига") живёт в своём
+// модуле; реэкспорт сохраняет существующие вызовы и видимость через `super::*`.
+use crate::upstream::pick_upstream;
 
 /// Accept connections on `listener` forever, spawning one task per
 /// connection. Accept errors are logged and retried with a backoff, so the
@@ -582,7 +536,7 @@ async fn accept_loop(
     permits: Arc<tokio::sync::Semaphore>,
     conn_health: ConnHealthCounters,
     next_conn_id: Arc<AtomicU64>,
-    block_onion: bool,
+    security: SecurityConfig,
 ) {
     loop {
         let (client, peer) = match listener.accept().await {
@@ -593,6 +547,12 @@ async fn accept_loop(
                 continue;
             }
         };
+        // Глобальный ingress-ACL: deny до permit/spawn — drop без ответных байт.
+        if !security.client_access.allowed_clients.allows(peer.ip()) {
+            debug!(%peer, "client rejected by security.client_access.allowed_clients");
+            drop(client);
+            continue;
+        }
         let conn_id = next_conn_id.fetch_add(1, Ordering::Relaxed);
         let egress = egress.clone();
         let auth = auth.clone();
@@ -612,7 +572,7 @@ async fn accept_loop(
                 egress,
                 auth,
                 conn_health.clone(),
-                block_onion,
+                security.block_onion,
                 conn_id,
             )
             .await
@@ -831,6 +791,26 @@ async fn handle_client(
         return Ok(());
     }
 
+    // Per-user client ACL (allowed_clients учётки): после успешного
+    // handshake личность уже проверена — берём имя из запроса, а не из
+    // сырого ProxyAuthorization. Peer — реальный адрес принятого сокета.
+    // Auth выключен — ACL не применяется; активирован, но имя отсутствует —
+    // fail-closed. Отказ до любого egress, relay-задач не порождаем.
+    let peer_ip = client.peer_addr().ok().map(|addr| addr.ip());
+    let user_allowed = match (auth.as_ref(), req.username(), peer_ip) {
+        (Some(state), Some(name), Some(peer)) => state.client_allowed(name, peer),
+        (Some(_), _, _) => false,
+        (None, _, _) => true,
+    };
+    if !user_allowed {
+        warn!(
+            peer = ?peer_ip,
+            "refused connection: user's allowed_clients policy denies this source"
+        );
+        req.reply(&mut client, Reply::Forbidden).await.ok();
+        return Ok(());
+    }
+
     match egress {
         Egress::Tor(handle) => {
             handle.bridge_refresh().request();
@@ -907,7 +887,11 @@ async fn handle_client(
         Egress::Upstream(up) => {
             info!(host = ?host, port = port, "forwarding through upstream SOCKS5");
             let mut upstream_stream = match up.connect(host, port).await {
-                Ok(s) => s,
+                Ok(s) => {
+                    // Успешный upstream-connect: счётчик до Established — как в Tor-ветке.
+                    conn_health.record_connect_ok();
+                    s
+                }
                 Err(e) => {
                     req.reply(&mut client, Reply::GeneralFailure).await.ok();
                     conn_health.record_connect_failed();
@@ -983,6 +967,9 @@ mod binding;
 #[path = "listen/server_listen_tests.rs"]
 mod listen_tests;
 
+#[cfg(test)]
+#[path = "listen/server_acl_tests.rs"]
+mod acl_tests;
 #[cfg(test)]
 #[path = "listen/server_tests.rs"]
 mod tests;

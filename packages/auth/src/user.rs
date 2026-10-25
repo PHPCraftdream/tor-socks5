@@ -23,6 +23,10 @@ pub struct User {
     /// predate this field load as `false`.
     #[serde(default)]
     pub allowed_onion: bool,
+    /// Дополнительный ACL клиентов для этой учётки. None = ограничения нет.
+    /// Явная пустая строка — ошибка загрузки, а не None/inherit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_clients: Option<client_acl::AllowedClients>,
 }
 
 fn default_true() -> bool {

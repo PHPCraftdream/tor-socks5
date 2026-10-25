@@ -204,7 +204,19 @@ jobs:
         with:
           tool: nextest
       - uses: Swatinem/rust-cache@v2
+      # ACL-тесты биндят отдельный loopback source 127.0.0.2; на macOS он не
+      # назначен lo0 автоматически — назначаем явно перед тестами.
+      - name: Assign loopback alias 127.0.0.2 (macOS)
+        if: runner.os == 'macOS'
+        run: sudo ifconfig lo0 alias 127.0.0.2 up
+        shell: bash
       - run: cargo nextest run --workspace --locked --profile ci
+        shell: bash
+      # DNS stress на Windows: повторить весь DNS suite 10 раз в PR CI
+      # (nightly flake: actual_ipv6_socket_options ConnectionReset при framed read).
+      - name: DNS stress (Windows PR, flaky-hunt)
+        if: matrix.os == 'windows-latest' && github.event_name == 'pull_request'
+        run: cargo nextest run -p tor-socks5-dns --locked --profile flaky-hunt --stress-count 10
         shell: bash
       - run: cargo test --doc --workspace --exclude saturating-time --locked
         shell: bash
@@ -213,6 +225,12 @@ jobs:
         with:
           name: junit-t2-${{ matrix.os }}
           path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        if: always() && matrix.os == 'windows-latest' && github.event_name == 'pull_request'
+        with:
+          name: junit-dns-stress-t2-windows-latest
+          path: target/nextest/flaky-hunt/junit.xml
           if-no-files-found: ignore
 
   test-affected:
@@ -234,7 +252,18 @@ jobs:
         with:
           tool: nextest
       - uses: Swatinem/rust-cache@v2
+      # ACL-тесты биндят отдельный loopback source 127.0.0.2; на macOS он не
+      # назначен lo0 автоматически — назначаем явно перед тестами.
+      - name: Assign loopback alias 127.0.0.2 (macOS)
+        if: runner.os == 'macOS'
+        run: sudo ifconfig lo0 alias 127.0.0.2 up
+        shell: bash
       - run: cargo nextest run $PKGS --locked --profile ci
+        shell: bash
+      # DNS stress на Windows: только если DNS package затронут изменениями
+      - name: DNS stress (Windows PR, flaky-hunt)
+        if: matrix.os == 'windows-latest' && github.event_name == 'pull_request' && contains(env.PKGS, 'tor-socks5-dns')
+        run: cargo nextest run -p tor-socks5-dns --locked --profile flaky-hunt --stress-count 10
         shell: bash
       # Doctests need a library target: `cargo test --doc -p <bin-only>` fails.
       - name: Doctests (library packages only)
@@ -265,6 +294,12 @@ jobs:
         with:
           name: junit-t1-${{ matrix.os }}
           path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        if: always() && matrix.os == 'windows-latest' && github.event_name == 'pull_request' && contains(env.PKGS, 'tor-socks5-dns')
+        with:
+          name: junit-dns-stress-t1-windows-latest
+          path: target/nextest/flaky-hunt/junit.xml
           if-no-files-found: ignore
 
   line-limit:

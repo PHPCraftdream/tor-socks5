@@ -17,6 +17,7 @@ fn run_and_refresh_remain_send_with_non_sync_factory() {
         endpoints: Arc::new(RwLock::new(vec![])),
         route_probe: local::route_probe(),
         statistics: None,
+        client_access: Arc::new(AllowedClients::default()),
     };
     send(refresh_question(
         context,
@@ -223,6 +224,7 @@ async fn gated_background_leaves_foreground_responsive_and_cancel_releases_permi
             endpoints: Arc::new(RwLock::new(vec![addr])),
             route_probe: local::route_probe(),
             statistics: None,
+            client_access: Arc::new(AllowedClients::default()),
         };
         let warm = request("cached.example.", RecordType::TXT, 5);
         context.cache.insert(&warm.queries[0], &ResolvedAnswer { message: upstream_reply(&warm), ttl: Duration::from_secs(60), resolved_at: time::OffsetDateTime::now_utc() });
@@ -279,6 +281,7 @@ async fn expired_refresh_deadline_drops_pending_acquisition_and_preserves_cache(
             endpoints: Arc::new(RwLock::new(vec![])),
             route_probe: local::route_probe(),
             statistics: None,
+            client_access: Arc::new(AllowedClients::default()),
         };
         let req = request("deadline.example.", RecordType::A, 1);
         context.cache.insert(
@@ -322,6 +325,7 @@ async fn unavailable_tor_and_expired_admission_keep_cache_then_next_refresh_reco
             endpoints: Arc::new(RwLock::new(vec![])),
             route_probe: local::route_probe(),
             statistics: None,
+            client_access: Arc::new(AllowedClients::default()),
         };
         context.cache.insert(
             &req.queries[0],

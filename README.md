@@ -204,6 +204,35 @@ auth.users_file:
 ## Destination policy: refuse .onion targets at the listener.
 security.block_onion: true
 
+## Контроль доступа клиентов: две независимые политики.
+## security.client_access.allowed_clients защищает слушатели SOCKS5/HTTP
+## CONNECT (CLI и Android FFI); dns_server.client_access.allowed_clients —
+## слушатели DNS (UDP+TCP). Каждое значение — одна скалярная строка,
+## разбираемая при загрузке.
+security.client_access.allowed_clients: *
+dns_server.client_access.allowed_clients: *
+## Грамматика: токены через запятую, каждый валидируется (в том числе
+## после ведущего *):
+## *  разрешить всем (значение по умолчанию, когда ключ отсутствует;
+##    явно пустая строка — ошибка загрузки, орфографии «запретить всем» нет)
+## loopback  строго в нижнем регистре: только 127.0.0.0/8 и ::1
+## точные IP: 192.168.1.5, 2001:db8::1
+## IPv4-wildcard октеты: 192.168.*.* (shorthand 192.168.* == 192.168.*.*)
+## IPv6-wildcard hextet'ы: 2001:db8:* (весь хвост после первых двух),
+##   2001:db8::* == 2001:db8:0:0:0:0:0:* (:: разворачивается в точные
+##   нули, никогда в wildcards)
+## mapped: ::ffff:192.168.*.* компилируется в эквивалентное IPv4-правило
+## Ошибки: имена хостов, CIDR, порты, zone ID, диапазоны, частичные *
+## (192.168.1*), ведущие нули. Имена никогда не резолвятся через DNS.
+## ACL прокси отклоняет пир до handshake (тихое закрытие соединения); при
+## включённой аутентификации после успешного логина дополнительно
+## применяется поле allowed_clients аккаунта из tor-socks5.users.ktav —
+## до любого исходящего трафика. См. docs/guide/auth.md и
+## docs/guide/dns-server.md.
+## Пример с реальными значениями:
+## security.client_access.allowed_clients: 127.*, ::1
+## dns_server.client_access.allowed_clients: loopback
+
 ## Bridge hostname resolution (used while probing bridges, before Tor
 ## is up). DoH races a built-in pool of public providers with pinned
 ## IP bootstrap addresses; system DNS is opt-in because carrier DNS

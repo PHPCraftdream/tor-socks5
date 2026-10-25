@@ -31,6 +31,13 @@ users: [
 - `allowed_onion` — whether the account may open connections to `.onion` hidden services.
   **Defaults to `false`**; registry files written before this field existed load as `false`
   (see *Onion access* below).
+- `allowed_clients` — необязательный per-account allow-список IP-адресов
+  клиентов (грамматика та же, что у `security.client_access.allowed_clients`).
+  Когда поля нет — аккаунт не имеет дополнительных ограничений сверх
+  глобальной политики слушателя; явный `*` НЕ обходит глобальный deny;
+  явно пустая строка — ошибка загрузки. Файл `tor-socks5.users.ktav`
+  правится вручную — CLI-команды `users` создают аккаунты без этого поля
+  и сохраняют его при мутациях password/onion/enable. Новых CLI-флагов нет.
 
 Passwords are hashed with **Argon2id** (per-user random salt). The file is written atomically
 (temp file + rename), and concurrent writers serialise on a per-file lock (see *Cross-process
@@ -73,6 +80,58 @@ no account to gate on, so anonymous clients may reach `.onion`. JNI applies only
 the global `security.block_onion` policy, not CLI per-account permissions.
 Both hosts use shared `is_onion` matching on the parsed host's final DNS label,
 case-insensitively and with trailing-dot tolerance.
+
+## Контроль доступа клиентов
+
+Кроме per-account флага `allowed_onion`, действуют две политики
+IP-allow-списков:
+
+1. **Глобальный шлюз** — `security.client_access.allowed_clients`
+   проверяется по реальному IP пира до handshake, до аутентификации и до
+   любого разбора запроса; отклонённому пиру соединение тихо закрывается.
+2. **Per-account шлюз** — после успешного логина (RFC 1929 / HTTP Basic)
+   необязательное поле `allowed_clients` аккаунта проверяется до любого
+   исходящего трафика или трафика Tor; отклонённому аккаунту —
+   Forbidden/403.
+
+Запись пользователя с полем (поле опционально: если оно опущено —
+дополнительного условия нет; явная пустая строка `allowed_clients::` —
+ошибка загрузки ACL, а не «унаследовать» глобальную политику):
+
+```ktav
+users: [
+    { name: alice, hash: init, is_enabled: true, allowed_onion: false, allowed_clients: 127.0.0.1 }
+]
+```
+
+В примере `hash: init` включает TOFU: первый разрешённый вход задаёт пароль
+учётки. Для уже настроенного пользователя сохраните действующий хеш.
+
+Политики пересекаются (логическое AND), а не объединяются. Глобальный
+список и per-user список:
+
+```ktav
+security.client_access.allowed_clients: 127.*, ::1
+```
+
+при per-user `allowed_clients: 127.0.0.1`: пир 127.8.0.1 проходит
+ГЛОБАЛЬНУЮ политику (127/8), но ОТКЛОНЯЕТСЯ per-user (там только
+127.0.0.1). Правило: разрешить должны обе политики; user `*` не
+расширяет глобальный deny. При выключенной аутентификации действует
+только глобальная политика. Политика DNS отдельна, например
+`dns_server.client_access.allowed_clients: loopback`.
+
+Применение изменений: обычные правки users-файла через CLI сами по себе
+НЕ включают live-reload уже загруженного auth state. Существующий
+TOFU-путь (`resolve_init`) при первом входе init-аккаунта авторитетно
+перечитывает users registry и переносит ACL и credentials одним
+snapshot. Полный live/hot reload политик не предусмотрен: перезапуск
+сервера применяет изменения конфига и users-файла.
+
+Когда аутентификация выключена (нет пользователей или
+`auth.enabled: false`), действует только глобальный шлюз. Неизвестные и
+выключенные аккаунты отклоняются как прежде. Обе политики применяются к
+SOCKS5 и HTTP CONNECT на общем слушателе в CLI и Android FFI.
 
 ## Trust on first use (`--init`)
 

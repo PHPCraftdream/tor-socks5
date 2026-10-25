@@ -37,6 +37,7 @@
 //!   connection offering a different password is then checked against
 //!   the freshly set hash and rejected.
 
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::RwLock;
 
@@ -201,6 +202,25 @@ impl AuthState {
             .expect("auth users lock poisoned")
             .find(name)
             .is_some_and(|u| u.is_enabled && u.allowed_onion)
+    }
+
+    /// Разрешён ли peer `peer` по per-user ACL учётки `name`. Метод всегда
+    /// fail-closed по lookup: пользователь отсутствует в текущем snapshot
+    /// ИЛИ `is_enabled == false` => `false` (в т.ч. при пустом реестре —
+    /// fail-open исключение для no-auth выбирает CALLER по configured auth
+    /// `None`, не по содержимому snapshot). Один read-guard — без двойного
+    /// lock TOCTOU. `None`-политика — без ограничений.
+    /// IPv4-mapped IPv6-пир (`::ffff:a.b.c.d`) нормализует уже
+    /// `AllowedClients::allows`, здесь повторной нормализации нет.
+    pub fn client_allowed(&self, name: &str, peer: IpAddr) -> bool {
+        let guard = self.users.read().expect("auth users lock poisoned");
+        let Some(u) = guard.find(name).filter(|u| u.is_enabled) else {
+            return false;
+        };
+        match u.allowed_clients.as_ref() {
+            Some(policy) => policy.allows(peer),
+            None => true,
+        }
     }
 
     /// Run a login attempt for `(name, password)`. Returns `true` iff
@@ -468,6 +488,7 @@ mod tests {
             hash: compute_hash(password).unwrap(),
             is_enabled: enabled,
             allowed_onion: false,
+            allowed_clients: None,
         }
     }
 
@@ -477,6 +498,7 @@ mod tests {
             hash: INIT_SENTINEL.into(),
             is_enabled: true,
             allowed_onion: false,
+            allowed_clients: None,
         }
     }
 
@@ -809,6 +831,7 @@ mod tests {
             hash: compute_hash("pw").unwrap(),
             is_enabled: enabled,
             allowed_onion,
+            allowed_clients: None,
         }
     }
 
@@ -846,6 +869,7 @@ mod tests {
             hash: INIT_SENTINEL.into(),
             is_enabled: false,
             allowed_onion: false,
+            allowed_clients: None,
         }]);
         assert!(!s.verify("alice", "chosen-pw"));
         let stored = s.users.read().unwrap().find("alice").unwrap().hash.clone();

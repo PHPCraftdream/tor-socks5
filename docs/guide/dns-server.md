@@ -35,6 +35,22 @@ dns_server.custom_doh_providers: [
 ]
 ```
 
+```ktav
+## Кто может обращаться к слушателям DNS (UDP и TCP — независимо
+## от политики прокси). Та же грамматика и то же значение по
+## умолчанию, что и на стороне прокси.
+dns_server.client_access.allowed_clients: *
+```
+
+По умолчанию — `*` (разрешить всем); явно пустая строка — ошибка загрузки.
+Отклонённые UDP-запросы тихо отбрасываются до разбора, статистики, кэша,
+probe или backend — ответа REFUSED клиент не получает. Отклонённые
+TCP-соединения закрываются до чтения первого кадра. IP-allow-список — НЕ
+аутентификация для UDP и не защита от IP-спуфинга; не доверяйте
+перенаправленным заголовкам (например, X-Forwarded-For) и адресу
+назначения. Ключ независим от `security.client_access.allowed_clients`;
+per-user идентичности в DNS нет.
+
 - `dns_server.listen` and the SOCKS5/HTTP CONNECT `listen` option both accept
   a scalar string or a list. Each scalar/list entry also accepts comma shorthand
   `host1,host2:port`: `dns_server.listen: 127.0.0.1,[::1]:15353` expands to

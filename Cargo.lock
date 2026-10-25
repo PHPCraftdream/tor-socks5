@@ -7186,9 +7186,18 @@ dependencies = [
  "serde",
  "sha2",
  "subtle",
+ "tor-socks5-client-acl",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "tor-socks5-client-acl"
+version = "0.2.0"
+dependencies = [
+ "ktav",
+ "serde",
 ]
 
 [[package]]
@@ -7202,6 +7211,7 @@ dependencies = [
  "persist-lock",
  "ptrs-gesher-bridge-line",
  "serde",
+ "tor-socks5-client-acl",
 ]
 
 [[package]]
@@ -7221,6 +7231,7 @@ dependencies = [
  "socket2",
  "thiserror 2.0.18",
  "time",
+ "tor-socks5-client-acl",
  "tokio",
  "tokio-rustls",
  "tokio-util",

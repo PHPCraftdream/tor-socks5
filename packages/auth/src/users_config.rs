@@ -137,7 +137,85 @@ mod tests {
             hash: "$argon2id$v=19$m=5120,t=2,p=1$AAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
             is_enabled: enabled,
             allowed_onion: false,
+            allowed_clients: None,
         }
+    }
+
+    #[test]
+    fn allowed_clients_absent_defaults_to_none() {
+        // Старый ktav-формат без поля: ограничения нет (None), а не `*`.
+        let raw = r#"
+name: alice
+hash: $argon2id$v=19$m=5120,t=2,p=1$salt$hash
+is_enabled: true
+"#;
+        let user: User = ktav::from_str(raw).expect("parse without allowed_clients");
+        assert!(user.allowed_clients.is_none());
+    }
+
+    #[test]
+    fn allowed_clients_scalar_parses_and_allows() {
+        // Явный скаляр (грамматика client-acl: без CIDR), compile-эквивалент:
+        // allows() разрешает адрес из списка и отвергает соседний.
+        let raw = r#"
+name: alice
+hash: $argon2id$v=19$m=5120,t=2,p=1$salt$hash
+allowed_clients: 192.0.2.*
+"#;
+        let user: User = ktav::from_str(raw).expect("parse with allowed_clients");
+        let policy = user.allowed_clients.as_ref().expect("policy loaded");
+        assert_eq!(policy.as_str(), "192.0.2.*");
+        assert!(policy.allows("192.0.2.7".parse().unwrap()));
+        assert!(!policy.allows("192.0.3.7".parse().unwrap()));
+    }
+
+    #[test]
+    fn allowed_clients_roundtrips_through_save_load() {
+        let dir = tmp_dir();
+        let path = dir.join("users-acl.ktav");
+        let mut u = user("alice", true);
+        u.allowed_clients = Some("192.0.2.*".parse().expect("valid allow-list"));
+        UsersConfig { users: vec![u] }.save(&path).unwrap();
+
+        let reloaded = UsersConfig::load(&path).unwrap();
+        let policy = reloaded
+            .find("alice")
+            .unwrap()
+            .allowed_clients
+            .as_ref()
+            .expect("policy survives roundtrip");
+        assert_eq!(policy.as_str(), "192.0.2.*");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn allowed_clients_empty_string_is_acl_error_not_ktav_syntax() {
+        // `key::` — ktav-маркер литеральной пустой строки: она доходит до
+        // AllowedClients::from_str, и ошибка — именно ACL-причина
+        // («invalid `allowed_clients` token … list is empty»), а не
+        // синтаксическая ошибка ktav. Различаем по подстрокам причины.
+        let raw = r#"
+name: alice
+hash: $argon2id$v=19$m=5120,t=2,p=1$salt$hash
+allowed_clients::
+"#;
+        let error = ktav::from_str::<User>(raw).unwrap_err().to_string();
+        assert!(
+            error.contains("allowed_clients") && error.contains("list is empty"),
+            "ожидалась ACL-ошибка пустого списка, получено: {error}"
+        );
+
+        // Невалидный токен — тоже ACL-ошибка с причиной токена.
+        let bad = r#"
+name: alice
+hash: $argon2id$v=19$m=5120,t=2,p=1$salt$hash
+allowed_clients: 192.168.1*
+"#;
+        let error = ktav::from_str::<User>(bad).unwrap_err().to_string();
+        assert!(
+            error.contains("allowed_clients"),
+            "ожидалась ACL-ошибка токена, получено: {error}"
+        );
     }
 
     #[test]
@@ -182,6 +260,51 @@ mod tests {
         assert!(reloaded.users[0].is_enabled);
         assert_eq!(reloaded.users[1].name, "bob");
         assert!(!reloaded.users[1].is_enabled);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writer_mutation_preserves_allowed_clients_through_save_load() {
+        // Существующий writer (password/onion/enabled) через find_mut НЕ
+        // теряет allowed_clients остальных/той же записи: реальный
+        // UsersConfig roundtrip, не derive-clone в памяти.
+        let dir = tmp_dir();
+        let path = dir.join("users-writer-acl.ktav");
+        let mut alice = user("alice", true);
+        alice.allowed_clients = Some("192.0.2.*".parse().expect("valid allow-list"));
+        UsersConfig {
+            users: vec![alice, user("bob", true)],
+        }
+        .save(&path)
+        .unwrap();
+
+        // CLI-стиль правки: смена hash/onion/enabled через find_mut.
+        let mut cfg = UsersConfig::load(&path).unwrap();
+        cfg.find_mut("alice").unwrap().allowed_onion = true;
+        cfg.find_mut("alice").unwrap().is_enabled = false;
+        cfg.find_mut("alice").unwrap().hash =
+            "$argon2id$v=19$m=5120,t=2,p=1$BBBBBBBBBBBBBBBBBBBB$BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into();
+        cfg.save(&path).unwrap();
+
+        let reloaded = UsersConfig::load(&path).unwrap();
+        let alice = reloaded.find("alice").unwrap();
+        assert!(alice.allowed_onion);
+        assert_eq!(
+            alice
+                .allowed_clients
+                .as_ref()
+                .expect("ACL alice на месте")
+                .as_str(),
+            "192.0.2.*"
+        );
+        assert!(!alice.is_enabled);
+        assert_eq!(
+            alice.hash,
+            "$argon2id$v=19$m=5120,t=2,p=1$BBBBBBBBBBBBBBBBBBBB$BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+        );
+        let bob = reloaded.find("bob").unwrap();
+        assert!(bob.is_enabled);
+        assert!(bob.allowed_clients.is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 

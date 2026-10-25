@@ -21,7 +21,7 @@ use arti_wrapper::{BootstrapEvent, BootstrapEventCallback, TorTunnel};
 use auth::AuthState;
 use bridge_line::BridgeLine;
 use bridge_store::BridgeStore;
-use proxy_config::BridgesConfig;
+use proxy_config::{AllowedClients, BridgesConfig};
 use resocks5_net::connect::HostPort;
 use resocks5_net::server::{IncomingRequest, Reply, ServerError};
 use time::OffsetDateTime;
@@ -179,6 +179,8 @@ pub(crate) struct BridgeHealthContext {
 pub(crate) struct ConnectionPolicy {
     pub auth_state: Option<Arc<AuthState>>,
     pub block_onion: bool,
+    /// Глобальный ingress-ACL для accept loop (клиентские IP).
+    pub allowed_clients: AllowedClients,
 }
 
 /// Final status publication at the end of `engine_main`. Skipped when this
@@ -717,7 +719,7 @@ async fn engine_async(
             info!("received stop signal");
             Ok(())
         }
-        res = accept_loop(&listener, &tunnel, permits, policy) => {
+        res = accept_loop(&listener, tunnel.clone(), permits, policy) => {
             if let Err(e) = res {
                 error!(error = %e, "accept loop exited with error");
                 Err(e.context("accept loop failed"))

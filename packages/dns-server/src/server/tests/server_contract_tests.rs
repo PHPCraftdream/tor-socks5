@@ -473,6 +473,7 @@ fn explicit_ipv6_pair(udp_only: bool, tcp_only: bool) -> std::io::Result<(UdpSoc
 async fn actual_ipv6_socket_options_define_udp_tcp_local_coverage() {
     for udp_only in [true, false] {
         for tcp_only in [true, false] {
+            eprintln!("ipv6 subcase udp_only={udp_only} tcp_only={tcp_only}: stage=server bind");
             let (udp, tcp) = explicit_ipv6_pair(udp_only, tcp_only)
                 .expect("host must support explicit UDP/TCP IPV6_V6ONLY and matching bind");
             let bound = udp.local_addr().unwrap();
@@ -538,23 +539,44 @@ async fn actual_ipv6_socket_options_define_udp_tcp_local_coverage() {
                 listener::tcp_loop(tcp, context, backend.clone(), Arc::new(Semaphore::new(64))),
             ));
             let cases = async {
+                eprintln!(
+                    "ipv6 subcase udp_only={udp_only} tcp_only={tcp_only}: stage=client bind, server={v6}"
+                );
                 let client = UdpSocket::bind("[::1]:0").await.unwrap();
+                eprintln!(
+                    "ipv6 subcase udp_only={udp_only} tcp_only={tcp_only}: stage=tcp connect, server={v6}, client={:?}",
+                    client.local_addr()
+                );
                 let mut peer = TcpStream::connect(v6).await.unwrap();
+                eprintln!(
+                    "ipv6 subcase udp_only={udp_only} tcp_only={tcp_only}: bound={bound}, tcp_local={:?}, tcp_remote={:?}",
+                    peer.local_addr(),
+                    peer.peer_addr()
+                );
                 let req = request("8.2.0.192.in-addr.arpa.", RecordType::PTR, 818);
-                for reply in [
-                    udp_exchange(&client, v6, &req).await,
-                    tcp_exchange(&mut peer, &req).await,
-                ] {
+                eprintln!(
+                    "ipv6 subcase udp_only={udp_only} tcp_only={tcp_only}: stage=udp exchange"
+                );
+                let udp_reply = udp_exchange(&client, v6, &req).await;
+                eprintln!(
+                    "ipv6 subcase udp_only={udp_only} tcp_only={tcp_only}: stage=tcp exchange"
+                );
+                let tcp_reply = tcp_exchange(&mut peer, &req).await;
+                for (stage, reply) in [("udp", udp_reply), ("tcp", tcp_reply)] {
+                    eprintln!(
+                        "ipv6 subcase udp_only={udp_only} tcp_only={tcp_only}: stage={stage} assertions"
+                    );
                     assert_eq!(
                         reply.metadata.response_code,
                         if !udp_only || !tcp_only {
                             ResponseCode::NoError
                         } else {
                             ResponseCode::ServFail
-                        }
+                        },
+                        "stage={stage}"
                     );
-                    assert!(reply.answers.is_empty());
-                    assert_eq!(backend.available_permits(), 0);
+                    assert!(reply.answers.is_empty(), "stage={stage}");
+                    assert_eq!(backend.available_permits(), 0, "stage={stage}");
                 }
             };
             timeout(CASE_BUDGET, async {

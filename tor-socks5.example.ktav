@@ -51,6 +51,12 @@ auth.users_file:
 ## Destination policy. Onion blocking is enabled by default.
 security.block_onion: true
 
+## Контроль доступа клиентов. security.client_access.allowed_clients защищает
+## слушатели SOCKS5/HTTP CONNECT, dns_server.client_access.allowed_clients —
+## слушатели DNS (оба по умолчанию * при отсутствии ключа):
+## security.client_access.allowed_clients: 127.*, ::1
+## dns_server.client_access.allowed_clients: loopback
+
 ## Background bridge-channel warm-pool (opt-in). Keeps channels to the
 ## healthiest candidate bridges open ahead of time; does not change which
 ## bridge carries traffic (that is a separate, not-yet-built feature).

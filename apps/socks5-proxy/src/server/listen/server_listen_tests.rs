@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::{AllowedClients, ClientAccessConfig, SecurityConfig};
 use futures::StreamExt;
 use std::net::SocketAddr;
 use tokio::io::AsyncReadExt;
@@ -29,7 +30,12 @@ async fn exercise_listeners(listeners: Vec<TcpListener>) {
                 permits.clone(),
                 ConnHealthCounters::default(),
                 ids.clone(),
-                false,
+                SecurityConfig {
+                    block_onion: false,
+                    client_access: ClientAccessConfig {
+                        allowed_clients: AllowedClients::default(),
+                    },
+                },
             )
         })
         .collect::<futures::stream::FuturesUnordered<_>>();

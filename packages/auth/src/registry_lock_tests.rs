@@ -48,6 +48,7 @@ fn init_user(name: &str) -> User {
         hash: INIT_SENTINEL.into(),
         is_enabled: true,
         allowed_onion: false,
+        allowed_clients: None,
     }
 }
 
@@ -57,6 +58,7 @@ fn enabled_user(name: &str, password: &str) -> User {
         hash: compute_hash(password).unwrap(),
         is_enabled: true,
         allowed_onion: false,
+        allowed_clients: None,
     }
 }
 

@@ -37,18 +37,21 @@ fn main() -> Result<()> {
                 hash: alice_hash,
                 is_enabled: true,
                 allowed_onion: false,
+                allowed_clients: None,
             },
             User {
                 name: "bob".into(),
                 hash: compute_hash("bob-pass")?,
                 is_enabled: false,
                 allowed_onion: false,
+                allowed_clients: None,
             },
             User {
                 name: "carol".into(),
                 hash: INIT_SENTINEL.into(),
                 is_enabled: true,
                 allowed_onion: false,
+                allowed_clients: None,
             },
         ],
     };

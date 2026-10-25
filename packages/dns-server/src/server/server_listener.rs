@@ -52,6 +52,12 @@ pub(super) async fn udp_loop_observed<T, F, Observe>(
             _ = work.next(), if !work.is_empty() => {},
             received = socket.recv_from(&mut buf) => {
                 let Ok((len, peer)) = received else { continue; };
+                // Проверка по реальному source peer до любого парсинга: молча
+                // дропаем пакет (без REFUSED/FORMERR), без статистики/кэша/backend.
+                if !ctx.client_access.allows(peer.ip()) {
+                    debug!(%peer, "udp dns client denied by client access policy");
+                    continue;
+                }
                 let Some(request) = wire::parse_query(&buf[..len]) else { continue; };
                 observe(&request);
                 if let Some(reply) = wire::unsupported_response(&request) {
@@ -136,7 +142,7 @@ pub(super) async fn tcp_loop_gated<T, F, MakeGate, Gate, G, Completed>(
             biased;
             _ = work.next(), if !work.is_empty() => { completed(); },
             accepted = listener.accept() => {
-                let (stream, _) = match accepted {
+                let (stream, peer) = match accepted {
                     Ok(pair) => pair,
                     Err(error) => {
                         debug!(%error, "tcp dns accept failed");
@@ -144,6 +150,12 @@ pub(super) async fn tcp_loop_gated<T, F, MakeGate, Gate, G, Completed>(
                         continue;
                     }
                 };
+                // Тот же gate, что и в UDP: по source peer из accept до
+                // capacity/permit/nodelay; deny — continue, стрим дропается.
+                if !ctx.client_access.allows(peer.ip()) {
+                    debug!(%peer, "tcp dns client denied by client access policy");
+                    continue;
+                }
                 if work.len() >= MAX_TCP_CONNECTIONS { continue; }
                 let Ok(permit) = connections.clone().try_acquire_owned() else { continue; };
                 // Small request/response frames: never wait for a delayed ACK.
@@ -181,14 +193,45 @@ async fn handle_tcp_gated<T, F, Gate, G>(
     Gate: FnMut() -> G,
     G: Future<Output = ()>,
 {
+    #[cfg(test)]
+    let mut diag = tcp_diag::TcpDiagGuard::new(stream.local_addr().ok(), stream.peer_addr().ok());
     loop {
+        #[cfg(test)]
+        diag.stage("gate");
         gate().await;
-        let Ok(Some(body)) = wire::read_framed_message(&mut stream, IO_TIMEOUT).await else {
-            return;
+        #[cfg(test)]
+        diag.stage("read");
+        let framed = wire::read_framed_message(&mut stream, IO_TIMEOUT).await;
+        let body = match framed {
+            Ok(Some(body)) => body,
+            Ok(None) => {
+                #[cfg(test)]
+                diag.terminal("eof");
+                return;
+            }
+            Err(error) => {
+                // Форматирование только под cfg(test); в prod error дропается
+                // при return, как и прежде.
+                #[cfg(test)]
+                diag.terminal(&format!(
+                    "read_error(kind={:?},os={:?})",
+                    error.kind(),
+                    error.raw_os_error()
+                ));
+                #[cfg(not(test))]
+                drop(error);
+                return;
+            }
         };
+        #[cfg(test)]
+        diag.stage("parse");
         let Some(request) = wire::parse_query(&body) else {
+            #[cfg(test)]
+            diag.terminal("parse_reject");
             return;
         };
+        #[cfg(test)]
+        diag.stage("answer");
         let reply = if let Some(reply) = wire::unsupported_response(&request) {
             reply
         } else if let Some(question) = request.queries.first().cloned() {
@@ -210,14 +253,222 @@ async fn handle_tcp_gated<T, F, Gate, G>(
         } else {
             wire::formerr(&request)
         };
+        #[cfg(test)]
+        diag.stage("encode");
         let Ok(bytes) = reply.to_vec() else {
+            #[cfg(test)]
+            diag.terminal("encode_error");
             return;
         };
-        if wire::write_framed_message(&mut stream, &bytes, IO_TIMEOUT)
-            .await
-            .is_err()
-        {
+        #[cfg(test)]
+        diag.stage("write");
+        if let Err(error) = wire::write_framed_message(&mut stream, &bytes, IO_TIMEOUT).await {
+            #[cfg(test)]
+            diag.terminal(&format!(
+                "write_error(kind={:?},os={:?})",
+                error.kind(),
+                error.raw_os_error()
+            ));
+            drop(error);
             return;
         }
+        // Успешная запись: только stage-метка (НЕ terminal), следующая
+        // итерация перезапишет её на "gate".
+        #[cfg(test)]
+        {
+            diag.record_write();
+            diag.stage("observed_write_completed");
+        }
+    }
+}
+
+// Test-only диагностика TCP-соединения (flaky RST/10054 в CI). В production
+// модуль целиком отсутствует: ни вызовов, ни аллокаций, ни I/O.
+#[cfg(test)]
+mod tcp_diag {
+    use std::future::Future;
+    use std::net::SocketAddr;
+    use std::task::{Context, Poll};
+
+    /// Чистая функция форматирования одной строки диагностики.
+    fn format_diag(
+        local: &Option<SocketAddr>,
+        peer: &Option<SocketAddr>,
+        stage: &str,
+        terminal: &str,
+        observed_writes: usize,
+    ) -> String {
+        format!(
+            "tcp_diag: local={local:?} peer={peer:?} stage={stage} \
+             terminal={terminal} observed_writes={observed_writes}"
+        )
+    }
+
+    /// Одна test-only строка в stderr без содержимого пакетов.
+    fn stderr_emit(line: &str) {
+        eprintln!("{line}");
+    }
+
+    // Буфер тестового sink изолирован по OS-потокам.
+    thread_local! {
+        static CAPTURE: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn capture_emit(s: &str) {
+        CAPTURE.with(|c| c.borrow_mut().push(s.to_string()));
+    }
+
+    fn take_capture() -> Vec<String> {
+        CAPTURE.with(|c| c.borrow_mut().drain(..).collect())
+    }
+
+    pub(super) struct TcpDiagGuard {
+        local: Option<SocketAddr>,
+        peer: Option<SocketAddr>,
+        stage: &'static str,
+        terminal: Option<String>,
+        observed_writes: usize,
+        emit: fn(&str),
+    }
+
+    impl TcpDiagGuard {
+        pub(super) fn new(local: Option<SocketAddr>, peer: Option<SocketAddr>) -> Self {
+            Self {
+                local,
+                peer,
+                stage: "entry",
+                terminal: None,
+                observed_writes: 0,
+                emit: stderr_emit,
+            }
+        }
+
+        pub(super) fn with_emit(
+            local: Option<SocketAddr>,
+            peer: Option<SocketAddr>,
+            emit: fn(&str),
+        ) -> Self {
+            let mut guard = Self::new(local, peer);
+            guard.emit = emit;
+            guard
+        }
+
+        pub(super) fn stage(&mut self, s: &'static str) {
+            self.stage = s;
+        }
+
+        /// Последний terminal непосредственно перед Drop побеждает.
+        pub(super) fn terminal(&mut self, t: &str) {
+            self.terminal = Some(t.to_string());
+        }
+
+        pub(super) fn record_write(&mut self) {
+            self.observed_writes = self.observed_writes.saturating_add(1);
+        }
+    }
+
+    impl Drop for TcpDiagGuard {
+        fn drop(&mut self) {
+            let terminal = match &self.terminal {
+                Some(t) => t.as_str(),
+                None => "unclassified_drop",
+            };
+            let line = format_diag(
+                &self.local,
+                &self.peer,
+                self.stage,
+                terminal,
+                self.observed_writes,
+            );
+            (self.emit)(&line);
+        }
+    }
+
+    fn endpoints() -> (Option<SocketAddr>, Option<SocketAddr>) {
+        (
+            Some(SocketAddr::from(([127, 0, 0, 1], 5353))),
+            Some(SocketAddr::from(([127, 0, 0, 1], 44444))),
+        )
+    }
+
+    #[test]
+    fn lifecycle_line_contains_stage_and_terminal() {
+        take_capture();
+        let (local, peer) = endpoints();
+        let mut guard = TcpDiagGuard::with_emit(local, peer, capture_emit);
+        guard.stage("read");
+        guard.terminal("eof");
+        drop(guard);
+        let lines = take_capture();
+        assert_eq!(lines.len(), 1, "got: {lines:?}");
+        let line = &lines[0];
+        assert!(line.contains("local=Some(127.0.0.1:5353)"), "got: {line}");
+        assert!(line.contains("peer=Some(127.0.0.1:44444)"), "got: {line}");
+        assert!(line.contains("stage=read"), "got: {line}");
+        assert!(line.contains("terminal=eof"), "got: {line}");
+    }
+
+    #[test]
+    fn success_then_error_is_not_masked() {
+        take_capture();
+        let (local, peer) = endpoints();
+        let mut guard = TcpDiagGuard::with_emit(local, peer, capture_emit);
+        guard.stage("write");
+        guard.record_write();
+        guard.terminal("read_error(kind=ConnectionReset,os=Some(10054))");
+        drop(guard);
+        let lines = take_capture();
+        assert_eq!(lines.len(), 1, "got: {lines:?}");
+        let line = &lines[0];
+        assert!(
+            line.contains("terminal=read_error(kind=ConnectionReset,os=Some(10054))"),
+            "got: {line}"
+        );
+        assert!(line.contains("observed_writes=1"), "got: {line}");
+    }
+
+    #[test]
+    fn cancel_after_successful_write_is_not_masked() {
+        take_capture();
+        let (local, peer) = endpoints();
+        let mut guard = TcpDiagGuard::with_emit(local, peer, capture_emit);
+        guard.record_write();
+        guard.stage("observed_write_completed");
+        drop(guard);
+        let lines = take_capture();
+        assert_eq!(lines.len(), 1, "got: {lines:?}");
+        let line = &lines[0];
+        assert!(line.contains("terminal=unclassified_drop"), "got: {line}");
+        assert!(
+            line.contains("stage=observed_write_completed"),
+            "got: {line}"
+        );
+        assert!(line.contains("observed_writes=1"), "got: {line}");
+    }
+
+    #[test]
+    fn dropped_pending_future_reports_unclassified_drop() {
+        take_capture();
+        let (local, peer) = endpoints();
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut pinned = Box::pin(async move {
+            let mut diag = TcpDiagGuard::with_emit(local, peer, capture_emit);
+            diag.stage("read");
+            std::future::pending::<()>().await;
+            drop(diag);
+        });
+        let polled = pinned.as_mut().poll(&mut cx);
+        assert!(matches!(polled, Poll::Pending));
+        // Дроп future гарантирует дроп diag внутри async-блока.
+        drop(pinned);
+        let lines = take_capture();
+        assert_eq!(lines.len(), 1, "got: {lines:?}");
+        let line = &lines[0];
+        assert!(line.contains("terminal=unclassified_drop"), "got: {line}");
+        assert!(line.contains("stage=read"), "got: {line}");
+        assert!(line.contains("local=Some(127.0.0.1:5353)"), "got: {line}");
+        assert!(line.contains("peer=Some(127.0.0.1:44444)"), "got: {line}");
     }
 }

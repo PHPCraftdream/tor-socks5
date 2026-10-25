@@ -343,6 +343,8 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
             cfg.tor.circuit_hops,
         );
         let block_onion = cfg.security.block_onion;
+        // Owned-копия для потока: `cfg` локален и не живёт в 'static.
+        let allowed_clients = cfg.security.client_access.allowed_clients.clone();
         // Captured before `loaded`/`cfg` go out of scope: the engine thread
         // needs its own owned copies to persist/rank bridge health via the
         // shared `bridge-store` crate (see `engine::engine_async`).
@@ -388,6 +390,7 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
                     engine::ConnectionPolicy {
                         auth_state,
                         block_onion,
+                        allowed_clients,
                     },
                     stop_rx,
                     done_tx,

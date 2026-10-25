@@ -585,12 +585,15 @@ pub(super) async fn persist_circuit_verify_results_async(
 /// All errors are logged and swallowed; individual connection failures don't
 /// crash the loop. Accept errors are also treated as transient and retried
 /// after `ACCEPT_ERROR_BACKOFF`.
-pub(super) async fn accept_loop(
+pub(super) async fn accept_loop<C>(
     listener: &TcpListener,
-    tunnel: &TorTunnel,
+    tunnel: C,
     permits: Arc<Semaphore>,
     policy: ConnectionPolicy,
-) -> Result<()> {
+) -> Result<()>
+where
+    C: EgressConnector + Clone + Send + 'static,
+{
     loop {
         // Accept a new connection; any accept error is treated as transient —
         // log it, back off, and retry instead of tearing down the engine.
@@ -602,6 +605,14 @@ pub(super) async fn accept_loop(
                 continue;
             }
         };
+
+        // Глобальный ingress-ACL: запрещённому пиру — drop без ответных байт,
+        // без permit и без клонов туннеля/бекенд-работы.
+        if !policy.allowed_clients.allows(peer.ip()) {
+            debug!(%peer, "client rejected by security.client_access.allowed_clients");
+            drop(client);
+            continue;
+        }
 
         // Acquire a permit before spawning (bounds task growth)
         let permit = permits
@@ -620,7 +631,7 @@ pub(super) async fn accept_loop(
 
             debug!(%peer, "new SOCKS5 connection");
 
-            match handle_connection(client, tunnel, auth, block_onion).await {
+            match handle_connection(client, peer.ip(), tunnel, auth, block_onion).await {
                 Ok(()) => {
                     debug!(%peer, "connection closed normally");
                 }
@@ -641,13 +652,15 @@ pub(super) async fn accept_loop(
     }
 }
 
-pub(super) async fn handle_connection(
+pub(super) async fn handle_connection<C: EgressConnector + Clone>(
     client: TcpStream,
-    tunnel: TorTunnel,
+    peer: std::net::IpAddr,
+    tunnel: C,
     auth: Option<Arc<AuthState>>,
     block_onion: bool,
 ) -> Result<()> {
-    let result = handle_connection_with_egress(client, auth, block_onion, tunnel.clone()).await;
+    let result =
+        handle_connection_with_egress(client, peer, auth, block_onion, tunnel.clone()).await;
     drop(tunnel);
     result
 }
@@ -678,6 +691,7 @@ impl EgressConnector for TorTunnel {
 /// Every error is terminal: owned streams drop; never retry or send a second reply.
 pub(super) async fn handle_connection_with_egress<S, C>(
     mut client: S,
+    peer: std::net::IpAddr,
     auth: Option<Arc<AuthState>>,
     block_onion: bool,
     connect: C,
@@ -688,9 +702,12 @@ where
 {
     use tokio::io::AsyncWriteExt;
 
-    let auth = auth
+    // Типизированный auth остаётся для ACL-гейта; в handshake уходит отдельная
+    // trait-object копия (PasswordVerifier), чтобы не перемещать Arc<AuthState>.
+    let proto_auth = auth
+        .clone()
         .map(|state| Arc::new(AuthStateVerifier(state)) as Arc<dyn socks5_proto::PasswordVerifier>);
-    let mut req = accept_with_deadline(&mut client, auth)
+    let mut req = accept_with_deadline(&mut client, proto_auth)
         .await
         .context("client handshake")?;
     let target = HostPort::parse(req.target()).context("invalid SDK target authority")?;
@@ -699,6 +716,23 @@ where
         req.reply(&mut client, Reply::Forbidden)
             .await
             .context("failed to send onion policy reply")?;
+        return Ok(());
+    }
+
+    // Per-user client ACL: после успешного handshake личность уже проверена —
+    // имя только из верифицированного запроса, peer — реальный адрес сокета.
+    // Auth выключен — не применяется; активирован, но имени/peer нет —
+    // fail-closed. Отказ до любого egress, без relay-задач.
+    let user_allowed = match (auth.as_deref(), req.username()) {
+        (Some(state), Some(name)) => state.client_allowed(name, peer),
+        (Some(_), None) => false,
+        (None, _) => true,
+    };
+    if !user_allowed {
+        info!(%peer, "rejecting connection by user allowed_clients policy");
+        req.reply(&mut client, Reply::Forbidden)
+            .await
+            .context("failed to send user ACL policy reply")?;
         return Ok(());
     }
 
@@ -897,3 +931,7 @@ pub(crate) fn take_auto_fetched_bridges() -> Vec<BridgeLine> {
 #[cfg(test)]
 #[path = "engine_deadline_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "engine_acl_tests.rs"]
+mod acl_tests;
