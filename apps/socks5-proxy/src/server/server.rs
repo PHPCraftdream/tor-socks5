@@ -16,7 +16,7 @@ use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{AllowedClients, Config, Loaded};
+use crate::config::{Config, Loaded, SecurityConfig};
 use crate::conn_health::{spawn_conn_health_logger, ConnHealthCounters};
 use crate::dns_wiring::{convert_custom_doh_providers, convert_dns_overrides, dns_cache_path};
 use crate::startup::{init_tracing, install_crypto_provider};
@@ -395,8 +395,7 @@ pub(crate) async fn run_server(
             permits.clone(),
             conn_health.clone(),
             next_conn_id.clone(),
-            cfg.security.block_onion,
-            cfg.security.client_access.allowed_clients.clone(),
+            cfg.security.clone(),
         ));
     }
     let mut retries = retry_addresses
@@ -423,8 +422,7 @@ pub(crate) async fn run_server(
                         permits.clone(),
                         conn_health.clone(),
                         next_conn_id.clone(),
-                        cfg.security.block_onion,
-                        cfg.security.client_access.allowed_clients.clone(),
+                        cfg.security.clone(),
                     ));
                 }
             }
@@ -538,8 +536,7 @@ async fn accept_loop(
     permits: Arc<tokio::sync::Semaphore>,
     conn_health: ConnHealthCounters,
     next_conn_id: Arc<AtomicU64>,
-    block_onion: bool,
-    allowed_clients: AllowedClients,
+    security: SecurityConfig,
 ) {
     loop {
         let (client, peer) = match listener.accept().await {
@@ -551,7 +548,7 @@ async fn accept_loop(
             }
         };
         // Глобальный ingress-ACL: deny до permit/spawn — drop без ответных байт.
-        if !allowed_clients.allows(peer.ip()) {
+        if !security.client_access.allowed_clients.allows(peer.ip()) {
             debug!(%peer, "client rejected by security.client_access.allowed_clients");
             drop(client);
             continue;
@@ -575,7 +572,7 @@ async fn accept_loop(
                 egress,
                 auth,
                 conn_health.clone(),
-                block_onion,
+                security.block_onion,
                 conn_id,
             )
             .await
@@ -890,7 +887,11 @@ async fn handle_client(
         Egress::Upstream(up) => {
             info!(host = ?host, port = port, "forwarding through upstream SOCKS5");
             let mut upstream_stream = match up.connect(host, port).await {
-                Ok(s) => s,
+                Ok(s) => {
+                    // Успешный upstream-connect: счётчик до Established — как в Tor-ветке.
+                    conn_health.record_connect_ok();
+                    s
+                }
                 Err(e) => {
                     req.reply(&mut client, Reply::GeneralFailure).await.ok();
                     conn_health.record_connect_failed();

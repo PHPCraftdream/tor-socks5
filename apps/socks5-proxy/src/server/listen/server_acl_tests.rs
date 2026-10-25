@@ -4,6 +4,7 @@
 
 use super::*;
 
+use crate::config::{AllowedClients, ClientAccessConfig, SecurityConfig};
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -32,8 +33,12 @@ async fn spawn_loop_with_policy(
         permits.clone(),
         conn_health.clone(),
         Arc::new(AtomicU64::new(1)),
-        false,
-        policy,
+        SecurityConfig {
+            block_onion: false,
+            client_access: ClientAccessConfig {
+                allowed_clients: policy,
+            },
+        },
     ));
     (permits, conn_health, handle)
 }
@@ -316,8 +321,8 @@ async fn socks5_connect(client: &mut TcpStream) -> u8 {
     reply[1]
 }
 
-/// Отрицательный контроль для user-gate: gate убран — сервер пошёл бы в
-/// upstream; поэтому каждый deny-тест ассертит именно отсутствие egress.
+// Отрицательный контроль для user-gate: gate убран — сервер пошёл бы в
+// upstream; поэтому каждый deny-тест ассертит именно отсутствие egress.
 
 /// Тест 1: глобальный deny + per-user `*`. Отказ происходит на ГЛОБАЛЬНОМ
 /// gate: 0 байт (FIN/RST) до handshake, RFC1929 даже не начинается,

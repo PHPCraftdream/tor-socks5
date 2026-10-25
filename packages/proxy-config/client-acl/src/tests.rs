@@ -282,14 +282,26 @@ fn error_message_names_the_token() {
 
 #[test]
 fn ktav_roundtrip_preserves_source_and_behaviour() {
-    let acl: AllowedClients = ktav::from_str("192.168.*").expect("ktav parses");
-    assert_eq!(acl.as_str(), "192.168.*");
-    let text = ktav::to_string(&acl).expect("ktav serialises");
+    use super::ClientAccessConfig;
+    // ktav не поддерживает scalar ROOT: оборачиваем ACL в compound-холдер.
+    let holder: ClientAccessConfig =
+        ktav::from_str("allowed_clients: 192.168.*\n").expect("ktav parses");
+    assert_eq!(holder.allowed_clients.as_str(), "192.168.*");
+    let text = ktav::to_string(&holder).expect("ktav serialises");
+    // Ровно одно string-поле с ожидаемым значением.
+    assert_eq!(
+        text.matches("allowed_clients").count(),
+        1,
+        "serialised: {text}"
+    );
     assert!(text.contains("192.168.*"), "serialised: {text}");
-    let restored: AllowedClients = ktav::from_str(&text).expect("ktav reparses");
-    assert_eq!(restored, acl);
-    assert!(restored.allows("192.168.9.9".parse().unwrap()));
-    assert!(!restored.allows("10.0.0.1".parse().unwrap()));
+    let restored: ClientAccessConfig = ktav::from_str(&text).expect("ktav reparses");
+    assert_eq!(restored.allowed_clients, holder.allowed_clients);
+    assert_eq!(restored.allowed_clients.as_str(), "192.168.*");
+    assert!(restored
+        .allowed_clients
+        .allows("192.168.9.9".parse().unwrap()));
+    assert!(!restored.allowed_clients.allows("10.0.0.1".parse().unwrap()));
 }
 
 #[test]
@@ -371,9 +383,19 @@ fn dotted_tail_with_non_mapped_prefix_is_rejected() {
 
 #[test]
 fn serde_serializes_the_source_string() {
-    let acl: AllowedClients = " 127.*, ::1 ".parse().expect("parses");
-    // Источник хранится дословно (с исходными пробелами);
-    // сериализация пишет ровно эту строку.
-    let text = ktav::to_string(&acl).expect("serialises");
-    assert!(text.contains("127.*, ::1"), "serialised: {text}");
+    use super::ClientAccessConfig;
+    let holder = ClientAccessConfig {
+        allowed_clients: " 127.*, ::1 ".parse().expect("parses"),
+    };
+    let text = ktav::to_string(&holder).expect("serialises");
+    // Ровно одно string-поле; значение — исходная строка с raw-пробелами.
+    assert_eq!(
+        text.matches("allowed_clients").count(),
+        1,
+        "serialised: {text}"
+    );
+    assert!(text.contains(" 127.*, ::1 "), "serialised: {text}");
+    // Повторный разбор: raw пробелы источника сохраняются дословно.
+    let restored: ClientAccessConfig = ktav::from_str(&text).expect("reparses");
+    assert_eq!(restored.allowed_clients.as_str(), " 127.*, ::1 ");
 }
