@@ -308,7 +308,7 @@ impl BridgeStore {
     /// kernel releases the lock on death). The final rename is atomic:
     /// readers see either the old or the new full file, never a torn state.
     /// Whole-file rename means two concurrent writers resolve as
-    /// last-writer-wins per whole snapshot; the daemon serialises its own
+    /// last-writer-wins per whole snapshot; the angel serialises its own
     /// writes through a single owner, which is a higher-level contract not
     /// enforced here.
     pub fn save(&self) -> Result<()> {

@@ -289,7 +289,7 @@ pub(crate) fn engine_main(
         // Build Tokio runtime. 8 workers, not 4: bootstrap's dirmgr/chanmgr
         // reactors need enough throughput to avoid ChanTimeout under a guard-
         // descriptor fetch burst (see docs/checkpoints/obfs4-connect-
-        // investigation.md) -- the CLI daemon runs 16 for the same reason.
+        // investigation.md) -- the CLI angel runs 16 for the same reason.
         let rt = match tokio::runtime::Builder::new_multi_thread()
             .worker_threads(8)
             .enable_all()

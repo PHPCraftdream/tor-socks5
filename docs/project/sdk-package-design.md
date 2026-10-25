@@ -233,7 +233,7 @@
 | `lyrebird` | всегда | бину нужен для запуска PT |
 | `tor-error`, `tracing-subscriber`, `tracing-appender`, `tempfile` | всегда | CLI-обвязка |
 | `windows-service`, `windows-sys` | `cfg(windows)` | сервис/JobObjects под Windows |
-| `daemonize` | `cfg(all(unix, not(target_os = "android")))` | `--daemon` под Unix |
+| `angelize` | `cfg(all(unix, not(target_os = "android")))` | `--angel` под Unix |
 
 - **`rusqlite` — отдельный случай:** он нужен самой библиотеке (модуль `verify` = bridge-verify-core, packages/bridge-verify-core/Cargo.toml), поэтому в вес бинаря не записывается и в фичу `cli` не попадает; он живёт в фиче `bridges`.
 - Смешанные зависимости: `indexmap` нужен библиотеке (config), `time` — store/dns, `getrandom` — auth (заявлен и в auth, и в CLI) — они остаются в фичах соответствующих модулей, не в `cli`.
@@ -241,7 +241,7 @@
   - **плюс** — `cargo install` из одного имени, ровно цель цельного пакета;
   - **минусы** — манифест тяжелеет (список optional-deps фичи `cli`), и бину нужен `required-features`, иначе «холодные» сборки без фич падают на отсутствующей поверхности.
 
-**Рекомендация:** включать `[[bin]]` (после открытия гейта), `required-features = ["tor", "cli"]`; фича `cli = ["dep:clap", "dep:service-manager", "dep:rpassword", "dep:serde_json", "dep:lyrebird", "dep:tor-error", "dep:tracing-subscriber", "dep:tracing-appender", "dep:tempfile", …]` + target-specific `windows-service`/`windows-sys`/`daemonize`. Имя бина (`tor-socks5` vs `socks5-proxy`) — развилка §8.2.
+**Рекомендация:** включать `[[bin]]` (после открытия гейта), `required-features = ["tor", "cli"]`; фича `cli = ["dep:clap", "dep:service-manager", "dep:rpassword", "dep:serde_json", "dep:lyrebird", "dep:tor-error", "dep:tracing-subscriber", "dep:tracing-appender", "dep:tempfile", …]` + target-specific `windows-service`/`windows-sys`/`angelize`. Имя бина (`tor-socks5` vs `socks5-proxy`) — развилка §8.2.
 
 ---
 

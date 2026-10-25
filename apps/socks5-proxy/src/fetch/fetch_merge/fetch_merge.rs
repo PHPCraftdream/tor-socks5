@@ -506,7 +506,7 @@ async fn drain_pool_with(
     );
 
     // Best-effort record — routed through the single bridge-store writer.
-    // This site runs both inside the daemon (maintenance auto-fetch via
+    // This site runs both inside the angel (maintenance auto-fetch via
     // `top_up_working`) and in the CLI `bridges fetch` subcommand, which is
     // a separate process and therefore takes the writer's inline fallback.
     // Only an unreadable on-disk store is logged here; publish failures are

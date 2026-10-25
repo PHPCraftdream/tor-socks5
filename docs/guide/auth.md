@@ -146,22 +146,22 @@ rejected if it differs).
 
 ### Cross-process serialisation of the registry
 
-Every writer of the registry — the daemon's TOFU write-back above and every mutating
+Every writer of the registry — the angel's TOFU write-back above and every mutating
 `tor-socks5 users ...` CLI command — holds a **cross-process advisory write lock** (sibling
 `<users-file>.lock` file) across its **entire read-modify-write**: from the load that reads the
 file to the atomic temp-file+rename publish that writes it. Overlapping writers are therefore
-serialised rather than last-write-wins: a CLI `disable` issued while the daemon is
+serialised rather than last-write-wins: a CLI `disable` issued while the angel is
 mid-provisioning (or vice versa) waits for the running transaction to publish and then edits
 the published state, so neither mutation is lost. The atomic rename alone protects the bytes of
 one write, not the read-modify-write around it — the lock closes that remaining window.
 
-- The daemon takes the lock with an **unbounded wait**: a refused login cannot be retried by
+- The angel takes the lock with an **unbounded wait**: a refused login cannot be retried by
   the client, so its provisioning must not fail just because another writer happened to be
   mid-transaction.
 - CLI commands wait at most **60 seconds** and then fail with a clear
   `... .lock is busy: another process holds the write lock` error instead of hanging behind a
-  busy daemon.
-- Expensive work happens **before** the lock is taken (Argon2id hashing in the daemon,
+  busy angel.
+- Expensive work happens **before** the lock is taken (Argon2id hashing in the angel,
   password prompts and hashing in the CLI), so the critical section stays short.
 - The lock file is never deleted; the kernel releases it if a holding process dies, so a
   crashed writer cannot leave the registry permanently locked.

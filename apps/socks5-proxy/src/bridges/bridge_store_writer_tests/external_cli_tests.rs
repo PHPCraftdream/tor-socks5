@@ -49,7 +49,7 @@ async fn apply_falls_back_to_inline_write_without_a_global_writer() {
 }
 
 #[tokio::test]
-async fn external_cli_write_between_daemon_mutations_survives() {
+async fn external_cli_write_between_angel_mutations_survives() {
     let dir = tempfile::tempdir().expect("tempdir");
     let b = test_bridge();
     let cli_bridge: BridgeLine =
@@ -65,7 +65,7 @@ async fn external_cli_write_between_daemon_mutations_survives() {
         INITIAL_BACKOFF,
     );
 
-    // Daemon mutation #1 publishes cleanly. Acks now precede the disk
+    // Angel mutation #1 publishes cleanly. Acks now precede the disk
     // write, so wait for the publish to land AND for the actor to retire
     // the completion (dropping its snapshot) before the external write.
     let b1 = b.clone();
@@ -73,35 +73,35 @@ async fn external_cli_write_between_daemon_mutations_survives() {
         .apply(move |s| s.note_channel_success_at(&b1, OffsetDateTime::now_utc()))
         .await
         .expect("absorbed");
-    wait_for_file_count(&path, &b, 1, "first daemon mutation published").await;
+    wait_for_file_count(&path, &b, 1, "first angel mutation published").await;
     wait_a_real_moment().await;
 
     // A separate CLI process (sequential, not concurrent) loads, adds a
-    // new bridge and bumps the daemon bridge's counter, then saves.
+    // new bridge and bumps the angel bridge's counter, then saves.
     let mut external = reload(&path);
     external.note_source_at(&cli_bridge, "cli", OffsetDateTime::now_utc());
     external.note_channel_success_at(&b, OffsetDateTime::now_utc());
     external.save().expect("external save");
 
-    // Daemon mutation #2 must build on the CLI's version, not the
-    // daemon's stale pre-CLI snapshot.
+    // Angel mutation #2 must build on the CLI's version, not the
+    // angel's stale pre-CLI snapshot.
     let b2 = b.clone();
     writer
         .apply(move |s| s.note_channel_success_at(&b2, OffsetDateTime::now_utc()))
         .await
         .expect("absorbed");
 
-    wait_for_file_count(&path, &b, 3, "daemon's second mutation published").await;
+    wait_for_file_count(&path, &b, 3, "angel's second mutation published").await;
     let store = reload(&path);
     assert_eq!(
         store.channel_ok_count(&b),
         3,
-        "daemon's second mutation must build on the CLI's counter (1 daemon + 1 CLI + 1 daemon)"
+        "angel's second mutation must build on the CLI's counter (1 angel + 1 CLI + 1 angel)"
     );
     assert_eq!(
         store.sources_of(&cli_bridge),
         vec!["cli"],
-        "CLI's new bridge must survive the daemon's next publish"
+        "CLI's new bridge must survive the angel's next publish"
     );
     assert!(
         leftover_tmp_files(dir.path()).is_empty(),
@@ -127,7 +127,7 @@ async fn external_cli_write_after_successful_retry_survives() {
         Duration::from_secs(1),
     );
 
-    // Daemon mutation #1: publish fails, snapshot retained, retry armed.
+    // Angel mutation #1: publish fails, snapshot retained, retry armed.
     let b1 = b.clone();
     writer
         .apply(move |s| s.note_channel_success_at(&b1, OffsetDateTime::now_utc()))
@@ -149,7 +149,7 @@ async fn external_cli_write_after_successful_retry_survives() {
     external.note_channel_success_at(&b, OffsetDateTime::now_utc());
     external.save().expect("external save");
 
-    // Daemon mutation #2 must build on the CLI's version.
+    // Angel mutation #2 must build on the CLI's version.
     let b2 = b.clone();
     writer
         .apply(move |s| s.note_channel_success_at(&b2, OffsetDateTime::now_utc()))
@@ -161,12 +161,12 @@ async fn external_cli_write_after_successful_retry_survives() {
     assert_eq!(
         store.channel_ok_count(&b),
         3,
-        "mutation after a successful retry must build on the CLI's counter (1 retry + 1 CLI + 1 daemon)"
+        "mutation after a successful retry must build on the CLI's counter (1 retry + 1 CLI + 1 angel)"
     );
     assert_eq!(
         store.sources_of(&cli_bridge),
         vec!["cli"],
-        "CLI's new bridge must survive a post-retry daemon publish"
+        "CLI's new bridge must survive a post-retry angel publish"
     );
     assert!(
         leftover_tmp_files(dir.path()).is_empty(),

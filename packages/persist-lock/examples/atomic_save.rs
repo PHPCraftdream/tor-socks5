@@ -1,7 +1,7 @@
 //! The atomic read-modify-write pattern `persist-lock` exists for:
 //!
 //! 1. take a cross-process advisory [`persist_lock::PathLock`] on the
-//!    target's sibling `.lock` file, so overlapping transactions (a daemon
+//!    target's sibling `.lock` file, so overlapping transactions (an angel
 //!    writer and a CLI process) queue instead of publishing over each
 //!    other's snapshot;
 //! 2. stage the new content in a [`persist_lock::TempFileGuard`] temp file
@@ -28,7 +28,7 @@ fn main() -> Result<()> {
 
     // Transaction lock: serialises whole read-modify-write cycles across
     // processes. Bounded so a CLI fails with a clear error instead of
-    // hanging behind a stuck daemon. Released when `tx` is dropped.
+    // hanging behind a stuck angel. Released when `tx` is dropped.
     let tx = PathLock::acquire_bounded(&target, CLI_LOCK_WAIT)
         .context("acquiring the transaction lock")?;
 

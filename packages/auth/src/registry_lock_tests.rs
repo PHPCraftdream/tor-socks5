@@ -1,7 +1,7 @@
 //! Regression tests for the users-registry cross-process transaction
 //! lock (TS17-07).
 //!
-//! These tests live inside the crate because they drive the daemon-side
+//! These tests live inside the crate because they drive the angel-side
 //! TOFU path at its `pub(crate)` test-only seams (`save_hook` /
 //! `lock_hook`). The competing writer in the cross-process test is a
 //! real second OS process spawned from this same test binary, following
@@ -24,7 +24,7 @@ use crate::compute_hash::compute_hash;
 use crate::{verify_hash, AuthState, User, UsersConfig, INIT_SENTINEL};
 
 /// Env var that turns a spawned copy of this test binary into the
-/// daemon-role child. Without it the helper test is a no-op.
+/// angel-role child. Without it the helper test is a no-op.
 const CHILD_ENV: &str = "AUTH_REGISTRY_LOCK_CHILD";
 /// Exact test path of the child helper, for `--exact`.
 const CHILD_TEST: &str = "registry_lock_tests::cross_process_child_parks_in_save_hook_helper";
@@ -104,7 +104,7 @@ fn wait_for_exit(child: &mut ChildGuard, timeout: Duration) -> std::process::Exi
     }
 }
 
-/// Daemon-role child for
+/// Angel-role child for
 /// `tofu_provision_survives_concurrent_cli_disable_across_processes`:
 /// provisions `alice` through the real TOFU path and parks inside the
 /// `save_hook` — i.e. after the registry re-read, holding the registry's
@@ -150,11 +150,11 @@ fn cross_process_child_parks_in_save_hook_helper() {
     );
 }
 
-/// TS17-07 subprocess regression: a daemon parked between its registry
+/// TS17-07 subprocess regression: an angel parked between its registry
 /// read and its save (transaction lock held) must not let a concurrent
 /// CLI process interleave a mutation into that window, and both
 /// mutations must survive. Before the fix the CLI's whole transaction
-/// ran inside that window and the daemon's stale snapshot clobbered the
+/// ran inside that window and the angel's stale snapshot clobbered the
 /// CLI's disable (or the CLI resurrected the `init` sentinel).
 #[test]
 fn tofu_provision_survives_concurrent_cli_disable_across_processes() {
@@ -172,7 +172,7 @@ fn tofu_provision_survives_concurrent_cli_disable_across_processes() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn daemon-role child");
+        .expect("spawn angel-role child");
     let mut child = ChildGuard(child);
 
     assert!(
@@ -187,7 +187,7 @@ fn tofu_provision_survives_concurrent_cli_disable_across_processes() {
     // interleave into.
     let busy = PathLock::acquire_bounded(&users_path, Duration::from_millis(300))
         .err()
-        .expect("TS17-07: the parked daemon's transaction lock must exclude a CLI writer");
+        .expect("TS17-07: the parked angel's transaction lock must exclude a CLI writer");
     let busy_msg = format!("{busy:#}");
     assert!(busy_msg.contains("busy"), "clear busy error: {busy_msg}");
 
@@ -200,7 +200,7 @@ fn tofu_provision_survives_concurrent_cli_disable_across_processes() {
     );
     assert!(on_disk.find("bob").expect("bob present").is_enabled);
 
-    // Let the daemon finish; its provisioning publishes.
+    // Let the angel finish; its provisioning publishes.
     fs::write(dir.join("child-release"), b"").expect("write release marker");
     let status = wait_for_exit(&mut child, Duration::from_secs(30));
     assert!(
@@ -209,10 +209,10 @@ fn tofu_provision_survives_concurrent_cli_disable_across_processes() {
         child_output(&mut child)
     );
 
-    // Now the CLI mutation lands — on the daemon's published state, under
+    // Now the CLI mutation lands — on the angel's published state, under
     // the same transaction lock (users_cli does exactly this).
     let lock = PathLock::acquire_bounded(&users_path, Duration::from_secs(10))
-        .expect("registry lock is free after the daemon finished");
+        .expect("registry lock is free after the angel finished");
     let mut cfg = UsersConfig::load(&users_path).expect("load under the lock");
     cfg.find_mut("bob").expect("bob present").is_enabled = false;
     cfg.save(&users_path).expect("publish the disable");
@@ -224,7 +224,7 @@ fn tofu_provision_survives_concurrent_cli_disable_across_processes() {
     assert_ne!(*alice_hash, INIT_SENTINEL, "alice was provisioned");
     assert!(
         verify_hash(alice_hash, "pwA").expect("verify alice hash"),
-        "the daemon's provisioning survived"
+        "the angel's provisioning survived"
     );
     assert!(
         !final_cfg.find("bob").expect("bob present").is_enabled,

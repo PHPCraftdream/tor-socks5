@@ -4,13 +4,13 @@
 
 Изучи и опиши:
 
-1. CLI-поверхность: все подкоманды и флаги (`tor-socks5 ...`, `bridges fetch`, `users ...`, `service ...`), особенно интересует: можно ли передать конфиг целиком через один путь/переменную окружения (уже видел `--config` / `$TOR_SOCKS5_CONFIG` / `tor-socks5.ktav` по умолчанию — подтверди и найди код), можно ли отключить `service`/`daemonize`/что-то Unix/Windows-специфичное, что не будет работать/не нужно на Android.
+1. CLI-поверхность: все подкоманды и флаги (`tor-socks5 ...`, `bridges fetch`, `users ...`, `service ...`), особенно интересует: можно ли передать конфиг целиком через один путь/переменную окружения (уже видел `--config` / `$TOR_SOCKS5_CONFIG` / `tor-socks5.ktav` по умолчанию — подтверди и найди код), можно ли отключить `service`/`angel`/`--angel`/что-то Unix/Windows-специфичное, что не будет работать/не нужно на Android.
 
 2. Как получить статус старта и бутстрапа программно (не из логов человеку, а как машиночитаемый сигнал): есть ли готовый machine-readable статус (JSON, control-сокет, exit code, health endpoint)? Если нет — где именно в коде (packages/arti-wrapper, apps/socks5-proxy) находится точка, куда проще всего добавить такой сигнал (например: пишем JSON-строки прогресса бутстрапа в отдельный файл/unix-сокет/stdout), не ломая остальной CLI.
 
 3. Как логирование настроено (packages/, tracing-subscriber) — можно ли направить его в файл с ротацией на Android (где нет stderr-консоли в привычном виде), и что нужно поменять.
 
-4. Зависимости, которые могут быть проблемными при кросс-компиляции под Android NDK (aarch64-linux-android, armv7-linux-androideabi, i686-linux-android, x86_64-linux-android): особенно static-sqlite (rusqlite/libsqlite3-sys?), ring/rustls (какая версия ring, есть ли готовая поддержка Android target), daemonize (cfg(unix) — Android это unix, но daemonize делает fork/setsid, что на Android процессной модели может быть нежелательно/ненужно — предложи, как это отключить), service-manager (systemd/launchd/SCM — не нужен на Android), lyrebird/ptrs-gesher (obfs4 PT, реализация on-process re-exec себя как PT — уточни детали, есть ли что-то Android-неудобное типа exec self через /proc/self/exe).
+4. Зависимости, которые могут быть проблемными при кросс-компиляции под Android NDK (aarch64-linux-android, armv7-linux-androideabi, i686-linux-android, x86_64-linux-android): особенно static-sqlite (rusqlite/libsqlite3-sys?), ring/rustls (какая версия ring, есть ли готовая поддержка Android target), angelize (alias внешнего пакета; cfg(unix) — Android это unix, но angelize делает fork/setsid, что на Android процессной модели может быть нежелательно/ненужно — предложи, как это отключить), service-manager (systemd/launchd/SCM — не нужен на Android), lyrebird/ptrs-gesher (obfs4 PT, реализация on-process re-exec себя как PT — уточни детали, есть ли что-то Android-неудобное типа exec self через /proc/self/exe).
 
 5. Формат ktav-конфига и как сгенерировать его программно "снаружи" (из Kotlin) — нужно ли писать целый файл на диск перед стартом процесса, или можно передать путь к уже сгенерированному файлу через `--config`. Подтверди по коду.
 

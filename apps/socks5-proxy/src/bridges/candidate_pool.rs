@@ -24,7 +24,7 @@
 //! The identity preserves the full WebTunnel carrier target and certificate.
 //! Writers (refresh, drain) run their whole load→mutate→save cycle as one
 //! cross-process transaction ([`CandidatePool::transaction`] or an explicitly
-//! held [`persist_lock::PathLock`]): daemon maintenance and the
+//! held [`persist_lock::PathLock`]): angel maintenance and the
 //! `bridges fetch` CLI serialize on the per-path lock instead of publishing
 //! whole files over each other's snapshot.
 

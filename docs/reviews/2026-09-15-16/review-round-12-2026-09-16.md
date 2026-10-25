@@ -10,12 +10,12 @@
 
 | ID | P | Задача | Статус |
 |---|---|---|---|
-| TS12-01 | P2 | Сохранять CLI-мутацию при пересечении с daemon publish | Закрыта; per-path advisory lock |
+| TS12-01 | P2 | Сохранять CLI-мутацию при пересечении с angel publish | Закрыта; per-path advisory lock |
 | TS12-02 | P2 | Согласовать конкурентные изменения CandidatePool | Закрыта; транзакционная блокировка |
 | TS12-03 | P3 | Проверять уже буферизованный EOF-body относительно лимита | Закрыта; pre-read cap check |
 
 Исправления: общий `PathLock` на sibling `.lock` файле сериализует полный
-load→mutate→save для daemon и CLI; CandidatePool удерживает его через probe
+load→mutate→save для angel и CLI; CandidatePool удерживает его через probe
 и сохраняет удаления без blind merge; HTTP reader проверяет уже buffered body
 до EOF-read. Добавлены детерминированные overlap и boundary regression tests.
 
@@ -29,21 +29,21 @@ Android verification теперь передаёт исходный PT path, с�
 
 ## Общий текущий код
 
-### TS12-01 — P2: daemon writer всё ещё может перезаписать принятую CLI-мутацию устаревшим snapshot
+### TS12-01 — P2: angel writer всё ещё может перезаписать принятую CLI-мутацию устаревшим snapshot
 
 Статус: исправлено общей блокировкой полного read-modify-write. Исправление последовательного случая TS2-01 сохраняется.
 
 Место: `apps/socks5-proxy/src/bridge_store_writer.rs:45-69`, `:388-422`, `:568-600`; fallback CLI в `:640-649`.
 
-Триггер: daemon уже загрузил `S`, применил mutation `A` и запустил blocking `save(S+A)`; до завершения этой записи отдельный `tor-socks5 bridges ...` процесс загружает `S`, добавляет `B` и атомарно переименовывает `S+B`.
+Триггер: angel уже загрузил `S`, применил mutation `A` и запустил blocking `save(S+A)`; до завершения этой записи отдельный `tor-socks5 bridges ...` процесс загружает `S`, добавляет `B` и атомарно переименовывает `S+B`.
 
-Механизм до исправления: daemon publish использовал ранее захваченный `Arc<BridgeStore>` и без проверки версии/mtime переименовывал `S+A` поверх `S+B`. После успешного publish `absorb_publish_result` делал snapshot clean и отбрасывал его; следующая daemon-мутация перечитывала уже файл `S+A`, поэтому `B` терялась окончательно, пока CLI не повторит операцию. Уникальные temp-файлы гарантировали отсутствие torn bytes, но не сохраняли обе read-modify-write мутации.
+Механизм до исправления: angel publish использовал ранее захваченный `Arc<BridgeStore>` и без проверки версии/mtime переименовывал `S+A` поверх `S+B`. После успешного publish `absorb_publish_result` делал snapshot clean и отбрасывал его; следующая angel-мутация перечитывала уже файл `S+A`, поэтому `B` терялась окончательно, пока CLI не повторит операцию. Уникальные temp-файлы гарантировали отсутствие torn bytes, но не сохраняли обе read-modify-write мутации.
 
 Влияние: health counters, retirement, source attribution и свежая bridge-мутация CLI могут исчезнуть; в зависимости от момента это меняет последующий ranking/pruning и требует повторного запуска команды.
 
-Доказательство регрессии: `bridge_store_writer_tests/cross_process_lock_tests.rs` удерживает daemon publish и запускает реальный CLI fallback в overlap; тест проверяет обе мутации. `PathLock` удерживается от clean-load до publish и сбрасывается только после clean completion.
+Доказательство регрессии: `bridge_store_writer_tests/cross_process_lock_tests.rs` удерживает angel publish и запускает реальный CLI fallback в overlap; тест проверяет обе мутации. `PathLock` удерживается от clean-load до publish и сбрасывается только после clean completion.
 
-### TS12-02 — P2: CandidatePool теряет изменения при одновременном daemon и CLI refresh/drain
+### TS12-02 — P2: CandidatePool теряет изменения при одновременном angel и CLI refresh/drain
 
 Статус: исправлено общей блокировкой CandidatePool transaction.
 

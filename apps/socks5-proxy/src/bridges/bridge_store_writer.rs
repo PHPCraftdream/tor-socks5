@@ -4,7 +4,7 @@
 //! docs/reviews/2026-09-07-08/stability-review-2026-09-08.md, plus TS2-02/TS2-03 in
 //! docs/reviews/2026-09-07-08/review-round-2-2026-09-08.md):
 //!
-//! * Daemon: exactly one actor task owns every publish. Writers send a
+//! * Angel: exactly one actor task owns every publish. Writers send a
 //!   mutation through an mpsc channel; the actor applies mutations one at a
 //!   time to its authoritative in-memory snapshot, so two background tasks
 //!   (maintenance observation drain, channel warmer, circuit verifier,
@@ -54,9 +54,9 @@
 //!   per-path advisory lock ([`persist_lock::PathLock`], sibling
 //!   `<store>.lock` file) from the load that reads the file through the
 //!   publish that writes it. The clean-state re-read alone cannot heal an
-//!   overlap: a CLI transaction that loads while a daemon publish is in
-//!   flight saves a snapshot the daemon's rename buries permanently. With
-//!   the lock, the CLI waits out the daemon's dirty window (including
+//!   overlap: a CLI transaction that loads while an angel publish is in
+//!   flight saves a snapshot the angel's rename buries permanently. With
+//!   the lock, the CLI waits out the angel's dirty window (including
 //!   backoff retries) and then mutates the published state, so both sides'
 //!   mutations survive. The actor acquires the lock inside its clean-load
 //!   `spawn_blocking` job (never on an async worker) and releases it as soon
@@ -67,12 +67,12 @@
 //!   deadline — and resolves with the flush result. Server shutdown calls
 //!   [`close_global`] after stopping the producer tasks. Test writers that
 //!   drop all handles without closing keep the legacy best-effort final
-//!   flush, but the daemon must use the explicit protocol.
+//!   flush, but the angel must use the explicit protocol.
 //! * CLI subcommands and unit tests run without an initialized writer and
 //!   fall back to an inline load→mutate→save under the same per-path write
 //!   lock, with a bounded wait ([`persist_lock::CLI_LOCK_WAIT`]) so a
-//!   CLI fails with a clear "busy" error instead of hanging behind a daemon
-//!   stuck retrying a failing publish. Between daemon dirty windows the
+//!   CLI fails with a clear "busy" error instead of hanging behind an angel
+//!   stuck retrying a failing publish. Between angel dirty windows the
 //!   lock is free, so sequential CLI usage is unaffected.
 
 use std::path::{Path, PathBuf};
@@ -626,7 +626,7 @@ fn try_start_publish(
 
 static WRITER: OnceLock<StoreWriter> = OnceLock::new();
 
-/// Start the process-wide store writer. Daemon startup calls this once,
+/// Start the process-wide store writer. Angel startup calls this once,
 /// before any task that writes the store. A second call logs a warning and
 /// returns the existing writer.
 pub(crate) fn init_global(config_path: Option<&Path>) -> StoreWriter {

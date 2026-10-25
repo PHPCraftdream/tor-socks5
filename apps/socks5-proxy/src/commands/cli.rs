@@ -45,7 +45,7 @@ tor-socks5 bridges fetch                # fetch & merge fresh bridges over Tor\n
 tor-socks5 config migrate               # convert a config written in the old layout\n  \
 tor-socks5 --upstream 127.0.0.1:9050    # egress via an upstream SOCKS5 instead of Tor\n  \
 tor-socks5 service install              # install as a system service\n  \
-tor-socks5 --daemon --pid-file /run/tor-socks5.pid   # run in the background (Unix only)\n  \
+tor-socks5 --angel --pid-file /run/tor-socks5.pid   # run in the background (Unix only)\n  \
 tor-socks5 help --all                   # print the full bundled documentation\n\n\
 Run `tor-socks5 <command> --help` for command-specific options, or \
 `tor-socks5 help` to browse the bundled manuals."
@@ -74,14 +74,14 @@ pub(crate) struct Cli {
     pub(crate) no_upstream: bool,
 
     #[cfg(not(target_os = "android"))]
-    /// Run in the background as a daemon (Unix, not Android): detach from the
-    /// controlling terminal, redirect stdio to /dev/null. On Windows,
+    /// Run in the background as an angel (Unix, not Android): detach from
+    /// the controlling terminal, redirect stdio to /dev/null. On Windows,
     /// install as a service instead (`tor-socks5 service install`).
-    #[arg(long, short = 'd')]
-    pub(crate) daemon: bool,
+    #[arg(long, short = 'a')]
+    pub(crate) angel: bool,
 
     #[cfg(not(target_os = "android"))]
-    /// Path to write the daemon's PID file (Unix, not Android; used with --daemon).
+    /// Path to write the angel's PID file (Unix, not Android; used with --angel).
     #[arg(long, value_name = "PATH")]
     pub(crate) pid_file: Option<PathBuf>,
 
@@ -192,5 +192,36 @@ mod tests {
             "migrate",
         ]);
         assert_eq!(cli.config, Some(PathBuf::from("etc/node.ktav")));
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn angel_flag_is_parsed() {
+        let cli = parse(&["tor-socks5", "--angel"]);
+        assert!(cli.angel);
+        assert!(cli.command.is_none());
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn angel_short_flag_is_parsed() {
+        let cli = parse(&["tor-socks5", "-a"]);
+        assert!(cli.angel);
+        assert!(cli.command.is_none());
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn angel_flag_accepts_pid_file() {
+        let cli = parse(&["tor-socks5", "--angel", "--pid-file", "/run/tor-socks5.pid"]);
+        assert!(cli.angel);
+        assert_eq!(cli.pid_file, Some(PathBuf::from("/run/tor-socks5.pid")));
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn angel_flag_is_absent_by_default() {
+        let cli = parse(&["tor-socks5"]);
+        assert!(!cli.angel);
     }
 }

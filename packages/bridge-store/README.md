@@ -2,7 +2,7 @@
 
 Persistent per-bridge health tracking: TCP-probe failure counters, rate-limited failure bumps, latency stamps, and pruning of bridges that fail too often — kept in a plain line-based file next to the active config.
 
-Built for bridge managers that run as more than one process: in the tor-socks5 project a CLI daemon and an Android app both probe bridges, and both want to remember which ones tend to work across restarts. A missing file loads as an empty store; every save publishes atomically (temp file + rename), so a crash mid-save never corrupts the health log.
+Built for bridge managers that run as more than one process: in the tor-socks5 project a CLI angel and an Android app both probe bridges, and both want to remember which ones tend to work across restarts. A missing file loads as an empty store; every save publishes atomically (temp file + rename), so a crash mid-save never corrupts the health log.
 
 Health is driven by what this process controls directly — probe-layer reachability. A successful probe resets the failure counter and stamps the latency; a failed probe bumps it at most once per `fail_window` (a burst of retries counts once); once the consecutive-failure counter reaches its limit, the bridge is pruned and returned to the caller, which should also drop it from its config.
 

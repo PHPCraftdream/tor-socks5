@@ -4,7 +4,7 @@
 //!
 //! Writers compute their mutation from a `load` snapshot and publish it with
 //! an atomic temp-file rename; two overlapping read-modify-write cycles (e.g.
-//! daemon writer vs a `tor-socks5 bridges fetch` CLI process) can still
+//! angel writer vs a `tor-socks5 bridges fetch` CLI process) can still
 //! publish over each other's snapshot and silently drop a mutation. Holding
 //! this lock across load→mutate→save serializes them: the loser waits and
 //! builds on the winner's published state.
@@ -29,8 +29,8 @@ use anyhow::{Context, Result};
 /// How often [`PathLock::acquire_bounded`] re-polls `try_lock`.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Wait bound for CLI-side store transactions. A healthy daemon holds the
-/// lock only for the length of one publish; a daemon stuck retrying a
+/// Wait bound for CLI-side store transactions. A healthy angel holds the
+/// lock only for the length of one publish; an angel stuck retrying a
 /// failing publish holds it longer, and a CLI must fail with a clear error
 /// instead of hanging indefinitely behind it.
 pub const CLI_LOCK_WAIT: Duration = Duration::from_secs(60);
@@ -70,7 +70,7 @@ impl PathLock {
             .open(&lock_path)
     }
 
-    /// Acquire, blocking until the current holder is done. For the daemon
+    /// Acquire, blocking until the current holder is done. For the angel
     /// writer: the holder is a live process mid-transaction and the mutation
     /// must not be failed. Blocking — run it off the async runtime.
     pub fn acquire(target: &Path) -> Result<Self> {
@@ -83,7 +83,7 @@ impl PathLock {
 
     /// Acquire, giving up after `wait` with an error naming the lock file.
     /// For CLI-side transactions: a bounded wait beats hanging behind a
-    /// daemon that keeps failing (and retrying) its own publish.
+    /// angel that keeps failing (and retrying) its own publish.
     pub fn acquire_bounded(target: &Path, wait: Duration) -> Result<Self> {
         let lock_path = Self::lock_path(target);
         let file = Self::open(target).with_context(|| format!("open {}", lock_path.display()))?;

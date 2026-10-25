@@ -1,12 +1,12 @@
 # Plan: keep the Android engine's bridge list — and arti's guard sample — fresh automatically
 
-Status: **planned, not implemented**. Companion to `docs/guide/bridges.md` (the CLI daemon's already-shipping
+Status: **planned, not implemented**. Companion to `docs/guide/bridges.md` (the CLI angel's already-shipping
 bridge lifecycle) and `docs/checkpoints/obfs4-connect-investigation.md` (orbot-rs repo — the livelock
 investigation that surfaced this gap).
 
 ## Problem
 
-The CLI daemon (`apps/socks5-proxy`) already has a full, documented, working bridge lifecycle
+The CLI angel (`apps/socks5-proxy`) already has a full, documented, working bridge lifecycle
 (`docs/guide/bridges.md`): TCP-probe health tracking, automatic pruning of dead bridges past `max_fails`/
 `max_circuit_fails`, a candidate pool fed from `bridges.sources`, and `auto_fetch`/`min_alive` to keep
 the working list topped up. None of that maintenance loop runs on Android — `packages/android-ffi`'s
@@ -98,7 +98,7 @@ self-cleans on its own schedule.
   Bridges" tap needed for steady-state operation.
 - `guards.json` inherits the freshness for free, via arti's own `unlisted_since`/`lifetime_unlisted`
   expiry — no direct file surgery, ever.
-- Net effect matches the CLI daemon's already-proven `use_seeds`/`auto_fetch`/`min_alive`/`max_fails`
+- Net effect matches the CLI angel's already-proven `use_seeds`/`auto_fetch`/`min_alive`/`max_fails`
   lifecycle (`docs/guide/bridges.md`), scoped to what Android's one-shot `engine_async` architecture needs —
   not a full port of `bridge_warmer.rs`/`tor_watchdog.rs`'s channel-warming and failover machinery
   (that remains a separate, larger effort if still wanted later).
