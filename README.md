@@ -116,6 +116,41 @@ powershell -NoProfile -ExecutionPolicy Bypass -File '.\install.ps1'
 - Поддерживаются ровно 4 таргета: Linux x86_64 GNU (**glibc** — Alpine/musl не поддерживаются),
   macOS x86_64, macOS aarch64, Windows x86_64. ARM Linux/Windows и BSD — нет.
 
+### Каталог бинарника и каталог конфигурации независимы
+
+Установщик только кладёт бинарник в каталог установки; он **не** запускает
+приложение и **не** создаёт конфигурационных файлов. Приложение при запуске ищет
+`tor-socks5.ktav` в **текущем рабочем каталоге**, откуда его запустили, а не рядом
+с бинарником: каталог бинарника и каталог конфигурации не связаны. Если
+`tor-socks5.ktav` в текущем каталоге нет, приложение само создаёт его с настройками
+по умолчанию при первом старте — там же появляется и `tor-socks5.bridges.ktav`.
+
+Так несколько узлов на одной машине используют разные настройки. Примеры
+независимых запусков из разных терминалов; каталог бинарника не обязан быть в PATH:
+
+```bash
+mkdir -p "$HOME/node-a" "$HOME/node-b"
+# Первый терминал: настройки в "$HOME/node-a/tor-socks5.ktav".
+cd "$HOME/node-a" && "$HOME/.local/bin/tor-socks5"
+# Второй терминал: настройки в "$HOME/node-b/tor-socks5.ktav".
+cd "$HOME/node-b" && "$HOME/.local/bin/tor-socks5" --angel
+```
+
+```powershell
+New-Item -ItemType Directory -Force -Path "$HOME\node-a", "$HOME\node-b" -ErrorAction Stop
+# Первый терминал: настройки в "$HOME\node-a\tor-socks5.ktav".
+Set-Location -LiteralPath "$HOME\node-a" -ErrorAction Stop
+& "$env:LOCALAPPDATA\Programs\tor-socks5\tor-socks5.exe"
+# Второй терминал: настройки в "$HOME\node-b\tor-socks5.ktav".
+Set-Location -LiteralPath "$HOME\node-b" -ErrorAction Stop
+& "$env:LOCALAPPDATA\Programs\tor-socks5\tor-socks5.exe"
+```
+
+Явный путь всегда сильнее: `--config <path>` переопределяет `$TOR_SOCKS5_CONFIG`,
+а тот — файл в текущем каталоге. Режим `--angel` (Unix) фиксирует каталог запуска:
+все относительные пути (конфиг, bridges, pid-файл, логи) остаются привязанными к
+нему, как и в foreground.
+
 ### Публикация релиза по тегу
 
 Поддерживаются теги формата `vX.Y.Z` (stable) и `vX.Y.Z-rc.N` (prerelease);

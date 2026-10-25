@@ -27,20 +27,20 @@ use anyhow::Context;
 ///
 /// # What it does
 ///
-/// Uses the [`angelize`](https://crates.io/crates/daemonize) crate, which
-/// performs the classic double-fork: `fork` → `setsid` → `fork`, then
-/// redirects stdin/stdout/stderr to `/dev/null` and `chdir("/")`. The
-/// crate's defaults already cover working directory `/`, umask `0o027`,
-/// and `/dev/null` stdio — we set `working_directory("/")` and
-/// `umask(0o027)` explicitly only for self-documentation; everything else
-/// is the crate default. When `pid_file` is `Some`, a locked PID file is
-/// written there holding the angel's PID.
+/// Использует [`angelize`](https://crates.io/crates/daemonize):
+/// `fork` → `setsid` → `fork`, перенаправление stdio в `/dev/null` и umask `0o027`.
+/// Каталог запуска фиксируется до fork и сохраняется в потомке: относительные
+/// пути конфига, PID-файла, логов и данных разрешаются так же, как в foreground.
+/// При `pid_file = Some` записывается заблокированный PID-файл ангела.
 ///
 /// `start()` returns to the *child* process only; the parent exits.
 #[cfg(all(unix, not(target_os = "android")))]
 pub fn angelize(pid_file: Option<&Path>) -> anyhow::Result<()> {
     use angelize::Daemonize as Angelize;
-    let mut angelize = Angelize::new().working_directory("/").umask(0o027);
+    // Сохраняем привязку относительных путей к каталогу запуска.
+    let working_dir = std::env::current_dir()
+        .context("определение каталога запуска перед уходом в фоновый режим")?;
+    let mut angelize = Angelize::new().working_directory(&working_dir).umask(0o027);
     if let Some(path) = pid_file {
         angelize = angelize.pid_file(path);
     }

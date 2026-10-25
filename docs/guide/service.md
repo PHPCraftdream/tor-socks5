@@ -68,8 +68,10 @@ tor-socks5 --angel
 tor-socks5 --angel --pid-file /run/tor-socks5.pid
 ```
 
-`--angel` detaches from the controlling terminal (double-fork + `setsid`), redirects stdin,
-stdout, and stderr to `/dev/null`, and `chdir`s to `/`. `--pid-file <PATH>` writes the angel's
+`--angel` отвязывает процесс от управляющего терминала (double-fork + `setsid`), направляет stdin,
+stdout и stderr в `/dev/null` и сохраняет каталог запуска в качестве рабочего — относительные пути
+(дефолтный `tor-socks5.ktav`, bridges/pid/лог-файлы) разрешаются от каталога, из которого вы
+запустили процесс, ровно как в foreground. `--pid-file <PATH>` writes the angel's
 PID to a file, useful for `kill` or an init script. Because stdio is sent to `/dev/null`, set a
 file log sink in the config so angel logs are captured — otherwise the proxy prints a warning on
 the original stderr before detaching and the records are lost:
