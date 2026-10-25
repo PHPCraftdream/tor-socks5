@@ -33,6 +33,14 @@ argv, число мутаций и типы полей (JSON boolean/number/stri
                         («свежий GET перед upload»): уже published / неверный
                         id / неверный tag / строка вместо boolean — publish.sh
                         обязан отвергнуть её typed-предикатом ДО upload
+  readback_obj        — управляемый ПОЛНЫЙ JSON-объект для GET releases/<id>
+                        ПОСЛЕ успешного PATCH (readback): применяется ТОЛЬКО
+                        когда state['patched'] истинно (отдельный механизм от
+                        fresh_get_obj, который срабатывает на ПЕРВОМ GET ДО
+                        upload). Позволяет подать в финальный readback
+                        произвольную схему (строковые false, неверный id/tag)
+                        и проверить, что typed-предикат publish.sh её
+                        отвергает БЕЗ 'Готово'
   corrupt_get_after_patch — true: после PATCH GET возвращает draft=true
                             (модель неуспешного readback)
 
@@ -127,6 +135,9 @@ def main():
             obj = dict(found[0])
             if state.get("corrupt_get_after_patch") and state.get("patched"):
                 obj["draft"] = True  # имитация устаревшего/сбойного readback
+            # Управляемый ПОЛНЫЙ объект readback: только после успешного PATCH
+            if state.get("patched") and "readback_obj" in state:
+                obj = dict(state["readback_obj"])
             done(False, 0, json.dumps(obj))
         # PATCH --method PATCH <endpoint> --input -
         if "--method" in rest and "PATCH" in rest:

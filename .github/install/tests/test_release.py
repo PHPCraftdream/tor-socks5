@@ -494,6 +494,8 @@ class PublisherTests(unittest.TestCase):
             "draft-string": dict(base, draft="yes"),
             # prerelease числом вместо boolean
             "prerelease-number": dict(base, prerelease=1),
+            # prerelease строкой вместо boolean
+            "prerelease-string": dict(base, prerelease="false"),
         }
         for label, obj in variants.items():
             with self.subTest(case=label):
@@ -510,6 +512,69 @@ class PublisherTests(unittest.TestCase):
                 state = read_state(sp)
                 self.assertTrue(self.assets_of(state)["draft"])
                 self.assertEqual(state["latest_tag"], "v0.9.0")
+
+    def test_typed_readback_rejects_invalid_fields(self):
+        # ПОЛНЫЙ управляемый объект readback (readback_obj) ПОСЛЕ успешного
+        # PATCH: baseline — fully valid published release; каждый вариант
+        # ломает ровно одно typed-поле, и typed-предикат publish.sh обязан
+        # отвергнуть его БЕЗ 'Готово'. Ассеты в readback обязаны быть полными
+        # и валидными (числовой id, реальный размер, state uploaded), иначе
+        # негатив упадёт на missing-assets, а не на typed-предикат.
+        d = self.make_artifacts(TAG)
+        good_assets = [{"id": 500 + i, "name": n,
+                        "size": os.path.getsize(os.path.join(d, n)),
+                        "state": "uploaded"}
+                       for i, n in enumerate(expected_names(TAG))]
+        baseline = {"id": 7, "tag_name": TAG, "draft": False,
+                    "prerelease": False, "assets": good_assets}
+        variants = {
+            "draft-string-false": dict(baseline, draft="false"),
+            "prerelease-string-false": dict(baseline, prerelease="false"),
+            "wrong-id": dict(baseline, id=8),
+            "string-id": dict(baseline, id="7"),
+            "wrong-tag": dict(baseline, tag_name="v0.0.1"),
+        }
+        for label, obj in variants.items():
+            with self.subTest(case=label):
+                sp = self.gh_state(releases=[{"id": 7, "tag_name": TAG,
+                                              "draft": True,
+                                              "prerelease": False,
+                                              "assets": []}],
+                                   readback_obj=obj)
+                p = self.run_publish(sp)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertNotIn("Готово", p.stdout.decode())
+                log = read_log(os.path.join(self.area.path, "gh-log.jsonl"))
+                # resume-путь draft-релиза: точная последовательность с 8
+                # uploads, PATCH и финальным readback GET
+                self.assertEqual(call_kinds(log),
+                                 ["list", "get-by-tag", "get-by-id"]
+                                 + ["upload"] * 8
+                                 + ["get-by-id", "patch", "get-by-id"])
+                state = read_state(sp)
+                self.assertTrue(state["patched"])
+                # PATCH-тело — настоящие JSON boolean + legacy
+                self.assertEqual(state["patch_body"],
+                                 {"draft": False, "prerelease": False,
+                                  "make_latest": "legacy"})
+
+    def test_missing_remote_tag_create_failure_preserves_latest(self):
+        # --verify-tag: тега нет на remote — create отказывает. Проверяется
+        # ИМЕННО create (он вызван и свернулся), а не «ноль мутационных
+        # попыток»: mutation=True для попытки create ожидаемо. Никаких
+        # upload/PATCH, releases и latest-pointer не изменены.
+        self.make_artifacts(TAG)
+        sp = self.gh_state(tags=[], releases=[], latest_tag="v0.9.0")
+        p = self.run_publish(sp)
+        self.assertNotEqual(p.returncode, 0)
+        log = read_log(os.path.join(self.area.path, "gh-log.jsonl"))
+        self.assertEqual(call_kinds(log), ["list", "create"])
+        self.assertFalse(any("upload" in r["argv"] for r in log))
+        self.assertFalse(any("--method" in r["argv"] for r in log))
+        self.assertNotIn("Готово", p.stdout.decode())
+        state = read_state(sp)
+        self.assertEqual(state["releases"], [])
+        self.assertEqual(state["latest_tag"], "v0.9.0")
 
     def test_bad_readback_fails(self):
         self.make_artifacts(TAG)
