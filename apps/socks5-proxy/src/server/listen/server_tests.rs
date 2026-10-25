@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::UpstreamConfig;
 use resocks5_net::server::ServerError;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -113,6 +114,7 @@ fn onion_state(name: &str, enabled: bool, allowed_onion: bool) -> AuthState {
         hash: auth::compute_hash("pw").unwrap(),
         is_enabled: enabled,
         allowed_onion,
+        allowed_clients: None,
     };
     AuthState::build(&UsersConfig { users: vec![user] }).unwrap()
 }
@@ -485,6 +487,7 @@ async fn spawn_test_server_with_upstream(
         ConnHealthCounters::default(),
         Arc::new(AtomicU64::new(1)),
         false,
+        AllowedClients::default(),
     ));
     (addr, permits, handle)
 }

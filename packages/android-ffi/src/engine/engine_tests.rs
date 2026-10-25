@@ -1,6 +1,7 @@
 //! JNI consumer tests. Adapter/auth tests below use real loopback sockets;
 //! handler tests use the production internal egress seam without phone/live Tor.
 
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,6 +13,11 @@ use tokio::net::{TcpListener, TcpStream};
 use super::bridges::{accept_with_deadline, handle_connection_with_egress, EgressConnector};
 use auth::{AuthState, User, UsersConfig};
 use resocks5_net::connect::HostPort;
+
+/// Синтетический peer для duplex-тестов (реальный адрес приходит из accept_loop).
+fn loopback_peer() -> IpAddr {
+    Ipv4Addr::LOCALHOST.into()
+}
 
 struct GatedLoopbackConnector {
     address: std::net::SocketAddr,
@@ -83,6 +89,7 @@ fn one_user_state(name: &str, password: &str) -> Arc<AuthState> {
         hash: auth::compute_hash(password).unwrap(),
         is_enabled: true,
         allowed_onion: false,
+        allowed_clients: None,
     };
     Arc::new(AuthState::build(&UsersConfig { users: vec![user] }).unwrap())
 }
@@ -278,6 +285,7 @@ async fn jni_same_port_protocols_wait_for_egress_and_relay_exact_payload() {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let handler = tokio::spawn(handle_connection_with_egress(
             server,
+            loopback_peer(),
             http.then(|| one_user_state("alice", "hunter2")),
             false,
             GatedLoopbackConnector {
@@ -352,6 +360,7 @@ async fn jni_http_auth_policy_and_upstream_failure_replies() {
         let observed = dialed.clone();
         let result = handle_connection_with_egress(
             server,
+            loopback_peer(),
             configured.then(|| one_user_state("alice", "hunter2")),
             block,
             FailingConnector {
@@ -381,6 +390,7 @@ async fn jni_http_ipv6_authority_passes_unbracketed_host_to_egress() {
         .unwrap();
     let result = handle_connection_with_egress(
         server,
+        loopback_peer(),
         None,
         false,
         FailingConnector {
@@ -404,6 +414,7 @@ async fn jni_socks_egress_failure_uses_general_failure_rep1() {
         .unwrap();
     let result = handle_connection_with_egress(
         server,
+        loopback_peer(),
         None,
         false,
         FailingConnector {
@@ -485,6 +496,7 @@ async fn jni_http_buffered_binary_prefix_precedes_relay_exactly_once() {
         let (upstream, mut peer) = tokio::io::duplex(2048);
         let handler = tokio::spawn(handle_connection_with_egress(
             server,
+            loopback_peer(),
             None,
             false,
             PrefixConnector {
@@ -591,6 +603,7 @@ async fn jni_partial_reply_and_pipeline_errors_are_terminal() {
         };
         let result = handle_connection_with_egress(
             server,
+            loopback_peer(),
             None,
             false,
             PrefixConnector {

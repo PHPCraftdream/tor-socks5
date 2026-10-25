@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use arti_wrapper::TorTunnel;
+use client_acl::AllowedClients;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use hickory_proto::op::{Message, Query, ResponseCode};
@@ -27,6 +28,9 @@ use crate::overrides::{
 use crate::query_statistics::{QueryStatistics, RecordOutcome, StatisticsPaths, StatisticsWorker};
 use crate::types::{DohProvider, ResolvedAnswer};
 
+#[cfg(test)]
+#[path = "tests/listeners/server_acl_tests.rs"]
+mod acl_tests;
 #[path = "server_listener.rs"]
 mod listener;
 #[path = "server_local.rs"]
@@ -53,6 +57,10 @@ struct QueryCtx<T> {
     endpoints: Arc<RwLock<Vec<SocketAddr>>>,
     route_probe: local::RouteProbe,
     statistics: Option<QueryStatistics>,
+    // Политика доступа клиентов компилируется из конфига один раз (serde-
+    // валидация до старта); в hot path разбора пакета её нет — только проверка
+    // скомпилированных правил.
+    client_access: Arc<AllowedClients>,
 }
 
 impl<T: Clone> Clone for QueryCtx<T> {
@@ -65,6 +73,7 @@ impl<T: Clone> Clone for QueryCtx<T> {
             endpoints: self.endpoints.clone(),
             route_probe: self.route_probe.clone(),
             statistics: self.statistics.clone(),
+            client_access: self.client_access.clone(),
         }
     }
 }
@@ -82,6 +91,41 @@ pub async fn run<T, F>(
     overrides: Vec<DnsOverride>,
     cache_path: PathBuf,
     shutdown: CancellationToken,
+) -> Result<()>
+where
+    T: Fn() -> F + Send + Clone + 'static,
+    F: Future<Output = Option<TorTunnel>> + Send + 'static,
+{
+    // Политика по умолчанию — `*` (разрешить всех); фильтрация клиентов через
+    // конфиг включается через `run_with_client_access`.
+    run_with_client_access(
+        listen,
+        tunnel,
+        cache,
+        providers,
+        overrides,
+        cache_path,
+        shutdown,
+        AllowedClients::default(),
+    )
+    .await
+}
+
+/// То же, что [`run`], но с независимой DNS client ACL: политика передаётся
+/// последним параметром `client_access` и применяется к UDP и TCP слушателям
+/// по реальному source-адресу пира. Публичная сигнатура `run` не меняется.
+// 8 аргументов — сознательно: совместимость старой сигнатуры `run` не ломаем,
+// opts-структуру не вводим; clippy::too_many_arguments заглушен точечно.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_client_access<T, F>(
+    listen: &[String],
+    tunnel: T,
+    cache: Arc<DnsCache>,
+    providers: Vec<DohProvider>,
+    overrides: Vec<DnsOverride>,
+    cache_path: PathBuf,
+    shutdown: CancellationToken,
+    client_access: AllowedClients,
 ) -> Result<()>
 where
     T: Fn() -> F + Send + Clone + 'static,
@@ -113,6 +157,7 @@ where
         endpoints: Arc::new(RwLock::new(endpoints)),
         route_probe: local::route_probe(),
         statistics,
+        client_access: Arc::new(client_access),
     };
     serve_owned_lifecycle(
         (udp_sockets, tcp_listeners, retry),

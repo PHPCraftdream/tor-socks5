@@ -52,6 +52,12 @@ pub(super) async fn udp_loop_observed<T, F, Observe>(
             _ = work.next(), if !work.is_empty() => {},
             received = socket.recv_from(&mut buf) => {
                 let Ok((len, peer)) = received else { continue; };
+                // Проверка по реальному source peer до любого парсинга: молча
+                // дропаем пакет (без REFUSED/FORMERR), без статистики/кэша/backend.
+                if !ctx.client_access.allows(peer.ip()) {
+                    debug!(%peer, "udp dns client denied by client access policy");
+                    continue;
+                }
                 let Some(request) = wire::parse_query(&buf[..len]) else { continue; };
                 observe(&request);
                 if let Some(reply) = wire::unsupported_response(&request) {
@@ -136,7 +142,7 @@ pub(super) async fn tcp_loop_gated<T, F, MakeGate, Gate, G, Completed>(
             biased;
             _ = work.next(), if !work.is_empty() => { completed(); },
             accepted = listener.accept() => {
-                let (stream, _) = match accepted {
+                let (stream, peer) = match accepted {
                     Ok(pair) => pair,
                     Err(error) => {
                         debug!(%error, "tcp dns accept failed");
@@ -144,6 +150,12 @@ pub(super) async fn tcp_loop_gated<T, F, MakeGate, Gate, G, Completed>(
                         continue;
                     }
                 };
+                // Тот же gate, что и в UDP: по source peer из accept до
+                // capacity/permit/nodelay; deny — continue, стрим дропается.
+                if !ctx.client_access.allows(peer.ip()) {
+                    debug!(%peer, "tcp dns client denied by client access policy");
+                    continue;
+                }
                 if work.len() >= MAX_TCP_CONNECTIONS { continue; }
                 let Ok(permit) = connections.clone().try_acquire_owned() else { continue; };
                 // Small request/response frames: never wait for a delayed ACK.

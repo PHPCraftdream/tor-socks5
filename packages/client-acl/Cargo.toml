@@ -1,0 +1,29 @@
+[package]
+name = "tor-socks5-client-acl"
+# Not published: the release artifact is the single `tor-socks5` package;
+# workspace crates are its internal modules (docs/project/sdk-package-design.md).
+publish = false
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+description = "Client access-control grammar for the local SOCKS5/DNS listeners: a validated allow-list of IP literals and wildcards, parsed eagerly at config load."
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+name = "client_acl"
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+ktav.workspace = true

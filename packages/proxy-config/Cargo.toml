@@ -37,4 +37,5 @@ indexmap.workspace = true
 bridge-line.workspace = true
 bridge-probe = { path = "../bridge-probe", version = "0.2.0" }
 persist-lock = { path = "../persist-lock", version = "0.2.0" }
+client-acl = { path = "../client-acl", version = "0.2.0", package = "tor-socks5-client-acl" }
 anyhow.workspace = true

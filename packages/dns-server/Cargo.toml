@@ -35,6 +35,7 @@ hickory-proto = "0.26.1"
 socket2 = "=0.6.3"
 hickory-resolver.workspace = true
 anyhow.workspace = true
+client-acl = { path = "../client-acl", version = "0.2.0", package = "tor-socks5-client-acl" }
 futures.workspace = true
 httparse.workspace = true
 rusqlite.workspace = true

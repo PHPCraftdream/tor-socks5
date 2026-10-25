@@ -388,6 +388,7 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
                     engine::ConnectionPolicy {
                         auth_state,
                         block_onion,
+                        allowed_clients: cfg.security.client_access.allowed_clients.clone(),
                     },
                     stop_rx,
                     done_tx,

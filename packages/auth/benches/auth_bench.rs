@@ -22,6 +22,7 @@ fn bench_auth_state_verify(c: &mut Criterion) {
         hash: auth::compute_hash("secret").unwrap(),
         is_enabled: true,
         allowed_onion: false,
+        allowed_clients: None,
     };
     let state = auth::AuthState::build(&auth::UsersConfig { users: vec![user] }).unwrap();
 
@@ -44,6 +45,7 @@ fn bench_auth_state_contention(c: &mut Criterion) {
             hash: auth::compute_hash(&format!("pass{i}")).unwrap(),
             is_enabled: true,
             allowed_onion: false,
+            allowed_clients: None,
         });
     }
     let state = std::sync::Arc::new(auth::AuthState::build(&auth::UsersConfig { users }).unwrap());

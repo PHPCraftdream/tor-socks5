@@ -30,6 +30,7 @@ async fn exercise_listeners(listeners: Vec<TcpListener>) {
                 ConnHealthCounters::default(),
                 ids.clone(),
                 false,
+                AllowedClients::default(),
             )
         })
         .collect::<futures::stream::FuturesUnordered<_>>();
