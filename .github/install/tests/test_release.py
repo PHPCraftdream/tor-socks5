@@ -54,6 +54,38 @@ def mutations(log):
     return [r for r in log if r["mutation"]]
 
 
+def call_kinds(log):
+    """Фактическая последовательность вызовов gh по журналу: read-list /
+    create / get-by-tag / get-by-id / upload / patch — чтобы ассертился
+    ПОРЯДОК producer-consumer пар, а не только число мутаций."""
+    kinds = []
+    for r in log:
+        a = r["argv"]
+        if a[:2] == ["release", "create"]:
+            kinds.append("create")
+        elif a[:2] == ["release", "upload"]:
+            kinds.append("upload")
+        elif a[:1] == ["api"]:
+            if a[1:3] == ["--paginate", "--slurp"]:
+                kinds.append("list")
+            elif "--method" in a:
+                kinds.append("patch")
+            else:
+                endpoints = [x for x in a if isinstance(x, str)
+                             and x.startswith("repos/")]
+                ep = endpoints[-1] if endpoints else ""
+                if "/releases/tags/" in ep:
+                    kinds.append("get-by-tag")
+                else:
+                    kinds.append("get-by-id")
+    return kinds
+
+
+def has_call(log, substr):
+    return any(any(substr in x for x in r["argv"] if isinstance(x, str))
+               for r in log)
+
+
 class ValidateTagTests(unittest.TestCase):
     def setUp(self):
         self.area = fx.TempArea(self)
@@ -110,7 +142,10 @@ class PublisherTests(unittest.TestCase):
 
     def gh_state(self, **kw):
         state = {"releases": kw.pop("releases", []),
-                 "tags": kw.pop("tags", [TAG]), "next_id": kw.pop("next_id", 100)}
+                 "tags": kw.pop("tags", [TAG]), "next_id": kw.pop("next_id", 100),
+                 # модель latest: в начальном состоянии УЖЕ есть прежний
+                 # stable тег; меняться он может только успешным stable PATCH
+                 "latest_tag": kw.pop("latest_tag", "v0.9.0")}
         state.update(kw)
         path = os.path.join(self.area.path, "gh-state.json")
         with open(path, "w", encoding="utf-8") as f:
@@ -196,6 +231,13 @@ class PublisherTests(unittest.TestCase):
         create = muts[0]["argv"]
         self.assertIn("--draft", create)
         self.assertIn("--verify-tag", create)
+        # ФАКТИЧЕСКАЯ последовательность вызовов: read-list → create →
+        # GET by tag → fresh GET → 8 uploads → GET verify → PATCH →
+        # GET readback
+        self.assertEqual(call_kinds(read_log(
+            os.path.join(self.area.path, "gh-log.jsonl"))),
+            ["list", "create", "get-by-tag", "get-by-id"]
+            + ["upload"] * 8 + ["get-by-id", "patch", "get-by-id"])
 
     def test_draft_resume(self):
         d = self.make_artifacts(TAG)
@@ -210,9 +252,15 @@ class PublisherTests(unittest.TestCase):
         rel = self.assets_of(state)
         self.assertFalse(rel["draft"])
         self.assertEqual(len(rel["assets"]), 8)
-        muts = mutations(read_log(
-            os.path.join(self.area.path, "gh-log.jsonl")))
+        log = read_log(os.path.join(self.area.path, "gh-log.jsonl"))
+        muts = mutations(log)
         self.assertNotIn("create", muts[0]["argv"])
+        # resume: без create, остальные фазы в том же порядке
+        self.assertEqual(call_kinds(log),
+                         ["list", "get-by-tag", "get-by-id"]
+                         + ["upload"] * 8 + ["get-by-id", "patch", "get-by-id"])
+        # успешный stable PATCH сдвинул legacy latest на наш тег
+        self.assertEqual(read_state(sp)["latest_tag"], TAG)
 
     def test_published_noop_zero_mutations(self):
         d = self.make_artifacts(TAG)
@@ -241,6 +289,8 @@ class PublisherTests(unittest.TestCase):
         self.assertIs(state["patch_body"]["prerelease"], True)
         self.assertIs(state["patch_body"]["draft"], False)
         self.assertEqual(state["patch_body"]["make_latest"], "false")
+        # публикация prerelease НЕ меняет legacy latest
+        self.assertEqual(state["latest_tag"], "v0.9.0")
 
     # --- плохие локальные артефакты: fail с НУЛЁМ gh-вызовов --------------
 
@@ -248,57 +298,69 @@ class PublisherTests(unittest.TestCase):
         tag = TAG
         d = self.make_artifacts(tag)
         names = expected_names(tag)
-        # positive control: тот же harness с чистой копией проходит ДО сети
-        d0 = self.area.subdir("v0")
-        shutil.copytree(d, d0, dirs_exist_ok=True)
-        sp0 = self.gh_state()
-        self.assertEqual(self.run_publish(sp0, artifacts_dir=d0).returncode, 0)
+
+        def variant(name):
+            v = self.area.subdir(name)
+            shutil.copytree(d, v, dirs_exist_ok=True)
+            return v
+
+        def positive(label):
+            # позитивный контроль группы: тот же harness с чистой копией
+            # проходит ДО сети (маскировка одной поломкой другой исключена
+            # отдельными каталогами ниже)
+            sp0 = self.gh_state()
+            self.assertEqual(
+                self.run_publish(sp0, artifacts_dir=variant(label)).returncode,
+                0)
+
+        positive("clean-pre-symlink")
         variants = {}
-        # missing
-        d1 = self.area.subdir("v1")
-        shutil.copytree(d, d1, dirs_exist_ok=True)
-        os.remove(os.path.join(d1, names[3]))
-        variants["missing"] = d1
-        # empty
-        d2 = self.area.subdir("v2")
-        shutil.copytree(d, d2, dirs_exist_ok=True)
-        open(os.path.join(d2, names[0]), "wb").close()
-        variants["empty"] = d2
-        # symlink на валидный файл + ОТДЕЛЬНЫЙ dangling symlink под НОВЫМ именем
-        d3 = self.area.subdir("v3")
-        shutil.copytree(d, d3, dirs_exist_ok=True)
-        target = os.path.join(d3, names[1])
+        # missing / empty — отдельные сценарии
+        v = variant("v-missing")
+        os.remove(os.path.join(v, names[3]))
+        variants["missing"] = v
+        v = variant("v-empty")
+        open(os.path.join(v, names[0]), "wb").close()
+        variants["empty"] = v
+        # symlink на валидный файл — отдельный сценарий
+        v = variant("v-symlink")
+        target = os.path.join(v, names[1])
         os.remove(target)                    # unlink ПЕРЕД созданием symlink
         os.symlink(os.path.join(d, names[1]), target)
-        dangling = os.path.join(d3, "dangling-extra-file")
+        variants["symlink"] = v
+        # dangling symlink под НОВЫМ именем — отдельный сценарий
+        v = variant("v-dangling")
+        dangling = os.path.join(v, "dangling-extra-file")
         if os.path.lexists(dangling):
             os.remove(dangling)
         os.symlink("nowhere", dangling)      # не поверх required-файла
-        variants["symlink"] = d3
-        # hidden/extra/subdir
-        d4 = self.area.subdir("v4")
-        shutil.copytree(d, d4, dirs_exist_ok=True)
-        open(os.path.join(d4, ".hidden"), "wb").write(b"x")
-        open(os.path.join(d4, "extra.txt"), "wb").write(b"x")
-        os.makedirs(os.path.join(d4, "subdir"))
-        variants["extra"] = d4
+        variants["dangling"] = v
+
+        positive("clean-pre-extra")
+        # hidden / extra / subdir — ОТДЕЛЬНЫЕ сценарии
+        v = variant("v-hidden")
+        open(os.path.join(v, ".hidden"), "wb").write(b"x")
+        variants["hidden"] = v
+        v = variant("v-extra")
+        open(os.path.join(v, "extra.txt"), "wb").write(b"x")
+        variants["extra"] = v
+        v = variant("v-subdir")
+        os.makedirs(os.path.join(v, "subdir"))
+        variants["subdir"] = v
         # bad sha / bad format / постороннее имя в checksum
-        d5 = self.area.subdir("v5")
-        shutil.copytree(d, d5, dirs_exist_ok=True)
-        with open(os.path.join(d5, names[0] + ".sha256"), "wb") as f:
+        v = variant("v-bad-sha")
+        with open(os.path.join(v, names[0] + ".sha256"), "wb") as f:
             f.write(b"0" * 64 + b"  " + names[0].encode() + b"\n")
-        variants["bad-sha"] = d5
-        d6 = self.area.subdir("v6")
-        shutil.copytree(d, d6, dirs_exist_ok=True)
-        with open(os.path.join(d6, names[4] + ".sha256"), "wb") as f:
+        variants["bad-sha"] = v
+        v = variant("v-bad-format")
+        with open(os.path.join(v, names[4] + ".sha256"), "wb") as f:
             f.write(b"zz" + names[4].encode())
-        variants["bad-format"] = d6
-        d7 = self.area.subdir("v7")
-        shutil.copytree(d, d7, dirs_exist_ok=True)
-        with open(os.path.join(d7, names[0] + ".sha256"), "wb") as f:
+        variants["bad-format"] = v
+        v = variant("v-foreign-name")
+        with open(os.path.join(v, names[0] + ".sha256"), "wb") as f:
             f.write(fx.checksum_text(fx.sha256_hex(fx.file_bytes(
                 os.path.join(d, names[0]))), "someone-else.tar.gz").encode())
-        variants["foreign-name"] = d7
+        variants["foreign-name"] = v
 
         for label, art in variants.items():
             with self.subTest(case=label):
@@ -375,16 +437,22 @@ class PublisherTests(unittest.TestCase):
 
     def test_failed_upload_no_patch(self):
         d = self.make_artifacts(TAG)
-        sp = self.gh_state(releases=[{"id": 7, "tag_name": TAG, "draft": True,
-                                      "prerelease": False, "assets": []}],
-                           fail_upload=[expected_names(TAG)[0]])
-        p = self.run_publish(sp)
-        self.assertNotEqual(p.returncode, 0)
-        state = read_state(sp)
-        self.assertTrue(self.assets_of(state)["draft"])
-        self.assertNotIn("patched", state)
-        # latest-pointer не тронут failed upload'ом
-        self.assertNotIn("latest_tag", state)
+        # отдельные подслучаи: сбой на archive И сбой на его .sha256
+        for label, asset in (("archive", expected_names(TAG)[0]),
+                             ("checksum", expected_names(TAG)[1])):
+            with self.subTest(case=label):
+                sp = self.gh_state(releases=[{"id": 7, "tag_name": TAG,
+                                              "draft": True,
+                                              "prerelease": False,
+                                              "assets": []}],
+                                   fail_upload=[asset])
+                p = self.run_publish(sp)
+                self.assertNotEqual(p.returncode, 0)
+                state = read_state(sp)
+                self.assertTrue(self.assets_of(state)["draft"])
+                self.assertNotIn("patched", state)
+                # latest-pointer не тронут failed upload'ом
+                self.assertEqual(state["latest_tag"], "v0.9.0")
 
     def test_remote_wrong_size_and_pending_no_patch(self):
         d = self.make_artifacts(TAG)
@@ -405,7 +473,43 @@ class PublisherTests(unittest.TestCase):
                 state = read_state(sp)
                 self.assertTrue(self.assets_of(state)["draft"])
                 self.assertNotIn("patched", state)
-                self.assertNotIn("latest_tag", state)
+                self.assertEqual(state["latest_tag"], "v0.9.0")
+
+    def test_fresh_get_variants_fail_before_upload(self):
+        # Свежий GET releases/<id> ПЕРЕД upload с управляемым ПОЛНЫМ объектом:
+        # typed-предикат publish.sh обязан отвергнуть каждый вариант ДО
+        # единой загрузки и PATCH (get_by_id_fail — только сетевая ошибка,
+        # здесь проверяется СОДЕРЖИМОЕ ответа).
+        self.make_artifacts(TAG)
+        base = {"id": 7, "tag_name": TAG, "draft": True,
+                "prerelease": False}
+        variants = {
+            # релиз УЖЕ published (гонка): draft=false => отказ
+            "already-published": dict(base, draft=False),
+            # неверный id в ответе
+            "wrong-id": dict(base, id=8),
+            # неверный tag в ответе
+            "wrong-tag": dict(base, tag_name="v0.0.1"),
+            # draft строкой вместо boolean
+            "draft-string": dict(base, draft="yes"),
+            # prerelease числом вместо boolean
+            "prerelease-number": dict(base, prerelease=1),
+        }
+        for label, obj in variants.items():
+            with self.subTest(case=label):
+                sp = self.gh_state(releases=[dict(base, assets=[])],
+                                   fresh_get_obj=dict(obj, assets=[]))
+                p = self.run_publish(sp)
+                self.assertNotEqual(p.returncode, 0)
+                log = read_log(os.path.join(self.area.path, "gh-log.jsonl"))
+                # fresh GET ДОСТИГНУТ (виден в журнале как releases/7)
+                self.assertTrue(has_call(log, "releases/7"))
+                # НЕТ upload и НЕТ PATCH
+                self.assertFalse(any("upload" in r["argv"] for r in log))
+                self.assertFalse(any("--method" in r["argv"] for r in log))
+                state = read_state(sp)
+                self.assertTrue(self.assets_of(state)["draft"])
+                self.assertEqual(state["latest_tag"], "v0.9.0")
 
     def test_bad_readback_fails(self):
         self.make_artifacts(TAG)
@@ -414,10 +518,22 @@ class PublisherTests(unittest.TestCase):
                            corrupt_get_after_patch=True)
         p = self.run_publish(sp)
         self.assertNotEqual(p.returncode, 0)
+        # PATCH был, но readback (draft=true) отвергнут: успеха НЕ заявлено
+        log = read_log(os.path.join(self.area.path, "gh-log.jsonl"))
+        self.assertEqual(call_kinds(log),
+                         ["list", "get-by-tag", "get-by-id"]
+                         + ["upload"] * 8 + ["get-by-id", "patch", "get-by-id"])
+        self.assertNotIn("Готово", p.stdout.decode())
+        state = read_state(sp)
+        self.assertTrue(state["patched"])
+        # PATCH прошёл — typed-тело как у stable; readback-сбой не откатывает
+        self.assertEqual(state["patch_body"],
+                         {"draft": False, "prerelease": False,
+                          "make_latest": "legacy"})
 
-    def test_fresh_get_before_upload_fail_no_uploads(self):
-        # свежий GET releases/<id> ПЕРЕД upload: неверный id => fail без
-        # единой загрузки и без PATCH
+    def test_fresh_get_network_fail_no_uploads(self):
+        # сетевая ошибка свежего GET releases/<id>: fail без единой загрузки
+        # и без PATCH
         self.make_artifacts(TAG)
         sp = self.gh_state(releases=[{"id": 7, "tag_name": TAG, "draft": True,
                                       "prerelease": False, "assets": []}],
@@ -428,7 +544,7 @@ class PublisherTests(unittest.TestCase):
         self.assertFalse(any("upload" in r["argv"] for r in log))
         state = read_state(sp)
         self.assertTrue(self.assets_of(state)["draft"])
-        self.assertNotIn("latest_tag", state)
+        self.assertEqual(state["latest_tag"], "v0.9.0")
 
     def test_patch_fail_no_publish_no_latest(self):
         # PATCH падает (сеть): ассеты загружены, но релиз остаётся draft,
@@ -442,7 +558,7 @@ class PublisherTests(unittest.TestCase):
         state = read_state(sp)
         self.assertTrue(self.assets_of(state)["draft"])
         self.assertNotIn("patched", state)
-        self.assertNotIn("latest_tag", state)
+        self.assertEqual(state["latest_tag"], "v0.9.0")
 
 
 class ReleaseWorkflowWiring(unittest.TestCase):
@@ -484,13 +600,21 @@ class ReleaseWorkflowWiring(unittest.TestCase):
                 out.append(line)
         return "\n".join(out)
 
+    def _code_lines(self, block):
+        """Строки блока без комментариев: property-строки сравниваются без
+        учёта комментариев, чтобы «# id: tag» не подменял реальное id."""
+        return [line.split("#", 1)[0] for line in block.splitlines()]
+
     def test_validate_step_bindings(self):
         val = self.jobs["validate"]
-        # id: tag — в ТОМ ЖЕ step, который запускает validate-tag.sh
+        # id: tag — в ТОМ ЖЕ step, который запускает validate-tag.sh;
+        # сравнение по property-строкам БЕЗ комментариев
         steps = val.split("\n      - ")
         tag_steps = [s for s in steps if "validate-tag.sh" in s]
         self.assertEqual(len(tag_steps), 1)
-        self.assertIn("id: tag", tag_steps[0])
+        code = [c.strip() for c in self._code_lines(tag_steps[0])
+                if c.strip()]
+        self.assertIn("id: tag", code)
         # job outputs ссылаются именно на этот step
         self.assertIn("tag: ${{ steps.tag.outputs.tag }}", val)
         self.assertIn("prerelease: ${{ steps.tag.outputs.prerelease }}", val)
@@ -509,17 +633,49 @@ class ReleaseWorkflowWiring(unittest.TestCase):
         for job in ("validate", "build"):
             self.assertNotIn("contents: write", self.jobs[job])
 
-    def test_tag_only_trigger_and_native_targets(self):
+    def test_top_level_permissions_read(self):
+        # top-level permissions: только read; write появляется ТОЛЬКО
+        # внутри release-job'а (проверено в предыдущем тесте)
+        perms = self._top_block("permissions")
+        self.assertIn("contents: read", perms)
+        self.assertNotIn("contents: write", perms)
+
+    def test_matrix_runner_target_mapping(self):
+        # target→runner привязка по ФАКТИЧЕСКИМ include-записям (парами
+        # runner/target в одном элементе), а не по одному множеству targets
+        expected = {
+            "ubuntu-latest": "x86_64-unknown-linux-gnu",
+            "windows-latest": "x86_64-pc-windows-msvc",
+            "macos-15-intel": "x86_64-apple-darwin",
+            "macos-15": "aarch64-apple-darwin",
+        }
+        entries, cur = [], None
+        for raw in self._code_lines(self.jobs["build"]):
+            s = raw.strip()
+            if s.startswith("- runner:"):
+                cur = {"runner": s.split(":", 1)[1].strip()}
+                entries.append(cur)
+            elif cur is not None and s.startswith("target:"):
+                cur["target"] = s.split(":", 1)[1].strip()
+        mapping = {e["runner"]: e.get("target") for e in entries}
+        self.assertEqual(mapping, expected)
+        # каждая запись полная: без второй половины пары — fail
+        self.assertTrue(all(set(e) == {"runner", "target"}
+                            for e in entries), entries)
+
+    def test_tag_only_trigger_and_targets_present(self):
         on_block = self._top_block("on")
+        self.assertIn("tags:", on_block)
         self.assertIn("'v*'", on_block)
         self.assertNotIn("pull_request", on_block)
         self.assertNotIn("workflow_dispatch", on_block)
-        targets = set()
-        for line in self.jobs["build"].splitlines():
-            s = line.strip()
-            if s.startswith("target:"):
-                targets.add(s.split(":", 1)[1].strip())
-        self.assertEqual(targets, set(UNIX_TARGETS) | {WIN_TARGET})
+        self.assertNotIn("branches:", on_block)
+        # сами таргеты присутствуют (пары runner/target — выше)
+        code = self._code_lines(self.jobs["build"])
+        found = {c.split(":", 1)[1].strip()
+                 for c in (x.strip() for x in code)
+                 if c.startswith("target:")}
+        self.assertEqual(found, set(UNIX_TARGETS) | {WIN_TARGET})
 
 
 if __name__ == "__main__":

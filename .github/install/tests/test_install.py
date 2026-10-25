@@ -135,9 +135,11 @@ class ShInstallTests(unittest.TestCase):
         self.assertEqual([n for n in os.listdir(os.path.dirname(dest))
                           if n.startswith(".tor-socks5.")], [])
 
-    def test_foreign_temp_collision_left_alone(self):
+    def test_foreign_tmpdir_entry_preserved(self):
         # cleanup install.sh удаляет ТОЛЬКО СВОЙ mktemp-каталог; чужие записи
-        # в TMPDIR (в т.ч. с похожим префиксом) не затрагиваются
+        # в TMPDIR (в т.ч. с похожим префиксом) не затрагиваются.
+        # ВАЖНО: это НЕ actual collision — mktemp создаёт СВОЙ каталог;
+        # реальная коллизия на sh невозможна без сломанного контракта ОС.
         ctx = self.build()
         foreign = os.path.join(self.tmp_root, "tor-socks5.foreign-collision")
         os.makedirs(foreign)
@@ -147,6 +149,17 @@ class ShInstallTests(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
         self.assertEqual(fx.file_bytes(os.path.join(foreign, "keep")),
                          b"foreign")
+
+    def test_tmpdir_is_file_real_mktemp_fails(self):
+        # TMPDIR-файл мешает mktemp после получения latest, но до скачивания assets.
+        ctx = self.build()
+        blocker = self.area.file("tmpdir-blocker", b"not a directory")
+        ctx["env"]["TMPDIR"] = blocker
+        p = self.install(ctx)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(self.curl_urls(ctx), [
+            "https://github.com/%s/%s/releases/latest" % (fx.OWNER, fx.REPO)])
+        self.assertEqual(fx.file_bytes(blocker), b"not a directory")
 
     def test_override_dir_with_spaces_and_brackets(self):
         ctx = self.build()
@@ -442,7 +455,9 @@ class PowerShellInstallTests(unittest.TestCase):
                 "s_url": s_url, "archive_path": archive_path}
 
     def ps_run(self, ctx, install_dir, env_extra=None, engine="powershell"):
-        env = dict(os.environ)
+        # Каждая оболочка строит собственный PSModulePath, не наследует модули pwsh.
+        env = {key: value for key, value in os.environ.items()
+               if key.upper() != "PSMODULEPATH"}
         env.pop("PROCESSOR_ARCHITEW6432", None)
         env["LOCALAPPDATA"] = self.area.subdir("appdata")
         if env_extra:
@@ -588,8 +603,26 @@ class PowerShellInstallTests(unittest.TestCase):
             for engine in self.for_each_engine():
                 with self.subTest(case=label, engine=engine):
                     ctx = self.build(release=release)
-                    p = self.ps_run(ctx, self.area.subdir("d"), engine=engine)
+                    dest = self.area.subdir("d")
+                    exe = os.path.join(dest, "tor-socks5.exe")
+                    with open(exe, "wb") as f:
+                        f.write(fx.MARKER_OLD)
+                    conf = os.path.join(dest, "tor-socks5.conf")
+                    with open(conf, "wb") as f:
+                        f.write(b"key=value\n")
+                    p = self.ps_run(ctx, dest, engine=engine)
                     self.assertNotEqual(p.returncode, 0)
+                    # latest API ДОСТИГНУТ, downloads НЕТ; старые файлы целы
+                    log = self.ps_log(ctx)
+                    irm = [r for r in log if r["fn"] == "Invoke-RestMethod"]
+                    self.assertEqual(len(irm), 1)
+                    self.assertEqual(irm[0]["uri"],
+                                     "https://api.github.com/repos/%s/%s/releases/latest"
+                                     % (fx.OWNER, fx.REPO))
+                    self.assertEqual(
+                        [r for r in log if r["fn"] == "Invoke-WebRequest"], [])
+                    self.assertEqual(fx.file_bytes(exe), fx.MARKER_OLD)
+                    self.assertEqual(fx.file_bytes(conf), b"key=value\n")
 
     # --- ручные redirects -------------------------------------------------
 
@@ -676,10 +709,17 @@ class PowerShellInstallTests(unittest.TestCase):
                         self.assertTrue(all(u == a_url for u in uris))
                         self.assertNotIn(s_url, uris)
                         continue
-                    # к запрещённому hop-у обращений не было
+                    # РОВНО ожидаемый достигнутый префикс: единственный вызов —
+                    # начальный download URL; forbidden hop mock'ом НЕ вызван
+                    # (install.ps1 отвергает Location до вызова; журнал пишется
+                    # mock'ом ДО его собственной ошибки, так что «не вызван»
+                    # здесь — факт, а не молчание лога)
+                    self.assertEqual(uris, [a_url])
                     forbidden = location if location else None
                     if forbidden:
                         self.assertNotIn(forbidden, uris)
+                # missing-location: первый request зафиксирован в журнале —
+                # ассерт выше (uris == [a_url]) это и проверяет
 
     # --- checksum-файл (PS-парсер) ----------------------------------------
 
@@ -792,6 +832,36 @@ class PowerShellInstallTests(unittest.TestCase):
 
     # --- файловые отказы: collision / rollback -----------------------------
 
+    def test_temp_dir_collision_new_item_fails_foreign_kept(self):
+        # НАСТОЯЩАЯ temp-коллизия: Join-Path mock возвращает СУЩЕСТВУЮЩИЙ
+        # чужой каталог для child 'tor-socks5-<GUID>' — настоящий New-Item
+        # без -Force обязан отказаться; finally НЕ удаляет чужое содержимое
+        for engine in self.for_each_engine():
+            with self.subTest(engine=engine):
+                ctx = self.build()
+                foreign = self.area.subdir("foreign-temp-" + engine)
+                keep = os.path.join(foreign, "keep-marker.txt")
+                with open(keep, "wb") as f:
+                    f.write(b"foreign temp")
+                pre = os.path.join(foreign, "pre-existing.txt")
+                with open(pre, "wb") as f:
+                    f.write(b"was here")
+                ctx2 = self.build(joinpath_mode="temp-collision",
+                                  joinpath_path=foreign)
+                p = self.ps_run(ctx2, self.area.subdir("dest"), engine=engine)
+                self.assertNotEqual(p.returncode, 0)
+                # чужое содержимое НЕ тронуто, новых записей не появилось
+                self.assertEqual(fx.file_bytes(keep), b"foreign temp")
+                self.assertEqual(fx.file_bytes(pre), b"was here")
+                self.assertEqual(sorted(os.listdir(foreign)),
+                                 ["keep-marker.txt", "pre-existing.txt"])
+                # загрузки не было: latest API достигнут, downloads НЕТ
+                log = self.ps_log(ctx2)
+                self.assertEqual(
+                    len([r for r in log if r["fn"] == "Invoke-RestMethod"]), 1)
+                self.assertEqual(
+                    [r for r in log if r["fn"] == "Invoke-WebRequest"], [])
+
     def test_candidate_collision_foreign_file_kept(self):
         for engine in self.for_each_engine():
             with self.subTest(engine=engine):
@@ -853,6 +923,30 @@ class PowerShellInstallTests(unittest.TestCase):
                 self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
                 self.assertTrue(os.path.exists(junction))
                 self.assertEqual(fx.file_bytes(keep), b"keep")
+                self.assertEqual(fx.file_bytes(
+                    os.path.join(dest, "tor-socks5.exe")), fx.MARKER)
+
+    def test_file_symlink_old_backup_skipped(self):
+        # НАСТОЯЩИЙ ФАЙЛОВЫЙ reparse point (symlink, не junction) в reserved
+        # namespace tor-socks5.exe.old.<32hex>: EnumerateFiles его ВИДИТ, и
+        # ветка FileAttributes.ReparsePoint обязана сработать для ФАЙЛА.
+        # Fixture создаёт python (os.symlink), это право CI-windows-runner
+        # (админ), а не installer ACL: сбой создания = ошибка теста (не skip).
+        targets = ("c1" * 16, "c2" * 16)   # уникальные hex на каждый движок
+        for idx, engine in enumerate(self.for_each_engine()):
+            with self.subTest(engine=engine):
+                ctx = self.build()
+                dest = self.area.subdir("dest-fs-" + engine)
+                target = self.area.file("symlink-target-" + engine,
+                                        b"link-target-data")
+                link = os.path.join(dest,
+                                    "tor-socks5.exe.old." + targets[idx])
+                os.symlink(target, link)
+                p = self.ps_run(ctx, dest, engine=engine)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                # link не удалён, данные по цели не изменены, установка ок
+                self.assertTrue(os.path.islink(link))
+                self.assertEqual(fx.file_bytes(target), b"link-target-data")
                 self.assertEqual(fx.file_bytes(
                     os.path.join(dest, "tor-socks5.exe")), fx.MARKER)
 

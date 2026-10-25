@@ -28,7 +28,11 @@ argv, число мутаций и типы полей (JSON boolean/number/stri
   asset_size_override — {имя: размер} — remote вернул неверный размер
   upload_state        — состояние ассетов после upload ('uploaded'|'pending')
   tags_get_fail       — GET releases/tags/<TAG> падает (сеть/API)
-  get_by_id_fail      — GET releases/<id> падает
+  get_by_id_fail      — GET releases/<id> падает (сетевая ошибка)
+  fresh_get_obj       — полная замена ОБЪЕКТА первого GET releases/<id>
+                        («свежий GET перед upload»): уже published / неверный
+                        id / неверный tag / строка вместо boolean — publish.sh
+                        обязан отвергнуть её typed-предикатом ДО upload
   corrupt_get_after_patch — true: после PATCH GET возвращает draft=true
                             (модель неуспешного readback)
 
@@ -110,6 +114,12 @@ def main():
         if len(parts) >= 5 and parts[-2] == "releases" and parts[-1].isdigit():
             if state.get("get_by_id_fail"):
                 done(False, 1)
+            # Первый GET releases/<id> в прогоне — это «свежий GET ПЕРЕД
+            # upload» из publish.sh: управляемая замена полного объекта.
+            n = state.get("get_by_id_calls", 0)
+            state["get_by_id_calls"] = n + 1
+            if n == 0 and "fresh_get_obj" in state:
+                done(False, 0, json.dumps(state["fresh_get_obj"]))
             rid = int(parts[-1])
             found = [r for r in state["releases"] if r.get("id") == rid]
             if len(found) != 1:

@@ -13,8 +13,10 @@
 #   downloads      — {<полный URL>: {file: путь-с-байтами, redirects: [...]}}
 #   redirects[]    — {status: 302, location: "<url>" | null,
 #                     shape: "ps51" | "ps7"}; пустой массив = 2xx сразу
-#   joinpath_mode  — none | collision | fail-backup | delete-candidate
-#   joinpath_path  — (collision) заранее созданный чужой файл-коллизия
+#   joinpath_mode  — none | collision | fail-backup | delete-candidate |
+#                    temp-collision
+#   joinpath_path  — (collision / temp-collision) заранее созданный чужой
+#                    файл-коллизия / существующий каталог temp-коллизии
 #   log            — путь JSONL-журнала фактических вызовов mock'ов
 
 param(
@@ -129,6 +131,17 @@ if ($Scen.joinpath_mode -and $Scen.joinpath_mode -ne 'none') {
                 return [System.IO.Path]::Combine(
                     [string]$Path, 'no-such-subdir-for-backup', [string]$ChildPath)
             }
+        }
+        # temp-collision: НАСТОЯЩАЯ коллизия temp-каталога установщика
+        # (child 'tor-socks5-<GUID>'): Join-Path возвращает УЖЕ СУЩЕСТВУЮЩИЙ
+        # чужой каталог, поэтому настоящий New-Item -ItemType Directory без
+        # -Force обязан отказаться (tmpCreated остаётся $false — finally
+        # не трогает чужое содержимое). Ветка ПОСЛЕ exe-паттернов: их
+        # режимы обрабатываются выше как раньше.
+        if ($Scen.joinpath_mode -eq 'temp-collision' -and
+            $ChildPath -like 'tor-socks5-*' -and
+            $ChildPath -notlike 'tor-socks5.exe.*') {
+            return [string]$Scen.joinpath_path
         }
         Microsoft.PowerShell.Management\Join-Path @PSBoundParameters
     }
