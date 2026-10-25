@@ -74,12 +74,10 @@ pub(crate) fn rule_from_v4_slots(slots: [Option<u8>; 4]) -> Rule {
     let mut mask = 0u32;
     for (i, slot) in slots.iter().enumerate() {
         let shift = 24 - 8 * i;
-        match slot {
-            Some(octet) => {
-                network |= u32::from(*octet) << shift;
-                mask |= 0xffu32 << shift;
-            }
-            None => {}
+        // None (wildcard) — ничего не делаем
+        if let Some(octet) = slot {
+            network |= u32::from(*octet) << shift;
+            mask |= 0xffu32 << shift;
         }
     }
     Rule::V4 { network, mask }
