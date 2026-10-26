@@ -400,3 +400,102 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: cargo ndk -t arm64-v8a build --locked -p android-ffi
+
+  # === Offline-тесты установщиков и release-хелперов =====================
+  # Независимые от Rust-тир job'ы: изменения .github/install и .github/release
+  # обязаны проверяться сами (реальные скрипты как дочерние процессы, сеть
+  # подменяется только в harness). Никаких Cargo/package зависимостей.
+  installer-sh:
+    name: Installer sh offline tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Syntax check (sh -n installer, bash -n release helpers)
+        run: |
+          set -eu
+          sh -n .github/install/install.sh
+          bash -n .github/release/validate-tag.sh
+          bash -n .github/release/publish.sh
+        shell: bash
+      - name: install.sh offline suite (real POSIX sh as child process)
+        run: python3 -I .github/install/tests/test_install.py ShInstallTests
+        shell: bash
+      # Live-update: реальная компиляция фикстур (cc/clang) + живой процесс
+      # под заменой бинарника (см. running/test_live_update.py)
+      - name: install.sh live-update suite (compiled fixtures)
+        run: python3 -I .github/install/tests/running/test_live_update.py ShLiveUpdateTests
+        shell: bash
+
+  installer-windows:
+    name: Installer PowerShell offline tests (5.1 + 7)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Обе версии движка ОБЯЗАТЕЛЬНО: парсер-проверка встроенным
+      # System.Management.Automation.Language.Parser + UTF-8 BOM check
+      # (5.1 без BOM читает файл как ANSI), без сетевых установок
+      # (PSScriptAnalyzer не используется).
+      - name: Parser + UTF-8 BOM check (PowerShell 5.1)
+        shell: powershell
+        run: |
+          $errors = $null
+          foreach ($f in @('.github\install\install.ps1',
+                           '.github\install\tests\powershell_mock.ps1',
+                           '.github\install\tests\running\compile_windows.ps1',
+                           '.github\install\tests\running\hold_mutex.ps1')) {
+            $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $f))
+            if ($bytes.Length -lt 3 -or $bytes[0] -ne 0xEF -or
+                $bytes[1] -ne 0xBB -or $bytes[2] -ne 0xBF) {
+              Write-Host "Нет UTF-8 BOM: $f"; exit 1
+            }
+            $parse = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $f), [ref]$parse, [ref]$errors) | Out-Null
+            if ($errors -and $errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Host $_.Message }
+              exit 1
+            }
+          }
+      - name: Parser + UTF-8 BOM check (PowerShell 7)
+        shell: pwsh
+        run: |
+          $errors = $null
+          foreach ($f in @('.github\install\install.ps1',
+                           '.github\install\tests\powershell_mock.ps1',
+                           '.github\install\tests\running\compile_windows.ps1',
+                           '.github\install\tests\running\hold_mutex.ps1')) {
+            $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $f))
+            if ($bytes.Length -lt 3 -or $bytes[0] -ne 0xEF -or
+                $bytes[1] -ne 0xBB -or $bytes[2] -ne 0xBF) {
+              Write-Host "Нет UTF-8 BOM: $f"; exit 1
+            }
+            $parse = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $f), [ref]$parse, [ref]$errors) | Out-Null
+            if ($errors -and $errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Host $_.Message }
+              exit 1
+            }
+          }
+      # Сьют сам прогоняет установщик под ОБОИМИ движками (powershell + pwsh)
+      - name: install.ps1 offline suite (both engines)
+        run: python -I .github/install/tests/test_install.py PowerShellInstallTests
+        shell: pwsh
+      # Live-update: compile_windows.ps1 (5.1, отдельный хост на компиляцию)
+      # собирает .NET Framework PE; сьют проверяет 2 движка сам
+      - name: install.ps1 live-update suite (both engines, compiled fixtures)
+        run: python -I .github/install/tests/running/test_live_update.py WindowsLiveUpdateTests
+        shell: pwsh
+
+  release-scripts:
+    name: Release helpers offline suite (validate-tag, publish)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: validate-tag.sh + publish.sh offline suite (gh stub, real jq/sha256sum/stat)
+        run: python3 -I .github/install/tests/test_release.py
+        shell: bash

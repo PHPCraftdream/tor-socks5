@@ -48,7 +48,7 @@ These items were the focus of this task, confirmed by compiling all 4 ABIs and E
 - ring 0.17.14 (pregenerated asm + NDK clang) — OK
 - libsqlite3-sys/rusqlite bundled sqlite3.c via cc — OK
 - zstd-sys via cc — OK
-- daemonize 0.5 + service-manager 0.11 compile under cfg(unix) — OK (Android is cfg(unix); runtime behaviour untested)
+- angelize (alias for the external package) 0.5 + service-manager 0.11 compile under cfg(unix) — OK (Android is cfg(unix); runtime behaviour untested)
 - vendored crates: tor-dirclient, tor-dirmgr, tor-chanmgr, tor-guardmgr, arti-client, saturating-time — OK
 - ptrs-gesher: lyrebird/obfs4/webtunnel 0.6.x — OK
 

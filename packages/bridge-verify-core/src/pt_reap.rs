@@ -1,5 +1,5 @@
 //! Marker-based PT child ownership: the FIFO kill-marker registry shared by
-//! the CLI daemon's and Android engine's leak-reaping sweeps, plus the pure
+//! the CLI angel's and Android engine's leak-reaping sweeps, plus the pure
 //! kill decision both used to duplicate.
 //!
 //! Reaps the PT processes a throwaway verify client's arti client leaves

@@ -326,7 +326,7 @@ impl AuthState {
     /// so a `tor-socks5 users ...` mutation in another process can never
     /// interleave inside this read-modify-write and be clobbered by our
     /// snapshot: the loser waits and builds on the winner's published
-    /// state (TS17-07). The daemon takes that lock with a blocking wait —
+    /// state (TS17-07). The angel takes that lock with a blocking wait —
     /// a refused login cannot be retried by the client, so the
     /// provisioning must not fail just because another writer happened to
     /// be mid-transaction. In-process, the registry write-lock is held
@@ -798,12 +798,12 @@ mod tests {
 
         // Simulate a concurrent CLI process (users_cli does
         // load -> mutate -> save in its own process): add "bob" with a
-        // real hash after the daemon built its in-memory snapshot.
+        // real hash after the angel built its in-memory snapshot.
         let mut cli_cfg = UsersConfig::load(&path).unwrap();
         cli_cfg.users.push(mk_user("bob", "bobpw", true));
         cli_cfg.save(&path).unwrap();
 
-        // The daemon's TOFU transition for alice must re-read the disk
+        // The angel's TOFU transition for alice must re-read the disk
         // registry and merge, not clobber.
         assert!(st.verify("alice", "alipw"));
 

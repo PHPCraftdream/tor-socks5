@@ -117,11 +117,11 @@ Two independent signal layers drive the bridge lifecycle:
 
 This is deliberately gentle — no network flood.
 
-Writers of the store (the daemon's single-writer actor and CLI
+Writers of the store (the angel's single-writer actor and CLI
 subcommands' inline fallback) hold a per-path advisory write lock
 (`<stem>.alive-bridges.log.lock`) across each whole read-modify-write
-cycle, so a `bridges fetch` run overlapping a live daemon serializes
-behind it instead of publishing a stale snapshot over the daemon's
+cycle, so a `bridges fetch` run overlapping a live angel serializes
+behind it instead of publishing a stale snapshot over the angel's
 in-flight write.
 
 ## Active health observation (`circuit_fails`)
@@ -197,7 +197,7 @@ webtunnel sources are pulled, so the pool — and the working list — grow in
 both transports.
 
 Refresh and drain each run as one cross-process transaction on a per-path
-write lock (`<stem>.candidates.log.lock`): a daemon drain and a CLI
+write lock (`<stem>.candidates.log.lock`): an angel drain and a CLI
 `bridges fetch` serialize instead of overwriting each other's snapshot, so
 concurrent additions survive and entries consumed by a drain (promoted or
 dead) stay removed.

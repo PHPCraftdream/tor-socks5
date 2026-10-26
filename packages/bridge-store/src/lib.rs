@@ -25,7 +25,7 @@
 //! Dedup key: [`bridge_probe::BridgeIdentity`] includes transport, address,
 //! fingerprint, carrier identity, and the obfs4 certificate.
 //!
-//! Shared by the CLI daemon (`apps/socks5-proxy`) and the Android JNI
+//! Shared by the CLI angel (`apps/socks5-proxy`) and the Android JNI
 //! engine (`packages/android-ffi`) — both processes probe bridges and want
 //! to remember which ones tend to work across restarts.
 #![warn(missing_docs)]

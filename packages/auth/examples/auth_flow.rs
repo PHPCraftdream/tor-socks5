@@ -57,7 +57,7 @@ fn main() -> Result<()> {
     };
 
     // 3. The runtime verifier. `build` = no TOFU write-back; a live
-    //    daemon would use `AuthState::build_persistent(cfg, users_path)`
+    //    angel would use `AuthState::build_persistent(cfg, users_path)`
     //    so a provisioned `init` password is persisted to the registry.
     let state = AuthState::build(&registry)?;
     println!(

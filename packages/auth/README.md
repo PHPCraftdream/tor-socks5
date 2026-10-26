@@ -25,7 +25,7 @@ let registry = UsersConfig {
 
 let state = AuthState::build(&registry)?;
 // `state.verify(user, password)` answers RFC 1929 login attempts.
-// A live daemon uses `AuthState::build_persistent(cfg, users_path)`
+// A live angel uses `AuthState::build_persistent(cfg, users_path)`
 // instead, so TOFU provisioning is written back to the registry.
 ```
 

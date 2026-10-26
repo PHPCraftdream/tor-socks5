@@ -369,7 +369,7 @@ pub(super) async fn bootstrap_stall_watchdog(tunnel: TorTunnel, callback: Bootst
 ///    through the tunnel (the same target Tor Browser itself uses for this). After
 ///    [`WATCHDOG_FAILURES_BEFORE_RESET`] consecutive failures it calls
 ///    [`TorTunnel::terminate_all_channels`] to force arti to rebuild its channels, giving the
-///    guard/circuit managers a clean slate -- mirrors the CLI daemon's `tor_watchdog.rs`,
+///    guard/circuit managers a clean slate -- mirrors the CLI angel's `tor_watchdog.rs`,
 ///    scoped down to a single canary target instead of replaying real traffic history
 ///    (Android's accept loop doesn't track per-connection success/failure the way the CLI's
 ///    `TorHealth` does).

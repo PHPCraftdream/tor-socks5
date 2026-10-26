@@ -4,7 +4,7 @@
 //!
 //! Reader-side cleanup helpers historically inferred staleness from
 //! `pid != std::process::id()`. That is unsound twice over: another pid is
-//! not a dead process (the owner may be a live daemon or CLI mid-save), and
+//! not a dead process (the owner may be a live angel or CLI mid-save), and
 //! a malformed pid suffix parses to `None`, which the old code treated as
 //! stale and deleted. Both cases delete a temp file belonging to a LIVE
 //! writer, which then fails its rename.

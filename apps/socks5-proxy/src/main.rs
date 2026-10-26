@@ -1,3 +1,5 @@
+#[path = "commands/angel.rs"]
+mod angel;
 #[path = "tor/arti_observability.rs"]
 mod arti_observability;
 #[path = "bridges/bridge_maintenance.rs"]
@@ -19,8 +21,6 @@ mod config;
 mod config_cmd;
 #[path = "tor/conn_health.rs"]
 mod conn_health;
-#[path = "commands/daemon.rs"]
-mod daemon;
 #[path = "server/dns_wiring.rs"]
 mod dns_wiring;
 #[path = "fetch/fetch_merge/fetch_merge.rs"]
@@ -95,7 +95,7 @@ fn main() -> Result<()> {
     // loop instead — same binary, two modes, no second executable on
     // disk. This MUST run before clap parsing because arti passes weird
     // argv to PT subprocesses that would blow up the parser. PT mode
-    // must NEVER daemonise, so it is handled here, out of the clap path
+    // must NEVER angelise, so it is handled here, out of the clap path
     // entirely, and returns directly.
     if std::env::var_os("TOR_PT_MANAGED_TRANSPORT_VER").is_some() {
         // arti (tor-ptmgr) sets TOR_PT_EXIT_ON_STDIN_CLOSE=1 on managed PT
@@ -120,27 +120,27 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // `--daemon` only applies to the foreground server. Subcommands
+    // `--angel` only applies to the foreground server. Subcommands
     // (`users`, `bridges`, `service`, `help`) are short-lived CLI tools
     // that must stay attached to the terminal.
     #[cfg(not(target_os = "android"))]
-    if cli.command.is_none() && cli.daemon {
+    if cli.command.is_none() && cli.angel {
         // Before forking, warn if the configured log sink is stdout/stderr:
-        // the daemon redirects both to /dev/null, so those records would be
+        // the angel redirects both to /dev/null, so those records would be
         // silently lost. This must happen on the *original* stderr (post-fork
-        // stderr is /dev/null), so it lives here, before `daemon::daemonize`.
+        // stderr is /dev/null), so it lives here, before `angel::angelize`.
         // If the config can't be loaded, skip the warning silently — the
         // server startup will surface the real config error.
         #[cfg(all(unix, not(target_os = "android")))]
         {
             warn_on_stdout_stderr_logging(cli.config.as_deref());
-            daemon::daemonize(cli.pid_file.as_deref())?;
+            angel::angelize(cli.pid_file.as_deref())?;
         }
 
         #[cfg(not(unix))]
         {
             anyhow::bail!(
-                "--daemon is Unix-only; on Windows install as a service instead: \
+                "--angel is Unix-only; on Windows install as a service instead: \
                  tor-socks5 service install"
             );
         }
@@ -193,8 +193,8 @@ fn enable_windows_ansi_support() {
 }
 
 /// If `log.output` is `stdout` or `stderr`, print a warning to the *original*
-/// stderr explaining that daemonisation will redirect those to `/dev/null`.
-/// No-op for any other sink (file logging survives the daemon fork just fine)
+/// stderr explaining that angelisation will redirect those to `/dev/null`.
+/// No-op for any other sink (file logging survives the angel fork just fine)
 /// and on any config-load failure (the server startup owns surfacing that).
 #[cfg(all(unix, not(target_os = "android")))]
 fn warn_on_stdout_stderr_logging(config_override: Option<&std::path::Path>) {
@@ -210,8 +210,8 @@ fn warn_on_stdout_stderr_logging(config_override: Option<&std::path::Path>) {
     };
     if let Some(name) = which {
         eprintln!(
-            "warning: --daemon detached the process, but log.output is {name} — those records go \
-             to /dev/null. Set log.output=file (and log.file=...) in the config to capture daemon \
+            "warning: --angel detached the process, but log.output is {name} — those records go \
+             to /dev/null. Set log.output=file (and log.file=...) in the config to capture angel \
              logs."
         );
     }

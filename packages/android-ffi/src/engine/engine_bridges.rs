@@ -133,7 +133,7 @@ pub(super) async fn select_active_probe_bridges_async(
 }
 
 /// Persist a probe round's reachability outcome to the shared bridge-health store
-/// (`<config-stem>.alive-bridges.log`, same file the CLI daemon uses) and re-sort `alive` by
+/// (`<config-stem>.alive-bridges.log`, same file the CLI angel uses) and re-sort `alive` by
 /// historical stability through `BridgeStore::rank_probe_round` (channel-proven count, then
 /// `ok_count`, ties broken by latency) ahead of a bridge seen reachable
 /// for the first time. Shared between the bootstrap-time probe in `engine_async`,

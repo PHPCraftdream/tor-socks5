@@ -2,7 +2,7 @@
 
 The Ktav startup configuration schema for the tor-socks5 proxy: a typed `Config` in which every section has defaults, loaded from a file — `TOR_SOCKS5_CONFIG` env var, then `tor-socks5.ktav` in the working directory, then built-in defaults — with an explicit override (a CLI flag) winning over all of that.
 
-For hosts of the proxy — the CLI daemon and the Android JNI engine share this crate — and for any tool that needs to read or rewrite the same configuration format: bridge lists, DNS policy, watchdog, warm pool, upstream chaining, SOCKS5 user accounts, security toggles.
+For hosts of the proxy — the CLI angel and the Android JNI engine share this crate — and for any tool that needs to read or rewrite the same configuration format: bridge lists, DNS policy, watchdog, warm pool, upstream chaining, SOCKS5 user accounts, security toggles.
 
 The main configuration includes `tor.circuit_hops`, permitted values `2` and `3` (default `3`). This setting affects client-side onion-service circuits only when vanguards are disabled; with `2`, those stems omit the middle relay. Ordinary exit circuits remain three hops. Onion-service circuits are configured per service with `onion_services[].circuit_hops` (default `4`); HsDir upload circuits never use fewer than three hops. Shorter paths reduce anonymity and are intended for censorship circumvention, not anonymity.
 

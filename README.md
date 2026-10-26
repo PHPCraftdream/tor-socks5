@@ -78,6 +78,111 @@ the limit when the rule was introduced are listed in the script's `BASELINE`
 with their current size: they may not grow, new ones may not appear, and an
 entry is lowered or deleted as the directory is split.
 
+## Установка готового бинарника
+
+Устанавливается **latest stable release** (не `main`, не prerelease) с проверкой SHA256
+до установки. На Unix файл заменяется атомарно; на Windows используется
+переименование с откатом при ошибке.
+
+Unix (Linux x86_64 GNU/glibc, macOS x86_64 и Apple Silicon):
+
+```bash
+curl -fsSL 'https://raw.githubusercontent.com/PHPCraftdream/tor-socks5/main/.github/install/install.sh' -o 'install.sh'
+sh './install.sh'
+```
+
+Windows (x86_64, PowerShell 5.1 или 7):
+
+```powershell
+Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/PHPCraftdream/tor-socks5/main/.github/install/install.ps1' -OutFile '.\install.ps1'
+powershell -NoProfile -ExecutionPolicy Bypass -File '.\install.ps1'
+# PowerShell 7: pwsh -NoProfile -File '.\install.ps1'
+```
+
+- Каталог по умолчанию: `~/.local/bin` (Unix), `%LOCALAPPDATA%\Programs\tor-socks5` (Windows).
+- Свой каталог: `sh './install.sh' --install-dir "$HOME/bin"` / `powershell -NoProfile -File '.\install.ps1' -InstallDir "$HOME\bin"`.
+- PATH и конфигурационные файлы **не** изменяются; sudo/права администратора не требуются.
+- Автозапуск не настраивается; приложение установщиком не запускается.
+- Обновление работающего приложения: остановка не нужна. На Unix старый бинарник
+  атомарно заменяется (`rename`) — запущенный процесс продолжает работать со старой
+  версией; на Windows работающий `tor-socks5.exe` переименовывается в
+  `tor-socks5.exe.old.<уникальный суффикс>` и на его место ставится новый.
+- Запущенный процесс сам на новую версию не переключается — её используют
+  следующие запуски. Старые копии удаляются только при эксклюзивном доступе;
+  занятые или недоступные сохраняются до следующей установки. Очистка ограничена
+  зарезервированными именами `tor-socks5.exe.old.<32 hex>`.
+- Замена на Windows — транзакция с откатом (backup возвращается при сбое), а не
+  атомарный replace: теоретически возможен короткий интервал без canonical exe.
+- Поддерживаются ровно 4 таргета: Linux x86_64 GNU (**glibc** — Alpine/musl не поддерживаются),
+  macOS x86_64, macOS aarch64, Windows x86_64. ARM Linux/Windows и BSD — нет.
+
+### Каталог бинарника и каталог конфигурации независимы
+
+Установщик только кладёт бинарник в каталог установки; он **не** запускает
+приложение и **не** создаёт конфигурационных файлов. Приложение при запуске ищет
+`tor-socks5.ktav` в **текущем рабочем каталоге**, откуда его запустили, а не рядом
+с бинарником: каталог бинарника и каталог конфигурации не связаны. Если
+`tor-socks5.ktav` в текущем каталоге нет, приложение само создаёт его с настройками
+по умолчанию при первом старте — там же появляется и `tor-socks5.bridges.ktav`.
+
+Так несколько узлов на одной машине используют разные настройки. Примеры
+независимых запусков из разных терминалов; каталог бинарника не обязан быть в PATH:
+
+```bash
+mkdir -p "$HOME/node-a" "$HOME/node-b"
+# Первый терминал: настройки в "$HOME/node-a/tor-socks5.ktav".
+cd "$HOME/node-a" && "$HOME/.local/bin/tor-socks5"
+# Второй терминал: настройки в "$HOME/node-b/tor-socks5.ktav".
+cd "$HOME/node-b" && "$HOME/.local/bin/tor-socks5" --angel
+```
+
+```powershell
+New-Item -ItemType Directory -Force -Path "$HOME\node-a", "$HOME\node-b" -ErrorAction Stop
+# Первый терминал: настройки в "$HOME\node-a\tor-socks5.ktav".
+Set-Location -LiteralPath "$HOME\node-a" -ErrorAction Stop
+& "$env:LOCALAPPDATA\Programs\tor-socks5\tor-socks5.exe"
+# Второй терминал: настройки в "$HOME\node-b\tor-socks5.ktav".
+Set-Location -LiteralPath "$HOME\node-b" -ErrorAction Stop
+& "$env:LOCALAPPDATA\Programs\tor-socks5\tor-socks5.exe"
+```
+
+Явный путь всегда сильнее: `--config <path>` переопределяет `$TOR_SOCKS5_CONFIG`,
+а тот — файл в текущем каталоге. Режим `--angel` (Unix) фиксирует каталог запуска:
+все относительные пути (конфиг, bridges, pid-файл, логи) остаются привязанными к
+нему, как и в foreground.
+
+### Публикация релиза по тегу
+
+Поддерживаются теги формата `vX.Y.Z` (stable) и `vX.Y.Z-rc.N` (prerelease);
+build metadata (`+`) и ведущие нули (`v01.2.3`) не принимаются.
+
+```bash
+git tag v0.3.0
+git push origin v0.3.0
+```
+
+Публикация автоматическая — отдельного «ручного publish» нет. После push тега
+workflow `.github/workflows/release.yml`:
+
+- собирает 4 нативных бинарника (Linux x86_64 GNU, macOS x86_64, macOS aarch64,
+  Windows x86_64) и публикует **4 архива + 4 SHA256-файла**
+  (`tor-socks5-<тег>-<таргет>.tar.gz/.zip` + `.sha256`);
+- сначала всё попадает в **draft release**; перед загрузкой сверяются SHA256
+  локальных архивов с их checksum-файлами; после загрузки проверяются наличие,
+  размеры и статус всех 8 assets (4 архива + 4 SHA256); затем draft публикуется
+  (draft → published);
+- выбор stable-релиза для `/releases/latest` оставлен правилам GitHub (`legacy`):
+  публикация не назначает любой новый maintenance-тег принудительно как latest;
+  prerelease (`vX.Y.Z-rc.N`) публикуется с флагом prerelease и **никогда**
+  не становится latest;
+- повторный запуск по полностью опубликованному тегу — безопасный no-op:
+  файлы не перезаписываются и не удаляются; при возобновлении прерванного
+  запуска draft дозагружается и публикуется.
+
+Важно: реальная сборка релиза происходит при push тега **после merge** в `main`;
+в PR выполняется только offline-проверка хелперов (валидация тега, логика
+публикации с mock `gh`).
+
 ## Quick start
 
 ```bash

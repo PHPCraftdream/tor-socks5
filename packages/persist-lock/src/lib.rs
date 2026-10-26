@@ -6,7 +6,7 @@
 //!
 //! Reader-side "cleanup temp files" helpers used to delete temp files whose
 //! embedded pid differed from `std::process::id()`. That reasoning is wrong:
-//! another pid is a LIVE process just as often as a dead one (a daemon or a
+//! another pid is a LIVE process just as often as a dead one (an angel or a
 //! concurrent CLI mid-save), and a malformed pid suffix (which parses to
 //! `None`) was treated as stale too. Cleanup deleted temp files belonging to
 //! live writers, which then failed their final rename and lost their save.

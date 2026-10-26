@@ -57,21 +57,23 @@ log.file: /var/log/tor-socks5.log
 
 See [logging](ops/logging.md).
 
-## Daemon mode (Unix only)
+## Angel mode (Unix only)
 
-`--daemon` (short form `-d`) is an alternative to `service install` for running the proxy in the
-background **without** a supervisor. It is **Unix-only**: on Windows, `--daemon` errors out —
+`--angel` (short form `-a`) is an alternative to `service install` for running the proxy in the
+background **without** a supervisor. It is **Unix-only**: on Windows, `--angel` errors out —
 install a service instead (`tor-socks5 service install`).
 
 ```bash
-tor-socks5 --daemon
-tor-socks5 --daemon --pid-file /run/tor-socks5.pid
+tor-socks5 --angel
+tor-socks5 --angel --pid-file /run/tor-socks5.pid
 ```
 
-`--daemon` detaches from the controlling terminal (double-fork + `setsid`), redirects stdin,
-stdout, and stderr to `/dev/null`, and `chdir`s to `/`. `--pid-file <PATH>` writes the daemon's
+`--angel` отвязывает процесс от управляющего терминала (double-fork + `setsid`), направляет stdin,
+stdout и stderr в `/dev/null` и сохраняет каталог запуска в качестве рабочего — относительные пути
+(дефолтный `tor-socks5.ktav`, bridges/pid/лог-файлы) разрешаются от каталога, из которого вы
+запустили процесс, ровно как в foreground. `--pid-file <PATH>` writes the angel's
 PID to a file, useful for `kill` or an init script. Because stdio is sent to `/dev/null`, set a
-file log sink in the config so daemon logs are captured — otherwise the proxy prints a warning on
+file log sink in the config so angel logs are captured — otherwise the proxy prints a warning on
 the original stderr before detaching and the records are lost:
 
 ```ktav
@@ -79,9 +81,9 @@ log.output: file
 log.file: /var/log/tor-socks5.log
 ```
 
-### `--daemon` vs `service install`
+### `--angel` vs `service install`
 
-| | `--daemon` | `service install` |
+| | `--angel` | `service install` |
 |---|---|---|
 | Backgrounds itself | yes | runs foreground under a supervisor |
 | Restart on crash | no | yes (supervisor policy) |
@@ -90,6 +92,6 @@ log.file: /var/log/tor-socks5.log
 
 `service install` registers with systemd / launchd / `rc.d` / the Windows SCM, which handles
 supervision, automatic restart, and start-on-boot. For most servers, prefer `service install`.
-Reach for `--daemon` for quick background runs on a host where you do not want (or cannot) install
+Reach for `--angel` for quick background runs on a host where you do not want (or cannot) install
 a full service unit — e.g. an ad-hoc run from a shell, a container entrypoint without an init
 system, or a one-off behind a process supervisor that only needs a PID file.

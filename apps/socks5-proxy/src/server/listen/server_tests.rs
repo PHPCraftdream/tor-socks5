@@ -724,7 +724,7 @@ async fn shutdown_producers_delayed_write_lands_before_close() {
     store.note_source_at(&bridge, "test", OffsetDateTime::now_utc());
     store.save().expect("seed save");
 
-    // A real writer (the same actor the daemon's producers write through),
+    // A real writer (the same actor the angel's producers write through),
     // locally spawned: the process-global OnceLock would leak this test's
     // path into every other test in the binary.
     let writer = crate::bridge_store_writer::StoreWriter::spawn(

@@ -34,14 +34,14 @@ fn gated_publisher(
     })
 }
 
-/// A CLI read-modify-write overlapping a daemon publish in flight must wait
+/// A CLI read-modify-write overlapping an angel publish in flight must wait
 /// on the store's cross-process lock and build on the published state; a
-/// stale snapshot would be buried by the daemon's rename with no self-heal.
+/// stale snapshot would be buried by the angel's rename with no self-heal.
 /// Forcing: the CLI is parked before its acquisition and released only
 /// while the publish is provably in flight (publisher parked, lock held,
 /// file unpublished). The completion wait only picks who releases the
-/// daemon: the CLI itself (lock bypassed — its save then precedes the
-/// daemon's and the assertions below fail) or a guard timeout (correct
+/// angel: the CLI itself (lock bypassed — its save then precedes the
+/// angel's and the assertions below fail) or a guard timeout (correct
 /// protocol).
 #[tokio::test]
 async fn concurrent_cli_transaction_waits_out_the_locked_publish_and_both_survive() {
@@ -94,7 +94,7 @@ async fn concurrent_cli_transaction_waits_out_the_locked_publish_and_both_surviv
     let pre_wait = pre.clone();
     sync_wait(move || pre_wait.wait_parked(HANG_GUARD)).await;
 
-    // The CLI now reaches its acquisition while the daemon owns the lock.
+    // The CLI now reaches its acquisition while the angel owns the lock.
     pre.release();
     let _cli_finished = sync_wait(move || cli_done_rx.recv_timeout(UNBLOCK_GUARD).is_ok()).await;
     {
@@ -111,7 +111,7 @@ async fn concurrent_cli_transaction_waits_out_the_locked_publish_and_both_surviv
             .is_ok()
     })
     .await;
-    assert!(published, "daemon publish must land");
+    assert!(published, "angel publish must land");
     // Release the post-load gate in both modes. With the lock working the
     // CLI is still blocked before it; with the lock bypassed this lets the
     // test reach the final loss-detection assertions instead of hanging.
@@ -126,7 +126,7 @@ async fn concurrent_cli_transaction_waits_out_the_locked_publish_and_both_surviv
     assert_eq!(
         store.channel_ok_count(&b),
         1,
-        "the CLI must build on the daemon's published state"
+        "the CLI must build on the angel's published state"
     );
     assert_eq!(
         store.sources_of(&cli_bridge),
@@ -148,13 +148,13 @@ async fn concurrent_cli_transaction_waits_out_the_locked_publish_and_both_surviv
             .is_ok()
     })
     .await;
-    assert!(published_twice, "post-CLI daemon publish must land");
+    assert!(published_twice, "post-CLI angel publish must land");
     let store = reload(&path);
     assert_eq!(store.channel_ok_count(&b), 2);
     assert_eq!(
         store.sources_of(&cli_bridge),
         vec!["cli"],
-        "the CLI's bridge must survive the daemon's next publish"
+        "the CLI's bridge must survive the angel's next publish"
     );
 
     writer.close().await.expect("writer closes");

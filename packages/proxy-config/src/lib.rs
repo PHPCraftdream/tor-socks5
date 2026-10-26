@@ -345,7 +345,7 @@ impl Default for AuthConfig {
     }
 }
 
-/// An upstream SOCKS5 proxy the daemon can forward through instead of
+/// An upstream SOCKS5 proxy the angel can forward through instead of
 /// dialing out via Tor. When `enabled`, the Tor bootstrap is skipped
 /// entirely and every accepted CONNECT is chained
 /// `client -> us -> upstream -> target`.

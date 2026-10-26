@@ -75,7 +75,7 @@ publish_failed=true
 | TS17-04 | Несовпадение новых имён закрыто общим генератором и parser; legacy sweep выделен отдельно |
 | TS17-05 | Закрыт: `parent_dir` нормализует пустого родителя в `.` |
 | TS17-06 | Закрыт: single-slot cache удалён; Android вызывает `rank_probe_round` с `sort_by_cached_key` и одним lookup на bridge |
-| TS17-07 | Закрыт для участвующих daemon/CLI writer: общий PathLock охватывает load → mutate → save; интерактивный prompt и hashing вынесены до lock |
+| TS17-07 | Закрыт для участвующих angel/CLI writer: общий PathLock охватывает load → mutate → save; интерактивный prompt и hashing вынесены до lock |
 | TS17-08 | Потеря кандидата при ошибке config закрыта сохранением его в pool до promotion; новые проблемы продвижения описаны TS18-02/03 |
 
 «Закрыт» здесь относится к исходному механизму, не к доказательству корректности всей подсистемы. Forced abort всего drain всё ещё может отсоединить blocking jobs; это прямо отмечено в `AdmissionWorkers`, не выдано за исправленное произвольное cancellation. Отдельная файловая операция может задержаться дольше cooperative deadline — `join_all` не является жёстким wall-clock пределом для неисправного диска.

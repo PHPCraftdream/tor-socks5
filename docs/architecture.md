@@ -189,12 +189,12 @@ The user-facing binary. Source modules under `src/`:
      skip the proxy startup entirely and run `lyrebird::run()` (same
      binary, two modes, no second executable). This runs before clap
      parsing because arti passes weird argv to PT subprocesses.
-  3. **Normal startup**: parse clap, optionally `--daemon`-ise (Unix
+  3. **Normal startup**: parse clap, optionally `--angel`-ise (Unix
      only), build the multi-thread Tokio runtime, dispatch a
      subcommand (`users` / `bridges` / `service` / `config` / `help`, and
      `onion` when built with `onion-service`) or run the foreground server.
 * `commands/cli.rs` — clap derive. Global flags: `--config`, `--upstream` /
-  `--upstream-user` / `--upstream-pass` / `--no-upstream`, `--daemon` /
+  `--upstream-user` / `--upstream-pass` / `--no-upstream`, `--angel` /
   `--pid-file`. Subcommands: `users`, `bridges` (with `fetch`),
   `service`, `config` (including `migrate`), `help`, and (when built with
   `onion-service`) `onion`.
@@ -239,8 +239,8 @@ The user-facing binary. Source modules under `src/`:
   is on.
 * `commands/service.rs` — install/start/stop/status/uninstall across systemd,
   OpenRC, launchd, Windows SCM, BSD `rc.d` (via `service-manager`).
-* `commands/daemon.rs` — `--daemon` mode (Unix only): double-fork via the
-  `daemonize` crate, stdio to `/dev/null`, optional PID file.
+* `commands/angel.rs` — `--angel` mode (Unix only): double-fork via the
+  `angelize` alias, stdio to `/dev/null`, optional PID file.
 * `server/shutdown.rs` — Windows Job Object (`KILL_ON_JOB_CLOSE`) so the PT
   child dies with us, plus cross-platform Ctrl+C / SIGTERM handling.
 * `commands/users_cli.rs` — the `tor-socks5 users` subcommand (add / set-password

@@ -109,4 +109,4 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [target.'cfg(all(unix, not(target_os = "android")))'.dependencies]
-daemonize = { workspace = true }
+angelize = { workspace = true }

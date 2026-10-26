@@ -1,6 +1,6 @@
 //! Upstream SOCKS5 egress: a thin adapter over `resocks5-net`'s client.
 //!
-//! When an upstream proxy is configured (and enabled), the daemon
+//! When an upstream proxy is configured (and enabled), the angel
 //! forwards each accepted CONNECT through it instead of dialing out via
 //! Tor — chaining `client -> us -> upstream -> target`. The RFC 1928
 //! CONNECT / RFC 1929 USERNAME-PASSWORD handshake itself is

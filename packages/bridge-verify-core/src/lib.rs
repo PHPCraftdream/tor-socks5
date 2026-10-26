@@ -1,5 +1,5 @@
 //! Shared bridge-verification support logic, extracted from the two
-//! line-by-line-identical copies that used to live in the CLI daemon
+//! line-by-line-identical copies that used to live in the CLI angel
 //! (`apps/socks5-proxy/src/bridge_verifier.rs`) and the Android JNI engine
 //! (`packages/android-ffi/src/jni/jni_verify.rs`):
 //!

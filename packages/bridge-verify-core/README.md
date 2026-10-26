@@ -1,6 +1,6 @@
 # bridge-verify-core
 
-Shared support logic for Tor bridge verification, extracted from two line-by-line-identical copies that lived in the tor-socks5 CLI daemon and its Android JNI engine. Two pieces:
+Shared support logic for Tor bridge verification, extracted from two line-by-line-identical copies that lived in the tor-socks5 CLI angel and its Android JNI engine. Two pieces:
 
 - `snapshot` — consistent SQLite cache-dir snapshotting for a throwaway check client;
 - `pt_reap` — a marker-based pluggable-transport child-ownership registry and the pure kill decisions behind leak-reaping sweeps.

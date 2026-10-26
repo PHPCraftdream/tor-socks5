@@ -34,7 +34,7 @@ P0: 0. P1: 0. **P2: 4. P3: 10.**
 |---|---|---|---|
 | R-01 | P2 | DNS persistence | `flush_dns_cache` + периодический save стирает из файла и из памяти все ответы текущей сессии |
 | R-02 | P2 | channel_probe | `warm_bridge(..).is_ok()` принимает `Ok(false)` (чужой канал) за доказательство и пишет `channel_ok` |
-| R-03 | P2 | config `.ktav` | read-modify-write конфига без lock: daemon vs CLI теряют изменения (класс TS12-01/02) |
+| R-03 | P2 | config `.ktav` | read-modify-write конфига без lock: angel vs CLI теряют изменения (класс TS12-01/02) |
 | R-04 | P2 | arti-wrapper | `warm_bridge`/`bridge_is_disabled`/`signal_bridge_failure` игнорируют `obfs4_iat_mode` |
 | R-05 | P3 | DNS invalidation | `invalidate_if_current` — no-op для hostname с ≥4 адресами (cap `MAX_PROBE_ADDRS=3`) |
 | R-06 | P3 | DNS cache | negative entry без version-gate может затереть свежий ответ того же поколения |
@@ -88,13 +88,13 @@ matches!(tor.bridge_is_disabled(&bridge), Ok(false))
 
 Предложение: `matches!(tor.warm_bridge(&bridge).await, Ok(true))`. Тест: fake `check`, возвращающий `Ok(false)` для одного из кандидатов, не должен попасть в `found`.
 
-### R-03 — config `.ktav`: read-modify-write без блокировки (daemon ↔ CLI)
+### R-03 — config `.ktav`: read-modify-write без блокировки (angel ↔ CLI)
 
 Места: `apps/socks5-proxy/src/tor_setup.rs:520-539` (`prune_bridges_from_config`: load → retain → write), `fetch_merge.rs:462-479` (promotion: load → push → write, выполняется ПОСЛЕ `drop(pool_lock)` на `:414`), `fetch_merge.rs:170-179` (migration URL: load → write). `Config::write` (`packages/proxy-config/src/lib.rs:763-787`) — atomic rename, temp-имя `.{file}.{pid}.tmp`.
 
-Механизм. TS12-01/02 закрыли lost update для `alive-bridges.log` и `candidates.log` через `PathLock`, но сам конфиг остался без него. Daemon: `bridge_maintenance::refresh` → `refresh_routes` → `build_tor_settings_preserving_live` → `update_health_and_prune` → prune-write; CLI `tor-socks5 bridges fetch` → `drain_pool` → promotion-write. Пересечение: daemon загрузил `S`, CLI загрузил `S`, CLI записал `S+P`, daemon записал `S−D` → промоушен `P` потерян (CLI отчитался «added»), либо в обратном порядке — мёртвый `D` воскрес. Внутри одного daemon-процесса записи последовательны (одна maintenance-таска; `Recheck` не поллит `discovery` параллельно), но PID-only temp-имя означает, что любой будущий второй писатель в процессе получит ещё и общий temp-файл (тот самый дефект, что был у `CandidatePool::save`).
+Механизм. TS12-01/02 закрыли lost update для `alive-bridges.log` и `candidates.log` через `PathLock`, но сам конфиг остался без него. Angel: `bridge_maintenance::refresh` → `refresh_routes` → `build_tor_settings_preserving_live` → `update_health_and_prune` → prune-write; CLI `tor-socks5 bridges fetch` → `drain_pool` → promotion-write. Пересечение: angel загрузил `S`, CLI загрузил `S`, CLI записал `S+P`, angel записал `S−D` → промоушен `P` потерян (CLI отчитался «added»), либо в обратном порядке — мёртвый `D` воскрес. Внутри одного angel-процесса записи последовательны (одна maintenance-таска; `Recheck` не поллит `discovery` параллельно), но PID-only temp-имя означает, что любой будущий второй писатель в процессе получит ещё и общий temp-файл (тот самый дефект, что был у `CandidatePool::save`).
 
-Условия: CLI-подкоманда во время работы daemon'а — то же условие, при котором TS12-01 признан P2.
+Условия: CLI-подкоманда во время работы angel'а — то же условие, при котором TS12-01 признан P2.
 
 Предложение: обернуть все три RMW в `PathLock::acquire_bounded(config_path, CLI_LOCK_WAIT)` (sibling `<config>.lock`), выполнять в `spawn_blocking`; temp-имя дополнить monotonic counter как в `BridgeStore::temp_path`. Тест по образцу `cross_process_lock_tests.rs`: parked prune vs promotion — обе мутации должны сохраниться.
 
