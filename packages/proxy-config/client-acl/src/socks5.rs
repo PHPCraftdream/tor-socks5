@@ -4,6 +4,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+/// Адрес SOCKS5 и необязательные учётные данные.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Socks5Endpoint {
     address: SocketAddr,
@@ -12,10 +13,12 @@ pub struct Socks5Endpoint {
 }
 
 impl Socks5Endpoint {
+    /// Возвращает адрес прокси.
     pub fn address(&self) -> SocketAddr {
         self.address
     }
 
+    /// Возвращает имя и пароль, если задана аутентификация.
     pub fn credentials(&self) -> Option<(&str, &str)> {
         self.username.as_deref().zip(self.password.as_deref())
     }
@@ -96,12 +99,16 @@ impl<'de> Deserialize<'de> for Socks5Endpoint {
     }
 }
 
+/// Явная отмена или замена настройки прокси.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EndpointOverride {
+    /// Отключить прокси, включая унаследованный.
     Disabled,
+    /// Использовать указанный прокси.
     Endpoint(Socks5Endpoint),
 }
 
+/// Применяет настройку аккаунта поверх глобальной.
 pub fn resolve_endpoint(
     global: Option<&EndpointOverride>,
     account: Option<&EndpointOverride>,
@@ -158,10 +165,12 @@ impl<'de> Deserialize<'de> for EndpointOverride {
     }
 }
 
+/// Сериализация необязательной настройки прокси.
 pub mod endpoint_field {
     use super::{Deserialize, Deserializer, EndpointOverride, Serializer};
     use serde::ser::Serialize as _;
 
+    /// Сериализует значение настройки.
     pub fn serialize<S: Serializer>(
         value: &Option<EndpointOverride>,
         serializer: S,
@@ -172,6 +181,7 @@ pub mod endpoint_field {
         }
     }
 
+    /// Десериализует явно заданную настройку.
     pub fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<Option<EndpointOverride>, D::Error> {

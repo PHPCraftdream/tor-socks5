@@ -2,6 +2,7 @@ use std::fmt;
 use std::net::SocketAddr;
 
 use tor_linkspec::ChannelMethod;
+#[cfg(test)]
 use url::Url;
 
 #[derive(Debug, thiserror::Error)]
