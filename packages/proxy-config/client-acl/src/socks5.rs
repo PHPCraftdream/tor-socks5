@@ -34,25 +34,46 @@ impl FromStr for Socks5Endpoint {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let (address, credentials) = value.split_once('|').map_or((value, None), |(a, c)| (a, Some(c)));
+        let (address, credentials) = value
+            .split_once('|')
+            .map_or((value, None), |(a, c)| (a, Some(c)));
         if value == "none" || value.is_empty() {
             return Err("endpoint value must not be empty or `none`".to_owned());
         }
-        let address = SocketAddr::from_str(address).map_err(|_| "endpoint address must be an IPv4 or bracketed IPv6 socket address".to_owned())?;
+        let address = SocketAddr::from_str(address).map_err(|_| {
+            "endpoint address must be an IPv4 or bracketed IPv6 socket address".to_owned()
+        })?;
         if address.port() == 0 {
             return Err("endpoint port must be nonzero".to_owned());
         }
         let (username, password) = match credentials {
             None => (None, None),
             Some(value) => {
-                let (username, password) = value.split_once(':').ok_or_else(|| "credentials must be username:password".to_owned())?;
-                if username.contains(':') || password.contains(':') || username.contains('|') || password.contains('|') || username.is_empty() || password.is_empty() || username.len() > 255 || password.len() > 255 {
-                    return Err("credentials must be nonempty, delimiter-free, and at most 255 bytes each".to_owned());
+                let (username, password) = value
+                    .split_once(':')
+                    .ok_or_else(|| "credentials must be username:password".to_owned())?;
+                if username.contains(':')
+                    || password.contains(':')
+                    || username.contains('|')
+                    || password.contains('|')
+                    || username.is_empty()
+                    || password.is_empty()
+                    || username.len() > 255
+                    || password.len() > 255
+                {
+                    return Err(
+                        "credentials must be nonempty, delimiter-free, and at most 255 bytes each"
+                            .to_owned(),
+                    );
                 }
                 (Some(username.to_owned()), Some(password.to_owned()))
             }
         };
-        Ok(Self { address, username, password })
+        Ok(Self {
+            address,
+            username,
+            password,
+        })
     }
 }
 
@@ -60,7 +81,9 @@ impl Serialize for Socks5Endpoint {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let address = self.address.to_string();
         match (&self.username, &self.password) {
-            (Some(username), Some(password)) => serializer.serialize_str(&format!("{address}|{username}:{password}")),
+            (Some(username), Some(password)) => {
+                serializer.serialize_str(&format!("{address}|{username}:{password}"))
+            }
             _ => serializer.serialize_str(&address),
         }
     }
@@ -123,7 +146,10 @@ impl<'de> Deserialize<'de> for EndpointOverride {
                 } else if value.is_empty() {
                     Err(E::custom("endpoint must be `none` or a SOCKS5 endpoint"))
                 } else {
-                    value.parse().map(EndpointOverride::Endpoint).map_err(E::custom)
+                    value
+                        .parse()
+                        .map(EndpointOverride::Endpoint)
+                        .map_err(E::custom)
                 }
             }
         }
@@ -136,14 +162,19 @@ pub mod endpoint_field {
     use super::{Deserialize, Deserializer, EndpointOverride, Serializer};
     use serde::ser::Serialize as _;
 
-    pub fn serialize<S: Serializer>(value: &Option<EndpointOverride>, serializer: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(
+        value: &Option<EndpointOverride>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
         match value {
             None => serializer.serialize_str("inherit"),
             Some(value) => value.serialize(serializer),
         }
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<EndpointOverride>, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<EndpointOverride>, D::Error> {
         EndpointOverride::deserialize(deserializer).map(Some)
     }
 }
@@ -160,6 +191,8 @@ mod tests {
         assert!("192.0.2.1:0".parse::<Socks5Endpoint>().is_err());
         assert!("192.0.2.1:1080|user:".parse::<Socks5Endpoint>().is_err());
         assert!("192.0.2.1:1080|:pass".parse::<Socks5Endpoint>().is_err());
-        assert!("192.0.2.1:1080|user:password:extra".parse::<Socks5Endpoint>().is_err());
+        assert!("192.0.2.1:1080|user:password:extra"
+            .parse::<Socks5Endpoint>()
+            .is_err());
     }
 }

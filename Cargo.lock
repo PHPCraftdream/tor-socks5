@@ -295,6 +295,7 @@ dependencies = [
  "tor-linkspec",
  "tor-rtcompat",
  "tracing",
+ "url",
 ]
 
 [[package]]

@@ -67,7 +67,11 @@ pub enum UsersAction {
         name: String,
     },
     /// Set or inherit a SOCKS5 hop (`pre` or `post`); `none` disables it.
-    SetSocks5 { name: String, hop: String, value: String },
+    SetSocks5 {
+        name: String,
+        hop: String,
+        value: String,
+    },
     /// List all users.
     List,
     /// Enable a disabled user.
@@ -114,14 +118,29 @@ pub fn run(
             post_socks5,
         } => {
             if init {
-                cmd_add_init(&users_path, &name, allow_onion, pre_socks5.as_deref(), post_socks5.as_deref())
+                cmd_add_init(
+                    &users_path,
+                    &name,
+                    allow_onion,
+                    pre_socks5.as_deref(),
+                    post_socks5.as_deref(),
+                )
             } else {
-                cmd_add(&users_path, &name, prompt, allow_onion, pre_socks5.as_deref(), post_socks5.as_deref())
+                cmd_add(
+                    &users_path,
+                    &name,
+                    prompt,
+                    allow_onion,
+                    pre_socks5.as_deref(),
+                    post_socks5.as_deref(),
+                )
             }
         }
         UsersAction::Remove { name } => cmd_remove(&users_path, &name),
         UsersAction::SetPassword { name } => cmd_set_password(&users_path, &name, prompt),
-        UsersAction::SetSocks5 { name, hop, value } => cmd_set_socks5(&users_path, &name, &hop, &value),
+        UsersAction::SetSocks5 { name, hop, value } => {
+            cmd_set_socks5(&users_path, &name, &hop, &value)
+        }
         UsersAction::List => cmd_list(&users_path),
         UsersAction::Enable { name } => cmd_enable(&users_path, &name),
         UsersAction::Disable { name } => cmd_disable(&users_path, &name),
@@ -182,8 +201,8 @@ fn cmd_add(
         allowed_onion: allow_onion,
         // Новые пользователи создаются без per-user ACL.
         allowed_clients: None,
-                pre_socks5: None,
-                post_socks5: None,
+        pre_socks5: None,
+        post_socks5: None,
     });
     users.save(users_path)?;
     drop(lock);
@@ -198,7 +217,13 @@ fn cmd_add(
 /// Create a user in trust-on-first-use mode: the stored hash is the
 /// `init` sentinel, so the first non-empty password presented at login
 /// is adopted and persisted as the real hash. No password is read here.
-fn cmd_add_init(users_path: &Path, name: &str, allow_onion: bool, pre_socks5: Option<&str>, post_socks5: Option<&str>) -> Result<()> {
+fn cmd_add_init(
+    users_path: &Path,
+    name: &str,
+    allow_onion: bool,
+    pre_socks5: Option<&str>,
+    post_socks5: Option<&str>,
+) -> Result<()> {
     let (lock, mut users) = lock_and_load(users_path)?;
     if users.find(name).is_some() {
         bail!("user \"{name}\" already exists — use `set-password` to change the password");
@@ -210,8 +235,8 @@ fn cmd_add_init(users_path: &Path, name: &str, allow_onion: bool, pre_socks5: Op
         allowed_onion: allow_onion,
         // Новые пользователи создаются без per-user ACL.
         allowed_clients: None,
-                pre_socks5: None,
-                post_socks5: None,
+        pre_socks5: None,
+        post_socks5: None,
     });
     users.save(users_path)?;
     drop(lock);
@@ -225,11 +250,19 @@ fn cmd_add_init(users_path: &Path, name: &str, allow_onion: bool, pre_socks5: Op
 }
 
 fn cmd_set_socks5(path: &Path, name: &str, hop: &str, value: &str) -> Result<()> {
-    if !matches!(hop, "pre" | "post") { bail!("hop must be `pre` or `post`"); }
+    if !matches!(hop, "pre" | "post") {
+        bail!("hop must be `pre` or `post`");
+    }
     let setting = parse_user_endpoint(Some(value))?;
     let (lock, mut users) = lock_and_load(path)?;
-    let user = users.find_mut(name).ok_or_else(|| anyhow::anyhow!("user does not exist"))?;
-    match hop { "pre" => user.pre_socks5 = setting, "post" => user.post_socks5 = setting, _ => bail!("hop must be `pre` or `post`") }
+    let user = users
+        .find_mut(name)
+        .ok_or_else(|| anyhow::anyhow!("user does not exist"))?;
+    match hop {
+        "pre" => user.pre_socks5 = setting,
+        "post" => user.post_socks5 = setting,
+        _ => bail!("hop must be `pre` or `post`"),
+    }
     users.save(path)?;
     drop(lock);
     println!("user SOCKS5 override updated");
@@ -240,7 +273,10 @@ fn parse_user_endpoint(value: Option<&str>) -> Result<Option<EndpointOverride>> 
     match value {
         None | Some("inherit") => Ok(None),
         Some("none") => Ok(Some(EndpointOverride::Disabled)),
-        Some(value) => value.parse().map(EndpointOverride::Endpoint).map(Some)
+        Some(value) => value
+            .parse()
+            .map(EndpointOverride::Endpoint)
+            .map(Some)
             .map_err(|_| anyhow::anyhow!("invalid SOCKS5 endpoint")),
     }
 }
@@ -406,7 +442,15 @@ mod tests {
         let path = tmp_users_path(dir.path());
         let mut prompt = fixed_prompt("secret123");
 
-        cmd_add(&path, "alice", &mut prompt, false, Some("127.0.0.1:1080"), Some("none")).unwrap();
+        cmd_add(
+            &path,
+            "alice",
+            &mut prompt,
+            false,
+            Some("127.0.0.1:1080"),
+            Some("none"),
+        )
+        .unwrap();
 
         let loaded = UsersConfig::load(&path).unwrap();
         assert_eq!(loaded.users.len(), 1);
@@ -414,8 +458,16 @@ mod tests {
         assert!(loaded.users[0].is_enabled);
         assert!(!loaded.users[0].hash.is_empty());
         assert!(verify_hash(&loaded.users[0].hash, "secret123").unwrap());
-        assert_eq!(loaded.users[0].pre_socks5, Some(EndpointOverride::Endpoint("127.0.0.1:1080".parse().unwrap())));
-        assert_eq!(loaded.users[0].post_socks5, Some(EndpointOverride::Disabled));
+        assert_eq!(
+            loaded.users[0].pre_socks5,
+            Some(EndpointOverride::Endpoint(
+                "127.0.0.1:1080".parse().unwrap()
+            ))
+        );
+        assert_eq!(
+            loaded.users[0].post_socks5,
+            Some(EndpointOverride::Disabled)
+        );
     }
 
     #[test]
@@ -858,7 +910,12 @@ mod tests {
 
         let loaded = UsersConfig::load(&path).unwrap();
         let alice = loaded.find("alice").unwrap();
-        assert_eq!(alice.pre_socks5, Some(EndpointOverride::Endpoint("127.0.0.1:1080".parse().unwrap())));
+        assert_eq!(
+            alice.pre_socks5,
+            Some(EndpointOverride::Endpoint(
+                "127.0.0.1:1080".parse().unwrap()
+            ))
+        );
         assert_eq!(alice.post_socks5, Some(EndpointOverride::Disabled));
 
         cmd_set_socks5(&path, "alice", "pre", "inherit").unwrap();
@@ -884,7 +941,12 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), before);
         let loaded = UsersConfig::load(&path).unwrap();
         let alice = loaded.find("alice").unwrap();
-        assert_eq!(alice.pre_socks5, Some(EndpointOverride::Endpoint("127.0.0.1:1080".parse().unwrap())));
+        assert_eq!(
+            alice.pre_socks5,
+            Some(EndpointOverride::Endpoint(
+                "127.0.0.1:1080".parse().unwrap()
+            ))
+        );
         assert_eq!(alice.post_socks5, Some(EndpointOverride::Disabled));
     }
 

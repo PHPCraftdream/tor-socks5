@@ -253,11 +253,7 @@ allowed_clients: 192.168.1*
 
         let dir = tmp_dir();
         let path = dir.join("users-socks5.ktav");
-        fs::write(
-            &path,
-            "users: [{ name: legacy, hash: old-hash }]\n",
-        )
-        .unwrap();
+        fs::write(&path, "users: [{ name: legacy, hash: old-hash }]\n").unwrap();
         let legacy = UsersConfig::load(&path).unwrap();
         assert!(legacy.find("legacy").unwrap().pre_socks5.is_none());
         assert!(legacy.find("legacy").unwrap().post_socks5.is_none());
@@ -267,7 +263,9 @@ allowed_clients: 192.168.1*
         let legacy_user = legacy.find_mut("legacy").unwrap();
         legacy_user.pre_socks5 = Some(EndpointOverride::Disabled);
         legacy_user.post_socks5 = Some(EndpointOverride::Endpoint(
-            "[2001:db8::5]:1081|user:pass".parse::<Socks5Endpoint>().unwrap(),
+            "[2001:db8::5]:1081|user:pass"
+                .parse::<Socks5Endpoint>()
+                .unwrap(),
         ));
         legacy.save(&path).unwrap();
 

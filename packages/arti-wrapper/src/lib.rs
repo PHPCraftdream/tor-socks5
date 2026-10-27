@@ -7,10 +7,7 @@
 #![warn(missing_docs)]
 
 use std::collections::BTreeSet;
-use std::fmt;
-use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -18,7 +15,6 @@ use arti_client::config::pt::TransportConfigBuilder;
 use arti_client::config::{BridgeConfigBuilder, CfgPath, Reconfigure, TorClientConfigBuilder};
 use arti_client::{DataStream, TorClient, TorClientConfig};
 use bridge_line::BridgeLine;
-use tor_chanmgr::ProxyProtocol;
 use tor_linkspec::{ChannelMethod, HasChanMethod};
 use tor_rtcompat::PreferredRuntime;
 
@@ -194,33 +190,6 @@ pub enum BootstrapEvent {
 /// task and the code awaiting bootstrap completion.
 pub type BootstrapEventCallback = Arc<dyn Fn(BootstrapEvent) + Send + Sync>;
 
-/// Typed owner-level SOCKS5 endpoint. Credential values are never included in Debug output.
-/// ASSUMPTION: `ChannelConfigBuilder::outbound_proxy(Option<ProxyProtocol>)` exists in Arti 0.47;
-/// the signature is not confirmed in the vendored source and requires PR-CI compilation.
-#[derive(Clone, PartialEq, Eq)]
-pub struct Socks5PreEndpoint {
-    address: SocketAddr,
-    username: Option<String>,
-    password: Option<String>,
-}
-
-impl Socks5PreEndpoint {
-    /// Construct a SOCKS5 endpoint with optional username/password credentials.
-    pub fn new(address: SocketAddr, credentials: Option<(String, String)>) -> Self {
-        let (username, password) = credentials.map_or((None, None), |(u, p)| (Some(u), Some(p)));
-        Self { address, username, password }
-    }
-}
-
-impl fmt::Debug for Socks5PreEndpoint {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Socks5PreEndpoint")
-            .field("address", &self.address)
-            .field("credentials", &self.username.as_ref().map(|_| "<redacted>"))
-            .finish()
-    }
-}
-
 /// Bootstrap-time settings for [`TorTunnel`].
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -316,10 +285,6 @@ impl Default for Settings {
 }
 
 impl Settings {
-    fn pre_endpoint(&self) -> Option<&Socks5PreEndpoint> {
-        self.pre_endpoint.as_ref()
-    }
-
     /// Whether every behavioural field equals [`Settings::default`]: no
     /// bridges, no pluggable transport, no obfs4 override, stock circuit
     /// building and stream timeouts. `state_dir`/`cache_dir` are location
@@ -612,7 +577,7 @@ impl TorTunnel {
         // only reliable carrier check: the `check_match` inside
         // `get_or_launch` compares relay identities, which different bridge
         // lines (e.g. two webtunnel endpoints of one relay) can share.
-        Ok(channel_proves_endpoint(
+        Ok(pre_endpoint::channel_proves_endpoint(
             &chan.target().chan_method(),
             &target.chan_method(),
         ))
@@ -867,7 +832,9 @@ fn fatal_protocol_error_hook(error: &arti_client::Error) {
     );
 }
 
+mod pre_endpoint;
 mod validate;
+pub use pre_endpoint::Socks5PreEndpoint;
 use validate::{
     validate_circuit_hops, validate_min_bandwidth_percentile, validate_service_circuit_hops,
 };
@@ -883,34 +850,25 @@ fn build_config(settings: &Settings) -> Result<TorClientConfig> {
     if let Some(endpoint) = settings.pre_endpoint.as_ref() {
         if !settings.extra_pt_protocols.is_empty()
             || settings.pt_binary.is_some()
-            || settings.bridges.iter().any(|bridge| bridge.transport.is_some())
+            || settings
+                .bridges
+                .iter()
+                .any(|bridge| bridge.transport.is_some())
         {
             return Err(TorError::BuildConfig(
                 "SOCKS5 pre endpoint cannot guarantee routing for pluggable transports".to_owned(),
             ));
         }
-        let uri = match (&endpoint.username, &endpoint.password) {
-            (Some(username), Some(password)) => {
-                if username.is_empty() || password.is_empty() || username.len() > 255 || password.len() > 255 {
-                    return Err(TorError::BuildConfig(
-                        "invalid SOCKS5 pre credentials (details redacted)".to_owned(),
-                    ));
-                }
-                format!(
-                    "socks5://{}:{}@{}",
-                    percent_encode_userinfo(username),
-                    percent_encode_userinfo(password),
-                    endpoint.address
-                )
-            }
-            (None, None) => format!("socks5://{}", endpoint.address),
-            _ => return Err(TorError::BuildConfig("incomplete SOCKS5 credentials (redacted)".to_owned())),
-        };
-        let proxy = ProxyProtocol::from_str(&uri).map_err(|_| {
+        let uri = endpoint.proxy_uri().map_err(|_| {
+            TorError::BuildConfig("invalid SOCKS5 pre endpoint (details redacted)".to_owned())
+        })?;
+        let proxy = uri.parse().map_err(|_| {
             TorError::BuildConfig("invalid SOCKS5 pre endpoint (details redacted)".to_owned())
         })?;
         if !matches!(proxy, ProxyProtocol::Socks { .. }) {
-            return Err(TorError::BuildConfig("pre endpoint must resolve to SOCKS5".to_owned()));
+            return Err(TorError::BuildConfig(
+                "pre endpoint must resolve to SOCKS5".to_owned(),
+            ));
         }
         builder.channel().outbound_proxy(Some(proxy));
     }
@@ -1033,31 +991,6 @@ fn build_config(settings: &Settings) -> Result<TorClientConfig> {
     builder
         .build()
         .map_err(|e| TorError::BuildConfig(e.to_string()))
-}
-
-/// Whether a channel's actual connection method proves it reaches a target
-/// requested with `requested`.
-///
-/// Pure decision function for [`TorTunnel::warm_bridge`]: a direct channel
-/// counts when its handshake actually used one of the requested addresses
-/// (`Channel::target()` is filtered down to the address really used, so this
-/// is an intersection, mirroring `PeerInfo::matches_chan_method` in
-/// tor-proto); a pluggable-transport channel counts only on an exact
-/// transport/address/settings match. Anything else — different endpoint,
-/// different transport class — is not proof.
-pub(crate) fn channel_proves_endpoint(
-    actual: &tor_linkspec::ChannelMethod,
-    requested: &tor_linkspec::ChannelMethod,
-) -> bool {
-    match (actual, requested) {
-        (ChannelMethod::Direct(actual_addrs), ChannelMethod::Direct(requested_addrs)) => {
-            actual_addrs.iter().any(|a| requested_addrs.contains(a))
-        }
-        (ChannelMethod::Pluggable(actual), ChannelMethod::Pluggable(requested)) => {
-            actual == requested
-        }
-        _ => false,
-    }
 }
 
 #[cfg(test)]

@@ -5,6 +5,8 @@
 
 use std::sync::{Arc, OnceLock};
 
+pub mod client;
+
 use resocks5_net::server::{self, Credentials, IncomingRequest, ServerError, ServerOptions};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Semaphore;

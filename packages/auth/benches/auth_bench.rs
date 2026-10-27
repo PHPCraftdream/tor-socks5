@@ -23,8 +23,8 @@ fn bench_auth_state_verify(c: &mut Criterion) {
         is_enabled: true,
         allowed_onion: false,
         allowed_clients: None,
-            pre_socks5: None,
-            post_socks5: None,
+        pre_socks5: None,
+        post_socks5: None,
     };
     let state = auth::AuthState::build(&auth::UsersConfig { users: vec![user] }).unwrap();
 
