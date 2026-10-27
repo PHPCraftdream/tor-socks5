@@ -90,6 +90,8 @@ fn one_user_state(name: &str, password: &str) -> Arc<AuthState> {
         is_enabled: true,
         allowed_onion: false,
         allowed_clients: None,
+            pre_socks5: None,
+            post_socks5: None,
     };
     Arc::new(AuthState::build(&UsersConfig { users: vec![user] }).unwrap())
 }

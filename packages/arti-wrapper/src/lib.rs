@@ -7,7 +7,10 @@
 #![warn(missing_docs)]
 
 use std::collections::BTreeSet;
+use std::fmt;
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -15,6 +18,7 @@ use arti_client::config::pt::TransportConfigBuilder;
 use arti_client::config::{BridgeConfigBuilder, CfgPath, Reconfigure, TorClientConfigBuilder};
 use arti_client::{DataStream, TorClient, TorClientConfig};
 use bridge_line::BridgeLine;
+use tor_chanmgr::ProxyProtocol;
 use tor_linkspec::{ChannelMethod, HasChanMethod};
 use tor_rtcompat::PreferredRuntime;
 
@@ -190,9 +194,38 @@ pub enum BootstrapEvent {
 /// task and the code awaiting bootstrap completion.
 pub type BootstrapEventCallback = Arc<dyn Fn(BootstrapEvent) + Send + Sync>;
 
+/// Typed owner-level SOCKS5 endpoint. Credential values are never included in Debug output.
+/// ASSUMPTION: `ChannelConfigBuilder::outbound_proxy(Option<ProxyProtocol>)` exists in Arti 0.47;
+/// the signature is not confirmed in the vendored source and requires PR-CI compilation.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Socks5PreEndpoint {
+    address: SocketAddr,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+impl Socks5PreEndpoint {
+    /// Construct a SOCKS5 endpoint with optional username/password credentials.
+    pub fn new(address: SocketAddr, credentials: Option<(String, String)>) -> Self {
+        let (username, password) = credentials.map_or((None, None), |(u, p)| (Some(u), Some(p)));
+        Self { address, username, password }
+    }
+}
+
+impl fmt::Debug for Socks5PreEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Socks5PreEndpoint")
+            .field("address", &self.address)
+            .field("credentials", &self.username.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
 /// Bootstrap-time settings for [`TorTunnel`].
 #[derive(Debug, Clone)]
 pub struct Settings {
+    /// Optional SOCKS5 pre-transport endpoint for owner-level routing. Credentials are redacted in Debug output.
+    pub pre_endpoint: Option<Socks5PreEndpoint>,
     /// Bridges to use. When non-empty, the client will go through these
     /// instead of public guards.
     pub bridges: Vec<BridgeLine>,
@@ -267,6 +300,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             bridges: Vec::new(),
+            pre_endpoint: None,
             pt_binary: None,
             extra_pt_protocols: Vec::new(),
             state_dir: None,
@@ -282,13 +316,18 @@ impl Default for Settings {
 }
 
 impl Settings {
+    fn pre_endpoint(&self) -> Option<&Socks5PreEndpoint> {
+        self.pre_endpoint.as_ref()
+    }
+
     /// Whether every behavioural field equals [`Settings::default`]: no
     /// bridges, no pluggable transport, no obfs4 override, stock circuit
     /// building and stream timeouts. `state_dir`/`cache_dir` are location
     /// hints rather than behaviour, so they are deliberately not compared —
     /// a client with only those set still behaves like the default one.
     pub fn is_default(&self) -> bool {
-        self.bridges.is_empty()
+        self.pre_endpoint.is_none()
+            && self.bridges.is_empty()
             && self.pt_binary.is_none()
             && self.extra_pt_protocols.is_empty()
             && self.min_bandwidth_percentile == 0
@@ -840,6 +879,41 @@ fn build_config(settings: &Settings) -> Result<TorClientConfig> {
         .map_err(TorError::BuildConfig)?;
 
     let mut builder: TorClientConfigBuilder = TorClientConfig::builder();
+
+    if let Some(endpoint) = settings.pre_endpoint.as_ref() {
+        if !settings.extra_pt_protocols.is_empty()
+            || settings.pt_binary.is_some()
+            || settings.bridges.iter().any(|bridge| bridge.transport.is_some())
+        {
+            return Err(TorError::BuildConfig(
+                "SOCKS5 pre endpoint cannot guarantee routing for pluggable transports".to_owned(),
+            ));
+        }
+        let uri = match (&endpoint.username, &endpoint.password) {
+            (Some(username), Some(password)) => {
+                if username.is_empty() || password.is_empty() || username.len() > 255 || password.len() > 255 {
+                    return Err(TorError::BuildConfig(
+                        "invalid SOCKS5 pre credentials (details redacted)".to_owned(),
+                    ));
+                }
+                format!(
+                    "socks5://{}:{}@{}",
+                    percent_encode_userinfo(username),
+                    percent_encode_userinfo(password),
+                    endpoint.address
+                )
+            }
+            (None, None) => format!("socks5://{}", endpoint.address),
+            _ => return Err(TorError::BuildConfig("incomplete SOCKS5 credentials (redacted)".to_owned())),
+        };
+        let proxy = ProxyProtocol::from_str(&uri).map_err(|_| {
+            TorError::BuildConfig("invalid SOCKS5 pre endpoint (details redacted)".to_owned())
+        })?;
+        if !matches!(proxy, ProxyProtocol::Socks { .. }) {
+            return Err(TorError::BuildConfig("pre endpoint must resolve to SOCKS5".to_owned()));
+        }
+        builder.channel().outbound_proxy(Some(proxy));
+    }
 
     builder
         .stream_timeouts()

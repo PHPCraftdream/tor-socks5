@@ -54,6 +54,52 @@ mod integration_tests {
     }
 
     #[test]
+    fn user_pre_and_post_overrides_resolve_independently_of_global_values() {
+        use client_acl::{resolve_endpoint, EndpointOverride};
+
+        let global_pre = Some(EndpointOverride::Endpoint("192.0.2.1:1080".parse().unwrap()));
+        let global_post = Some(EndpointOverride::Endpoint("192.0.2.2:1080".parse().unwrap()));
+        let user_pre = Some(EndpointOverride::Disabled);
+        let user_post = Some(EndpointOverride::Endpoint("198.51.100.2:1080".parse().unwrap()));
+
+        let resolved_pre = resolve_endpoint(global_pre.as_ref(), user_pre.as_ref());
+        let resolved_post = resolve_endpoint(global_post.as_ref(), user_post.as_ref());
+        assert!(resolved_pre.is_none());
+        assert_eq!(resolved_post.unwrap().address().to_string(), "198.51.100.2:1080");
+
+        let inherited_pre = resolve_endpoint(global_pre.as_ref(), None).unwrap();
+        let inherited_post = resolve_endpoint(global_post.as_ref(), None).unwrap();
+        assert_eq!(inherited_pre.address().to_string(), "192.0.2.1:1080");
+        assert_eq!(inherited_post.address().to_string(), "192.0.2.2:1080");
+        assert!(resolve_endpoint(global_post.as_ref(), user_pre.as_ref()).is_none());
+        assert_eq!(resolve_endpoint(global_pre.as_ref(), user_post.as_ref()).unwrap().address().to_string(), "198.51.100.2:1080");
+    }
+
+    #[test]
+    fn user_socks_chain_states_roundtrip_and_fail_closed() {
+        let old = r#"
+name: alice
+hash: $argon2id$v=19$m=5120,t=2,p=1$salt$hash
+"#;
+        let inherited: User = ktav::from_str(old).expect("legacy account");
+        assert!(inherited.pre_socks5.is_none());
+        let explicit = r#"
+name: alice
+hash: $argon2id$v=19$m=5120,t=2,p=1$salt$hash
+pre_socks5: none
+post_socks5: 192.0.2.1:1080|u:p
+"#;
+        let user: User = ktav::from_str(explicit).expect("overrides");
+        assert_eq!(user.pre_socks5, Some(client_acl::EndpointOverride::Disabled));
+        let saved = ktav::to_string(&user).expect("serialize");
+        assert!(saved.contains("pre_socks5: none"));
+        let restored: User = ktav::from_str(&saved).expect("roundtrip");
+        assert_eq!(restored.pre_socks5, user.pre_socks5);
+        assert_eq!(restored.post_socks5, user.post_socks5);
+        assert!(ktav::from_str::<User>(&explicit.replace("192.0.2.1:1080|u:p", "proxy.invalid:1080")).is_err());
+    }
+
+    #[test]
     fn user_serde_deny_unknown_fields() {
         let raw = r#"
 name: alice
@@ -116,6 +162,8 @@ allowed_onion: true
             is_enabled: true,
             allowed_onion: false,
             allowed_clients: None,
+            pre_socks5: None,
+            post_socks5: None,
         };
         let state = AuthState::build(&UsersConfig { users: vec![user] }).unwrap();
         assert!(!state.verify("mallory", "anything"));
@@ -138,6 +186,8 @@ mod user_acl_tests {
             is_enabled: true,
             allowed_onion: false,
             allowed_clients: Some(acl.parse().expect("valid allow-list")),
+            pre_socks5: None,
+            post_socks5: None,
         }
     }
 
@@ -195,6 +245,8 @@ mod user_acl_tests {
                 is_enabled: true,
                 allowed_onion: false,
                 allowed_clients: None,
+                pre_socks5: None,
+                post_socks5: None,
             }],
         })
         .unwrap();
@@ -212,6 +264,8 @@ mod user_acl_tests {
                 is_enabled: false,
                 allowed_onion: false,
                 allowed_clients: None,
+                pre_socks5: None,
+                post_socks5: None,
             }],
         })
         .unwrap();
@@ -270,6 +324,8 @@ mod user_acl_tests {
                     is_enabled: true,
                     allowed_onion: false,
                     allowed_clients: Some("203.0.113.*".parse().expect("valid allow-list")),
+                    pre_socks5: None,
+                    post_socks5: None,
                 },
                 User {
                     name: "carol".into(),
@@ -277,6 +333,8 @@ mod user_acl_tests {
                     is_enabled: true,
                     allowed_onion: false,
                     allowed_clients: None,
+                    pre_socks5: None,
+                    post_socks5: None,
                 },
             ],
         };

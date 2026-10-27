@@ -1,5 +1,7 @@
 use super::*;
+use std::str::FromStr;
 use arti_client::config::circ::CircMgrConfig;
+use tor_chanmgr::ProxyProtocol;
 use std::path::PathBuf;
 use std::sync::Once;
 
@@ -24,6 +26,7 @@ fn ensure_crypto_provider() {
 #[test]
 fn settings_default_is_default() {
     let s = Settings::default();
+    assert!(s.pre_endpoint.is_none());
     assert!(s.is_default());
     assert!(s.bridges.is_empty());
     assert!(s.pt_binary.is_none());
@@ -48,6 +51,61 @@ fn settings_with_shorter_service_circuit_hops_is_not_default() {
         ..Default::default()
     };
     assert!(!settings.is_default());
+}
+
+#[test]
+fn build_config_routes_pre_proxy_and_redacts_credentials() {
+    for credentials in [None, Some(("owner".to_owned(), "top-secret".to_owned()))] {
+        let endpoint = Socks5PreEndpoint::new("127.0.0.9:1087".parse().unwrap(), credentials);
+        let debug = format!("{endpoint:?}");
+        assert!(!debug.contains("top-secret"));
+        let expected_uri = match endpoint.username.as_deref() {
+            Some(username) => format!(
+                "socks5://{}:top-secret@127.0.0.9:1087",
+                percent_encode_userinfo(username)
+            ),
+            None => "socks5://127.0.0.9:1087".to_owned(),
+        };
+        let settings = Settings {
+            pre_endpoint: Some(endpoint),
+            ..Default::default()
+        };
+        let config = build_config(&settings).expect("SOCKS5 channel proxy config builds");
+        let proxy = config.channel().outbound_proxy().expect("proxy configured");
+        assert_eq!(
+            proxy,
+            &ProxyProtocol::from_str(&expected_uri).unwrap(),
+            "configured proxy must exactly match the requested endpoint"
+        );
+        let protocol_debug = format!("{proxy:?}");
+        assert!(!protocol_debug.contains("top-secret"));
+        assert!(!format!("{settings:?}").contains("top-secret"));
+    }
+}
+
+#[test]
+fn build_config_rejects_unsupported_proxy_protocol_without_fallback() {
+    let settings = Settings {
+        pre_endpoint: Some(Socks5PreEndpoint::new("127.0.0.9:1087".parse().unwrap(), None)),
+        pt_binary: Some(PathBuf::from("any-configured-pt")),
+        bridges: vec!["obfs4 192.0.2.1:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA iat-mode=0".parse().unwrap()],
+        ..Default::default()
+    };
+    let error = build_config(&settings).expect_err("PT combined with pre is unsupported");
+    assert!(error.to_string().contains("cannot guarantee routing"));
+}
+
+#[test]
+fn build_config_redacts_invalid_pre_proxy_credentials() {
+    let settings = Settings {
+        pre_endpoint: Some(Socks5PreEndpoint::new(
+            "127.0.0.9:1087".parse().unwrap(),
+            Some(("user name".to_owned(), "do-not-leak".to_owned())),
+        )),
+        ..Default::default()
+    };
+    let error = build_config(&settings).expect_err("invalid URI userinfo is rejected");
+    assert!(!error.to_string().contains("do-not-leak"));
 }
 
 #[test]

@@ -138,6 +138,8 @@ mod tests {
             is_enabled: enabled,
             allowed_onion: false,
             allowed_clients: None,
+            pre_socks5: None,
+            post_socks5: None,
         }
     }
 
@@ -242,6 +244,42 @@ allowed_clients: 192.168.1*
         let dir = tmp_dir();
         let cfg = UsersConfig::load(&dir.join("nope.ktav")).unwrap();
         assert!(cfg.users.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn socks5_overrides_omitted_disabled_and_endpoint_survive_registry_save_load() {
+        use client_acl::{EndpointOverride, Socks5Endpoint};
+
+        let dir = tmp_dir();
+        let path = dir.join("users-socks5.ktav");
+        fs::write(
+            &path,
+            "users: [{ name: legacy, hash: old-hash }]\n",
+        )
+        .unwrap();
+        let legacy = UsersConfig::load(&path).unwrap();
+        assert!(legacy.find("legacy").unwrap().pre_socks5.is_none());
+        assert!(legacy.find("legacy").unwrap().post_socks5.is_none());
+        assert!(legacy.find("missing").is_none());
+
+        let mut legacy = legacy;
+        let legacy_user = legacy.find_mut("legacy").unwrap();
+        legacy_user.pre_socks5 = Some(EndpointOverride::Disabled);
+        legacy_user.post_socks5 = Some(EndpointOverride::Endpoint(
+            "[2001:db8::5]:1081|user:pass".parse::<Socks5Endpoint>().unwrap(),
+        ));
+        legacy.save(&path).unwrap();
+
+        let loaded = UsersConfig::load(&path).unwrap();
+        let user = loaded.find("legacy").unwrap();
+        assert_eq!(user.pre_socks5, Some(EndpointOverride::Disabled));
+        let Some(EndpointOverride::Endpoint(endpoint)) = &user.post_socks5 else {
+            panic!("post SOCKS endpoint must survive registry persistence");
+        };
+        assert_eq!(endpoint.address().to_string(), "[2001:db8::5]:1081");
+        assert_eq!(endpoint.credentials(), Some(("user", "pass")));
+        assert!(loaded.find("other").is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 

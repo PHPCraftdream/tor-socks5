@@ -56,6 +56,9 @@ mod matcher;
 mod tests;
 
 mod parser;
+mod socks5;
+pub use socks5::endpoint_field as socks5_endpoint_field;
+pub use socks5::{resolve_endpoint, EndpointOverride, Socks5Endpoint};
 
 use std::fmt;
 use std::net::IpAddr;

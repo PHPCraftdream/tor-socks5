@@ -27,6 +27,11 @@ pub struct User {
     /// Явная пустая строка — ошибка загрузки, а не None/inherit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_clients: Option<client_acl::AllowedClients>,
+    /// Per-account SOCKS chain selection: omitted inherits global configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "client_acl::socks5_endpoint_field")]
+    pub pre_socks5: Option<client_acl::EndpointOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "client_acl::socks5_endpoint_field")]
+    pub post_socks5: Option<client_acl::EndpointOverride>,
 }
 
 fn default_true() -> bool {

@@ -100,6 +100,11 @@ pub struct Config {
     pub conn_health: ConnHealthConfig,
     /// Optional upstream SOCKS5 proxy used as the egress instead of Tor.
     pub upstream: UpstreamConfig,
+    /// Необязательные SOCKS5 hops: адрес до локального SOCKS-приёмника и после него.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "client_acl::socks5_endpoint_field")]
+    pub pre_socks5: Option<client_acl::EndpointOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "client_acl::socks5_endpoint_field")]
+    pub post_socks5: Option<client_acl::EndpointOverride>,
     /// Local SOCKS5 (RFC 1929) authentication for the listener. Used by
     /// both the CLI and the Android JNI FFI crate — see [`AuthConfig`].
     pub auth: AuthConfig,
@@ -825,6 +830,8 @@ impl Default for Config {
             warm_pool: WarmPoolConfig::default(),
             conn_health: ConnHealthConfig::default(),
             upstream: UpstreamConfig::default(),
+            pre_socks5: None,
+            post_socks5: None,
             auth: AuthConfig::default(),
             security: SecurityConfig::default(),
             dns: DnsConfig::default(),
@@ -953,3 +960,6 @@ impl Config {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+#[path = "tests/socks5_config.rs"]
+mod socks5_config_tests;

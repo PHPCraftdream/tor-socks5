@@ -49,6 +49,8 @@ fn init_user(name: &str) -> User {
         is_enabled: true,
         allowed_onion: false,
         allowed_clients: None,
+            pre_socks5: None,
+            post_socks5: None,
     }
 }
 
@@ -59,6 +61,8 @@ fn enabled_user(name: &str, password: &str) -> User {
         is_enabled: true,
         allowed_onion: false,
         allowed_clients: None,
+            pre_socks5: None,
+            post_socks5: None,
     }
 }
 
