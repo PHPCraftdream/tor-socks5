@@ -1,5 +1,31 @@
 use super::*;
 
+fn reject_unimplemented_global_socks5_endpoints(config: &Config) -> Result<(), String> {
+    use proxy_config::EndpointOverride;
+
+    if [&config.pre_socks5, &config.post_socks5]
+        .iter()
+        .any(|setting| matches!(setting, Some(EndpointOverride::Endpoint(_))))
+    {
+        return Err("Android SOCKS5 global pre_socks5/post_socks5 endpoints are not supported yet; refusing startup to prevent direct connections".to_owned());
+    }
+    Ok(())
+}
+
+fn reject_unimplemented_account_socks5_endpoints(users: &UsersConfig) -> Result<(), String> {
+    use proxy_config::EndpointOverride;
+
+    for user in users.users.iter().filter(|user| user.is_enabled) {
+        if [&user.pre_socks5, &user.post_socks5]
+            .iter()
+            .any(|setting| matches!(setting, Some(EndpointOverride::Endpoint(_))))
+        {
+            return Err("Android SOCKS5 account pre_socks5/post_socks5 endpoints are not supported yet; refusing startup to prevent direct connections".to_owned());
+        }
+    }
+    Ok(())
+}
+
 /// How long `nativeStop` waits for the engine thread (unchanged 10s contract).
 const STOP_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -26,7 +52,55 @@ pub(crate) fn main_engine_settings(
 
 #[cfg(test)]
 mod tests {
-    use super::main_engine_settings;
+    use super::{
+        main_engine_settings, reject_unimplemented_account_socks5_endpoints,
+        reject_unimplemented_global_socks5_endpoints,
+    };
+    use auth::{User, UsersConfig};
+    use proxy_config::{client_acl::EndpointOverride, Config};
+
+    fn endpoint() -> EndpointOverride {
+        EndpointOverride::Endpoint("127.0.0.1:9050".parse().unwrap())
+    }
+
+    fn user(enabled: bool, pre: Option<EndpointOverride>) -> User {
+        User {
+            name: "account".to_owned(),
+            hash: "unused".to_owned(),
+            is_enabled: enabled,
+            allowed_onion: false,
+            allowed_clients: None,
+            pre_socks5: pre,
+            post_socks5: None,
+        }
+    }
+
+    #[test]
+    fn global_endpoint_is_rejected_but_none_or_absence_is_allowed() {
+        let mut config = Config::default();
+        assert!(reject_unimplemented_global_socks5_endpoints(&config).is_ok());
+        config.pre_socks5 = Some(EndpointOverride::Disabled);
+        config.post_socks5 = Some(endpoint());
+        assert!(reject_unimplemented_global_socks5_endpoints(&config).is_err());
+        config.post_socks5 = None;
+        assert!(reject_unimplemented_global_socks5_endpoints(&config).is_ok());
+    }
+
+    #[test]
+    fn enabled_account_endpoint_is_rejected_but_disabled_account_is_ignored() {
+        let users = UsersConfig {
+            users: vec![user(true, Some(endpoint()))],
+        };
+        assert!(reject_unimplemented_account_socks5_endpoints(&users).is_err());
+        let users = UsersConfig {
+            users: vec![user(false, Some(endpoint()))],
+        };
+        assert!(reject_unimplemented_account_socks5_endpoints(&users).is_ok());
+        let users = UsersConfig {
+            users: vec![user(true, Some(EndpointOverride::Disabled))],
+        };
+        assert!(reject_unimplemented_account_socks5_endpoints(&users).is_ok());
+    }
 
     #[test]
     fn main_engine_settings_forwards_circuit_hops_two_and_three() {
@@ -190,6 +264,12 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
             }
         };
 
+        #[cfg(target_os = "android")]
+        if let Err(message) = reject_unimplemented_global_socks5_endpoints(cfg) {
+            let _ = env.throw_new("java/lang/IllegalStateException", &message);
+            return Err(anyhow::anyhow!(message));
+        }
+
         // 3a. One-time process init. Must run before any `tracing::info!`/
         // `warn!`/`error!` call below (step 7a's auth-decision logging in
         // particular): with no global `tracing` subscriber installed yet,
@@ -309,6 +389,11 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
                     let _ = env.throw_new("java/lang/RuntimeException", &msg);
                     e
                 })?;
+            #[cfg(target_os = "android")]
+            if let Err(message) = reject_unimplemented_account_socks5_endpoints(&users) {
+                let _ = env.throw_new("java/lang/IllegalStateException", &message);
+                return Err(anyhow::anyhow!(message));
+            }
             if users.users.is_empty() {
                 let msg = format!(
                     "auth is enabled but the users registry is empty: {}",
