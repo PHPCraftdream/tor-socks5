@@ -1,7 +1,9 @@
 use super::*;
+use crate::pre_endpoint::channel_proves_endpoint;
 use arti_client::config::circ::CircMgrConfig;
 use std::path::PathBuf;
 use std::sync::Once;
+use tor_linkspec::ChannelMethod;
 
 /// Install rustls's process-wide `CryptoProvider` exactly once for this
 /// test binary, mirroring `install_crypto_provider()` in
@@ -54,21 +56,24 @@ fn settings_with_shorter_service_circuit_hops_is_not_default() {
 #[test]
 fn build_config_routes_pre_proxy_and_redacts_credentials() {
     for credentials in [None, Some(("owner".to_owned(), "top-secret".to_owned()))] {
-        let endpoint = Socks5PreEndpoint::new("127.0.0.9:1087".parse().unwrap(), credentials);
-        let debug = format!("{endpoint:?}");
-        assert!(!debug.contains("top-secret"));
         let expected_uri = if credentials.is_some() {
             "socks5://owner:top-secret@127.0.0.9:1087"
         } else {
             "socks5://127.0.0.9:1087"
         };
+        let endpoint = Socks5PreEndpoint::new("127.0.0.9:1087".parse().unwrap(), credentials);
+        let debug = format!("{endpoint:?}");
+        assert!(!debug.contains("top-secret"));
         let settings = Settings {
             pre_endpoint: Some(endpoint),
             ..Default::default()
         };
-        let config = build_config(&settings).expect("SOCKS5 channel proxy config builds");
-        let proxy = config.channel().outbound_proxy().expect("proxy configured");
-        assert_eq!(proxy.to_string(), expected_uri);
+        let mut builder: TorClientConfigBuilder = TorClientConfig::builder();
+        pre_endpoint::configure_pre_endpoint(&mut builder, &settings)
+            .expect("SOCKS5 proxy configures");
+        let channel = builder.channel().build().expect("channel config builds");
+        let proxy = channel.outbound_proxy();
+        assert_eq!(proxy.expect("proxy configured").to_string(), expected_uri);
         assert!(!format!("{settings:?}").contains("top-secret"));
     }
 }

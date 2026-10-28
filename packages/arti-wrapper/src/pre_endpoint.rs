@@ -1,6 +1,7 @@
 use std::fmt;
 use std::net::SocketAddr;
 
+use arti_client::config::TorClientConfigBuilder;
 use tor_linkspec::ChannelMethod;
 #[cfg(test)]
 use url::Url;
@@ -13,6 +14,39 @@ pub(crate) enum EndpointError {
     InvalidCredentials,
     #[error("incomplete SOCKS5 credentials")]
     IncompleteCredentials,
+}
+
+pub(crate) fn configure_pre_endpoint(
+    builder: &mut TorClientConfigBuilder,
+    settings: &crate::Settings,
+) -> crate::Result<()> {
+    let Some(endpoint) = settings.pre_endpoint.as_ref() else {
+        return Ok(());
+    };
+    if !settings.extra_pt_protocols.is_empty()
+        || settings.pt_binary.is_some()
+        || settings
+            .bridges
+            .iter()
+            .any(|bridge| bridge.transport.is_some())
+    {
+        return Err(crate::TorError::BuildConfig(
+            "SOCKS5 pre endpoint cannot guarantee routing for pluggable transports".to_owned(),
+        ));
+    }
+    let uri = endpoint.proxy_uri().map_err(|_| {
+        crate::TorError::BuildConfig("invalid SOCKS5 pre endpoint (details redacted)".to_owned())
+    })?;
+    let proxy = uri.parse().map_err(|_| {
+        crate::TorError::BuildConfig("invalid SOCKS5 pre endpoint (details redacted)".to_owned())
+    })?;
+    if !matches!(proxy, tor_chanmgr::ProxyProtocol::Socks { .. }) {
+        return Err(crate::TorError::BuildConfig(
+            "pre endpoint must resolve to SOCKS5".to_owned(),
+        ));
+    }
+    builder.channel().outbound_proxy(Some(proxy));
+    Ok(())
 }
 
 pub(crate) fn channel_proves_endpoint(actual: &ChannelMethod, requested: &ChannelMethod) -> bool {
@@ -102,7 +136,7 @@ mod tests {
         assert!(!format!("{endpoint:?}").contains("雪"));
         assert!(!format!("{endpoint:?}").contains("p:ss"));
         let proxy = uri.parse::<tor_chanmgr::ProxyProtocol>().unwrap();
-        let tor_chanmgr::ProxyProtocol::Socks { auth, .. } = proxy else {
+        let tor_chanmgr::ProxyProtocol::Socks { auth, .. } = &proxy else {
             panic!("SOCKS5 URI must parse to SOCKS protocol");
         };
         assert_eq!(

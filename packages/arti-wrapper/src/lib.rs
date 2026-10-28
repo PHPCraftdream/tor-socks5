@@ -848,36 +848,11 @@ fn build_config(settings: &Settings) -> Result<TorClientConfig> {
 
     let mut builder: TorClientConfigBuilder = TorClientConfig::builder();
 
-    if let Some(endpoint) = settings.pre_endpoint.as_ref() {
-        if !settings.extra_pt_protocols.is_empty()
-            || settings.pt_binary.is_some()
-            || settings
-                .bridges
-                .iter()
-                .any(|bridge| bridge.transport.is_some())
-        {
-            return Err(TorError::BuildConfig(
-                "SOCKS5 pre endpoint cannot guarantee routing for pluggable transports".to_owned(),
-            ));
-        }
-        let uri = endpoint.proxy_uri().map_err(|_| {
-            TorError::BuildConfig("invalid SOCKS5 pre endpoint (details redacted)".to_owned())
-        })?;
-        let proxy = uri.parse().map_err(|_| {
-            TorError::BuildConfig("invalid SOCKS5 pre endpoint (details redacted)".to_owned())
-        })?;
-        if !matches!(proxy, ProxyProtocol::Socks { .. }) {
-            return Err(TorError::BuildConfig(
-                "pre endpoint must resolve to SOCKS5".to_owned(),
-            ));
-        }
-        builder.channel().outbound_proxy(Some(proxy));
-    }
+    pre_endpoint::configure_pre_endpoint(&mut builder, settings)?;
 
     builder
         .stream_timeouts()
         .initial_connect_timeout(settings.initial_connect_timeout);
-
     // Patience for slow bridges. arti's default download schedules are tuned
     // for fast public relays; over a slow/marginal obfs4 or webtunnel bridge
     // the consensus / certificates / microdescriptors arrive slowly and the

@@ -34,6 +34,7 @@ pub struct User {
         with = "client_acl::socks5_endpoint_field"
     )]
     pub pre_socks5: Option<client_acl::EndpointOverride>,
+    /// SOCKS5 endpoint used after Tor for this account; omitted inherits the global setting.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
