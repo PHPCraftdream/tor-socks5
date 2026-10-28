@@ -579,6 +579,53 @@ fn set_socks5_updates_only_selected_hop_and_round_trips_inherit_and_none() {
 }
 
 #[test]
+fn set_socks5_cli_round_trips_ipv6_credentials_and_hides_them_from_debug_and_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = tmp_users_path(dir.path());
+    cmd_add_init(&path, "alice", false, None, None).unwrap();
+    cmd_set_socks5(&path, "alice", "pre", "192.0.2.4:1080|pre-user:pre-secret").unwrap();
+    cmd_set_socks5(
+        &path,
+        "alice",
+        "post",
+        "[2001:db8::2]:1082|post-user:post-secret",
+    )
+    .unwrap();
+
+    let loaded = UsersConfig::load(&path).unwrap();
+    let alice = loaded.find("alice").unwrap();
+    assert_eq!(
+        alice.pre_socks5,
+        Some(EndpointOverride::Endpoint(
+            "192.0.2.4:1080|pre-user:pre-secret".parse().unwrap()
+        ))
+    );
+    assert_eq!(
+        alice.post_socks5,
+        Some(EndpointOverride::Endpoint(
+            "[2001:db8::2]:1082|post-user:post-secret".parse().unwrap()
+        ))
+    );
+    let saved = std::fs::read_to_string(&path).unwrap();
+    let roundtrip_path = dir.path().join("roundtrip.users.ktav");
+    std::fs::write(&roundtrip_path, saved).unwrap();
+    let roundtripped = UsersConfig::load(&roundtrip_path).unwrap();
+    let alice = roundtripped.find("alice").unwrap();
+    assert_eq!(alice.pre_socks5, loaded.find("alice").unwrap().pre_socks5);
+    assert_eq!(alice.post_socks5, loaded.find("alice").unwrap().post_socks5);
+
+    let debug = format!("{alice:?}");
+    for secret in ["pre-user", "pre-secret", "post-user", "post-secret"] {
+        assert!(!debug.contains(secret), "Debug leaked {secret}");
+    }
+    let error =
+        cmd_set_socks5(&path, "alice", "post", "192.0.2.4:0|post-user:post-secret").unwrap_err();
+    let error = format!("{error}");
+    assert!(!error.contains("post-user"));
+    assert!(!error.contains("post-secret"));
+}
+
+#[test]
 fn set_socks5_invalid_endpoint_preserves_saved_data() {
     let dir = tempfile::tempdir().unwrap();
     let path = tmp_users_path(dir.path());

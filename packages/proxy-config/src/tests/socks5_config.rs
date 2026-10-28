@@ -77,4 +77,25 @@ fn socks5_config_omitted_disabled_and_endpoint_roundtrip() {
         ktav::from_str::<Config>("listen: 127.0.0.1:1080\npre_socks5: 192.0.2.4:1080|alice\n")
             .is_err()
     );
+
+    let independent: Config = ktav::from_str(
+        "listen: 127.0.0.1:1080\npre_socks5: 192.0.2.4:1080|alice:pre-secret\npost_socks5:: [2001:db8::2]:1082|bob:post-secret\n",
+    )
+    .expect("independent endpoints with IPv6 literal and credentials");
+    let saved = ktav::to_string(&independent).expect("serialize");
+    let loaded: Config = ktav::from_str(&saved).expect("roundtrip");
+    assert_eq!(loaded.pre_socks5, independent.pre_socks5);
+    assert_eq!(loaded.post_socks5, independent.post_socks5);
+    let debug = format!("{independent:?}");
+    for secret in ["alice", "pre-secret", "bob", "post-secret"] {
+        assert!(!debug.contains(secret), "Debug leaked {secret}");
+    }
+
+    let credential_error = ktav::from_str::<Config>(
+        "listen: 127.0.0.1:1080\npost_socks5: 192.0.2.4:0|bob:post-secret\n",
+    )
+    .unwrap_err();
+    let error = format!("{credential_error}");
+    assert!(!error.contains("bob"));
+    assert!(!error.contains("post-secret"));
 }
