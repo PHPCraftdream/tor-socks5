@@ -139,6 +139,9 @@ where
             3 => {
                 let mut n = [0];
                 stream.read_exact(&mut n).await.map_err(|_| Error::Io)?;
+                if n[0] == 0 {
+                    return Err(Error::Protocol);
+                }
                 n[0] as usize
             }
             _ => return Err(Error::Protocol),
@@ -338,6 +341,11 @@ mod tests {
         failing_reply(&[5, 1, 0, 9], Error::Protocol).await;
         failing_reply(&[5, 0, 0, 1, 127, 0], Error::Io).await;
         failing_reply(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0], Error::Protocol).await;
+    }
+
+    #[tokio::test]
+    async fn zero_length_domain_bind_address_is_protocol_error() {
+        failing_reply(&[5, 0, 0, 3, 0], Error::Protocol).await;
     }
 
     #[tokio::test]

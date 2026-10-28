@@ -64,6 +64,14 @@ pub enum TorError {
         source: arti_client::Error,
     },
 
+    /// SOCKS5 CONNECT negotiation over a Tor-opened stream failed.
+    #[error("post-SOCKS5 CONNECT failed: {0}")]
+    PostSocks(#[source] socks5_proto::client::Error),
+
+    /// The absolute post-SOCKS stream deadline elapsed.
+    #[error("post-SOCKS5 connection deadline elapsed")]
+    PostSocksTimeout,
+
     /// A bridge line could not be turned into arti's `BridgeConfig`:
     /// either its serialised form (after any obfs4 `iat-mode` override)
     /// failed to parse as a bridge line, or the parsed builder failed
@@ -832,9 +840,12 @@ fn fatal_protocol_error_hook(error: &arti_client::Error) {
     );
 }
 
+mod post_endpoint;
 mod pre_endpoint;
 mod validate;
+pub use post_endpoint::connect_post_socks;
 pub use pre_endpoint::Socks5PreEndpoint;
+pub use socks5_proto::client::Credentials as PostSocksCredentials;
 use validate::{
     validate_circuit_hops, validate_min_bandwidth_percentile, validate_service_circuit_hops,
 };

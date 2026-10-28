@@ -37,6 +37,8 @@ tracing.workspace = true
 
 bridge-line.workspace = true
 url.workspace = true
+socks5-proto = { path = "../socks5-proto", package = "tor-socks5-proto" }
+tokio-util.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
