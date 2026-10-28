@@ -7,6 +7,7 @@ use anyhow::{bail, Result};
 use auth::{compute_hash, verify_hash, User, UsersConfig, INIT_SENTINEL};
 use clap::Subcommand;
 use persist_lock::{PathLock, CLI_LOCK_WAIT};
+use proxy_config::EndpointOverride;
 
 /// Test-only override (milliseconds) for the CLI lock wait; `0` uses the
 /// production [`CLI_LOCK_WAIT`]. Lets tests exercise the busy path
@@ -402,7 +403,6 @@ fn cmd_set_onion(users_path: &Path, name: &str, allowed: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use client_acl::EndpointOverride;
 
     struct FixedPrompt {
         password: String,
