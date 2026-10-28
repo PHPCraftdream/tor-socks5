@@ -15,7 +15,6 @@ use arti_client::config::pt::TransportConfigBuilder;
 use arti_client::config::{BridgeConfigBuilder, CfgPath, Reconfigure, TorClientConfigBuilder};
 use arti_client::{DataStream, TorClient, TorClientConfig};
 use bridge_line::BridgeLine;
-use tor_chanmgr::ProxyProtocol;
 use tor_linkspec::HasChanMethod;
 use tor_rtcompat::PreferredRuntime;
 
