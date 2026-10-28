@@ -38,9 +38,20 @@ jobs:
           # stdout вида tag=... / prerelease=... идёт в $GITHUB_OUTPUT.
           bash .github/release/validate-tag.sh "$GH_REF_NAME" > "$GITHUB_OUTPUT"
 
+  license-audit:
+    name: Cargo license policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-local-sdk
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
+
   build:
     name: Build (${{ matrix.target }})
-    needs: [validate]
+    needs: [validate, license-audit]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
