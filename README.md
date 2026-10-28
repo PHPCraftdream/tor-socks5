@@ -84,7 +84,7 @@ entry is lowered or deleted as the directory is split.
 до установки. На Unix файл заменяется атомарно; на Windows используется
 переименование с откатом при ошибке.
 
-Unix (Linux x86_64 GNU/glibc, macOS x86_64 и Apple Silicon):
+Unix (Linux x86_64/aarch64 GNU/glibc и musl, macOS x86_64 и Apple Silicon):
 
 ```bash
 curl -fsSL 'https://raw.githubusercontent.com/PHPCraftdream/tor-socks5/main/.github/install/install.sh' -o 'install.sh'
@@ -113,8 +113,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File '.\install.ps1'
   зарезервированными именами `tor-socks5.exe.old.<32 hex>`.
 - Замена на Windows — транзакция с откатом (backup возвращается при сбое), а не
   атомарный replace: теоретически возможен короткий интервал без canonical exe.
-- Поддерживаются ровно 4 таргета: Linux x86_64 GNU (**glibc** — Alpine/musl не поддерживаются),
-  macOS x86_64, macOS aarch64, Windows x86_64. ARM Linux/Windows и BSD — нет.
+- GNU выбирается только для известного legacy latest `v0.2.0`, только на x86_64 и только если `getconf GNU_LIBC_VERSION` явно подтверждает glibc; иначе установщик прекращает работу. Для новых Linux releases установщик всегда запрашивает статический musl archive на x86_64/aarch64, независимо от обнаружения libc (включая неизвестную libc); GNU archives доступны вручную.
+- Legacy latest ограничен `v0.2.0`: остальные исторические Linux assets не предполагаются и при их отсутствии установка завершится ошибкой. Установщик не запускает скачанный бинарник; SHA256 и структура архива проверяются до замены назначения, network/TLS/checksum failures не переключают target.
+- Статические musl binaries обычно работают на GNU и musl userspace, но требуют совместимое Linux kernel/CPU; минимальная версия ядра и поддержка старого оборудования не обещаются. GNU archives зависят от glibc baseline сборочного runner (минимальная версия не зафиксирована).
 
 ### Каталог бинарника и каталог конфигурации независимы
 
@@ -164,20 +165,19 @@ git push origin v0.3.0
 Публикация автоматическая — отдельного «ручного publish» нет. После push тега
 workflow `.github/workflows/release.yml`:
 
-- собирает 4 нативных бинарника (Linux x86_64 GNU, macOS x86_64, macOS aarch64,
-  Windows x86_64) и публикует **4 архива + 4 SHA256-файла**
+- собирает 7 нативных бинарников (Linux x86_64 GNU/musl, Linux aarch64 GNU/musl, macOS x86_64/aarch64, Windows x86_64 MSVC) и публикует **7 архивов + 7 SHA256-файлов**
   (`tor-socks5-<тег>-<таргет>.tar.gz/.zip` + `.sha256`);
 - сначала всё попадает в **draft release**; перед загрузкой сверяются SHA256
   локальных архивов с их checksum-файлами; после загрузки проверяются наличие,
-  размеры и статус всех 8 assets (4 архива + 4 SHA256); затем draft публикуется
+  размеры и статус всех 14 assets (7 архивов + 7 SHA256); затем draft публикуется
   (draft → published);
 - выбор stable-релиза для `/releases/latest` оставлен правилам GitHub (`legacy`):
   публикация не назначает любой новый maintenance-тег принудительно как latest;
   prerelease (`vX.Y.Z-rc.N`) публикуется с флагом prerelease и **никогда**
   не становится latest;
-- повторный запуск по полностью опубликованному тегу — безопасный no-op:
-  файлы не перезаписываются и не удаляются; при возобновлении прерванного
-  запуска draft дозагружается и публикуется.
+- повторный запуск по тегу с полным комплектом из 14 опубликованных assets —
+  безопасный no-op: файлы не перезаписываются и не удаляются. Старый комплект
+  из 8 assets отклоняется без изменений; draft можно дозагрузить и опубликовать.
 
 Важно: реальная сборка релиза происходит при push тега **после merge** в `main`;
 в PR выполняется только offline-проверка хелперов (валидация тега, логика

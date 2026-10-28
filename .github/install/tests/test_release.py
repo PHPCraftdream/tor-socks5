@@ -21,9 +21,10 @@ import fixtures as fx
 
 REMOTE_REPO = "octo-cat/tor-socks5"
 TAG = "v1.2.3"
-UNIX_TARGETS = ("x86_64-unknown-linux-gnu", "x86_64-apple-darwin",
-                "aarch64-apple-darwin")
-WIN_TARGET = "x86_64-pc-windows-msvc"
+UNIX_TARGETS = ("x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl",
+                "aarch64-unknown-linux-gnu", "aarch64-unknown-linux-musl",
+                "x86_64-apple-darwin", "aarch64-apple-darwin")
+WIN_TARGETS = ("x86_64-pc-windows-msvc",)
 GH = shutil.which("gh")  # настоящий gh не нужен: stub добавляется в PATH
 
 
@@ -32,7 +33,7 @@ def expected_names(tag):
     for t in UNIX_TARGETS:
         names += ["tor-socks5-%s-%s.tar.gz" % (tag, t),
                   "tor-socks5-%s-%s.tar.gz.sha256" % (tag, t)]
-    for t in (WIN_TARGET,):
+    for t in WIN_TARGETS:
         names += ["tor-socks5-%s-%s.zip" % (tag, t),
                   "tor-socks5-%s-%s.zip.sha256" % (tag, t)]
     return names
@@ -153,12 +154,10 @@ class PublisherTests(unittest.TestCase):
         return path
 
     def make_artifacts(self, tag, content_prefix=b"archive-marker"):
-        """Ровно 8 файлов (4 архива + 4 .sha256): каждый архив получает
-        РОВНО ОДИН свой checksum в формате publish.sh (tar.gz: '<h>  <n>\n',
-        zip: '<h> *<n>' без LF). Самопроверка точного набора имён ДО запуска."""
+        """Ровно 14 файлов (7 архивов + 7 checksums); точный комплект без двойных checksum."""
         d = self.area.subdir("artifacts")
         archives = [n for n in expected_names(tag) if not n.endswith(".sha256")]
-        self.assertEqual(len(archives), 4)
+        self.assertEqual(len(archives), 7)
         for name in archives:
             data = content_prefix + b":" + name.encode("ascii") + b"\n"
             p = os.path.join(d, name)
@@ -226,18 +225,18 @@ class PublisherTests(unittest.TestCase):
         self.assertFalse(any("-target-" in n for n in names))
         muts = mutations(read_log(
             os.path.join(self.area.path, "gh-log.jsonl")))
-        # 1 create + 8 uploads + 1 PATCH; GET/readback — read-only
-        self.assertEqual(len(muts), 10)
+        # 1 create + 14 uploads + 1 PATCH; GET/readback — read-only
+        self.assertEqual(len(muts), 16)
         create = muts[0]["argv"]
         self.assertIn("--draft", create)
         self.assertIn("--verify-tag", create)
         # ФАКТИЧЕСКАЯ последовательность вызовов: read-list → create →
-        # GET by tag → fresh GET → 8 uploads → GET verify → PATCH →
+        # GET by tag → fresh GET → 14 uploads → GET verify → PATCH →
         # GET readback
         self.assertEqual(call_kinds(read_log(
             os.path.join(self.area.path, "gh-log.jsonl"))),
             ["list", "create", "get-by-tag", "get-by-id"]
-            + ["upload"] * 8 + ["get-by-id", "patch", "get-by-id"])
+            + ["upload"] * 14 + ["get-by-id", "patch", "get-by-id"])
 
     def test_draft_resume(self):
         d = self.make_artifacts(TAG)
@@ -251,14 +250,14 @@ class PublisherTests(unittest.TestCase):
         state = read_state(sp)
         rel = self.assets_of(state)
         self.assertFalse(rel["draft"])
-        self.assertEqual(len(rel["assets"]), 8)
+        self.assertEqual(len(rel["assets"]), 14)
         log = read_log(os.path.join(self.area.path, "gh-log.jsonl"))
         muts = mutations(log)
         self.assertNotIn("create", muts[0]["argv"])
         # resume: без create, остальные фазы в том же порядке
         self.assertEqual(call_kinds(log),
                          ["list", "get-by-tag", "get-by-id"]
-                         + ["upload"] * 8 + ["get-by-id", "patch", "get-by-id"])
+                         + ["upload"] * 14 + ["get-by-id", "patch", "get-by-id"])
         # успешный stable PATCH сдвинул legacy latest на наш тег
         self.assertEqual(read_state(sp)["latest_tag"], TAG)
 
@@ -278,6 +277,38 @@ class PublisherTests(unittest.TestCase):
         # extra user-asset не тронут
         self.assertTrue(any(a["name"] == "user-notes.txt"
                             for a in read_state(sp)["releases"][0]["assets"]))
+
+    def test_legacy_published_release_is_immutable_and_rejected(self):
+        self.make_artifacts(TAG)
+        legacy_targets = ("x86_64-unknown-linux-gnu", "x86_64-apple-darwin",
+                          "aarch64-apple-darwin", *WIN_TARGETS)
+        legacy_names = []
+        for target in legacy_targets:
+            ext = "zip" if target in WIN_TARGETS else "tar.gz"
+            name = "tor-socks5-%s-%s.%s" % (TAG, target, ext)
+            legacy_names.extend((name, name + ".sha256"))
+        assets = [{"name": n, "size": 10, "state": "uploaded"}
+                  for n in legacy_names]
+        sp = self.gh_state(releases=[{"id": 5, "tag_name": TAG,
+                                      "draft": False, "prerelease": False,
+                                      "assets": assets}])
+        p = self.run_publish(sp)
+        self.assertNotEqual(p.returncode, 0, p.stdout.decode())
+        self.assertEqual(mutations(read_log(os.path.join(self.area.path,
+                                                        "gh-log.jsonl"))), [])
+
+    def test_legacy_published_partial_fails_immutable(self):
+        self.make_artifacts(TAG)
+        old_names = expected_names(TAG)[:8]
+        assets = [{"name": n, "size": 10, "state": "uploaded"}
+                  for n in old_names]
+        sp = self.gh_state(releases=[{"id": 5, "tag_name": TAG,
+                                      "draft": False, "prerelease": False,
+                                      "assets": assets}])
+        p = self.run_publish(sp)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(mutations(read_log(os.path.join(self.area.path,
+                                                        "gh-log.jsonl"))), [])
 
     def test_prerelease_patch_typed(self):
         self.make_artifacts("v2.0.0-rc.1")
@@ -545,11 +576,11 @@ class PublisherTests(unittest.TestCase):
                 self.assertNotEqual(p.returncode, 0)
                 self.assertNotIn("Готово", p.stdout.decode())
                 log = read_log(os.path.join(self.area.path, "gh-log.jsonl"))
-                # resume-путь draft-релиза: точная последовательность с 8
+                # resume-путь draft-релиза: точная последовательность с 14
                 # uploads, PATCH и финальным readback GET
                 self.assertEqual(call_kinds(log),
                                  ["list", "get-by-tag", "get-by-id"]
-                                 + ["upload"] * 8
+                                 + ["upload"] * 14
                                  + ["get-by-id", "patch", "get-by-id"])
                 state = read_state(sp)
                 self.assertTrue(state["patched"])
@@ -587,7 +618,7 @@ class PublisherTests(unittest.TestCase):
         log = read_log(os.path.join(self.area.path, "gh-log.jsonl"))
         self.assertEqual(call_kinds(log),
                          ["list", "get-by-tag", "get-by-id"]
-                         + ["upload"] * 8 + ["get-by-id", "patch", "get-by-id"])
+                         + ["upload"] * 14 + ["get-by-id", "patch", "get-by-id"])
         self.assertNotIn("Готово", p.stdout.decode())
         state = read_state(sp)
         self.assertTrue(state["patched"])
@@ -708,12 +739,15 @@ class ReleaseWorkflowWiring(unittest.TestCase):
     def test_matrix_runner_target_mapping(self):
         # target→runner привязка по ФАКТИЧЕСКИМ include-записям (парами
         # runner/target в одном элементе), а не по одному множеству targets
-        expected = {
-            "ubuntu-latest": "x86_64-unknown-linux-gnu",
-            "windows-latest": "x86_64-pc-windows-msvc",
-            "macos-15-intel": "x86_64-apple-darwin",
-            "macos-15": "aarch64-apple-darwin",
-        }
+        expected = [
+            ("ubuntu-latest", "x86_64-unknown-linux-gnu"),
+            ("ubuntu-latest", "x86_64-unknown-linux-musl"),
+            ("ubuntu-24.04-arm", "aarch64-unknown-linux-gnu"),
+            ("ubuntu-24.04-arm", "aarch64-unknown-linux-musl"),
+            ("windows-latest", "x86_64-pc-windows-msvc"),
+            ("macos-15-intel", "x86_64-apple-darwin"),
+            ("macos-15", "aarch64-apple-darwin"),
+        ]
         entries, cur = [], None
         for raw in self._code_lines(self.jobs["build"]):
             s = raw.strip()
@@ -722,11 +756,39 @@ class ReleaseWorkflowWiring(unittest.TestCase):
                 entries.append(cur)
             elif cur is not None and s.startswith("target:"):
                 cur["target"] = s.split(":", 1)[1].strip()
-        mapping = {e["runner"]: e.get("target") for e in entries}
+        mapping = [(e["runner"], e.get("target")) for e in entries]
         self.assertEqual(mapping, expected)
         # каждая запись полная: без второй половины пары — fail
         self.assertTrue(all(set(e) == {"runner", "target"}
                             for e in entries), entries)
+
+    def test_portability_alpine_smoke_wiring(self):
+        ci_path = os.path.join(fx.REPO_ROOT, ".github", "workflows", "ci.yml")
+        with open(ci_path, "r", encoding="utf-8") as f:
+            ci = f.read()
+        jobs, cur = {}, None
+        for line in ci.splitlines():
+            if (line.startswith("  ") and not line.startswith("   ")
+                    and line.rstrip().endswith(":")
+                    and ":" not in line.strip()[:-1]):
+                cur = line.strip()[:-1]
+                jobs[cur] = []
+            elif cur is not None:
+                jobs[cur].append(line)
+        block = "\\n".join(jobs["portability-diagnostics"])
+        def assert_smoke_wiring(text):
+            for expected in (
+                    'docker run --rm --network none --read-only',
+                    '--platform "$platform"',
+                    'dst=/socks5-proxy,readonly', 'alpine:3.22 /socks5-proxy --version',
+                    'x86_64-*) platform=linux/amd64',
+                    'aarch64-*) platform=linux/arm64',
+                    'if [ "$MUSL" = "true" ]; then'):
+                if expected not in text:
+                    raise AssertionError("missing Alpine smoke wiring: " + expected)
+        assert_smoke_wiring(block)
+        with self.assertRaises(AssertionError):
+            assert_smoke_wiring(block.replace("docker run", "podman run", 1))
 
     def test_tag_only_trigger_and_targets_present(self):
         on_block = self._top_block("on")
@@ -740,7 +802,7 @@ class ReleaseWorkflowWiring(unittest.TestCase):
         found = {c.split(":", 1)[1].strip()
                  for c in (x.strip() for x in code)
                  if c.startswith("target:")}
-        self.assertEqual(found, set(UNIX_TARGETS) | {WIN_TARGET})
+        self.assertEqual(found, set(UNIX_TARGETS) | set(WIN_TARGETS))
 
 
 if __name__ == "__main__":

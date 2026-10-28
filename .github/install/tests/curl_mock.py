@@ -12,6 +12,8 @@
   latest_exit           — код выхода для /releases/latest (сетевой сбой)
   files                 — {имя ассета: путь к файлу с байтами на диске}
   fail_download         — имя ассета, при скачивании которого выйти с ошибкой
+  fail_status           — {имя ассета: HTTP-подобный статус, например 404}
+  fail_exit             — {имя ассета: код curl для сетевой/TLS-ошибки}
 
 Журнал: каждая строка TORSOCKS_CURL_LOG — JSON {argv, url, out, proto_ok}.
 Тесты ассертят ФАКТИЧЕСКИЕ argv/URI/число запросов и флаги
@@ -71,9 +73,18 @@ def main():
             rec["error"] = "нет -o для download URL"
             append()
             sys.exit(3)
-        append()
         if scen.get("fail_download") == name:
+            append()
             sys.exit(22)
+        if name in scen.get("fail_status", {}):
+            rec["http_status"] = scen["fail_status"][name]
+            append()
+            sys.exit(22)
+        if name in scen.get("fail_exit", {}):
+            rec["transport_exit"] = scen["fail_exit"][name]
+            append()
+            sys.exit(int(scen["fail_exit"][name]))
+        append()
         files = scen.get("files", {})
         if name not in files:
             sys.exit(22)

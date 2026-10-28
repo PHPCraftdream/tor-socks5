@@ -37,11 +37,7 @@ detect_target() {
     case "$uname_m" in
         x86_64|amd64) arch=x86_64 ;;
         arm64|aarch64)
-            if [ "$os" = macos ]; then
-                arch=aarch64
-            else
-                err "Linux ARM не поддерживается (только x86_64 GNU/glibc)"
-            fi
+            arch=aarch64
             ;;
         *)
             err "неподдерживаемая архитектура: $uname_m"
@@ -57,8 +53,7 @@ detect_target() {
 
     case "$os" in
         linux)
-            # Linux-ассет только x86_64-unknown-linux-gnu (glibc)
-            target=x86_64-unknown-linux-gnu
+            target="$arch-unknown-linux-musl"
             ;;
         macos)
             if [ "$arch" = aarch64 ]; then
@@ -219,6 +214,13 @@ main() {
     esac
 
     latest_tag
+
+    if [ "$os" = linux ] && [ "$tag" = v0.2.0 ]; then
+        [ "$arch" = x86_64 ] || err "релиз v0.2.0 содержит Linux GNU только для x86_64"
+        command -v getconf >/dev/null 2>&1 && getconf GNU_LIBC_VERSION 2>/dev/null | grep -q '^glibc ' \
+            || err "релиз v0.2.0 требует явно подтверждённую GNU libc"
+        target=x86_64-unknown-linux-gnu
+    fi
 
     # umask 077: наши файлы (в т.ч. staging) недоступны другим пользователям
     umask 077

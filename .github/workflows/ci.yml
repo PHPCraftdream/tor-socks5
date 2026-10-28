@@ -491,6 +491,65 @@ jobs:
         run: python -I .github/install/tests/running/test_live_update.py WindowsLiveUpdateTests
         shell: pwsh
 
+  portability-diagnostics:
+    name: Portability (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            musl: true
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            musl: true
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            musl: false
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-local-sdk
+      - name: Установка системных инструментов musl
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: portability-${{ matrix.target }}
+      - name: Build diagnostic binary
+        run: cargo build --locked --release -p socks5-proxy --target ${{ matrix.target }}
+      - name: Проверка ELF и запуск версии
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          MUSL: ${{ matrix.musl }}
+        run: |
+          set -euo pipefail
+          binary="target/$TARGET/release/socks5-proxy"
+          file "$binary"
+          readelf -l "$binary" > /tmp/program-headers.txt
+          readelf -d "$binary" > /tmp/dynamic-section.txt
+          if [ "$MUSL" = "true" ]; then
+            ! grep -q 'INTERP' /tmp/program-headers.txt
+            ! grep -q '(NEEDED)' /tmp/dynamic-section.txt
+            file "$binary" | grep -Eq 'statically linked|static-pie linked'
+          fi
+          "$binary" --version
+          if [ "$MUSL" = "true" ]; then
+            case "$TARGET" in
+              x86_64-*) platform=linux/amd64 ;;
+              aarch64-*) platform=linux/arm64 ;;
+              *) echo "unsupported musl target: $TARGET" >&2; exit 1 ;;
+            esac
+            docker run --rm --network none --read-only \
+              --platform "$platform" \
+              --mount "type=bind,src=$(realpath "$binary"),dst=/socks5-proxy,readonly" \
+              alpine:3.22 /socks5-proxy --version
+          fi
+
   release-scripts:
     name: Release helpers offline suite (validate-tag, publish)
     runs-on: ubuntu-latest
