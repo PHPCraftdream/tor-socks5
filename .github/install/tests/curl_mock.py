@@ -73,8 +73,8 @@ def main():
             rec["error"] = "нет -o для download URL"
             append()
             sys.exit(3)
-        append()
         if scen.get("fail_download") == name:
+            append()
             sys.exit(22)
         if name in scen.get("fail_status", {}):
             rec["http_status"] = scen["fail_status"][name]
@@ -84,6 +84,7 @@ def main():
             rec["transport_exit"] = scen["fail_exit"][name]
             append()
             sys.exit(int(scen["fail_exit"][name]))
+        append()
         files = scen.get("files", {})
         if name not in files:
             sys.exit(22)
