@@ -76,11 +76,11 @@ where
     request.extend_from_slice(&[5, 1, 0]);
     match host.parse::<IpAddr>() {
         Ok(IpAddr::V4(ip)) => {
-            request[2] = 1;
+            request.push(1);
             request.extend_from_slice(&ip.octets());
         }
         Ok(IpAddr::V6(ip)) => {
-            request[2] = 4;
+            request.push(4);
             request.extend_from_slice(&ip.octets());
         }
         Err(_) => {
