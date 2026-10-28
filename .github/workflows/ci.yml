@@ -535,7 +535,7 @@ jobs:
           if [ "$MUSL" = "true" ]; then
             ! grep -q 'INTERP' /tmp/program-headers.txt
             ! grep -q '(NEEDED)' /tmp/dynamic-section.txt
-            file "$binary" | grep -q 'statically linked'
+            file "$binary" | grep -Eq 'statically linked|static-pie linked'
           fi
           "$binary" --version
 
