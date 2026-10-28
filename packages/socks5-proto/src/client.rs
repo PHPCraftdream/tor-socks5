@@ -201,9 +201,17 @@ mod tests {
                 let mut req = vec![0; expected.len()];
                 peer.read_exact(&mut req).await.unwrap();
                 assert_eq!(req, expected);
+                let (address_len, length_prefix) = match reply[3] {
+                    1 => (4, 0),
+                    4 => (16, 0),
+                    3 => (reply[4] as usize, 1),
+                    _ => unreachable!(),
+                };
+                assert_eq!(reply.len(), 4 + length_prefix + address_len + 2);
                 for byte in reply {
                     peer.write_all(&[*byte]).await.unwrap();
                 }
+                peer.shutdown().await.unwrap();
             };
             let result = connect(
                 &mut client,
@@ -223,13 +231,18 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), async {
             let (mut client, mut peer) = duplex(64);
             let server = async {
-                let mut greeting = [0; 3];
+                let mut greeting = [0; 2];
                 peer.read_exact(&mut greeting).await.unwrap();
+                assert_eq!(greeting, [5, 1]);
+                let mut methods = [0; 1];
+                peer.read_exact(&mut methods).await.unwrap();
+                assert_eq!(methods, [0]);
                 peer.write_all(&[5, 0]).await.unwrap();
                 let mut request = [0; 10];
                 peer.read_exact(&mut request).await.unwrap();
+                assert_eq!(request, [5, 1, 0, 1, 1, 2, 3, 4, 0, 80]);
                 peer.write_all(reply).await.unwrap();
-                peer.shutdown().await.unwrap();
+                drop(peer);
             };
             let (result, ()) = tokio::join!(
                 connect(
@@ -266,17 +279,14 @@ mod tests {
             &[5, 0, 0, 1, 127, 0, 0, 1, 0, 1],
         )
         .await;
-        successful_case(
-            "::1",
-            None,
-            &[
-                5, 1, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 80,
-            ],
-            &[
-                5, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1,
-            ],
-        )
-        .await;
+        let ipv6 = std::net::Ipv6Addr::LOCALHOST.octets();
+        let mut ipv6_request = vec![5, 1, 0, 4];
+        ipv6_request.extend_from_slice(&ipv6);
+        ipv6_request.extend_from_slice(&80_u16.to_be_bytes());
+        let mut ipv6_reply = vec![5, 0, 0, 4];
+        ipv6_reply.extend_from_slice(&ipv6);
+        ipv6_reply.extend_from_slice(&1_u16.to_be_bytes());
+        successful_case("::1", None, &ipv6_request, &ipv6_reply).await;
     }
 
     #[tokio::test]

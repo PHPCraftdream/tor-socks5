@@ -3,9 +3,10 @@
 //! exclusively owned by the SDK. This crate never resolves or dials a target.
 #![warn(missing_docs)]
 
-use std::sync::{Arc, OnceLock};
-
+/// SOCKS5 CONNECT-клиент для исходящих соединений.
 pub mod client;
+
+use std::sync::{Arc, OnceLock};
 
 use resocks5_net::server::{self, Credentials, IncomingRequest, ServerError, ServerOptions};
 use tokio::io::{AsyncRead, AsyncWrite};

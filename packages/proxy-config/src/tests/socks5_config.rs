@@ -25,7 +25,7 @@ fn socks5_config_omitted_disabled_and_endpoint_roundtrip() {
     assert_eq!(loaded.post_socks5, disabled.post_socks5);
 
     let endpoint: Config = ktav::from_str(
-        "listen: 127.0.0.1:1080\npre_socks5: 192.0.2.4:1080|alice:pw\npost_socks5: [2001:db8::1]:1081\n",
+        "listen: 127.0.0.1:1080\npre_socks5: 192.0.2.4:1080|alice:pw\npost_socks5:: [2001:db8::1]:1081\n",
     )
     .expect("endpoint");
     let saved = ktav::to_string(&endpoint).expect("serialize");
