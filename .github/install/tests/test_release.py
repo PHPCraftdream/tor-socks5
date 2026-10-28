@@ -739,12 +739,15 @@ class ReleaseWorkflowWiring(unittest.TestCase):
     def test_matrix_runner_target_mapping(self):
         # target→runner привязка по ФАКТИЧЕСКИМ include-записям (парами
         # runner/target в одном элементе), а не по одному множеству targets
-        expected = {
-            "ubuntu-latest": "x86_64-unknown-linux-gnu",
-            "windows-latest": "x86_64-pc-windows-msvc",
-            "macos-15-intel": "x86_64-apple-darwin",
-            "macos-15": "aarch64-apple-darwin",
-        }
+        expected = [
+            ("ubuntu-latest", "x86_64-unknown-linux-gnu"),
+            ("ubuntu-latest", "x86_64-unknown-linux-musl"),
+            ("ubuntu-24.04-arm", "aarch64-unknown-linux-gnu"),
+            ("ubuntu-24.04-arm", "aarch64-unknown-linux-musl"),
+            ("windows-latest", "x86_64-pc-windows-msvc"),
+            ("macos-15-intel", "x86_64-apple-darwin"),
+            ("macos-15", "aarch64-apple-darwin"),
+        ]
         entries, cur = [], None
         for raw in self._code_lines(self.jobs["build"]):
             s = raw.strip()
@@ -753,7 +756,7 @@ class ReleaseWorkflowWiring(unittest.TestCase):
                 entries.append(cur)
             elif cur is not None and s.startswith("target:"):
                 cur["target"] = s.split(":", 1)[1].strip()
-        mapping = {e["runner"]: e.get("target") for e in entries}
+        mapping = [(e["runner"], e.get("target")) for e in entries]
         self.assertEqual(mapping, expected)
         # каждая запись полная: без второй половины пары — fail
         self.assertTrue(all(set(e) == {"runner", "target"}
@@ -799,7 +802,7 @@ class ReleaseWorkflowWiring(unittest.TestCase):
         found = {c.split(":", 1)[1].strip()
                  for c in (x.strip() for x in code)
                  if c.startswith("target:")}
-        self.assertEqual(found, set(UNIX_TARGETS) | {WIN_TARGET})
+        self.assertEqual(found, set(UNIX_TARGETS) | set(WIN_TARGETS))
 
 
 if __name__ == "__main__":

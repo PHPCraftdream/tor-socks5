@@ -544,9 +544,9 @@ jobs:
               aarch64-*) platform=linux/arm64 ;;
               *) echo "unsupported musl target: $TARGET" >&2; exit 1 ;;
             esac
-            docker run --rm --network none --read-only \\
-              --platform "$platform" \\
-              --mount "type=bind,src=$(realpath "$binary"),dst=/socks5-proxy,readonly" \\
+            docker run --rm --network none --read-only \
+              --platform "$platform" \
+              --mount "type=bind,src=$(realpath "$binary"),dst=/socks5-proxy,readonly" \
               alpine:3.22 /socks5-proxy --version
           fi
 

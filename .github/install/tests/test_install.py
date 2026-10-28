@@ -62,7 +62,8 @@ class ShInstallTests(unittest.TestCase):
         # платформу отвергает САМ installer (stub uname) ДО сети. Ошибку
         # placeholder-выбора в Python НЕ маскируем.
         target = {"Linux": "%s-unknown-linux-%s" %
-                  ("aarch64" if machine in ("aarch64", "arm64") else "x86_64", libc),
+                  ("aarch64" if machine in ("aarch64", "arm64") else "x86_64",
+                   "gnu" if libc == "mixed" else libc),
                   "Darwin": "aarch64-apple-darwin" if
                   (machine in ("arm64", "aarch64") or sysctl_arm == "1")
                   else "x86_64-apple-darwin"}.get(os_name) \
@@ -263,10 +264,18 @@ class ShInstallTests(unittest.TestCase):
         self.assertIn("aarch64-unknown-linux-gnu", self.curl_urls(ctx)[1])
 
     def test_linux_conflicting_libc_prefers_gnu(self):
-        ctx = self.build(machine="aarch64", libc="mixed")
+        ctx = self.build(machine="aarch64", libc="mixed",
+                         member=[fx.tar_member("tor-socks5", b"aarch64-gnu-payload")])
         p = self.install(ctx)
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn("aarch64-unknown-linux-gnu", self.curl_urls(ctx)[1])
+        expected_name = "tor-socks5-%s-aarch64-unknown-linux-gnu.tar.gz" % fx.MOCK_TAG
+        self.assertEqual(ctx["target"], "aarch64-unknown-linux-gnu")
+        self.assertEqual(ctx["archive_name"], expected_name)
+        self.assertEqual(self.curl_urls(ctx)[1],
+                         "https://github.com/%s/%s/releases/download/%s/%s" %
+                         (fx.OWNER, fx.REPO, fx.MOCK_TAG, expected_name))
+        dest = os.path.join(ctx["home"], ".local", "bin", "tor-socks5")
+        self.assert_installed(dest, b"aarch64-gnu-payload")
 
     # --- latest tag: негативы -------------------------------------------
 
