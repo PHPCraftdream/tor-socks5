@@ -84,7 +84,7 @@ entry is lowered or deleted as the directory is split.
 до установки. На Unix файл заменяется атомарно; на Windows используется
 переименование с откатом при ошибке.
 
-Unix (Linux x86_64 GNU/glibc, macOS x86_64 и Apple Silicon):
+Unix (Linux x86_64/aarch64 GNU/glibc и musl, macOS x86_64 и Apple Silicon):
 
 ```bash
 curl -fsSL 'https://raw.githubusercontent.com/PHPCraftdream/tor-socks5/main/.github/install/install.sh' -o 'install.sh'
@@ -113,8 +113,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File '.\install.ps1'
   зарезервированными именами `tor-socks5.exe.old.<32 hex>`.
 - Замена на Windows — транзакция с откатом (backup возвращается при сбое), а не
   атомарный replace: теоретически возможен короткий интервал без canonical exe.
-- Поддерживаются ровно 4 таргета: Linux x86_64 GNU (**glibc** — Alpine/musl не поддерживаются),
-  macOS x86_64, macOS aarch64, Windows x86_64. ARM Linux/Windows и BSD — нет.
+- GNU выбирается при работающем `getconf GNU_LIBC_VERSION`; если его нет, установщик ориентируется на явный вывод `ldd --version`. На смешанной системе GNU имеет приоритет. При неизвестных/противоречивых признаках установка прекращается; ручной выбор libc не предусмотрен. Старые релизы без требуемого target завершаются ошибкой без несовместимого fallback.
+- GNU-сборки зависят от glibc runner baseline (минимальная версия не зафиксирована); минимальная версия ядра Linux и поддержка старого оборудования не обещаются. Musl binaries static и могут работать на glibc/musl, но installer выбирает их только при ясно определённом musl.
 
 ### Каталог бинарника и каталог конфигурации независимы
 
@@ -164,20 +164,19 @@ git push origin v0.3.0
 Публикация автоматическая — отдельного «ручного publish» нет. После push тега
 workflow `.github/workflows/release.yml`:
 
-- собирает 4 нативных бинарника (Linux x86_64 GNU, macOS x86_64, macOS aarch64,
-  Windows x86_64) и публикует **4 архива + 4 SHA256-файла**
+- собирает 7 нативных бинарников (Linux x86_64 GNU/musl, Linux aarch64 GNU/musl, macOS x86_64/aarch64, Windows x86_64 MSVC) и публикует **7 архивов + 7 SHA256-файлов**
   (`tor-socks5-<тег>-<таргет>.tar.gz/.zip` + `.sha256`);
 - сначала всё попадает в **draft release**; перед загрузкой сверяются SHA256
   локальных архивов с их checksum-файлами; после загрузки проверяются наличие,
-  размеры и статус всех 8 assets (4 архива + 4 SHA256); затем draft публикуется
+  размеры и статус всех 14 assets (7 архивов + 7 SHA256); затем draft публикуется
   (draft → published);
 - выбор stable-релиза для `/releases/latest` оставлен правилам GitHub (`legacy`):
   публикация не назначает любой новый maintenance-тег принудительно как latest;
   prerelease (`vX.Y.Z-rc.N`) публикуется с флагом prerelease и **никогда**
   не становится latest;
-- повторный запуск по полностью опубликованному тегу — безопасный no-op:
-  файлы не перезаписываются и не удаляются; при возобновлении прерванного
-  запуска draft дозагружается и публикуется.
+- повторный запуск по тегу с полным комплектом из 14 опубликованных assets —
+  безопасный no-op: файлы не перезаписываются и не удаляются. Старый комплект
+  из 8 assets отклоняется без изменений; draft можно дозагрузить и опубликовать.
 
 Важно: реальная сборка релиза происходит при push тега **после merge** в `main`;
 в PR выполняется только offline-проверка хелперов (валидация тега, логика

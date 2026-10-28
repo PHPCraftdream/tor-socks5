@@ -538,6 +538,17 @@ jobs:
             file "$binary" | grep -Eq 'statically linked|static-pie linked'
           fi
           "$binary" --version
+          if [ "$MUSL" = "true" ]; then
+            case "$TARGET" in
+              x86_64-*) platform=linux/amd64 ;;
+              aarch64-*) platform=linux/arm64 ;;
+              *) echo "unsupported musl target: $TARGET" >&2; exit 1 ;;
+            esac
+            docker run --rm --network none --read-only \\
+              --platform "$platform" \\
+              --mount "type=bind,src=$(realpath "$binary"),dst=/socks5-proxy,readonly" \\
+              alpine:3.22 /socks5-proxy --version
+          fi
 
   release-scripts:
     name: Release helpers offline suite (validate-tag, publish)

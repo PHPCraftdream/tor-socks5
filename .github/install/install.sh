@@ -37,11 +37,7 @@ detect_target() {
     case "$uname_m" in
         x86_64|amd64) arch=x86_64 ;;
         arm64|aarch64)
-            if [ "$os" = macos ]; then
-                arch=aarch64
-            else
-                err "Linux ARM не поддерживается (только x86_64 GNU/glibc)"
-            fi
+            arch=aarch64
             ;;
         *)
             err "неподдерживаемая архитектура: $uname_m"
@@ -57,8 +53,18 @@ detect_target() {
 
     case "$os" in
         linux)
-            # Linux-ассет только x86_64-unknown-linux-gnu (glibc)
-            target=x86_64-unknown-linux-gnu
+            # GNU libc evidence takes precedence on mixed systems; otherwise
+            # require an explicit ldd implementation marker. Never run the asset.
+            if command -v getconf >/dev/null 2>&1 && getconf GNU_LIBC_VERSION 2>/dev/null | grep -q '^glibc '; then
+                libc=gnu
+            elif command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi 'musl'; then
+                libc=musl
+            elif command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi 'glibc'; then
+                libc=gnu
+            else
+                err "не удалось однозначно определить libc Linux (возможны смешанные окружения)"
+            fi
+            target="$arch-unknown-linux-$libc"
             ;;
         macos)
             if [ "$arch" = aarch64 ]; then

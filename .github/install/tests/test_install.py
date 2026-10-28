@@ -53,7 +53,7 @@ class ShInstallTests(unittest.TestCase):
 
     def build(self, os_name="Linux", machine="x86_64", sysctl_arm="0",
               hash_tools=None, member=None, checksum=None,
-              scenario_kw=None, archive_kw=None):
+              scenario_kw=None, archive_kw=None, libc="gnu"):
         if hash_tools is None:
             # macOS runners не имеют coreutils: берём то, что реально есть
             hash_tools = (("sha256sum",) if shutil.which("sha256sum")
@@ -61,10 +61,11 @@ class ShInstallTests(unittest.TestCase):
         # Неизвестная ОС (SunOS и т.п.): ассет-placeholder — валидный Linux,
         # платформу отвергает САМ installer (stub uname) ДО сети. Ошибку
         # placeholder-выбора в Python НЕ маскируем.
-        target = {"Linux": "x86_64-unknown-linux-gnu",
+        target = {"Linux": "%s-unknown-linux-%s" %
+                  ("aarch64" if machine in ("aarch64", "arm64") else "x86_64", libc),
                   "Darwin": "aarch64-apple-darwin" if
-                            (machine in ("arm64", "aarch64") or sysctl_arm == "1")
-                            else "x86_64-apple-darwin"}.get(os_name) \
+                  (machine in ("arm64", "aarch64") or sysctl_arm == "1")
+                  else "x86_64-apple-darwin"}.get(os_name) \
             or "x86_64-unknown-linux-gnu"
         archive_name = "tor-socks5-%s-%s.tar.gz" % (fx.MOCK_TAG, target)
         # Каждый build — НОВЫЙ уникальный namespace (bin/bin-data/dl/home/log):
@@ -87,7 +88,7 @@ class ShInstallTests(unittest.TestCase):
                            else checksum.encode("utf-8"))
         bin_dir, scen, log = fx.make_fakebin(
             ns, "bin", os_name=os_name, machine=machine,
-            sysctl_arm=sysctl_arm, hash_tools=hash_tools)
+            sysctl_arm=sysctl_arm, hash_tools=hash_tools, libc=libc)
         kw = {"files": {archive_name: archive_path,
                         archive_name + ".sha256": sum_path}}
         kw.update(scenario_kw or {})
@@ -197,8 +198,8 @@ class ShInstallTests(unittest.TestCase):
     # --- платформа/arch: fail ДО скачивания ----------------------------
 
     def test_wrong_platform_fails_before_download(self):
-        for os_name, machine in (("SunOS", "x86_64"), ("Linux", "aarch64"),
-                                 ("Linux", "i686"), ("Darwin", "i386")):
+        for os_name, machine in (("SunOS", "x86_64"), ("Linux", "i686"),
+                                 ("Darwin", "i386")):
             with self.subTest(platform="%s/%s" % (os_name, machine)):
                 ctx = self.build(os_name=os_name, machine=machine)
                 p = self.install(ctx)
@@ -207,16 +208,19 @@ class ShInstallTests(unittest.TestCase):
 
     def test_target_selection(self):
         cases = [
-            # (os, machine, sysctl, ожидаемый target в URL скачивания)
-            ("Linux", "x86_64", "0", "x86_64-unknown-linux-gnu"),
-            ("Darwin", "x86_64", "0", "x86_64-apple-darwin"),      # Intel
-            ("Darwin", "x86_64", "1", "aarch64-apple-darwin"),     # Rosetta
-            ("Darwin", "arm64", "0", "aarch64-apple-darwin"),
+            # (os, machine, sysctl, libc, expected archive target)
+            ("Linux", "x86_64", "0", "gnu", "x86_64-unknown-linux-gnu"),
+            ("Linux", "amd64", "0", "musl", "x86_64-unknown-linux-musl"),
+            ("Linux", "aarch64", "0", "gnu", "aarch64-unknown-linux-gnu"),
+            ("Linux", "arm64", "0", "musl", "aarch64-unknown-linux-musl"),
+            ("Darwin", "x86_64", "0", "gnu", "x86_64-apple-darwin"),
+            ("Darwin", "x86_64", "1", "gnu", "aarch64-apple-darwin"),
+            ("Darwin", "arm64", "0", "gnu", "aarch64-apple-darwin"),
         ]
-        for os_name, machine, sysctl, target in cases:
+        for os_name, machine, sysctl, libc, target in cases:
             with self.subTest(target=target):
                 ctx = self.build(os_name=os_name, machine=machine,
-                                 sysctl_arm=sysctl)
+                                 sysctl_arm=sysctl, libc=libc)
                 p = self.install(ctx)
                 self.assertEqual(p.returncode, 0, p.stderr)
                 urls = self.curl_urls(ctx)
@@ -227,6 +231,42 @@ class ShInstallTests(unittest.TestCase):
                 # 'tor-socks5', поэтому установка успешна
                 self.assert_installed(
                     os.path.join(ctx["home"], ".local", "bin", "tor-socks5"))
+
+        cases = [
+            ("Linux", "x86_64", "gnu", "x86_64-unknown-linux-gnu"),
+            ("Linux", "amd64", "musl", "x86_64-unknown-linux-musl"),
+            ("Linux", "aarch64", "gnu", "aarch64-unknown-linux-gnu"),
+            ("Linux", "arm64", "musl", "aarch64-unknown-linux-musl"),
+        ]
+        for os_name, machine, libc, target in cases:
+            with self.subTest(platform=(machine, libc)):
+                ctx = self.build(os_name=os_name, machine=machine, libc=libc)
+                p = self.install(ctx)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertIn(target, self.curl_urls(ctx)[1])
+
+        for machine, libc in (("x86_64", "unknown"), ("arm64", "unknown")):
+            ctx = self.build(machine=machine, libc=libc)
+            p = self.install(ctx)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertEqual(self.curl_urls(ctx), [])
+
+        dest_dir = self.area.subdir("old-release-dest")
+        old = os.path.join(dest_dir, "tor-socks5")
+        with open(old, "wb") as f:
+            f.write(fx.MARKER_OLD)
+        ctx = self.build(machine="arm64", libc="gnu",
+                         scenario_kw={"fail_download": "tor-socks5-%s-aarch64-unknown-linux-gnu.tar.gz" % fx.MOCK_TAG})
+        p = self.install(ctx, "--install-dir", dest_dir)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(fx.file_bytes(old), fx.MARKER_OLD)
+        self.assertIn("aarch64-unknown-linux-gnu", self.curl_urls(ctx)[1])
+
+    def test_linux_conflicting_libc_prefers_gnu(self):
+        ctx = self.build(machine="aarch64", libc="mixed")
+        p = self.install(ctx)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("aarch64-unknown-linux-gnu", self.curl_urls(ctx)[1])
 
     # --- latest tag: негативы -------------------------------------------
 
