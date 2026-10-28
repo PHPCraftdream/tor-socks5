@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(any(target_os = "android", test))]
 fn reject_unimplemented_global_socks5_endpoints(config: &Config) -> Result<(), String> {
     use proxy_config::EndpointOverride;
 
@@ -12,6 +13,7 @@ fn reject_unimplemented_global_socks5_endpoints(config: &Config) -> Result<(), S
     Ok(())
 }
 
+#[cfg(any(target_os = "android", test))]
 fn reject_unimplemented_account_socks5_endpoints(users: &UsersConfig) -> Result<(), String> {
     use proxy_config::EndpointOverride;
 
@@ -57,7 +59,7 @@ mod tests {
         reject_unimplemented_global_socks5_endpoints,
     };
     use auth::{User, UsersConfig};
-    use proxy_config::{client_acl::EndpointOverride, Config};
+    use proxy_config::{Config, EndpointOverride};
 
     fn endpoint() -> EndpointOverride {
         EndpointOverride::Endpoint("127.0.0.1:9050".parse().unwrap())
