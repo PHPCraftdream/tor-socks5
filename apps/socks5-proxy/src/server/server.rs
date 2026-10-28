@@ -84,6 +84,12 @@ pub(crate) async fn run_server(
         Loaded::Defaults(_) => (None, "built-in defaults".to_string()),
     };
     let cfg = loaded.into_config();
+    for (scope, setting) in [
+        ("global pre_socks5", &cfg.pre_socks5),
+        ("global post_socks5", &cfg.post_socks5),
+    ] {
+        reject_unsupported_endpoint(setting, scope)?;
+    }
 
     // Held until the server shuts down so the non-blocking log writer
     // keeps flushing for the whole run. The observation sink captures
@@ -112,6 +118,7 @@ pub(crate) async fn run_server(
     // back to the legacy NO_AUTH path.
     let users_path = UsersConfig::resolve_path(config_path.as_deref());
     let users = UsersConfig::load(&users_path).context("loading users registry")?;
+    reject_unsupported_account_endpoints(&users)?;
     let auth_state = if users.users.is_empty() {
         info!(path = %users_path.display(), "no users configured — SOCKS5 will accept anonymous clients");
         None
@@ -469,6 +476,97 @@ pub(crate) async fn run_server(
     }
     info!("bye");
     Ok(())
+}
+
+/// Temporarily fail closed until the pre/post proxy routes are implemented.
+fn reject_unsupported_endpoint(
+    setting: &Option<proxy_config::EndpointOverride>,
+    scope: &str,
+) -> Result<()> {
+    if matches!(setting, Some(proxy_config::EndpointOverride::Endpoint(_))) {
+        bail!("{scope} SOCKS5 endpoint is not supported yet; remove it or set it to `none`");
+    }
+    Ok(())
+}
+
+fn reject_unsupported_account_endpoints(users: &UsersConfig) -> Result<()> {
+    for user in users.users.iter().filter(|user| user.is_enabled) {
+        for (scope, setting) in [
+            ("enabled account pre_socks5", &user.pre_socks5),
+            ("enabled account post_socks5", &user.post_socks5),
+        ] {
+            reject_unsupported_endpoint(setting, scope)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod endpoint_guard_tests {
+    use super::*;
+    use auth::{User, UsersConfig};
+    use proxy_config::EndpointOverride;
+
+    fn endpoint() -> EndpointOverride {
+        EndpointOverride::Endpoint("127.0.0.1:1080".parse().unwrap())
+    }
+
+    fn user(
+        is_enabled: bool,
+        pre_socks5: Option<EndpointOverride>,
+        post_socks5: Option<EndpointOverride>,
+    ) -> User {
+        User {
+            name: "test".to_string(),
+            hash: "unused".to_string(),
+            is_enabled,
+            allowed_onion: false,
+            allowed_clients: None,
+            pre_socks5,
+            post_socks5,
+        }
+    }
+
+    #[test]
+    fn rejects_global_pre_and_post_endpoints() {
+        for scope in ["global pre_socks5", "global post_socks5"] {
+            let error = reject_unsupported_endpoint(&Some(endpoint()), scope).unwrap_err();
+            assert!(error.to_string().contains(scope));
+            assert!(error.to_string().contains("not supported yet"));
+        }
+    }
+
+    #[test]
+    fn rejects_account_endpoint_without_global_setting() {
+        let users = UsersConfig {
+            users: vec![
+                user(true, Some(endpoint()), None),
+                user(true, None, Some(endpoint())),
+            ],
+        };
+        let error = reject_unsupported_account_endpoints(&users).unwrap_err();
+        assert!(error.to_string().contains("enabled account pre_socks5"));
+        assert!(error.to_string().contains("not supported yet"));
+        let post_only = UsersConfig {
+            users: vec![user(true, None, Some(endpoint()))],
+        };
+        let error = reject_unsupported_account_endpoints(&post_only).unwrap_err();
+        assert!(error.to_string().contains("enabled account post_socks5"));
+    }
+
+    #[test]
+    fn disabled_account_does_not_run_endpoint_guard() {
+        let users = UsersConfig {
+            users: vec![user(false, Some(endpoint()), Some(endpoint()))],
+        };
+        assert!(reject_unsupported_account_endpoints(&users).is_ok());
+    }
+
+    #[test]
+    fn absent_and_explicitly_disabled_settings_are_allowed() {
+        assert!(reject_unsupported_endpoint(&None, "endpoint").is_ok());
+        assert!(reject_unsupported_endpoint(&Some(EndpointOverride::Disabled), "endpoint").is_ok());
+    }
 }
 
 /// Shutdown choreography for the Tor-side background producers (bridge
