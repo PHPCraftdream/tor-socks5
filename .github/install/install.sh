@@ -53,18 +53,7 @@ detect_target() {
 
     case "$os" in
         linux)
-            # GNU libc evidence takes precedence on mixed systems; otherwise
-            # require an explicit ldd implementation marker. Never run the asset.
-            if command -v getconf >/dev/null 2>&1 && getconf GNU_LIBC_VERSION 2>/dev/null | grep -q '^glibc '; then
-                libc=gnu
-            elif command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi 'musl'; then
-                libc=musl
-            elif command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi 'glibc'; then
-                libc=gnu
-            else
-                err "не удалось однозначно определить libc Linux (возможны смешанные окружения)"
-            fi
-            target="$arch-unknown-linux-$libc"
+            target="$arch-unknown-linux-musl"
             ;;
         macos)
             if [ "$arch" = aarch64 ]; then
@@ -225,6 +214,13 @@ main() {
     esac
 
     latest_tag
+
+    if [ "$os" = linux ] && [ "$tag" = v0.2.0 ]; then
+        [ "$arch" = x86_64 ] || err "релиз v0.2.0 содержит Linux GNU только для x86_64"
+        command -v getconf >/dev/null 2>&1 && getconf GNU_LIBC_VERSION 2>/dev/null | grep -q '^glibc ' \
+            || err "релиз v0.2.0 требует явно подтверждённую GNU libc"
+        target=x86_64-unknown-linux-gnu
+    fi
 
     # umask 077: наши файлы (в т.ч. staging) недоступны другим пользователям
     umask 077
