@@ -86,12 +86,20 @@ mod tests {
         assert!(reject_unimplemented_global_socks5_endpoints(&config).is_err());
         config.post_socks5 = None;
         assert!(reject_unimplemented_global_socks5_endpoints(&config).is_ok());
+        config.pre_socks5 = Some(endpoint());
+        assert!(reject_unimplemented_global_socks5_endpoints(&config).is_err());
     }
 
     #[test]
     fn enabled_account_endpoint_is_rejected_but_disabled_account_is_ignored() {
         let users = UsersConfig {
             users: vec![user(true, Some(endpoint()))],
+        };
+        assert!(reject_unimplemented_account_socks5_endpoints(&users).is_err());
+        let mut post_only = user(true, None);
+        post_only.post_socks5 = Some(endpoint());
+        let users = UsersConfig {
+            users: vec![post_only],
         };
         assert!(reject_unimplemented_account_socks5_endpoints(&users).is_err());
         let users = UsersConfig {
