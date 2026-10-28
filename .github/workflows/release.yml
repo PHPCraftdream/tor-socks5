@@ -45,9 +45,10 @@ jobs:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-local-sdk
       - uses: dtolnay/rust-toolchain@stable
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: taiki-e/install-action@v2
         with:
-          command: check licenses
+          tool: cargo-deny
+      - run: cargo deny --config .github/deny.toml check licenses
 
   build:
     name: Build (${{ matrix.target }})
