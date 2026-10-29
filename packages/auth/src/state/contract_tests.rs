@@ -2,7 +2,6 @@ use super::*;
 use crate::{compute_hash, User};
 use std::future::Future;
 use std::sync::{mpsc, Mutex};
-use std::task::Poll;
 use std::time::{Duration, Instant};
 
 const LIMIT: Duration = Duration::from_secs(15);

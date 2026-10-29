@@ -1,5 +1,4 @@
 use super::*;
-use std::future::Future as _;
 
 // -- same-port consumer migration ------------------------------------------
 
