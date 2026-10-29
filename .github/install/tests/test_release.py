@@ -769,6 +769,16 @@ class ReleaseWorkflowWiring(unittest.TestCase):
         import re
         jobs = self._jobs(text)
         self.assertEqual(set(jobs), {'offline-tests', 'build', 'aggregate'})
+        job_envs = {}
+        for name, job in jobs.items():
+            envs = re.findall(r'(?m)^    env:[ \t]*\n((?:(?: {6,}[^\n]*|[ \t]*)\n)*)',
+                              self._code(job) + '\n')
+            job_envs[name] = envs
+            for env in envs:
+                self.assertNotRegex(env, r'(?is)\$\{\{(?:(?!\}\}).)*\brunner\s*(?:\.|\[)')
+        self.assertEqual(len(job_envs['build']), 1)
+        self.assertEqual(re.findall(r'(?m)^      CARGO_HOME:[ \t]*(.*)$', job_envs['build'][0]),
+                         ['${{ github.workspace }}/target/license-cargo-home'])
         self.assertEqual([s.strip() for s in self._top(text, 'permissions').splitlines() if s.strip()], ['contents: read'])
         offline = jobs['offline-tests']
         for suite in ('test_source_inventory.py', 'test_provenance.py'):
@@ -781,6 +791,7 @@ class ReleaseWorkflowWiring(unittest.TestCase):
         self.assertEqual(len(checkout), 1)
         self.assertEqual(len(sdk), 1)
         self.assertEqual(len(suites), 1)
+        self._contains_line(steps[suites[0]], 'python3 -I .github/install/tests/test_release.py ReleaseWorkflowWiring')
         self.assertEqual(len(chain), 1)
         self.assertLess(checkout[0], sdk[0])
         self.assertLess(sdk[0], suites[0])
@@ -931,7 +942,17 @@ class ReleaseWorkflowWiring(unittest.TestCase):
         self._assert_release(self.release)
         self._assert_producer(self.producer)
         self._assert_promotion(self.promotion)
+        step_runner = self.producer.replace(
+            '        run: python3 -I .github/release/license/tests/integration/test_release_chain.py',
+            '        env:\n          TEMP_DIR: ${{ runner.temp }}\n'
+            '        run: python3 -I .github/release/license/tests/integration/test_release_chain.py', 1)
+        self.assertNotEqual(step_runner, self.producer)
+        self._assert_producer(step_runner)
         cases = [
+            (self._assert_producer, self.producer.replace('CARGO_HOME: ${{ github.workspace }}/target/license-cargo-home', 'CARGO_HOME: ${{ runner.temp }}/license-cargo-home', 1)),
+            (self._assert_producer, self.producer.replace('    name: License tooling offline tests\n', '    name: License tooling offline tests\n    env:\n      TEMP_DIR: ${{ runner.temp }}\n', 1)),
+            (self._assert_producer, self.producer.replace('CARGO_HOME: ${{ github.workspace }}/target/license-cargo-home', 'CARGO_HOME: ~/.cargo', 1)),
+            (self._assert_producer, self.producer.replace('          python3 -I .github/install/tests/test_release.py ReleaseWorkflowWiring\n', '', 1)),
             (self._assert_producer, self.producer.replace('      - uses: ./.github/actions/setup-local-sdk\n', '', 1)),
             (self._assert_producer, self.producer.replace('run: python3 -I .github/release/license/tests/integration/test_release_chain.py', 'run: true', 1)),
             (self._assert_producer, self.producer.replace('            target/license-blockers.json', '            license-blockers.json', 1)),

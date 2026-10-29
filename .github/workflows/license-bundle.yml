@@ -46,6 +46,7 @@ jobs:
           python3 -I .github/release/license/tests/unit/test_source_inventory.py
           python3 -I .github/release/license/tests/unit/test_provenance.py
           python3 -I .github/install/tests/test_release.py PublisherTests
+          python3 -I .github/install/tests/test_release.py ReleaseWorkflowWiring
       - name: TEST-ONLY transport chain (not production authority)
         run: python3 -I .github/release/license/tests/integration/test_release_chain.py
 
@@ -67,7 +68,7 @@ jobs:
     env:
       CARGO_BUILD_JOBS: 2
       TARGET: ${{ matrix.target }}
-      CARGO_HOME: ${{ runner.temp }}/license-cargo-home
+      CARGO_HOME: ${{ github.workspace }}/target/license-cargo-home
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/license-build
       TOR_SOCKS5_NOTICES: ${{ github.workspace }}/target/license-prepared/NOTICES.txt
       TOR_SOCKS5_SOURCE_INFO: ${{ github.workspace }}/target/license-prepared/SOURCE-INFO.txt
