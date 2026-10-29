@@ -18,10 +18,12 @@ use crate::tor_setup::{
 };
 
 fn pre_config() -> Config {
-    let mut cfg = Config::default();
-    cfg.pre_socks5 = Some(proxy_config::EndpointOverride::Endpoint(
-        "127.0.0.1:1080|alice:secret".parse().unwrap(),
-    ));
+    let mut cfg = Config {
+        pre_socks5: Some(proxy_config::EndpointOverride::Endpoint(
+            "127.0.0.1:1080|alice:secret".parse().unwrap(),
+        )),
+        ..Config::default()
+    };
     cfg.bridges.use_seeds = false;
     cfg.bridges.auto_fetch = false;
     cfg.bridges.lines = vec!["8.8.8.8:443 1111111111111111111111111111111111111111".into()];
@@ -127,14 +129,32 @@ async fn pre_hint_and_rejected_pt_cannot_bypass_validation() {
             assert_eq!(settings.bridges.len(), 1);
             assert!(settings.bridges.iter().all(|b| b.transport.is_none()));
 
-            // Обычный парсер отбрасывает локальные адреса, но режим pre должен
-            // отклонить PT до того, как эта фильтрация сможет его скрыть.
+            // Парсер отбрасывает obfs4 с документационным IPv6-адресом,
+            // но режим pre должен отклонить PT до этой фильтрации.
             cfg.bridges.lines.push(
-                "obfs4 127.0.0.1:443 2222222222222222222222222222222222222222 cert=AAA iat-mode=0"
+                "obfs4 [2001:db8::1]:443 2222222222222222222222222222222222222222 cert=AAA iat-mode=0"
                     .into(),
             );
             let parsed = cfg.bridges.parsed().unwrap();
             assert_eq!(parsed.rejected, 1);
+            assert_eq!(parsed.duplicates, 0);
+            assert_eq!(parsed.bridges, settings.bridges);
+            assert!(build_tor_settings(&cfg, None)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("pluggable transport"));
+
+            // IPv4 loopback проходит фильтр, но сырой PT всё равно запрещён в pre.
+            *cfg.bridges.lines.last_mut().expect("PT-строка существует") =
+                "obfs4 127.0.0.1:443 2222222222222222222222222222222222222222 cert=AAA iat-mode=0"
+                    .into();
+            let parsed = cfg.bridges.parsed().unwrap();
+            assert_eq!(parsed.rejected, 0);
+            assert_eq!(parsed.duplicates, 0);
+            assert_eq!(parsed.bridges.len(), 2);
+            assert_eq!(parsed.bridges[0], settings.bridges[0]);
+            assert!(parsed.bridges[1].transport.is_some());
             assert!(build_tor_settings(&cfg, None)
                 .await
                 .unwrap_err()

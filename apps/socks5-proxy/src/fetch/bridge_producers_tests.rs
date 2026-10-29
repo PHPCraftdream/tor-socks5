@@ -10,10 +10,12 @@ fn ensure_crypto_provider() {
 #[tokio::test]
 async fn pre_skips_real_producer_launches_and_default_reaches_boundaries() {
     let dir = tempfile::tempdir().unwrap();
-    let mut cfg = Config::default();
-    cfg.pre_socks5 = Some(proxy_config::EndpointOverride::Endpoint(
-        "127.0.0.1:1080".parse().unwrap(),
-    ));
+    let mut cfg = Config {
+        pre_socks5: Some(proxy_config::EndpointOverride::Endpoint(
+            "127.0.0.1:1080".parse().unwrap(),
+        )),
+        ..Config::default()
+    };
     cfg.bridges.use_seeds = false;
     cfg.bridges.auto_fetch = false;
     cfg.bridges.lines = vec!["8.8.8.8:443 1111111111111111111111111111111111111111".into()];

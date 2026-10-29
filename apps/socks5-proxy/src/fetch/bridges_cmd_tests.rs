@@ -13,10 +13,12 @@ fn action() -> BridgesAction {
 async fn fetch_rejects_pre_before_network_startup() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("proxy.ktav");
-    let mut cfg = Config::default();
-    cfg.pre_socks5 = Some(proxy_config::EndpointOverride::Endpoint(
-        "127.0.0.1:1080".parse().unwrap(),
-    ));
+    let mut cfg = Config {
+        pre_socks5: Some(proxy_config::EndpointOverride::Endpoint(
+            "127.0.0.1:1080".parse().unwrap(),
+        )),
+        ..Config::default()
+    };
     cfg.bridges.use_seeds = false;
     cfg.bridges.auto_fetch = false;
     cfg.bridges.lines = vec!["8.8.8.8:443 1111111111111111111111111111111111111111".into()];
