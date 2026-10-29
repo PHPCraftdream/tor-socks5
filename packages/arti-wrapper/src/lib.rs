@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 
 use arti_client::config::pt::TransportConfigBuilder;
 use arti_client::config::{BridgeConfigBuilder, CfgPath, Reconfigure, TorClientConfigBuilder};
-use arti_client::{DataStream, TorClient, TorClientConfig};
+/// Поток данных, открытый через Tor.
+pub use arti_client::DataStream;
+use arti_client::{TorClient, TorClientConfig};
 use bridge_line::BridgeLine;
 use tor_linkspec::HasChanMethod;
 use tor_rtcompat::PreferredRuntime;

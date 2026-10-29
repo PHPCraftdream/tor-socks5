@@ -37,6 +37,88 @@ pub(crate) fn reject_unsupported_account_endpoints(users: &UsersConfig) -> anyho
     Ok(())
 }
 
+/// Отклонить неподдерживаемую отмену глобального post для аккаунта.
+pub(crate) fn validate_post_account_overrides(
+    post: bool,
+    users: &UsersConfig,
+) -> anyhow::Result<()> {
+    if post
+        && users.users.iter().any(|user| {
+            user.is_enabled && matches!(user.post_socks5.as_ref(), Some(EndpointOverride::Disabled))
+        })
+    {
+        anyhow::bail!("account post_socks5 override is not supported yet");
+    }
+    if post
+        && users
+            .users
+            .iter()
+            .any(|user| user.is_enabled && user.hash == auth::INIT_SENTINEL)
+    {
+        anyhow::bail!("post_socks5 cannot be combined with active init accounts until account routes are supported");
+    }
+    Ok(())
+}
+
+/// Не допустить обход post через независимый DNS или upstream вместо Tor.
+pub(crate) fn validate_post_compatibility(
+    post: bool,
+    dns: bool,
+    upstream: bool,
+) -> anyhow::Result<()> {
+    if post && (dns || upstream) {
+        anyhow::bail!("post_socks5 cannot be combined with DNS listener or upstream egress");
+    }
+    Ok(())
+}
+
+/// Выбрать один маршрут; ошибка post не запускает прямой путь.
+pub(crate) async fn select_post_route<T, D, P>(use_post: bool, direct: D, post: P) -> T
+where
+    D: std::future::Future<Output = T>,
+    P: std::future::Future<Output = T>,
+{
+    if use_post {
+        post.await
+    } else {
+        direct.await
+    }
+}
+
+/// Установить соединение через Tor и необязательный post SOCKS5.
+///
+/// cancel-safe: NO — при отмене частично открытый поток отбрасывается.
+pub(crate) async fn connect_tor_route(
+    tor: &arti_wrapper::TorTunnel,
+    post: Option<&EndpointOverride>,
+    host: &str,
+    port: u16,
+) -> Result<arti_wrapper::DataStream, arti_wrapper::TorError> {
+    let post_connect = async {
+        let Some(EndpointOverride::Endpoint(endpoint)) = post else {
+            return Err(arti_wrapper::TorError::PostSocks(
+                socks5_proto::client::Error::InvalidInput,
+            ));
+        };
+        let credentials = endpoint
+            .credentials()
+            .map(|(username, password)| arti_wrapper::PostSocksCredentials::new(username, password))
+            .transpose()
+            .map_err(arti_wrapper::TorError::PostSocks)?;
+        arti_wrapper::connect_post_socks(
+            tor,
+            &endpoint.address().ip().to_string(),
+            endpoint.address().port(),
+            host,
+            port,
+            credentials.as_ref(),
+            std::time::Instant::now() + crate::upstream::UPSTREAM_SETUP_DEADLINE,
+        )
+        .await
+    };
+    select_post_route(post.is_some(), tor.connect(host, port), post_connect).await
+}
+
 /// `rustls` 0.23 requires picking a process-wide crypto provider explicitly.
 pub(crate) fn install_crypto_provider() {
     rustls::crypto::ring::default_provider()
@@ -107,7 +189,10 @@ pub(crate) fn init_tracing(cfg: &Config) -> (WorkerGuard, ObservationSink) {
 
 #[cfg(test)]
 mod endpoint_guard_tests {
-    use super::{reject_unsupported_account_endpoints, reject_unsupported_endpoint};
+    use super::{
+        reject_unsupported_account_endpoints, reject_unsupported_endpoint, select_post_route,
+        validate_post_account_overrides, validate_post_compatibility,
+    };
     use auth::{User, UsersConfig};
     use proxy_config::EndpointOverride;
 
@@ -129,6 +214,72 @@ mod endpoint_guard_tests {
             pre_socks5,
             post_socks5,
         }
+    }
+
+    #[test]
+    fn account_none_with_global_post_is_not_silently_ignored() {
+        let enabled = UsersConfig {
+            users: vec![user(true, None, Some(EndpointOverride::Disabled))],
+        };
+        assert!(validate_post_account_overrides(true, &enabled).is_err());
+        assert!(validate_post_account_overrides(false, &enabled).is_ok());
+        let disabled = UsersConfig {
+            users: vec![user(false, None, Some(EndpointOverride::Disabled))],
+        };
+        assert!(validate_post_account_overrides(true, &disabled).is_ok());
+        let inherited = UsersConfig {
+            users: vec![user(true, None, None)],
+        };
+        assert!(validate_post_account_overrides(true, &inherited).is_ok());
+    }
+
+    #[test]
+    fn active_init_with_global_post_is_rejected() {
+        let mut init = user(true, None, None);
+        init.hash = auth::INIT_SENTINEL.to_owned();
+        let users = UsersConfig {
+            users: vec![init.clone()],
+        };
+        assert!(validate_post_account_overrides(true, &users).is_err());
+        assert!(validate_post_account_overrides(false, &users).is_ok());
+        init.is_enabled = false;
+        let disabled = UsersConfig { users: vec![init] };
+        assert!(validate_post_account_overrides(true, &disabled).is_ok());
+    }
+
+    #[test]
+    fn post_rejects_bypassing_egress_and_dns() {
+        assert!(validate_post_compatibility(true, true, false).is_err());
+        assert!(validate_post_compatibility(true, false, true).is_err());
+        assert!(validate_post_compatibility(true, false, false).is_ok());
+        assert!(validate_post_compatibility(false, true, true).is_ok());
+    }
+
+    #[tokio::test]
+    async fn post_failure_never_polls_direct_route() {
+        let direct_polled = std::cell::Cell::new(false);
+        let direct = async {
+            direct_polled.set(true);
+            Ok::<_, &str>(())
+        };
+        let post = async { Err::<(), _>("post failed") };
+        assert_eq!(
+            select_post_route(true, direct, post).await,
+            Err("post failed")
+        );
+        assert!(!direct_polled.get());
+    }
+
+    #[tokio::test]
+    async fn no_post_never_polls_post_route() {
+        let post_polled = std::cell::Cell::new(false);
+        let direct = async { Ok::<_, &str>(()) };
+        let post = async {
+            post_polled.set(true);
+            Err::<(), _>("unexpected post")
+        };
+        assert_eq!(select_post_route(false, direct, post).await, Ok(()));
+        assert!(!post_polled.get());
     }
 
     #[test]

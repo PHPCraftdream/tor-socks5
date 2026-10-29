@@ -20,8 +20,8 @@ use crate::config::{Config, Loaded, SecurityConfig};
 use crate::conn_health::{spawn_conn_health_logger, ConnHealthCounters};
 use crate::dns_wiring::{convert_custom_doh_providers, convert_dns_overrides, dns_cache_path};
 use crate::startup::{
-    init_tracing, install_crypto_provider, reject_unsupported_account_endpoints,
-    reject_unsupported_endpoint,
+    connect_tor_route, init_tracing, install_crypto_provider, reject_unsupported_account_endpoints,
+    reject_unsupported_endpoint, validate_post_account_overrides, validate_post_compatibility,
 };
 use crate::tor_setup::build_tor_settings;
 use crate::tor_watchdog::{spawn_bridge_failover_watchdog, spawn_tor_watchdog, TorHandle};
@@ -60,7 +60,7 @@ const PRODUCER_JOIN_TIMEOUT: Duration = Duration::from_secs(120);
 /// replaces Tor entirely.
 #[derive(Clone)]
 enum Egress {
-    Tor(TorHandle),
+    Tor(TorHandle, Option<Arc<proxy_config::EndpointOverride>>),
     Upstream(Arc<upstream::Upstream>),
 }
 
@@ -87,12 +87,13 @@ pub(crate) async fn run_server(
         Loaded::Defaults(_) => (None, "built-in defaults".to_string()),
     };
     let cfg = loaded.into_config();
-    for (scope, setting) in [
-        ("global pre_socks5", &cfg.pre_socks5),
-        ("global post_socks5", &cfg.post_socks5),
-    ] {
-        reject_unsupported_endpoint(setting, scope)?;
-    }
+    reject_unsupported_endpoint(&cfg.pre_socks5, "global pre_socks5")?;
+    let post_socks = cfg
+        .post_socks5
+        .clone()
+        .filter(|setting| matches!(setting, proxy_config::EndpointOverride::Endpoint(_)))
+        .map(Arc::new);
+    validate_post_compatibility(post_socks.is_some(), cfg.dns_server.enabled, false)?;
 
     // Held until the server shuts down so the non-blocking log writer
     // keeps flushing for the whole run. The observation sink captures
@@ -122,6 +123,7 @@ pub(crate) async fn run_server(
     let users_path = UsersConfig::resolve_path(config_path.as_deref());
     let users = UsersConfig::load(&users_path).context("loading users registry")?;
     reject_unsupported_account_endpoints(&users)?;
+    validate_post_account_overrides(post_socks.is_some(), &users)?;
     let auth_state = if users.users.is_empty() {
         info!(path = %users_path.display(), "no users configured — SOCKS5 will accept anonymous clients");
         None
@@ -155,6 +157,7 @@ pub(crate) async fn run_server(
         args.no_upstream,
     )? {
         Some(up) => {
+            validate_post_compatibility(post_socks.is_some(), false, true)?;
             info!(
                 upstream = %up.address(),
                 auth = up.has_auth(),
@@ -306,7 +309,7 @@ pub(crate) async fn run_server(
                 }
             }
 
-            Egress::Tor(handle)
+            Egress::Tor(handle, post_socks)
         }
     };
 
@@ -316,7 +319,7 @@ pub(crate) async fn run_server(
     // ("client DNS leaves the machine only inside Tor") cannot be honoured,
     // and refusing to start beats silently leaking plaintext queries.
     if cfg.dns_server.enabled {
-        let Egress::Tor(handle) = &egress else {
+        let Egress::Tor(handle, _) = &egress else {
             bail!(
                 "dns_server.enabled requires Tor egress, not an upstream SOCKS5 proxy — \
                  disable dns_server or remove the upstream"
@@ -446,7 +449,7 @@ pub(crate) async fn run_server(
     // subprocesses and releases arti's exclusive lock on its state
     // directory. The Job Object installed at startup kills anything that
     // leaks past this point. The upstream egress holds no such resources.
-    if let Egress::Tor(handle) = egress {
+    if let Egress::Tor(handle, _) = egress {
         info!("stopping Tor client and pluggable transports");
         // Order matters: cancel first (no producer starts a new work
         // iteration), then drain the slot (in-flight tunnel reads see
@@ -822,7 +825,7 @@ async fn handle_client(
     }
 
     match egress {
-        Egress::Tor(handle) => {
+        Egress::Tor(handle, post_socks) => {
             handle.bridge_refresh().request();
             info!(host = ?host, port = port, "tunneling through Tor");
             // Read the *current* tunnel through the handle: a watchdog
@@ -844,7 +847,7 @@ async fn handle_client(
             handle.health().record_attempt();
             let tor_stream = match handle
                 .bridge_refresh()
-                .track_connection(tor.connect(host, port))
+                .track_connection(connect_tor_route(&tor, post_socks.as_deref(), host, port))
                 .await
             {
                 Ok(s) => {
