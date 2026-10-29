@@ -6,11 +6,12 @@ runs:
     - uses: actions/checkout@v7
       with:
         repository: PHPCraftdream/resocks5
-        ref: v0.3.0
+        ref: e754abaa88ce4f9745b4729652789ffc57f8ba4c
         path: .ci-deps/resocks5
         persist-credentials: false
     - shell: bash
       run: |
         set -euo pipefail
+        test "$(git -C "$GITHUB_WORKSPACE/.ci-deps/resocks5" rev-parse HEAD)" = e754abaa88ce4f9745b4729652789ffc57f8ba4c
         test ! -e ../resocks5
         mv "$GITHUB_WORKSPACE/.ci-deps/resocks5" ../resocks5
