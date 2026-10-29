@@ -125,10 +125,12 @@ async fn pre_refresh_and_heal_relaunch_through_same_proxy() {
         } else {
             proxy.local_addr().unwrap().to_string()
         };
-        let mut cfg = Config::default();
-        cfg.pre_socks5 = Some(proxy_config::EndpointOverride::Endpoint(
-            endpoint.parse().unwrap(),
-        ));
+        let mut cfg = Config {
+            pre_socks5: Some(proxy_config::EndpointOverride::Endpoint(
+                endpoint.parse().unwrap(),
+            )),
+            ..Config::default()
+        };
         cfg.bridges.use_seeds = false;
         cfg.bridges.auto_fetch = false;
         cfg.bridges.lines = vec![format!(
@@ -356,21 +358,18 @@ async fn failed_pre_refresh_delays_recovery_notification() {
         ack: tokio::sync::Semaphore::new(0),
     });
     let token = CancellationToken::new();
-    let task = LOOP_CONTROL
-        .scope(
-            control.clone(),
-            PRE_PROBE.scope(probe.clone(), async {
-                spawn(
-                    handle.clone(),
-                    Some(path),
-                    0,
-                    ObservationSink::new(),
-                    active,
-                    token.clone(),
-                )
-            }),
-        )
-        .await;
+    let task = LOOP_CONTROL.sync_scope(control.clone(), || {
+        PRE_PROBE.sync_scope(probe.clone(), || {
+            spawn(
+                handle.clone(),
+                Some(path),
+                0,
+                ObservationSink::new(),
+                active,
+                token.clone(),
+            )
+        })
+    });
     assert_eq!(received.recv().await, Some("completed"));
     assert_eq!(probe.entered.load(Ordering::SeqCst), 1);
     handle.bridge_refresh().recovery().notify_one();
