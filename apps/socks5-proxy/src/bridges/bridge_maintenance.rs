@@ -162,9 +162,13 @@ pub(crate) fn spawn(
 /// cannot stall an async worker (TS19-01).
 pub(crate) async fn load_config_off_worker(path: Option<&Path>) -> Result<Config> {
     let path = path.map(Path::to_path_buf);
-    tokio::task::spawn_blocking(move || {
+    crate::bridge_verifier::run_fallible_blocking(move || {
         #[cfg(test)]
         crate::test_seams::note_task_context(crate::test_seams::Site::MaintenanceConfigLoad);
+        #[cfg(test)]
+        if let Some(path) = path.as_deref() {
+            crate::test_seams::park_if_armed(crate::test_seams::Site::MaintenanceConfigLoad, path);
+        }
         crate::config::Config::load_with_override(path.as_deref())
             .map(|loaded| loaded.into_config())
     })
@@ -402,6 +406,39 @@ async fn live_route_works(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_maintenance_load_keeps_its_worker_owned() {
+        use crate::test_seams::{ParkedGate, Site, HANG_GUARD};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.ktav");
+        Config::default().write(&path).unwrap();
+        let gate = ParkedGate::arm(Site::MaintenanceConfigLoad, &path);
+        let registry = Arc::new(crate::bridge_verifier::TestWorkers::default());
+        let owner = registry.clone();
+        let outer =
+            tokio::spawn(async move { owner.scope(load_config_off_worker(Some(&path))).await });
+        let wait = gate.clone();
+        tokio::task::spawn_blocking(move || wait.wait_parked(HANG_GUARD))
+            .await
+            .unwrap();
+        outer.abort();
+        assert!(outer.await.unwrap_err().is_cancelled());
+        assert_eq!(registry.pending_count().await, 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), registry.join())
+                .await
+                .is_err()
+        );
+        gate.release();
+        tokio::time::timeout(HANG_GUARD, registry.join())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(registry.pending_count().await, 0);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn stalled_connect_requests_recovery_without_dropping_the_attempt() {

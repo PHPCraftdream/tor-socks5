@@ -42,6 +42,7 @@ pub(crate) enum Site {
     /// TS19-01 recorder site: `bridge_verifier::run_circuit_verify_tick`'s
     /// bridge-store load.
     CircuitVerifyStoreLoad,
+    WriterCloseReplySent,
 }
 
 /// Guard for waits that must succeed (a transaction reaching its gated
@@ -58,6 +59,7 @@ pub(crate) const UNBLOCK_GUARD: Duration = Duration::from_secs(2);
 struct GateInner {
     state: Mutex<(bool, bool)>, // (parked, released)
     cv: Condvar,
+    promotion_slot: Mutex<Option<Option<crate::bridge_verifier::WorkerSlot>>>,
 }
 
 type GateKey = (Site, PathBuf);
@@ -91,6 +93,7 @@ impl ParkedGate {
         let inner = Arc::new(GateInner {
             state: Mutex::new((false, false)),
             cv: Condvar::new(),
+            promotion_slot: Mutex::new(None),
         });
         registry()
             .lock()
@@ -124,6 +127,14 @@ impl ParkedGate {
         assert!(parked, "transaction never reached {:?}", self.key.0);
     }
 
+    pub(crate) fn promotion_slot(&self) -> Option<Option<crate::bridge_verifier::WorkerSlot>> {
+        self.inner
+            .promotion_slot
+            .lock()
+            .expect("promotion slot")
+            .clone()
+    }
+
     pub(crate) fn release(&self) {
         let mut state = self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
         state.1 = true;
@@ -144,6 +155,17 @@ impl Drop for ParkedGate {
         {
             gates.remove(&self.key);
         }
+    }
+}
+
+pub(crate) fn note_promotion_slot(path: &Path, slot: Option<crate::bridge_verifier::WorkerSlot>) {
+    let gate = registry()
+        .lock()
+        .expect("park gate registry")
+        .get(&(Site::ConfigPromotion, path.to_path_buf()))
+        .cloned();
+    if let Some(gate) = gate {
+        *gate.promotion_slot.lock().expect("promotion slot") = Some(slot);
     }
 }
 

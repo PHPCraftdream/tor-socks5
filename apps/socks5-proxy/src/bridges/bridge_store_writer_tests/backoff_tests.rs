@@ -6,6 +6,57 @@ use super::{
 use std::sync::atomic::{AtomicUsize, Ordering};
 use time::OffsetDateTime;
 #[tokio::test(start_paused = true)]
+async fn handled_publish_failures_recover_worker_capacity() {
+    let registry = Arc::new(crate::bridge_verifier::TestWorkers::default());
+    let dir = tempfile::tempdir().unwrap();
+    let path = config_path(dir.path());
+    let bridge = test_bridge();
+    seed_store(&path, &bridge);
+    let (events, mut attempts) = tokio::sync::mpsc::channel(1);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let publisher: Publisher = Arc::new(move |store| {
+        let attempt = counter.fetch_add(1, Ordering::SeqCst) + 1;
+        let result = if attempt <= 72 {
+            Err(anyhow!("ошибка публикации"))
+        } else {
+            store.save()
+        };
+        let _ = events.blocking_send(attempt);
+        result
+    });
+    let writer = registry
+        .scope(async {
+            let writer = StoreWriter::spawn(
+                BridgeStore::resolve_path(Some(&path)),
+                publisher,
+                Duration::from_secs(1),
+            );
+            let bridge = bridge.clone();
+            writer
+                .apply(move |store| {
+                    store.note_channel_success_at(&bridge, OffsetDateTime::now_utc())
+                })
+                .await
+                .unwrap();
+            writer
+        })
+        .await;
+    for expected in 1..=73 {
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(120), attempts.recv())
+                .await
+                .unwrap(),
+            Some(expected)
+        );
+    }
+    writer.close().await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 73);
+    assert_eq!(reload(&path).channel_ok_count(&bridge), 1);
+    registry.join().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
 async fn publish_failure_retains_absorbed_updates_until_next_op() {
     let dir = tempfile::tempdir().expect("tempdir");
     let b = test_bridge();
