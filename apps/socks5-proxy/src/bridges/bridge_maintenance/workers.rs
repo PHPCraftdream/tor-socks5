@@ -11,6 +11,10 @@ pub(crate) struct WorkerState {
 #[derive(Debug)]
 pub(crate) struct WorkerFailures(Vec<anyhow::Error>);
 impl WorkerFailures {
+    pub(crate) fn new(errors: Vec<anyhow::Error>) -> Self {
+        Self(errors)
+    }
+
     #[cfg(test)]
     pub(crate) fn into_errors(self) -> Vec<anyhow::Error> {
         self.0
@@ -194,9 +198,9 @@ impl WorkerRegistry {
         if errors.is_empty() {
             Ok(())
         } else {
-            Err(anyhow::Error::new(crate::bridge_verifier::WorkerFailures(
-                errors,
-            )))
+            Err(anyhow::Error::new(
+                crate::bridge_verifier::WorkerFailures::new(errors),
+            ))
         }
     }
     async fn run<T: Send + 'static>(
