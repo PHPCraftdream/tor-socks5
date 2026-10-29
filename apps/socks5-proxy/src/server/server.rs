@@ -20,8 +20,9 @@ use crate::config::{Config, Loaded, SecurityConfig};
 use crate::conn_health::{spawn_conn_health_logger, ConnHealthCounters};
 use crate::dns_wiring::{convert_custom_doh_providers, convert_dns_overrides, dns_cache_path};
 use crate::startup::{
-    connect_tor_route, init_tracing, install_crypto_provider, reject_unsupported_account_endpoints,
-    reject_unsupported_endpoint, validate_post_account_overrides, validate_post_compatibility,
+    connect_tor_route, init_tracing, install_crypto_provider, reject_unsupported_endpoint,
+    resolve_admitted_route, validate_account_routes, validate_post_compatibility,
+    AuthStateVerifier,
 };
 use crate::tor_setup::build_tor_settings;
 use crate::tor_watchdog::{spawn_bridge_failover_watchdog, spawn_tor_watchdog, TorHandle};
@@ -60,7 +61,7 @@ const PRODUCER_JOIN_TIMEOUT: Duration = Duration::from_secs(120);
 /// replaces Tor entirely.
 #[derive(Clone)]
 enum Egress {
-    Tor(TorHandle, Option<Arc<proxy_config::EndpointOverride>>),
+    Tor(TorHandle, Option<Arc<proxy_config::EndpointOverride>>, bool),
     Upstream(Arc<upstream::Upstream>),
 }
 
@@ -122,8 +123,13 @@ pub(crate) async fn run_server(
     // back to the legacy NO_AUTH path.
     let users_path = UsersConfig::resolve_path(config_path.as_deref());
     let users = UsersConfig::load(&users_path).context("loading users registry")?;
-    reject_unsupported_account_endpoints(&users)?;
-    validate_post_account_overrides(post_socks.is_some(), &users)?;
+    validate_account_routes(
+        &users,
+        cfg.pre_socks5.as_ref(),
+        cfg.post_socks5.as_ref(),
+        cfg.dns_server.enabled,
+        false,
+    )?;
     let auth_state = if users.users.is_empty() {
         info!(path = %users_path.display(), "no users configured — SOCKS5 will accept anonymous clients");
         None
@@ -158,6 +164,13 @@ pub(crate) async fn run_server(
     )? {
         Some(up) => {
             validate_post_compatibility(post_socks.is_some(), false, true)?;
+            validate_account_routes(
+                &users,
+                cfg.pre_socks5.as_ref(),
+                cfg.post_socks5.as_ref(),
+                false,
+                true,
+            )?;
             info!(
                 upstream = %up.address(),
                 auth = up.has_auth(),
@@ -309,7 +322,7 @@ pub(crate) async fn run_server(
                 }
             }
 
-            Egress::Tor(handle, post_socks)
+            Egress::Tor(handle, post_socks, cfg.dns_server.enabled)
         }
     };
 
@@ -319,7 +332,7 @@ pub(crate) async fn run_server(
     // ("client DNS leaves the machine only inside Tor") cannot be honoured,
     // and refusing to start beats silently leaking plaintext queries.
     if cfg.dns_server.enabled {
-        let Egress::Tor(handle, _) = &egress else {
+        let Egress::Tor(handle, _, _) = &egress else {
             bail!(
                 "dns_server.enabled requires Tor egress, not an upstream SOCKS5 proxy — \
                  disable dns_server or remove the upstream"
@@ -449,7 +462,7 @@ pub(crate) async fn run_server(
     // subprocesses and releases arti's exclusive lock on its state
     // directory. The Job Object installed at startup kills anything that
     // leaks past this point. The upstream egress holds no such resources.
-    if let Egress::Tor(handle, _) = egress {
+    if let Egress::Tor(handle, _, _) = egress {
         info!("stopping Tor client and pluggable transports");
         // Order matters: cancel first (no producer starts a new work
         // iteration), then drain the slot (in-flight tunnel reads see
@@ -611,171 +624,100 @@ async fn accept_loop(
     }
 }
 
-/// Coarse classification of a [`handle_client`] failure, so operators can
-/// tell "the client misbehaved" from "Tor is having a bad time" from
-/// "something else" without grepping the error text — see [`ConnErrorKind`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConnErrorKind {
-    /// The client side of the SOCKS5 session misbehaved or disconnected —
-    /// e.g. it dropped the TCP connection mid-handshake. Not a proxy or Tor
-    /// problem; normal for clients that churn through many parallel
-    /// connections (Telegram and similar).
-    Client,
-    /// A Tor-side failure building a circuit/stream — an
-    /// `arti_wrapper::TorError::Connect` anywhere in the error's cause
-    /// chain. Finer-grained classification (which `tor_error::ErrorKind`)
-    /// already happens in [`crate::tor_watchdog::classify_and_record`]; this
-    /// variant only answers "is this Tor's problem at all".
-    Tor,
-    /// relay-stage I/O failure. Deliberately NOT Client:
-    /// `tokio::io::copy_bidirectional` does not expose WHICH end errored, so the
-    /// client-vs-Tor direction of a mid-relay reset is indeterminate; what is
-    /// determinate is the stage, and a relay-stage reset must not inflate the
-    /// client-misbehavior count. Per-direction byte counts exist only on
-    /// success.
-    Relay,
-    /// Anything else: I/O errors unrelated to the SOCKS5 handshake, bugs,
-    /// or failures that don't fit any bucket above.
-    Other,
+use crate::startup::{
+    classify_conn_failure, STAGE_CONNECT_TOR, STAGE_CONNECT_UPSTREAM, STAGE_HANDSHAKE, STAGE_RELAY,
+};
+pub(crate) use crate::startup::{ConnErrorKind, ConnStage};
+
+// RPITIT + Send: внутренний интерфейс без динамической диспетчеризации.
+trait TorConnector {
+    fn connect<'a>(
+        &'a mut self,
+        tor: &'a TorTunnel,
+        post: Option<&'a proxy_config::EndpointOverride>,
+        host: &'a str,
+        port: u16,
+    ) -> impl std::future::Future<Output = arti_wrapper::Result<arti_wrapper::DataStream>> + Send + 'a;
 }
 
-/// Which protocol stage a connection failed at. Discriminating on stage (an
-/// internal, stable anyhow context tag — see the `STAGE_*` constants) rather
-/// than on error text lets the same I/O condition be attributed differently:
-/// a ConnectionReset during the handshake is the client's doing, while the
-/// identical reset mid-relay is reported as [`ConnStage::Relay`] so it does
-/// not inflate the client-misbehavior count.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConnStage {
-    /// SOCKS5 method negotiation / auth / CONNECT request.
-    Handshake,
-    /// Establishing the egress (Tor circuit or upstream proxy) connection.
-    Connect,
-    /// Bidirectional data transfer between client and egress.
-    Relay,
-    /// No stage context tag found in the error chain.
-    Other,
-}
+struct RealTorConnector;
 
-/// Internal, stable context tags `handle_client` attaches to each stage.
-/// Classification string-matches ONLY these — never arbitrary error message
-/// text (message text is not a stable classification key).
-const STAGE_HANDSHAKE: &str = "SOCKS5 handshake";
-const STAGE_CONNECT_TOR: &str = "tor connect";
-const STAGE_CONNECT_UPSTREAM: &str = "upstream connect";
-const STAGE_RELAY: &str = "relay";
-
-/// Classify a [`handle_client`] failure into a stage and an error kind, by
-/// the *type* of its root cause and the stage context tag in the chain,
-/// never by string-matching arbitrary rendered error message text (only the
-/// internal `STAGE_*` context tags above are matched — message text is not a
-/// stable classification key).
-///
-/// Order of checks:
-/// 1. Stage: the first chain cause matching a `STAGE_*` tag wins (relay →
-///    handshake → connect → other).
-/// 2. Kind: any `arti_wrapper::TorError::Connect` in the chain →
-///    [`ConnErrorKind::Tor`], regardless of stage (a Tor connect failure is
-///    unambiguous and takes priority over any incidental I/O wrapping).
-/// 3. Otherwise by stage: handshake → Client (everything escaping the
-///    handshake phase is client-side, including the deadline); relay →
-///    Relay when a chain cause is a client-drop-ish `io::Error`
-///    (ConnectionReset/Aborted/BrokenPipe/UnexpectedEof), else Other;
-///    connect → Other (a non-Tor connect failure is not attributable to the
-///    SOCKS client — the `connect_failed` counter carries the stage signal);
-///    other stage → Client when a chain cause is a drop-ish `io::Error`
-///    (after the stage tags the only untagged I/O escape path is the SOCKS
-///    reply writes, which are client-side), else Other.
-pub(crate) fn classify_conn_failure(err: &anyhow::Error) -> (ConnStage, ConnErrorKind) {
-    let stage = if err.chain().any(|cause| cause.to_string() == STAGE_RELAY) {
-        ConnStage::Relay
-    } else if err
-        .chain()
-        .any(|cause| cause.to_string() == STAGE_HANDSHAKE)
+impl TorConnector for RealTorConnector {
+    fn connect<'a>(
+        &'a mut self,
+        tor: &'a TorTunnel,
+        post: Option<&'a proxy_config::EndpointOverride>,
+        host: &'a str,
+        port: u16,
+    ) -> impl std::future::Future<Output = arti_wrapper::Result<arti_wrapper::DataStream>> + Send + 'a
     {
-        ConnStage::Handshake
-    } else if err.chain().any(|cause| {
-        cause.to_string() == STAGE_CONNECT_TOR || cause.to_string() == STAGE_CONNECT_UPSTREAM
-    }) {
-        ConnStage::Connect
-    } else {
-        ConnStage::Other
-    };
-
-    let is_dropish_io = err.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io_err| {
-                matches!(
-                    io_err.kind(),
-                    std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::ConnectionAborted
-                        | std::io::ErrorKind::BrokenPipe
-                        | std::io::ErrorKind::UnexpectedEof
-                )
-            })
-    });
-
-    for cause in err.chain() {
-        if let Some(tor_err) = cause.downcast_ref::<arti_wrapper::TorError>() {
-            if matches!(tor_err, arti_wrapper::TorError::Connect { .. }) {
-                return (stage, ConnErrorKind::Tor);
-            }
-        }
-    }
-
-    let kind = match stage {
-        ConnStage::Handshake => ConnErrorKind::Client,
-        ConnStage::Relay => {
-            if is_dropish_io {
-                ConnErrorKind::Relay
-            } else {
-                ConnErrorKind::Other
-            }
-        }
-        ConnStage::Connect => ConnErrorKind::Other,
-        ConnStage::Other => {
-            if is_dropish_io {
-                ConnErrorKind::Client
-            } else {
-                ConnErrorKind::Other
-            }
-        }
-    };
-    (stage, kind)
-}
-
-/// Adapter from the app's [`AuthState`] user store to the protocol
-/// crate's `PasswordVerifier` port. The impl lives here — the only
-/// crate that sees both types — `auth` never depends on `socks5-proto`.
-struct AuthStateVerifier(Arc<AuthState>);
-
-impl socks5_proto::PasswordVerifier for AuthStateVerifier {
-    fn verify(&self, username: &str, password: &str) -> bool {
-        self.0.verify(username, password)
+        connect_tor_route(tor, post, host, port)
     }
 }
 
 /// cancel-safe: NO — partial protocol replies/prefix writes/relay are terminal;
 /// dropping this handler closes its owned client and egress, with no replay.
 async fn handle_client(
-    mut client: TcpStream,
+    client: TcpStream,
     egress: Egress,
     auth: Option<Arc<AuthState>>,
     conn_health: ConnHealthCounters,
     block_onion: bool,
     conn_id: u64,
 ) -> Result<()> {
+    handle_client_with_connector(
+        client,
+        egress,
+        auth,
+        conn_health,
+        block_onion,
+        conn_id,
+        RealTorConnector,
+    )
+    .await
+}
+
+/// cancel-safe: NO — частичный ответ или relay терминальны; отмена закрывает поток.
+async fn handle_client_with_connector<C: TorConnector + Send>(
+    mut client: TcpStream,
+    egress: Egress,
+    auth: Option<Arc<AuthState>>,
+    conn_health: ConnHealthCounters,
+    block_onion: bool,
+    conn_id: u64,
+    mut connector: C,
+) -> Result<()> {
     let started_at = std::time::Instant::now();
     // Absolute deadline for the whole handshake chain — armed once here and
     // never renewed per read.
     let deadline = tokio::time::Instant::now() + HANDSHAKE_DEADLINE;
-    let proto_auth: Option<Arc<dyn socks5_proto::PasswordVerifier>> = auth
-        .clone()
-        .map(|state| Arc::new(AuthStateVerifier(state)) as Arc<dyn socks5_proto::PasswordVerifier>);
-    let mut req = socks5_proto::accept(&mut client, deadline, proto_auth)
+    let proto_auth = auth.clone().map(|state| Arc::new(AuthStateVerifier(state)));
+    let (mut req, proof) = socks5_proto::accept_verified(&mut client, deadline, proto_auth)
         .await
-        .context(STAGE_HANDSHAKE)?;
+        .map_err(|error| match error {
+            socks5_proto::VerifiedError::Handshake(error) => anyhow::Error::new(error),
+            other => anyhow::Error::new(other),
+        })
+        .context(STAGE_HANDSHAKE)?
+        .into_parts();
+    let lease = match (auth.as_ref(), proof.as_ref()) {
+        (Some(state), Some(proof)) => match tokio::time::timeout_at(deadline, state.admit(proof))
+            .await
+            .map_err(|_| anyhow::Error::new(resocks5_net::server::ServerError::Deadline))
+            .context(STAGE_HANDSHAKE)?
+        {
+            Some(lease) => Some(lease),
+            None => {
+                req.reply(&mut client, Reply::Forbidden).await.ok();
+                return Ok(());
+            }
+        },
+        (None, None) => None,
+        _ => {
+            req.reply(&mut client, Reply::Forbidden).await.ok();
+            return Ok(());
+        }
+    };
     // Consume the SDK-owned prefix once. A partial write is terminal: never replay.
     let pipeline = req.take_pipeline();
     let HostPort { host, port } = HostPort::parse(req.target())
@@ -786,46 +728,43 @@ async fn handle_client(
     // useful for CLI deployments that grant onion access selectively.
     if block_onion && socks5_proto::is_onion(host) {
         warn!(host = %host, "refused .onion connection: blocked by security.block_onion");
+        drop(lease);
         req.reply(&mut client, Reply::Forbidden).await.ok();
         return Ok(());
     }
 
-    // Per-account onion gate: a `.onion` destination is allowed only
-    // when the authenticated account carries `allowed_onion`. Anonymous
-    // (NO_AUTH) clients are unrestricted — there is no account to gate
-    // on, and the operator deliberately ran without auth.
-    if socks5_proto::is_onion(host) && !onion_permitted(auth.as_deref(), req.username()) {
-        warn!(
-            host = %host,
-            user = ?req.username(),
-            "refused .onion connection: account not permitted (allowed_onion = false)"
-        );
+    // Политика и маршрут берутся только из допущенного снимка.
+    if socks5_proto::is_onion(host) && lease.as_ref().is_some_and(|lease| !lease.allowed_onion()) {
+        drop(lease);
         req.reply(&mut client, Reply::Forbidden).await.ok();
         return Ok(());
     }
-
-    // Per-user client ACL (allowed_clients учётки): после успешного
-    // handshake личность уже проверена — берём имя из запроса, а не из
-    // сырого ProxyAuthorization. Peer — реальный адрес принятого сокета.
-    // Auth выключен — ACL не применяется; активирован, но имя отсутствует —
-    // fail-closed. Отказ до любого egress, relay-задач не порождаем.
     let peer_ip = client.peer_addr().ok().map(|addr| addr.ip());
-    let user_allowed = match (auth.as_ref(), req.username(), peer_ip) {
-        (Some(state), Some(name), Some(peer)) => state.client_allowed(name, peer),
-        (Some(_), _, _) => false,
-        (None, _, _) => true,
+    let user_allowed = match lease.as_ref().and_then(|lease| lease.allowed_clients()) {
+        Some(acl) => peer_ip.is_some_and(|ip| acl.allows(ip)),
+        None => true,
     };
     if !user_allowed {
-        warn!(
-            peer = ?peer_ip,
-            "refused connection: user's allowed_clients policy denies this source"
-        );
+        drop(lease);
         req.reply(&mut client, Reply::Forbidden).await.ok();
         return Ok(());
     }
+    let (global_post, dns, upstream) = match &egress {
+        Egress::Tor(_, post, dns) => (post.as_deref(), *dns, false),
+        Egress::Upstream(_) => (None, false, true),
+    };
+    let post = match resolve_admitted_route(global_post, lease.as_ref(), dns, upstream) {
+        Ok(post) => post,
+        Err(error) => {
+            drop(lease);
+            warn!(%error, "account route rejected");
+            req.reply(&mut client, Reply::Forbidden).await.ok();
+            return Ok(());
+        }
+    };
 
     match egress {
-        Egress::Tor(handle, post_socks) => {
+        Egress::Tor(handle, _, _) => {
             handle.bridge_refresh().request();
             info!(host = ?host, port = port, "tunneling through Tor");
             // Read the *current* tunnel through the handle: a watchdog
@@ -835,6 +774,7 @@ async fn handle_client(
             let tor = match handle.tunnel().await {
                 Some(t) => t,
                 None => {
+                    drop(lease);
                     req.reply(&mut client, Reply::GeneralFailure).await.ok();
                     conn_health.record_connect_failed();
                     return Err(anyhow!("tor tunnel unavailable (shutting down?)")
@@ -845,11 +785,12 @@ async fn handle_client(
             // tell "no traffic" from "circuits failing"), a success stamps
             // the last-good time it compares against.
             handle.health().record_attempt();
-            let tor_stream = match handle
+            let tor_result = handle
                 .bridge_refresh()
-                .track_connection(connect_tor_route(&tor, post_socks.as_deref(), host, port))
-                .await
-            {
+                .track_connection(connector.connect(&tor, post.as_ref(), host, port))
+                .await;
+            drop(lease);
+            let tor_stream = match tor_result {
                 Ok(s) => {
                     handle.health().record_success();
                     handle.health().record_success_target(host, port);
@@ -899,7 +840,9 @@ async fn handle_client(
         }
         Egress::Upstream(up) => {
             info!(host = ?host, port = port, "forwarding through upstream SOCKS5");
-            let mut upstream_stream = match up.connect(host, port).await {
+            let upstream_result = up.connect(host, port).await;
+            drop(lease);
+            let mut upstream_stream = match upstream_result {
                 Ok(s) => {
                     // Успешный upstream-connect: счётчик до Established — как в Tor-ветке.
                     conn_health.record_connect_ok();
@@ -939,22 +882,6 @@ async fn handle_client(
     Ok(())
 }
 
-/// Decide whether a `.onion` connection is allowed for this request.
-///
-/// * No authenticator (anonymous proxy) → allowed: there is no account
-///   to gate on.
-/// * Authenticated → allowed iff the named account carries
-///   `allowed_onion` (and is still enabled).
-/// * Auth required but no account on the request (should not happen for
-///   a completed handshake) → denied, fail-closed.
-fn onion_permitted(auth: Option<&AuthState>, authed_user: Option<&str>) -> bool {
-    match (auth, authed_user) {
-        (None, _) => true,
-        (Some(state), Some(name)) => state.allowed_onion(name),
-        (Some(_), None) => false,
-    }
-}
-
 /// How many working bridges we are short of, accounting for *both* layers
 /// of bridge health: TCP reachability and circuit-layer usability.
 ///
@@ -986,3 +913,6 @@ mod acl_tests;
 #[cfg(test)]
 #[path = "listen/server_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+use crate::startup::onion_permitted;

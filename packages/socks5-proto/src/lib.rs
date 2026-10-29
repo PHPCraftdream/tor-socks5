@@ -5,6 +5,10 @@
 
 /// SOCKS5 CONNECT-клиент для исходящих соединений.
 pub mod client;
+mod verified;
+pub use verified::{accept_verified, ProofVerifier, VerifiedError, VerifiedRequest};
+#[cfg(test)]
+mod verified_tests;
 
 use std::sync::{Arc, OnceLock};
 
