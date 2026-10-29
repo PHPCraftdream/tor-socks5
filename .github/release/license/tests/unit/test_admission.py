@@ -22,6 +22,24 @@ class AdmissionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             admission.cargo(data[:-1], '/tmp/proxy')
 
+    def test_cargo_rejects_verbose_stdout_and_invalid_streams(self):
+        b = admission.bundle
+        artifact = b.encoded({'reason': 'compiler-artifact',
+                              'package_id': 'path+file:///work/apps/socks5-proxy#0.2.0',
+                              'target': {'name': 'socks5-proxy'}, 'executable': '/tmp/proxy'})
+        finished = b.encoded({'reason': 'build-finished', 'success': True})
+        admission.cargo(artifact + finished, '/tmp/proxy')
+        # Строка stdout из фактического журнала CI не является JSON.
+        verbose = b'[proc-macro2 1.0.106] cargo:rustc-check-cfg=cfg(fuzzing)\n'
+        invalid = (artifact + verbose + finished, artifact + b'{\n' + finished,
+                   (artifact + finished)[:-1], artifact + finished + artifact,
+                   artifact + b.encoded({'reason': 'build-finished', 'success': False}))
+        for data in invalid:
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                admission.cargo(data, '/tmp/proxy')
+        with self.assertRaises(ValueError):
+            admission.cargo(artifact + finished, '/tmp/other')
+
     def test_expanded_source_checks(self):
         b = admission.bundle
         with tempfile.TemporaryDirectory() as temp:

@@ -814,11 +814,11 @@ class ReleaseWorkflowWiring(unittest.TestCase):
             ('macos-15', 'aarch64-apple-darwin')])
         self._contains_line(build, 'runs-on: ${{ matrix.runner }}')
         for needle in ('admission.py snapshot --prepared target/license-prepared',
-                       'cargo build -vv --locked --offline --release -p socks5-proxy --target "$TARGET"',
+                       'cargo build --locked --offline --release -p socks5-proxy --target "$TARGET"',
                        'admission.py record --prepared target/license-prepared'):
             self.assertIn(needle, build)
         snapshot = build.index('admission.py snapshot --prepared target/license-prepared')
-        compile_at = build.index('cargo build -vv --locked --offline --release -p socks5-proxy --target "$TARGET"')
+        compile_at = build.index('cargo build --locked --offline --release -p socks5-proxy --target "$TARGET"')
         record = build.index('admission.py record --prepared target/license-prepared')
         self.assertLess(snapshot, compile_at)
         self.assertLess(compile_at, record)

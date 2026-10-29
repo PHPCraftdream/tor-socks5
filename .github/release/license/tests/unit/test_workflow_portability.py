@@ -16,6 +16,12 @@ FETCH = 'Fetch and capture source before build'
 RECORD = 'Snapshot receipt and compare sources after build'
 
 
+def selected_bash(value):
+    if not value or not Path(value).is_absolute() or not Path(value).is_file():
+        raise ValueError('LICENSE_TEST_BASH должен указывать на абсолютный путь к файлу Bash')
+    return value
+
+
 def extract(text, name):
     jobs = re.split(r'(?m)^  ([\w-]+):\s*$', text.split('jobs:\n', 1)[1])
     build = dict(zip(jobs[1::2], jobs[2::2]))['build']
@@ -62,7 +68,41 @@ class WorkflowPortability(unittest.TestCase):
                 self.check_pattern(self.text.replace(script.replace('\n', '\n          ').rstrip(),
                                                      mutated.replace('\n', '\n          ').rstrip(), 1))
 
+    def check_build_command(self, text):
+        script = extract(text, 'Build release and collect evidence')
+        lines = [line for line in script.splitlines() if re.match(r'^\s*cargo\s+build\b', line)]
+        self.assertEqual(len(lines), 1)
+        self.assertNotRegex(lines[0], r'(?:^|\s)(?:-v+|--verbose)(?:\s|$)')
+        self.assertEqual(lines[0], 'cargo build --locked --offline --release -p socks5-proxy --target "$TARGET" '
+                         '--message-format=json-render-diagnostics > target/license-logs/build-messages.jsonl '
+                         '2> target/license-logs/build-stderr.txt')
+
+    def test_build_command_and_verbose_mutations(self):
+        self.check_build_command(self.text)
+        for flag in ('-v', '-vv', '--verbose'):
+            mutated = self.text.replace('cargo build --locked', 'cargo build ' + flag + ' --locked', 1)
+            self.assertNotEqual(mutated, self.text)
+            with self.subTest(flag=flag), self.assertRaises(AssertionError):
+                self.check_build_command(mutated)
+
+    def test_bash_path_contract(self):
+        for value in (None, '', 'bash', 'relative/bash', str(WORKFLOW / 'missing-bash')):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                selected_bash(value)
+
     def test_real_scripts_with_transport(self):
+        bash = selected_bash(os.environ.get('LICENSE_TEST_BASH'))
+        smoke = subprocess.run([bash, '--noprofile', '--norc', '-c',
+                                'p="$BASH"; if command -v cygpath >/dev/null 2>&1; '
+                                'then p="$(cygpath -w "$p")"; fi; '
+                                'printf "LICENSE_BASH_ID\\n%s\\n" "$p"'],
+                               capture_output=True)
+        diagnostic = f'exe={bash!r} stdout={smoke.stdout[:4096]!r} stderr={smoke.stderr[:4096]!r}'
+        self.assertEqual(smoke.returncode, 0, diagnostic)
+        lines = smoke.stdout.splitlines()
+        self.assertEqual(len(lines), 2, diagnostic)
+        self.assertEqual(lines[0], b'LICENSE_BASH_ID', diagnostic)
+        self.assertTrue(os.path.samefile(bash, os.fsdecode(lines[1])), diagnostic)
         # Подменяются только внешние команды; проектные валидаторы не запускаются.
         for name in (FETCH, RECORD):
             for present in (False, True):
@@ -103,22 +143,29 @@ class WorkflowPortability(unittest.TestCase):
                                TARGET=target, RUNNER_OS='Linux')
                     script = extract(self.text, name).encode('utf-8')
                     self.assertNotIn(b'\r', script)
-                    result = subprocess.run(['bash'], input=script,
+                    result = subprocess.run([bash], input=script,
                                             cwd=data, env=env, capture_output=True)
-                    self.assertEqual(result.returncode, 0, result.stderr)
+                    logged = None
+                    if log.is_file():
+                        with log.open('rb') as stream:
+                            logged = stream.read(4096)
+                    diagnostic = (f'exe={bash!r} stdout={result.stdout[:4096]!r} '
+                                  f'stderr={result.stderr[:4096]!r} argv={logged!r}')
+                    self.assertEqual(result.returncode, 0, diagnostic)
+                    self.assertTrue(log.is_file(), diagnostic)
                     calls = [json.loads(line) for line in log.read_text(encoding='utf-8').splitlines()]
-                    self.assertEqual(len(calls), 3 if name == FETCH else 1)
-                    self.assertTrue(all('' not in call for call in calls))
+                    self.assertEqual(len(calls), 3 if name == FETCH else 1, diagnostic)
+                    self.assertTrue(all('' not in call for call in calls), diagnostic)
                     call = calls[1] if name == FETCH else calls[0]
                     self.assertEqual(call[:4], ['python', '-I',
                         '.github/release/license/bundle.py' if name == FETCH else '.github/release/license/admission.py',
-                        'prepare' if name == FETCH else 'record'])
+                        'prepare' if name == FETCH else 'record'], diagnostic)
                     flag = '--reviews' if name == FETCH else '--review'
                     expected = '.github/release/license/reviews/' + ('components.json' if name == FETCH else target + '.json')
-                    self.assertEqual(call.count(flag), int(present))
+                    self.assertEqual(call.count(flag), int(present), diagnostic)
                     if present:
-                        self.assertEqual(call[-2:], [flag, expected])
-                    self.assertNotIn('--review' if name == FETCH else '--reviews', call)
+                        self.assertEqual(call[-2:], [flag, expected], diagnostic)
+                    self.assertNotIn('--review' if name == FETCH else '--reviews', call, diagnostic)
 
 
 if __name__ == '__main__':

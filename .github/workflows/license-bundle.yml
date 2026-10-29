@@ -40,6 +40,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          bash_path="$BASH"
+          if command -v cygpath >/dev/null 2>&1; then bash_path="$(cygpath -w "$BASH")"; fi
+          export LICENSE_TEST_BASH="$bash_path"
           python3 -I .github/release/license/tests/unit/test_bundle.py
           python3 -I .github/release/license/tests/unit/test_admission.py
           python3 -I .github/release/license/tests/unit/test_publish_bundle.py
@@ -87,7 +90,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install --yes musl-tools
       - name: Test workflow Bash portability
         shell: bash
-        run: python3 -I .github/release/license/tests/unit/test_workflow_portability.py
+        run: |
+          set -euo pipefail
+          bash_path="$BASH"
+          if command -v cygpath >/dev/null 2>&1; then bash_path="$(cygpath -w "$BASH")"; fi
+          LICENSE_TEST_BASH="$bash_path" python3 -I .github/release/license/tests/unit/test_workflow_portability.py
       - name: Fetch and capture source before build
         shell: bash
         run: |
@@ -106,7 +113,7 @@ jobs:
           set -euo pipefail
           rustc -vV > target/license-logs/toolchain.txt
           cargo tree --locked --offline -p socks5-proxy --target "$TARGET" -e features > target/license-logs/features.txt
-          cargo build -vv --locked --offline --release -p socks5-proxy --target "$TARGET" --message-format=json-render-diagnostics > target/license-logs/build-messages.jsonl 2> target/license-logs/build-stderr.txt
+          cargo build --locked --offline --release -p socks5-proxy --target "$TARGET" --message-format=json-render-diagnostics > target/license-logs/build-messages.jsonl 2> target/license-logs/build-stderr.txt
       - name: Capture native outputs and linkage observations
         if: always()
         shell: bash
