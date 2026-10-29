@@ -3,7 +3,7 @@
 Дата: 2026-10-29. Вход — `target/license-evidence-40856561166/evidence.zip`. Python 3.11+; из корня worktree:
 
 ```console
-python -I docs/project/license-evidence-40856561166-compare.py target/license-evidence-40856561166/evidence.zip
+python -I docs/project/license/license-evidence-40856561166-compare.py target/license-evidence-40856561166/evidence.zip
 ```
 
 Отдельный скрипт находится вне данных evidence, читает ZIP и выбранные gzip/tar-члены только в память, не извлекает их на диск и не исполняет код пакетов. Он требует уникальных записей ZIP, lock, manifest и выбранных tar-членов, проверяет идентичность name/version/source, checksum и непосредственное равенство байтов; при несовпадении завершается ошибкой. Пути `archives/` и `files/` ниже — члены ZIP; пути членов crate — внутри tar, не файлы worktree. Все отпечатки — SHA-256.
