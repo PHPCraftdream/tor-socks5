@@ -77,6 +77,15 @@ fn socks5_config_omitted_disabled_and_endpoint_roundtrip() {
         ktav::from_str::<Config>("listen: 127.0.0.1:1080\npre_socks5: 192.0.2.4:1080|alice\n")
             .is_err()
     );
+    let pre_only: Config = ktav::from_str("listen: 127.0.0.1:1080\npre_socks5: 192.0.2.8:1080\n")
+        .expect("pre endpoint parses without post endpoint");
+    assert!(pre_only.pre_socks5.is_some());
+    assert!(pre_only.post_socks5.is_none());
+    let post_only: Config =
+        ktav::from_str("listen: 127.0.0.1:1080\npost_socks5:: [2001:db8::8]:1088\n")
+            .expect("post endpoint parses without pre endpoint");
+    assert!(post_only.pre_socks5.is_none());
+    assert!(post_only.post_socks5.is_some());
 
     let independent: Config = ktav::from_str(
         "listen: 127.0.0.1:1080\npre_socks5: 192.0.2.4:1080|alice:pre-secret\npost_socks5:: [2001:db8::2]:1082|bob:post-secret\n",
@@ -86,6 +95,20 @@ fn socks5_config_omitted_disabled_and_endpoint_roundtrip() {
     let loaded: Config = ktav::from_str(&saved).expect("roundtrip");
     assert_eq!(loaded.pre_socks5, independent.pre_socks5);
     assert_eq!(loaded.post_socks5, independent.post_socks5);
+    assert_eq!(
+        client_acl::resolve_endpoint(independent.pre_socks5.as_ref(), None)
+            .unwrap()
+            .address()
+            .to_string(),
+        "192.0.2.4:1080"
+    );
+    assert_eq!(
+        client_acl::resolve_endpoint(independent.post_socks5.as_ref(), None)
+            .unwrap()
+            .address()
+            .to_string(),
+        "[2001:db8::2]:1082"
+    );
     let debug = format!("{independent:?}");
     for secret in ["alice", "pre-secret", "bob", "post-secret"] {
         assert!(!debug.contains(secret), "Debug leaked {secret}");
