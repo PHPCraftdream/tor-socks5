@@ -558,11 +558,13 @@ pub fn spawn_tor_watchdog(
             if new_attempts < MIN_ATTEMPTS_TO_TRIGGER {
                 continue;
             }
-            // Condition 3: at least one bridge is proven reachable per the last
-            // probe round (answered a probe, no failure since, not retired), so
-            // this is a circuit/channel problem, not the bridge-maintenance
-            // loop's "bridges are genuinely down" case.
-            let alive = live_bridge_count(config_path.as_deref());
+            // Канал pre может быть повторно использован и не доказывает свежую достижимость.
+            // Его наличие лишь разрешает попытку сброса при остальных условиях.
+            let Some(tor) = handle.tunnel().await else {
+                continue;
+            };
+            let alive =
+                route_bridge_count(&tor, &handle.active_bridges(), config_path.as_deref()).await;
             if alive == 0 {
                 continue;
             }
@@ -725,6 +727,11 @@ pub(super) enum HealResult {
     TerminateFailed(anyhow::Error),
 }
 
+#[cfg(test)]
+pub(crate) async fn test_heal(tor: &TorTunnel) -> bool {
+    matches!(heal(tor, None).await, HealResult::Healed)
+}
+
 /// Terminate every channel the live `tor` client's `ChanMgr` currently
 /// tracks, then judge whether the client actually recovers.
 ///
@@ -745,10 +752,23 @@ pub(super) enum HealResult {
 /// driven backoff exactly as before, just without a client to construct and
 /// dispose of on every tick.
 pub(super) async fn heal(tor: &TorTunnel, canary_target: Option<(String, u16)>) -> HealResult {
-    if let Err(e) = tor.terminate_all_channels() {
-        return HealResult::TerminateFailed(anyhow::Error::new(e));
+    heal_with(
+        || tor.terminate_all_channels().map_err(anyhow::Error::new),
+        || verify_usable(tor, canary_target),
+    )
+    .await
+}
+
+pub(super) async fn heal_with<F, V, Fut>(terminate: F, verify: V) -> HealResult
+where
+    F: FnOnce() -> anyhow::Result<()>,
+    V: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    if let Err(error) = terminate() {
+        return HealResult::TerminateFailed(error);
     }
-    if verify_usable(tor, canary_target).await {
+    if verify().await {
         HealResult::Healed
     } else {
         HealResult::StillUnhealthy
@@ -771,6 +791,24 @@ pub(super) async fn verify_usable(tor: &TorTunnel, target: Option<(String, u16)>
         .await
         .map(|r| r.is_ok())
         .unwrap_or(false)
+}
+
+pub(crate) async fn route_bridge_count(
+    tor: &TorTunnel,
+    bridges: &[BridgeLine],
+    path: Option<&Path>,
+) -> usize {
+    match tor.configured_pre_endpoint() {
+        Some(Some(_)) => {
+            for bridge in bridges.iter().take(8) {
+                if crate::bridge_maintenance::pre_channel_ready(tor, bridge).await {
+                    return 1;
+                }
+            }
+            0
+        }
+        Some(None) | None => live_bridge_count(path),
+    }
 }
 
 /// Number of bridges with proven reachability (`BridgeStore::alive_count`:

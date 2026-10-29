@@ -10,7 +10,21 @@ pub(super) fn launch(
     producers: &mut Vec<tokio::task::JoinHandle<()>>,
 ) {
     if settings.pre_endpoint.is_some() {
-        warn!("global pre_socks5: bridge refresh, PT, probes, verifier, warmer and watchdogs are unsupported or disabled until restart");
+        warn!("global pre_socks5: warmer, verifier, discovery and soft failover remain disabled");
+        producers.push(crate::bridge_maintenance::spawn(
+            handle.clone(),
+            config_path.clone(),
+            cfg.bridges.recheck_interval_mins,
+            obs_sink,
+            settings,
+            producer_token.clone(),
+        ));
+        producers.extend(spawn_tor_watchdog(
+            handle,
+            config_path,
+            cfg.watchdog,
+            producer_token,
+        ));
     } else {
         // Periodic upkeep: re-probe, prune dead bridges, top up when short,
         // drain circuit-layer observations from arti's tracing into the

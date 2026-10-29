@@ -39,6 +39,46 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
+  real-tor-channel:
+    name: Изолированный канал Tor
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-local-sdk
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Собрать тест и закреплённый инструмент Tor
+        id: real-build
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          work=$(mktemp -d "$GITHUB_WORKSPACE/target/real-tor-source.XXXXXXXX")
+          curl --fail --location --silent --show-error https://dist.torproject.org/tor-0.4.9.15.tar.gz -o "$work/tor.tar.gz"
+          echo "1911f5b216a6814ed143a08bbcff1c6dc96d2ca3b505df9a21876080a92963f3  $work/tor.tar.gz" | sha256sum -c -
+          tar -xzf "$work/tor.tar.gz" -C "$work"
+          cd "$work/tor-0.4.9.15"
+          ./configure --disable-asciidoc --disable-manpage
+          make -j2
+          cd "$GITHUB_WORKSPACE"
+          cargo test -p socks5-proxy --bin socks5-proxy --locked --no-run --message-format=json > "$work/artifacts.json"
+          python3 -I -c 'import json,sys; p=sys.argv[1]; a=[x["executable"] for l in open(p) if (x:=json.loads(l)).get("reason")=="compiler-artifact" and x.get("target",{}).get("name")=="socks5-proxy" and x.get("profile",{}).get("test") and x.get("executable")]; assert len(a)==1, a; open(sys.argv[2], "w").write(a[0])' "$work/artifacts.json" "$work/test-path"
+          echo "tor=$work/tor-0.4.9.15/src/app/tor" >> "$GITHUB_OUTPUT"
+          echo "test=$(<"$work/test-path")" >> "$GITHUB_OUTPUT"
+      - name: Проверить в сетевом пространстве без внешних интерфейсов
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v unshare
+          command -v ip
+          sudo unshare --net -- timeout --signal=TERM --kill-after=15s 10m env GITHUB_ACTIONS=true TOR_REAL_ISOLATED=yes TOR_REAL_BINARY="${{ steps.real-build.outputs.tor }}" TOR_REAL_TEST_BINARY="${{ steps.real-build.outputs.test }}" bash scripts/testing/real-tor-channel.sh
+      - name: Проверить отрицательные мутации в изоляции
+        shell: bash
+        env:
+          TOR_REAL_BINARY: ${{ steps.real-build.outputs.tor }}
+        run: bash scripts/testing/real-tor-mutations.sh
+
   plan:
     name: Plan (tier selection)
     runs-on: ubuntu-latest

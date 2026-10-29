@@ -273,6 +273,50 @@ mod tests {
     impl std::error::Error for First {}
     impl std::error::Error for Second {}
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pre_launch_cancellation_retains_parked_maintenance_until_join() {
+        use crate::test_seams::{ParkedGate, Site, HANG_GUARD};
+        let _serial = super::super::owners::TEST_LIFECYCLE.lock().await;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.ktav");
+        let mut cfg = crate::config::Config::default();
+        cfg.bridges.use_seeds = false;
+        cfg.bridges.auto_fetch = false;
+        cfg.bridges.lines = vec!["8.8.8.8:443 1111111111111111111111111111111111111111".into()];
+        cfg.pre_socks5 = Some(proxy_config::EndpointOverride::Endpoint(
+            "127.0.0.1:1080".parse().unwrap(),
+        ));
+        cfg.write(&path).unwrap();
+        let settings = crate::tor_setup::build_tor_settings(&cfg, Some(&path))
+            .await
+            .unwrap();
+        let tunnel = arti_wrapper::TorTunnel::create_unbootstrapped_with(settings.clone()).unwrap();
+        let gate = ParkedGate::arm(Site::MaintenanceConfigLoad, &path);
+        let owner = ProducerTasks::retain().unwrap();
+        let mut launch = LaunchGuard::new(owner.clone());
+        super::super::bridge_producers::launch(
+            crate::tor_watchdog::TorHandle::new(tunnel),
+            Some(path),
+            &cfg,
+            crate::arti_observability::ObservationSink::new(),
+            settings,
+            owner.token(),
+            &mut launch.handles,
+        );
+        launch.commit();
+        let waiter = gate.clone();
+        tokio::task::spawn_blocking(move || waiter.wait_parked(HANG_GUARD))
+            .await
+            .unwrap();
+        owner.cancel();
+        assert!(owner.join(Duration::ZERO).await.is_err());
+        assert!(owner.has_retained_handle().await);
+        gate.release();
+        owner.join(Duration::from_secs(10)).await.unwrap();
+        assert!(!owner.has_retained_handle().await);
+    }
+
     #[tokio::test]
     async fn cancelled_join_preserves_outer_and_distinct_child_failures() {
         use std::error::Error as _;

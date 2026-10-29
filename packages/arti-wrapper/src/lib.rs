@@ -12,11 +12,15 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use arti_client::config::pt::TransportConfigBuilder;
-use arti_client::config::{BridgeConfigBuilder, CfgPath, Reconfigure, TorClientConfigBuilder};
+/// Конструктор цели моста для доступа к менеджеру каналов Arti.
+pub use arti_client::config::BridgeConfigBuilder;
+use arti_client::config::{CfgPath, Reconfigure, TorClientConfigBuilder};
 /// Поток данных, открытый через Tor.
 pub use arti_client::DataStream;
 use arti_client::{TorClient, TorClientConfig};
 use bridge_line::BridgeLine;
+/// Назначение канала при запросе к менеджеру Arti.
+pub use tor_chanmgr::ChannelUsage;
 use tor_linkspec::HasChanMethod;
 use tor_rtcompat::PreferredRuntime;
 
@@ -523,6 +527,7 @@ impl TorTunnel {
     pub fn terminate_all_channels(&self) -> Result<()> {
         let chanmgr = self.inner.chanmgr().map_err(TorError::ChanMgrUnavailable)?;
         chanmgr.terminate_all_channels();
+        tracing::debug!(target: "arti_wrapper::channel_reset", "вызвано завершение каналов");
         Ok(())
     }
 
@@ -682,6 +687,11 @@ impl TorTunnel {
     /// dropped explicitly afterward.
     pub async fn wait_bootstrapped(&self) -> Result<()> {
         self.inner.bootstrap().await.map_err(TorError::Bootstrap)
+    }
+
+    /// Маршрут, закреплённый за клиентом при создании из настроек; внешний `None` означает raw-конфигурацию.
+    pub fn configured_pre_endpoint(&self) -> Option<Option<&Socks5PreEndpoint>> {
+        self.pre_endpoint.as_ref().map(Option::as_ref)
     }
 
     /// Apply updated settings before bootstrap starts. The channel manager may already have
