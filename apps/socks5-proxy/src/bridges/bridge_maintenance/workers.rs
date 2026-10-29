@@ -1,5 +1,4 @@
 use std::sync::{Arc, LazyLock, Mutex};
-use tracing::warn;
 
 // Неполученные ошибки занимают ячейки до терминального join.
 const BLOCKING_WORKER_LIMIT: usize = 64;
@@ -22,12 +21,16 @@ impl WorkerFailures {
 }
 impl std::fmt::Display for WorkerFailures {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "verifier blocking workers failed ({})", self.0.len())
+        write!(
+            f,
+            "verifier blocking workers failed ({})",
+            self.errors().len()
+        )
     }
 }
 impl std::error::Error for WorkerFailures {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.0.first().map(|error| error.as_ref())
+        self.errors().first().map(|error| error.as_ref())
     }
 }
 #[derive(Default)]
@@ -191,7 +194,9 @@ impl WorkerRegistry {
         if errors.is_empty() {
             Ok(())
         } else {
-            Err(anyhow::Error::new(WorkerFailures(errors)))
+            Err(anyhow::Error::new(crate::bridge_verifier::WorkerFailures(
+                errors,
+            )))
         }
     }
     async fn run<T: Send + 'static>(
@@ -429,7 +434,7 @@ impl AdmissionWorkers {
         let worker = tokio::spawn(async move {
             match handle.await {
                 Ok(Ok(_)) => {}
-                Ok(Err(error)) => warn!(%error, "circuit-verify: admission worker failed"),
+                Ok(Err(error)) => tracing::warn!(%error, "circuit-verify: admission worker failed"),
                 Err(error) => panic!("admission worker failed: {error}"),
             }
         });

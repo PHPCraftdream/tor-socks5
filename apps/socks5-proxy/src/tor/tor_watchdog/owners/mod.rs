@@ -53,6 +53,10 @@ struct State {
     entries: Vec<Arc<Entry>>,
 }
 
+#[cfg(test)]
+type BootstrapHook =
+    Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
+
 pub(super) struct OwnerRegistry {
     global_pre: Option<Socks5PreEndpoint>,
     global: TorHandle,
@@ -63,13 +67,7 @@ pub(super) struct OwnerRegistry {
     #[cfg(test)]
     storage_quarantine: Arc<std::sync::Mutex<Vec<std::fs::File>>>,
     #[cfg(test)]
-    bootstrap_hook: Option<
-        Arc<
-            dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
-                + Send
-                + Sync,
-        >,
-    >,
+    bootstrap_hook: Option<BootstrapHook>,
 }
 
 pub(super) struct Owner {
@@ -79,6 +77,7 @@ pub(super) struct Owner {
 }
 
 impl OwnerRegistry {
+    #[cfg(test)]
     pub(super) fn new(global: TorHandle, settings: Settings) -> Result<Self> {
         let global_pre = settings.pre_endpoint.clone();
         Self::new_with_template(global, global_pre, Ok(settings))

@@ -7,6 +7,7 @@ use anyhow::{anyhow, bail, Result};
 
 const LIMIT: usize = 15;
 const MARKER: &[u8] = b"tor-socks5 owners-v1\n";
+#[cfg(not(test))]
 static QUARANTINE: Mutex<Vec<File>> = Mutex::new(Vec::new());
 
 pub(super) struct Storage {
@@ -40,6 +41,7 @@ fn require_directory(path: &Path) -> Result<()> {
 /// `base` и пространство owners-v1 должны управляться администратором и быть
 /// недоступны для записи клиентам и недоверенным локальным пользователям.
 /// Проверки путей не атомарны и не защищают от конкурентной подмены файлов.
+#[cfg(not(test))]
 pub(super) fn acquire(base: &Path) -> Result<Storage> {
     acquire_with_quarantine(base, &QUARANTINE)
 }

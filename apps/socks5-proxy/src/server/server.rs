@@ -442,22 +442,23 @@ pub(crate) async fn run_server(
     use futures::StreamExt;
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     // Shared across all listeners so log-correlation conn_ids stay unique.
-    let next_conn_id = Arc::new(AtomicU64::new(1));
+    let tracking = handlers::ConnectionTracking {
+        conn_health,
+        next_conn_id: Arc::new(AtomicU64::new(1)),
+    };
     let handlers = Arc::new(handlers::HandlerTasks::new());
     handlers.retain()?;
     let _handler_guard = HandlerRunGuard(handlers.clone());
     let mut handler_reap = tokio::time::interval(Duration::from_secs(1));
     let mut accept_loops = futures::stream::FuturesUnordered::new();
     for listener in listeners {
-        accept_loops.push(handlers::accept_loop_tracked(
+        accept_loops.push(handlers.clone().accept_loop_tracked(
             listener,
             egress.clone(),
             auth_state.clone(),
             permits.clone(),
-            conn_health.clone(),
-            next_conn_id.clone(),
+            tracking.clone(),
             cfg.security.clone(),
-            handlers.clone(),
         ));
     }
     let mut retries = retry_addresses
@@ -478,15 +479,13 @@ pub(crate) async fn run_server(
             recovered = retries.next(), if !retries.is_empty() => {
                 if let Some((address, listener)) = recovered {
                     info!(listen_addr = %address, "SOCKS5 proxy listener recovered");
-                    accept_loops.push(handlers::accept_loop_tracked(
+                    accept_loops.push(handlers.clone().accept_loop_tracked(
                         listener,
                         egress.clone(),
                         auth_state.clone(),
                         permits.clone(),
-                        conn_health.clone(),
-                        next_conn_id.clone(),
+                        tracking.clone(),
                         cfg.security.clone(),
-                        handlers.clone(),
                     ));
                 }
             }
@@ -775,7 +774,7 @@ async fn handle_client_with_connector<C: TorConnector + Send>(
             };
             let global = owner
                 .as_ref()
-                .map_or(true, |owner| owner.global_handle().is_some());
+                .is_none_or(|owner| owner.global_handle().is_some());
             if global {
                 handle.bridge_refresh().request();
             }

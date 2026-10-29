@@ -28,7 +28,7 @@ impl ProducerFailures {
 }
 impl std::fmt::Display for ProducerFailures {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "shutdown failures ({})", self.0.len())
+        write!(f, "shutdown failures ({})", self.errors().len())
     }
 }
 impl std::fmt::Debug for ProducerFailures {
@@ -38,7 +38,7 @@ impl std::fmt::Debug for ProducerFailures {
 }
 impl std::error::Error for ProducerFailures {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.0.first().map(|error| error.as_ref())
+        self.errors().first().map(|error| error.as_ref())
     }
 }
 

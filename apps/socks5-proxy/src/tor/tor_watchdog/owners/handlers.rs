@@ -6,6 +6,12 @@ static RETAINED_HANDLERS: std::sync::Mutex<Option<Arc<HandlerTasks>>> = std::syn
 
 const HANDLER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Clone)]
+pub(super) struct ConnectionTracking {
+    pub(super) conn_health: ConnHealthCounters,
+    pub(super) next_conn_id: Arc<AtomicU64>,
+}
+
 pub(super) struct HandlerTasks {
     closed: AtomicBool,
     tasks: tokio::sync::Mutex<JoinSet<()>>,
@@ -103,53 +109,54 @@ impl HandlerTasks {
         }
         Ok(())
     }
-}
 
-/// Accept connections on `listener` forever, spawning one task per
-/// connection. Accept errors are logged and retried with a backoff, so the
-/// loop only ends by being dropped (shutdown).
-///
-/// `next_conn_id` is the shared, monotonic per-connection identifier for
-/// log correlation — shared across every listener's accept loop, since
-/// per-loop counters would hand out colliding conn_ids once several
-/// listeners are bound. Wraps only after 2^64 connections — never, in
-/// practice.
-pub(super) async fn accept_loop_tracked(
-    listener: TcpListener,
-    egress: Egress,
-    auth: Option<Arc<AuthState>>,
-    permits: Arc<tokio::sync::Semaphore>,
-    conn_health: ConnHealthCounters,
-    next_conn_id: Arc<AtomicU64>,
-    security: SecurityConfig,
-    handlers: Arc<HandlerTasks>,
-) {
-    loop {
-        let (client, peer) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                error!(?e, "accept failed; retrying in {ACCEPT_ERROR_BACKOFF:?}");
-                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+    /// Accept connections on `listener` forever, spawning one task per
+    /// connection. Accept errors are logged and retried with a backoff, so the
+    /// loop only ends by being dropped (shutdown).
+    ///
+    /// `next_conn_id` is the shared, monotonic per-connection identifier for
+    /// log correlation — shared across every listener's accept loop, since
+    /// per-loop counters would hand out colliding conn_ids once several
+    /// listeners are bound. Wraps only after 2^64 connections — never, in
+    /// practice.
+    pub(super) async fn accept_loop_tracked(
+        self: Arc<Self>,
+        listener: TcpListener,
+        egress: Egress,
+        auth: Option<Arc<AuthState>>,
+        permits: Arc<tokio::sync::Semaphore>,
+        tracking: ConnectionTracking,
+        security: SecurityConfig,
+    ) {
+        let ConnectionTracking {
+            conn_health,
+            next_conn_id,
+        } = tracking;
+        loop {
+            let (client, peer) = match listener.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    error!(?e, "accept failed; retrying in {ACCEPT_ERROR_BACKOFF:?}");
+                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                    continue;
+                }
+            };
+            // Глобальный ingress-ACL: deny до permit/spawn — drop без ответных байт.
+            if !security.client_access.allowed_clients.allows(peer.ip()) {
+                debug!(%peer, "client rejected by security.client_access.allowed_clients");
+                drop(client);
                 continue;
             }
-        };
-        // Глобальный ingress-ACL: deny до permit/spawn — drop без ответных байт.
-        if !security.client_access.allowed_clients.allows(peer.ip()) {
-            debug!(%peer, "client rejected by security.client_access.allowed_clients");
-            drop(client);
-            continue;
-        }
-        let conn_id = next_conn_id.fetch_add(1, Ordering::Relaxed);
-        let egress = egress.clone();
-        let auth = auth.clone();
-        let conn_health = conn_health.clone();
-        let permit = permits
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("semaphore not closed");
-        handlers
-            .spawn(async move {
+            let conn_id = next_conn_id.fetch_add(1, Ordering::Relaxed);
+            let egress = egress.clone();
+            let auth = auth.clone();
+            let conn_health = conn_health.clone();
+            let permit = permits
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("semaphore not closed");
+            self.spawn(async move {
                 debug!(conn_id, %peer, "new connection");
                 // RAII gauge: moved into the task so `pending` is decremented
                 // wherever the task ends — error, success, or panic.
@@ -183,6 +190,7 @@ pub(super) async fn accept_loop_tracked(
                 drop(pending_guard);
             })
             .await;
+        }
     }
 }
 
@@ -196,17 +204,19 @@ pub(super) async fn accept_loop(
     next_conn_id: Arc<AtomicU64>,
     security: SecurityConfig,
 ) {
-    accept_loop_tracked(
-        listener,
-        egress,
-        auth,
-        permits,
-        conn_health,
-        next_conn_id,
-        security,
-        Arc::new(HandlerTasks::new()),
-    )
-    .await;
+    Arc::new(HandlerTasks::new())
+        .accept_loop_tracked(
+            listener,
+            egress,
+            auth,
+            permits,
+            ConnectionTracking {
+                conn_health,
+                next_conn_id,
+            },
+            security,
+        )
+        .await;
 }
 
 #[cfg(test)]

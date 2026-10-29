@@ -93,14 +93,21 @@ type MutateFn = Box<dyn FnOnce(&mut BridgeStore) + Send>;
 type Publisher = Arc<dyn Fn(&BridgeStore) -> Result<()> + Send + Sync>;
 
 // Payload переходит в реестр без форматирования; актор получает только безопасную ошибку.
-pub(crate) struct PublisherPanic(Mutex<Box<dyn Any + Send>>);
+pub(crate) struct PublisherPanic {
+    _payload: Mutex<Box<dyn Any + Send>>,
+}
 impl PublisherPanic {
     fn new(payload: Box<dyn Any + Send>) -> Self {
-        Self(Mutex::new(payload))
+        Self {
+            _payload: Mutex::new(payload),
+        }
     }
     #[cfg(test)]
     fn payload_is<T: Any>(&self, predicate: impl FnOnce(&T) -> bool) -> bool {
-        let payload = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let payload = self
+            ._payload
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         payload.downcast_ref::<T>().is_some_and(predicate)
     }
 }

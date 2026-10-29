@@ -77,9 +77,37 @@ mod tests {
         cfg.warm_pool.enabled = false;
         cfg.bridges.lines.clear();
         assert!(restricted_owner_settings(&cfg, None).is_err());
-        cfg.bridges
-            .lines
-            .push("192.0.2.20:443 2222222222222222222222222222222222222222".into());
+        cfg.bridges.lines.push("not a bridge".into());
         assert!(restricted_owner_settings(&cfg, None).is_err());
+
+        let filtered = "[2001:db8::20]:443 2222222222222222222222222222222222222222";
+        assert!(filtered.parse::<BridgeLine>().is_ok());
+        cfg.bridges.lines = vec![filtered.into()];
+        let parsed = cfg.bridges.parsed().unwrap();
+        assert!(parsed.bridges.is_empty());
+        assert_eq!(parsed.rejected, 1);
+        assert!(restricted_owner_settings(&cfg, None).is_err());
+
+        let accepted = [
+            "192.0.2.20:443 2222222222222222222222222222222222222222",
+            "8.8.8.8:443 3333333333333333333333333333333333333333",
+            "[2606:4700:4700::1111]:443 4444444444444444444444444444444444444444",
+        ];
+        let expected: Vec<BridgeLine> = accepted.iter().map(|line| line.parse().unwrap()).collect();
+        for (line, bridge) in accepted.iter().zip(&expected) {
+            cfg.bridges.lines = vec![(*line).into()];
+            assert_eq!(
+                restricted_owner_settings(&cfg, None).unwrap().bridges,
+                vec![bridge.clone()]
+            );
+        }
+        cfg.bridges.lines = std::iter::once(filtered)
+            .chain(accepted.iter().copied())
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            restricted_owner_settings(&cfg, None).unwrap().bridges,
+            expected
+        );
     }
 }

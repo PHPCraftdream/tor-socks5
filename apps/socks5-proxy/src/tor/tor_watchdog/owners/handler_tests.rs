@@ -21,8 +21,10 @@ async fn run_server_reports_final_flush_worker_panic() {
     let _serial = TEST_LIFECYCLE.lock().await;
     tokio::time::timeout(Duration::from_secs(60), async {
         let dir = tempfile::tempdir().unwrap();
-        let mut cfg = crate::config::Config::default();
-        cfg.listen = vec!["127.0.0.1:0".into()];
+        let mut cfg = crate::config::Config {
+            listen: vec!["127.0.0.1:0".into()],
+            ..Default::default()
+        };
         cfg.log.ansi = true;
         let path = dir.path().join("server.ktav");
         std::fs::write(&path, ktav::to_string(&cfg).unwrap()).unwrap();
@@ -119,8 +121,10 @@ async fn parked_server_startup(global: bool) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     drop(listener);
-    let mut cfg = crate::config::Config::default();
-    cfg.listen = vec![address.to_string()];
+    let mut cfg = crate::config::Config {
+        listen: vec![address.to_string()],
+        ..Default::default()
+    };
     cfg.log.ansi = true;
     let path = dir.path().join("server.ktav");
     std::fs::write(&path, ktav::to_string(&cfg).unwrap()).unwrap();
@@ -223,10 +227,12 @@ async fn tracked_handler_shutdown_joins_pending_owner_constructor() {
         let permits = Arc::new(tokio::sync::Semaphore::new(1));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let mut accept = AbortOnDrop(tokio::spawn(super::super::handlers::accept_loop_tracked(
+        let mut accept = AbortOnDrop(tokio::spawn(handlers.clone().accept_loop_tracked(
             listener, Egress::Tor(handle, None, None, false, Some(registry.clone())),
-            Some(auth), permits.clone(), ConnHealthCounters::default(),
-            Arc::new(std::sync::atomic::AtomicU64::new(1)), Default::default(), handlers.clone(),
+            Some(auth), permits.clone(), super::super::handlers::ConnectionTracking {
+                conn_health: ConnHealthCounters::default(),
+                next_conn_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            }, Default::default(),
         )));
         let mut client = TcpStream::connect(address).await.unwrap();
         client.write_all(b"CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic YWxpY2U6cHc=\r\n\r\n").await.unwrap();
