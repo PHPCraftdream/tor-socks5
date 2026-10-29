@@ -100,6 +100,33 @@ class EvidenceTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         evidence.collect(self.lock, self.cache.parent, Path(output) / "new")
 
+    def test_file_limit_only_for_read_members(self):
+        manifest = ("demo-1.0.0/Cargo.toml", tarfile.REGTYPE,
+                    b'[package]\nlicense-file = "legal/terms.txt"\n')
+        large = b"x" * 81
+        ordinary = ("demo-1.0.0/src/data", tarfile.REGTYPE, large)
+        license_entry = ("demo-1.0.0/legal/terms.txt", tarfile.REGTYPE, b"terms")
+        with mock.patch.object(evidence, "MAX_FILE", 80):
+            self.archive([ordinary, manifest, license_entry])
+            evidence.collect(self.lock, self.cache.parent, self.out)
+            candidates = json.loads((self.out / "manifest.json").read_text())["packages"][0]["license_candidates"]
+            self.assertEqual([c["archive_path"] for c in candidates], [license_entry[0]])
+            self.assertEqual((self.out / candidates[0]["path"]).read_bytes(), b"terms")
+            for entries in ([ordinary, ("demo-1.0.0/LICENSE", tarfile.REGTYPE, large)],
+                            [ordinary, (manifest[0], tarfile.REGTYPE, large)],
+                            [manifest, (license_entry[0], tarfile.REGTYPE, large)],
+                            [(license_entry[0], tarfile.REGTYPE, large), manifest]):
+                with self.subTest(entries=entries), tempfile.TemporaryDirectory() as other:
+                    self.archive(entries)
+                    with self.assertRaisesRegex(ValueError, "archive content too large"):
+                        evidence.collect(self.lock, self.cache.parent, Path(other) / "out")
+            for constant in ("MAX_TOTAL", "MAX_ALL_CONTENT"):
+                with self.subTest(constant=constant), tempfile.TemporaryDirectory() as other:
+                    self.archive([ordinary])
+                    with mock.patch.object(evidence, constant, 80):
+                        with self.assertRaisesRegex(ValueError, "archive content too large"):
+                            evidence.collect(self.lock, self.cache.parent, Path(other) / "out")
+
     def test_pax_stream_limit_and_valid_pax(self):
         self.archive([("demo-1.0.0/" + "x" * 150 + "/NOTICE", tarfile.REGTYPE, b"ok")])
         with tempfile.TemporaryDirectory() as other:

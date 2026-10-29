@@ -129,13 +129,17 @@ def collect(lock, cache, output):
                         regular_paths.add(path)
                         total += member.size
                         all_content += member.size
-                        if member.size > MAX_FILE or total > MAX_TOTAL or all_content > MAX_ALL_CONTENT:
+                        if total > MAX_TOTAL or all_content > MAX_ALL_CONTENT:
                             raise ValueError(f"archive content too large: {stem}")
                         if path == f"{stem}/Cargo.toml":
+                            if member.size > MAX_FILE:
+                                raise ValueError(f"archive content too large: {stem}")
                             manifest_content = tar.extractfile(member).read()
                             if len(manifest_content) != member.size:
                                 raise ValueError(f"truncated member: {path}")
                         if len(parts) >= 2 and LICENSE.match(parts[-1]):
+                            if member.size > MAX_FILE:
+                                raise ValueError(f"archive content too large: {stem}")
                             content = tar.extractfile(member).read()
                             if len(content) != member.size:
                                 raise ValueError(f"truncated member: {path}")
@@ -166,6 +170,8 @@ def collect(lock, cache, output):
                         with tarfile.open(fileobj=LimitedStream(compressed, MAX_TAR_STREAM), mode="r|") as tar:
                             for member in tar:
                                 if member.name == target:
+                                    if member.size > MAX_FILE:
+                                        raise ValueError(f"archive content too large: {stem}")
                                     content = tar.extractfile(member).read()
                                     if len(content) != member.size:
                                         raise ValueError(f"truncated member: {target}")
