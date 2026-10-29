@@ -13,6 +13,8 @@ import tempfile
 import unittest
 import zipfile
 
+sys.dont_write_bytecode = True
+
 HERE = Path(__file__).resolve().parent
 LICENSE = HERE.parents[1]
 ROOT = HERE.parents[4]

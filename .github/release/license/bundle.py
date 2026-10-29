@@ -32,6 +32,8 @@ import tarfile
 import tomllib
 from pathlib import Path
 
+sys.dont_write_bytecode = True
+
 _spec = importlib.util.spec_from_file_location('source_inventory', Path(__file__).with_name('source_inventory.py'))
 source_inventory = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(source_inventory)
@@ -170,8 +172,8 @@ def build(project, sdk, cache, tag, project_commit=None):
         raise ValueError('invalid tag')
     MODES.clear()
     base = 'sources/' + tag + '/'
-    project_proof, project_data = source_inventory.snapshot_git(project, project_commit)
-    sdk_proof, sdk_data = source_inventory.snapshot_git(sdk, SDK_COMMIT)
+    project_proof, project_data = source_inventory.snapshot_git(project, project_commit, checkout='project')
+    sdk_proof, sdk_data = source_inventory.snapshot_git(sdk, SDK_COMMIT, checkout='sdk')
     payload = {}
     for name, proof, data in (('project', project_proof, project_data), ('sdk', sdk_proof, sdk_data)):
         for record in proof['files']:

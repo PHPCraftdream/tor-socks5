@@ -10,6 +10,8 @@ import tarfile
 import unittest
 import zipfile
 
+sys.dont_write_bytecode = True
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import bundle
@@ -194,7 +196,12 @@ class BundlePublisherTests(unittest.TestCase):
                    REMOTE_REPO=harness.REMOTE_REPO, GH_TOKEN="offline-test")
         if not missing_origin:
             env.update(ORIGIN_ENV, ORIGIN_DIR=self.area.path)
-        return fx.run_cmd(["bash", str(PUBLISHER)], env=env, cwd=fx.REPO_ROOT)
+        result = fx.run_cmd(["bash", str(PUBLISHER)], env=env, cwd=fx.REPO_ROOT)
+        result.stdout = result.stdout.decode('utf-8')
+        result.stderr = result.stderr.decode('utf-8')
+        self.assertIsInstance(result.stdout, str)
+        self.assertIsInstance(result.stderr, str)
+        return result
 
     def assert_untrusted_workflow(self, result):
         self.assertNotEqual(result.returncode, 0)

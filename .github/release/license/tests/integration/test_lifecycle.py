@@ -15,6 +15,8 @@ import subprocess
 import sys
 import tempfile
 
+sys.dont_write_bytecode = True
+
 HERE = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location('admission', HERE / 'admission.py')
 admission = importlib.util.module_from_spec(spec)

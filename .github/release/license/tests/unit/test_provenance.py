@@ -6,9 +6,12 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import sys
 import unittest
 from unittest import mock
 import zipfile
+
+sys.dont_write_bytecode = True
 
 spec = importlib.util.spec_from_file_location('provenance', Path(__file__).resolve().parents[2] / 'provenance.py')
 p = importlib.util.module_from_spec(spec)

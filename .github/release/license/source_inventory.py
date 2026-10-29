@@ -43,7 +43,7 @@ def commit_tree(raw, commit):
     return lines[0][5:].decode('ascii')
 
 
-def snapshot_git(root, expected_commit=None):
+def snapshot_git(root, expected_commit=None, *, checkout='checkout'):
     """Return (proof, bytes by relative path); require checkout and index match HEAD."""
     root = Path(root).resolve(strict=True)
     commit = git(root, 'rev-parse', '--verify', 'HEAD^{commit}').strip().decode('ascii')
@@ -60,8 +60,16 @@ def snapshot_git(root, expected_commit=None):
             if stage != b'0' or name in index:
                 raise ValueError('unmerged index')
             index[name] = (mode.decode('ascii'), oid.decode('ascii'))
-    if git(root, 'ls-files', '--others', '--exclude-standard', '-z'):
-        raise ValueError('untracked source inputs')
+    untracked = git(root, 'ls-files', '--others', '--exclude-standard', '-z')
+    if untracked:
+        paths = untracked.split(b'\0')
+        if paths[-1] == b'':
+            paths.pop()
+        shown = [path[:4096].decode('utf-8', 'surrogateescape') for path in paths[:20]]
+        raise ValueError('untracked source inputs in ' + json.dumps(checkout, ensure_ascii=True) +
+                         ' checkout ' + json.dumps(root.name, ensure_ascii=True) +
+                         ': ' + json.dumps(shown, ensure_ascii=True) +
+                         ' (total: ' + str(len(paths)) + ')')
     records, contents, seen = [], {}, set()
     for entry in git(root, 'ls-tree', '-rz', '--full-tree', commit).split(b'\0'):
         if not entry:
@@ -181,8 +189,8 @@ def verify_sources(payload, tag, expected_project_commit=None, sdk_expected=SDK_
 
 
 def collect(project, sdk, output, project_commit=None):
-    project_proof, project_data = snapshot_git(project, project_commit)
-    sdk_proof, sdk_data = snapshot_git(sdk, SDK_COMMIT)
+    project_proof, project_data = snapshot_git(project, project_commit, checkout='project')
+    sdk_proof, sdk_data = snapshot_git(sdk, SDK_COMMIT, checkout='sdk')
     items = [('project/' + n, d, r['mode'] == '100755') for r in project_proof['files'] for n, d in [(r['path'], project_data[r['path']])]]
     items += [('sdk/' + n, d, r['mode'] == '100755') for r in sdk_proof['files'] for n, d in [(r['path'], sdk_data[r['path']])]]
     if not any(n.startswith('project/vendor/') for n, _, _ in items) or not any(n == 'project/Cargo.lock' for n, _, _ in items) or not any(n.startswith('sdk/crates/resocks5-net/') for n, _, _ in items):

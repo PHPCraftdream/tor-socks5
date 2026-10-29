@@ -24,6 +24,8 @@ from types import SimpleNamespace
 import zipfile
 from pathlib import Path
 
+sys.dont_write_bytecode = True
+
 HERE = Path(__file__).resolve().parent
 
 def load(name):
@@ -372,7 +374,7 @@ def review_bundle(root, expected_commit):
         raise ValueError('invalid review commit')
     if not (root / '.git').exists():
         raise ValueError('reviews must be a Git checkout root')
-    proof, contents = inventory.snapshot_git(root, expected_commit)
+    proof, contents = inventory.snapshot_git(root, expected_commit, checkout='reviews')
     used = review_inputs(contents)
     result = {'review-source-proof.json': bundle.encoded(proof)}
     result.update({'reviews-used/' + path: contents[path] for path in used})
