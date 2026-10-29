@@ -168,6 +168,30 @@ jobs:
           name: pr-license-inventory
           path: target/license-inventory/cargo-metadata-*.json
           if-no-files-found: error
+      - name: Test Cargo evidence collection
+        if: github.event_name == 'pull_request'
+        run: python3 -I .github/release/test_cargo_evidence.py
+      - name: Collect verified Cargo registry evidence
+        if: github.event_name == 'pull_request'
+        id: cargo-evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence_root=$(mktemp -d "$GITHUB_WORKSPACE/.cargo-evidence.XXXXXX")
+          mkdir "$evidence_root/cargo-home"
+          (
+            export CARGO_HOME="$evidence_root/cargo-home"
+            cargo fetch --locked
+            python3 -I .github/release/cargo_evidence.py Cargo.lock "$CARGO_HOME/registry/cache" "$evidence_root/output"
+          )
+          echo "path=$evidence_root/output" >> "$GITHUB_OUTPUT"
+      - name: Upload Cargo registry evidence
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-cargo-license-evidence
+          path: ${{ steps.cargo-evidence.outputs.path }}
+          if-no-files-found: error
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
