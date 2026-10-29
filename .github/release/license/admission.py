@@ -11,6 +11,7 @@ import argparse
 import gzip
 import io
 import importlib.util
+import os
 import re
 import stat
 import subprocess
@@ -54,7 +55,38 @@ def source_digest(payload):
     return bundle.source_digest(digest_payload, paths + ['SOURCE-MODES.json', 'GIT-SOURCES.json'])
 
 
-def cargo(data, binary):
+def executable_identity(value, target):
+    # Сравнение путей зависит только от целевой платформы, а не от файловой системы проверяющего.
+    if target is not None and target not in TARGETS:
+        raise ValueError('unknown executable target')
+    if isinstance(value, os.PathLike):
+        value = os.fspath(value)
+    if not isinstance(value, str) or not value or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in value):
+        raise ValueError('invalid executable path')
+    if target == 'x86_64-pc-windows-msvc':
+        if not re.match(r'^[A-Za-z]:[\\/]', value):
+            raise ValueError('executable path must be drive-absolute')
+        parts = re.split(r'[\\/]', value[3:])
+        reserved = r'(?i:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\..*)?'
+        if any(not part or part in ('.', '..') or part[-1] in ' .' or
+               re.search(r'[<>:"|?*]', part) or re.fullmatch(reserved, part) for part in parts):
+            raise ValueError('invalid Windows executable path component')
+        identity = (value[0].lower(), *(part.lower() for part in parts))
+        expected = 'socks5-proxy.exe'
+    else:
+        if not value.startswith('/') or '\\' in value or ':' in value:
+            raise ValueError('executable path must be POSIX absolute')
+        parts = value[1:].split('/')
+        if any(not part or part in ('.', '..') for part in parts):
+            raise ValueError('invalid POSIX executable path component')
+        identity = tuple(parts)
+        expected = 'socks5-proxy'
+    if target is not None and identity[-1] != expected:
+        raise ValueError('unexpected executable basename')
+    return identity
+
+
+def cargo(data, binary, target=None):
     if not data.endswith(b'\n'):
         raise ValueError('truncated Cargo messages')
     final = None
@@ -65,16 +97,18 @@ def cargo(data, binary):
             raise ValueError('malformed or trailing Cargo message')
         if obj.get('reason') == 'compiler-artifact' and obj.get('executable'):
             package = obj.get('package_id', '')
-            target = obj.get('target', {})
+            artifact_target = obj.get('target', {})
             # Cargo supports both old and new package-id formats.
-            if isinstance(package, str) and (re.search(r'(^|[/# ])socks5-proxy(?:[ @#]|$)', package)) and isinstance(target, dict) and target.get('name') == 'socks5-proxy':
+            if isinstance(package, str) and (re.search(r'(^|[/# ])socks5-proxy(?:[ @#]|$)', package)) and isinstance(artifact_target, dict) and artifact_target.get('name') == 'socks5-proxy':
                 final = obj['executable']
         if obj.get('reason') == 'build-finished':
             if obj.get('success') is not True:
                 raise ValueError('Cargo build failed')
             finished = True
-    if not finished or not isinstance(final, str) or Path(final).resolve() != Path(binary).resolve():
+    if not finished or not isinstance(final, str):
         raise ValueError('missing final socks5-proxy artifact or build-finished')
+    if executable_identity(final, target) != executable_identity(binary, target):
+        raise ValueError('Cargo executable path mismatch')
 
 
 def archive_name(tag, target):
@@ -245,7 +279,8 @@ def record(args):
         if not payload[name] or payload[name] not in binary:
             raise ValueError('missing embedded ' + name)
     messages = read(args.messages)
-    cargo(messages, args.binary)
+    binary_path = str(args.binary.resolve())
+    cargo(messages, binary_path, args.target)
     files = {'candidate.tar.gz': candidate_path.read_bytes(), 'messages.jsonl': messages,
              'features.txt': read(args.features), 'toolchain.txt': read(args.toolchain)}
     native = args.native_evidence
@@ -264,7 +299,7 @@ def record(args):
         raise ValueError('empty build evidence')
     receipt = {'schema': 1, 'target': args.target, 'tag': manifest['tag'],
                'sdk_commit': manifest['sdk_commit'], 'source_digest': source_digest(payload),
-               'binary_sha256': bundle.digest(binary), 'binary_path': str(args.binary.resolve()),
+               'binary_sha256': bundle.digest(binary), 'binary_path': binary_path,
                'build_evidence_digest': build_evidence_digest(files)}
     if args.review:
         problems += add_review(files, args.review, receipt)
@@ -306,7 +341,7 @@ def check_receipt(files, target, tag):
             raise ValueError('missing receipt evidence: ' + name)
     if receipt.get('build_evidence_digest') != build_evidence_digest(files):
         raise ValueError('build evidence digest mismatch')
-    cargo(files['messages.jsonl'], receipt['binary_path'])
+    cargo(files['messages.jsonl'], receipt['binary_path'], target)
     with tempfile.TemporaryDirectory() as temp:
         path = Path(temp) / 'candidate.tar.gz'
         path.write_bytes(files['candidate.tar.gz'])

@@ -116,7 +116,8 @@ def make_artifacts(area, artifacts):
     evidence_root = root / 'evidence'
     for target in admission.TARGETS:
         binary = b'synthetic binary ' + target.encode() + b'\n' + payload['NOTICES.txt'] + payload['SOURCE-INFO.txt']
-        binary_path = str((root / ('binary-' + target)).resolve())
+        binary_path = ('C:\\fixture\\TESTONLY\\' + target + '\\release\\socks5-proxy.exe'
+                       if 'windows' in target else str((root / 'binary' / target / 'socks5-proxy').resolve()))
         messages = (bundle.encoded({'reason': 'compiler-artifact', 'package_id': 'socks5-proxy 1.0.0',
                                     'target': {'name': 'socks5-proxy'}, 'executable': binary_path})
                     + bundle.encoded({'reason': 'build-finished', 'success': True}))

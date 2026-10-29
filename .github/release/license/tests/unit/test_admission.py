@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 sys.dont_write_bytecode = True
 
@@ -31,7 +32,7 @@ class AdmissionTests(unittest.TestCase):
         admission.cargo(artifact + finished, '/tmp/proxy')
         # Строка stdout из фактического журнала CI не является JSON.
         verbose = b'[proc-macro2 1.0.106] cargo:rustc-check-cfg=cfg(fuzzing)\n'
-        invalid = (artifact + verbose + finished, artifact + b'{\n' + finished,
+        invalid = (artifact, artifact + verbose + finished, artifact + b'{\n' + finished,
                    (artifact + finished)[:-1], artifact + finished + artifact,
                    artifact + b.encoded({'reason': 'build-finished', 'success': False}))
         for data in invalid:
@@ -39,6 +40,99 @@ class AdmissionTests(unittest.TestCase):
                 admission.cargo(data, '/tmp/proxy')
         with self.assertRaises(ValueError):
             admission.cargo(artifact + finished, '/tmp/other')
+
+    def test_cargo_target_path_contract(self):
+        b = admission.bundle
+        windows = 'x86_64-pc-windows-msvc'
+        receipt = r'D:\ci\project\target\license-build\x86_64-pc-windows-msvc\release\socks5-proxy.exe'
+        mixed = r'd:\CI\project/target/license-build\x86_64-pc-windows-msvc\release\SOCKS5-PROXY.EXE'
+        artifact = {'reason': 'compiler-artifact', 'package_id': 'path+file:///fixture/socks5-proxy#0.2.0',
+                    'target': {'name': 'socks5-proxy'}, 'executable': mixed}
+        finished = b.encoded({'reason': 'build-finished', 'success': True})
+        def stream(item):
+            return b.encoded(item) + finished
+        admission.cargo(stream(dict(artifact, executable=r'D:\ci\project/target/license-build\x86_64-pc-windows-msvc\release\socks5-proxy.exe')), receipt, windows)
+        admission.cargo(stream(artifact), receipt, windows)
+        for target in admission.TARGETS:
+            path = receipt if target == windows else '/fixture/foreign-host/' + target + '/release/socks5-proxy'
+            with self.subTest(target=target):
+                admission.cargo(stream(dict(artifact, executable=path)), path, target)
+        for path in (receipt.replace('project', 'other'), 'E:' + receipt[2:],
+                     receipt.replace('socks5-proxy.exe', 'other.exe')):
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                admission.cargo(stream(artifact), path, windows)
+        for item in (dict(artifact, package_id='other 1.0'),
+                     dict(artifact, target={'name': 'other'})):
+            with self.subTest(item=item), self.assertRaises(ValueError):
+                admission.cargo(stream(item), receipt, windows)
+        with self.assertRaises(ValueError):
+            admission.cargo(stream(artifact), receipt, admission.TARGETS[0])
+        posix = '/foreign-host/target/release/socks5-proxy'
+        with self.assertRaises(ValueError):
+            admission.cargo(stream(dict(artifact, executable=posix.upper())), posix, admission.TARGETS[0])
+
+    def test_cargo_rejects_unsafe_windows_paths(self):
+        b = admission.bundle
+        target = 'x86_64-pc-windows-msvc'
+        good = r'C:\fixture\release\socks5-proxy.exe'
+        artifact = {'reason': 'compiler-artifact', 'package_id': 'socks5-proxy 1.0',
+                    'target': {'name': 'socks5-proxy'}, 'executable': good}
+        finished = b.encoded({'reason': 'build-finished', 'success': True})
+        invalid = (r'C:\fixture\..\release\socks5-proxy.exe', r'C:\fixture\.\release\socks5-proxy.exe',
+                   r'fixture\release\socks5-proxy.exe', r'C:fixture\release\socks5-proxy.exe',
+                   r'\\server\share\socks5-proxy.exe', r'\\?\C:\fixture\socks5-proxy.exe',
+                   r'C:\fixture\release\socks5-proxy.exe:stream', r'C:\fixture\\release\socks5-proxy.exe',
+                   good + '\\', r'C:\fixture.\release\socks5-proxy.exe',
+                   r'C:\fixture \release\socks5-proxy.exe', r'C:\CON.txt\socks5-proxy.exe',
+                   'C:\\fixture\\bad\x01name\\socks5-proxy.exe')
+        for path in invalid:
+            with self.subTest(path=path):
+                for message_path, receipt_path in ((path, good), (good, path), (path, path)):
+                    with self.assertRaises(ValueError):
+                        admission.cargo(b.encoded(dict(artifact, executable=message_path)) + finished,
+                                        receipt_path, target)
+
+    def test_cargo_rejects_unsafe_posix_paths(self):
+        b = admission.bundle
+        target = 'x86_64-unknown-linux-gnu'
+        artifact = {'reason': 'compiler-artifact', 'package_id': 'socks5-proxy 1.0',
+                    'target': {'name': 'socks5-proxy'}}
+        finished = b.encoded({'reason': 'build-finished', 'success': True})
+        invalid = ('fixture/release/socks5-proxy', '//fixture/release/socks5-proxy',
+                   '/fixture/./release/socks5-proxy', '/fixture/../release/socks5-proxy',
+                   r'/fixture\release/socks5-proxy', '/fixture/bad\x01name/socks5-proxy')
+        for path in invalid:
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                admission.cargo(b.encoded(dict(artifact, executable=path)) + finished, path, target)
+
+    def test_check_receipt_passes_target_to_cargo(self):
+        b = admission.bundle
+        target = 'x86_64-pc-windows-msvc'
+        path = r'C:\fixture\release\socks5-proxy.exe'
+        messages = (b.encoded({'reason': 'compiler-artifact', 'package_id': 'socks5-proxy 1.0',
+                               'target': {'name': 'socks5-proxy'},
+                               'executable': r'C:\fixture/release\socks5-proxy.exe'}) +
+                    b.encoded({'reason': 'build-finished', 'success': True}))
+        files = {'candidate.tar.gz': b'fixture', 'messages.jsonl': messages, 'features.txt': b'f',
+                 'toolchain.txt': b't', 'native-evidence/linkage.txt': b'l',
+                 'native-evidence/build-stderr.txt': b's', 'expanded-sources.json': b.encoded({}),
+                 'review.json': b.encoded({})}
+        receipt = {'schema': 1, 'target': target, 'tag': 'v1', 'sdk_commit': b.SDK_COMMIT,
+                   'binary_path': path, 'binary_sha256': '0' * 64, 'source_digest': 'source',
+                   'build_evidence_digest': admission.build_evidence_digest(files),
+                   'evidence': {p: b.digest(data) for p, data in files.items()}}
+        files['receipt.json'] = b.encoded(receipt)
+        altered_files = dict(files, **{'messages.jsonl': messages + b'altered'})
+        with self.assertRaisesRegex(ValueError, 'receipt evidence hash mismatch'):
+            admission.check_receipt(altered_files, target, 'v1')
+        with mock.patch.object(admission, 'candidate', return_value=({}, {'tag': 'v1'}, [])), \
+             mock.patch.object(admission, 'crate_hashes', return_value={}), \
+             mock.patch.object(admission, 'source_digest', return_value='source'), \
+             mock.patch.object(admission, 'cargo', wraps=admission.cargo) as cargo:
+            admission.check_receipt(files, target, 'v1')
+            cargo.assert_called_once_with(messages, path, target)
+        with self.assertRaisesRegex(ValueError, 'receipt identity mismatch'):
+            admission.check_receipt(files, admission.TARGETS[0], 'v1')
 
     def test_expanded_source_checks(self):
         b = admission.bundle

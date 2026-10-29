@@ -105,7 +105,9 @@ def make_inputs(root, sdk):
     (review_dir / 'TEST-ONLY.txt').write_bytes(MARKER)
     for target in admission.TARGETS:
         binary = MARKER + target.encode() + b'\n' + payload['NOTICES.txt'] + payload['SOURCE-INFO.txt']
-        binary_path = (root / 'fake-build' / target / ('tor-socks5.exe' if 'windows' in target else 'tor-socks5')).resolve()
+        binary_path = (root / 'fake-build' / target / ('socks5-proxy.exe' if 'windows' in target else 'socks5-proxy')).resolve()
+        evidence_path = (('C:\\fixture\\TESTONLY\\' + target + '\\release\\socks5-proxy.exe')
+                         if 'windows' in target else str(binary_path))
         binary_path.parent.mkdir(parents=True, exist_ok=True)
         binary_path.write_bytes(binary)
         name = admission.archive_name(TAG, target)
@@ -120,7 +122,7 @@ def make_inputs(root, sdk):
         (artifacts / (name + '.sha256')).write_bytes((bundle.digest(archive_bytes) + suffix).encode())
         messages = (bundle.encoded({'reason': 'compiler-artifact',
                                    'package_id': 'path+file:///fixture/socks5-proxy#0.0.0',
-                                   'target': {'name': 'socks5-proxy'}, 'executable': str(binary_path)}) +
+                                   'target': {'name': 'socks5-proxy'}, 'executable': evidence_path}) +
                     bundle.encoded({'reason': 'build-finished', 'success': True}))
         files = {'candidate.tar.gz': candidate.read_bytes(), 'messages.jsonl': messages,
                  'features.txt': MARKER, 'toolchain.txt': MARKER,
@@ -130,7 +132,7 @@ def make_inputs(root, sdk):
                  'review.json': bundle.encoded({})}
         receipt = {'schema': 1, 'target': target, 'tag': TAG, 'sdk_commit': bundle.SDK_COMMIT,
                    'source_digest': admission.source_digest(payload), 'binary_sha256': bundle.digest(binary),
-                   'binary_path': str(binary_path), 'build_evidence_digest': admission.build_evidence_digest(files)}
+                   'binary_path': evidence_path, 'build_evidence_digest': admission.build_evidence_digest(files)}
         receipt_dir = original / ('license-evidence-' + target) / 'license-receipt'
         receipt_dir.parent.mkdir(parents=True, exist_ok=True)
         admission.write_receipt(receipt_dir, files, receipt)
