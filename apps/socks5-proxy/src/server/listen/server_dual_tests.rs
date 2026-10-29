@@ -613,7 +613,7 @@ async fn verified_handshakes_resolve_admitted_post_independently() {
                 let (_request, proof) = handshake.await.unwrap();
                 let lease = state.admit(&proof.unwrap()).await.unwrap();
                 let selected = resolve_admitted_route(None, Some(&global), Some(&lease), false, false).unwrap();
-                assert_eq!(selected, match mode { 0 => Some(global), 1 => Some(account), _ => None });
+                assert_eq!(selected.post, match mode { 0 => Some(global), 1 => Some(account), _ => None });
             }
         }
     }).await.expect("route admission test timed out");
@@ -751,7 +751,7 @@ async fn tor_handler_enforces_global_pre_before_connector_after_reload() {
                     let calls = Arc::new(AtomicUsize::new(0));
                     let connector = ParkedTorConnector { observed: Some(observed_tx), release: Some(release_rx), calls: calls.clone() };
                     let mut handler = AbortHandler(tokio::spawn(handle_client_with_connector(
-                        server, Egress::Tor(tor.clone(), Some(Arc::new(pre.clone())), Some(Arc::new(global_post.clone())), false),
+                        server, Egress::Tor(tor.clone(), Some(Arc::new(pre.clone())), Some(Arc::new(global_post.clone())), false, None),
                         Some(state), ConnHealthCounters::default(), false, 1, connector,
                     )));
                     if http {
@@ -815,7 +815,7 @@ async fn tor_handler_routes_and_releases_admission_on_error_or_cancel() {
                     let calls = Arc::new(AtomicUsize::new(0));
                     let connector = ParkedTorConnector { observed: Some(observed_tx), release: Some(release_rx), calls: calls.clone() };
                     let mut handler = AbortHandler(tokio::spawn(handle_client_with_connector(
-                        server, Egress::Tor(tor.clone(), None, Some(Arc::new(global)), false),
+                        server, Egress::Tor(tor.clone(), None, Some(Arc::new(global)), false, None),
                         Some(state.clone()), ConnHealthCounters::default(), false, 1, connector,
                     )));
                     if http {

@@ -75,6 +75,7 @@
 //!   stuck retrying a failing publish. Between angel dirty windows the
 //!   lock is free, so sequential CLI usage is unaffected.
 
+use std::any::Any;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -90,6 +91,30 @@ use persist_lock::{PathLock, CLI_LOCK_WAIT};
 type MutateFn = Box<dyn FnOnce(&mut BridgeStore) + Send>;
 /// Publishing strategy; production uses `BridgeStore::save`, tests inject failures.
 type Publisher = Arc<dyn Fn(&BridgeStore) -> Result<()> + Send + Sync>;
+
+// Payload переходит в реестр без форматирования; актор получает только безопасную ошибку.
+pub(crate) struct PublisherPanic(Mutex<Box<dyn Any + Send>>);
+impl PublisherPanic {
+    fn new(payload: Box<dyn Any + Send>) -> Self {
+        Self(Mutex::new(payload))
+    }
+    #[cfg(test)]
+    fn payload_is<T: Any>(&self, predicate: impl FnOnce(&T) -> bool) -> bool {
+        let payload = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        payload.downcast_ref::<T>().is_some_and(predicate)
+    }
+}
+impl std::fmt::Display for PublisherPanic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("bridge health store publisher panicked")
+    }
+}
+impl std::fmt::Debug for PublisherPanic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+impl std::error::Error for PublisherPanic {}
 
 enum Op {
     Mutate {
@@ -110,13 +135,17 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// other's retirements. In non-test builds nothing is ever pushed.
 type RetirementLog = Arc<Mutex<Vec<std::thread::ThreadId>>>;
 
+struct ActorState {
+    handle: Option<JoinHandle<Result<()>>>,
+    close_requested: bool,
+}
+
 #[derive(Clone)]
 pub(crate) struct StoreWriter {
     tx: mpsc::Sender<Op>,
     path: PathBuf,
-    /// The actor task's join handle; `close` takes it once (never double-
-    /// awaited) and later close callers see `None`, meaning already joined.
-    actor: Arc<Mutex<Option<JoinHandle<Result<()>>>>>,
+    /// Дескриптор остаётся в ячейке до завершения ожидания, даже при отмене close.
+    actor: Arc<tokio::sync::Mutex<ActorState>>,
     /// TS6-04: where `drop_off_worker` records the thread each retirement
     /// drop ran on. Test-only: `retirement_tests.rs` asserts every
     /// retirement lands on a blocking-pool thread, never on the actor's
@@ -213,28 +242,35 @@ impl StoreWriter {
 
     /// Ask the actor to stop: wait for any in-flight publish, flush the
     /// snapshot if it is still dirty (even before the backoff deadline),
-    /// then join the actor task. The first caller takes the join handle;
-    /// later callers find it `None` (already joined) and get `Ok`. Resolves
-    /// `Err` only if the final flush failed or the actor died unexpectedly.
+    /// then join the actor task. Вызывающие сериализованы одним mutex. После постановки Close
+    /// отмена ожидания ответа или handle сохраняет исходный результат актора.
+    /// Первый завершивший join получает результат; последующие получают `Ok`.
+    /// Возвращает `Err` при ошибке финальной записи или гибели актора.
     pub(crate) async fn close(&self) -> Result<()> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let mut result = if self.tx.send(Op::Close { reply: reply_tx }).await.is_ok() {
-            match reply_rx.await {
-                Ok(reply) => reply,
-                Err(_) => Err(anyhow!(
-                    "bridge store writer actor terminated before replying"
-                )),
+        let mut state = self.actor.lock().await;
+        if state.handle.is_none() {
+            return Ok(());
+        }
+        let mut result = Ok(());
+        if !state.close_requested {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if self.tx.send(Op::Close { reply: reply_tx }).await.is_ok() {
+                // Между успешной отправкой и фиксацией нет точки отмены.
+                state.close_requested = true;
+                result = match reply_rx.await {
+                    Ok(reply) => reply,
+                    Err(_) => Err(anyhow!(
+                        "bridge store writer actor terminated before replying"
+                    )),
+                };
             }
-        } else {
-            // The actor is already gone (never started, or dropped without a
-            // close op); fall through to the join step.
-            Ok(())
-        };
-        let handle = self.actor.lock().expect("actor join slot lock").take();
-        if let Some(handle) = handle {
-            match handle.await {
+        }
+        if let Some(handle) = state.handle.as_mut() {
+            let joined = handle.await;
+            state.handle.take();
+            match joined {
                 Ok(joined) => {
-                    if result.is_ok() {
+                    if joined.is_err() || result.is_ok() {
                         result = joined;
                     }
                 }
@@ -252,7 +288,9 @@ impl StoreWriter {
         let retirements: RetirementLog = Arc::default();
         #[cfg(test)]
         let actor_retirements = Arc::clone(&retirements);
-        let handle = tokio::spawn(async move {
+        #[cfg(test)]
+        let registry = crate::bridge_verifier::test_registry();
+        let actor = async move {
             let path = actor_path;
             #[cfg(test)]
             let retirements = actor_retirements;
@@ -268,7 +306,7 @@ impl StoreWriter {
             let mut close_replies: Vec<oneshot::Sender<Result<()>>> = Vec::new();
             // Completion channel for in-flight publishes; the actor holds the
             // receiver, each spawn_blocking job gets a clone of the sender.
-            let (done_tx, mut done_rx) = mpsc::channel::<Result<()>>(1);
+            let (done_tx, mut done_rx) = mpsc::channel::<crate::bridge_verifier::Delivery<()>>(1);
 
             loop {
                 if closing {
@@ -296,7 +334,8 @@ impl StoreWriter {
                                     &mut mutations_since_publish,
                                     &publish,
                                     &done_tx,
-                                );
+                                )
+                                .await;
                             }
                             None => publishing = false,
                         }
@@ -305,7 +344,10 @@ impl StoreWriter {
                         match store.clone() {
                             Some(snapshot) => {
                                 let publish = publish.clone();
-                                let flush = tokio::task::spawn_blocking(move || publish(&snapshot))
+                                let flush =
+                                    crate::bridge_verifier::run_fallible_blocking(move || {
+                                        publish(&snapshot)
+                                    })
                                     .await
                                     .map_err(|join_error| {
                                         anyhow!(
@@ -345,6 +387,17 @@ impl StoreWriter {
                         };
                         let _ = reply.send(reply_result);
                     }
+                    #[cfg(test)]
+                    {
+                        let seam_path = path.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            crate::test_seams::park_if_armed(
+                                crate::test_seams::Site::WriterCloseReplySent,
+                                &seam_path,
+                            );
+                        })
+                        .await;
+                    }
                     break outcome;
                 }
 
@@ -365,7 +418,7 @@ impl StoreWriter {
                             // blocking pool; ops buffer in the channel.
                             if store.is_none() {
                                 let load_path = path.clone();
-                                match tokio::task::spawn_blocking(move || {
+                                match crate::bridge_verifier::run_fallible_blocking(move || {
                                     let lock = PathLock::acquire(&load_path)?;
                                     let store = BridgeStore::load(load_path.clone())?;
                                     Ok::<(PathLock, BridgeStore), anyhow::Error>((lock, store))
@@ -407,7 +460,7 @@ impl StoreWriter {
                             // earlier acknowledged mutations riding in the
                             // retained snapshot (TS5-06 regression guard).
                             let cloned = store.clone().expect("store loaded above");
-                            match tokio::task::spawn_blocking(move || {
+                            match crate::bridge_verifier::run_tracked_blocking(move || {
                                 let mut owned = cloned;
                                 apply(Arc::make_mut(&mut owned));
                                 owned
@@ -441,7 +494,7 @@ impl StoreWriter {
                                         &mut mutations_since_publish,
                                         &publish,
                                         &done_tx,
-                                    );
+                                    ).await;
                                 }
                                 Err(join_error) => {
                                     // The closure panicked mid-apply and its
@@ -496,7 +549,7 @@ impl StoreWriter {
                             &mut mutations_since_publish,
                             &publish,
                             &done_tx,
-                        );
+                        ).await;
                     }
                     _ = tokio::time::sleep_until(retry_at.unwrap_or_else(tokio::time::Instant::now)), if retry.dirty && retry_at.is_some() && !publishing && !closing => {
                         // The gate inside try_start_publish re-checks the
@@ -508,15 +561,27 @@ impl StoreWriter {
                             &mut mutations_since_publish,
                             &publish,
                             &done_tx,
-                        );
+                        ).await;
                     }
                 }
             }
+        };
+        #[cfg(test)]
+        let handle = tokio::spawn(async move {
+            match registry {
+                Some(registry) => registry.scope(actor).await,
+                None => actor.await,
+            }
         });
+        #[cfg(not(test))]
+        let handle = tokio::spawn(actor);
         Self {
             tx,
             path,
-            actor: Arc::new(Mutex::new(Some(handle))),
+            actor: Arc::new(tokio::sync::Mutex::new(ActorState {
+                handle: Some(handle),
+                close_requested: false,
+            })),
             #[cfg(test)]
             retirements,
         }
@@ -529,14 +594,14 @@ impl StoreWriter {
 /// absorbed during the save (clean state ⇒ the next op re-reads the file);
 /// on failure retain the snapshot and arm the backoff.
 fn absorb_publish_result(
-    res: Result<()>,
+    res: crate::bridge_verifier::Delivery<()>,
     retry: &mut RetryState,
     store: &mut Option<Arc<BridgeStore>>,
     lock: &mut Option<PathLock>,
     mutations_since_publish: &mut u32,
     retirements: &RetirementLog,
 ) {
-    match res {
+    match res.absorb() {
         Ok(()) => {
             let routine = *mutations_since_publish == 0;
             retry.record_success();
@@ -593,13 +658,13 @@ fn drop_off_worker(old: Option<Arc<BridgeStore>>, retirements: RetirementLog) {
 /// Start one publish on the blocking pool, unless one is already in flight,
 /// there is nothing dirty to publish, or a backoff retry is still pending
 /// (the timer governs retries — incoming mutations must not bypass it).
-fn try_start_publish(
+async fn try_start_publish(
     publishing: &mut bool,
     retry: &mut RetryState,
     store: &Option<Arc<BridgeStore>>,
     mutations_since_publish: &mut u32,
     publish: &Publisher,
-    done_tx: &mpsc::Sender<Result<()>>,
+    done_tx: &mpsc::Sender<crate::bridge_verifier::Delivery<()>>,
 ) {
     if *publishing || !retry.dirty || store.is_none() {
         return;
@@ -614,14 +679,28 @@ fn try_start_publish(
     let snapshot = store.clone().expect("snapshot present above");
     let publish = publish.clone();
     let done_tx = done_tx.clone();
-    // The JoinHandle is deliberately not retained: the job cannot be
-    // cancelled and reliably delivers its result via `done_tx`.
-    tokio::task::spawn_blocking(move || {
-        let res = publish(&snapshot);
-        let _ = done_tx.blocking_send(res);
-    });
-    *publishing = true;
-    *mutations_since_publish = 0;
+    // Сохраняем задачу независимо от ожидания актора; панику публикации
+    // считаем ошибкой, чтобы изменённый снимок можно было отправить повторно.
+    match crate::bridge_verifier::spawn_blocking_with_failure(move |failure| {
+        let delivery =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| publish(&snapshot))) {
+                Ok(result) => crate::bridge_verifier::Delivery::new(result, failure),
+                Err(payload) => crate::bridge_verifier::Delivery::panic(
+                    Err(anyhow::Error::new(PublisherPanic::new(payload))),
+                    failure,
+                ),
+            };
+        // При закрытом приёмнике ошибка остаётся в реестре.
+        let _ = done_tx.blocking_send(delivery);
+    })
+    .await
+    {
+        Ok(_receiver) => {
+            *publishing = true;
+            *mutations_since_publish = 0;
+        }
+        Err(error) => retry.record_failure(&error),
+    }
 }
 
 static WRITER: OnceLock<StoreWriter> = OnceLock::new();
@@ -666,7 +745,7 @@ pub(crate) async fn apply(
     let resolved = BridgeStore::resolve_path(config_path);
     match global() {
         Some(writer) if writer.path() == resolved => writer.apply(apply).await,
-        _ => tokio::task::spawn_blocking(move || {
+        _ => crate::bridge_verifier::run_fallible_blocking(move || {
             #[cfg(test)]
             crate::test_seams::park_if_armed(crate::test_seams::Site::PreAcquire, &resolved);
             let lock = PathLock::acquire_bounded(&resolved, CLI_LOCK_WAIT)

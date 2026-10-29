@@ -30,6 +30,29 @@ fn pre_config() -> Config {
     cfg
 }
 
+#[test]
+fn restricted_owner_settings_are_network_free_and_reject_incompatible_options() {
+    let mut cfg = pre_config();
+    cfg.warm_pool.enabled = false;
+    cfg.upstream.enabled = true;
+    let settings = crate::tor_setup::restricted_owner_settings(&cfg, None).unwrap();
+    assert_eq!(settings.bridges, cfg.bridges.parsed().unwrap().bridges);
+    assert!(settings.pre_endpoint.is_none());
+    assert!(settings.pt_binary.is_none());
+    assert!(settings.extra_pt_protocols.is_empty());
+
+    cfg.bridges.use_seeds = true;
+    assert!(crate::tor_setup::restricted_owner_settings(&cfg, None).is_err());
+    cfg.bridges.use_seeds = false;
+    cfg.dns_server.enabled = true;
+    assert!(crate::tor_setup::restricted_owner_settings(&cfg, None).is_err());
+    cfg.dns_server.enabled = false;
+    cfg.bridges.lines.push(
+        "obfs4 8.8.4.4:443 2222222222222222222222222222222222222222 cert=AAA iat-mode=0".into(),
+    );
+    assert!(crate::tor_setup::restricted_owner_settings(&cfg, None).is_err());
+}
+
 #[tokio::test]
 async fn pre_settings_use_configured_plain_bridges_without_probing() {
     FORBID_STARTUP_PROBE

@@ -47,6 +47,10 @@ fn settings_for_config(cfg: &Config) -> Settings {
     }
 }
 
+#[path = "tor_watchdog/owner_settings.rs"]
+mod owner_settings;
+pub(crate) use owner_settings::{restricted_owner_settings, validate_owner_routes};
+
 /// Parse the configured bridges, probe them for reachability, persist the
 /// live ones to the alive-bridges log, and assemble arti [`Settings`]
 /// (including pointing the PT manager at our own binary when needed).
@@ -63,41 +67,14 @@ pub(crate) async fn build_tor_settings_preserving_live(
     live: &[BridgeLine],
 ) -> Result<Settings> {
     if let Some(endpoint) = proxy_config::resolve_endpoint(cfg.pre_socks5.as_ref(), None) {
-        if cfg.bridges.use_seeds || cfg.bridges.auto_fetch {
-            bail!("pre_socks5 requires bridges.use_seeds and bridges.auto_fetch to be disabled");
-        }
-        if cfg.warm_pool.enabled {
-            bail!("pre_socks5 is incompatible with warm_pool.enabled");
-        }
-        for line in &cfg.bridges.lines {
-            if !line.starts_with(bridge_probe::DNS_HINT_PREFIX) {
-                let bridge: BridgeLine = line.parse().context("parsing configured bridge")?;
-                if bridge.transport.is_some() {
-                    bail!("pre_socks5 does not support pluggable transport bridges");
-                }
-            }
-        }
-        let bridges = cfg
-            .bridges
-            .parsed()
-            .context("parsing bridges from config")?
-            .bridges;
-        if bridges.is_empty() {
-            bail!("pre_socks5 requires at least one explicitly configured usable plain bridge");
-        }
-        return Ok(Settings {
-            bridges,
-            state_dir: Some(arti_base_dir(config_path)),
-            pre_endpoint: Some(arti_wrapper::Socks5PreEndpoint::new(
-                endpoint.address(),
-                endpoint
-                    .credentials()
-                    .map(|(user, pass)| (user.to_owned(), pass.to_owned())),
-            )),
-            pt_binary: None,
-            extra_pt_protocols: Vec::new(),
-            ..settings_for_config(cfg)
-        });
+        let mut settings = restricted_owner_settings(cfg, config_path)?;
+        settings.pre_endpoint = Some(arti_wrapper::Socks5PreEndpoint::new(
+            endpoint.address(),
+            endpoint
+                .credentials()
+                .map(|(user, pass)| (user.to_owned(), pass.to_owned())),
+        ));
+        return Ok(settings);
     }
     let parsed = cfg
         .bridges
@@ -560,7 +537,10 @@ pub(crate) async fn update_health_and_prune(
             let path = path.to_path_buf();
             let log_path = path.clone();
             let dead = pruned.clone();
-            match tokio::task::spawn_blocking(move || prune_bridges_from_config(&path, &dead)).await
+            match crate::bridge_verifier::run_fallible_blocking(move || {
+                prune_bridges_from_config(&path, &dead)
+            })
+            .await
             {
                 Ok(Ok(n)) if n > 0 => info!(
                     removed = n,
