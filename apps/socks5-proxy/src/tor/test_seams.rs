@@ -3,6 +3,16 @@
 //! drop, so a panicking test cannot leave one armed). Compiles away outside
 //! `cfg(test)`.
 
+tokio::task_local! {
+    pub(crate) static FORBID_PRODUCER: ();
+}
+
+pub(crate) fn forbid_producer(site: &'static str) {
+    if FORBID_PRODUCER.try_with(|_| ()).is_ok() {
+        std::panic::panic_any(site);
+    }
+}
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};

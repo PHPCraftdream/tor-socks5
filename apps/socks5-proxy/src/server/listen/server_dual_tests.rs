@@ -612,7 +612,7 @@ async fn verified_handshakes_resolve_admitted_post_independently() {
                 }
                 let (_request, proof) = handshake.await.unwrap();
                 let lease = state.admit(&proof.unwrap()).await.unwrap();
-                let selected = resolve_admitted_route(Some(&global), Some(&lease), false, false).unwrap();
+                let selected = resolve_admitted_route(None, Some(&global), Some(&lease), false, false).unwrap();
                 assert_eq!(selected, match mode { 0 => Some(global), 1 => Some(account), _ => None });
             }
         }
@@ -711,6 +711,78 @@ async fn observe_queued_writer(state: &AuthState, proof: &auth::CredentialProof)
     }
 }
 
+#[tokio::test]
+async fn tor_handler_enforces_global_pre_before_connector_after_reload() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        ensure_crypto_provider();
+        let tor_dir = tempfile::tempdir().unwrap();
+        let tor = TorHandle::new(TorTunnel::create_unbootstrapped_with(arti_wrapper::Settings {
+            state_dir: Some(tor_dir.path().to_path_buf()),
+            ..Default::default()
+        }).unwrap());
+        let pre = proxy_config::EndpointOverride::Endpoint("127.0.0.1:1080|alice:secret".parse().unwrap());
+        let other = proxy_config::EndpointOverride::Endpoint("127.0.0.1:1080|alice:other".parse().unwrap());
+        let global_post = proxy_config::EndpointOverride::Endpoint("127.0.0.1:1082".parse().unwrap());
+        let account_post = proxy_config::EndpointOverride::Endpoint("127.0.0.1:1083".parse().unwrap());
+        for http in [false, true] {
+            for mode in 0..4 {
+                for after_reload in [false, true] {
+                    let account_pre = match mode {
+                        0 => None,
+                        1 => Some(pre.clone()),
+                        2 => Some(other.clone()),
+                        _ => Some(proxy_config::EndpointOverride::Disabled),
+                    };
+                    let post = if mode == 1 { Some(account_post.clone()) } else { None };
+                    let (_dir, path, state, mut users) = persistent_state(post);
+                    users.users[0].pre_socks5 = account_pre;
+                    users.save(&path).unwrap();
+                    let state = if after_reload {
+                        reload(state.clone()).await;
+                        state
+                    } else {
+                        Arc::new(AuthState::build_persistent(&users, path).unwrap())
+                    };
+                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+                    let (server, _) = listener.accept().await.unwrap();
+                    let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+                    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let connector = ParkedTorConnector { observed: Some(observed_tx), release: Some(release_rx), calls: calls.clone() };
+                    let mut handler = AbortHandler(tokio::spawn(handle_client_with_connector(
+                        server, Egress::Tor(tor.clone(), Some(Arc::new(pre.clone())), Some(Arc::new(global_post.clone())), false),
+                        Some(state), ConnHealthCounters::default(), false, 1, connector,
+                    )));
+                    if http {
+                        client.write_all(b"CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic YWxpY2U6cHc=\r\n\r\n").await.unwrap();
+                    } else {
+                        socks_auth(&mut client, b"pw").await;
+                        client.write_all(&[5, 1, 0, 1, 1, 2, 3, 4, 0, 80]).await.unwrap();
+                    }
+                    if mode < 2 {
+                        let (post, host, port) = observed_rx.await.unwrap();
+                        assert_eq!(post, Some(if mode == 0 { global_post.clone() } else { account_post.clone() }));
+                        assert_eq!((host.as_str(), port), if http { ("example.com", 443) } else { ("1.2.3.4", 80) });
+                        release_tx.send(()).unwrap();
+                        let error = (&mut handler.0).await.unwrap().unwrap_err();
+                        assert!(matches!(error.downcast_ref::<arti_wrapper::TorError>(), Some(arti_wrapper::TorError::PostSocks(socks5_proto::client::Error::InvalidInput))));
+                        assert_eq!(calls.load(Ordering::SeqCst), 1);
+                    } else {
+                        (&mut handler.0).await.unwrap().unwrap();
+                        assert!(observed_rx.await.is_err());
+                        assert_eq!(calls.load(Ordering::SeqCst), 0);
+                        let mut response = Vec::new();
+                        client.read_to_end(&mut response).await.unwrap();
+                        if http { assert!(response.starts_with(b"HTTP/1.1 403 "), "{response:?}"); }
+                        else { assert_eq!(response, [5, 2, 0, 1, 0, 0, 0, 0, 0, 0]); }
+                    }
+                }
+            }
+        }
+    }).await.expect("global pre handler regression timed out");
+}
+
 // Проверяется граница ошибки, а не успешный Tor-поток или e2e.
 #[tokio::test]
 async fn tor_handler_routes_and_releases_admission_on_error_or_cancel() {
@@ -743,7 +815,7 @@ async fn tor_handler_routes_and_releases_admission_on_error_or_cancel() {
                     let calls = Arc::new(AtomicUsize::new(0));
                     let connector = ParkedTorConnector { observed: Some(observed_tx), release: Some(release_rx), calls: calls.clone() };
                     let mut handler = AbortHandler(tokio::spawn(handle_client_with_connector(
-                        server, Egress::Tor(tor.clone(), Some(Arc::new(global)), false),
+                        server, Egress::Tor(tor.clone(), None, Some(Arc::new(global)), false),
                         Some(state.clone()), ConnHealthCounters::default(), false, 1, connector,
                     )));
                     if http {

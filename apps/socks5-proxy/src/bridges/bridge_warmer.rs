@@ -253,6 +253,8 @@ pub fn spawn_bridge_warmer(
     cfg: WarmPoolConfig,
     token: CancellationToken,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    #[cfg(test)]
+    crate::test_seams::forbid_producer("warmer");
     if !cfg.enabled {
         info!("bridge warm-pool disabled");
         return None;

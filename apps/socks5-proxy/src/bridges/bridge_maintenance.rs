@@ -112,6 +112,8 @@ pub(crate) fn spawn(
     mut active: Settings,
     token: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
+    #[cfg(test)]
+    crate::test_seams::forbid_producer("maintenance");
     // The server runtime joins this handle at shutdown, so an in-flight refresh finishes and its store writes land before the bridge-store writer closes.
     tokio::spawn(async move {
         let mut ticker =

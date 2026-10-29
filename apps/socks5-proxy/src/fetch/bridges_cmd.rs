@@ -12,8 +12,13 @@ use tracing::info;
 
 use crate::cli::BridgesAction;
 use crate::config::{Config, Loaded};
-use crate::startup::{init_tracing, install_crypto_provider};
+use crate::startup::{init_tracing, install_crypto_provider, reject_unsupported_endpoint};
 use crate::tor_setup::build_tor_settings;
+
+#[cfg(test)]
+tokio::task_local! {
+    static FETCH_BOUNDARY: std::cell::Cell<bool>;
+}
 
 /// cancel-safe: NO — bootstraps Tor, performs network I/O, writes config.
 pub(crate) async fn cmd_bridges(
@@ -35,7 +40,12 @@ pub(crate) async fn cmd_bridges(
         }
     };
     let cfg = loaded.into_config();
+    reject_unsupported_endpoint(&cfg.pre_socks5, "bridges fetch global pre_socks5")?;
 
+    #[cfg(test)]
+    if FETCH_BOUNDARY.try_with(|hit| hit.set(true)).is_ok() {
+        bail!("test stopped before fetch startup");
+    }
     let _log_guard = init_tracing(&cfg);
     install_crypto_provider();
 
@@ -89,3 +99,7 @@ pub(crate) async fn cmd_bridges(
     tokio::time::sleep(Duration::from_millis(200)).await;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "bridges_cmd_tests.rs"]
+mod tests;
