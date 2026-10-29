@@ -24,7 +24,7 @@ mod registry_lock_tests;
 
 pub use compute_hash::{compute_hash, verify_hash};
 pub use params::{argon2_instance, ARGON_M_KIB, ARGON_P, ARGON_T};
-pub use state::{AuthState, INIT_SENTINEL};
+pub use state::{AdmissionLease, AuthState, CredentialProof, INIT_SENTINEL};
 pub use user::User;
 pub use users_config::UsersConfig;
 
