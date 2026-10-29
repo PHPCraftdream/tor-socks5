@@ -146,6 +146,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dial_timeout_returns_post_socks_timeout() {
+        type TestStream = tokio_util::compat::Compat<tokio::io::DuplexStream>;
+        let result = connect_post_over_dial(
+            std::future::pending::<Result<TestStream, TorError>>(),
+            "target.example",
+            443,
+            None,
+            Instant::now() - Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(result, Err(TorError::PostSocksTimeout)));
+    }
+
+    #[tokio::test]
     async fn dialled_stream_uses_credentials_and_preserves_target_domain() {
         let (client, mut peer) = tokio::io::duplex(256);
         let credentials = Credentials::new("user", "pass").unwrap();
