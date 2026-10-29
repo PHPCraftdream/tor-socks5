@@ -20,9 +20,8 @@ use crate::config::{Config, Loaded, SecurityConfig};
 use crate::conn_health::{spawn_conn_health_logger, ConnHealthCounters};
 use crate::dns_wiring::{convert_custom_doh_providers, convert_dns_overrides, dns_cache_path};
 use crate::startup::{
-    connect_tor_route, init_tracing, install_crypto_provider, reject_unsupported_endpoint,
-    resolve_admitted_route, validate_account_routes, validate_post_compatibility,
-    AuthStateVerifier,
+    connect_tor_route, init_tracing, install_crypto_provider, resolve_admitted_route,
+    validate_account_routes, validate_post_compatibility, AuthStateVerifier,
 };
 use crate::tor_setup::build_tor_settings;
 use crate::tor_watchdog::{spawn_bridge_failover_watchdog, spawn_tor_watchdog, TorHandle};
@@ -61,7 +60,12 @@ const PRODUCER_JOIN_TIMEOUT: Duration = Duration::from_secs(120);
 /// replaces Tor entirely.
 #[derive(Clone)]
 enum Egress {
-    Tor(TorHandle, Option<Arc<proxy_config::EndpointOverride>>, bool),
+    Tor(
+        TorHandle,
+        Option<Arc<proxy_config::EndpointOverride>>,
+        Option<Arc<proxy_config::EndpointOverride>>,
+        bool,
+    ),
     Upstream(Arc<upstream::Upstream>),
 }
 
@@ -88,7 +92,17 @@ pub(crate) async fn run_server(
         Loaded::Defaults(_) => (None, "built-in defaults".to_string()),
     };
     let cfg = loaded.into_config();
-    reject_unsupported_endpoint(&cfg.pre_socks5, "global pre_socks5")?;
+    let pre_socks = cfg
+        .pre_socks5
+        .clone()
+        .filter(|setting| matches!(setting, proxy_config::EndpointOverride::Endpoint(_)))
+        .map(Arc::new);
+    validate_pre_compatibility(
+        pre_socks.is_some(),
+        cfg.dns_server.enabled,
+        cfg.onion_services.iter().any(|service| service.enabled),
+        false,
+    )?;
     let post_socks = cfg
         .post_socks5
         .clone()
@@ -163,6 +177,7 @@ pub(crate) async fn run_server(
         args.no_upstream,
     )? {
         Some(up) => {
+            validate_pre_compatibility(pre_socks.is_some(), false, false, true)?;
             validate_post_compatibility(post_socks.is_some(), false, true)?;
             validate_account_routes(
                 &users,
@@ -236,66 +251,15 @@ pub(crate) async fn run_server(
                     && crate::bridge_maintenance::preferred_missing(&cfg, &settings.bridges),
             );
 
-            // Periodic upkeep: re-probe, prune dead bridges, top up when short,
-            // drain circuit-layer observations from arti's tracing into the
-            // health store so descriptor-mismatch / unsuitable bridges are
-            // pruned alongside the TCP-dead ones. Reads the tunnel through
-            // the handle so pool refreshes follow a watchdog rebuild.
-            producers.push(crate::bridge_maintenance::spawn(
+            bridge_producers::launch(
                 handle.clone(),
                 config_path.clone(),
-                cfg.bridges.recheck_interval_mins,
+                &cfg,
                 obs_sink.clone(),
                 settings,
                 producer_token.clone(),
-            ));
-
-            // Stale-channel watchdog: rebuilds the `TorClient` when circuits
-            // keep failing against TCP-reachable bridges (the half-open
-            // channel scenario). Joined at shutdown; disabled by config when unwanted.
-            producers.extend(spawn_tor_watchdog(
-                handle.clone(),
-                config_path.clone(),
-                cfg.watchdog,
-                producer_token.clone(),
-            ));
-
-            // Soft-failover watchdog: nudges arti's guard manager away from
-            // a specific bridge whose own circuit-layer health has degraded
-            // past a threshold, when a meaningfully healthier configured
-            // alternative exists. Shares the `[watchdog]` config section and
-            // check cadence with the stale-channel watchdog above; disabled
-            // by the same `enabled`/`check_interval_secs` switches.
-            producers.extend(spawn_bridge_failover_watchdog(
-                handle.clone(),
-                config_path.clone(),
-                cfg.watchdog,
-                producer_token.clone(),
-            ));
-
-            // Bridge-channel warm-pool: keeps channels to the healthiest
-            // candidate bridges open in the background, so a future
-            // switch-over (not built here) does not pay for a cold
-            // obfs4/webtunnel handshake. Opt-in; disabled by default.
-            producers.extend(crate::bridge_warmer::spawn_bridge_warmer(
-                handle.clone(),
-                config_path.clone(),
-                cfg.warm_pool,
-                producer_token.clone(),
-            ));
-
-            // Periodic circuit-level bridge verification: every 30 min, checks
-            // a small batch of channel-proven bridges for real end-to-end
-            // reachability (throwaway clients, live probe) and records the
-            // successes into the bridge store. This is the CLI counterpart of
-            // android-ffi's background circuit-verify tick; it is self-paced
-            // by store state (a tick with no due bridges is nearly free) and
-            // uses the active pool but verifies through separate clients.
-            producers.push(crate::bridge_verifier::spawn_bridge_circuit_verifier(
-                config_path.clone(),
-                handle.clone(),
-                producer_token.clone(),
-            ));
+                &mut producers,
+            );
 
             // Onion services from the config: one more producer (launches
             // each enabled service, forwards its virtual ports to local
@@ -322,7 +286,7 @@ pub(crate) async fn run_server(
                 }
             }
 
-            Egress::Tor(handle, post_socks, cfg.dns_server.enabled)
+            Egress::Tor(handle, pre_socks, post_socks, cfg.dns_server.enabled)
         }
     };
 
@@ -332,7 +296,7 @@ pub(crate) async fn run_server(
     // ("client DNS leaves the machine only inside Tor") cannot be honoured,
     // and refusing to start beats silently leaking plaintext queries.
     if cfg.dns_server.enabled {
-        let Egress::Tor(handle, _, _) = &egress else {
+        let Egress::Tor(handle, _, _, _) = &egress else {
             bail!(
                 "dns_server.enabled requires Tor egress, not an upstream SOCKS5 proxy — \
                  disable dns_server or remove the upstream"
@@ -462,7 +426,7 @@ pub(crate) async fn run_server(
     // subprocesses and releases arti's exclusive lock on its state
     // directory. The Job Object installed at startup kills anything that
     // leaks past this point. The upstream egress holds no such resources.
-    if let Egress::Tor(handle, _, _) = egress {
+    if let Egress::Tor(handle, _, _, _) = egress {
         info!("stopping Tor client and pluggable transports");
         // Order matters: cancel first (no producer starts a new work
         // iteration), then drain the slot (in-flight tunnel reads see
@@ -495,6 +459,31 @@ pub(crate) async fn run_server(
     }
     info!("bye");
     Ok(())
+}
+
+fn validate_pre_compatibility(pre: bool, dns: bool, onion: bool, upstream: bool) -> Result<()> {
+    if pre && (dns || onion || upstream) {
+        bail!("global pre_socks5 cannot be combined with DNS listener, enabled onion services, or upstream egress");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod pre_policy_tests {
+    use super::validate_pre_compatibility;
+
+    #[test]
+    fn rejects_independent_egress_only_with_global_pre() {
+        for (dns, onion, upstream) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            assert!(validate_pre_compatibility(true, dns, onion, upstream).is_err());
+            assert!(validate_pre_compatibility(false, dns, onion, upstream).is_ok());
+        }
+        assert!(validate_pre_compatibility(true, false, false, false).is_ok());
+    }
 }
 
 /// Shutdown choreography for the Tor-side background producers (bridge
@@ -749,11 +738,12 @@ async fn handle_client_with_connector<C: TorConnector + Send>(
         req.reply(&mut client, Reply::Forbidden).await.ok();
         return Ok(());
     }
-    let (global_post, dns, upstream) = match &egress {
-        Egress::Tor(_, post, dns) => (post.as_deref(), *dns, false),
-        Egress::Upstream(_) => (None, false, true),
+    let (global_pre, global_post, dns, upstream) = match &egress {
+        Egress::Tor(_, pre, post, dns) => (pre.as_deref(), post.as_deref(), *dns, false),
+        Egress::Upstream(_) => (None, None, false, true),
     };
-    let post = match resolve_admitted_route(global_post, lease.as_ref(), dns, upstream) {
+    let post = match resolve_admitted_route(global_pre, global_post, lease.as_ref(), dns, upstream)
+    {
         Ok(post) => post,
         Err(error) => {
             drop(lease);
@@ -764,7 +754,7 @@ async fn handle_client_with_connector<C: TorConnector + Send>(
     };
 
     match egress {
-        Egress::Tor(handle, _, _) => {
+        Egress::Tor(handle, _, _, _) => {
             handle.bridge_refresh().request();
             info!(host = ?host, port = port, "tunneling through Tor");
             // Read the *current* tunnel through the handle: a watchdog
@@ -899,6 +889,9 @@ pub(crate) fn compute_deficit(min_alive: usize, tcp_alive: usize, circuit_health
     let effective_healthy = tcp_alive.min(circuit_healthy);
     min_alive.saturating_sub(effective_healthy)
 }
+
+#[path = "../fetch/bridge_producers.rs"]
+mod bridge_producers;
 
 #[path = "listen/server_binding.rs"]
 mod binding;

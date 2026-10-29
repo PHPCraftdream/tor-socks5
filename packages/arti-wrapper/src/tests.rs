@@ -699,3 +699,288 @@ fn onion_service_server_api_is_available() {
     let cfg = OnionServiceConfigBuilder::default();
     let _ = cfg.build();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn nonloopback_proxy_warning_omits_credentials() {
+    use std::fmt::Write;
+    use std::future::Future;
+    use std::sync::Mutex;
+    use std::task::Context;
+    use tracing::{field, span, Event, Metadata, Subscriber};
+
+    struct Capture(Arc<Mutex<Vec<String>>>);
+    struct Fields(String);
+    impl field::Visit for Fields {
+        fn record_debug(&mut self, field: &field::Field, value: &dyn std::fmt::Debug) {
+            write!(self.0, "{}={value:?} ", field.name()).unwrap();
+        }
+    }
+    impl Subscriber for Capture {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.is_event() && *metadata.level() == tracing::Level::WARN
+        }
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+        fn enter(&self, _: &span::Id) {}
+        fn exit(&self, _: &span::Id) {}
+        fn event(&self, event: &Event<'_>) {
+            if event.metadata().target().starts_with("tor_chanmgr") {
+                let mut fields = Fields(String::new());
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(fields.0);
+            }
+        }
+    }
+
+    ensure_crypto_provider();
+    let state = tempfile::tempdir().unwrap();
+    let settings = Settings {
+        state_dir: Some(state.path().to_path_buf()),
+        pre_endpoint: Some(Socks5PreEndpoint::new(
+            "192.0.2.77:1087".parse().unwrap(),
+            Some(("warn-user@marker".to_owned(), "warn-pass:marker".to_owned())),
+        )),
+        ..Default::default()
+    };
+    let tunnel = TorTunnel::create_unbootstrapped_with(settings).unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let dispatch = tracing::Dispatch::new(Capture(events.clone()));
+    let mut bootstrap = Box::pin(tunnel.wait_bootstrapped());
+    let waker = futures::task::noop_waker();
+    let mut context = Context::from_waker(&waker);
+    // Конструктор ChanMgr вызывается при опросе bootstrap; диспетчер действует только на этот опрос.
+    // Current-thread runtime и отсутствие await до конца теста не дают запущенным
+    // bootstrap задачам выполняться; runtime уничтожается вместе с ними без сети.
+    tracing::dispatcher::with_default(&dispatch, || {
+        let _ = bootstrap.as_mut().poll(&mut context);
+    });
+    let events = events.lock().unwrap();
+    let warning = events
+        .iter()
+        .find(|event| event.contains("non-loopback"))
+        .expect("предупреждение конструктора ChanMgr не получено");
+    assert!(warning.contains("proxy_scheme=socks5 "), "{warning}");
+    assert!(warning.contains("proxy_addr=192.0.2.77:1087 "), "{warning}");
+    for event in events.iter() {
+        for secret in [
+            "warn-user@marker",
+            "warn-pass:marker",
+            "warn-user%40marker",
+            "warn-pass%3Amarker",
+            "warn-pass%3amarker",
+        ] {
+            assert!(
+                !event.contains(secret),
+                "обнаружены учётные данные: {event}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn initial_bootstrap_uses_pre_proxy_without_direct_fallback_after_rejection() {
+    use std::future::Future;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::time::timeout;
+
+    ensure_crypto_provider();
+    let state = tempfile::tempdir().unwrap();
+    let direct = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = direct.local_addr().unwrap();
+    // Отдельный адрес и идентификатор исключают совмещение warm с bootstrap.
+    let bootstrap_direct = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bootstrap_target = bootstrap_direct.local_addr().unwrap();
+    let pre = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bridge: BridgeLine = format!(
+        "{} ABCDEF0123456789ABCDEF0123456789ABCDEF01",
+        bootstrap_target
+    )
+    .parse()
+    .unwrap();
+    let warm_bridge: BridgeLine = format!("{} 2222222222222222222222222222222222222222", target)
+        .parse()
+        .unwrap();
+    let settings = Settings {
+        state_dir: Some(state.path().to_path_buf()),
+        bridges: vec![bridge],
+        disable_preemptive_circuits: true,
+        pre_endpoint: Some(Socks5PreEndpoint::new(
+            pre.local_addr().unwrap(),
+            Some(("bootstrap-user".to_owned(), "bootstrap-secret".to_owned())),
+        )),
+        ..Default::default()
+    };
+    let tunnel = TorTunnel::create_unbootstrapped_with(settings.clone()).unwrap();
+    tunnel.reconfigure_bridges(&settings).unwrap();
+
+    // Один опрос создаёт менеджер; дальше наблюдаем и bootstrap, и warm.
+    let mut bootstrap = Box::pin(tunnel.wait_bootstrapped());
+    let waker = futures::task::noop_waker();
+    assert!(bootstrap
+        .as_mut()
+        .poll(&mut Context::from_waker(&waker))
+        .is_pending());
+    let warm = tunnel.warm_bridge(&warm_bridge);
+    tokio::pin!(warm);
+    let mut exchanges = futures::stream::FuturesUnordered::new();
+    let mut bootstrap_seen = false;
+    let mut warm_seen = false;
+    let mut warm_result = None;
+    use futures::StreamExt;
+    timeout(Duration::from_secs(20), async {
+        while warm_result.is_none() || !bootstrap_seen || !warm_seen {
+            tokio::select! {
+                result = &mut bootstrap => panic!("неожиданное завершение bootstrap: {result:?}"),
+                result = bootstrap_direct.accept() => panic!("прямое подключение bootstrap: {result:?}"),
+                result = direct.accept() => panic!("прямое подключение warm: {result:?}"),
+                result = &mut warm, if warm_result.is_none() => {
+                    warm_result = Some(result);
+                    assert!(matches!(direct.poll_accept(&mut Context::from_waker(&waker)), Poll::Pending),
+                        "в очереди обнаружено прямое подключение warm");
+                },
+                result = pre.accept() => {
+                    let (mut peer, _) = result.unwrap();
+                    exchanges.push(async move {
+                        let mut greeting = [0u8; 2];
+                        peer.read_exact(&mut greeting).await.unwrap();
+                        assert_eq!(greeting[0], 5);
+                        let mut methods = vec![0; greeting[1] as usize];
+                        peer.read_exact(&mut methods).await.unwrap();
+                        assert!(methods.contains(&2), "SOCKS должен предложить пароль");
+                        peer.write_all(&[5, 2]).await.unwrap();
+                        let mut auth = [0u8; 2];
+                        peer.read_exact(&mut auth).await.unwrap();
+                        assert_eq!(auth[0], 1);
+                        let mut user = vec![0; auth[1] as usize];
+                        peer.read_exact(&mut user).await.unwrap();
+                        let mut len = [0u8; 1];
+                        peer.read_exact(&mut len).await.unwrap();
+                        let mut password = vec![0; len[0] as usize];
+                        peer.read_exact(&mut password).await.unwrap();
+                        assert_eq!(user, b"bootstrap-user");
+                        assert_eq!(password, b"bootstrap-secret");
+                        peer.write_all(&[1, 0]).await.unwrap();
+                        let mut request = [0u8; 4];
+                        peer.read_exact(&mut request).await.unwrap();
+                        assert_eq!(request, [5, 1, 0, 1]);
+                        let mut address = [0u8; 6];
+                        peer.read_exact(&mut address).await.unwrap();
+                        assert_eq!(&address[..4], &[127, 0, 0, 1]);
+                        let port = u16::from_be_bytes([address[4], address[5]]);
+                        assert!(port == target.port() || port == bootstrap_target.port(), "неизвестный CONNECT: {port}");
+                        peer.write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0]).await.unwrap();
+                        port
+                    });
+                },
+                Some(port) = exchanges.next(), if !exchanges.is_empty() => {
+                    bootstrap_seen |= port == bootstrap_target.port();
+                    warm_seen |= port == target.port();
+                },
+            }
+        }
+    }).await.expect("warm или bootstrap не завершил наблюдаемую попытку до истечения срока");
+    assert!(warm_seen, "нет отказа SOCKS для warm");
+    // Error::Connect содержит список ошибок, а не стандартную цепочку source.
+    match warm_result.unwrap() {
+        Err(TorError::Warm { source, .. }) => match *source {
+            tor_chanmgr::Error::Connect { addresses } => {
+                let errors = format!("{addresses:?}");
+                assert!(
+                    errors.contains("SocksError(SocksStatus(CONNECTION_REFUSED))"),
+                    "{errors}"
+                );
+            }
+            other => panic!("ожидался отказ SOCKS, получено: {other:?}"),
+        },
+        other => panic!("ожидался Warm с отказом SOCKS: {other:?}"),
+    }
+    // get_or_launch ожидает build_channel и его повторы до возврата ошибки.
+    // Это проверка очереди в момент завершения, а не бесконечного отсутствия трафика.
+    assert!(
+        matches!(
+            direct.poll_accept(&mut Context::from_waker(&waker)),
+            Poll::Pending
+        ),
+        "в очереди обнаружено прямое подключение warm"
+    );
+    assert!(matches!(
+        bootstrap_direct.poll_accept(&mut Context::from_waker(&waker)),
+        Poll::Pending
+    ));
+}
+
+#[tokio::test]
+async fn reconfigure_cannot_enable_pre_on_direct_shared_client() {
+    ensure_crypto_provider();
+    let state = tempfile::tempdir().unwrap();
+    let initial = Settings {
+        state_dir: Some(state.path().to_path_buf()),
+        ..Default::default()
+    };
+    let tunnel = TorTunnel::create_unbootstrapped_with(initial.clone()).unwrap();
+    let mut changed = initial.clone();
+    changed.pre_endpoint = Some(Socks5PreEndpoint::new(
+        "127.0.0.1:9050".parse().unwrap(),
+        None,
+    ));
+    let err = tunnel.clone().reconfigure_bridges(&changed).unwrap_err();
+    assert!(
+        matches!(err, TorError::BuildConfig(ref message) if message == "cannot change the pre endpoint on a shared client")
+    );
+    tunnel.reconfigure_bridges(&initial).unwrap();
+}
+
+#[tokio::test]
+async fn raw_default_configuration_can_still_be_reconfigured() {
+    ensure_crypto_provider();
+    let state = tempfile::tempdir().unwrap();
+    let settings = Settings {
+        state_dir: Some(state.path().to_path_buf()),
+        ..Default::default()
+    };
+    let tunnel = TorTunnel::create_unbootstrapped(build_config(&settings).unwrap()).unwrap();
+    tunnel.reconfigure_bridges(&settings).unwrap();
+}
+
+#[tokio::test]
+async fn pre_endpoint_is_immutable_across_clones() {
+    ensure_crypto_provider();
+    let state = tempfile::tempdir().unwrap();
+    let settings = Settings {
+        state_dir: Some(state.path().to_path_buf()),
+        pre_endpoint: Some(Socks5PreEndpoint::new(
+            "127.0.0.1:9050".parse().unwrap(),
+            None,
+        )),
+        ..Default::default()
+    };
+    let tunnel = TorTunnel::create_unbootstrapped_with(settings.clone()).unwrap();
+    let mut changed = settings.clone();
+    changed.pre_endpoint = None;
+    let err = tunnel.clone().reconfigure_bridges(&changed).unwrap_err();
+    assert!(
+        matches!(err, TorError::BuildConfig(ref message) if message == "cannot change the pre endpoint on a shared client")
+    );
+    changed.pre_endpoint = Some(Socks5PreEndpoint::new(
+        "127.0.0.1:9051".parse().unwrap(),
+        None,
+    ));
+    let err = tunnel.clone().reconfigure_bridges(&changed).unwrap_err();
+    assert!(
+        matches!(err, TorError::BuildConfig(ref message) if message == "cannot change the pre endpoint on a shared client")
+    );
+    changed.pre_endpoint = Some(Socks5PreEndpoint::new(
+        "127.0.0.1:9050".parse().unwrap(),
+        Some(("user".to_owned(), "secret".to_owned())),
+    ));
+    let err = tunnel.clone().reconfigure_bridges(&changed).unwrap_err();
+    assert!(
+        matches!(err, TorError::BuildConfig(ref message) if message == "cannot change the pre endpoint on a shared client")
+    );
+    tunnel.reconfigure_bridges(&settings).unwrap();
+}

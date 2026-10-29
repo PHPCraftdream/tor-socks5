@@ -256,6 +256,8 @@ pub(crate) fn spawn_bridge_circuit_verifier(
     handle: crate::tor_watchdog::TorHandle,
     token: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
+    #[cfg(test)]
+    crate::test_seams::forbid_producer("verifier");
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(CIRCUIT_VERIFY_INTERVAL);
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);

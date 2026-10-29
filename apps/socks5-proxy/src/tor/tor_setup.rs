@@ -62,6 +62,43 @@ pub(crate) async fn build_tor_settings_preserving_live(
     config_path: Option<&Path>,
     live: &[BridgeLine],
 ) -> Result<Settings> {
+    if let Some(endpoint) = proxy_config::resolve_endpoint(cfg.pre_socks5.as_ref(), None) {
+        if cfg.bridges.use_seeds || cfg.bridges.auto_fetch {
+            bail!("pre_socks5 requires bridges.use_seeds and bridges.auto_fetch to be disabled");
+        }
+        if cfg.warm_pool.enabled {
+            bail!("pre_socks5 is incompatible with warm_pool.enabled");
+        }
+        for line in &cfg.bridges.lines {
+            if !line.starts_with(bridge_probe::DNS_HINT_PREFIX) {
+                let bridge: BridgeLine = line.parse().context("parsing configured bridge")?;
+                if bridge.transport.is_some() {
+                    bail!("pre_socks5 does not support pluggable transport bridges");
+                }
+            }
+        }
+        let bridges = cfg
+            .bridges
+            .parsed()
+            .context("parsing bridges from config")?
+            .bridges;
+        if bridges.is_empty() {
+            bail!("pre_socks5 requires at least one explicitly configured usable plain bridge");
+        }
+        return Ok(Settings {
+            bridges,
+            state_dir: Some(arti_base_dir(config_path)),
+            pre_endpoint: Some(arti_wrapper::Socks5PreEndpoint::new(
+                endpoint.address(),
+                endpoint
+                    .credentials()
+                    .map(|(user, pass)| (user.to_owned(), pass.to_owned())),
+            )),
+            pt_binary: None,
+            extra_pt_protocols: Vec::new(),
+            ..settings_for_config(cfg)
+        });
+    }
     let parsed = cfg
         .bridges
         .parsed()
@@ -304,10 +341,20 @@ pub(crate) fn preferred_transport_bridges(
     matching
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static FORBID_STARTUP_PROBE: ();
+}
+
 pub(crate) async fn probe_measured(
     bridges: Vec<BridgeLine>,
     cfg: &Config,
 ) -> (Vec<BridgeLine>, Vec<(BridgeLine, Duration)>) {
+    #[cfg(test)]
+    assert!(
+        FORBID_STARTUP_PROBE.try_with(|_| ()).is_err(),
+        "unexpected app-owned bridge probe"
+    );
     let round = bridge_probe::probe_round_with_policy(
         bridges.clone(),
         BRIDGE_PROBE_TIMEOUT,
@@ -383,7 +430,6 @@ fn select_active_probe_bridges(
     if configured.len() <= MAX_ACTIVE_BRIDGES {
         return configured.to_vec();
     }
-
     let by_text: HashMap<String, BridgeLine> = configured
         .iter()
         .map(|bridge| (bridge.to_string(), bridge.clone()))
@@ -399,7 +445,6 @@ fn select_active_probe_bridges(
             return ranked;
         }
     }
-
     configured
         .iter()
         .take(MAX_ACTIVE_BRIDGES)
@@ -562,15 +607,9 @@ fn prune_bridges_from_config(path: &Path, dead: &[BridgeLine]) -> Result<usize> 
     Ok(removed)
 }
 
-/// Pure decision function: extract PT binary path from an optional env var value.
-/// Returns `None` for `None` or empty `OsStr`; `Some(PathBuf)` for non-empty values.
-/// This is testable without touching process state.
-fn pt_binary_override_from(value: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
-    match value {
-        Some(v) if !v.is_empty() => Some(std::path::PathBuf::from(v)),
-        _ => None,
-    }
-}
+#[path = "../fetch/pt_binary_override.rs"]
+mod pt_binary_override;
+use pt_binary_override::pt_binary_override_from;
 
 /// Resolve the PT binary path for arti's `tor-ptmgr` to spawn.
 ///

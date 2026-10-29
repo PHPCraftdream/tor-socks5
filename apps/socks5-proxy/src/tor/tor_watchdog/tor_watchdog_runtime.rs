@@ -279,6 +279,8 @@ pub fn spawn_bridge_failover_watchdog(
     cfg: WatchdogConfig,
     token: CancellationToken,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    #[cfg(test)]
+    crate::test_seams::forbid_producer("failover");
     if !cfg.enabled || cfg.check_interval_secs == 0 {
         info!("bridge soft-failover watchdog disabled");
         return None;
@@ -457,6 +459,8 @@ pub fn spawn_tor_watchdog(
     cfg: WatchdogConfig,
     token: CancellationToken,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    #[cfg(test)]
+    crate::test_seams::forbid_producer("watchdog");
     if !cfg.enabled || cfg.check_interval_secs == 0 {
         info!("tor stale-channel watchdog disabled");
         return None;

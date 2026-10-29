@@ -46,7 +46,7 @@ pub(crate) fn validate_account_routes(
     Ok(())
 }
 
-/// Разрешить pre и post независимо; неподдерживаемый pre всегда запрещён.
+/// Разрешить pre и post независимо, сохраняя общий процессный pre.
 pub(crate) fn resolve_account_route(
     global_pre: Option<&EndpointOverride>,
     global_post: Option<&EndpointOverride>,
@@ -55,10 +55,14 @@ pub(crate) fn resolve_account_route(
     dns: bool,
     upstream: bool,
 ) -> anyhow::Result<Option<EndpointOverride>> {
+    let global_pre_resolved = proxy_config::resolve_endpoint(global_pre, None);
     let pre = proxy_config::resolve_endpoint(global_pre, account_pre);
     let post = proxy_config::resolve_endpoint(global_post, account_post);
-    if pre.is_some() {
-        anyhow::bail!("effective pre_socks5 endpoint is not supported yet");
+    if upstream && global_pre_resolved.is_some() {
+        anyhow::bail!("global pre_socks5 cannot be combined with upstream egress");
+    }
+    if pre != global_pre_resolved {
+        anyhow::bail!("effective pre_socks5 must match the global pre_socks5");
     }
     validate_post_compatibility(post.is_some(), dns, upstream)?;
     Ok(post.map(EndpointOverride::Endpoint))
@@ -66,13 +70,14 @@ pub(crate) fn resolve_account_route(
 
 /// Маршрут определяется только из допущенного снимка.
 pub(crate) fn resolve_admitted_route(
+    global_pre: Option<&EndpointOverride>,
     global_post: Option<&EndpointOverride>,
     lease: Option<&auth::AdmissionLease>,
     dns: bool,
     upstream: bool,
 ) -> anyhow::Result<Option<EndpointOverride>> {
     resolve_account_route(
-        None,
+        global_pre,
         global_post,
         lease.and_then(|lease| lease.pre_socks5()),
         lease.and_then(|lease| lease.post_socks5()),
@@ -211,8 +216,8 @@ pub(crate) fn init_tracing(cfg: &Config) -> (WorkerGuard, ObservationSink) {
 #[cfg(test)]
 mod endpoint_guard_tests {
     use super::{
-        reject_unsupported_endpoint, resolve_account_route, select_post_route,
-        validate_account_routes, validate_post_compatibility,
+        reject_unsupported_endpoint, resolve_account_route, resolve_admitted_route,
+        select_post_route, validate_account_routes, validate_post_compatibility,
     };
     use auth::{User, UsersConfig};
     use proxy_config::EndpointOverride;
@@ -278,12 +283,12 @@ mod endpoint_guard_tests {
                 .unwrap(),
             Some(replacement.clone())
         );
-        assert!(resolve_account_route(Some(&global), None, None, None, false, false).is_err());
+        assert!(resolve_account_route(Some(&global), None, None, None, false, false).is_ok());
         assert_eq!(
             resolve_account_route(
                 Some(&global),
+                Some(&global),
                 None,
-                Some(&disabled),
                 Some(&replacement),
                 false,
                 false
@@ -291,9 +296,104 @@ mod endpoint_guard_tests {
             .unwrap(),
             Some(replacement.clone())
         );
+        assert!(resolve_account_route(
+            Some(&global),
+            None,
+            Some(&disabled),
+            Some(&replacement),
+            false,
+            false
+        )
+        .is_err());
         assert!(resolve_account_route(None, None, Some(&replacement), None, false, false).is_err());
         assert!(resolve_account_route(None, None, None, Some(&replacement), true, false).is_err());
         assert!(resolve_account_route(None, None, None, Some(&replacement), false, true).is_err());
+    }
+
+    #[test]
+    fn pre_must_match_global_including_credentials() {
+        let global = EndpointOverride::Endpoint("127.0.0.1:1080|alice:secret".parse().unwrap());
+        let equal = global.clone();
+        let other_address =
+            EndpointOverride::Endpoint("127.0.0.1:1081|alice:secret".parse().unwrap());
+        let other_user = EndpointOverride::Endpoint("127.0.0.1:1080|bob:secret".parse().unwrap());
+        let other_password =
+            EndpointOverride::Endpoint("127.0.0.1:1080|alice:other".parse().unwrap());
+        let no_credentials = endpoint();
+        let disabled = EndpointOverride::Disabled;
+        for account in [None, Some(&equal)] {
+            assert!(
+                resolve_account_route(Some(&global), None, account, None, false, false).is_ok()
+            );
+            assert!(
+                resolve_account_route(Some(&global), None, account, None, false, true).is_err()
+            );
+        }
+        for account in [
+            &other_address,
+            &other_user,
+            &other_password,
+            &no_credentials,
+            &disabled,
+        ] {
+            assert!(
+                resolve_account_route(Some(&global), None, Some(account), None, false, false)
+                    .is_err()
+            );
+        }
+        assert!(
+            resolve_account_route(Some(&global), None, Some(&disabled), None, false, true).is_err()
+        );
+        for global in [None, Some(&disabled)] {
+            for account in [None, Some(&disabled)] {
+                assert!(resolve_account_route(global, None, account, None, false, true).is_ok());
+            }
+            assert!(resolve_account_route(global, None, Some(&equal), None, false, false).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_route_uses_lease_snapshot_across_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.ktav");
+        let global = endpoint();
+        let post = EndpointOverride::Endpoint("127.0.0.1:1081".parse().unwrap());
+        let mut account = user(true, None, Some(post.clone()));
+        account.hash = auth::compute_hash("pw").unwrap();
+        let mut users = UsersConfig {
+            users: vec![account],
+        };
+        users.save(&path).unwrap();
+        let state =
+            std::sync::Arc::new(auth::AuthState::build_persistent(&users, path.clone()).unwrap());
+        let proof = state.verify_proof("test", "pw").unwrap();
+        let lease = state.admit(&proof).await.unwrap();
+        assert_eq!(lease.pre_socks5(), None);
+        assert_eq!(
+            resolve_admitted_route(Some(&global), None, Some(&lease), false, false).unwrap(),
+            Some(post)
+        );
+        assert!(resolve_admitted_route(Some(&global), None, Some(&lease), false, true).is_err());
+        users.users[0].pre_socks5 = Some(EndpointOverride::Disabled);
+        users.users[0].post_socks5 = Some(EndpointOverride::Disabled);
+        users.save(&path).unwrap();
+        let reload_state = state.clone();
+        let reload = tokio::task::spawn_blocking(move || reload_state.reload());
+        assert_eq!(
+            resolve_admitted_route(Some(&global), None, Some(&lease), false, false).unwrap(),
+            lease.post_socks5().cloned()
+        );
+        drop(lease);
+        reload.await.unwrap().unwrap();
+        assert!(state.admit(&proof).await.is_none());
+        let fresh = state.verify_proof("test", "pw").unwrap();
+        let lease = state.admit(&fresh).await.unwrap();
+        assert_eq!(lease.pre_socks5(), Some(&EndpointOverride::Disabled));
+        assert!(resolve_admitted_route(Some(&global), None, Some(&lease), false, false).is_err());
+        assert_eq!(
+            resolve_admitted_route(None, Some(&global), Some(&lease), false, false).unwrap(),
+            None
+        );
     }
 
     #[test]
