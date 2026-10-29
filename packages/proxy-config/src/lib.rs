@@ -49,7 +49,7 @@ pub use tor::TorConfig;
 
 /// Реэкспорт, чтобы обвязке auth/dns-server/CLI/FFI хватало одного пути
 /// импорта (`proxy_config::...`) для типов клиентского ACL.
-pub use client_acl::{AllowedClients, AllowedClientsError, ClientAccessConfig};
+pub use client_acl::{AllowedClients, AllowedClientsError, ClientAccessConfig, EndpointOverride};
 const ENV_VAR: &str = "TOR_SOCKS5_CONFIG";
 const DEFAULT_FILE: &str = "tor-socks5.ktav";
 pub(crate) static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -100,6 +100,20 @@ pub struct Config {
     pub conn_health: ConnHealthConfig,
     /// Optional upstream SOCKS5 proxy used as the egress instead of Tor.
     pub upstream: UpstreamConfig,
+    /// Необязательный SOCKS5-прокси для соединений к сети Tor.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "client_acl::socks5_endpoint_field"
+    )]
+    pub pre_socks5: Option<client_acl::EndpointOverride>,
+    /// Необязательный SOCKS5-прокси для соединений через Tor к целевому адресу.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "client_acl::socks5_endpoint_field"
+    )]
+    pub post_socks5: Option<client_acl::EndpointOverride>,
     /// Local SOCKS5 (RFC 1929) authentication for the listener. Used by
     /// both the CLI and the Android JNI FFI crate — see [`AuthConfig`].
     pub auth: AuthConfig,
@@ -825,6 +839,8 @@ impl Default for Config {
             warm_pool: WarmPoolConfig::default(),
             conn_health: ConnHealthConfig::default(),
             upstream: UpstreamConfig::default(),
+            pre_socks5: None,
+            post_socks5: None,
             auth: AuthConfig::default(),
             security: SecurityConfig::default(),
             dns: DnsConfig::default(),
@@ -951,5 +967,8 @@ impl Config {
     }
 }
 
+#[cfg(test)]
+#[path = "tests/socks5_config.rs"]
+mod socks5_config_tests;
 #[cfg(test)]
 mod tests;

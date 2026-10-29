@@ -53,7 +53,7 @@ mod tor_watchdog;
 mod ts19_tests;
 #[path = "server/upstream.rs"]
 mod upstream;
-#[path = "commands/users_cli.rs"]
+#[path = "commands/users_cli/mod.rs"]
 mod users_cli;
 
 use anyhow::{Context, Result};

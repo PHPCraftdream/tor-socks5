@@ -38,6 +38,8 @@ fn main() -> Result<()> {
                 is_enabled: true,
                 allowed_onion: false,
                 allowed_clients: None,
+                pre_socks5: None,
+                post_socks5: None,
             },
             User {
                 name: "bob".into(),
@@ -45,6 +47,8 @@ fn main() -> Result<()> {
                 is_enabled: false,
                 allowed_onion: false,
                 allowed_clients: None,
+                pre_socks5: None,
+                post_socks5: None,
             },
             User {
                 name: "carol".into(),
@@ -52,6 +56,8 @@ fn main() -> Result<()> {
                 is_enabled: true,
                 allowed_onion: false,
                 allowed_clients: None,
+                pre_socks5: None,
+                post_socks5: None,
             },
         ],
     };
