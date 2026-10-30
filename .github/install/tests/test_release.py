@@ -768,7 +768,13 @@ class ReleaseWorkflowWiring(unittest.TestCase):
     def _assert_producer(self, text):
         import re
         jobs = self._jobs(text)
-        self.assertEqual(set(jobs), {'offline-tests', 'build', 'aggregate'})
+        self.assertEqual(set(jobs), {'guard', 'plan', 'offline-tests', 'build', 'aggregate', 'required'})
+        self.assertNotIn('workflow_call:', self._top(text, 'on')); self.assertNotRegex(jobs['guard'], r'(?m)^    if:')
+        self._contains_line(jobs['guard'], '[ "$EVENT" = pull_request ] || { [ "$EVENT" = workflow_dispatch ] && [ "$REF" = refs/heads/main ]; }')
+        self._contains_line(jobs['plan'], 'needs: guard'); self.assertNotRegex(jobs['plan'], r'(?m)^    if:')
+        self.assertIn('--event pull_request --base "$BASE" --head "$HEAD"', jobs['plan']); self._contains_line(jobs['plan'], '''printf '%s\\n' '{"segments":["license-offline"]}' > "$RUNNER_TEMP/license-plan.json"''')
+        self.assertIn("require(e['PLAN_RESULT'] == 'success')", jobs['required']); self._contains_line(jobs['required'], 'if: always()'); self._contains_line(jobs['required'], 'needs: [guard, plan, offline-tests, build, aggregate]')
+        self._contains_line(jobs['build'], "if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'"); self._contains_line(jobs['build'], 'needs: [guard, plan]')
         job_envs = {}
         for name, job in jobs.items():
             envs = re.findall(r'(?m)^    env:[ \t]*\n((?:(?: {6,}[^\n]*|[ \t]*)\n)*)',
@@ -780,7 +786,7 @@ class ReleaseWorkflowWiring(unittest.TestCase):
         self.assertEqual(re.findall(r'(?m)^      CARGO_HOME:[ \t]*(.*)$', job_envs['build'][0]),
                          ['${{ github.workspace }}/target/license-cargo-home'])
         self.assertEqual([s.strip() for s in self._top(text, 'permissions').splitlines() if s.strip()], ['contents: read'])
-        offline = jobs['offline-tests']
+        offline = jobs['offline-tests']; self._contains_line(offline, 'needs: [guard, plan]'); self._contains_line(offline, "if: always() && needs.guard.result == 'success' && needs.plan.result == 'success' && ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && contains(fromJSON(needs.plan.outputs.plan).segments, 'license-offline')))")
         for suite in ('test_source_inventory.py', 'test_provenance.py'):
             self._contains_line(offline, 'python3 -I .github/release/license/tests/unit/' + suite)
         steps = self._steps(offline)
@@ -788,14 +794,10 @@ class ReleaseWorkflowWiring(unittest.TestCase):
         sdk = [i for i, s in enumerate(steps) if s.startswith('uses: ./.github/actions/setup-local-sdk')]
         suites = [i for i, s in enumerate(steps) if s.startswith('name: Run offline Python suites')]
         chain = [i for i, s in enumerate(steps) if s.startswith('name: TEST-ONLY transport chain (not production authority)')]
-        self.assertEqual(len(checkout), 1)
-        self.assertEqual(len(sdk), 1)
-        self.assertEqual(len(suites), 1)
+        self.assertEqual(len(checkout), 1); self.assertEqual(len(sdk), 1); self.assertEqual(len(suites), 1)
         self._contains_line(steps[suites[0]], 'python3 -I .github/install/tests/test_release.py ReleaseWorkflowWiring')
         self.assertEqual(len(chain), 1)
-        self.assertLess(checkout[0], sdk[0])
-        self.assertLess(sdk[0], suites[0])
-        self.assertLess(suites[0], chain[0])
+        self.assertLess(checkout[0], sdk[0]); self.assertLess(sdk[0], suites[0]); self.assertLess(suites[0], chain[0])
         self._contains_line(steps[chain[0]], 'run: python3 -I .github/release/license/tests/integration/test_release_chain.py')
         self.assertNotRegex(steps[chain[0]], r'(?m)^\s*(?:if|continue-on-error):')
         build = jobs['build']
@@ -820,20 +822,22 @@ class ReleaseWorkflowWiring(unittest.TestCase):
         snapshot = build.index('admission.py snapshot --prepared target/license-prepared')
         compile_at = build.index('cargo build --locked --offline --release -p socks5-proxy --target "$TARGET"')
         record = build.index('admission.py record --prepared target/license-prepared')
-        self.assertLess(snapshot, compile_at)
-        self.assertLess(compile_at, record)
-        lifecycle = self._command(build, '.github/release/license/tests/integration/test_lifecycle.py', (
+        self.assertLess(snapshot, compile_at); self.assertLess(compile_at, record)
+        with open(os.path.join(fx.REPO_ROOT, '.github', 'workflows', 'ci.yml'), encoding='utf-8') as f:
+            ci = f.read()
+        core = self._jobs(ci)['license-lifecycle']; self.assertNotIn('test_lifecycle.py', text)
+        self._contains_line(core, "if: github.event_name == 'pull_request' && contains(fromJSON(needs.plan.outputs.plan).segments, 'license-lifecycle')")
+        lifecycle = self._command(core, '.github/release/license/tests/integration/test_lifecycle.py', (
             '--prepared target/license-prepared', '--project .', '--sdk ../resocks5',
             '--registry-cache "$CARGO_HOME/registry/cache"', '--target "$TARGET"',
             '--binary "$binary"', '--messages target/license-logs/build-messages.jsonl',
             '--features target/license-logs/features.txt', '--toolchain target/license-logs/toolchain.txt',
             '--native-evidence target/license-logs', '--expanded-before target/license-expanded-before.json'))
         self._contains_line(lifecycle, "if: github.event_name == 'pull_request'")
-        self.assertLess(record, build.index('test_lifecycle.py'))
+        self.assertLess(core.index('admission.py record --prepared target/license-prepared'), core.index('test_lifecycle.py'))
         self.assertNotIn('--output', lifecycle)
         evidence_upload = [s for s in self._steps(build) if 'name: license-evidence-${{ matrix.target }}' in s]
-        self.assertEqual(len(evidence_upload), 1)
-        self.assertIn('            target/license-receipt\n', evidence_upload[0])
+        self.assertEqual(len(evidence_upload), 1); self.assertIn('            target/license-receipt\n', evidence_upload[0])
         self.assertNotIn('lifecycle', evidence_upload[0])
         self.assertIn('--expanded-before target/license-expanded-before.json', build[record:])
         self._contains_line(build, 'cmp "$TOR_SOCKS5_SOURCE_INFO" target/license-logs/actual-source-info.txt')
@@ -853,8 +857,7 @@ class ReleaseWorkflowWiring(unittest.TestCase):
         self._contains_line(aggregate, 'name: license-retained-${{ github.run_id }}-${{ github.run_attempt }}')
         self._contains_line(aggregate, 'path: target/retained/')
         targets = re.search(r'for target in (.*); do', aggregate)
-        self.assertIsNotNone(targets)
-        self.assertEqual(sorted(targets.group(1).split()), sorted(UNIX_TARGETS + WIN_TARGETS))
+        self.assertIsNotNone(targets); self.assertEqual(sorted(targets.group(1).split()), sorted(UNIX_TARGETS + WIN_TARGETS))
 
     def _assert_promotion(self, text):
         import re
@@ -949,14 +952,17 @@ class ReleaseWorkflowWiring(unittest.TestCase):
         self.assertNotEqual(step_runner, self.producer)
         self._assert_producer(step_runner)
         cases = [
+            (self._assert_producer, self.producer.replace('    needs: guard\n    runs-on: ubuntu-latest', "    needs: guard\n    if: github.event_name == 'pull_request'\n    runs-on: ubuntu-latest", 1)),
+            (self._assert_producer, self.producer.replace('[ "$EVENT" = pull_request ] || { [ "$EVENT" = workflow_dispatch ] && [ "$REF" = refs/heads/main ]; }', 'true', 1)),
             (self._assert_producer, self.producer.replace('CARGO_HOME: ${{ github.workspace }}/target/license-cargo-home', 'CARGO_HOME: ${{ runner.temp }}/license-cargo-home', 1)),
             (self._assert_producer, self.producer.replace('    name: License tooling offline tests\n', '    name: License tooling offline tests\n    env:\n      TEMP_DIR: ${{ runner.temp }}\n', 1)),
             (self._assert_producer, self.producer.replace('CARGO_HOME: ${{ github.workspace }}/target/license-cargo-home', 'CARGO_HOME: ~/.cargo', 1)),
             (self._assert_producer, self.producer.replace('          python3 -I .github/install/tests/test_release.py ReleaseWorkflowWiring\n', '', 1)),
-            (self._assert_producer, self.producer.replace('      - uses: ./.github/actions/setup-local-sdk\n', '', 1)),
+            (self._assert_producer, self.producer.replace(self._jobs(self.producer)['offline-tests'], self._jobs(self.producer)['offline-tests'].replace('      - uses: ./.github/actions/setup-local-sdk\n', '', 1), 1)),
             (self._assert_producer, self.producer.replace('run: python3 -I .github/release/license/tests/integration/test_release_chain.py', 'run: true', 1)),
             (self._assert_producer, self.producer.replace('            target/license-blockers.json', '            license-blockers.json', 1)),
             (self._assert_producer, self.producer.replace('          - {runner: macos-15, target: aarch64-apple-darwin, archive: tar.gz}\n', '', 1)),
+            (self._assert_producer, self.producer.replace('    needs: [guard, plan]\n    if: github.event_name', '    needs: guard\n    if: github.event_name', 1)), (self._assert_producer, self.producer.replace('{"segments":["license-offline"]}', '{"segments":[]}', 1)), (self._assert_producer, self.producer.replace(" && needs.plan.result == 'success'", '', 1)), (self._assert_producer, self.producer.replace('    if: always()\n    needs: [guard, plan, offline-tests, build, aggregate]', "    if: github.event_name == 'pull_request'\n    needs: [guard, plan, offline-tests, build, aggregate]", 1)),
             (self._assert_release, self.release.replace('needs: [validate, origin, license-audit]', 'needs: [validate, origin]', 1)),
             (self._assert_release, self.release.replace('run: bash .github/release/publish-bundle.sh', 'run: bash .github/release/publish.sh', 1)),
             (self._assert_release, self.release.replace('ORIGIN_DIR: ${{ github.workspace }}/target/promoted', 'ORIGIN_DIR: ${{ github.workspace }}/target/promoted/artifacts', 1)),
@@ -975,23 +981,20 @@ class ReleaseWorkflowWiring(unittest.TestCase):
         ci_path = os.path.join(fx.REPO_ROOT, ".github", "workflows", "ci.yml")
         with open(ci_path, "r", encoding="utf-8") as f:
             ci = f.read()
-        jobs = self._jobs(ci)
-        block = jobs["portability-diagnostics"]
+        jobs = self._jobs(ci); block = jobs["native-portability"]
         def assert_smoke_wiring(text):
             for expected in (
+                    'row: ${{ fromJSON(needs.plan.outputs.plan).native_rows }}', 'matrix.row.target', 'matrix.row.musl',
+                    'x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu',
+                    'readelf -l "$bin"', 'readelf -d "$bin"', '! grep -q INTERP', '! grep -q NEEDED',
                     'docker run --rm --network none --read-only',
-                    '--platform "$platform"',
-                    'dst=/socks5-proxy,readonly', 'alpine:3.22 /socks5-proxy --version',
-                    'x86_64-*) platform=linux/amd64',
-                    'aarch64-*) platform=linux/arm64',
-                    'if [ "$MUSL" = "true" ]; then'):
+                    'target=/app,readonly', 'alpine:3.22 /app --version', '"$bin" --version'):
                 if expected not in text:
                     raise AssertionError("missing Alpine smoke wiring: " + expected)
         assert_smoke_wiring(block)
         self.assertNotEqual(block.replace("docker run", "podman run", 1), block)
         with self.assertRaises(AssertionError):
             assert_smoke_wiring(block.replace("docker run", "podman run", 1))
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
