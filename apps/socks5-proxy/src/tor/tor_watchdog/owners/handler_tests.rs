@@ -15,7 +15,9 @@ impl std::fmt::Display for InitialPublishError {
 }
 impl std::error::Error for InitialPublishError {}
 
+// Потребитель — отдельный harness=false; обычный unit-test binary этот модуль не вызывает.
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 mod pt_contract {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -23,6 +25,7 @@ mod pt_contract {
     ));
 }
 #[cfg(target_os = "linux")]
+#[allow(unused_imports)]
 pub(crate) use pt_contract::run_pt_owner_contract;
 
 // Bootstrap подменён; проверяется завершение сервера, а не сеть Tor.
