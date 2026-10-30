@@ -38,6 +38,7 @@ impl std::error::Error for ConstructorCancelled {}
 struct Constructed {
     tunnel: TorTunnel,
     slot: usize,
+    outcome: Result<()>,
 }
 
 struct EntryState {
@@ -46,6 +47,7 @@ struct EntryState {
     slot: Option<usize>,
     tunnel: Option<TorTunnel>,
     attempted: bool,
+    failed: bool,
 }
 
 struct State {
@@ -144,15 +146,7 @@ impl OwnerRegistry {
                 .settings
                 .as_ref()
                 .ok_or_else(|| anyhow!("шаблон альтернативного владельца недействителен"))?;
-            if settings.pt_binary.is_some()
-                || !settings.extra_pt_protocols.is_empty()
-                || settings
-                    .bridges
-                    .iter()
-                    .any(|bridge| bridge.transport.is_some())
-            {
-                bail!("альтернативным владельцам разрешены только обычные мосты");
-            }
+            settings.validate_stock_pt_proxy()?;
             if settings.state_dir.is_none() {
                 bail!("нет каталога состояния для альтернативного владельца");
             }
@@ -170,6 +164,7 @@ impl OwnerRegistry {
                         teardown: None,
                         tunnel: None,
                         attempted: false,
+                        failed: false,
                     }),
                 });
                 state.entries.push(Arc::clone(&entry));
@@ -191,6 +186,9 @@ impl OwnerRegistry {
         let mut state = entry.state.lock().await;
         if self.cancel.is_cancelled() {
             bail!("реестр закрыт");
+        }
+        if state.failed {
+            bail!("конструктор Tor владельца завершился ошибкой");
         }
         if !state.attempted {
             let mut settings = self
@@ -224,9 +222,9 @@ impl OwnerRegistry {
                 let tunnel = TorTunnel::create_unbootstrapped_with(settings)
                     .map_err(|_| anyhow!("не удалось создать Tor владельца"))?;
                 runtime.block_on(async {
-                    tokio::select! {
+                    let outcome = tokio::select! {
                         biased;
-                        _ = cancel.cancelled() => return Err(anyhow::Error::new(ConstructorCancelled)),
+                        _ = cancel.cancelled() => Err(anyhow::Error::new(ConstructorCancelled)),
                         result = tokio::time::timeout_at(deadline, async {
                             #[cfg(test)]
                             if let Some(hook) = bootstrap_hook {
@@ -235,11 +233,12 @@ impl OwnerRegistry {
                             }
                             tunnel.wait_bootstrapped().await
                                 .map_err(|_| anyhow!("не удалось запустить Tor владельца"))
-                        }) => result.map_err(|_| anyhow!("истёк срок запуска Tor владельца"))??,
-                    }
+                        }) => result.map_err(|_| anyhow!("истёк срок запуска Tor владельца")).and_then(|result| result),
+                    };
                     Ok(Constructed {
                         tunnel,
                         slot: storage.slot,
+                        outcome,
                     })
                 })
             }));
@@ -248,10 +247,19 @@ impl OwnerRegistry {
             // Ожидание по ссылке безопасно при отмене: дескриптор остаётся в записи до завершения.
             let result = handle.await;
             state.constructing.take();
-            let constructed =
-                result.map_err(|_| anyhow!("конструктор Tor завершился аварийно"))??;
+            let constructed = match result {
+                Ok(Ok(value)) => value,
+                _ => {
+                    state.failed = true;
+                    bail!("конструктор Tor завершился ошибкой");
+                }
+            };
             state.slot = Some(constructed.slot);
             state.tunnel = Some(constructed.tunnel);
+            if let Err(error) = constructed.outcome {
+                state.failed = true;
+                return Err(error);
+            }
         }
         if state.tunnel.is_none() {
             bail!("конструктор Tor владельца завершился ошибкой");
@@ -319,34 +327,61 @@ impl OwnerRegistry {
             state.closed = true;
             state.entries.clone()
         };
+        use futures::stream::{FuturesUnordered, StreamExt};
+        let mut pending = FuturesUnordered::new();
         for entry in entries {
-            let mut state = entry.state.lock().await;
-            if let Some(handle) = state.constructing.as_mut() {
-                let result = handle.await;
-                state.constructing.take();
-                match result {
-                    Ok(Ok(constructed)) => {
-                        state.slot = Some(constructed.slot);
-                        state.tunnel = Some(constructed.tunnel);
+            pending.push(async move {
+                let mut state = entry.state.lock().await;
+                if let Some(handle) = state.constructing.as_mut() {
+                    let result = handle.await;
+                    state.constructing.take();
+                    match result {
+                        Ok(Ok(constructed)) => {
+                            state.slot = Some(constructed.slot);
+                            state.tunnel = Some(constructed.tunnel);
+                        }
+                        Ok(Err(error)) if error.is::<ConstructorCancelled>() => {}
+                        Ok(Err(_)) | Err(_) => {
+                            return Err(anyhow!("ошибка создания Tor владельца при закрытии"));
+                        }
                     }
-                    Ok(Err(error)) if error.is::<ConstructorCancelled>() => {}
-                    _ => self
-                        .close_failed
-                        .store(true, std::sync::atomic::Ordering::Relaxed),
                 }
+                if let Some(tunnel) = state.tunnel.as_ref() {
+                    tunnel
+                        .shutdown()
+                        .await
+                        .map_err(|_| anyhow!("ошибка завершения PT"))?;
+                }
+                if let Some(tunnel) = state.tunnel.take() {
+                    state.teardown = Some(tokio::task::spawn_blocking(move || drop(tunnel)));
+                }
+                if let Some(handle) = state.teardown.as_mut() {
+                    let result = handle.await;
+                    state.teardown.take();
+                    result.map_err(|_| anyhow!("ошибка освобождения Tor"))?;
+                }
+                Ok::<(), anyhow::Error>(())
+            });
+        }
+        // Global handle remains in its shared slot on receipt failure or cancellation.
+        let global = async {
+            if let Some(tunnel) = self.global.tunnel().await {
+                tunnel
+                    .shutdown()
+                    .await
+                    .map_err(|_| anyhow!("ошибка завершения глобального PT"))?;
             }
-            if let Some(tunnel) = state.tunnel.take() {
-                state.teardown = Some(tokio::task::spawn_blocking(move || drop(tunnel)));
-            }
-            if let Some(handle) = state.teardown.as_mut() {
-                let result = handle.await;
-                state.teardown.take();
+            Ok::<(), anyhow::Error>(())
+        };
+        let (global_result, ()) = tokio::join!(global, async {
+            while let Some(result) = pending.next().await {
                 if result.is_err() {
                     self.close_failed
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
-        }
+        });
+        global_result?;
         if self
             .close_failed
             .swap(false, std::sync::atomic::Ordering::Relaxed)
@@ -374,6 +409,6 @@ impl Owner {
 }
 
 #[cfg(test)]
-mod handler_tests;
+pub(crate) mod handler_tests;
 #[cfg(test)]
 mod tests;

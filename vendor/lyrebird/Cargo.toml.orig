@@ -1,0 +1,81 @@
+[package]
+name = "ptrs-gesher-lyrebird"
+version = "0.7.0"
+edition = "2021"
+rust-version = "1.92"
+license = "MIT OR Apache-2.0"
+description = "Lyrebird PT-manager: in-process loop usable as a library or busybox-style binary (ptrs-gesher framework)"
+keywords = ["tor", "censorship", "pluggable", "transports"]
+categories = ["network-programming", "cryptography"]
+repository = "https://github.com/PHPCraftdream/ptrs-gesher"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = []
+debug = ["ptrs/debug", "obfs4/debug"]
+# Server-side PT-manager loop is INCOMPLETE and INSECURE.
+# The PT handshake is not wired and there is no ExtORPort dial — enabling
+# this feature in production would expose an unauthenticated proxy.
+# Opt-in only for development of the missing pieces.
+experimental-server = []
+
+[lib]
+name = "lyrebird"
+
+[[bin]]
+name = "lyrebird"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+## internal crates
+ptrs = { package = "ptrs-gesher-core", path = "../core", version = "0.7.0" }
+obfs4 = { package = "ptrs-gesher-obfs4", path = "../obfs4", version = "0.7.0" }
+webtunnel = { package = "ptrs-gesher-webtunnel", path = "../webtunnel", version = "0.7.0" }
+
+# shared deps
+
+# fwd deps
+anyhow = "1.0"
+async-trait = "0.1"
+clap = { version = "4.5", features = ["derive"]}
+fast-socks5 = "0.10.0"
+log = "0.4.34"
+# TCP keepalive on the outgoing bridge dial (already in-tree via tokio).
+socket2 = "0.6"
+futures = "0.3.31"
+safelog = "0.4.2"
+thiserror = "2.0.9"
+tokio = { version = "1.42", features = ["io-util", "net", "macros", "sync", "signal", "time"] }
+tokio-util = "0.7.13"
+tracing = "0.1.41"
+tracing-core = "0.1.36"
+tracing-log = "0.2.0"
+tracing-subscriber = { version = "0.3.19", default-features = false, features = ["ansi", "env-filter", "fmt", "smallvec"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_IO",
+    "Win32_System_Console",
+] }
+
+# lyrebird deps
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "test-util"] }
+
+[[bench]]
+name = "lyrebird_bench"
+harness = false

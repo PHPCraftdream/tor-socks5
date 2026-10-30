@@ -25,6 +25,7 @@ use crate::startup::{
 };
 use crate::tor_watchdog::{spawn_bridge_failover_watchdog, spawn_tor_watchdog, TorHandle};
 use crate::{shutdown, upstream};
+use handlers::{HandlerRunGuard, RegistryRunGuard};
 
 /// Maximum concurrent SOCKS5 connections. Each may run an Argon2id verify
 /// (~5 MiB working memory, 2 passes), so unbounded spawns risk resource
@@ -61,20 +62,6 @@ enum Egress {
         Option<Arc<owners::OwnerRegistry>>,
     ),
     Upstream(Arc<upstream::Upstream>),
-}
-
-struct RegistryRunGuard(Arc<owners::OwnerRegistry>);
-impl Drop for RegistryRunGuard {
-    fn drop(&mut self) {
-        self.0.begin_close();
-    }
-}
-
-struct HandlerRunGuard(Arc<handlers::HandlerTasks>);
-impl Drop for HandlerRunGuard {
-    fn drop(&mut self) {
-        self.0.begin_shutdown();
-    }
 }
 
 /// Inputs needed to run the SOCKS5 server, gathered from the CLI (or, in
@@ -309,6 +296,7 @@ pub(crate) async fn run_server(
             )?);
             owners.retain_for_shutdown()?;
             registry_guard = Some(RegistryRunGuard(owners.clone()));
+            init.complete_handoff()?;
             if global_init::launch_background() {
                 let mut launch = producers::LaunchGuard::new(producer_owner.clone());
                 bridge_producers::launch(
@@ -497,17 +485,9 @@ pub(crate) async fn run_server(
         guard.0.begin_close();
     }
     let mut shutdown_errors = producers::ProducerFailures::default();
+    let mut registry_closed = true;
     if let Err(error) = handlers.shutdown().await {
         shutdown_errors.push(error);
-    }
-    if let Some(guard) = &registry_guard {
-        if let Err(error) = guard
-            .0
-            .close_with_deadline(tokio::time::Instant::now() + Duration::from_secs(5))
-            .await
-        {
-            shutdown_errors.push(error);
-        }
     }
 
     // For the Tor egress, draining the handle takes the tunnel out of the
@@ -523,7 +503,6 @@ pub(crate) async fn run_server(
         // current operations, so their final store writes land before the
         // writer closes below.
         producer_owner.cancel();
-        drop(handle.drain().await);
         if let Err(error) = producer_owner.join(PRODUCER_JOIN_TIMEOUT).await {
             warn!(%error, "producer graceful shutdown failed; aborting");
             shutdown_errors.push(error);
@@ -531,6 +510,19 @@ pub(crate) async fn run_server(
             if let Err(error) = producer_owner.join(Duration::from_secs(5)).await {
                 shutdown_errors.push(error);
             }
+        }
+        if let Some(guard) = &registry_guard {
+            if let Err(error) = guard
+                .0
+                .close_with_deadline(tokio::time::Instant::now() + Duration::from_secs(5))
+                .await
+            {
+                registry_closed = false;
+                shutdown_errors.push(error);
+            }
+        }
+        if registry_closed {
+            drop(handle.drain().await);
         }
         // Give arti's reactor a brief moment to flush the shutdown.
         // Empirically this is enough for the state-dir lock to be released
@@ -978,6 +970,10 @@ use handlers::accept_loop;
 #[path = "../tor/tor_watchdog/owners/global_init.rs"]
 mod global_init;
 
+#[cfg(test)]
+#[path = "../tor/tor_watchdog/owners/mod.rs"]
+pub(crate) mod owners;
+#[cfg(not(test))]
 #[path = "../tor/tor_watchdog/owners/mod.rs"]
 mod owners;
 

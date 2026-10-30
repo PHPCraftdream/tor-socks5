@@ -1,4 +1,8 @@
+#[path = "pre_pt_tests.rs"]
+mod pre_pt_tests;
+
 use super::*;
+
 use crate::pre_endpoint::channel_proves_endpoint;
 use arti_client::config::circ::CircMgrConfig;
 use std::path::PathBuf;

@@ -1,21 +1,23 @@
-# vendor/ — locally-patched forks of upstream arti crates
+# vendor/ — локальные копии upstream-пакетов
 
-This directory holds **full source copies** of upstream crates from the
-[arti](https://gitlab.torproject.org/tpo/core/arti) workspace. The root
-`Cargo.toml` applies `[patch.crates-io]` overrides to the seven crates under
-`vendor/`; the build does not depend on these fixes being accepted upstream.
+Здесь находятся полные копии пакетов из workspace
+[arti](https://gitlab.torproject.org/tpo/core/arti) и PT-пакетов ptrs-gesher. Корневой
+`Cargo.toml` применяет `[patch.crates-io]` к локальным копиям в
+`vendor/`; сборка не зависит от принятия исправлений upstream.
 
 **Base line: Arti 0.47.0 (arti 2.7.0), synced 2026-10-13.**
 Workspace MSRV is 1.92 (up from 1.89 on the 0.43 line).
 
-Vendored crates (7): `arti-client`, `tor-chanmgr`, `tor-circmgr`,
+Vendored crates: `arti-client`, `tor-chanmgr`, `tor-circmgr`,
 `tor-dirclient`, `tor-dirmgr`, `tor-guardmgr` — all at **0.47.0** — and
 `saturating-time` at **0.5.0**.
 
-`ptrs-gesher` (the obfs4/webtunnel PT client and `bridge-line` parser) is
-not vendored here. The root `Cargo.toml` declares its crates.io packages
-(`ptrs-gesher-bridge-line` and `ptrs-gesher-lyrebird`) as workspace
-dependencies; there is no sibling-checkout `[patch.crates-io]` override.
+`ptrs-gesher-lyrebird` и `ptrs-gesher-webtunnel` версии 0.7.0 сохранены
+полностью из архивов crates.io; `ptrs-gesher-bridge-line` остаётся в реестре.
+SHA-256 архивов: lyrebird `27e7fe5a6a292b960c5a467e25cf7146ba07b50f5d14ae7696d1c8142ebd5d1b`,
+webtunnel `90a11756859f576c003a1df2e9784398053c625a3ee44c71052c4fea5c6f9b63`.
+Локальные изменения направляют carrier через SOCKS5 и предоставляют проверенный
+адрес WebTunnel; интеграция и поведение границы процесса ещё требуют проверки CI.
 
 ### Onion-service server (not vendored)
 
@@ -27,6 +29,18 @@ The app's `onion-service` feature enables `arti-wrapper/onion-service`
 implemented in the vendored `tor-circmgr`; `tor-hsrproxy` is not a direct
 application dependency. A new fork, if needed, must be added under `vendor/`
 and patched in the root `Cargo.toml`.
+
+## Интеграция менеджера PT
+
+### `tor-ptmgr` (локальная копия, 0.47.0)
+
+Локальный менеджер предоставляет квитанцию завершения PT. Штатный pre-маршрут с
+obfs4/webtunnel поддержан через явные `stock_pt_proxy` и совпадение пути PT с
+текущим исполняемым файлом; внешний `TOR_PT_BINARY` с pre-маршрутом PT
+отклоняется. Android и вспомогательные сценарии не поддерживаются; CI-задание
+`pt-proxy-contract` запускает проверки процессов (`process_tests`), но
+сквозная работа в CI-рантайме пока не подтверждена. Семантика повторных
+попыток жизненного цикла реализована в управляемом реакторе.
 
 ## Why each crate is vendored
 
@@ -105,6 +119,12 @@ exit-stream retry of `begin_stream` (0.47 still does a single attempt); and
 an optional `initial_connect_timeout` config field (Android sets 4 s for a
 fast-first budget).
 
+Локальное дополнение 2026-10-30: только для чтения аксессоры
+`TorClientConfig::channel()` и `TorClientConfig::transports()`
+(поля `channel` и `bridges.transports` остаются `pub(crate)`); приёмник
+`arti-wrapper::TorTunnel::bootstrap_raw` отклоняет конфигурации pre+PT
+до любого сетевого этапа. Поведение plain-pre и без-pre не изменено;
+
 ### `tor-circmgr` (0.47.0)
 
 Opt-in bandwidth floor for middle/exit relay selection; client HS stems honor
@@ -142,6 +162,7 @@ One row per patch group. Marker names are the identifiers in the
 | external-guard-failure passthrough | arti-client | src/client.rs, src/lib.rs | `note_external_guard_failure()` + re-exports; `reset_disabled_guards`/`guard_is_disabled` passthroughs | carried |
 | exit-stream retry | arti-client | src/client.rs, src/client/stream_retry.rs | one bounded `begin_stream` retry, narrow retryable set, snapshot budgets | carried (0.47 Exit branch is single-attempt) |
 | `initial_connect_timeout` | arti-client | src/config.rs; packages/android-ffi | optional fast-first budget; Android sets 4 s; inactive when `None` | carried |
+| `raw_config_read_accessors` | arti-client | src/config.rs | только для чтения `channel()` / `transports()` для guard'а `bootstrap_raw` (pre+PT отклоняется) | local |
 | `min_bandwidth_percentile` | tor-circmgr | src/config.rs, src/path.rs, src/path/exitpath.rs, src/path/hspath.rs | opt-in bandwidth floor for middle/exit; default 0 = stock | carried |
 | `hs_circuit_hops` | tor-circmgr | src/config.rs, src/hspool.rs, src/hspool/pool.rs, src/path.rs, src/path/exitpath.rs, src/path/hspath.rs | role-aware client lengths, exact-length pool targets, epoch-safe retirement | local |
 | service stem length | tor-circmgr | src/config.rs, src/hspool.rs, src/hspool/pool.rs, src/path.rs, src/path/exitpath.rs, src/path/hspath.rs | `service_circuit_hops` for Svc stems (Disabled mode), guard-only 1-hop path, pool retargeting on change | local |
@@ -151,7 +172,7 @@ One row per patch group. Marker names are the identifiers in the
 
 ## Cross-cutting notes
 
-* All seven forks set `publish = false`.
+* Семь исходных локальных пакетов Arti и `saturating-time` устанавливают `publish = false`; это не утверждение о новых PT-копиях.
 * `arti-client` gains the tokio `test-util` dev feature.
 * The vendored source also carries cross-cutting lint allowances where upstream
   code would otherwise fail the workspace lint configuration; these are build

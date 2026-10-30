@@ -110,3 +110,7 @@ windows-sys = { version = "0.61", features = [
 
 [target.'cfg(all(unix, not(target_os = "android")))'.dependencies]
 angelize = { workspace = true }
+
+[[test]]
+name = "pt_owner_contract"
+harness = false

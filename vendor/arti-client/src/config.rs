@@ -808,6 +808,20 @@ impl TorClientConfig {
         &self.stream_timeouts
     }
 
+    // tor-socks5 local patch: read-only channel accessor for the wrapper's
+    // raw-constructor pre-PT guard (outbound proxy inspection only).
+    /// Возвращает настройки канала — только чтение, для проверки исходящего прокси.
+    pub fn channel(&self) -> &ChannelConfig {
+        &self.channel
+    }
+
+    // tor-socks5 local patch: read-only transport list accessor for the
+    // wrapper's raw-constructor pre-PT guard.
+    /// Возвращает настроенные подключаемые транспорты — только чтение.
+    pub fn transports(&self) -> &[pt::TransportConfig] {
+        &self.bridges.transports
+    }
+
     /// Get the state directory and its corresponding
     /// [`Mistrust`] configuration.
     pub(crate) fn state_dir(&self) -> StdResult<(PathBuf, &fs_mistrust::Mistrust), ErrorDetail> {
