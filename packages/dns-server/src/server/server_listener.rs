@@ -145,25 +145,70 @@ pub(super) async fn tcp_loop_gated<T, F, MakeGate, Gate, G, Completed>(
                 let (stream, peer) = match accepted {
                     Ok(pair) => pair,
                     Err(error) => {
+                        #[cfg(test)]
+                        tcp_diag::emit(&tcp_diag::format_accept_error(
+                            &listener.local_addr().ok(),
+                            &error,
+                        ));
                         debug!(%error, "tcp dns accept failed");
                         tokio::time::sleep(Duration::from_millis(500)).await;
                         continue;
                     }
                 };
+                // Только успешный accept: это НЕ финальный admission — возможные
+                // исходы (deny/limit/permit/enqueued) эмитятся ниже по факту.
+                #[cfg(test)]
+                tcp_diag::emit(&tcp_diag::format_accept_state(
+                    &listener.local_addr().ok(),
+                    &peer,
+                    "accepted",
+                ));
                 // Тот же gate, что и в UDP: по source peer из accept до
                 // capacity/permit/nodelay; deny — continue, стрим дропается.
                 if !ctx.client_access.allows(peer.ip()) {
                     debug!(%peer, "tcp dns client denied by client access policy");
+                    #[cfg(test)]
+                    tcp_diag::emit(&tcp_diag::format_accept_state(
+                        &listener.local_addr().ok(),
+                        &peer,
+                        "denied_client_access",
+                    ));
                     continue;
                 }
-                if work.len() >= MAX_TCP_CONNECTIONS { continue; }
-                let Ok(permit) = connections.clone().try_acquire_owned() else { continue; };
+                if work.len() >= MAX_TCP_CONNECTIONS {
+                    #[cfg(test)]
+                    tcp_diag::emit(&tcp_diag::format_accept_state(
+                        &listener.local_addr().ok(),
+                        &peer,
+                        "dropped_connection_limit",
+                    ));
+                    continue;
+                }
+                let Ok(permit) = connections.clone().try_acquire_owned() else {
+                    #[cfg(test)]
+                    tcp_diag::emit(&tcp_diag::format_accept_state(
+                        &listener.local_addr().ok(),
+                        &peer,
+                        "dropped_permit_unavailable",
+                    ));
+                    continue;
+                };
                 // Small request/response frames: never wait for a delayed ACK.
                 let _ = stream.set_nodelay(true);
                 let ctx = ctx.clone();
                 let backend = backend.clone();
                 let gate = make_gate();
-                work.push(Box::pin(async move {
+                #[cfg(test)]
+                let connection_local = stream.local_addr().ok();
+                // enqueued — future положен в work; handler мог ещё НЕ стартовать
+                // (факт старта виден только по tcp_handler state=start).
+                #[cfg(test)]
+                tcp_diag::emit(&tcp_diag::format_accept_state(
+                    &listener.local_addr().ok(),
+                    &peer,
+                    "enqueued",
+                ));
+                let connection = async move {
                     let _permit = permit;
                     // Finite connection lifetime also bounds peers continuously
                     // sending valid local/cache queries, not merely idle peers.
@@ -172,7 +217,18 @@ pub(super) async fn tcp_loop_gated<T, F, MakeGate, Gate, G, Completed>(
                         handle_tcp_gated(stream, ctx, backend, gate),
                     )
                     .await;
-                }));
+                };
+                // Обёртка закрывает слепую зону: дроп future до первого poll
+                // даёт state=dropped_before_poll (guard создаётся лишь при poll).
+                #[cfg(test)]
+                work.push(Box::pin(tcp_diag::poll_observed(
+                    listener.local_addr().ok(),
+                    connection_local,
+                    peer,
+                    connection,
+                )));
+                #[cfg(not(test))]
+                work.push(Box::pin(connection));
             }
         }
     }
@@ -284,10 +340,14 @@ async fn handle_tcp_gated<T, F, Gate, G>(
 
 // Test-only диагностика TCP-соединения (flaky RST/10054 в CI). В production
 // модуль целиком отсутствует: ни вызовов, ни аллокаций, ни I/O.
+// Реэкспорт для тестов уровня server (accept-loop emission oracle).
+#[cfg(test)]
+pub(super) use tcp_diag::{set_capture_mode, take_capture};
 #[cfg(test)]
 mod tcp_diag {
     use std::future::Future;
     use std::net::SocketAddr;
+    use std::pin::Pin;
     use std::task::{Context, Poll};
 
     /// Чистая функция форматирования одной строки диагностики.
@@ -309,17 +369,114 @@ mod tcp_diag {
         eprintln!("{line}");
     }
 
+    /// Единая маршрутизация: capture-режим для тестов, иначе stderr.
+    fn dispatch_emit(line: &str) {
+        if CAPTURE_MODE.with(|m| m.get()) {
+            capture_emit(line);
+        } else {
+            stderr_emit(line);
+        }
+    }
+
+    /// Публичная обёртка: emit строк уровня accept/admission и handler'а.
+    pub(super) fn emit(line: &str) {
+        dispatch_emit(line);
+    }
+
+    /// Состояния приёма соединения: accepted — только успешный accept (НЕ
+    /// финальный admission); denied/limit/permit — дропы; enqueued — future
+    /// в work, handler мог не стартовать (см. tcp_handler state=start).
+    pub(super) fn format_accept_state(
+        listener: &Option<SocketAddr>,
+        peer: &SocketAddr,
+        state: &str,
+    ) -> String {
+        format!("tcp_accept: listener={listener:?} peer={peer} state={state}")
+    }
+
+    /// Ошибка accept с корреляцией по реальному listener-адресу (без
+    /// вымышленных идентификаторов соединения).
+    pub(super) fn format_accept_error(
+        listener: &Option<SocketAddr>,
+        error: &std::io::Error,
+    ) -> String {
+        format!(
+            "tcp_accept_error: listener={listener:?} kind={:?} os={:?} error={error}",
+            error.kind(),
+            error.raw_os_error()
+        )
+    }
+
+    /// Test-only future-обёртка: закрывает слепую зону между enqueue и первым
+    /// poll — дроп до poll фиксируется как dropped_before_poll.
+    pub(super) struct PollObserved<F> {
+        listener: Option<SocketAddr>,
+        local: Option<SocketAddr>,
+        peer: SocketAddr,
+        polled: bool,
+        inner: Pin<Box<F>>,
+    }
+
+    pub(super) fn poll_observed<F: Future + Send>(
+        listener: Option<SocketAddr>,
+        local: Option<SocketAddr>,
+        peer: SocketAddr,
+        inner: F,
+    ) -> PollObserved<F> {
+        PollObserved {
+            listener,
+            local,
+            peer,
+            polled: false,
+            inner: Box::pin(inner),
+        }
+    }
+
+    impl<F: Future> Future for PollObserved<F> {
+        type Output = F::Output;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if !self.polled {
+                self.polled = true;
+                emit(&format!(
+                    "tcp_handler: listener={:?} local={:?} peer={} state=start",
+                    self.listener, self.local, self.peer
+                ));
+            }
+            self.inner.as_mut().poll(cx)
+        }
+    }
+
+    impl<F> Drop for PollObserved<F> {
+        fn drop(&mut self) {
+            if !self.polled {
+                emit(&format!(
+                    "tcp_handler: listener={:?} local={:?} peer={} state=dropped_before_poll",
+                    self.listener, self.local, self.peer
+                ));
+            }
+        }
+    }
+
     // Буфер тестового sink изолирован по OS-потокам.
     thread_local! {
         static CAPTURE: std::cell::RefCell<Vec<String>> =
             const { std::cell::RefCell::new(Vec::new()) };
+        /// По умолчанию выключен: обычные тесты продолжают печатать в stderr.
+        static CAPTURE_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Включает перехват реальных loop-emissions в CAPTURE (вместо stderr).
+    pub(in super::super) fn set_capture_mode(on: bool) {
+        CAPTURE_MODE.with(|m| m.set(on));
     }
 
     fn capture_emit(s: &str) {
         CAPTURE.with(|c| c.borrow_mut().push(s.to_string()));
     }
 
-    fn take_capture() -> Vec<String> {
+    /// Забирает накопленные test-only строки.
+    pub(in super::super) fn take_capture() -> Vec<String> {
         CAPTURE.with(|c| c.borrow_mut().drain(..).collect())
     }
 
@@ -340,7 +497,8 @@ mod tcp_diag {
                 stage: "entry",
                 terminal: None,
                 observed_writes: 0,
-                emit: stderr_emit,
+                // Через dispatch_emit guard тоже уважает capture-режим.
+                emit: dispatch_emit,
             }
         }
 
@@ -426,6 +584,63 @@ mod tcp_diag {
             "got: {line}"
         );
         assert!(line.contains("observed_writes=1"), "got: {line}");
+    }
+
+    #[test]
+    fn accept_state_line_contains_listener_peer_state() {
+        let (local, peer) = endpoints();
+        let line = format_accept_state(&local, peer.as_ref().unwrap(), "denied_client_access");
+        assert!(line.contains("tcp_accept:"), "got: {line}");
+        assert!(
+            line.contains("listener=Some(127.0.0.1:5353)"),
+            "got: {line}"
+        );
+        assert!(line.contains("peer=127.0.0.1:44444"), "got: {line}");
+        assert!(line.contains("state=denied_client_access"), "got: {line}");
+    }
+
+    #[test]
+    fn accept_error_line_contains_kind() {
+        let error = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        let line = format_accept_error(&Some(SocketAddr::from(([127, 0, 0, 1], 5353))), &error);
+        assert!(line.contains("tcp_accept_error:"), "got: {line}");
+        assert!(
+            line.contains("listener=Some(127.0.0.1:5353)"),
+            "got: {line}"
+        );
+        assert!(line.contains("kind=ConnectionReset"), "got: {line}");
+    }
+
+    #[test]
+    fn accept_error_preserves_raw_os_error() {
+        let error = std::io::Error::from_raw_os_error(10054);
+        let line = format_accept_error(&Some(SocketAddr::from(([0, 0, 0, 0], 5353))), &error);
+        assert!(line.contains("listener=Some(0.0.0.0:5353)"), "got: {line}");
+        assert!(line.contains("os=Some(10054)"), "got: {line}");
+    }
+
+    #[test]
+    fn queued_future_dropped_before_poll_reports_endpoints() {
+        take_capture();
+        set_capture_mode(true);
+        let (local, peer) = endpoints();
+        let queue = futures::stream::FuturesUnordered::new();
+        queue.push(poll_observed(
+            Some(SocketAddr::from(([0, 0, 0, 0], 5353))),
+            local,
+            peer.unwrap(),
+            std::future::pending::<()>(),
+        ));
+        drop(queue);
+        let lines = take_capture();
+        set_capture_mode(false);
+        assert_eq!(lines.len(), 1, "got: {lines:?}");
+        let line = &lines[0];
+        assert!(line.contains("state=dropped_before_poll"), "got: {line}");
+        assert!(line.contains("listener=Some(0.0.0.0:5353)"), "got: {line}");
+        assert!(line.contains("local=Some(127.0.0.1:5353)"), "got: {line}");
+        assert!(line.contains("peer=127.0.0.1:44444"), "got: {line}");
+        assert!(!line.contains("state=start"), "got: {line}");
     }
 
     #[test]

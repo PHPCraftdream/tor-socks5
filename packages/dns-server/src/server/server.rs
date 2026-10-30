@@ -38,6 +38,9 @@ mod local;
 #[path = "server_socket_options.rs"]
 mod socket_options;
 #[cfg(test)]
+#[path = "tests/listeners/server_tcp_diag_tests.rs"]
+mod tcp_diag_tests;
+#[cfg(test)]
 #[path = "tests/server_tests.rs"]
 mod tests;
 #[path = "server_wire.rs"]
