@@ -40,6 +40,10 @@ python -I inspect-primary.py --candidate ../../../../target/stage1-data-20261029
 
 Поле `project_sdk_license_files` имеет историческое имя: это результаты широкого filename-фильтра, а не классификация первичных лицензионных текстов. Наличие в этом списке workflow, аналитического документа или скрипта не подтверждает лицензионное обязательство и не увеличивает число проверенных первичных лицензий.
 
+## Материалы всех registry archives
+
+Последующий [materials toolkit и отчёт](materials/README.md) охватывает 727 registry archives и 1212 сохранённых license-copy. Parent-пересчёты p/q побайтно совпали; source distribution и содержательные записи отделены от filename-кандидатов, keyword scan и legal approval. Полные pins, точные missing/external blockers и история процедурных нарушений сохранены рядом. Это не расширяет старую выборку 13 до утверждения о полном per-file/native/linkage аудите.
+
 ## Source proof из корня worktree
 
 Для сохранённого candidate без сети, с новым свободным output непосредственно под `target`:

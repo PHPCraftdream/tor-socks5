@@ -328,8 +328,7 @@ Target review привязывается к четырём значениям id
 
 ## Минимальные следующие действия
 
-1. Расширить безопасный анализ на остальные 714 `.crate` и недостающие evidence;
-   проверить native/static inputs и embedded data, не выводя их из графа.
+1. Для всех 727 `.crate` теперь сохранён отдельный [анализ именованных первичных материалов](release-components-40934653900-repro/materials/README.md): архивы/копии, содержательные записи и parent-пересчёты p/q. Продолжить конкретные missing/external blockers и полный per-file/native/static/embedded scope; наличие этого этапа не доказывает состав бинарника и не является юридическим одобрением.
 2. Использовать проверенные совпадения binary и receipt и отдельно пересчитанные source и build evidence digests; retained bytes получить и проверить, если это понадобится для production proof.
 3. Установить native и platform inputs, состав и доступные исходники;
    после этого провести component, target и необходимые юридические reviews.
