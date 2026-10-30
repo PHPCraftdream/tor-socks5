@@ -51,6 +51,14 @@ Run `tor-socks5 <command> --help` for command-specific options, or \
 `tor-socks5 help` to browse the bundled manuals."
 )]
 pub(crate) struct Cli {
+    /// Показать встроенные лицензии и сторонние уведомления.
+    #[arg(long, conflicts_with = "source_info")]
+    pub(crate) licenses: bool,
+
+    /// Показать встроенные сведения о доступе к исходникам.
+    #[arg(long)]
+    pub(crate) source_info: bool,
+
     /// Override the main-config path used to resolve auxiliary files.
     #[arg(long, global = true)]
     pub(crate) config: Option<PathBuf>,

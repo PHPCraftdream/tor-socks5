@@ -120,6 +120,19 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    if cli.licenses || cli.source_info {
+        use std::io::Write;
+        let bytes: &[u8] = if cli.licenses {
+            include_bytes!(concat!(env!("OUT_DIR"), "/notices.txt"))
+        } else {
+            include_bytes!(concat!(env!("OUT_DIR"), "/source-info.txt"))
+        };
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(bytes)?;
+        stdout.flush()?;
+        return Ok(());
+    }
+
     // `--angel` only applies to the foreground server. Subcommands
     // (`users`, `bridges`, `service`, `help`) are short-lived CLI tools
     // that must stay attached to the terminal.
