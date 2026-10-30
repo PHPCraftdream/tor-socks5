@@ -46,6 +46,11 @@ jobs:
         with:
           tool: nextest
       - uses: Swatinem/rust-cache@v2
+      # Сохраняем исправление ACL fixtures при переносе nightly на сегменты.
+      - name: Assign loopback alias 127.0.0.2 (macOS)
+        if: runner.os == 'macOS'
+        run: sudo ifconfig lo0 alias 127.0.0.2 up
+        shell: bash
       - run: >-
           cargo nextest run --profile flaky-hunt --stress-count 10
           -p tor-socks5-dns -p tor-circmgr -p tor-guardmgr -p socks5-proxy

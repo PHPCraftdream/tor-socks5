@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Внешние регрессии с настоящим Git и поддельным cargo, только в CI."""
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,9 @@ DOCS = ("README.md", "tor-socks5.example.ktav",
         "docs/guide/auth.md", "docs/guide/upstream.md", "docs/guide/dns-server.md",
         "docs/guide/ops/logging.md", "docs/guide/ops/onion-service.md", "docs/guide/service.md")
 ZERO = "0" * 40
+spec = importlib.util.spec_from_file_location("ci_planner", SOURCE / "scripts/testing/ci_planner.py")
+p = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(p)
 
 
 class External(unittest.TestCase):
@@ -61,6 +65,10 @@ class External(unittest.TestCase):
         for _, path, _ in names.values():
             self.put(path + "/Cargo.toml", "[package]\nname='fixture'\nversion='0.1.0'\n")
             self.put(path + "/src/lib.rs", "начало\n")
+        # Маркеры — только данные: синтетические скрипты и Rust-код не исполняются.
+        self.put(p.CONTRACT_MANIFEST, "real_tor_channel = true\n")
+        for path, markers in p.TOR_MARKERS.items():
+            self.put(path, "\n".join(markers) + "\n")
         self.git("init", "-q")
         self.commit("начало")
         self.base = self.git("rev-parse", "HEAD").strip()
@@ -163,6 +171,44 @@ class External(unittest.TestCase):
         self.put("unmapped.file", "unknown")
         self.commit("неизвестное")
         self.push(ok=False)
+
+    def test_capability_git_removal_and_absence(self):
+        anchors = ("scripts/testing/real-tor-channel.sh", "scripts/testing/real-tor-mutations.sh",
+                   "apps/socks5-proxy/src/bridges/bridge_maintenance/real_channel_tests.rs")
+        self.git("rm", anchors[0])
+        self.commit("remove one anchor")
+        self.push(ok=False)
+        self.git("reset", "--hard", self.base)
+        self.git("rm", *anchors)
+        self.put(".config/ci-contracts.toml", "real_tor_channel = false\n")
+        self.commit("remove all and downgrade")
+        self.push(ok=False)
+        self.planner("--event", "workflow_dispatch", "--mode", "sprint-full", "--head", self.head(), ok=False)
+        self.git("reset", "--hard", self.base)
+        self.git("rm", ".config/ci-contracts.toml")
+        self.commit("remove declaration")
+        self.push(ok=False)
+        self.git("reset", "--hard", self.base)
+        self.git("rm", *anchors)
+        self.put(".config/ci-contracts.toml", "real_tor_channel = false\n")
+        self.commit("legacy branch")
+        legacy = self.head()
+        self.put("packages/proxy-config/client-acl/src/lib.rs", "changed\n")
+        self.commit("legacy acl")
+        result = self.push(base=legacy)
+        self.assertFalse(result["capabilities"]["real_tor_channel"])
+        self.assertNotIn("tor", result["segments"])
+        self.assertIn("rust", result["segments"])
+        self.assertIn("tor-socks5-client-acl", result["packages"])
+        self.git("rm", ".config/ci-contracts.toml")
+        self.commit("legacy without manifest")
+        legacy_without_manifest = self.head()
+        self.put(".config/ci-contracts.toml", "real_tor_channel = false\n")
+        self.commit("declare absent capability")
+        result = self.push(base=legacy_without_manifest)
+        self.assertFalse(result["capabilities"]["real_tor_channel"])
+        self.assertEqual(result["segments"], ["fast", "regression"])
+        self.assertEqual(result["capability_reasons"]["real_tor_channel"], "контракт не установлен")
 
     def test_doc_rename_missing_mapping(self):
         self.git("mv", "tor-socks5.example.ktav", "renamed.ktav")

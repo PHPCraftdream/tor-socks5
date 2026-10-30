@@ -67,7 +67,7 @@ jobs:
 
   real-tor-channel:
     needs: plan
-    if: contains(fromJSON(needs.plan.outputs.plan).segments, 'tor')
+    if: fromJSON(needs.plan.outputs.plan).capabilities.real_tor_channel && contains(fromJSON(needs.plan.outputs.plan).segments, 'tor')
     name: Изолированный канал Tor
     runs-on: ubuntu-latest
     timeout-minutes: 50

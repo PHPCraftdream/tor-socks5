@@ -62,6 +62,17 @@ class Routing(unittest.TestCase):
         self.assertEqual(self.route("apps/socks5-proxy/src/main.rs")["command_packages"]["android"], ["socks5-proxy"])
         self.assertIn("tor", self.route("packages/arti-wrapper/src/lib.rs")["segments"])
         self.assertEqual(self.route("docs/plans/note.md")["segments"], ["fast"])
+        caps = {"license_stack": True, "real_tor_channel": False}
+        for path in (".github/release/license/README.md", "docs/project/licensing.md", "packages/auth/README.md"):
+            result = self.route(path, capabilities=caps)
+            self.assertEqual(result["segments"], ["fast"])
+            self.assertEqual(result["packages"], [])
+            self.assertEqual(result["native_rows"], [])
+        for path in (".github/release/license/bundle.py", ".github/release/license/reviews/evidence.md"):
+            result = self.route(path, capabilities=caps)
+            for segment in ("rust", "native-portability", "license-offline", "license-audit", "license-lifecycle"):
+                self.assertIn(segment, result["segments"])
+            self.assertNotIn("tor", result["segments"])
 
     def test_install_license_tor_native(self):
         self.assertIn("installer-sh", self.route(".github/install/install.sh")["segments"])
@@ -99,6 +110,24 @@ class Routing(unittest.TestCase):
         self.assertIn("msrv", self.route(".github/workflows/ci.yml", blobs={".github/workflows/ci.yml": (old, new)})["segments"])
         with self.assertRaises(p.MappingError):
             self.route(".github/workflows/ci.yml", blobs={".github/workflows/ci.yml": (old, new.replace("msrv", "mystery"))})
+
+    def test_legacy_license_portability_migration(self):
+        old = ("name: CI\njobs:\n  portability-diagnostics:\n"
+               "    strategy:\n      matrix:\n        include:\n"
+               "          - target: x86_64-unknown-linux-musl\n"
+               "          - target: aarch64-unknown-linux-musl\n"
+               "          - target: aarch64-unknown-linux-gnu\n")
+        new = "name: CI\njobs:\n  native-portability:\n    runs-on: ${{ matrix.runner }}\n"
+        result = self.route(".github/workflows/ci.yml",
+                            blobs={".github/workflows/ci.yml": (old, new)},
+                            capabilities={"license_stack": True, "real_tor_channel": False})
+        self.assertFalse(result["full"])
+        self.assertIn("native-portability", result["segments"])
+        self.assertEqual({row["target"] for row in result["native_rows"]},
+                         {"x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl",
+                          "aarch64-unknown-linux-gnu"})
+        self.assertNotIn("tor", result["segments"])
+        self.assertNotIn("license-lifecycle", result["segments"])
 
     def test_contracts_and_native(self):
         self.assertNotIn("tor", self.route("apps/socks5-proxy/src/commands/auth.rs")["segments"])
@@ -164,6 +193,16 @@ class Routing(unittest.TestCase):
         self.assertIn("always()", blocks["required"])
         self.assertIn("cargo deny", blocks["license-audit"])
         self.assertNotIn("license-audit", self.route(mode="sprint-full")["segments"])
+
+    def test_macos_loopback_fixtures(self):
+        root = Path(__file__).resolve().parents[2]
+        alias = "sudo ifconfig lo0 alias 127.0.0.2 up"
+        for name, job in (("ci.yml", "rust"), ("nightly.yml", "flaky-hunt")):
+            with self.subTest(workflow=name):
+                blocks = p.workflow_blocks((root / ".github/workflows" / name).read_text(encoding="utf-8"))
+                self.assertIn("if: runner.os == 'macOS'", blocks[job])
+                self.assertIn(alias, blocks[job])
+                self.assertLess(blocks[job].index(alias), blocks[job].index("cargo nextest run"))
 
     def test_specific_corrections(self):
         path = ".github/workflows/ci.yml"
@@ -289,7 +328,7 @@ jobs:
         self.assertIn("name: CI required", blocks["required"])
 
     def test_required_results(self):
-        plan = {"segments": ["fast", "rust"]}
+        plan = {"segments": ["fast", "rust"], "capabilities": {"real_tor_channel": True}}
         needs = {job: {"result": "success" if any(s in plan["segments"] for s in selections) else "skipped"} for job, selections in p.RESULT_JOBS.items()}
         needs["plan"] = {"result": "success"}
         p.validate_results(plan, needs)
@@ -303,17 +342,53 @@ jobs:
             p.validate_results(plan, needs)
         needs["android"]["result"] = "skipped"
         p.validate_results(plan, needs)
-        lifecycle_plan = {"segments": ["fast", "rust", "license-lifecycle"]}
+        lifecycle_plan = {"segments": ["fast", "rust", "license-lifecycle"], "capabilities": {"real_tor_channel": True}}
         with self.assertRaises(p.MappingError):
             p.validate_results(lifecycle_plan, needs)
         needs["license-lifecycle"]["result"] = "success"
         p.validate_results(lifecycle_plan, needs)
         needs["license-lifecycle"]["result"] = "skipped"
         with self.assertRaisesRegex(p.MappingError, "нет потребителя"):
-            p.validate_results({"segments": ["fast", "rust", "unknown-segment"]}, needs)
+            p.validate_results({"segments": ["fast", "rust", "unknown-segment"], "capabilities": {"real_tor_channel": True}}, needs)
         del needs["android"]
         with self.assertRaises(p.MappingError):
             p.validate_results(plan, needs)
+
+    def test_capability_contract(self):
+        absent = {p.CONTRACT_MANIFEST: 'real_tor_channel = false\n'}
+        read = lambda data: lambda path: data.get(path, '')
+        self.assertFalse(p.contract_capability(read({}), read(absent)))
+        for path in p.TOR_ANCHORS:
+            with self.assertRaisesRegex(p.MappingError, 'missing mapping'):
+                p.contract_capability(read({path: 'evidence'}), read(absent))
+        manifest_route = self.route(p.CONTRACT_MANIFEST, capabilities={'real_tor_channel': False})
+        self.assertEqual(manifest_route['segments'], ['fast', 'regression'])
+        self.assertEqual(manifest_route['capability_reasons']['real_tor_channel'], 'контракт не установлен')
+        for path in ('packages/proxy-config/src/lib.rs', 'packages/proxy-config/client-acl/src/lib.rs', 'packages/bridge-probe/src/lib.rs'):
+            result = self.route(path, capabilities={'real_tor_channel': False})
+            self.assertNotIn('tor', result['segments'])
+            self.assertIn('rust', result['segments'])
+            self.assertFalse(result['capabilities']['real_tor_channel'])
+        self.assertNotIn('tor', self.route(mode='sprint-full', capabilities={'real_tor_channel': False})['segments'])
+        installed = {path: '\n'.join(markers) for path, markers in p.TOR_MARKERS.items()}
+        installed[p.CONTRACT_MANIFEST] = 'real_tor_channel = true\n'
+        self.assertTrue(p.contract_capability(read({}), read(installed)))
+        manifest = Path(__file__).resolve().parents[2] / p.CONTRACT_MANIFEST
+        if p.tomllib.loads(manifest.read_text(encoding='utf-8'))['real_tor_channel']:
+            workflow = (Path(__file__).resolve().parents[2] / '.github/workflows/ci.yml').read_text(encoding='utf-8')
+            for marker in p.TOR_MARKERS['.github/workflows/ci.yml']:
+                self.assertIn(marker, workflow)
+        for path in p.TOR_MARKERS:
+            broken = dict(installed, **{path: ''})
+            with self.assertRaisesRegex(p.MappingError, 'missing mapping'):
+                p.contract_capability(read(installed), read(broken))
+        for broken in (absent, {}, dict(installed, **{p.CONTRACT_MANIFEST: 'unknown = true\n'})):
+            with self.assertRaisesRegex(p.MappingError, 'missing mapping'):
+                p.contract_capability(read(installed), read(broken))
+        needs = {job: {'result': 'skipped'} for job in p.RESULT_JOBS}
+        needs['plan'] = {'result': 'success'}
+        with self.assertRaisesRegex(p.MappingError, 'missing mapping'):
+            p.validate_results({'segments': ['tor'], 'capabilities': {'real_tor_channel': False}}, needs)
 
     def test_events(self):
         calls = []

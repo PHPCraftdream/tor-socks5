@@ -16,6 +16,44 @@ REQUIRED_DOCS = ("README.md", "tor-socks5.example.ktav",
                  "docs/guide/ops/logging.md", "docs/guide/ops/onion-service.md", "docs/guide/service.md")
 
 
+CONTRACT_MANIFEST = ".config/ci-contracts.toml"
+LICENSE_DOCS = frozenset({".github/release/license/README.md"})
+TOR_ANCHORS = ("scripts/testing/real-tor-channel.sh", "scripts/testing/real-tor-mutations.sh",
+               "apps/socks5-proxy/src/bridges/bridge_maintenance/real_channel_tests.rs")
+TOR_MARKERS = {
+    "apps/socks5-proxy/src/bridges/bridge_maintenance.rs": ('#[cfg(test)]\n#[path = "bridge_maintenance/real_channel_tests.rs"]\nmod real_channel_tests;',),
+    "packages/arti-wrapper/src/lib.rs": ('pub use arti_client::config::BridgeConfigBuilder;', 'pub use tor_chanmgr::ChannelUsage;', '        chanmgr.terminate_all_channels();\n', '        self.inner\n            .reconfigure(&config, Reconfigure::AllOrNothing)\n            .map_err(TorError::Reconfigure)?;\n'),
+    TOR_ANCHORS[0]: ('TOR_REAL_ISOLATED', 'real_channel_heal_and_config_selection', '--ignored --exact'),
+    TOR_ANCHORS[1]: ('for mutation in terminate reconfigure', 'scripts/testing/real-tor-channel.sh', 'GITHUB_ACTIONS'),
+    TOR_ANCHORS[2]: ('#[ignore', 'async fn real_channel_heal_and_config_selection()', 'ChannelUsage::UserTraffic'),
+    ".github/workflows/ci.yml": ("capabilities.real_tor_channel", "scripts/testing/real-tor-channel.sh", "scripts/testing/real-tor-mutations.sh"),
+}
+
+
+def contract_capability(base_read, head_read):
+    def declaration(read):
+        text = read(CONTRACT_MANIFEST)
+        if not text:
+            return None
+        try:
+            data = tomllib.loads(text)
+        except ValueError as exc:
+            raise MappingError("missing mapping: capability declaration") from exc
+        if set(data) != {"real_tor_channel"} or type(data["real_tor_channel"]) is not bool:
+            raise MappingError("missing mapping: capability declaration")
+        return data["real_tor_channel"]
+    before, after = declaration(base_read), declaration(head_read)
+    evidence = any(read(path) for read in (base_read, head_read) for path in TOR_ANCHORS)
+    if after is None or (before is True and after is not True) or (evidence and not after):
+        raise MappingError("missing mapping: real Tor capability declaration removed or inconsistent")
+    if after:
+        for path, markers in TOR_MARKERS.items():
+            text = head_read(path)
+            if not text or any(marker not in text for marker in markers):
+                raise MappingError("missing mapping: real Tor contract: " + path)
+    return after
+
+
 class MappingError(Exception):
     pass
 
@@ -114,6 +152,7 @@ JOB_SEGMENTS = {
     "packageability": "release", "release-scripts": "release",
     "required": "fast", "regression": "fast", "rust": "rust", "docs-contract": "docs-contract",
     "vendor-extra": "vendor-extra", "features": "features", "native-portability": "native-portability",
+    "portability-diagnostics": "native-portability",
     "license-offline": "license-offline", "license-audit": "license-audit",
     "license-lifecycle": "license-lifecycle", "license-producer": "fast", "stress": "stress",
 }
@@ -287,12 +326,17 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
     if capabilities is None:
         capabilities = {"license_stack": (graph.root / ".github/deny.toml").is_file() and (graph.root / ".github/release/license").is_dir()}
     license_stack = bool(capabilities.get("license_stack", False))
+    real_tor = capabilities.get("real_tor_channel", True)
+    if type(real_tor) is not bool:
+        raise MappingError("missing mapping: real Tor capability")
     segments = {"fast"}
     reasons = {"fast": {"всегда"}}
     seeds = set()
     native = set()
     dependency_seeds = set()
     def add(segment, reason):
+        if segment == "tor" and not real_tor:
+            return
         if segment == "license-lifecycle" and (event != "pull_request" or mode == "sprint-full"):
             return
         segments.add(segment)
@@ -340,6 +384,10 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
                         add("rust", path + ":" + job)
                     else:
                         add(mapping[job], path + ":" + job)
+                    if job == "portability-diagnostics" and path.endswith("/ci.yml"):
+                        # При переходе сохраняются все цели прежнего portability-контракта.
+                        native.update(("x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl",
+                                       "aarch64-unknown-linux-gnu"))
                     if job == "build" and path.endswith("/license-bundle.yml"):
                         add("license-offline", path + ":" + job)
                     if path.endswith("/nightly.yml"):
@@ -355,6 +403,9 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
                 raise MappingError("missing mapping: .cargo/config.toml") from exc
             if native:
                 add("native-portability", path)
+        elif path == CONTRACT_MANIFEST:
+            add("fast", path)
+            add("regression", path)
         elif path == ".config/nextest.toml":
             try:
                 for segment in nextest_segments(*blobs(path)):
@@ -399,6 +450,8 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
             else:
                 add("installer-sh", path)
                 add("installer-windows", path)
+        elif path in LICENSE_DOCS:
+            add("fast", path)
         elif path.startswith("scripts/license/") or path.startswith(".github/release/license/") or path.startswith("LICENSE"):
             add("license-offline", path)
         elif path == ".github/deny.toml":
@@ -449,7 +502,7 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
             native.add("x86_64-pc-windows-msvc")
         add("native-portability", "изменена native-зависимость proxy")
     if license_stack and mode != "sprint-full":
-        interfaces = any(path.startswith((".github/release/license/", "scripts/license/")) or
+        interfaces = any((path not in LICENSE_DOCS and path.startswith((".github/release/license/", "scripts/license/"))) or
                          (path.startswith("apps/socks5-proxy/") and (path.endswith("/build.rs") or "license" in path.lower() or "recipient_information" in path or path in ("apps/socks5-proxy/src/main.rs", "apps/socks5-proxy/src/args.rs", "apps/socks5-proxy/src/cli.rs")))
                          for path in paths)
         dependency_change = proxy & selected and any(path == "Cargo.toml" or path == "Cargo.lock" or path.endswith("/Cargo.toml") for path in paths)
@@ -510,7 +563,9 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
             "shipping_packages": sorted(graph.packages[i]["name"] for i in required(shipping)),
             "segments": sorted(segments), "target_rows": rows, "native_rows": native_rows,
             "paths": sorted(set(paths)), "reasons": {k: sorted(reasons[k]) for k in sorted(segments)}, "full": mode == "sprint-full",
-            "capabilities": {"license_stack": license_stack}, "license_stack": license_stack}
+            "capabilities": {"license_stack": license_stack, "real_tor_channel": real_tor},
+            "capability_reasons": {"real_tor_channel": "установлен контракт" if real_tor else "контракт не установлен"},
+            "license_stack": license_stack}
 
 
 RESULT_JOBS = {
@@ -534,6 +589,11 @@ def validate_results(plan, needs):
     segments = plan["segments"]
     if not isinstance(segments, list) or not all(isinstance(x, str) for x in segments):
         raise MappingError("missing mapping: неверные сегменты")
+    capabilities = plan.get("capabilities")
+    if not isinstance(capabilities, dict) or type(capabilities.get("real_tor_channel")) is not bool:
+        raise MappingError("missing mapping: real Tor capability")
+    if "tor" in segments and not capabilities["real_tor_channel"]:
+        raise MappingError("missing mapping: real Tor selected without capability")
     unsupported = set(segments) - {s for values in RESULT_JOBS.values() for s in values} - {"required"}
     if unsupported:
         raise MappingError("missing mapping: нет потребителя: " + ", ".join(sorted(unsupported)))
@@ -575,7 +635,20 @@ def main():
                 entry = git("ls-tree", "--name-only", ref, "--", path).decode().strip()
                 return git("show", ref + ":" + path).decode() if entry == path else ""
             return tuple(read(ref) for ref in (base, args.head))
-        result = plan(graph, paths, blobs, args.mode, event=args.event)
+        def tree_read(ref, path):
+            if ref is None:
+                return ""
+            entry = git("ls-tree", "--name-only", ref, "--", path).decode().strip()
+            return git("show", ref + ":" + path).decode() if entry == path else ""
+        # Ручной полный запуск также проверяет первого родителя на удаление контракта в HEAD.
+        parent = base
+        if parent is None:
+            parents = git("rev-list", "--parents", "-n", "1", args.head).decode().split()
+            parent = parents[1] if len(parents) > 1 else None
+        real_tor = contract_capability(lambda p: tree_read(parent, p), lambda p: tree_read(args.head, p))
+        capabilities = {"real_tor_channel": real_tor,
+                        "license_stack": (Path(root) / ".github/deny.toml").is_file() and (Path(root) / ".github/release/license").is_dir()}
+        result = plan(graph, paths, blobs, args.mode, capabilities=capabilities, event=args.event)
         supported = {s for values in RESULT_JOBS.values() for s in values} | {"required"}
         unsupported = set(result["segments"]) - supported
         if unsupported:
