@@ -58,12 +58,13 @@ python -I docs/project/license/release-components-40934653900-repro/materials/re
 
 ## Конкретные результаты
 
-- LLVM exception: полный текст отсутствует среди retained материалов у wasip3, wasmparser, wit-component, wit-parser.
+- LLVM exception: полный текст ранее отсутствовал среди retained материалов для `wasip3 0.4.0+wasi-0.3.0-rc-2026-01-06`, `wasmparser 0.244.0`, `wit-component 0.244.0`, `wit-parser 0.244.0`; manifest всех четырёх: `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`. Захвачен официальный LLVM `LICENSE.TXT`: `target/llvm-primary-20261030-c/LICENSE.TXT`, commit `e9996a2e210d021783d597d99ccd3199b0885d49`, blob `fa6ac540007032cbd0ec772a1c72e6cb5527a4fe`, 15141 bytes, SHA-256 `8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee`; capture/provenance и условия — в [README](README.md). Официальная цепочка сайта→репозитория установлена через llvm.org и его ссылку на llvm/llvm-project; текущий текст не является разрешением выбора пакетной ветви. §4 исключение (210–213) применимо только при компиляции YOUR source с embedded Software в Object form YOUR source и касается только §§4(a), 4(b), 4(d), не §4(c); GPLv2 условие (215–222) — только Combined Software при судебном конфликте. Не выбирать OR-ветвь. SHA `268872b9816f90fd8e85db5a28d33f8150ebb8dd016653fb39ef1f94f2686bc5` для reference TEXT относится к другим 12 компонентам. Пины n/o и их исторические counts не обновлены; p/q сохраняет четыре исторических blocker и 12 distinct reference-material ссылок, не доказывающих применимость.
+
 - r-efi: объявлен LGPL-2.1-or-later, полный текст отсутствует.
 - dynasm/dynasmrt: объявлен MPL, `LICENSE` отсутствует.
 - enum_dispatch/ident_case: полный MIT присутствует, объявленный текст Apache отсутствует.
 - plotters×3 и objc2×2: ссылки вне crate.
-- webpki-roots: внешние CCADB terms не сохранены и не оценены.
+- webpki-roots: внешний CCADB terms blocker сохранён. Supplemental source capture описан в [README](README.md); запрос текущего raw `curl -L --max-filesize 262144 -D - https://www.ccadb.org/rootstores/usage` был отклонён: `ERROR command is not allowed for security reasons`. Не обходить отказ. Исторический repo snapshot — supplement, не official identity proof и не доказательство исторического grant; современная официальная parent page — не raw. Data/Results не классифицированы автоматически; approval отсутствует. p/q ledger не изменён.
 
 ## Исторические пины n/o
 

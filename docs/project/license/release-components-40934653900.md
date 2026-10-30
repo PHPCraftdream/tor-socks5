@@ -216,24 +216,31 @@ Outer: 824 записи, сумма размеров членов 878710567 ба
 - Общий `NOTICES.txt` может содержать GPL от других компонентов; его отсутствие не утверждается.
 - При необходимости текст GPL и применимые материалы нужно обеспечить и проверить.
 
+### LLVM exception
+
+- Официальный LLVM `LICENSE.TXT` захвачен: `target/llvm-primary-20261030-c/LICENSE.TXT`, commit `e9996a2e210d021783d597d99ccd3199b0885d49`, blob `fa6ac540007032cbd0ec772a1c72e6cb5527a4fe`, 15141 bytes, SHA-256 `8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee`; capture и provenance: [materials README](release-components-40934653900-repro/materials/README.md).
+- Цепочка источника установлена от официального llvm.org к его ссылке на llvm/llvm-project. Это идентификация источника, не разрешение выбора пакетной лицензии; четыре manifest сохраняют `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`, без выбора.
+- Исключение (210–213) действует только для компиляции YOUR source с embedded Software в Object form YOUR source; только §§4(a), 4(b), 4(d), не §4(c). GPLv2 условие (215–222) относится только к Combined Software при судебном конфликте. Reference TEXT hash `268872b9816f90fd8e85db5a28d33f8150ebb8dd016653fb39ef1f94f2686bc5` остаётся для других 12 distinct ссылок; применимость к четырём не установлена.
+
 ### webpki-roots, CDLA и CCADB
 
 - Исторический анализ рассматривает версии `0.26.11` и `1.0.7`.
-- В нём 0.26.11 переэкспортирует данные родительской зависимости;
-  1.0.7 содержит исходную таблицу trust anchors и комментарии к сертификатам.
-- Наличие исходников не доказывает наличие этих данных в конкретном binary.
+- Дополнительные материалы CCADB, pins, provenance и ограничения описаны в [materials evidence README](release-components-40934653900-repro/materials/README.md); p/q ledger не изменён. Запрос текущего raw `curl -L --max-filesize 262144 -D - https://www.ccadb.org/rootstores/usage` отклонён с точным сообщением `ERROR command is not allowed for security reasons`; отказ не обходить. Исторический repository supplement не доказывает официальную identity или исторический grant; современная официальная parent page не является raw. Data/Results не классифицированы автоматически, approval отсутствует.
+- 0.26.11 переэкспортирует данные родительской зависимости; 1.0.7 содержит исходную таблицу trust anchors и комментарии к сертификатам. Наличие исходников не доказывает наличие этих данных в конкретном binary.
 - CDLA-Permissive-2.0 §2.1: при sharing Data текст соглашения доступен с Data.
 - §3.1 не налагает ограничений или обязательств на Results.
 - Является ли конкретный распространяемый материал Data или Results, неизвестно.
-- Исторический анализ приводит требование атрибуции на странице CCADB,
-  отдельно от текста CDLA; применимость и условия конкретного получения неизвестны.
+- [Snapshot страницы CCADB, commit 499b881 от 2025-02-03](https://github.com/mozilla/www.ccadb.org/blob/499b8818c174030e979041842d1d4cfb5fcbda89/rootstores/usage.md) (не утверждение, что это current master) заявляет CDLA-Permissive 2.0, attribution при redistribution/use в derived works и запрет endorsement/promotion без prior written permission; см. raw capture и exact pins в materials README. Это формулировки страницы, не полный текст CDLA.
+- Для двух usage-текстов пины 110/112 предшествовали просмотрам 116/118; domain 106 был просмотрен до pin 114, это нарушение. История b не является корректной pin-before-read для всего каталога; прежнее provenance-обобщение отозвано. Исторический snapshot `ed227276` от 2024-02-05 допускает redistribution/use с ограничением endorsement/promotion и disclaimer; он не current и не доказывает условия исторического grant.
 - Выяснить происхождение, атрибуцию, notices и запрет подразумеваемого endorsement.
 - В текущем `NOTICES.txt` найдено 10 совпадений `CCADB`, включая исторический анализ;
-  это не доказательство достаточной атрибуции, но и не её полное отсутствие.
-- [Условия CCADB](https://www.ccadb.org/rootstores/usage#ccadb-data-usage-terms) и
+  это не доказательство достаточной атрибуции, но и не её полное отсутствие. Внешний snapshot и точные pins см. в [materials evidence README](release-components-40934653900-repro/materials/README.md).
+- [CCADB Data Usage Terms snapshot](https://www.ccadb.org/rootstores/usage#ccadb-data-usage-terms) и
   [текст CDLA](https://cdla.dev/permissive-2-0/) оценивать отдельно.
 - Бинарное наличие самих данных не наблюдалось при этой проверке.
+- Статус наличия текста страницы в evidence дополнен, но два исходных blocker `external_ccadb_terms_not_saved` в ledger не сняты; никакого вывода о применимости к конкретному получению/распространению, Data-vs-Results, достаточности attribution или compliance нет.
 - Само преобразование данных не доказывает классификацию Results.
+- Процедурная история CCADB capture сохранена: первоначальная директория `ccadb-capture-20261030-a` не имела pin до семантического чтения; поздние pins это нарушение не исправляют. В b порядок pin-before-read соблюдён для usage-текстов, но нарушен для domain evidence; детали и исправление прежнего обобщения — в materials README.
 
 ### Прочие исторические записи
 
