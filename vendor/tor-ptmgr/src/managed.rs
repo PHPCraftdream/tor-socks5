@@ -734,6 +734,38 @@ async fn spawn_from_config<R: Runtime>(
     }
 }
 
+/// Given a path to a binary for a pluggable transport, return an identifier for
+/// that binary in a format that can be used as a path component.
+fn pt_identifier_as_path(binary_path: impl AsRef<Path>) -> Result<PathBuf, PtError> {
+    // Extract the final component.
+    let mut filename =
+        PathBuf::from(
+            binary_path
+                .as_ref()
+                .file_name()
+                .ok_or_else(|| PtError::NotAFile {
+                    path: binary_path.as_ref().to_path_buf(),
+                })?,
+        );
+
+    // Strip an "exe" off the end, if appropriate.
+    if let Some(ext) = filename.extension() {
+        if ext.eq_ignore_ascii_case(std::env::consts::EXE_EXTENSION) {
+            filename.set_extension("");
+        }
+    }
+
+    Ok(filename)
+}
+
+/// Given a path to a binary for a pluggable transport, return an identifier for
+/// that binary in human-readable form.
+pub(crate) fn pt_identifier(binary_path: impl AsRef<Path>) -> Result<String, PtError> {
+    Ok(pt_identifier_as_path(binary_path)?
+        .to_string_lossy()
+        .to_string())
+}
+
 // Проверки запускаются только в CI.
 #[cfg(test)]
 mod lifecycle_tests {
@@ -827,7 +859,7 @@ mod lifecycle_tests {
         assert!(!slots_terminal(&[cleaning]));
         assert!(slots_terminal(&[]));
         // Пустой ключ сироты никогда не совпадает с ключом слота-пути.
-        assert!(PathBuf::new() != PathBuf::from("pt"));
+        assert!(Path::new("") != Path::new("pt"));
     }
 
     // Слот в фазе Running с нулевым счётчиком попыток для переходов.
@@ -914,7 +946,7 @@ mod lifecycle_tests {
         }
         // Started(Err, Some(pt)) в complete_task: retained-процесс уходит в
         // очистку без уже израсходованных попыток.
-        let mut slots = vec![running_slot()];
+        let mut slots = [running_slot()];
         slots[0].phase = Phase::Cleaning;
         assert_eq!(slots[0].cleanup_attempts, 0);
         // Неудачная очистка retained-процесса: первая неудача -> attempts=1.
@@ -1214,7 +1246,7 @@ mod lifecycle_tests {
                     use crate::ipc::sealed::PluggableTransportPrivate as _;
                     match &mut reactor.slots[0].phase {
                         Phase::Running(pt) => {
-                            pt.inner().expect("child").force_next_shutdown_error()
+                            pt.inner().expect("child").force_next_shutdown_error();
                         }
                         _ => panic!("слот должен быть в фазе Running"),
                     }
@@ -1504,36 +1536,4 @@ mod lifecycle_tests {
             });
         }
     }
-}
-
-/// Given a path to a binary for a pluggable transport, return an identifier for
-/// that binary in a format that can be used as a path component.
-fn pt_identifier_as_path(binary_path: impl AsRef<Path>) -> Result<PathBuf, PtError> {
-    // Extract the final component.
-    let mut filename =
-        PathBuf::from(
-            binary_path
-                .as_ref()
-                .file_name()
-                .ok_or_else(|| PtError::NotAFile {
-                    path: binary_path.as_ref().to_path_buf(),
-                })?,
-        );
-
-    // Strip an "exe" off the end, if appropriate.
-    if let Some(ext) = filename.extension() {
-        if ext.eq_ignore_ascii_case(std::env::consts::EXE_EXTENSION) {
-            filename.set_extension("");
-        }
-    }
-
-    Ok(filename)
-}
-
-/// Given a path to a binary for a pluggable transport, return an identifier for
-/// that binary in human-readable form.
-pub(crate) fn pt_identifier(binary_path: impl AsRef<Path>) -> Result<String, PtError> {
-    Ok(pt_identifier_as_path(binary_path)?
-        .to_string_lossy()
-        .to_string())
 }
