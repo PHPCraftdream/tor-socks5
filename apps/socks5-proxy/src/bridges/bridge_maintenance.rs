@@ -114,8 +114,12 @@ pub(crate) fn spawn(
 ) -> tokio::task::JoinHandle<()> {
     #[cfg(test)]
     crate::test_seams::forbid_producer("maintenance");
+    #[cfg(test)]
+    let probe = PRE_PROBE.try_with(std::sync::Arc::clone).ok();
+    #[cfg(test)]
+    let control = LOOP_CONTROL.try_with(std::sync::Arc::clone).ok();
     // The server runtime joins this handle at shutdown, so an in-flight refresh finishes and its store writes land before the bridge-store writer closes.
-    tokio::spawn(async move {
+    let run = async move {
         let mut ticker =
             tokio::time::interval(Duration::from_secs(interval_mins.saturating_mul(60).max(1)));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -133,6 +137,14 @@ pub(crate) fn spawn(
                         tokio::time::sleep_until(next_recovery).await;
                         handle.bridge_refresh().recovery().notified().await;
                     } => {},
+                    _ = async {
+                        #[cfg(test)]
+                        if let Some(control) = &control {
+                            control.idle().await;
+                            return;
+                        }
+                        std::future::pending::<()>().await;
+                    } => { continue; },
                     _ = ticker.tick(), if interval_mins != 0 => {},
                     _ = async {
                         tokio::time::sleep_until(next_allowed).await;
@@ -141,6 +153,12 @@ pub(crate) fn spawn(
                 }
             }
             first = false;
+            #[cfg(test)]
+            if let Some(control) = &control {
+                control
+                    .started
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             let cycle: futures::future::BoxFuture<'_, Result<()>> = Box::pin(refresh(
                 &handle,
                 config_path.as_deref(),
@@ -153,8 +171,17 @@ pub(crate) fn spawn(
                 warn!(%error, "bridge refresh failed; keeping current routes");
             }
             next_allowed = Instant::now() + CONNECTION_REFRESH_INTERVAL;
+            #[cfg(test)]
+            if let Some(control) = &control {
+                control.completed().await;
+            }
         }
-    })
+    };
+    #[cfg(test)]
+    if let Some(probe) = probe {
+        return tokio::spawn(PRE_PROBE.scope(probe, run));
+    }
+    tokio::spawn(run)
 }
 
 /// `Config::load_with_override` does blocking file I/O (config read plus
@@ -188,6 +215,14 @@ async fn refresh(
     let Some(tor) = handle.tunnel().await else {
         return Ok(());
     };
+    if let Some(Some(endpoint)) = tor.configured_pre_endpoint() {
+        let result = refresh_pre(handle, path, active, &cfg, &tor, endpoint).await;
+        *next_recovery = Instant::now() + RECOVERY_REFRESH_INTERVAL;
+        return result;
+    }
+    if active.pre_endpoint.is_some() {
+        anyhow::bail!("неизвестный маршрут действующего клиента");
+    }
     let mut usable = refresh_routes(
         handle,
         path,
@@ -271,6 +306,70 @@ async fn refresh(
         cfg.bridges.auto_fetch && (usable == 0 || preferred_missing(&cfg, &active.bridges)),
     );
     Ok(())
+}
+
+async fn refresh_pre(
+    handle: &TorHandle,
+    path: Option<&Path>,
+    active: &mut Settings,
+    cfg: &Config,
+    tor: &arti_wrapper::TorTunnel,
+    endpoint: &arti_wrapper::Socks5PreEndpoint,
+) -> Result<()> {
+    let configured = proxy_config::resolve_endpoint(cfg.pre_socks5.as_ref(), None).map(|value| {
+        arti_wrapper::Socks5PreEndpoint::new(
+            value.address(),
+            value
+                .credentials()
+                .map(|(user, pass)| (user.to_owned(), pass.to_owned())),
+        )
+    });
+    if configured.as_ref() != Some(endpoint) || active.pre_endpoint.as_ref() != Some(endpoint) {
+        anyhow::bail!("изменение pre требует перезапуска");
+    }
+    if cfg.upstream.enabled {
+        anyhow::bail!("pre несовместим с upstream");
+    }
+    let validated = crate::tor_setup::restricted_owner_settings(cfg, path)?;
+    let mut selected = active.clone();
+    selected.bridges = validated.bridges;
+    use futures::StreamExt;
+    let ready: Vec<_> = futures::stream::iter(selected.bridges.iter().take(30).cloned())
+        .map(|bridge| async move { pre_channel_ready(tor, &bridge).await.then_some(bridge) })
+        .buffered(8)
+        .filter_map(|bridge| async move { bridge })
+        .collect()
+        .await;
+    if ready.is_empty() {
+        anyhow::bail!("нет подтверждённых каналов через pre; текущий маршрут сохранён");
+    }
+    selected.bridges = ready;
+    activate(handle, active, selected, tor)?;
+    Ok(())
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static PRE_PROBE: std::sync::Arc<pre_tests::Probe>;
+    static LOOP_CONTROL: std::sync::Arc<pre_tests::LoopControl>;
+}
+
+/// cancel-safe: да — отмена прекращает ожидание канала, владение клиентом не передаётся.
+pub(crate) async fn pre_channel_ready(tor: &arti_wrapper::TorTunnel, bridge: &BridgeLine) -> bool {
+    if !matches!(tor.configured_pre_endpoint(), Some(Some(_))) || bridge.transport.is_some() {
+        return false;
+    }
+    #[cfg(test)]
+    if let Ok(probe) = PRE_PROBE.try_with(std::sync::Arc::clone) {
+        probe
+            .entered
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        return probe.ready;
+    }
+    matches!(
+        tokio::time::timeout(Duration::from_secs(15), tor.warm_bridge(bridge)).await,
+        Ok(Ok(true))
+    )
 }
 
 fn refresh_routes<'a>(
@@ -402,6 +501,14 @@ async fn live_route_works(
         false
     }
 }
+
+#[cfg(test)]
+#[path = "bridge_maintenance/real_channel_tests.rs"]
+mod real_channel_tests;
+
+#[cfg(test)]
+#[path = "bridge_maintenance/pre_tests.rs"]
+mod pre_tests;
 
 #[cfg(test)]
 mod tests {

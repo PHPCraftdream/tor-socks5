@@ -1,8 +1,5 @@
-# Nightly tests — T3 tier (docs/plans/test-tiers.md).
-#
-# T3 = T2 full run + flaky-hunt stress runs + vendored-crate tests +
-# cargo-hack each-feature checks + a consolidated report/issue.
-# Deliberately a separate scheduled workflow (see ci.yml header).
+# Ночной контур: ограниченные стресс-наборы, vendor и отдельные фичи.
+# Полная матрица workspace здесь не запускается.
 #
 # Cron minute 17 is intentionally odd so it never collides with the
 # top-of-hour stampede of other repositories' scheduled workflows.
@@ -30,33 +27,6 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
-  # T2 equivalent: full workspace nextest run + doctests, all three OSes.
-  full:
-    name: Test T3 full (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup-local-sdk
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: nextest
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo nextest run --workspace --locked --profile ci
-        shell: bash
-      - run: cargo test --doc --workspace --exclude saturating-time --locked
-        shell: bash
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: junit-full-${{ matrix.os }}
-          path: target/nextest/ci/junit.xml
-          if-no-files-found: ignore
-
   # Flaky hunt: repeat whole runs of the socket/clock-heavy suites with the
   # flaky-hunt nextest profile (status-level: all, retries stay 0 — repeats,
   # not masking). --stress-count verified against nextest 0.9.137
@@ -76,6 +46,11 @@ jobs:
         with:
           tool: nextest
       - uses: Swatinem/rust-cache@v2
+      # Сохраняем исправление ACL fixtures при переносе nightly на сегменты.
+      - name: Assign loopback alias 127.0.0.2 (macOS)
+        if: runner.os == 'macOS'
+        run: sudo ifconfig lo0 alias 127.0.0.2 up
+        shell: bash
       - run: >-
           cargo nextest run --profile flaky-hunt --stress-count 10
           -p tor-socks5-dns -p tor-circmgr -p tor-guardmgr -p socks5-proxy
@@ -144,7 +119,7 @@ jobs:
   # auto-close with a "recovered" comment when green again).
   report:
     name: Report
-    needs: [full, flaky-hunt, vendor-extra, features]
+    needs: [flaky-hunt, vendor-extra, features]
     if: always()
     runs-on: ubuntu-latest
     permissions:
@@ -164,7 +139,6 @@ jobs:
             echo ""
             echo "| Job | Result |"
             echo "|-----|--------|"
-            echo "| full | \`${{ needs.full.result }}\` |"
             echo "| flaky-hunt | \`${{ needs.flaky-hunt.result }}\` |"
             echo "| vendor-extra | \`${{ needs.vendor-extra.result }}\` |"
             echo "| features | \`${{ needs.features.result }}\` |"
@@ -172,8 +146,7 @@ jobs:
 
           failed_jobs=""
           all_success=true
-          for entry in "full=${{ needs.full.result }}" \
-                       "flaky-hunt=${{ needs.flaky-hunt.result }}" \
+          for entry in "flaky-hunt=${{ needs.flaky-hunt.result }}" \
                        "vendor-extra=${{ needs.vendor-extra.result }}" \
                        "features=${{ needs.features.result }}"; do
             job="${entry%%=*}"
