@@ -35,8 +35,8 @@ class Routing(unittest.TestCase):
     def setUp(self):
         self.g = graph()
 
-    def route(self, *paths, blobs=None, mode="affected", capabilities=None, event="pull_request"):
-        return p.plan(self.g, paths, lambda path: blobs[path], mode, capabilities, event)
+    def route(self, *paths, blobs=None, mode="affected", capabilities=None, event="pull_request", full_trigger=None):
+        return p.plan(self.g, paths, lambda path: blobs[path], mode, capabilities, event, full_trigger=full_trigger)
 
     def test_proxy_auth_config(self):
         self.assertEqual(self.route("apps/socks5-proxy/src/main.rs")["packages"], ["socks5-proxy"])
@@ -62,8 +62,11 @@ class Routing(unittest.TestCase):
         self.assertEqual(self.route("apps/socks5-proxy/src/main.rs")["command_packages"]["android"], ["socks5-proxy"])
         self.assertIn("tor", self.route("packages/arti-wrapper/src/lib.rs")["segments"])
         self.assertEqual(self.route("docs/plans/note.md")["segments"], ["fast"])
+        self.assertEqual(self.route("vendor/README.md")["segments"], ["fast"])
+        with self.assertRaises(p.MappingError):
+            self.route("vendor/unknown-control.txt")
         caps = {"license_stack": True, "real_tor_channel": False}
-        for path in (".github/release/license/README.md", "docs/project/licensing.md", "packages/auth/README.md"):
+        for path in (".github/release/license/README.md", "docs/project/licensing.md", "packages/auth/README.md", "vendor/README.md"):
             result = self.route(path, capabilities=caps)
             self.assertEqual(result["segments"], ["fast"])
             self.assertEqual(result["packages"], [])
@@ -403,10 +406,17 @@ jobs:
 
     def test_events(self):
         calls = []
+        checkout = "merge"
         def git(*args):
             calls.append(args)
-            return b"ancestor\n"
+            if args[0] == "rev-list":
+                return b"merge base head\n"
+            if args[0] == "merge-base":
+                return b"" if "--is-ancestor" in args else b"ancestor\n"
+            ref = args[-1].removesuffix("^{commit}")
+            return ((checkout if ref == "HEAD" else ref) + "\n").encode()
         self.assertEqual(p.comparison("pull_request", "affected", "base", "head", "", git), "ancestor")
+        checkout = "head"
         self.assertEqual(p.comparison("push", "affected", "before", "head", "", git), "before")
         self.assertEqual(p.comparison("workflow_dispatch", "affected", "", "head", "main", git), "main")
         with self.assertRaises(p.MappingError):
@@ -419,6 +429,205 @@ jobs:
             raise p.MappingError("git")
         with self.assertRaises(p.MappingError):
             p.comparison("push", "affected", "base", "head", "", failed)
+
+
+def license_route(*paths, blobs=None, mode="affected", capabilities=None,
+                  event="pull_request", full_trigger=None):
+    """Общий helper лицензионных кейсов: свежий graph() и p.plan на каждый вызов.
+
+    blobs=None означает читателя, возвращающего None (пути, для которых содержимое
+    не нужно — например, build.rs или check.py); для манифестов передавайте blobs явно.
+    """
+    return p.plan(graph(), paths, lambda path: (blobs or {}).get(path), mode,
+                  capabilities, event, full_trigger=full_trigger)
+
+
+class LicenseFooterFull(unittest.TestCase):
+    """Явный footer-full на PR сохраняет обязательные лицензионные контракты.
+
+    Обычный TestCase (не наследник Routing), чтобы унаследованные Routing-тесты
+    не переисполнялись; общий fixture вынесен в модульную license_route().
+    """
+    CAPS = {"license_stack": True, "real_tor_channel": True}
+
+    def test_footer_full_pr_keeps_license_contracts(self):
+        # build.rs попадает сразу в несколько лицензионных веток plan():
+        # путь "/build.rs" даёт license-offline ("изменён build.rs") и interfaces-ветку
+        # (license-offline/license-audit/license-lifecycle), причём в sprint-full
+        # selected = все члены workspace, так что proxy & selected гарантирован.
+        full = license_route("apps/socks5-proxy/build.rs", capabilities=self.CAPS,
+                             event="pull_request", mode="sprint-full",
+                             full_trigger="commit_footer")
+        for segment in ("license-lifecycle", "license-offline", "license-audit"):
+            self.assertIn(segment, full["segments"])
+        self.assertTrue(full["full"])
+
+    def test_manual_full_pr_excludes_lifecycle(self):
+        # Ручной sprint-full (full_trigger="manual") ведёт себя как раньше:
+        # license-lifecycle на PR исключён, но лицензионный стек sprint-full
+        # по-прежнему даёт license-offline/license-audit.
+        manual = license_route("apps/socks5-proxy/build.rs", capabilities=self.CAPS,
+                               event="pull_request", mode="sprint-full",
+                               full_trigger="manual")
+        self.assertNotIn("license-lifecycle", manual["segments"])
+        self.assertIn("license-offline", manual["segments"])
+        self.assertIn("license-audit", manual["segments"])
+
+    def test_push_footer_full_excludes_lifecycle(self):
+        # lifecycle остаётся PR-only даже при footer-full на push.
+        push = license_route("apps/socks5-proxy/build.rs", capabilities=self.CAPS,
+                             event="push", mode="sprint-full",
+                             full_trigger="commit_footer")
+        self.assertNotIn("license-lifecycle", push["segments"])
+
+    def test_affected_default_without_full_trigger_unchanged(self):
+        # Старые вызовы route без full_trigger (default None) не включают footer_full:
+        # поведение affected и manual sprint-full не изменилось.
+        affected = license_route("apps/socks5-proxy/build.rs", capabilities=self.CAPS,
+                                 event="pull_request")
+        self.assertIn("license-lifecycle", affected["segments"])
+        manual = license_route("apps/socks5-proxy/build.rs", capabilities=self.CAPS,
+                               event="pull_request", mode="sprint-full",
+                               full_trigger=None)
+        self.assertNotIn("license-lifecycle", manual["segments"])
+
+    def test_real_manual_full_workflow_dispatch(self):
+        # Единственная достижимая через CLI комбинация для manual-полного прогона:
+        # event="workflow_dispatch", mode="sprint-full" — comparison отвергает
+        # пару PR+manual как противоречие, поэтому plan() её не получает.
+        # license-lifecycle при manual не добавляется; лицензионный стек полного
+        # прогона по-прежнему даёт license-offline/license-audit.
+        manual = license_route("apps/socks5-proxy/build.rs", capabilities=self.CAPS,
+                               event="workflow_dispatch", mode="sprint-full",
+                               full_trigger="manual")
+        self.assertNotIn("license-lifecycle", manual["segments"])
+        self.assertIn("license-offline", manual["segments"])
+        self.assertIn("license-audit", manual["segments"])
+        self.assertTrue(manual["full"])
+
+    def test_no_license_stack_no_license_segments(self):
+        # Без лицензионного стека (license_stack=False) лицензионных сегментов
+        # нет ни в affected, ни в footer-full: контракт — что без стека
+        # лицензионные контракты не появляются вовсе.
+        caps = {"license_stack": False, "real_tor_channel": True}
+        affected = license_route("apps/socks5-proxy/build.rs", capabilities=caps,
+                                 event="pull_request")
+        full = license_route("apps/socks5-proxy/build.rs", capabilities=caps,
+                             event="pull_request", mode="sprint-full",
+                             full_trigger="commit_footer")
+        for plan in (affected, full):
+            for segment in ("license-offline", "license-audit", "license-lifecycle"):
+                self.assertNotIn(segment, plan["segments"])
+
+    def test_footer_full_pr_not_stricter_than_affected(self):
+        # Сравнительный контракт «footer-full PR не строже affected» по
+        # license-consumers: позитивное сохранение обязательных consumers,
+        # а не только текстуальная сохранность условия в коде — каждый
+        # лицензионный сегмент affected-плана обязан остаться в footer-full.
+        for path, blobs in (("apps/socks5-proxy/build.rs", None),
+                            (".github/release/license/check.py", None),
+                            ("Cargo.toml", {"Cargo.toml": ('[workspace.dependencies]\nopenssl-sys="1"',
+                                                           '[workspace.dependencies]\nopenssl-sys="2"')})):
+            with self.subTest(path=path):
+                affected = license_route(path, blobs=blobs, capabilities=self.CAPS,
+                                         event="pull_request")
+                full = license_route(path, blobs=blobs, capabilities=self.CAPS,
+                                     event="pull_request", mode="sprint-full",
+                                     full_trigger="commit_footer")
+                for segment in {"license-offline", "license-audit", "license-lifecycle"} & set(affected["segments"]):
+                    self.assertIn(segment, full["segments"])
+
+
+class CommitFooter(unittest.TestCase):
+    def matches(self, message):
+        return any(p.FULL_FOOTER_RE.match(line) for line in message.split("\n"))
+    def test_exact_footer(self):
+        self.assertTrue(self.matches("заголовок\n\nCI-Full: sprint-end"))
+        self.assertTrue(self.matches("CI-Full: sprint-end"))
+        self.assertTrue(self.matches("CI-Full: sprint-end\r\nвторой\r\n"))
+    def test_negatives(self):
+        for message in ("  CI-Full: sprint-end", "CI-Full: sprint-end ", "CI-Full:  sprint-end",
+                        "CI-Full:sprint-end", "ci-full: sprint-end", "CI-Full: sprint-end.",
+                        "упоминание CI-Full: sprint-end в тексте", "CI-Full: sprint-full",
+                        "CI-Full: sprint-end\r \n", "X"):
+            self.assertFalse(self.matches(message), message)
+
+
+class PullRequestSource(unittest.TestCase):
+    def git_merge(self, parents_line):
+        def git(*args):
+            if args[0] == "rev-list":
+                return parents_line
+            if args[0] == "merge-base":
+                return b"mb\n"
+            if args[-1] == "HEAD^{commit}":
+                return b"merge\n"
+            return (args[-1].removesuffix("^{commit}") + "\n").encode()
+        return git
+    def test_merge_checkout_parents_prove_source_and_base(self):
+        git = self.git_merge(b"merge base source\n")
+        self.assertEqual(p.comparison("pull_request", "affected", "base", "source", "", git), "mb")
+    def test_parent_mismatch_is_rejected(self):
+        for line in (b"merge other source\n", b"merge base other\n", b"merge\n"):
+            with self.subTest(parents=line):
+                with self.assertRaises(p.MappingError):
+                    p.comparison("pull_request", "affected", "base", "source", "", self.git_merge(line))
+    def test_non_pr_still_requires_exact_checkout(self):
+        def git(*args):
+            if args[0] == "rev-list":
+                return b"merge base source\n"
+            if args[-1] == "HEAD^{commit}":
+                return b"other\n"
+            return b"resolved\n"
+        with self.assertRaises(p.MappingError):
+            p.comparison("push", "affected", "before", "source", "", git)
+        with self.assertRaises(p.MappingError):
+            p.comparison("workflow_dispatch", "affected", "", "source", "main", git)
+
+
+class WorkflowWiring(unittest.TestCase):
+    def test_head_and_base_event_sources(self):
+        text = (Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        def expression(prefix):
+            line = next(line for line in text.splitlines() if line.strip().startswith(prefix + ": ${{"))
+            return line.split("${{", 1)[1].rsplit("}}", 1)[0].strip()
+        payloads = {
+            "pull_request": {"github.event.pull_request.head.sha": "SRC", "github.event.pull_request.base.sha": "BASE",
+                             "github.sha": "SHA", "github.event.before": "BEFORE"},
+            "push": {"github.sha": "SHA", "github.event.before": "BEFORE"},
+            "workflow_dispatch": {"github.sha": "SHA"},
+        }
+        def evaluate(expr, payload):
+            for part in (item.strip() for item in expr.split("||")):
+                if payload.get(part):
+                    return payload[part]
+            return ""
+        head_expr, base_expr = expression("HEAD"), expression("BASE")
+        self.assertEqual(evaluate(head_expr, payloads["pull_request"]), "SRC")
+        self.assertEqual(evaluate(head_expr, payloads["push"]), "SHA")
+        self.assertEqual(evaluate(head_expr, payloads["workflow_dispatch"]), "SHA")
+        self.assertEqual(evaluate(base_expr, payloads["pull_request"]), "BASE")
+        self.assertEqual(evaluate(base_expr, payloads["push"]), "BEFORE")
+        self.assertNotIn("github.event.before", head_expr)
+
+    def test_license_bundle_head_and_base_event_sources(self):
+        text = (Path(__file__).resolve().parents[2] / ".github/workflows/license-bundle.yml").read_text(encoding="utf-8")
+        def expression(prefix):
+            line = next(line for line in text.splitlines() if line.strip().startswith(prefix + ": ${{"))
+            return line.split("${{", 1)[1].rsplit("}}", 1)[0].strip()
+        payloads = {
+            "pull_request": {"github.event.pull_request.head.sha": "SRC", "github.event.pull_request.base.sha": "BASE",
+                             "github.sha": "SHA", "github.event.before": "BEFORE"},
+        }
+        def evaluate(expr, payload):
+            for part in (item.strip() for item in expr.split("||")):
+                if payload.get(part):
+                    return payload[part]
+            return ""
+        head_expr, base_expr = expression("HEAD"), expression("BASE")
+        self.assertEqual(evaluate(head_expr, payloads["pull_request"]), "SRC")
+        self.assertNotIn("github.event.before", head_expr)
+        self.assertIn("github.event.pull_request.head.sha", head_expr)
 
 
 if __name__ == "__main__":
