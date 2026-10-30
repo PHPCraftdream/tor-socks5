@@ -176,6 +176,16 @@ impl fmt::Debug for Socks5PreEndpoint {
     }
 }
 
+impl crate::TorTunnel {
+    /// Ожидает подтверждения остановки PT; после отмены ожидание можно повторить.
+    pub async fn shutdown(&self) -> crate::Result<()> {
+        self.inner
+            .shutdown_pluggable_transports()
+            .await
+            .map_err(|_| crate::TorError::Shutdown)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,15 +235,5 @@ mod tests {
             proxy.to_string(),
             "socks5://user%3A%40%2F%C3%A9:p%3Ass%2F%40%E9%9B%AA@127.0.0.1:9050"
         );
-    }
-}
-
-impl crate::TorTunnel {
-    /// Ожидает подтверждения остановки PT; после отмены ожидание можно повторить.
-    pub async fn shutdown(&self) -> crate::Result<()> {
-        self.inner
-            .shutdown_pluggable_transports()
-            .await
-            .map_err(|_| crate::TorError::Shutdown)
     }
 }
