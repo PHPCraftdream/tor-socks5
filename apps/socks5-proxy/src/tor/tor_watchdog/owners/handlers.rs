@@ -2,6 +2,20 @@ use super::*;
 use std::sync::atomic::AtomicBool;
 use tokio::task::JoinSet;
 
+pub(super) struct RegistryRunGuard(pub(super) Arc<owners::OwnerRegistry>);
+impl Drop for RegistryRunGuard {
+    fn drop(&mut self) {
+        self.0.begin_close();
+    }
+}
+
+pub(super) struct HandlerRunGuard(pub(super) Arc<HandlerTasks>);
+impl Drop for HandlerRunGuard {
+    fn drop(&mut self) {
+        self.0.begin_shutdown();
+    }
+}
+
 static RETAINED_HANDLERS: std::sync::Mutex<Option<Arc<HandlerTasks>>> = std::sync::Mutex::new(None);
 
 const HANDLER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);

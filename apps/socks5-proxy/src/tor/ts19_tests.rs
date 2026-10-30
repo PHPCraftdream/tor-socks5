@@ -48,7 +48,7 @@ fn restricted_owner_settings_are_network_free_and_reject_incompatible_options() 
     assert!(crate::tor_setup::restricted_owner_settings(&cfg, None).is_err());
     cfg.dns_server.enabled = false;
     cfg.bridges.lines.push(
-        "obfs4 8.8.4.4:443 2222222222222222222222222222222222222222 cert=AAA iat-mode=0".into(),
+        "unknownpt 8.8.4.4:443 2222222222222222222222222222222222222222 cert=AAA iat-mode=0".into(),
     );
     assert!(crate::tor_setup::restricted_owner_settings(&cfg, None).is_err());
 }
@@ -84,12 +84,37 @@ async fn pre_settings_use_configured_plain_bridges_without_probing() {
 }
 
 #[tokio::test]
-async fn pre_rejects_pt_and_incompatible_configuration() {
+async fn pre_stock_pt_settings_and_rebuild_skip_startup_probes() {
+    FORBID_STARTUP_PROBE.scope((), async {
+        let obfs = "obfs4 8.8.4.4:443 2222222222222222222222222222222222222222 cert=AAA iat-mode=0";
+        let web = "webtunnel 8.8.8.8:443 3333333333333333333333333333333333333333 url=https://example.com/x ver=0.0.3";
+        let plain = "1.1.1.1:443 1111111111111111111111111111111111111111";
+        for lines in [vec![obfs], vec![web], vec![plain, obfs, web]] {
+            let mut cfg = pre_config();
+            cfg.warm_pool.enabled = false;
+            cfg.bridges.lines = lines.iter().map(|line| (*line).to_owned()).collect();
+            let settings = build_tor_settings(&cfg, None).await.unwrap();
+            assert_eq!(settings.bridges, cfg.bridges.parsed().unwrap().bridges);
+            assert_eq!(settings.pt_binary, Some(std::env::current_exe().unwrap()));
+            assert!(settings.stock_pt_proxy);
+            assert!(settings.pre_endpoint.is_some());
+            settings.validate_stock_pt_proxy().unwrap();
+            let rebuilt = build_tor_settings_preserving_live(&cfg, None, &settings.bridges).await.unwrap();
+            assert_eq!(rebuilt.bridges, settings.bridges);
+            assert_eq!(rebuilt.pre_endpoint, settings.pre_endpoint);
+            assert_eq!(rebuilt.pt_binary, settings.pt_binary);
+            assert!(rebuilt.stock_pt_proxy);
+        }
+    }).await;
+}
+
+#[tokio::test]
+async fn pre_rejects_unknown_pt_and_incompatible_configuration() {
     FORBID_STARTUP_PROBE
         .scope((), async {
             let mut cfg = pre_config();
             cfg.bridges.lines.push(
-                "obfs4 8.8.4.4:443 2222222222222222222222222222222222222222 cert=AAA iat-mode=0"
+                "unknownpt 8.8.4.4:443 2222222222222222222222222222222222222222 cert=AAA iat-mode=0"
                     .into(),
             );
             assert!(build_tor_settings(&cfg, None)
@@ -152,10 +177,9 @@ async fn pre_hint_and_rejected_pt_cannot_bypass_validation() {
             assert_eq!(settings.bridges.len(), 1);
             assert!(settings.bridges.iter().all(|b| b.transport.is_none()));
 
-            // Парсер отбрасывает obfs4 с документационным IPv6-адресом,
-            // но режим pre должен отклонить PT до этой фильтрации.
+            // Неизвестный PT запрещён до фильтрации документационного адреса.
             cfg.bridges.lines.push(
-                "obfs4 [2001:db8::1]:443 2222222222222222222222222222222222222222 cert=AAA iat-mode=0"
+                "unknownpt [2001:db8::1]:443 2222222222222222222222222222222222222222 cert=AAA iat-mode=0"
                     .into(),
             );
             let parsed = cfg.bridges.parsed().unwrap();
@@ -168,9 +192,9 @@ async fn pre_hint_and_rejected_pt_cannot_bypass_validation() {
                 .to_string()
                 .contains("pluggable transport"));
 
-            // IPv4 loopback проходит фильтр, но сырой PT всё равно запрещён в pre.
+            // IPv4 loopback проходит фильтр, но неизвестный PT запрещён.
             *cfg.bridges.lines.last_mut().expect("PT-строка существует") =
-                "obfs4 127.0.0.1:443 2222222222222222222222222222222222222222 cert=AAA iat-mode=0"
+                "unknownpt 127.0.0.1:443 2222222222222222222222222222222222222222 cert=AAA iat-mode=0"
                     .into();
             let parsed = cfg.bridges.parsed().unwrap();
             assert_eq!(parsed.rejected, 0);

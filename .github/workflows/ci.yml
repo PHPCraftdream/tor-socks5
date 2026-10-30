@@ -10,6 +10,7 @@ on:
         type: choice
         options: [affected, sprint-full]
         default: affected
+        description: 'affected — по диффу (commit footer CI-Full: sprint-end игнорируется); sprint-full — полный прогон без footer'
       base_ref:
         type: string
         description: 'Базовый коммит обязателен для режима affected'
@@ -50,7 +51,8 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
-          HEAD: ${{ github.sha }}
+          # Для PR — исходный head; push/dispatch — текущий checkout (github.sha), event.before не используется как head
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
           BASE_REF: ${{ inputs.base_ref }}
           MODE: ${{ inputs.mode || 'affected' }}
         shell: bash
@@ -63,7 +65,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          python -I -c 'import json,os,pathlib; f=pathlib.Path("plan.json"); s=pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"]); p=json.loads(f.read_text(encoding="utf-8")) if f.is_file() and f.stat().st_size else None; s.write_text("## План CI\n\n" + ("```json\n" + json.dumps({k:p[k] for k in ("paths","reasons")},ensure_ascii=False,indent=2) + "\n```\n" if p else "План не сформирован.\n"),encoding="utf-8")'
+          python -I -c 'import json,os,pathlib; f=pathlib.Path("plan.json"); s=pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"]); p=json.loads(f.read_text(encoding="utf-8")) if f.is_file() and f.stat().st_size else None; s.write_text("## План CI\n\n" + ("```json\n" + json.dumps({k:p[k] for k in ("paths","reasons","full","full_trigger")},ensure_ascii=False,indent=2) + "\n```\n" if p else "План не сформирован.\n"),encoding="utf-8")'
 
   real-tor-channel:
     needs: plan
@@ -108,6 +110,59 @@ jobs:
         env:
           TOR_REAL_BINARY: ${{ steps.real-build.outputs.tor }}
         run: bash scripts/testing/real-tor-mutations.sh
+
+  pt-proxy-contract:
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.plan).segments, 'pt-proxy')
+    name: Граница stock PT и SOCKS5
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-local-sdk
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Собрать поставляемый CLI и тест владельцев
+        run: |
+          set -euo pipefail
+          cargo build --locked -p socks5-proxy --bin socks5-proxy
+          mkdir -p target
+          cargo test --locked -p socks5-proxy --test pt_owner_contract --no-run --message-format=json > target/pt-owner-artifacts.jsonl
+          python3 -I .github/pt_proxy/artifact.py target/pt-owner-artifacts.jsonl > target/pt-owner-path
+      - name: Проверить жизненный цикл PT и Arti
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=15s 5m cargo test --locked -p tor-ptmgr --features managed-pts,tor-channel-factory lifecycle_tests
+          timeout --signal=TERM --kill-after=15s 5m cargo test --locked -p tor-ptmgr --features managed-pts,tor-channel-factory process_tests
+          timeout --signal=TERM --kill-after=15s 5m cargo test --locked -p arti-client --features pt-client pt_shutdown_
+      - name: Проверить carrier в изолированном сетевом пространстве
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo unshare --net -- timeout --signal=TERM --kill-after=15s 4m bash -c '
+            set -euo pipefail
+            [ "$(ip -o link show | wc -l)" -eq 1 ]
+            [ "$(ip -o link show | cut -d: -f2 | xargs)" = "lo" ]
+            [ -z "$(ip -4 route show default)" ]
+            [ -z "$(ip -6 route show default)" ]
+            ip link set lo up
+            ip -6 addr add ::2/128 dev lo
+            iptables -N PT_AUDIT
+            iptables -A OUTPUT -j PT_AUDIT
+            iptables -A PT_AUDIT -d 127.0.0.77 -j RETURN
+            iptables -A PT_AUDIT -p udp --dport 53 -j RETURN
+            iptables -A PT_AUDIT -p tcp --dport 53 -j RETURN
+            iptables -A PT_AUDIT ! -d 127.0.0.0/8 -j RETURN
+            iptables -A PT_AUDIT ! -d 127.0.0.1/32 -j RETURN
+            ip6tables -N PT_AUDIT
+            ip6tables -A OUTPUT -j PT_AUDIT
+            ip6tables -A PT_AUDIT -p udp --dport 53 -j RETURN
+            ip6tables -A PT_AUDIT -p tcp --dport 53 -j RETURN
+            ip6tables -A PT_AUDIT ! -d ::1/128 -j RETURN
+            GITHUB_ACTIONS=true PT_PROXY_ISOLATED=yes python3 -I .github/pt_proxy/contract.py "$1/target/debug/socks5-proxy"
+            GITHUB_ACTIONS=true PT_PROXY_ISOLATED=yes "$(<"$1/target/pt-owner-path")"
+          ' bash "$GITHUB_WORKSPACE"
 
   fmt:
     name: Rustfmt
@@ -629,7 +684,7 @@ jobs:
   required:
     name: CI required
     if: always()
-    needs: [plan, fmt, line-limit, dir-entries, publish-guard, packageability, real-tor-channel, rust, msrv, android, docs-contract, installer-sh, installer-windows, release-scripts, native-portability, vendor-extra, features, stress, license-offline, license-audit, license-lifecycle]
+    needs: [plan, fmt, line-limit, dir-entries, publish-guard, packageability, real-tor-channel, pt-proxy-contract, rust, msrv, android, docs-contract, installer-sh, installer-windows, release-scripts, native-portability, vendor-extra, features, stress, license-offline, license-audit, license-lifecycle]
     runs-on: ubuntu-latest
     env:
       NEEDS: ${{ toJSON(needs) }}

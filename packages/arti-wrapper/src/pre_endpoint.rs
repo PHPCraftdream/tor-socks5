@@ -2,6 +2,7 @@ use std::fmt;
 use std::net::SocketAddr;
 
 use arti_client::config::TorClientConfigBuilder;
+use arti_client::TorClientConfig;
 use tor_linkspec::ChannelMethod;
 #[cfg(test)]
 use url::Url;
@@ -16,6 +17,69 @@ pub(crate) enum EndpointError {
     IncompleteCredentials,
 }
 
+pub(crate) fn reject_one_shot_pre_pt(settings: &crate::Settings) -> crate::Result<()> {
+    if settings.pre_endpoint.is_some()
+        && (settings.bridges.iter().any(|bridge| bridge.transport.is_some())
+            || !settings.extra_pt_protocols.is_empty()
+            || settings.pt_binary.is_some())
+    {
+        return Err(crate::TorError::BuildConfig(
+            "pre-PT one-shot bootstrap is unsupported; use create_unbootstrapped_with and retain the tunnel through shutdown".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// raw-конструктор: возвращает конфигурацию только после проверки, что исходящий
+/// прокси не сочетается с подключаемыми транспортами; plain-pre и без-pre сохранены.
+pub(crate) fn checked_raw(config: TorClientConfig) -> crate::Result<TorClientConfig> {
+    if config.channel().outbound_proxy().is_some() && !config.transports().is_empty() {
+        return Err(crate::TorError::BuildConfig(
+            "pre-PT one-shot bootstrap_raw is unsupported; use create_unbootstrapped and retain the tunnel through shutdown".to_owned(),
+        ));
+    }
+    Ok(config)
+}
+
+/// Проверяет доверенный исполняемый файл и поддерживаемые протоколы PT.
+pub(crate) fn validate_stock_pt(settings: &crate::Settings) -> crate::Result<()> {
+    let protocols: Vec<&str> = settings
+        .bridges
+        .iter()
+        .filter_map(|b| b.transport.as_deref())
+        .chain(settings.extra_pt_protocols.iter().map(String::as_str))
+        .collect();
+    if protocols.is_empty() && settings.pt_binary.is_none() {
+        return Ok(());
+    }
+    let current = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.canonicalize().ok());
+    let binary = settings
+        .pt_binary
+        .as_ref()
+        .and_then(|p| p.canonicalize().ok());
+    if !settings.stock_pt_proxy
+        || current.is_none()
+        || current != binary
+        || protocols
+            .iter()
+            .any(|p| !matches!(*p, "obfs4" | "webtunnel"))
+    {
+        return Err(crate::TorError::BuildConfig(
+            "SOCKS5 pre endpoint cannot guarantee routing for pluggable transports".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+impl crate::Settings {
+    /// Проверяет возможность безопасного использования PT с pre-маршрутом.
+    pub fn validate_stock_pt_proxy(&self) -> crate::Result<()> {
+        validate_stock_pt(self)
+    }
+}
+
 pub(crate) fn configure_pre_endpoint(
     builder: &mut TorClientConfigBuilder,
     settings: &crate::Settings,
@@ -23,17 +87,7 @@ pub(crate) fn configure_pre_endpoint(
     let Some(endpoint) = settings.pre_endpoint.as_ref() else {
         return Ok(());
     };
-    if !settings.extra_pt_protocols.is_empty()
-        || settings.pt_binary.is_some()
-        || settings
-            .bridges
-            .iter()
-            .any(|bridge| bridge.transport.is_some())
-    {
-        return Err(crate::TorError::BuildConfig(
-            "SOCKS5 pre endpoint cannot guarantee routing for pluggable transports".to_owned(),
-        ));
-    }
+    validate_stock_pt(settings)?;
     let uri = endpoint.proxy_uri().map_err(|_| {
         crate::TorError::BuildConfig("invalid SOCKS5 pre endpoint (details redacted)".to_owned())
     })?;
@@ -124,6 +178,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn one_shot_rejects_pre_pt_without_constructing_client() {
+        let mut settings = crate::Settings {
+            pre_endpoint: Some(Socks5PreEndpoint::new("127.0.0.1:9050".parse().unwrap(), None)),
+            extra_pt_protocols: vec!["obfs4".to_owned()],
+            ..Default::default()
+        };
+        assert!(reject_one_shot_pre_pt(&settings).is_err());
+        settings.pre_endpoint = None;
+        assert!(reject_one_shot_pre_pt(&settings).is_ok());
+        settings.pre_endpoint = Some(Socks5PreEndpoint::new("127.0.0.1:9050".parse().unwrap(), None));
+        settings.extra_pt_protocols.clear();
+        assert!(reject_one_shot_pre_pt(&settings).is_ok());
+    }
+
+    #[test]
     fn proxy_uri_encodes_reserved_and_unicode_credentials() {
         let endpoint = Socks5PreEndpoint::new(
             "127.0.0.1:9050".parse().unwrap(),
@@ -147,5 +216,15 @@ mod tests {
             proxy.to_string(),
             "socks5://user%3A%40%2F%C3%A9:p%3Ass%2F%40%E9%9B%AA@127.0.0.1:9050"
         );
+    }
+}
+
+impl crate::TorTunnel {
+    /// Ожидает подтверждения остановки PT; после отмены ожидание можно повторить.
+    pub async fn shutdown(&self) -> crate::Result<()> {
+        self.inner
+            .shutdown_pluggable_transports()
+            .await
+            .map_err(|_| crate::TorError::Shutdown)
     }
 }

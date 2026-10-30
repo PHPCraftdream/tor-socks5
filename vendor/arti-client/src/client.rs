@@ -12,7 +12,7 @@ use crate::address::{IntoTorAddr, ResolveInstructions, StreamInstructions};
 
 use crate::config::{ClientAddrConfig, StreamTimeoutConfig, TorClientConfig};
 use crate::status::BootstrapStatus;
-use safelog::{Sensitive, sensitive};
+use safelog::{sensitive, Sensitive};
 use tor_async_utils::{DropNotifyWatchSender, PostageWatchSenderExt};
 use tor_chanmgr::ChanMgrConfig;
 use tor_circmgr::ClientDataTunnel;
@@ -20,16 +20,16 @@ use tor_circmgr::ClientDataTunnel;
 mod stream_retry;
 use stream_retry::{retry_exit_stream, retryable_stream_error, snapshot_exit_stream_timeouts};
 use tor_circmgr::isolation::{Isolation, StreamIsolation};
-use tor_circmgr::{IsolationToken, TargetPort, isolation::StreamIsolationBuilder};
+use tor_circmgr::{isolation::StreamIsolationBuilder, IsolationToken, TargetPort};
 use tor_config::{BoolOrAuto, MutCfg};
 #[cfg(feature = "bridge-client")]
 use tor_dirmgr::bridgedesc::BridgeDescMgr;
 use tor_dirmgr::{DirMgrStore, Timeliness};
-use tor_error::{Bug, error_report, internal};
+use tor_error::{error_report, internal, Bug};
 use tor_guardmgr::{GuardMgr, RetireCircuits};
 use tor_keymgr::Keystore;
 use tor_memquota::MemoryQuotaTracker;
-use tor_netdir::{NetDirProvider, params::NetParameters};
+use tor_netdir::{params::NetParameters, NetDirProvider};
 use tor_persist::StateMgr;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use tor_persist::TestingStateMgr;
@@ -55,20 +55,22 @@ use tor_hsservice::HsIdKeypairSpecifier;
 #[cfg(all(feature = "onion-service-client", feature = "experimental-api"))]
 use {tor_hscrypto::pk::HsId, tor_hscrypto::pk::HsIdKeypair, tor_keymgr::KeystoreSelector};
 
-use tor_keymgr::{ArtiNativeKeystore, KeyMgr, KeyMgrBuilder, config::ArtiKeystoreKind};
+use tor_keymgr::{config::ArtiKeystoreKind, ArtiNativeKeystore, KeyMgr, KeyMgrBuilder};
 
 #[cfg(feature = "ephemeral-keystore")]
 use tor_keymgr::ArtiEphemeralKeystore;
 
-use futures::StreamExt as _;
 use futures::lock::Mutex as AsyncMutex;
+use futures::StreamExt as _;
 use std::net::IpAddr;
 use std::result::Result as StdResult;
+#[cfg(feature = "pt-client")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tor_rtcompat::SpawnExt;
 
 use crate::err::ErrorDetail;
-use crate::{TorClientBuilder, status, util};
+use crate::{status, util, TorClientBuilder};
 #[cfg(feature = "geoip")]
 use tor_geoip::CountryCode;
 use tor_rtcompat::scheduler::TaskHandle;
@@ -128,6 +130,13 @@ struct ClientShared<R: Runtime> {
     /// Inner typestate object to represent the parts of the ClientShared that may be absent
     /// depending on whether we are running.
     inner: Mutex<Inner<R>>,
+
+    /// Навсегда запрещает доступ к работающему клиенту после начала остановки PT.
+    #[cfg(feature = "pt-client")]
+    pt_shutdown: AtomicBool,
+    /// Сохраняет менеджер даже при ошибке создания работающего клиента.
+    #[cfg(feature = "pt-client")]
+    retained_pt_mgr: Mutex<Option<Arc<tor_ptmgr::PtMgr<R>>>>,
 
     /// Memory quota tracker
     memquota: Arc<MemoryQuotaTracker>,
@@ -1090,6 +1099,10 @@ impl<R: Runtime> TorClient<R> {
         let client = Arc::new(ClientShared {
             runtime,
             inner,
+            #[cfg(feature = "pt-client")]
+            pt_shutdown: AtomicBool::new(false),
+            #[cfg(feature = "pt-client")]
+            retained_pt_mgr: Mutex::new(None),
             memquota,
             inert_client,
             statemgr,
@@ -1112,6 +1125,48 @@ impl<R: Runtime> TorClient<R> {
             connect_prefs: Default::default(),
             client,
         }))
+    }
+
+    /// Останавливает подключаемые транспорты этого клиента и производных дескрипторов.
+    ///
+    /// Дальнейший доступ к работающему клиенту и его создание запрещаются навсегда.
+    /// Существующие каналы закрываются, но ожидающие создания каналы не образуют
+    /// барьер остановки. Менеджер транспортов должен отклонять последующие запросы
+    /// после начала своей остановки.
+    ///
+    /// При отмене клиент остаётся закрытым; для завершения вызовите метод повторно.
+    /// Завершение и безопасность отмены очистки зависят от реализации менеджера.
+    #[cfg(feature = "pt-client")]
+    pub async fn shutdown_pluggable_transports(&self) -> crate::Result<()> {
+        use std::sync::TryLockError;
+        use std::time::Duration;
+
+        self.client.pt_shutdown.store(true, Ordering::SeqCst);
+        // Создание может долго удерживать синхронную блокировку. Не блокируем
+        // поток исполнителя и не удерживаем защиту через await.
+        let (manager, channels) = loop {
+            let snapshot = match self.client.inner.try_lock() {
+                Ok(guard) => Some(self.client.pt_shutdown_snapshot(&guard)),
+                Err(TryLockError::Poisoned(e)) => {
+                    Some(self.client.pt_shutdown_snapshot(&e.into_inner()))
+                }
+                Err(TryLockError::WouldBlock) => None,
+            };
+            if let Some(snapshot) = snapshot {
+                break snapshot;
+            }
+            self.client.runtime.sleep(Duration::from_millis(10)).await;
+        };
+        if let Some(channels) = channels {
+            channels.terminate_all_channels();
+        }
+        if let Some(manager) = manager {
+            manager
+                .shutdown()
+                .await
+                .map_err(ErrorDetail::PluggableTransport)?;
+        }
+        Ok(())
     }
 
     /// Construct a state manager from the client configuration.
@@ -1249,6 +1304,11 @@ impl<R: Runtime> RunningInner<R> {
                 runtime.clone(),
             )?);
 
+            // Создание удерживает `inner`; сохраняем менеджер до возможных ошибок.
+            *client
+                .retained_pt_mgr
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&mgr));
             chanmgr.set_pt_mgr(mgr.clone());
 
             mgr
@@ -2493,11 +2553,45 @@ impl<R: Runtime> TorClient<R> {
 }
 
 impl<R: Runtime> ClientShared<R> {
+    /// Получает снимок только после освобождения блокировки создания.
+    #[cfg(feature = "pt-client")]
+    fn pt_shutdown_snapshot(
+        &self,
+        inner: &Inner<R>,
+    ) -> (
+        Option<Arc<tor_ptmgr::PtMgr<R>>>,
+        Option<Arc<tor_chanmgr::ChanMgr<R>>>,
+    ) {
+        let manager = self
+            .retained_pt_mgr
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let channels = match inner {
+            Inner::Running(running) => Some(Arc::clone(&running.chanmgr)),
+            Inner::NotConstructed(_) | Inner::Poisoned(_) => None,
+        };
+        (manager, channels)
+    }
+
+    /// Запрещает новый доступ после запроса остановки.
+    #[cfg(feature = "pt-client")]
+    fn check_pt_shutdown(&self) -> StdResult<(), ErrorDetail> {
+        if self.pt_shutdown.load(Ordering::SeqCst) {
+            return Err(
+                tor_error::bad_api_usage!("pluggable transports have been shut down").into(),
+            );
+        }
+        Ok(())
+    }
+
     /// Used by `bootstrap_inner`: Return a `RunningInner`, constructing it if necessary.
     fn instantiate_running_inner(
         &self,
         mut inner_guard: std::sync::MutexGuard<'_, Inner<R>>,
     ) -> Result<Arc<RunningInner<R>>, ErrorDetail> {
+        #[cfg(feature = "pt-client")]
+        self.check_pt_shutdown()?;
         match &*inner_guard {
             Inner::Running(running_inner) => Ok(Arc::clone(running_inner)),
             Inner::Poisoned(e) => Err(e.as_ref().clone()),
@@ -2638,6 +2732,8 @@ impl<R: Runtime> ClientShared<R> {
     /// If we are currently bootstrapping or running, return a [`RunningInner`].
     fn running_inner(&self, action: &'static str) -> StdResult<Arc<RunningInner<R>>, ErrorDetail> {
         let guard = self.inner.lock().expect("Lock poisoned");
+        #[cfg(feature = "pt-client")]
+        self.check_pt_shutdown()?;
         match &*guard {
             Inner::NotConstructed(_) => Err(ErrorDetail::BootstrapRequired { action }),
             Inner::Running(running_inner) => Ok(Arc::clone(running_inner)),
@@ -2654,6 +2750,8 @@ impl<R: Runtime> ClientShared<R> {
         action: &'static str,
     ) -> StdResult<Arc<RunningInner<R>>, ErrorDetail> {
         let guard = self.inner.lock().expect("Lock poisoned");
+        #[cfg(feature = "pt-client")]
+        self.check_pt_shutdown()?;
         match &*guard {
             Inner::Running(running_inner) => Ok(Arc::clone(running_inner)),
             Inner::Poisoned(e) => Err(e.as_ref().clone()),
@@ -2873,6 +2971,68 @@ mod test {
             let result = client.reset_disabled_guards();
             assert!(result.is_err());
             assert_eq!(result.err().unwrap().kind(), ErrorKind::BootstrapRequired);
+        });
+    }
+
+    #[cfg(feature = "pt-client")]
+    #[test]
+    fn pt_shutdown_before_construction_blocks_bootstrap() {
+        tor_rtcompat::test_with_one_runtime!(|rt| async {
+            let state_dir = tempfile::tempdir().unwrap();
+            let cache_dir = tempfile::tempdir().unwrap();
+            let cfg = TorClientConfigBuilder::from_directories(state_dir, cache_dir)
+                .build()
+                .unwrap();
+            let client = TorClient::with_runtime(rt)
+                .config(cfg)
+                .create_unbootstrapped()
+                .unwrap();
+            let isolated = client.isolated_client();
+            client.shutdown_pluggable_transports().await.unwrap();
+            assert!(isolated.bootstrap().await.is_err());
+            let guard = client.client.inner.lock().unwrap();
+            assert!(matches!(&*guard, Inner::NotConstructed(_)));
+            assert!(client.client.instantiate_running_inner(guard).is_err());
+            assert!(matches!(
+                &*client.client.inner.lock().unwrap(),
+                Inner::NotConstructed(_)
+            ));
+        });
+    }
+
+    #[cfg(feature = "pt-client")]
+    #[test]
+    fn pt_shutdown_snapshot_retains_manager_after_construction_failure() {
+        tor_rtcompat::test_with_one_runtime!(|rt| async {
+            let state_dir = tempfile::tempdir().unwrap();
+            let cache_dir = tempfile::tempdir().unwrap();
+            let cfg = TorClientConfigBuilder::from_directories(&state_dir, &cache_dir)
+                .build()
+                .unwrap();
+            let client = TorClient::with_runtime(rt.clone())
+                .config(cfg.clone())
+                .create_unbootstrapped()
+                .unwrap();
+            let manager = Arc::new(
+                tor_ptmgr::PtMgr::new(
+                    cfg.bridges.transports.clone(),
+                    state_dir.path().join("pt_state"),
+                    Arc::new(cfg.path_resolver.clone()),
+                    cfg.channel.outbound_proxy().cloned(),
+                    rt,
+                )
+                .unwrap(),
+            );
+            *client.client.retained_pt_mgr.lock().unwrap() = Some(Arc::clone(&manager));
+            let mut guard = client.client.inner.lock().unwrap();
+            *guard = Inner::Poisoned(Box::new(ErrorDetail::from(internal!(
+                "construction failed"
+            ))));
+            let (retained, channels) = client.client.pt_shutdown_snapshot(&guard);
+            assert!(Arc::ptr_eq(&manager, retained.as_ref().unwrap()));
+            assert!(channels.is_none());
+            drop(guard);
+            client.shutdown_pluggable_transports().await.unwrap();
         });
     }
 

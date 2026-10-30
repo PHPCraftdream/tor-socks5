@@ -15,6 +15,16 @@ impl std::fmt::Display for InitialPublishError {
 }
 impl std::error::Error for InitialPublishError {}
 
+#[cfg(target_os = "linux")]
+mod pt_contract {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/pt_owner/owner_contract.rs"
+    ));
+}
+#[cfg(target_os = "linux")]
+pub(crate) use pt_contract::run_pt_owner_contract;
+
 // Bootstrap подменён; проверяется завершение сервера, а не сеть Tor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_server_reports_final_flush_worker_panic() {

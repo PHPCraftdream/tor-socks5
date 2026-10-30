@@ -30,6 +30,46 @@ TOR_MARKERS = {
 }
 
 
+PT_LEGACY_MARKERS = {
+    ".github/pt_proxy/contract.py": ("assert_failed", "trap.assert_idle()", "assert_audit_clean()", "audit_counts('iptables')[0] > 0", "audit_counts('ip6tables')[2] > 0", "PROXY DONE"),
+    ".github/workflows/ci.yml": ("pt-proxy-contract:", ".github/pt_proxy/contract.py", "ip -6 addr add ::2/128 dev lo", "PT_AUDIT"),
+}
+PT_MARKERS = {
+    **PT_LEGACY_MARKERS,
+    "apps/socks5-proxy/tests/pt_owner_contract.rs": ("TOR_PT_MANAGED_TRANSPORT_VER", "PT_PROXY_ISOLATED", "lyrebird::run()"),
+    "apps/socks5-proxy/tests/pt_owner/owner_contract.rs": ("run_pt_owner_contract", "OwnerRegistry::new", "proxy_connection"),
+    ".github/pt_proxy/artifact.py": ("compiler-artifact", "pt_owner_contract", "4 * 1024 * 1024", "len(found) != 1"),
+    ".github/workflows/ci.yml": PT_LEGACY_MARKERS[".github/workflows/ci.yml"] + ("cargo test --locked -p socks5-proxy --test pt_owner_contract --no-run --message-format=json", ".github/pt_proxy/artifact.py", 'GITHUB_ACTIONS=true PT_PROXY_ISOLATED=yes "$(<"$1/target/pt-owner-path")"', "-p tor-ptmgr --features managed-pts,tor-channel-factory lifecycle_tests", "-p tor-ptmgr --features managed-pts,tor-channel-factory process_tests", "-p arti-client --features pt-client pt_shutdown_"),
+}
+
+
+def pt_contract(base_read, head_read):
+    script = ".github/pt_proxy/contract.py"
+    workflow = ".github/workflows/ci.yml"
+    def installed(read):
+        return bool(read(script) or "pt-proxy-contract:" in read(workflow))
+    evidence, enabled = installed(base_read), installed(head_read)
+    upgraded = bool(base_read("apps/socks5-proxy/tests/pt_owner_contract.rs") or
+                    base_read(".github/pt_proxy/artifact.py") or
+                    "--test pt_owner_contract" in base_read(workflow))
+    for read, required, markers_by_path in ((base_read, evidence or upgraded, PT_MARKERS if upgraded else PT_LEGACY_MARKERS),
+                                            (head_read, evidence or enabled, PT_MARKERS)):
+        if required:
+            for path, markers in markers_by_path.items():
+                text = read(path)
+                if not text or any(marker not in text for marker in markers):
+                    raise MappingError("missing mapping: контракт PT: " + path)
+    return enabled
+
+
+# Полный прогон выбирает ТОЧНЫЙ standalone footer в сообщении коммита:
+# строка после разбивки на \n должна целиком совпадать с "CI-Full: sprint-end";
+# допустим только завершающий \r (CRLF). Никаких пробелов в начале/конце,
+# ровно один пробел после двоеточия, регистр и текст точные. Содержимое
+# файлов, diff, названия веток, prose-упоминания и PR description триггером не являются.
+FULL_FOOTER_RE = re.compile(r"^CI-Full: sprint-end\r?$")
+
+
 def contract_capability(base_read, head_read):
     def declaration(read):
         text = read(CONTRACT_MANIFEST)
@@ -65,6 +105,15 @@ def run(*args):
         raise MappingError(f"команда не выполнена: {args[0]}: {exc}") from exc
 
 
+def merge_base_is_ancestor(git, base, head):
+    try:
+        git("merge-base", "--is-ancestor", base, head)
+        return True
+    except MappingError:
+        # run() оборачивает и код 1 («не предок»), и реальный сбой git: fail-closed.
+        return False
+
+
 def comparison(event, mode, base, head, base_ref, git):
     if event not in {"pull_request", "push", "workflow_dispatch"}:
         raise MappingError("неизвестное событие")
@@ -72,7 +121,13 @@ def comparison(event, mode, base, head, base_ref, git):
         raise MappingError("sprint-full разрешён только вручную")
     requested = git("rev-parse", "--verify", head + "^{commit}").decode().strip()
     checkout = git("rev-parse", "--verify", "HEAD^{commit}").decode().strip()
-    if not requested or requested != checkout:
+    # Для PR checkout — synthetic merge: первый родитель обязан быть base, второй — исходным head.
+    # Произвольное родство не доказывает source/base: только точное совпадение родителей.
+    if event == "pull_request":
+        parents = git("rev-list", "--parents", "-n", "1", checkout).decode().split()
+        if len(parents) != 3 or parents[1] != base or parents[2] != requested:
+            raise MappingError("checkout не является PR merge с указанными base/head")
+    elif requested != checkout:
         raise MappingError("checkout HEAD не совпадает с --head")
     if mode == "sprint-full":
         return None
@@ -81,10 +136,25 @@ def comparison(event, mode, base, head, base_ref, git):
         raise MappingError("не задана база сравнения")
     git("rev-parse", "--verify", chosen + "^{commit}")
     if event == "pull_request":
-        chosen = git("merge-base", chosen, head).decode().strip()
+        chosen = git("merge-base", chosen, requested).decode().strip()
         if not chosen:
             raise MappingError("merge-base не найден")
+    elif event == "push":
+        if not merge_base_is_ancestor(git, chosen, requested):
+            raise MappingError("база не является предком HEAD: недоказанная история")
     return chosen
+
+
+def commit_footer_full(git, base, head):
+    """Только реальные сообщения коммитов диапазона base..head; для PR head — исходный
+    head, synthetic merge не сканируется; история должна быть доказана."""
+    if not merge_base_is_ancestor(git, base, head):
+        raise MappingError("база не является предком HEAD: недоказанная история")
+    for commit in git("rev-list", base + ".." + head).decode().split():
+        message = git("log", "-1", "--format=%B", commit).decode("utf-8")
+        if any(FULL_FOOTER_RE.match(line) for line in message.split("\n")):
+            return True
+    return False
 
 
 class Graph:
@@ -147,7 +217,7 @@ JOB_SEGMENTS = {
     "plan": "fast", "fmt": "fast", "line-limit": "fast", "dir-entries": "fast",
     "clippy-full": "rust", "clippy-affected": "rust", "test-full": "rust",
     "test-affected": "rust", "msrv": "msrv", "android": "android",
-    "real-tor-channel": "tor", "installer-sh": "installer-sh",
+    "real-tor-channel": "tor", "pt-proxy-contract": "pt-proxy", "installer-sh": "installer-sh",
     "installer-windows": "installer-windows", "publish-guard": "release",
     "packageability": "release", "release-scripts": "release",
     "required": "fast", "regression": "fast", "rust": "rust", "docs-contract": "docs-contract",
@@ -199,10 +269,37 @@ def changed_keys(a, b):
 def manifest_seeds(old, new, graph):
     a, b = tomllib.loads(old), tomllib.loads(new)
     seeds = set()
+    def added_members(before, after):
+        if not isinstance(before, list) or not isinstance(after, list) or any(type(item) is not str for item in before + after):
+            raise MappingError("missing mapping: workspace.members")
+        if len(set(before)) != len(before) or len(set(after)) != len(after):
+            raise MappingError("missing mapping: workspace.members")
+        if len(after) < len(before) or after[:len(before)] != before:
+            raise MappingError("missing mapping: workspace.members")
+        additions = after[len(before):]
+        for member in additions:
+            if (not member or "\\" in member or any(c in member for c in "*?[]") or
+                    member.startswith("/") or re.match(r"^[A-Za-z]:", member) or
+                    any(part in ("", ".", "..") for part in member.split("/"))):
+                raise MappingError("missing mapping: workspace.members: " + member)
+            root = graph.root.resolve()
+            candidate = (root / member).resolve()
+            try:
+                candidate.relative_to(root)
+            except ValueError as exc:
+                raise MappingError("missing mapping: workspace.members: " + member) from exc
+            matches = [ident for ident, package in graph.packages.items()
+                       if ident in graph.members and Path(package["manifest_path"]).parent.resolve() == candidate]
+            if len(matches) != 1:
+                raise MappingError("missing mapping: workspace.members: " + member)
+            seeds.add(matches[0])
     for key in changed_keys(a, b):
         if key == "workspace":
             wa, wb = a.get(key, {}), b.get(key, {})
             for sub in changed_keys(wa, wb):
+                if sub == "members":
+                    added_members(wa.get(sub), wb.get(sub))
+                    continue
                 if sub != "dependencies":
                     raise MappingError("missing mapping: workspace." + sub)
                 da, db = wa.get(sub, {}), wb.get(sub, {})
@@ -322,7 +419,8 @@ def config_targets(old, new):
     return targets
 
 
-def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_request"):
+def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_request",
+         full_reason="ручной sprint-full", full_trigger=None):
     if capabilities is None:
         capabilities = {"license_stack": (graph.root / ".github/deny.toml").is_file() and (graph.root / ".github/release/license").is_dir()}
     license_stack = bool(capabilities.get("license_stack", False))
@@ -426,6 +524,8 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
             add("fast", path)
         elif path in ("scripts/testing/real-tor-channel.sh", "scripts/testing/real-tor-mutations.sh"):
             add("tor", path)
+        elif path.startswith(".github/pt_proxy/"):
+            add("pt-proxy", path)
         elif path.startswith("scripts/testing/"):
             raise MappingError("missing mapping: " + path)
         elif path == "scripts/build-android.ps1":
@@ -481,10 +581,16 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
         add("tor", "изменена зависимость контракта Tor")
     if any(path.startswith("apps/socks5-proxy/") and any(part in {"tor", "arti", "bridge", "bridges"} or part.startswith(("tor_", "arti_", "bridge_", "bridges_")) for part in path.split("/")) for path in paths):
         add("tor", "изменён код контракта Tor proxy")
+    # Граница PT зависит от исполняемого proxy и его зависимостей.
+    pt_roots = graph.named({"ptrs-gesher-lyrebird", "ptrs-gesher-webtunnel", "tor-socks5-proto", "tor-ptmgr", "arti-wrapper", "arti-client"})
+    pt_upstream = graph.closure(pt_roots, graph.forward) if pt_roots else set()
+    if seeds & pt_upstream or any(path.startswith(("apps/socks5-proxy/", "vendor/lyrebird/", "vendor/webtunnel/", "packages/socks5-proto/", ".github/actions/setup-local-sdk/")) or path in ("scripts/testing/ci_planner.py", "scripts/testing/test_ci_planner.py", "scripts/testing/test_ci_integration.py") for path in paths):
+        add("pt-proxy", "изменена граница PT или её зависимость")
     if mode == "sprint-full":
         selected = set(graph.members)
         for segment in ("rust", "msrv", "android", "tor", "vendor", "vendor-extra", "docs-contract", "installer-sh", "installer-windows", "release", "features", "stress", "regression", "native-portability", "required"):
-            add(segment, "ручной sprint-full")
+            add(segment, full_reason)
+        add("pt-proxy", full_reason)
         if license_stack:
             add("license-offline", "лицензионный стек")
             add("license-audit", "лицензионный стек")
@@ -563,7 +669,7 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
     return {"packages": names, "command_packages": commands, "library_packages": libs,
             "shipping_packages": sorted(graph.packages[i]["name"] for i in required(shipping)),
             "segments": sorted(segments), "target_rows": rows, "native_rows": native_rows,
-            "paths": sorted(set(paths)), "reasons": {k: sorted(reasons[k]) for k in sorted(segments)}, "full": mode == "sprint-full",
+            "paths": sorted(set(paths)), "reasons": {k: sorted(reasons[k]) for k in sorted(segments)}, "full": mode == "sprint-full", "full_trigger": full_trigger,
             "capabilities": {"license_stack": license_stack, "real_tor_channel": real_tor},
             "capability_reasons": {"real_tor_channel": "установлен контракт" if real_tor else "контракт не установлен"},
             "license_stack": license_stack}
@@ -572,7 +678,7 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
 RESULT_JOBS = {
     "fmt": ("fast", "regression"), "line-limit": ("fast",), "dir-entries": ("fast",),
     "publish-guard": ("fast",), "packageability": ("fast",),
-    "real-tor-channel": ("tor",), "rust": ("rust",), "msrv": ("msrv",),
+    "real-tor-channel": ("tor",), "pt-proxy-contract": ("pt-proxy",), "rust": ("rust",), "msrv": ("msrv",),
     "android": ("android",), "docs-contract": ("docs-contract",),
     "installer-sh": ("installer-sh",), "installer-windows": ("installer-windows",),
     "release-scripts": ("release",), "native-portability": ("native-portability",),
@@ -615,6 +721,7 @@ def main():
     args = parser.parse_args()
     try:
         git = lambda *a: run("git", *a)
+        checkout = git("rev-parse", "--verify", "HEAD^{commit}").decode().strip()
         base = comparison(args.event, args.mode, args.base, args.head, args.base_ref, git)
         root = git("rev-parse", "--show-toplevel").decode().strip()
         # Граф и проверяемые исходники должны соответствовать выбранному коммиту.
@@ -622,20 +729,22 @@ def main():
         for entry in dirty:
             if entry and (entry.endswith((".rs", "Cargo.toml", "Cargo.lock")) or entry.startswith((" R", "R ", " C", "C "))):
                 raise MappingError("незакоммиченные исходники или манифесты: " + entry)
-        # Контракт поставляемых документов проверяется по дереву коммита, не по рабочему каталогу.
+        # План целиком считается по фактическому checkout-дереву (для PR — synthetic merge):
+        # diff, граф, контракт, документы и capabilities из него; base диффа — merge-base его истории.
         for path in REQUIRED_DOCS:
-            entries = git("ls-tree", "-z", "--name-only", args.head, "--", path).decode().split("\0")
+            entries = git("ls-tree", "-z", "--name-only", checkout, "--", path).decode().split("\0")
             if path not in entries:
                 raise MappingError("missing mapping: отсутствует обязательный документ: " + path)
         metadata = json.loads(run("cargo", "metadata", "--locked", "--all-features", "--format-version", "1"))
         graph = Graph(metadata, root)
-        paths = [] if base is None else git("diff", "--name-only", "--no-renames", "-z", base, args.head).decode().split("\0")
+        # Для PR checkout может быть synthetic merge: граф/license_stack читаются из него.
+        paths = [] if base is None else git("diff", "--name-only", "--no-renames", "-z", base, checkout).decode().split("\0")
         paths = [p for p in paths if p]
         def blobs(path):
             def read(ref):
                 entry = git("ls-tree", "--name-only", ref, "--", path).decode().strip()
                 return git("show", ref + ":" + path).decode() if entry == path else ""
-            return tuple(read(ref) for ref in (base, args.head))
+            return tuple(read(ref) for ref in (base, checkout))
         def tree_read(ref, path):
             if ref is None:
                 return ""
@@ -644,12 +753,20 @@ def main():
         # Ручной полный запуск также проверяет первого родителя на удаление контракта в HEAD.
         parent = base
         if parent is None:
-            parents = git("rev-list", "--parents", "-n", "1", args.head).decode().split()
+            parents = git("rev-list", "--parents", "-n", "1", checkout).decode().split()
             parent = parents[1] if len(parents) > 1 else None
-        real_tor = contract_capability(lambda p: tree_read(parent, p), lambda p: tree_read(args.head, p))
+        pt_contract(lambda p: tree_read(parent, p), lambda p: tree_read(checkout, p))
+        real_tor = contract_capability(lambda p: tree_read(parent, p), lambda p: tree_read(checkout, p))
         capabilities = {"real_tor_channel": real_tor,
                         "license_stack": (Path(root) / ".github/deny.toml").is_file() and (Path(root) / ".github/release/license").is_dir()}
-        result = plan(graph, paths, blobs, args.mode, capabilities=capabilities, event=args.event)
+        # Ручной affected не сканирует footer: ручной выбор режима главнее.
+        # Сообщения — из исходного диапазона: synthetic merge не сканируется.
+        footer = base is not None and args.event in ("push", "pull_request") and commit_footer_full(git, base, args.head)
+        full_reason = "footer коммита CI-Full: sprint-end" if footer else "ручной sprint-full"
+        full_trigger = "commit_footer" if footer else ("manual" if args.mode == "sprint-full" else None)
+        result = plan(graph, paths, blobs, "sprint-full" if footer else args.mode,
+                      capabilities=capabilities, event=args.event,
+                      full_reason=full_reason, full_trigger=full_trigger)
         supported = {s for values in RESULT_JOBS.values() for s in values} | {"required"}
         unsupported = set(result["segments"]) - supported
         if unsupported:
