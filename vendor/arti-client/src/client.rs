@@ -2552,16 +2552,17 @@ impl<R: Runtime> TorClient<R> {
     }
 }
 
+/// Менеджеры, удерживаемые на время завершения PT.
+#[cfg(feature = "pt-client")]
+type PtShutdownSnapshot<R> = (
+    Option<Arc<tor_ptmgr::PtMgr<R>>>,
+    Option<Arc<tor_chanmgr::ChanMgr<R>>>,
+);
+
 impl<R: Runtime> ClientShared<R> {
     /// Получает снимок только после освобождения блокировки создания.
     #[cfg(feature = "pt-client")]
-    fn pt_shutdown_snapshot(
-        &self,
-        inner: &Inner<R>,
-    ) -> (
-        Option<Arc<tor_ptmgr::PtMgr<R>>>,
-        Option<Arc<tor_chanmgr::ChanMgr<R>>>,
-    ) {
+    fn pt_shutdown_snapshot(&self, inner: &Inner<R>) -> PtShutdownSnapshot<R> {
         let manager = self
             .retained_pt_mgr
             .lock()
