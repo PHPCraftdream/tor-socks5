@@ -258,11 +258,16 @@ impl<R: Runtime> ChanMgr<R> {
             None,
         );
 
-        // Warn if outbound_proxy is configured to a non-loopback address
+        // tor-socks5 local patch: proxy_warning_redaction — не журналировать учётные данные.
         if let Some(ref proxy) = config.cfg.outbound_proxy {
             if !proxy.is_loopback() {
+                let (scheme, addr) = match proxy {
+                    ProxyProtocol::Socks { version, addr, .. } => (version.to_string(), addr),
+                    ProxyProtocol::HttpConnect { addr, .. } => ("http".to_string(), addr),
+                };
                 tracing::warn!(
-                    proxy_addr = %proxy,
+                    proxy_scheme = %scheme,
+                    proxy_addr = %addr,
                     "outbound_proxy is configured to a non-loopback address; \
                      this may expose Tor traffic to an untrusted intermediate"
                 );

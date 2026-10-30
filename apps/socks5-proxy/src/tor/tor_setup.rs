@@ -47,6 +47,10 @@ fn settings_for_config(cfg: &Config) -> Settings {
     }
 }
 
+#[path = "tor_watchdog/owner_settings.rs"]
+mod owner_settings;
+pub(crate) use owner_settings::{restricted_owner_settings, validate_owner_routes};
+
 /// Parse the configured bridges, probe them for reachability, persist the
 /// live ones to the alive-bridges log, and assemble arti [`Settings`]
 /// (including pointing the PT manager at our own binary when needed).
@@ -62,6 +66,16 @@ pub(crate) async fn build_tor_settings_preserving_live(
     config_path: Option<&Path>,
     live: &[BridgeLine],
 ) -> Result<Settings> {
+    if let Some(endpoint) = proxy_config::resolve_endpoint(cfg.pre_socks5.as_ref(), None) {
+        let mut settings = restricted_owner_settings(cfg, config_path)?;
+        settings.pre_endpoint = Some(arti_wrapper::Socks5PreEndpoint::new(
+            endpoint.address(),
+            endpoint
+                .credentials()
+                .map(|(user, pass)| (user.to_owned(), pass.to_owned())),
+        ));
+        return Ok(settings);
+    }
     let parsed = cfg
         .bridges
         .parsed()
@@ -304,10 +318,20 @@ pub(crate) fn preferred_transport_bridges(
     matching
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static FORBID_STARTUP_PROBE: ();
+}
+
 pub(crate) async fn probe_measured(
     bridges: Vec<BridgeLine>,
     cfg: &Config,
 ) -> (Vec<BridgeLine>, Vec<(BridgeLine, Duration)>) {
+    #[cfg(test)]
+    assert!(
+        FORBID_STARTUP_PROBE.try_with(|_| ()).is_err(),
+        "unexpected app-owned bridge probe"
+    );
     let round = bridge_probe::probe_round_with_policy(
         bridges.clone(),
         BRIDGE_PROBE_TIMEOUT,
@@ -383,7 +407,6 @@ fn select_active_probe_bridges(
     if configured.len() <= MAX_ACTIVE_BRIDGES {
         return configured.to_vec();
     }
-
     let by_text: HashMap<String, BridgeLine> = configured
         .iter()
         .map(|bridge| (bridge.to_string(), bridge.clone()))
@@ -399,7 +422,6 @@ fn select_active_probe_bridges(
             return ranked;
         }
     }
-
     configured
         .iter()
         .take(MAX_ACTIVE_BRIDGES)
@@ -515,7 +537,10 @@ pub(crate) async fn update_health_and_prune(
             let path = path.to_path_buf();
             let log_path = path.clone();
             let dead = pruned.clone();
-            match tokio::task::spawn_blocking(move || prune_bridges_from_config(&path, &dead)).await
+            match crate::bridge_verifier::run_fallible_blocking(move || {
+                prune_bridges_from_config(&path, &dead)
+            })
+            .await
             {
                 Ok(Ok(n)) if n > 0 => info!(
                     removed = n,
@@ -562,15 +587,9 @@ fn prune_bridges_from_config(path: &Path, dead: &[BridgeLine]) -> Result<usize> 
     Ok(removed)
 }
 
-/// Pure decision function: extract PT binary path from an optional env var value.
-/// Returns `None` for `None` or empty `OsStr`; `Some(PathBuf)` for non-empty values.
-/// This is testable without touching process state.
-fn pt_binary_override_from(value: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
-    match value {
-        Some(v) if !v.is_empty() => Some(std::path::PathBuf::from(v)),
-        _ => None,
-    }
-}
+#[path = "../fetch/pt_binary_override.rs"]
+mod pt_binary_override;
+use pt_binary_override::pt_binary_override_from;
 
 /// Resolve the PT binary path for arti's `tor-ptmgr` to spawn.
 ///

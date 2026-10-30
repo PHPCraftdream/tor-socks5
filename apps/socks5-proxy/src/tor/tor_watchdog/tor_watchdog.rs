@@ -127,6 +127,8 @@ mod runtime;
 pub(crate) use health::BridgeRefresh;
 #[allow(unused_imports)]
 pub use health::{classify_and_record, TorHandle, TorHealth};
+#[cfg(test)]
+pub(crate) use runtime::{route_bridge_count, test_heal};
 pub use runtime::{spawn_bridge_failover_watchdog, spawn_tor_watchdog};
 
 #[cfg(test)]
