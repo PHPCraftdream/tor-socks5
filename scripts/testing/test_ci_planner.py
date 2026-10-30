@@ -406,10 +406,17 @@ jobs:
 
     def test_events(self):
         calls = []
+        checkout = "merge"
         def git(*args):
             calls.append(args)
-            return b"ancestor\n"
+            if args[0] == "rev-list":
+                return b"merge base head\n"
+            if args[0] == "merge-base":
+                return b"" if "--is-ancestor" in args else b"ancestor\n"
+            ref = args[-1].removesuffix("^{commit}")
+            return ((checkout if ref == "HEAD" else ref) + "\n").encode()
         self.assertEqual(p.comparison("pull_request", "affected", "base", "head", "", git), "ancestor")
+        checkout = "head"
         self.assertEqual(p.comparison("push", "affected", "before", "head", "", git), "before")
         self.assertEqual(p.comparison("workflow_dispatch", "affected", "", "head", "main", git), "main")
         with self.assertRaises(p.MappingError):
@@ -422,6 +429,79 @@ jobs:
             raise p.MappingError("git")
         with self.assertRaises(p.MappingError):
             p.comparison("push", "affected", "base", "head", "", failed)
+
+
+class CommitFooter(unittest.TestCase):
+    def matches(self, message):
+        return any(p.FULL_FOOTER_RE.match(line) for line in message.split("\n"))
+    def test_exact_footer(self):
+        self.assertTrue(self.matches("заголовок\n\nCI-Full: sprint-end"))
+        self.assertTrue(self.matches("CI-Full: sprint-end"))
+        self.assertTrue(self.matches("CI-Full: sprint-end\r\nвторой\r\n"))
+    def test_negatives(self):
+        for message in ("  CI-Full: sprint-end", "CI-Full: sprint-end ", "CI-Full:  sprint-end",
+                        "CI-Full:sprint-end", "ci-full: sprint-end", "CI-Full: sprint-end.",
+                        "упоминание CI-Full: sprint-end в тексте", "CI-Full: sprint-full",
+                        "CI-Full: sprint-end\r \n", "X"):
+            self.assertFalse(self.matches(message), message)
+
+
+class PullRequestSource(unittest.TestCase):
+    def git_merge(self, parents_line):
+        def git(*args):
+            if args[0] == "rev-list":
+                return parents_line
+            if args[0] == "merge-base":
+                return b"mb\n"
+            if args[-1] == "HEAD^{commit}":
+                return b"merge\n"
+            return (args[-1].removesuffix("^{commit}") + "\n").encode()
+        return git
+    def test_merge_checkout_parents_prove_source_and_base(self):
+        git = self.git_merge(b"merge base source\n")
+        self.assertEqual(p.comparison("pull_request", "affected", "base", "source", "", git), "mb")
+    def test_parent_mismatch_is_rejected(self):
+        for line in (b"merge other source\n", b"merge base other\n", b"merge\n"):
+            with self.subTest(parents=line):
+                with self.assertRaises(p.MappingError):
+                    p.comparison("pull_request", "affected", "base", "source", "", self.git_merge(line))
+    def test_non_pr_still_requires_exact_checkout(self):
+        def git(*args):
+            if args[0] == "rev-list":
+                return b"merge base source\n"
+            if args[-1] == "HEAD^{commit}":
+                return b"other\n"
+            return b"resolved\n"
+        with self.assertRaises(p.MappingError):
+            p.comparison("push", "affected", "before", "source", "", git)
+        with self.assertRaises(p.MappingError):
+            p.comparison("workflow_dispatch", "affected", "", "source", "main", git)
+
+
+class WorkflowWiring(unittest.TestCase):
+    def test_head_and_base_event_sources(self):
+        text = (Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        def expression(prefix):
+            line = next(line for line in text.splitlines() if line.strip().startswith(prefix + ": ${{"))
+            return line.split("${{", 1)[1].rsplit("}}", 1)[0].strip()
+        payloads = {
+            "pull_request": {"github.event.pull_request.head.sha": "SRC", "github.event.pull_request.base.sha": "BASE",
+                             "github.sha": "SHA", "github.event.before": "BEFORE"},
+            "push": {"github.sha": "SHA", "github.event.before": "BEFORE"},
+            "workflow_dispatch": {"github.sha": "SHA"},
+        }
+        def evaluate(expr, payload):
+            for part in (item.strip() for item in expr.split("||")):
+                if payload.get(part):
+                    return payload[part]
+            return ""
+        head_expr, base_expr = expression("HEAD"), expression("BASE")
+        self.assertEqual(evaluate(head_expr, payloads["pull_request"]), "SRC")
+        self.assertEqual(evaluate(head_expr, payloads["push"]), "SHA")
+        self.assertEqual(evaluate(head_expr, payloads["workflow_dispatch"]), "SHA")
+        self.assertEqual(evaluate(base_expr, payloads["pull_request"]), "BASE")
+        self.assertEqual(evaluate(base_expr, payloads["push"]), "BEFORE")
+        self.assertNotIn("github.event.before", head_expr)
 
 
 if __name__ == "__main__":

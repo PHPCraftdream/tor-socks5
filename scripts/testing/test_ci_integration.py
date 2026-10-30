@@ -132,21 +132,22 @@ class External(unittest.TestCase):
         self.assertEqual(result["paths"], ["packages/auth/src/lib.rs", "packages/proxy-config/src/lib.rs"])
         self.assertIn("tor", result["segments"])
         self.assertFalse(result["full"])
+        main_head = self.head()
         self.git("branch", "side-base", first)
         self.git("checkout", "-q", "side-base")
         self.put("docs/side.md", "другая ветка\n")
         self.commit("другая ветка")
         side = self.head()
+        # Synthetic PR checkout: настоящий merge с родителями (side, main_head).
+        self.git("merge", "--no-ff", "-q", "-m", "PR merge checkout", main_head)
+        pr = self.planner("--event", "pull_request", "--base", side, "--head", main_head)
+        self.assertEqual(pr["paths"], sorted(["docs/side.md", "packages/proxy-config/src/lib.rs"]))
         self.git("checkout", "-q", "-")
-        pr = self.planner("--event", "pull_request", "--base", side, "--head", self.head())
-        self.assertEqual(pr["paths"], ["packages/proxy-config/src/lib.rs"])
-        self.assertEqual(self.push(base=first)["paths"], pr["paths"])
+        self.assertEqual(self.push(base=first)["paths"], ["packages/proxy-config/src/lib.rs"])
         manual = self.planner("--event", "workflow_dispatch", "--mode", "affected",
                               "--base-ref", first, "--head", self.head())
         self.assertFalse(manual["full"])
-        self.assertEqual(manual["paths"], pr["paths"])
-        self.assertEqual(manual["packages"], pr["packages"])
-        self.assertEqual(manual["segments"], pr["segments"])
+        self.assertEqual(manual["paths"], ["packages/proxy-config/src/lib.rs"])
         for base in ("", "missing-ref"):
             self.planner("--event", "workflow_dispatch", "--base-ref", base, "--head", self.head(), ok=False)
         self.planner("--event", "push", "--base", self.base, "--head", first, ok=False)
@@ -156,6 +157,292 @@ class External(unittest.TestCase):
         self.assertEqual(full["library_packages"], ["android-ffi", "arti-wrapper", "bridge-probe", "tor-socks5-auth", "tor-socks5-client-acl", "tor-socks5-config"])
         self.metadata.write_text('{}', encoding="utf-8")
         self.push(ok=False)
+
+    def test_commit_footer_full_trigger(self):
+        members = sorted(["socks5-proxy", "android-ffi", "tor-socks5-auth", "tor-socks5-config",
+                          "tor-socks5-client-acl", "bridge-probe", "arti-wrapper"])
+        self.put("packages/auth/src/lib.rs", "auth\n")
+        self.commit("auth")
+        early = self.head()
+        self.put("packages/proxy-config/src/lib.rs", "config\n")
+        self.commit("config\n\nCI-Full: sprint-end")
+        self.put("packages/bridge-probe/src/lib.rs", "bridge\n")
+        self.commit("bridge после footer")
+        result = self.push()
+        self.assertTrue(result["full"])
+        self.assertEqual(result["full_trigger"], "commit_footer")
+        self.assertEqual(result["packages"], members)
+        self.assertIn({"segment": "rust", "target": "macos-latest"}, result["target_rows"])
+        self.assertIn("footer коммита CI-Full: sprint-end", result["reasons"]["rust"])
+        self.assertEqual(result["segments"], sorted(["fast", "rust", "msrv", "android", "tor", "vendor", "vendor-extra", "docs-contract", "installer-sh", "installer-windows", "release", "features", "stress", "regression", "native-portability", "required"]))
+        self.assertEqual(result["command_packages"]["android"], ["android-ffi", "socks5-proxy"])
+        self.assertEqual(result["shipping_packages"], ["android-ffi", "socks5-proxy"])
+        self.assertEqual(result["library_packages"], sorted(["android-ffi", "arti-wrapper", "bridge-probe", "tor-socks5-auth", "tor-socks5-client-acl", "tor-socks5-config"]))
+        self.assertEqual(result["native_rows"], [
+            {"runner": "macos-15", "target": "aarch64-apple-darwin", "musl": False},
+            {"runner": "ubuntu-latest", "target": "aarch64-linux-android", "musl": False},
+            {"runner": "ubuntu-24.04-arm", "target": "aarch64-unknown-linux-gnu", "musl": False},
+            {"runner": "ubuntu-24.04-arm", "target": "aarch64-unknown-linux-musl", "musl": True},
+            {"runner": "macos-15-intel", "target": "x86_64-apple-darwin", "musl": False},
+            {"runner": "windows-latest", "target": "x86_64-pc-windows-msvc", "musl": False},
+            {"runner": "ubuntu-latest", "target": "x86_64-unknown-linux-gnu", "musl": False},
+            {"runner": "ubuntu-latest", "target": "x86_64-unknown-linux-musl", "musl": True},
+        ])
+        # Полный прогон (sprint-full): командные пакеты rust/msrv — все члены, матрица rust — три ОС.
+        self.assertEqual(result["command_packages"]["rust"], members)
+        self.assertEqual(result["command_packages"]["msrv"], members)
+        self.assertEqual([row["target"] for row in result["target_rows"] if row["segment"] == "rust"],
+                         ["ubuntu-latest", "macos-latest", "windows-latest"])
+        expected_consumers = {
+            "fmt": ("fast", "regression"), "line-limit": ("fast",),
+            "dir-entries": ("fast",), "publish-guard": ("fast",),
+            "packageability": ("fast",), "real-tor-channel": ("tor",),
+            "rust": ("rust",), "msrv": ("msrv",), "android": ("android",),
+            "docs-contract": ("docs-contract",), "installer-sh": ("installer-sh",),
+            "installer-windows": ("installer-windows",), "release-scripts": ("release",),
+            "native-portability": ("native-portability",),
+            "vendor-extra": ("vendor-extra", "vendor"), "features": ("features",),
+            "stress": ("stress",), "license-offline": ("license-offline",),
+            "license-audit": ("license-audit",), "license-lifecycle": ("license-lifecycle",),
+        }
+        self.assertEqual(expected_consumers, dict(p.RESULT_JOBS))  # Независимый literal-контракт потребителей.
+        needs = {job: {"result": "success" if any(s in result["segments"] for s in selections) else "skipped"} for job, selections in expected_consumers.items()}
+        needs["plan"] = {"result": "success"}
+        p.validate_results(result, needs)
+        # Footer в содержимом файла триггером не является.
+        self.git("reset", "--hard", self.base)
+        self.put("packages/auth/src/lib.rs", "auth\n\nCI-Full: sprint-end\n")
+        self.commit("файл с текстом footer")
+        result = self.push()
+        self.assertFalse(result["full"])
+        self.assertIsNone(result["full_trigger"])
+        self.assertLess(len(result["packages"]), 7)
+        # Footer в prose сообщения коммита не триггер.
+        self.put("packages/auth/src/lib.rs", "auth\n")
+        self.commit("план: добавить CI-Full: sprint-end позже")
+        result = self.push()
+        self.assertFalse(result["full"])
+        # Ручной affected игнорирует footer: ручной выбор режима главнее.
+        self.put("packages/proxy-config/src/lib.rs", "config\n")
+        self.commit("config\n\nCI-Full: sprint-end")
+        manual = self.planner("--event", "workflow_dispatch", "--mode", "affected",
+                              "--base-ref", self.base, "--head", self.head())
+        self.assertFalse(manual["full"])
+        self.assertIsNone(manual["full_trigger"])
+        # PR-семантика: merge-base исходных веток, footer в не последнем коммите.
+        self.put("packages/arti-wrapper/src/lib.rs", "\n".join(p.TOR_MARKERS["packages/arti-wrapper/src/lib.rs"]) + "\narti\n")
+        self.commit("arti после footer")
+        pr_head = self.head()
+        # Synthetic PR checkout: merge с родителями (early, pr_head).
+        self.git("checkout", "-q", "-b", "pr-checkout", early)
+        self.git("merge", "--no-ff", "-q", "-m", "PR merge checkout", pr_head)
+        pr = self.planner("--event", "pull_request", "--base", early, "--head", pr_head)
+        self.assertTrue(pr["full"])
+        self.assertEqual(pr["full_trigger"], "commit_footer")
+        self.git("checkout", "-q", "-")
+        # База-не-предок (side-ветка) = ошибка плана, а не FULL и не пустой план.
+        self.git("branch", "side", self.base)
+        self.git("checkout", "-q", "side")
+        self.put("docs/side.md", "другая ветка\n")
+        self.commit("другая ветка")
+        side = self.head()
+        self.git("checkout", "-q", "-")
+        self.planner("--event", "push", "--base", side, "--head", self.head(), ok=False)
+
+    def test_pr_synthetic_merge_not_scanned(self):
+        self.put("packages/auth/src/lib.rs", "auth\n")
+        self.commit("auth")
+        target = self.head()
+        self.git("checkout", "-q", "-b", "pr-branch", self.base)
+        self.put("packages/proxy-config/src/lib.rs", "config pr\n")
+        self.commit("config pr без marker")
+        source = self.head()
+        # Настоящий двухродительский merge имитирует synthetic PR checkout.
+        self.git("checkout", "-q", target)
+        self.git("merge", "--no-ff", "-q", "-m", "PR merge\n\nCI-Full: sprint-end", "pr-branch")
+        merge = self.head()
+        self.assertNotEqual(merge, source)
+        # --head = исходный source; checkout = synthetic merge; marker только в его message.
+        result = self.planner("--event", "pull_request", "--base", target, "--head", source)
+        self.assertFalse(result["full"])
+        self.assertIsNone(result["full_trigger"])
+        # paths — из merge-дерева: тесты исполняются в нём.
+        self.assertEqual(result["paths"], sorted(["packages/auth/src/lib.rs", "packages/proxy-config/src/lib.rs"]))
+        # Негативы: base не первый родитель; head=checkout (не проходит merge-proof); push head≠checkout.
+        self.planner("--event", "pull_request", "--base", self.base, "--head", source, ok=False)
+        self.planner("--event", "pull_request", "--base", target, "--head", merge, ok=False)
+        self.planner("--event", "push", "--base", target, "--head", source, ok=False)
+
+    def test_plan_uses_merge_checkout_tree(self):
+        # Контрпример: target уже установил guarded capability, source — на старой декларации (старое чтение
+        # source упало бы на несогласованных anchors, а не отключило бы tor тихо).
+        self.put(p.CONTRACT_MANIFEST, "real_tor_channel = false\n")
+        self.commit("временное понижение контракта")
+        downgrade = self.head()
+        self.put(p.CONTRACT_MANIFEST, "real_tor_channel = true\n")
+        self.commit("target устанавливает контракт")
+        target = self.head()
+        self.git("checkout", "-q", "-b", "old-source", downgrade)
+        self.put("packages/proxy-config/src/lib.rs", "config source\n")
+        self.commit("source изменение config")
+        source = self.head()
+        self.git("checkout", "-q", target)
+        self.git("merge", "--no-ff", "-q", "-m", "PR merge checkout", source)
+        # План обязан видеть capability из merge-дерева (true): tor обязателен.
+        result = self.planner("--event", "pull_request", "--base", target, "--head", source)
+        self.assertTrue(result["capabilities"]["real_tor_channel"])
+        self.assertIn("tor", result["segments"])
+
+    def test_graph_follows_merge_checkout_manifests(self):
+        # Target меняет настоящие dependency/target declarations; source остаётся со старым manifest.
+        original = json.loads(self.metadata.read_text(encoding="utf-8"))
+        merged = json.loads(json.dumps(original))
+        next(node for node in merged["resolve"]["nodes"] if node["id"] == "arti")["deps"].append(
+            {"pkg": "config", "name": "tor_socks5_config", "dep_kinds": [{"kind": None, "target": None}]})
+        next(package for package in merged["packages"] if package["id"] == "arti")["targets"] = [{"kind": ["cdylib"]}]
+        meta_b = self.metadata.with_name("metadata-b.json")
+        meta_b.write_text(json.dumps(merged), encoding="utf-8")
+        cargo = self.bin / "cargo"
+        cargo.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$CARGO_LOG"\n[ "$*" = "metadata --locked --all-features --format-version 1" ] || exit 99\ngrep -Fq \'tor-socks5-config = { path = "../proxy-config" }\' packages/arti-wrapper/Cargo.toml && exec cat "$FAKE_METADATA_ALT"\nexec cat "$FAKE_METADATA"\n', encoding="utf-8")
+        cargo.chmod(0o755)
+        self.env["FAKE_METADATA_ALT"] = str(meta_b)
+        manifest = "[package]\nname='arti-wrapper'\nversion='0.1.0'\n"
+        self.put("packages/arti-wrapper/Cargo.toml", manifest)
+        self.put("packages/proxy-config/Cargo.toml", "[package]\nname='tor-socks5-config'\nversion='0.1.0'\n")
+        self.commit("базовые манифесты графа")
+        common = self.head()
+        self.git("checkout", "-q", "-b", "graph-source")
+        self.put("packages/proxy-config/src/lib.rs", "config source\n")
+        self.commit("source меняет config со старым графом")
+        source = self.head()
+        self.git("checkout", "-q", common)
+        dependency = 'tor-socks5-config = { path = "../proxy-config" }\n'
+        self.put("packages/arti-wrapper/Cargo.toml", manifest + '[lib]\ncrate-type=["cdylib"]\n[dependencies]\n' + dependency)
+        self.commit("target меняет dependency и тип target")
+        target = self.head()
+        self.git("merge", "--no-ff", "-q", "-m", "PR merge checkout", source)
+        self.assertNotIn(dependency, self.git("show", source + ":packages/arti-wrapper/Cargo.toml"))
+        self.assertIn(dependency, (self.root / "packages/arti-wrapper/Cargo.toml").read_text(encoding="utf-8"))
+        result = self.planner("--event", "pull_request", "--base", target, "--head", source)
+        expected = ["android-ffi", "arti-wrapper", "socks5-proxy", "tor-socks5-config"]
+        self.assertEqual(result["packages"], expected)
+        self.assertEqual(result["command_packages"]["rust"], expected)
+        # Старый source graph включил бы arti-wrapper в library_packages; merge содержит только cdylib.
+        self.assertEqual(result["library_packages"], ["android-ffi", "tor-socks5-config"])
+        self.assertEqual(result["paths"], ["packages/arti-wrapper/Cargo.toml", "packages/proxy-config/src/lib.rs"])
+
+    def test_plan_uses_merge_checkout_tree_legacy(self):
+        # Валидный legacy: declaration false и anchors отсутствуют — совместимое состояние.
+        # Source — наследник legacy без контрактных изменений; только merge-дерево
+        # восстанавливает контракт. Чтение source тихо отключило бы tor.
+        self.git("rm", "-q", *p.TOR_ANCHORS)
+        self.put(p.CONTRACT_MANIFEST, "real_tor_channel = false\n")
+        self.commit("downgrade без контракта")
+        downgrade = self.head()
+        self.git("checkout", "-q", "HEAD~1", "--", p.CONTRACT_MANIFEST, *p.TOR_ANCHORS)
+        self.commit("target восстанавливает контракт")
+        target = self.head()
+        self.git("checkout", "-q", "-b", "legacy-source", downgrade)
+        self.put("packages/proxy-config/src/lib.rs", "config legacy\n")
+        self.commit("source изменение config")
+        source = self.head()
+        self.git("checkout", "-q", target)
+        self.git("merge", "--no-ff", "-q", "-m", "PR merge checkout", "legacy-source")
+        result = self.planner("--event", "pull_request", "--base", target, "--head", source)
+        self.assertTrue(result["capabilities"]["real_tor_channel"])
+        self.assertIn("tor", result["segments"])
+
+    def test_event_wiring_end_to_end(self):
+        # Параметры вычисляются из workflow-выражений и передаются CLI как есть — не руками.
+        text = (Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+
+        def expression(prefix):
+            line = next(item for item in text.splitlines() if item.strip().startswith(prefix + ": ${{"))
+            return line.split("${{", 1)[1].rsplit("}}", 1)[0].strip()
+
+        def evaluate(expr, payload):
+            for part in (chunk.strip() for chunk in expr.split("||")):
+                if payload.get(part):
+                    return payload[part]
+            return ""
+
+        self.put("packages/auth/src/lib.rs", "auth wiring\n")
+        self.commit("auth wiring")
+        target = self.head()
+        self.git("checkout", "-q", "-b", "wiring-pr", self.base)
+        self.put("packages/proxy-config/src/lib.rs", "config wiring\n")
+        self.commit("config wiring")
+        source = self.head()
+        self.git("checkout", "-q", target)
+        self.git("merge", "--no-ff", "-q", "-m", "PR merge checkout", source)
+        # github.sha — merge checkout: assert проверяет приоритет head.sha над github.sha.
+        payload = {"github.event.pull_request.head.sha": source, "github.event.pull_request.base.sha": target,
+                   "github.sha": self.head(), "github.event.before": ""}
+        base = evaluate(expression("BASE"), payload)
+        head = evaluate(expression("HEAD"), payload)
+        self.assertEqual((base, head), (target, source))
+        invocation = next(line.strip() for line in text.splitlines()
+                          if line.strip().startswith("python -I scripts/testing/ci_planner.py --event "))
+        env = dict(self.env, EVENT="pull_request", BASE=base, HEAD=head, BASE_REF="", MODE="affected")
+        executed = self.cmd("bash", "-c", "set -euo pipefail\n" + invocation, env=env)
+        self.assertEqual(executed.returncode, 0, executed.stderr)
+        result = json.loads((self.root / "plan.json").read_text(encoding="utf-8"))
+        self.assertFalse(result["full"])
+        self.assertEqual(result["paths"], sorted(["packages/auth/src/lib.rs", "packages/proxy-config/src/lib.rs"]))
+
+    def test_main_squash_push_semantics(self):
+        self.put("packages/auth/src/lib.rs", "auth base\n")
+        self.commit("auth base")
+        base1 = self.head()
+        self.git("checkout", "-q", "-b", "topic")
+        self.put("packages/auth/src/lib.rs", "auth topic\n")
+        self.commit("auth topic")
+        self.git("checkout", "-q", "-")
+        # Реальный squash на main: итоговый коммит один, его message и есть Git message диапазона.
+        self.git("merge", "--squash", "-q", "topic")
+        self.commit("squash auth\n\nCI-Full: sprint-end")
+        squashed = self.head()
+        result = self.push(base=base1, head=squashed)
+        self.assertTrue(result["full"])
+        self.assertEqual(result["full_trigger"], "commit_footer")
+        # Негатив: footer был в исходных PR-коммитах, но squash-коммит его не содержит.
+        self.git("checkout", "-q", "-b", "topic2")
+        self.put("packages/proxy-config/src/lib.rs", "config pr\n")
+        self.commit("config часть 1\n\nCI-Full: sprint-end")
+        self.put("packages/proxy-config/src/lib.rs", "config pr 2\n")
+        self.commit("config часть 2")
+        self.git("checkout", "-q", "-")
+        self.git("merge", "--squash", "-q", "topic2")
+        self.commit("squash config без footer")
+        result = self.push(base=squashed)
+        self.assertFalse(result["full"])
+        self.assertIsNone(result["full_trigger"])
+
+    def test_main_merge_push_semantics(self):
+        self.put("packages/auth/src/lib.rs", "auth base\n")
+        self.commit("auth base")
+        base1 = self.head()
+        self.git("checkout", "-q", "-b", "topic")
+        self.put("packages/auth/src/lib.rs", "auth topic\n")
+        self.commit("auth topic\n\nCI-Full: sprint-end")
+        self.git("checkout", "-q", "-")
+        # Реальный merge-push на main: footer в исходном коммите топика, НЕ в merge message.
+        self.git("merge", "--no-ff", "-q", "-m", "Merge topic без footer", "topic")
+        result = self.push(base=base1)
+        self.assertTrue(result["full"])
+        self.assertEqual(result["full_trigger"], "commit_footer")
+
+    def test_manual_affected_base_not_ancestor(self):
+        self.git("branch", "side", self.base)
+        self.git("checkout", "-q", "side")
+        self.put("docs/side.md", "side\n")
+        self.commit("side ветка")
+        side = self.head()
+        self.git("checkout", "-q", "-")
+        manual = self.planner("--event", "workflow_dispatch", "--mode", "affected",
+                              "--base-ref", side, "--head", self.head())
+        self.assertFalse(manual["full"])
+        self.assertIn("docs/side.md", manual["paths"])
 
     def test_real_rename_delete_and_unknown(self):
         self.git("mv", "packages/auth/src/lib.rs", "packages/bridge-probe/src/переименован файл.rs")
