@@ -344,3 +344,100 @@ Target review привязывается к четырём значениям id
 5. До устранения всех блокеров не создавать tag и не выпускать релиз.
 
 **Итог: PARTIAL.** Доказательств состава, compliance и production authority недостаточно.
+
+## Сохранённые native/toolchain свидетельства семи целей
+
+Ниже интегрирован исправленный handoff задачи 76. Его локальная копия: `target/native-evidence-40934653900-task76-corrected-20261030/REPORT.ru.md`, 23360 байт, SHA-256 `871dd3754800c6bbe9c699dfff091df2aad0c294282acdfb4c487b24510a41c8`. Parent сверил восемь Linux path/size/hash с индексом `summary.json` (250518 байт, SHA-256 `674863e7596c34790a1617a8aae9b362bb8a0ea78ba1a95fb03c259c0725ba01`). Пути worktree в handoff обозначают историческое размещение inputs; это не публикация raw captures.
+
+### Вывод
+
+**#53 остаётся PARTIAL; #56 не закрыта.** Это отчёт о сохранённых свидетельствах сборки/бинарных файлов для run `40934653900`, а не инвентаризация Cargo-кандидатов, юридическое одобрение, установление production-origin или полный граф входов линковщика. Внешний артефакт: ID `12932028389`, 853,866,809 байт, SHA-256 `75a58bb9393525b64f083105113771680bb561e1ff2f28f337fa584954b847d4`. Сохранённый артефакт `943666915` отсутствует. ZIP/TAR не открывались.
+
+Источники и точные ссылки, приведённые ниже из закреплённого исходного отчёта: `../license-external-terms-20261030/target/repro-saved-binaries-20261029-c/summary.json`; `../license-external-terms-20261030/target/stage1-data-20261029/all-targets.txt` строки 35–42, 103–110, 140–147, 181–188, 217–224, 285–292, 343–350; `../license-external-terms-20261030/target/source-proof-20261030-a/proof.json:15876–15940`; `docs/project/license/release-components-40934653900-repro/source-proof.md:9–14,33–47`; `docs/project/license/release-components-40934653900.md:252–262`. Эти ссылки наследуются из закреплённого исходного отчёта и не означают, что raw материалы повторно проверялись в этой корректирующей сессии.
+
+Исходный отчёт `target/native-evidence-40934653900-task76-20261030-final/REPORT.md` прочитан после проверки SHA-256 `a695530630e704b54c180d8685ab0276edbaf034229afeb69581a9544a0b38bc` и размера 19601 байт. Он здесь не изменялся. Совпадение хеша подтверждает лишь сохранность исходного файла, а не процедурную корректность прежней работы.
+
+Пины исследования материалов: `summary.json` — 1711 байт, SHA-256 `8daf33662c94c5dd1b8d64d54a6e9c6877b106e22920e6a845dc64713aae4a88`; `research.json` — 96454549 байт, SHA-256 `43f39d841bf58b128c07f5cecd7359209e0cb1cd6da019c82328e1ab5b81d2a6` (пины/результаты наследуются из закреплённого исходного отчёта, повторного хеширования в этой корректирующей сессии не было). Сводка: 727/727 registry-архивов проверено, ноль ошибок сканирования, 6182 уникальных сохранённых текста; 164 отсутствующих отдельных branch-материала, 83 отсутствующие в архивном инвентаре ссылки, четыре LLVM exception-текста не найдены в сохранённых материалах. Это выводы о материалах исходников, не свидетельство линковки, содержимого дистрибутива компилятора или одобрения.
+
+Материалы `toolchain.txt` и `linkage.txt` доступны как исторические plain-текстовые выдержки в `all-targets.txt`/`binaries-and-graphs.txt`, а не как отдельно восстановленные raw captures. Для каждого из семи target `targets/<target>/native-evidence/build-stderr.txt` — индексированный archive member с путём/размером/хешем из матрицы, но standalone raw capture отсутствует среди просмотренных разрешённых входов. Аналогично, все восемь Linux `native/**/output` ниже — индексированные archive members; standalone raw captures отсутствуют среди просмотренных разрешённых входов. Это граница проверенных входов, не утверждение, что данные отсутствуют повсюду. Это handoff о недостающих captures; восстановление/извлечение не выполнялось.
+
+Пути ниже — члены дерева сохранённого кандидата `targets/<target>/`; хеши исполняемых файлов и доказательств относятся к сохранённым записям. Материалы `toolchain.txt`, `native-evidence/linkage.txt`, `native-evidence/build-stderr.txt` и перечисленные файлы `native-evidence/native/**` записаны в индексе/свидетельствах, но не образуют полный трассируемый граф native-входов.
+
+| Цель; ID артефакта | Исполняемый файл; байты / SHA-256 | toolchain.txt SHA-256 | linkage.txt SHA-256 | build-stderr.txt: размер; SHA-256 | Наблюдения и ограничения |
+|---|---|---|---|---|---|
+| `aarch64-apple-darwin`; `12931773573` | `tor-socks5`; 36,355,568 / `e452ccd04ab22cd614f29dbdd1ebce4952f13db9a61370e5c751db9e06e90de4` | 192 B `e003fd3d385fcd0de16bc6b049124efb20207831dd810fd4ab39ff079bbb12a5` | 870 B `b86fbe5ac38691e5d16ab0a36957b224a80d05a0d91224faa5aa922464b1f2be` | 24,775; `9bb90e3b6326e75b1403aedf2f844fc18d9bb205666cdf581bc34de071b44c21` | linkage называет IOKit, CoreFoundation, SystemConfiguration, libiconv, libSystem. Сообщения Cargo содержат директивы ring/sqlite3/SystemConfiguration. Точный SDK/framework и полный набор статических входов не установлены. |
+| `x86_64-apple-darwin`; `12930598391` | `tor-socks5`; 37,581,112 / `507e1c1349837eb7e52eb4a87002e02ee7ab8e209ddbb25f3c0031849132a326` | 191 B `bf1658636877f9403ad0a32419fc3b0da3d3164f3585a184108063f8499d7434` | 869 B `e0489b7eea787911e1a219f1cbd06d0e19a79abc2727225ad0a7f5c3f7cf4759` | 24,833; `c0c825c8d99aaf23e1f7ccaf8f341af07207f6a9149b8ea22dccc510ba364fdb` | Те же записанные имена framework/library и ограничения, что для Apple arm64; точный SDK и полный native trace неизвестны. |
+| `x86_64-pc-windows-msvc`; `12929435820` | `tor-socks5.exe`; 36,523,520 / `132cf698d1841cfe4123abc95e891e9e60153d893fb46a4ba5a5b505c7090746` | 194 B `341fed434cf52bd9ba5ab2f3507dbd943a2062212028574e529fc3e7e5ecd7a8` | 276 B `0da1d98dc0cb607f5fd51b618334c0f389d40a3adeb402e8faf5beaab7fd5192` | 25,370; `ffd90acf27ff966081f8e1e9baefd4affa84d05ee678567673a376cd5ab23ba1` | Сохранённый результат readelf: «not ELF». Данных PE import table нет; состояние Windows imports — **UNKNOWN**. Это исправляет ошибочную формулировку прежнего `final_text` «PE imports отсутствуют»: наблюдались только отсутствие свидетельства PE-import и результат readelf «not ELF», а не отсутствие импортов. Сообщения о ring/sqlite3/winapi/iphlpapi — директивы, не импорты. Версии MSVC/linker/runtime/SDK неизвестны. |
+| `aarch64-unknown-linux-musl`; `12927756356` | `tor-socks5`; 39,124,368 / `78e051c957228fea7f719d394f6827d0d50e06691d9f725ffb488692521e9673` | 197 B `ba203e33fe4a5b8e05147bb6e57fb1ddace26d9f799f357420b666887dd7e2f1` | 242 B `948f9b6efa68bacbe8e2a407154f9839d820f9847115e9d6bf737551922bcb9a` | 24,539; `575146d3c63772d371cce575b04422f8a69a86ce76857a3930dd62dc40ab9257` | «There is no dynamic section». Не устанавливает версию musl, статическое содержимое или native provenance. |
+| `aarch64-unknown-linux-gnu`; `12926432069` | `tor-socks5`; 39,885,872 / `3e263cdeab6638502e83fdb89cb7878623592f177b450e49dc25fac1cbc4efe8` | 197 B `ba203e33fe4a5b8e05147bb6e57fb1ddace26d9f799f357420b666887dd7e2f1` | 1,896 B `fd4ea033f72f79e82206dd7035820a24b6ea7384fda8d0d13cbb21879d47b1b1` | 24,539; `085064ee1862f9ce3d2bf7fc14c3124910ab4eacf29880b30e3ba05efb82a081` | NEEDED: `libgcc_s.so.1`, `libm.so.6`, `libc.so.6`, `ld-linux-aarch64.so.1`. Версии GNU runtime/toolchain и статические входы неизвестны. |
+| `x86_64-unknown-linux-gnu`; `12925166590` | `tor-socks5`; 40,749,864 / `f8ee9ffd9a58e0578f92b2c6df84a5754bcfb9b61c5bf3d6895dc5e48baf0ab1` | 196 B `f22d5e4e9ced367e774ce5bc140d9e6b1235c1882fec80d011044851f3ae6369` | 1,897 B `c16560a6cd68c1faff470112becf528233a0c3e7a0d084540e6a630c5ab047be` | 24,596; `1a4abf7c74ee0262f95cb977498d650e8a0cdc90bf35b4b444bc1fa19061d08b` | NEEDED: `libgcc_s.so.1`, `libm.so.6`, `libc.so.6`, `ld-linux-x86-64.so.2`. Версии GNU runtime/toolchain и статические входы неизвестны. |
+| `x86_64-unknown-linux-musl`; `12924449353` | `tor-socks5`; 40,647,872 / `2b2184d890ca902c286039ef19a9eae863528ce4fb363cfa3a6c6ce5cfa4bd66` | 196 B `f22d5e4e9ced367e774ce5bc140d9e6b1235c1882fec80d011044851f3ae6369` | 1,310 B `69b564668c4be0f897b8b6a538c90c1e2e34e058843633d60a12e1e13e21798a` | 24,596; `847669bd7cbbeb9520afdfdf50a432566034435eb81ddc50146727aa4a6b5326` | Dynamic section есть, NEEDED-записей нет; это не доказывает конкретное musl/статическое происхождение. |
+
+Все семь записей toolchain сообщают rustc `1.99.1`, commit `58cf8f9c35b355199727627d07ae34a4e2846d67`, LLVM `23.1.1`. Записанные host для Apple/Windows/GNU соответствуют target; обе musl-записи указывают GNU host соответствующей архитектуры. Это наблюдения из файлов, не независимая проверка установленного компилятора, stdlib/runtime или всех входов. MSRV не является фактической версией компилятора.
+
+Хеши `build_evidence_digest` из proof.json и число файлов:
+
+| Цель | digest | Файлов |
+|---|---|---:|
+| `aarch64-apple-darwin` | `447d139cf97c5317e5414003d630c076bab577d00e57eea4bdc66a4d8358f2e5` | 115 |
+| `aarch64-unknown-linux-gnu` | `e36c10caae8c10defe9bbf494119a9512618f98682763b9904d08fb22ae6ac6c` | 112 |
+| `aarch64-unknown-linux-musl` | `d8ebedeadce1b4847e3a0b406e39e9201c6824191603e45b13d917d26fa24a3e` | 112 |
+| `x86_64-apple-darwin` | `9d8b22c09090993f898ddd5f9b4133e80973dd54c8058c44dbef4013df855a1e` | 115 |
+| `x86_64-pc-windows-msvc` | `6b298fdf8a35f45718bae4a2afd8e1bdc414f310fd7cd3abf4405af01212fe1e` | 124 |
+| `x86_64-unknown-linux-gnu` | `f322276ca62c2a711fb028bdda2be89b0b75089c4b7ee7ab0a26d7a5197fa703` | 112 |
+| `x86_64-unknown-linux-musl` | `09fbda25cf92becce41c2e46b33a8a43b57daae0189aabd7fe992ecd29f9e830` | 112 |
+
+Сводка saved-binaries содержит целевые member paths/размеры/хеши: Apple arm64 lines 1549–1557, 2227–2229; GNU arm64 2257–2265, 2917–2919; musl arm64 2947–2955, 3607–3609; Apple x86 3637–3645, 4315–4317; Windows 4345–4353, 5077–5079; GNU x86 5107–5115, 5767–5769; musl x86 5797–5805, 6457–6459. Это индекс членов, не самостоятельное чтение каждого файла. Записи digest — агрегированные доказательства receipts, не карта хешей каждого raw member.
+
+### Native/toolchain, материалы и ограничения
+
+| Семейство | Что наблюдалось | Не установлено |
+|---|---|---|
+| Rust/LLVM | Семь записей toolchain выше. | Происхождение дистрибутива компилятора/LLVM и его license/package manifest. Четыре отсутствующих LLVM exception-текста в registry-материалах не доказывают, что отсутствует исключение, применимое к использованному компилятору. |
+| stdlib/compiler-builtins/unwind | Отдельного per-target package/license manifest нет. | Точные артефакты, версии, copyright/license notices, хеши и фактическое использование. Версия toolchain не заменяет эти данные. |
+| GNU/musl runtime | GNU ELF содержит указанные динамические NEEDED; musl arm64 без dynamic section, x86 musl без NEEDED. | Точная дистрибуция/версия/лицензия runtime и полная трассировка статических входов. |
+| MSVC/Windows | Есть Windows target и capture native build output ring/sqlite/winapi. | Версии MSVC linker/toolset, CRT, Windows SDK, лицензии и PE import table; Windows imports остаются UNKNOWN. |
+| Apple SDK/frameworks | linkage именует IOKit, CoreFoundation, SystemConfiguration, libiconv, libSystem. `binaries-and-graphs.txt:8–12,21–25` сообщает compatibility/current versions: IOKit 1.0.0/275.0.0; CoreFoundation 150.0.0/3502.1.255; SystemConfiguration 1.0.0/1351.120.3; iconv 7.0.0/7.0.0; libSystem 1.0.0/1351.0.0. | Эти значения не являются версией SDK, происхождением/лицензией SDK package или полным графом статических/native входов. |
+
+Cargo-сообщения сообщают для ring `0.17.14` директивы `static=ring_core_0_17_14_` и `static=ring_core_0_17_14__test`, для libsqlite3-sys `0.37.0` — `static=sqlite3`; test-директива не доказывает наличие test-библиотеки в финальном бинарнике. Apple запрашивает SystemConfiguration; Windows содержит директивы iphlpapi и `dylib=`. Директивы не подтверждают итоговые imports. Кандидаты исходников `openssl-src`/`zstd-sys` не доказывают линковку. Полного графа static/native linker inputs нет.
+
+Родительские материалы сообщают ring `LICENSE` SHA-256 `b3d734001a94efff3579978d953391aa7115f877657d25eb54037a43875d078a` (ISC-файлы отдельно от Apache-2.0 BoringSSL); также упомянуты `LICENSE-BoringSSL` и `LICENSE-other-bits`. `libsqlite3-sys` `LICENSE` SHA-256 `c10c1f27337546471e5f7e4e97fdd398b35b9d4e126115dcd22de8d8e65abf6f` — лицензия/copyright MIT обёртки; `sqlite3/sqlite3.c` SHA-256 `9512509b1bccb7461f79bea8aad6280ae4699e925fa4804381b71f59e7efb0c5` указывает public-domain status. Это сведения об исходных материалах, не точных native bytes в бинарях.
+
+#### Восемь Linux native output records
+
+Ниже точные пути, размеры и SHA-256 из разрешённого индекса `summary.json`; номера строк относятся к этому файлу. Индексированный archive member не равен отдельно читаемому capture и не доказывает присутствие/линковку объектов в исполняемом файле.
+
+| Цель | Пакет / путь | Байты | SHA-256 | Строки summary.json |
+|---|---|---:|---|---|
+| `aarch64-unknown-linux-gnu` | `targets/aarch64-unknown-linux-gnu/native-evidence/native/libsqlite3-sys-43caa778f99d306e/output` | 2800 | `8f2a4e148a3e08666ad6c5a1e54187e0636d7c94e0c594762306753ddf863eb5` | 2545–2547 |
+| то же | `targets/aarch64-unknown-linux-gnu/native-evidence/native/ring-06d78f2d5463b481/output` | 7333 | `566e50c9cf149dabbf39f8cde849b72888fd68f53e942a852923cb123c732e14` | 2659–2661 |
+| `aarch64-unknown-linux-musl` | `targets/aarch64-unknown-linux-musl/native-evidence/native/libsqlite3-sys-b3f1c9f25bc5e311/output` | 3036 | `5bcebb17bc1886c0506db439bb37b911a3d8982d111ce9c02c6b2368e2a87285` | 3235–3237 |
+| то же | `targets/aarch64-unknown-linux-musl/native-evidence/native/ring-5b9c8b9d0c6fb9a6/output` | 7490 | `46bcd6af9f98aa8749bdb1eb72fb4273e8eb0a439dbdd738c5c15b8df1cc9630` | 3349–3351 |
+| `x86_64-unknown-linux-gnu` | `targets/x86_64-unknown-linux-gnu/native-evidence/native/libsqlite3-sys-8f8cf1c8240c276c/output` | 2774 | `4b56c157e31b020367639932aebd44ece7e67e0b44222f1d16be89862cd6a077` | 5395–5397 |
+| то же | `targets/x86_64-unknown-linux-gnu/native-evidence/native/ring-3a91efdcc3b8a52d/output` | 7316 | `d89255c83f816c2e2397b58e9c380dccfd27fa98e1b4391901123611217f5635` | 5509–5511 |
+| `x86_64-unknown-linux-musl` | `targets/x86_64-unknown-linux-musl/native-evidence/native/libsqlite3-sys-5ea49f2c969c7c4c/output` | 4294 | `4da1c88d54defd5e9f2fcd13acb67cbf64bb73bf855a362251613abab10c19b9` | 6085–6087 |
+| то же | `targets/x86_64-unknown-linux-musl/native-evidence/native/ring-d39c1e356df5d320/output` | 8329 | `00cff73611bd7f9f38df9ca703043abb9aabecfdc994299163f6128c987fbbcb` | 6199–6201 |
+
+Для Apple arm64 индексирует `libsqlite3-sys-377d37a63ce0fd29/output` SHA-256 `81a63de22a7b4ba261429cfeb2cdc0d3f0ac06830331f345261dc752d067702e` (1837–1839) и `ring-f957787254a34d2c/output` `7b80bf7f4288cea16a2bb7173ac073cfd4eeee4ebd64b3dd2774c6ff0af22747` (1951–1953). Windows: `libsqlite3-sys-41f49751baff0676/output` `d7a8db6ebd668d816520ee3430fb28a8b66ca700f3a79a602bb750a65467a900` (4651–4653), `ring-5456e3b1b7f3bda0/output` `29474fc32d9e4aab3db515c9fa2a4e1f187c31adf27d9f231e76be1d00f2a195` (4783–4785), `winapi-c7e04be40f3bbf47/output` `71561baf3a8972c100b664d0a611facbabfdd289b538a9c3f2479f3236e7c84f` (4981–4983). Все перечисленное — записи индекса; raw captures отдельно не проверялись.
+
+### Процедурный инцидент
+
+Предыдущая дочерняя сессия `97367124-8234-483a-a097-2d425c9e45fb$$call_aea316c6a36f4c9eaef0385bf33e9d17` нарушила заданную границу чтения: msg2/6 выполнили широкое `ls` внешнего target на depth 2; msg28–31 — glob/content grep по всему внешнему target вне разрешённого объёма; msg7/12–13 прочитали summaries и msg26–27 — research семантически до проверки пинов в msg46–47. Эти нарушения реальны и не исправляются последующим совпадением хешей. Хеш исходного отчёта доказывает только его сохранность, не ретроспективную процедурную корректность. Транскрипт и другие деревья в этой работе повторно не читались.
+
+### Материалы, provenance и пробелы
+
+Source proof связывает общий исходный commit/tree для семи receipts: `67f82c1e107ab24e8fd22afb9fd12134ffa7f982` / `8c5be9171f2a2fa0f83dc42a60d9bb731d891d4c`; SDK commit/tree `e754abaa88ce4f9745b4729652789ffc57f8ba4c` / `263db1bd209e4151eb4deadf532d423d0bf2b41c`. Эти привязки и совпадения receipts описывают сохранённые свидетельства старого PR run, не доказывают composition source-to-binary и не относятся к будущему релизу.
+
+Инвентарь кандидата — отдельная инвентаризация исходников: 736 компонентов, 743 blockers, пустые reviews, семь vendor notice gaps. Декларации и присутствие в registry archive не доказывают линковку. Открытые legal reviews и production origin остаются открытыми; этот отчёт не снимает blockers и не является юридическим одобрением или подтверждением полного связанного графа.
+
+### Минимальные действия для #54
+
+1. **Сохранённый run `40934653900`:** только разрешённое ограниченное безопасное восстановление уже закреплённого артефакта. Сверить каждый member path/hash с `repro-saved-binaries-20261029-c/summary.json`; отдельно получить точные raw bytes, особенно семь `toolchain.txt`, `native-evidence/linkage.txt`, `native-evidence/build-stderr.txt` и выбранные `native-evidence/native/**/output`. Подтвердить receipt bindings; зафиксировать пробелы в compiler/runtime/SDK артефактах. Не запускать legacy parsers и не перезаписывать доказательства. Это характеризует сохранённые члены, но не восстанавливает отсутствующие входные байты и не доказывает состав старого бинарника задним числом.
+2. **Только будущий релиз:** producer сохраняет и связывает receipt с точными per-target compiler+LLVM identity/license, manifest/hash stdlib/compiler-builtins/unwind, релевантными native objects/generated inputs, linker/runtime/SDK package identity и notices, а также платформенными import/load результатами. Для GNU/musl — runtime distribution/version и static/dynamic provenance; Windows — MSVC linker/CRT/SDK и PE imports; Apple — SDK/framework source/version/license package. Узкое добавление свидетельств, не широкая пересборка: новая сборка доказывает только собственные артефакты, не старый run.
+3. Отдельно разрешить component notices/reviews и production origin; native capture сам по себе не даёт legal approval или production authority. #53 и #56 не закрыты.
+
+### Источники и проверка
+
+Точные ссылки на разрешённые inputs, summary.json, proof.json, исторические plain excerpts и component materials приведены в начале отчёта и наследуются из закреплённого исходного отчёта; raw содержимое этих материалов повторно не проверялось в этой корректирующей сессии. Никаких тестов, сборок, валидаторов проекта, сети, CI, разбора/извлечения архивов не выполнялось.
+
+Только изменённый/созданный файл: `target/native-evidence-40934653900-task76-corrected-20261030/REPORT.ru.md`.
