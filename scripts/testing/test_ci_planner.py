@@ -111,6 +111,17 @@ class Routing(unittest.TestCase):
         with self.assertRaises(p.MappingError):
             self.route(".github/workflows/ci.yml", blobs={".github/workflows/ci.yml": (old, new.replace("msrv", "mystery"))})
 
+    def test_added_workflow_has_no_base_jobs(self):
+        path = ".github/workflows/license-promote.yml"
+        new = "name: Promote\njobs:\n  promote:\n    runs-on: ubuntu-latest\n"
+        caps = {"license_stack": True, "real_tor_channel": False}
+        result = self.route(path, blobs={path: ("", new)}, capabilities=caps)
+        self.assertIn("license-offline", result["segments"])
+        self.assertFalse(result["full"])
+        for invalid in ("", "name: Promote\n"):
+            with self.subTest(invalid=invalid), self.assertRaises(p.MappingError):
+                self.route(path, blobs={path: (new, invalid)}, capabilities=caps)
+
     def test_legacy_license_portability_migration(self):
         old = ("name: CI\njobs:\n  portability-diagnostics:\n"
                "    strategy:\n      matrix:\n        include:\n"

@@ -361,7 +361,8 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
                 raise MappingError("missing mapping: ошибка TOML: " + path) from exc
         elif path in (".github/workflows/ci.yml", ".github/workflows/nightly.yml", ".github/workflows/release.yml", ".github/workflows/license-bundle.yml", ".github/workflows/license-promote.yml"):
             old, new = blobs(path)
-            a, b = workflow_blocks(old), workflow_blocks(new)
+            a = workflow_blocks(old) if old else {}
+            b = workflow_blocks(new)
             nightly = {"full": "rust", "flaky-hunt": "stress", "vendor-extra": "vendor-extra", "features": "features", "report": "fast"}
             release = {"validate": "release", "build": "release", "release": "release", "license-audit": "license-audit", "origin": "license-offline"}
             license_jobs = {"offline-tests": "license-offline", "build": "license-lifecycle", "aggregate": "license-offline", "promote": "license-offline", "plan": "fast", "required": "fast", "guard": "fast", "pr-lifecycle": "license-lifecycle", "license-producer": "license-lifecycle"}
