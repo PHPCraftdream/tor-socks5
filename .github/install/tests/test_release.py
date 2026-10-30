@@ -775,20 +775,49 @@ class ReleaseWorkflowWiring(unittest.TestCase):
                 jobs[cur] = []
             elif cur is not None:
                 jobs[cur].append(line)
-        block = "\\n".join(jobs["portability-diagnostics"])
+        block = "\\n".join(jobs["native-portability"])
+        smoke_marker = 'name: Проверка статического ELF и Alpine'
         def assert_smoke_wiring(text):
+            if smoke_marker not in text:
+                raise AssertionError("missing Alpine smoke step")
+            smoke = text.split(smoke_marker, 1)[1]
             for expected in (
                     'docker run --rm --network none --read-only',
-                    '--platform "$platform"',
-                    'dst=/socks5-proxy,readonly', 'alpine:3.22 /socks5-proxy --version',
-                    'x86_64-*) platform=linux/amd64',
-                    'aarch64-*) platform=linux/arm64',
-                    'if [ "$MUSL" = "true" ]; then'):
-                if expected not in text:
+                    'type=bind,source=$PWD/$bin,target=/app,readonly',
+                    'alpine:3.22 /app --version', 'if: matrix.row.musl',
+                    'readelf -l "$bin"', 'readelf -d "$bin"',
+                    '! grep -q INTERP', '! grep -q NEEDED',
+                    "grep -Eq 'statically linked|static-pie linked'"):
+                if expected not in smoke:
                     raise AssertionError("missing Alpine smoke wiring: " + expected)
+            for expected in (
+                    'row: ${{ fromJSON(needs.plan.outputs.plan).native_rows }}',
+                    'runs-on: ${{ matrix.row.runner }}',
+                    'TARGET: ${{ matrix.row.target }}'):
+                if expected not in text:
+                    raise AssertionError("missing native target wiring: " + expected)
         assert_smoke_wiring(block)
-        with self.assertRaises(AssertionError):
-            assert_smoke_wiring(block.replace("docker run", "podman run", 1))
+        before, smoke = block.split(smoke_marker, 1)
+        for old, new in (("docker run", "podman run"),
+                         ("--network none", "--network host"),
+                         ("target=/app,readonly", "target=/app"),
+                         ("if: matrix.row.musl", "if: false")):
+            with self.subTest(mutation=old), self.assertRaises(AssertionError):
+                assert_smoke_wiring(before + smoke_marker + smoke.replace(old, new, 1))
+        # Прежние цели остаются на нативных runner соответствующей архитектуры.
+        import ast
+        planner = os.path.join(fx.REPO_ROOT, "scripts", "testing", "ci_planner.py")
+        with open(planner, "r", encoding="utf-8") as stream:
+            statements = ast.parse(stream.read()).body
+        node = next(item.value for item in statements if isinstance(item, ast.Assign)
+                    and any(isinstance(target, ast.Name) and target.id == "NATIVE_TARGETS"
+                            for target in item.targets))
+        rows = ast.literal_eval(node)
+        for target, expected in (
+                ("x86_64-unknown-linux-musl", ("ubuntu-latest", True)),
+                ("aarch64-unknown-linux-musl", ("ubuntu-24.04-arm", True)),
+                ("aarch64-unknown-linux-gnu", ("ubuntu-24.04-arm", False))):
+            self.assertEqual(rows[target], expected)
 
     def test_tag_only_trigger_and_targets_present(self):
         on_block = self._top_block("on")
