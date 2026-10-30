@@ -1,20 +1,3 @@
-# CI — tiered test model.
-#
-# T0: cheap structural checks that always run (fmt, line-limit, dir-entries,
-#     publish-guard, packageability, msrv, android).
-# T1: affected packages only, on pull requests (computed by
-#     scripts/testing/test-affected.sh --base <pr base sha>).
-# T2: full workspace run, on push to main and on workflow_dispatch (always:
-# a manual dispatch has no reliable base to diff against, and an empty T1
-# plan would run no tests at all).
-# T3: nightly full run — a separate scheduled workflow, deliberately not here.
-#
-# See docs/plans/test-tiers.md for the full tier specification.
-#
-# fmt/clippy/test still mirror the local pre-push hook at .githooks/pre-push;
-# line-limit/dir-entries/publish-guard/packageability/msrv/android are
-# CI-only.
-
 name: CI
 
 on:
@@ -22,6 +5,14 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [affected, sprint-full]
+        default: affected
+      base_ref:
+        type: string
+        description: 'Базовый коммит обязателен для режима affected'
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -40,105 +31,83 @@ env:
 
 jobs:
   plan:
-    name: Plan (tier selection)
     runs-on: ubuntu-latest
     outputs:
-      full: ${{ steps.plan.outputs.full }}
-      packages: ${{ steps.plan.outputs.packages }}
-      empty: ${{ steps.plan.outputs.empty }}
+      plan: ${{ steps.plan.outputs.plan }}
+      rust_rows: ${{ steps.plan.outputs.rust_rows }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: ./.github/actions/setup-local-sdk
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
       - uses: dtolnay/rust-toolchain@stable
-      # Tier-selection selftest: pure sh + jq + cargo metadata, no cargo build.
-      - name: Selftest test-affected.sh
-        run: sh scripts/testing/selftest.sh
-      - name: Compute tier
-        id: plan
+      - run: python -I scripts/testing/test_ci_planner.py
+      - run: python -I scripts/testing/test_ci_integration.py
+      - id: plan
         env:
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.sha }}
+          BASE_REF: ${{ inputs.base_ref }}
+          MODE: ${{ inputs.mode || 'affected' }}
+        shell: bash
         run: |
-          pr=false
-          force_full=false
-          reason=""
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            pr=true
-            if ! git cat-file -e "$PR_BASE_SHA^{commit}" 2>/dev/null; then
-              if ! git fetch --no-tags origin "$PR_BASE_SHA"; then
-                force_full=true
-                reason="could not fetch PR base commit"
-              fi
-            fi
-          elif [ "${{ github.event_name }}" = "push" ]; then
-            # push events fire only on main (see `on:` above): full tier.
-            force_full=true
-          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            # Manual dispatch: FULL by default (no reliable base to diff against).
-            force_full=true
-          fi
-          if ! command -v jq >/dev/null 2>&1; then
-            force_full=true
-            reason="jq not found on runner"
-          fi
-          out=""
-          script_rc=0
-          if [ "$force_full" != "true" ]; then
-            if [ "$pr" = "true" ]; then
-              args="--base $PR_BASE_SHA"
-            else
-              args=""
-            fi
-            # `|| script_rc=$?` keeps the runner's implicit `bash -e` from aborting
-            # the step: a failing script must fall through to FULL below.
-            out=$(sh scripts/testing/test-affected.sh $args --mode args --kind test) || script_rc=$?
-          fi
-          if [ "$script_rc" != "0" ]; then
-            echo "::warning::test-affected.sh failed (rc=$script_rc); forcing FULL"
-            force_full=true
-            reason="test-affected.sh failed (rc=$script_rc)"
-          fi
-          full=false
-          packages=""
-          empty=false
-          if [ "$force_full" = "true" ]; then
-            full=true
-            packages=""
-            empty=false
-          elif [ "$out" = "--workspace" ]; then
-            full=true
-          elif [ -z "$out" ]; then
-            empty=true
-          else
-            packages="$out"
-          fi
-          {
-            echo "full=$full"
-            echo "packages=$packages"
-            echo "empty=$empty"
-          } >> "$GITHUB_OUTPUT"
-          if [ "$full" = "true" ]; then
-            tier="T2 FULL"
-          elif [ "$empty" = "true" ]; then
-            tier="T0 nothing to test"
-          else
-            tier="T1 affected"
-          fi
-          if [ -n "$packages" ]; then
-            pkgs_line="Packages: \`$packages\`"
-          else
-            pkgs_line="Packages: —"
-          fi
-          {
-            echo "## CI plan"
-            echo "Tier: $tier"
-            echo "$pkgs_line"
-            if [ -n "$reason" ]; then
-              echo "Reason: $reason"
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
-          exit 0
+          set -euo pipefail
+          python -I scripts/testing/ci_planner.py --event "$EVENT" --base "$BASE" --head "$HEAD" --base-ref "$BASE_REF" --mode "$MODE" > plan.json
+          python -I -c 'import json,os; p=json.load(open("plan.json",encoding="utf-8")); f=open(os.environ["GITHUB_OUTPUT"],"a",encoding="utf-8"); print("plan="+json.dumps(p,ensure_ascii=True,separators=(",",":")),file=f); print("rust_rows="+json.dumps([r for r in p["target_rows"] if r["segment"]=="rust"],separators=(",",":")),file=f)'
+
+      - name: Сводка плана
+        if: always()
+        shell: bash
+        run: |
+          python -I -c 'import json,os,pathlib; f=pathlib.Path("plan.json"); s=pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"]); p=json.loads(f.read_text(encoding="utf-8")) if f.is_file() and f.stat().st_size else None; s.write_text("## План CI\n\n" + ("```json\n" + json.dumps({k:p[k] for k in ("paths","reasons")},ensure_ascii=False,indent=2) + "\n```\n" if p else "План не сформирован.\n"),encoding="utf-8")'
+
+  real-tor-channel:
+    needs: plan
+    if: fromJSON(needs.plan.outputs.plan).capabilities.real_tor_channel && contains(fromJSON(needs.plan.outputs.plan).segments, 'tor')
+    name: Изолированный канал Tor
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-local-sdk
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Установить зависимости сборки Tor
+        run: sudo apt-get update && sudo apt-get install --yes libevent-dev libssl-dev zlib1g-dev
+      - name: Собрать тест и закреплённый инструмент Tor
+        id: real-build
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          work=$(mktemp -d "$GITHUB_WORKSPACE/target/real-tor-source.XXXXXXXX")
+          curl --fail --location --silent --show-error https://dist.torproject.org/tor-0.4.9.15.tar.gz -o "$work/tor.tar.gz"
+          echo "1911f5b216a6814ed143a08bbcff1c6dc96d2ca3b505df9a21876080a92963f3  $work/tor.tar.gz" | sha256sum -c -
+          tar -xzf "$work/tor.tar.gz" -C "$work"
+          cd "$work/tor-0.4.9.15"
+          ./configure --disable-asciidoc --disable-manpage
+          make -j2
+          cd "$GITHUB_WORKSPACE"
+          cargo test -p socks5-proxy --bin socks5-proxy --locked --no-run --message-format=json > "$work/artifacts.json"
+          python3 -I -c 'import json,sys; p=sys.argv[1]; a=[x["executable"] for l in open(p) if (x:=json.loads(l)).get("reason")=="compiler-artifact" and x.get("target",{}).get("name")=="socks5-proxy" and x.get("profile",{}).get("test") and x.get("executable")]; assert len(a)==1, a; open(sys.argv[2], "w").write(a[0])' "$work/artifacts.json" "$work/test-path"
+          echo "tor=$work/tor-0.4.9.15/src/app/tor" >> "$GITHUB_OUTPUT"
+          echo "test=$(<"$work/test-path")" >> "$GITHUB_OUTPUT"
+      - name: Проверить в сетевом пространстве без внешних интерфейсов
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v unshare
+          command -v ip
+          sudo unshare --net -- timeout --signal=TERM --kill-after=15s 10m env GITHUB_ACTIONS=true TOR_REAL_ISOLATED=yes TOR_REAL_BINARY="${{ steps.real-build.outputs.tor }}" TOR_REAL_TEST_BINARY="${{ steps.real-build.outputs.test }}" bash scripts/testing/real-tor-channel.sh
+      - name: Проверить отрицательные мутации в изоляции
+        shell: bash
+        env:
+          TOR_REAL_BINARY: ${{ steps.real-build.outputs.tor }}
+        run: bash scripts/testing/real-tor-mutations.sh
 
   fmt:
     name: Rustfmt
@@ -150,157 +119,6 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
-
-  clippy-full:
-    name: Clippy T2 (${{ matrix.os }})
-    needs: plan
-    if: needs.plan.outputs.full == 'true'
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup-local-sdk
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
-        shell: bash
-
-  clippy-affected:
-    name: Clippy T1 (ubuntu-latest)
-    needs: plan
-    if: needs.plan.outputs.full != 'true' && needs.plan.outputs.empty != 'true'
-    runs-on: ubuntu-latest
-    env:
-      PKGS: ${{ needs.plan.outputs.packages }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup-local-sdk
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy $PKGS --all-targets --locked -- -D warnings
-        shell: bash
-
-  test-full:
-    name: Test T2 (${{ matrix.os }})
-    needs: plan
-    if: needs.plan.outputs.full == 'true'
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup-local-sdk
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: nextest
-      - uses: Swatinem/rust-cache@v2
-      # ACL-тесты биндят отдельный loopback source 127.0.0.2; на macOS он не
-      # назначен lo0 автоматически — назначаем явно перед тестами.
-      - name: Assign loopback alias 127.0.0.2 (macOS)
-        if: runner.os == 'macOS'
-        run: sudo ifconfig lo0 alias 127.0.0.2 up
-        shell: bash
-      - run: cargo nextest run --workspace --locked --profile ci
-        shell: bash
-      # DNS stress на Windows: повторить весь DNS suite 10 раз в PR CI
-      # (nightly flake: actual_ipv6_socket_options ConnectionReset при framed read).
-      - name: DNS stress (Windows PR, flaky-hunt)
-        if: matrix.os == 'windows-latest' && github.event_name == 'pull_request'
-        run: cargo nextest run -p tor-socks5-dns --locked --profile flaky-hunt --stress-count 10
-        shell: bash
-      - run: cargo test --doc --workspace --exclude saturating-time --locked
-        shell: bash
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: junit-t2-${{ matrix.os }}
-          path: target/nextest/ci/junit.xml
-          if-no-files-found: ignore
-      - uses: actions/upload-artifact@v4
-        if: always() && matrix.os == 'windows-latest' && github.event_name == 'pull_request'
-        with:
-          name: junit-dns-stress-t2-windows-latest
-          path: target/nextest/flaky-hunt/junit.xml
-          if-no-files-found: ignore
-
-  test-affected:
-    name: Test T1 (${{ matrix.os }})
-    needs: plan
-    if: needs.plan.outputs.full != 'true' && needs.plan.outputs.empty != 'true'
-    runs-on: ${{ matrix.os }}
-    env:
-      PKGS: ${{ needs.plan.outputs.packages }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup-local-sdk
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: nextest
-      - uses: Swatinem/rust-cache@v2
-      # ACL-тесты биндят отдельный loopback source 127.0.0.2; на macOS он не
-      # назначен lo0 автоматически — назначаем явно перед тестами.
-      - name: Assign loopback alias 127.0.0.2 (macOS)
-        if: runner.os == 'macOS'
-        run: sudo ifconfig lo0 alias 127.0.0.2 up
-        shell: bash
-      - run: cargo nextest run $PKGS --locked --profile ci
-        shell: bash
-      # DNS stress на Windows: только если DNS package затронут изменениями
-      - name: DNS stress (Windows PR, flaky-hunt)
-        if: matrix.os == 'windows-latest' && github.event_name == 'pull_request' && contains(env.PKGS, 'tor-socks5-dns')
-        run: cargo nextest run -p tor-socks5-dns --locked --profile flaky-hunt --stress-count 10
-        shell: bash
-      # Doctests need a library target: `cargo test --doc -p <bin-only>` fails.
-      - name: Doctests (library packages only)
-        shell: bash
-        run: |
-          libs=$(cargo metadata --locked --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(any(.targets[].kind[]; . == "lib" or . == "rlib" or . == "proc-macro")) | .name' \
-            | tr -d '\r')
-          args=""
-          set -- $PKGS
-          while [ $# -gt 0 ]; do
-            if [ "$1" = "-p" ] && [ $# -ge 2 ]; then
-              if [ "$2" != saturating-time ] && printf '%s\n' $libs | grep -qx -- "$2"; then
-                args="$args -p $2"
-              fi
-              shift 2
-            else
-              shift
-            fi
-          done
-          if [ -n "$args" ]; then
-            cargo test --doc $args --locked
-          else
-            echo "no library package selected; doctests skipped"
-          fi
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: junit-t1-${{ matrix.os }}
-          path: target/nextest/ci/junit.xml
-          if-no-files-found: ignore
-      - uses: actions/upload-artifact@v4
-        if: always() && matrix.os == 'windows-latest' && github.event_name == 'pull_request' && contains(env.PKGS, 'tor-socks5-dns')
-        with:
-          name: junit-dns-stress-t1-windows-latest
-          path: target/nextest/flaky-hunt/junit.xml
-          if-no-files-found: ignore
 
   line-limit:
     name: First-party line limit (1000)
@@ -351,61 +169,105 @@ jobs:
       - name: cargo package every publishable crate (or log the empty no-op)
         run: sh scripts/check-packageability.sh
 
+  rust:
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.plan).segments, 'rust')
+    runs-on: ${{ matrix.row.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        row: ${{ fromJSON(needs.plan.outputs.rust_rows) }}
+    env:
+      PLAN: ${{ needs.plan.outputs.plan }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-local-sdk
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - uses: Swatinem/rust-cache@v2
+      - if: runner.os == 'macOS'
+        run: sudo ifconfig lo0 alias 127.0.0.2 up
+      - name: Clippy
+        if: runner.os == 'Linux' || fromJSON(needs.plan.outputs.plan).full
+        shell: bash
+        run: python -I -c 'import json,os,subprocess; p=json.loads(os.environ["PLAN"]); a=sum((["-p",n] for n in p["command_packages"]["rust"]),[]); subprocess.run(["cargo","clippy","--locked",*a,"--all-targets","--","-D","warnings"],check=True)'
+      - name: Nextest
+        shell: bash
+        run: python -I -c 'import json,os,subprocess; p=json.loads(os.environ["PLAN"]); a=sum((["-p",n] for n in p["command_packages"]["rust"]),[]); subprocess.run(["cargo","nextest","run","--locked","--profile","ci",*a],check=True)'
+      - name: Doctests
+        shell: bash
+        run: python -I -c 'import json,os,subprocess; p=json.loads(os.environ["PLAN"]); a=sum((["-p",n] for n in p["library_packages"]),[]); a and subprocess.run(["cargo","test","--doc","--locked",*a],check=True)'
+      - name: DNS stress
+        if: runner.os == 'Windows' && github.event_name == 'pull_request' && contains(fromJSON(needs.plan.outputs.plan).command_packages.rust, 'tor-socks5-dns')
+        run: cargo nextest run -p tor-socks5-dns --locked --profile flaky-hunt --stress-count 10
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-${{ matrix.row.target }}
+          path: target/nextest/*/junit.xml
+          if-no-files-found: ignore
+
   msrv:
-    name: MSRV (1.92)
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.plan).segments, 'msrv')
     runs-on: ubuntu-latest
+    env:
+      PLAN: ${{ needs.plan.outputs.plan }}
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-local-sdk
       - uses: dtolnay/rust-toolchain@1.92
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: msrv-1.92
-      - run: cargo check --locked --workspace --all-targets
+      - run: python3 -I -c 'import json,os,subprocess; p=json.loads(os.environ["PLAN"]); a=sum((["-p",n] for n in p["command_packages"]["msrv"]),[]); subprocess.run(["cargo","check","--locked","--all-targets",*a],check=True)'
 
   android:
-    name: Android arm64 (aarch64-linux-android)
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.plan).segments, 'android')
     runs-on: ubuntu-latest
+    env:
+      PLAN: ${{ needs.plan.outputs.plan }}
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-local-sdk
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
-      # r27c matches the locally verified build in docs/android/android-cross-compile.md.
-      - id: ndk
-        uses: nttld/setup-ndk@v1
+      - uses: nttld/setup-ndk@v1
+        id: ndk
         with:
           ndk-version: r27c
           add-to-path: true
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: aarch64-linux-android
-      # cargo-ndk injects the per-target CARGO_TARGET_*_LINKER plus CC/AR/CXX
-      # env vars; without it, cc-based build scripts (ring, libsqlite3-sys
-      # bundled sqlite, zstd-sys) have no NDK toolchain to compile C against
-      # (see docs/android/android-cross-compile.md, "Why no .cargo/config.toml").
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk --locked
-      # Scoped to the packages that actually ship on Android (matches the
-      # locally verified build), not --workspace: a workspace-wide check
-      # pulls in arti-client's own dev-dependency on itself, which resolves
-      # tor-rtcompat's native-tls/openssl-sys and has no NDK sysroot to
-      # cross-compile against.
-      - name: cargo ndk check (socks5-proxy + android-ffi, arm64-v8a)
-        env:
+      - run: cargo install cargo-ndk --locked
+      - env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
-        run: cargo ndk -t arm64-v8a check --locked -p socks5-proxy -p android-ffi
-      - name: cargo ndk build (android-ffi cdylib, arm64-v8a)
-        env:
-          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
-        run: cargo ndk -t arm64-v8a build --locked -p android-ffi
+        run: python3 -I -c 'import json,os,subprocess; p=json.loads(os.environ["PLAN"]); a=sum((["-p",n] for n in p["command_packages"]["android"]),[]); subprocess.run(["cargo","ndk","-t","arm64-v8a","check","--locked",*a],check=True); ("android-ffi" not in p["command_packages"]["android"]) or subprocess.run(["cargo","ndk","-t","arm64-v8a","build","--locked","-p","android-ffi"],check=True)'
 
-  # === Offline-тесты установщиков и release-хелперов =====================
-  # Независимые от Rust-тир job'ы: изменения .github/install и .github/release
-  # обязаны проверяться сами (реальные скрипты как дочерние процессы, сеть
-  # подменяется только в harness). Никаких Cargo/package зависимостей.
+  docs-contract:
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.plan).segments, 'docs-contract')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-local-sdk
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Проверить наличие поставляемых документов
+        run: |
+          set -eu
+          for f in README.md tor-socks5.example.ktav packages/proxy-config/examples/tor-socks5.bridges.example.ktav docs/architecture.md docs/guide/bridges.md docs/guide/webtunnel.md docs/guide/auth.md docs/guide/upstream.md docs/guide/dns-server.md docs/guide/ops/logging.md docs/guide/ops/onion-service.md docs/guide/service.md; do
+            test -f "$f"
+          done
+      - run: cargo test --locked -p tor-socks5-config --test shipped_examples
+      - run: cargo check --locked -p socks5-proxy
+
   installer-sh:
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.plan).segments, 'installer-sh')
     name: Installer sh offline tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -431,6 +293,8 @@ jobs:
         shell: bash
 
   installer-windows:
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.plan).segments, 'installer-windows')
     name: Installer PowerShell offline tests (5.1 + 7)
     runs-on: windows-latest
     steps:
@@ -491,66 +355,9 @@ jobs:
         run: python -I .github/install/tests/running/test_live_update.py WindowsLiveUpdateTests
         shell: pwsh
 
-  portability-diagnostics:
-    name: Portability (${{ matrix.target }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            musl: true
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
-            musl: true
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            musl: false
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup-local-sdk
-      - name: Установка системных инструментов musl
-        if: matrix.musl
-        run: sudo apt-get update && sudo apt-get install --yes musl-tools
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: portability-${{ matrix.target }}
-      - name: Build diagnostic binary
-        run: cargo build --locked --release -p socks5-proxy --target ${{ matrix.target }}
-      - name: Проверка ELF и запуск версии
-        shell: bash
-        env:
-          TARGET: ${{ matrix.target }}
-          MUSL: ${{ matrix.musl }}
-        run: |
-          set -euo pipefail
-          binary="target/$TARGET/release/socks5-proxy"
-          file "$binary"
-          readelf -l "$binary" > /tmp/program-headers.txt
-          readelf -d "$binary" > /tmp/dynamic-section.txt
-          if [ "$MUSL" = "true" ]; then
-            ! grep -q 'INTERP' /tmp/program-headers.txt
-            ! grep -q '(NEEDED)' /tmp/dynamic-section.txt
-            file "$binary" | grep -Eq 'statically linked|static-pie linked'
-          fi
-          "$binary" --version
-          if [ "$MUSL" = "true" ]; then
-            case "$TARGET" in
-              x86_64-*) platform=linux/amd64 ;;
-              aarch64-*) platform=linux/arm64 ;;
-              *) echo "unsupported musl target: $TARGET" >&2; exit 1 ;;
-            esac
-            docker run --rm --network none --read-only \
-              --platform "$platform" \
-              --mount "type=bind,src=$(realpath "$binary"),dst=/socks5-proxy,readonly" \
-              alpine:3.22 /socks5-proxy --version
-          fi
-
   release-scripts:
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.plan).segments, 'release')
     name: Release helpers offline suite (validate-tag, publish)
     runs-on: ubuntu-latest
     steps:
@@ -558,3 +365,280 @@ jobs:
       - name: validate-tag.sh + publish.sh offline suite (gh stub, real jq/sha256sum/stat)
         run: python3 -I .github/install/tests/test_release.py
         shell: bash
+
+  native-portability:
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.plan).segments, 'native-portability')
+    runs-on: ${{ matrix.row.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        row: ${{ fromJSON(needs.plan.outputs.plan).native_rows }}
+    env:
+      PLAN: ${{ needs.plan.outputs.plan }}
+      TARGET: ${{ matrix.row.target }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-local-sdk
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.row.target }}
+      - if: matrix.row.musl
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+      - uses: nttld/setup-ndk@v1
+        if: matrix.row.target == 'aarch64-linux-android'
+        id: ndk
+        with:
+          ndk-version: r27c
+          add-to-path: true
+      - if: matrix.row.target == 'aarch64-linux-android'
+        run: cargo install cargo-ndk --locked
+      - name: Сборка целевой платформы
+        shell: bash
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: python -I -c 'import json,os,subprocess; p=json.loads(os.environ["PLAN"]); a=sum((["-p",n] for n in p["command_packages"]["native-portability"]),[]); t=os.environ["TARGET"]; cmd=["cargo","ndk","-t","arm64-v8a","build"] if t=="aarch64-linux-android" else ["cargo","build","--target",t]; subprocess.run([*cmd,"--release","--locked",*a],check=True)'
+      - name: Проверка GNU ELF и запуск версии
+        if: matrix.row.target == 'x86_64-unknown-linux-gnu' || matrix.row.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/$TARGET/release/socks5-proxy"
+          file "$bin"
+          readelf -l "$bin" > /tmp/program-headers.txt
+          readelf -d "$bin" > /tmp/dynamic-section.txt
+          "$bin" --version
+      - name: Проверка статического ELF и Alpine
+        if: matrix.row.musl
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/$TARGET/release/socks5-proxy"
+          file "$bin" > /tmp/file-info.txt
+          grep -Eq 'statically linked|static-pie linked' /tmp/file-info.txt
+          readelf -l "$bin" > /tmp/program-headers.txt
+          readelf -d "$bin" > /tmp/dynamic-section.txt
+          ! grep -q INTERP /tmp/program-headers.txt
+          ! grep -q NEEDED /tmp/dynamic-section.txt
+          docker run --rm --network none --read-only --tmpfs /tmp --mount "type=bind,source=$PWD/$bin,target=/app,readonly" alpine:3.22 /app --version
+
+  vendor-extra:
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.plan).segments, 'vendor-extra') || contains(fromJSON(needs.plan.outputs.plan).segments, 'vendor')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-local-sdk
+      - uses: dtolnay/rust-toolchain@stable
+      - shell: bash
+        run: |
+          python3 -I -c 'from pathlib import Path; p=Path("Cargo.toml"); s=p.read_text(encoding="utf-8"); marker="    \"vendor/tor-guardmgr\","; assert s.count(marker)==1; p.write_text(s.replace(marker, marker + "\n    \"vendor/tor-chanmgr\",\n    \"vendor/tor-dirmgr\",\n    \"vendor/tor-dirclient\","), encoding="utf-8")'
+          cargo test -p tor-chanmgr -p tor-dirclient -p tor-dirmgr --features tor-dirmgr/static
+          cargo test -p tor-circmgr --all-features
+
+  features:
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.plan).segments, 'features')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-local-sdk
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+      - run: cargo hack check --each-feature --no-dev-deps -p tor-socks5-config -p arti-wrapper
+
+  stress:
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.plan).segments, 'stress')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-local-sdk
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - run: cargo nextest run --locked --profile flaky-hunt --stress-count 10 -p tor-socks5-dns -p tor-circmgr -p tor-guardmgr -p socks5-proxy
+
+  license-offline:
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.plan).segments, 'license-offline')
+    runs-on: ubuntu-latest
+    env:
+      PLAN: ${{ needs.plan.outputs.plan }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-local-sdk
+        if: fromJSON(needs.plan.outputs.plan).license_stack
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Проверка юридических файлов и локального набора лицензий
+        run: |
+          set -eu
+          test -s LICENSE-MIT
+          test -s LICENSE-APACHE
+          if [ -d .github/release/license ]; then
+            export LICENSE_TEST_BASH="$BASH"
+            python3 -I .github/release/license/tests/unit/test_bundle.py
+            python3 -I .github/release/license/tests/unit/test_admission.py
+            python3 -I .github/release/license/tests/unit/test_publish_bundle.py
+            python3 -I .github/release/license/tests/unit/test_source_inventory.py
+            python3 -I .github/release/license/tests/unit/test_provenance.py
+            python3 -I .github/release/license/tests/unit/test_workflow_portability.py
+            python3 -I .github/install/tests/test_release.py PublisherTests
+            python3 -I .github/install/tests/test_release.py ReleaseWorkflowWiring
+            python3 -I .github/release/license/tests/integration/test_release_chain.py
+          else
+            python3 -I -c 'import json,os,sys; r=json.loads(os.environ["PLAN"])["reasons"]["license-offline"]; all(x in ("LICENSE-MIT","LICENSE-APACHE") for x in r) or sys.exit("missing mapping: отсутствует лицензионный набор")'
+          fi
+
+  license-audit:
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.plan).segments, 'license-audit')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-local-sdk
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: |
+          test -f .github/deny.toml
+          cargo deny --config .github/deny.toml check licenses
+
+  license-lifecycle:
+    needs: plan
+    if: github.event_name == 'pull_request' && contains(fromJSON(needs.plan.outputs.plan).segments, 'license-lifecycle')
+    runs-on: ubuntu-latest
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+      TAG: v0.0.0-license-ci
+      CARGO_HOME: ${{ github.workspace }}/target/license-cargo-home
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/license-build
+      TOR_SOCKS5_NOTICES: ${{ github.workspace }}/target/license-prepared/NOTICES.txt
+      TOR_SOCKS5_SOURCE_INFO: ${{ github.workspace }}/target/license-prepared/SOURCE-INFO.txt
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-local-sdk
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - name: Загрузить и зафиксировать исходники до сборки
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR" target/license-logs
+          cargo fetch --locked
+          set --
+          if [ -f .github/release/license/reviews/components.json ]; then
+            set -- "$@" --reviews .github/release/license/reviews/components.json
+          fi
+          python -I .github/release/license/bundle.py prepare --project . --sdk ../resocks5 --registry-cache "$CARGO_HOME/registry/cache" --output "$GITHUB_WORKSPACE/target/license-prepared" --tag "$TAG" --project-commit "$GITHUB_SHA" "$@"
+          python -I .github/release/license/admission.py snapshot --prepared target/license-prepared --registry-cache "$CARGO_HOME/registry/cache" --output target/license-expanded-before.json
+      - name: Собрать релиз и собрать свидетельства
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc -vV > target/license-logs/toolchain.txt
+          cargo tree --locked --offline -p socks5-proxy --target "$TARGET" -e features > target/license-logs/features.txt
+          cargo build --locked --offline --release -p socks5-proxy --target "$TARGET" --message-format=json-render-diagnostics > target/license-logs/build-messages.jsonl 2> target/license-logs/build-stderr.txt
+      - name: Зафиксировать результаты native-сборки и наблюдения о связывании
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/license-logs/native
+          python -I - "$CARGO_TARGET_DIR/$TARGET/release/build" target/license-logs/native <<'PY'
+          import hashlib, json, pathlib, shutil, sys
+          source, dest = map(pathlib.Path, sys.argv[1:])
+          records = []
+          if source.is_dir():
+              for path in sorted(source.rglob('*')):
+                  if not path.is_file() or path.is_symlink():
+                      continue
+                  rel = path.relative_to(source)
+                  if path.name in ('output', 'stderr', 'invoked.timestamp'):
+                      target = dest / rel
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      shutil.copyfile(path, target)
+                  elif 'out' in rel.parts:
+                      h = hashlib.sha256()
+                      with path.open('rb') as f:
+                          for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                              h.update(chunk)
+                      records.append({'path': rel.as_posix(), 'size': path.stat().st_size, 'sha256': h.hexdigest()})
+          (dest / 'output-hashes.json').write_text(json.dumps(records, sort_keys=True, indent=2) + '\n', encoding='utf-8')
+          PY
+          binary="$CARGO_TARGET_DIR/$TARGET/release/socks5-proxy"
+          if [ "$RUNNER_OS" = Windows ]; then binary="$binary.exe"; fi
+          {
+            echo 'Diagnostic only: verbose Cargo output and native build outputs are not a complete linker input trace.'
+            echo 'BLOCKER: complete native/static link input and platform SDK provenance require admission review.'
+            if [ -f "$binary" ]; then
+              if command -v readelf >/dev/null 2>&1; then readelf -d "$binary" || true; fi
+              if command -v otool >/dev/null 2>&1; then otool -L "$binary" || true; fi
+              if command -v dumpbin >/dev/null 2>&1; then dumpbin /dependents "$binary" || true; fi
+            fi
+          } > target/license-logs/linkage.txt 2>&1
+      - name: Зафиксировать квитанцию и сравнить исходники после сборки
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="$CARGO_TARGET_DIR/$TARGET/release/socks5-proxy"
+          if [ "$RUNNER_OS" = Windows ]; then binary="$binary.exe"; fi
+          set --
+          review_file=".github/release/license/reviews/$TARGET.json"
+          if [ -f "$review_file" ]; then
+            set -- "$@" --review "$review_file"
+          fi
+          python -I .github/release/license/admission.py record --prepared target/license-prepared --project . --sdk ../resocks5 --registry-cache "$CARGO_HOME/registry/cache" --target "$TARGET" --binary "$binary" --messages target/license-logs/build-messages.jsonl --features target/license-logs/features.txt --toolchain target/license-logs/toolchain.txt --native-evidence target/license-logs --expanded-before target/license-expanded-before.json --output target/license-receipt "$@"
+      - name: Проверить жизненный цикл PR на собранном бинарнике
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="$CARGO_TARGET_DIR/$TARGET/release/socks5-proxy"
+          if [ "$RUNNER_OS" = Windows ]; then binary="$binary.exe"; fi
+          python -I .github/release/license/tests/integration/test_lifecycle.py --prepared target/license-prepared --project . --sdk ../resocks5 --registry-cache "$CARGO_HOME/registry/cache" --target "$TARGET" --binary "$binary" --messages target/license-logs/build-messages.jsonl --features target/license-logs/features.txt --toolchain target/license-logs/toolchain.txt --native-evidence target/license-logs --expanded-before target/license-expanded-before.json
+      - name: Сравнить встроенную информацию для получателя
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="$CARGO_TARGET_DIR/$TARGET/release/socks5-proxy"
+          if [ "$RUNNER_OS" = Windows ]; then binary="$binary.exe"; fi
+          "$binary" --licenses > target/license-logs/actual-notices.txt
+          "$binary" --source-info > target/license-logs/actual-source-info.txt
+          cmp "$TOR_SOCKS5_NOTICES" target/license-logs/actual-notices.txt
+          cmp "$TOR_SOCKS5_SOURCE_INFO" target/license-logs/actual-source-info.txt
+      - name: Проверить интерфейс информации для получателя
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline -p socks5-proxy --test recipient_information --target "$TARGET"
+
+  required:
+    name: CI required
+    if: always()
+    needs: [plan, fmt, line-limit, dir-entries, publish-guard, packageability, real-tor-channel, rust, msrv, android, docs-contract, installer-sh, installer-windows, release-scripts, native-portability, vendor-extra, features, stress, license-offline, license-audit, license-lifecycle]
+    runs-on: ubuntu-latest
+    env:
+      NEEDS: ${{ toJSON(needs) }}
+      PLAN: ${{ needs.plan.outputs.plan }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Проверить обязательные результаты
+        run: |
+          python -I -c 'import importlib.util,json,os; s=importlib.util.spec_from_file_location("ci_planner", "scripts/testing/ci_planner.py"); p=importlib.util.module_from_spec(s); s.loader.exec_module(p); n=json.loads(os.environ["NEEDS"]); n["plan"]["result"] == "success" or p.validate_results({}, n); p.validate_results(json.loads(os.environ["PLAN"]), n)'
