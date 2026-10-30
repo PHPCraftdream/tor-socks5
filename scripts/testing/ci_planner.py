@@ -434,7 +434,7 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
             add("native-portability", path)
         elif path.startswith("packages/proxy-config/examples/") or path == "README.md" or path == "tor-socks5.example.ktav" or path == "docs/architecture.md" or path.startswith("docs/guide/"):
             add("docs-contract", path)
-        elif path.startswith("docs/") or path in ("CHANGELOG.md", ".gitignore", ".gitattributes"):
+        elif path.startswith("docs/") or path in ("CHANGELOG.md", ".gitignore", ".gitattributes", "vendor/README.md"):
             add("fast", path)
         elif path in (".github/install/tests/test_release.py", ".github/install/tests/gh_mock.py", ".github/install/tests/fixtures.py"):
             add("release", path)

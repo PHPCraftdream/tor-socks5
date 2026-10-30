@@ -62,8 +62,11 @@ class Routing(unittest.TestCase):
         self.assertEqual(self.route("apps/socks5-proxy/src/main.rs")["command_packages"]["android"], ["socks5-proxy"])
         self.assertIn("tor", self.route("packages/arti-wrapper/src/lib.rs")["segments"])
         self.assertEqual(self.route("docs/plans/note.md")["segments"], ["fast"])
+        self.assertEqual(self.route("vendor/README.md")["segments"], ["fast"])
+        with self.assertRaises(p.MappingError):
+            self.route("vendor/unknown-control.txt")
         caps = {"license_stack": True, "real_tor_channel": False}
-        for path in (".github/release/license/README.md", "docs/project/licensing.md", "packages/auth/README.md"):
+        for path in (".github/release/license/README.md", "docs/project/licensing.md", "packages/auth/README.md", "vendor/README.md"):
             result = self.route(path, capabilities=caps)
             self.assertEqual(result["segments"], ["fast"])
             self.assertEqual(result["packages"], [])
