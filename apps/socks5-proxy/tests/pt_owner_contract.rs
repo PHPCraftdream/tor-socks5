@@ -3,62 +3,116 @@
 // tor-ptmgr. Это НЕ полный путь supplied-CLI/конфиг -> обработчик и НЕ сквозной
 // тест Tor. WebTunnel покрывается отдельно на уровне дочернего процесса в
 // .github/pt_proxy/contract.py.
+// При harness=false у скопированных бинарных entrypoint-ов и тестовых элементов нет потребителей.
+// Подавляем dead_code/unused_imports только для этих Linux-копий; production и другие тесты
+// сохраняют обычную проверку lint-ами.
+#[cfg(target_os = "linux")]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/commands/angel.rs"]
 mod angel;
+#[cfg(target_os = "linux")]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/tor/arti_observability.rs"]
 mod arti_observability;
+#[cfg(target_os = "linux")]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/bridges/bridge_maintenance.rs"]
 mod bridge_maintenance;
+#[cfg(target_os = "linux")]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/bridges/bridge_store_writer.rs"]
 mod bridge_store_writer;
+#[cfg(target_os = "linux")]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/bridges/bridge_verifier.rs"]
 mod bridge_verifier;
+#[cfg(target_os = "linux")]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/bridges/bridge_warmer.rs"]
 mod bridge_warmer;
+#[cfg(target_os = "linux")]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/fetch/bridges_cmd.rs"]
 mod bridges_cmd;
+#[cfg(target_os = "linux")]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/bridges/candidate_pool.rs"]
 mod candidate_pool;
+#[cfg(target_os = "linux")]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/commands/cli.rs"]
 mod cli;
+#[cfg(target_os = "linux")]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/config.rs"]
 mod config;
+#[cfg(target_os = "linux")]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/commands/config_cmd.rs"]
 mod config_cmd;
+#[cfg(target_os = "linux")]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/tor/conn_health.rs"]
 mod conn_health;
+#[cfg(target_os = "linux")]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/server/dns_wiring.rs"]
 mod dns_wiring;
+#[cfg(target_os = "linux")]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/fetch/fetch_merge/fetch_merge.rs"]
 mod fetch_merge;
+#[cfg(target_os = "linux")]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/commands/help_cmd.rs"]
 mod help_cmd;
 // Onion helpers: the address/vanity core is not wired into the CLI yet.
-#[allow(dead_code)]
+#[cfg(target_os = "linux")]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/commands/onion/mod.rs"]
 mod onion;
+#[cfg(target_os = "linux")]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/fetch/seed.rs"]
 mod seed;
+#[cfg(target_os = "linux")]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/server/server.rs"]
 mod server;
+#[cfg(target_os = "linux")]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/commands/service.rs"]
 mod service;
+#[cfg(target_os = "linux")]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/server/shutdown.rs"]
 mod shutdown;
+#[cfg(target_os = "linux")]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/server/startup.rs"]
 mod startup;
-#[cfg(test)]
+#[cfg(all(target_os = "linux", test))]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/tor/test_seams.rs"]
 mod test_seams;
+#[cfg(target_os = "linux")]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/tor/tor_setup.rs"]
 mod tor_setup;
+#[cfg(target_os = "linux")]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/tor/tor_watchdog/tor_watchdog.rs"]
 mod tor_watchdog;
-#[cfg(test)]
+#[cfg(all(target_os = "linux", test))]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/tor/ts19_tests.rs"]
 mod ts19_tests;
+#[cfg(target_os = "linux")]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/server/upstream.rs"]
 mod upstream;
+#[cfg(target_os = "linux")]
+#[allow(dead_code, unused_imports)]
 #[path = "../src/commands/users_cli/mod.rs"]
 mod users_cli;
 

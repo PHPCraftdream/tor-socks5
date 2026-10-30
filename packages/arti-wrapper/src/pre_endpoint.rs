@@ -19,7 +19,10 @@ pub(crate) enum EndpointError {
 
 pub(crate) fn reject_one_shot_pre_pt(settings: &crate::Settings) -> crate::Result<()> {
     if settings.pre_endpoint.is_some()
-        && (settings.bridges.iter().any(|bridge| bridge.transport.is_some())
+        && (settings
+            .bridges
+            .iter()
+            .any(|bridge| bridge.transport.is_some())
             || !settings.extra_pt_protocols.is_empty()
             || settings.pt_binary.is_some())
     {
@@ -180,14 +183,20 @@ mod tests {
     #[test]
     fn one_shot_rejects_pre_pt_without_constructing_client() {
         let mut settings = crate::Settings {
-            pre_endpoint: Some(Socks5PreEndpoint::new("127.0.0.1:9050".parse().unwrap(), None)),
+            pre_endpoint: Some(Socks5PreEndpoint::new(
+                "127.0.0.1:9050".parse().unwrap(),
+                None,
+            )),
             extra_pt_protocols: vec!["obfs4".to_owned()],
             ..Default::default()
         };
         assert!(reject_one_shot_pre_pt(&settings).is_err());
         settings.pre_endpoint = None;
         assert!(reject_one_shot_pre_pt(&settings).is_ok());
-        settings.pre_endpoint = Some(Socks5PreEndpoint::new("127.0.0.1:9050".parse().unwrap(), None));
+        settings.pre_endpoint = Some(Socks5PreEndpoint::new(
+            "127.0.0.1:9050".parse().unwrap(),
+            None,
+        ));
         settings.extra_pt_protocols.clear();
         assert!(reject_one_shot_pre_pt(&settings).is_ok());
     }

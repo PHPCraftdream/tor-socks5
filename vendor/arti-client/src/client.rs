@@ -12,7 +12,7 @@ use crate::address::{IntoTorAddr, ResolveInstructions, StreamInstructions};
 
 use crate::config::{ClientAddrConfig, StreamTimeoutConfig, TorClientConfig};
 use crate::status::BootstrapStatus;
-use safelog::{sensitive, Sensitive};
+use safelog::{Sensitive, sensitive};
 use tor_async_utils::{DropNotifyWatchSender, PostageWatchSenderExt};
 use tor_chanmgr::ChanMgrConfig;
 use tor_circmgr::ClientDataTunnel;
@@ -20,16 +20,16 @@ use tor_circmgr::ClientDataTunnel;
 mod stream_retry;
 use stream_retry::{retry_exit_stream, retryable_stream_error, snapshot_exit_stream_timeouts};
 use tor_circmgr::isolation::{Isolation, StreamIsolation};
-use tor_circmgr::{isolation::StreamIsolationBuilder, IsolationToken, TargetPort};
+use tor_circmgr::{IsolationToken, TargetPort, isolation::StreamIsolationBuilder};
 use tor_config::{BoolOrAuto, MutCfg};
 #[cfg(feature = "bridge-client")]
 use tor_dirmgr::bridgedesc::BridgeDescMgr;
 use tor_dirmgr::{DirMgrStore, Timeliness};
-use tor_error::{error_report, internal, Bug};
+use tor_error::{Bug, error_report, internal};
 use tor_guardmgr::{GuardMgr, RetireCircuits};
 use tor_keymgr::Keystore;
 use tor_memquota::MemoryQuotaTracker;
-use tor_netdir::{params::NetParameters, NetDirProvider};
+use tor_netdir::{NetDirProvider, params::NetParameters};
 use tor_persist::StateMgr;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use tor_persist::TestingStateMgr;
@@ -55,13 +55,13 @@ use tor_hsservice::HsIdKeypairSpecifier;
 #[cfg(all(feature = "onion-service-client", feature = "experimental-api"))]
 use {tor_hscrypto::pk::HsId, tor_hscrypto::pk::HsIdKeypair, tor_keymgr::KeystoreSelector};
 
-use tor_keymgr::{config::ArtiKeystoreKind, ArtiNativeKeystore, KeyMgr, KeyMgrBuilder};
+use tor_keymgr::{ArtiNativeKeystore, KeyMgr, KeyMgrBuilder, config::ArtiKeystoreKind};
 
 #[cfg(feature = "ephemeral-keystore")]
 use tor_keymgr::ArtiEphemeralKeystore;
 
-use futures::lock::Mutex as AsyncMutex;
 use futures::StreamExt as _;
+use futures::lock::Mutex as AsyncMutex;
 use std::net::IpAddr;
 use std::result::Result as StdResult;
 #[cfg(feature = "pt-client")]
@@ -70,7 +70,7 @@ use std::sync::{Arc, Mutex};
 use tor_rtcompat::SpawnExt;
 
 use crate::err::ErrorDetail;
-use crate::{status, util, TorClientBuilder};
+use crate::{TorClientBuilder, status, util};
 #[cfg(feature = "geoip")]
 use tor_geoip::CountryCode;
 use tor_rtcompat::scheduler::TaskHandle;

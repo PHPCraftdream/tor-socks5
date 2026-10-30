@@ -367,7 +367,9 @@ pub(crate) mod sealed {
     /// Возможность независимо запросить остановку процесса.
     #[derive(Clone, Debug)]
     pub struct ShutdownHandle {
+        /// Канал для запроса завершения с подтверждением.
         sender: std::sync::mpsc::Sender<futures::channel::oneshot::Sender<io::Result<()>>>,
+        /// Общий признак, что supervisor завершил ожидание дочернего процесса.
         reaped: Arc<std::sync::atomic::AtomicBool>,
     }
 
@@ -397,27 +399,36 @@ pub(crate) mod sealed {
     /// Владение процессом и асинхронным каналом его вывода.
     #[derive(Debug)]
     pub struct AsyncPtChild {
+        /// Асинхронный поток строк stdout дочернего процесса.
         stdout: Receiver<io::Result<String>>,
+        /// Идентификатор процесса для диагностики.
         pub identifier: String,
+        /// Канал передачи запросов supervisor-потоку.
         shutdown: std::sync::mpsc::Sender<futures::channel::oneshot::Sender<io::Result<()>>>,
+        /// Ожидание подтверждения для уже отправленного запроса остановки.
         pending: Option<futures::channel::oneshot::Receiver<io::Result<()>>>,
+        /// Отмечает полученное подтверждение reaping.
         reaped: bool,
+        /// Совместный флаг завершения supervisor-потока.
         completion: Arc<std::sync::atomic::AtomicBool>,
+        /// Ошибка, полученная при запуске/инициализации процесса.
         startup_error: Option<Arc<io::Error>>,
+        /// Требуется ли этому процессу настроенный прокси.
         proxy_sensitive: bool,
+        /// Разрешённые методы транспорта для дочернего процесса.
         allowed_methods: Vec<PtTransportName>,
-        // Test-only seam: детерминированная ошибка одного следующего shutdown().
+        /// Ошибка, которую нужно однократно внедрить в следующий вызов `shutdown()` в тестах.
         #[cfg(all(test, unix))]
         test_shutdown_error_once: bool,
     }
 
-    // Процесс остаётся в этом потоке до подтверждённого завершения wait.
+    /// Поток supervisor'а сохраняет владение процессом до подтверждённого wait.
     fn supervise(
         mut command: Command,
-        launch: std::sync::mpsc::SyncSender<io::Result<std::process::ChildStdout>>,
-        requests: std::sync::mpsc::Receiver<futures::channel::oneshot::Sender<io::Result<()>>>,
-        ident: String,
-        completion: Arc<std::sync::atomic::AtomicBool>,
+        launch: &std::sync::mpsc::SyncSender<io::Result<std::process::ChildStdout>>,
+        requests: &std::sync::mpsc::Receiver<futures::channel::oneshot::Sender<io::Result<()>>>,
+        ident: &str,
+        completion: &Arc<std::sync::atomic::AtomicBool>,
     ) {
         let mut child = match command.spawn() {
             Ok(child) => child,
@@ -433,20 +444,14 @@ pub(crate) mod sealed {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let stdout = child.stdout.take();
             if child.stdin.is_none() {
-                let _ = launch.send(Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "missing stdin pipe",
-                )));
+                let _ = launch.send(Err(io::Error::other("missing stdin pipe")));
                 stopping = true;
             } else if let Some(stdout) = stdout {
                 if launch.send(Ok(stdout)).is_err() {
                     stopping = true;
                 }
             } else {
-                let _ = launch.send(Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "missing stdout pipe",
-                )));
+                let _ = launch.send(Err(io::Error::other("missing stdout pipe")));
                 stopping = true;
             }
             loop {
@@ -467,7 +472,7 @@ pub(crate) mod sealed {
                     drop(child.stdin.take());
                     deadline = Some(std::time::Instant::now() + GRACEFUL_EXIT_TIME);
                 }
-                if deadline.map_or(false, |d| std::time::Instant::now() >= d) {
+                if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
                     let result = child.kill().and_then(|()| child.wait().map(|_| ()));
                     match result {
                         Ok(()) => {
@@ -506,10 +511,7 @@ pub(crate) mod sealed {
         }));
         if outcome.is_err() {
             for tx in receipts.drain(..) {
-                let _ = tx.send(Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "PT supervisor panicked",
-                )));
+                let _ = tx.send(Err(io::Error::other("PT supervisor panicked")));
             }
             drop(child.stdin.take());
             loop {
@@ -528,10 +530,7 @@ pub(crate) mod sealed {
                     break;
                 }
                 while let Ok(tx) = requests.try_recv() {
-                    let _ = tx.send(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "PT cleanup retry failed",
-                    )));
+                    let _ = tx.send(Err(io::Error::other("PT cleanup retry failed")));
                 }
                 thread::sleep(std::time::Duration::from_secs(1));
             }
@@ -561,7 +560,9 @@ pub(crate) mod sealed {
             let worker_completion = completion.clone();
             thread::Builder::new()
                 .name("pt-supervisor".into())
-                .spawn(move || supervise(command, launch_tx, requests, ident, worker_completion))
+                .spawn(move || {
+                    supervise(command, &launch_tx, &requests, &ident, &worker_completion)
+                })
                 .map_err(|e| PtError::ChildSpawnFailed {
                     path: path.clone(),
                     error: Arc::new(e),
@@ -806,6 +807,9 @@ pub(crate) mod sealed {
     }
 
     /// Defines some helper methods that are required later on
+    // async_trait добавляет #[must_use] сгенерированным методам, возвращающим Future,
+    // что вызывает double_must_use для двух методов, возвращающих уже помеченные значения.
+    #[allow(clippy::double_must_use)]
     #[async_trait::async_trait]
     pub trait PluggableTransportPrivate {
         /// Return the [`AsyncPtChild`] if it exists
@@ -1142,6 +1146,9 @@ impl PtServerParameters {
 }
 
 /// Common functionality implemented to allow code reuse
+/// Общая функциональность интерфейса реализации async_trait добавляет #[must_use]
+/// сгенерированным Future; подавление относится только к этому trait.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 #[cfg_attr(feature = "experimental-api", visibility::make(pub))]
 pub trait PluggableTransport: PluggableTransportPrivate {
@@ -1668,7 +1675,11 @@ mod lifecycle_process_tests {
              echo 'CMETHODS DONE'",
             Some("socks5://127.0.0.1:1080"),
         );
-        assert_violation(&mut pt, "client methods completed before proxy confirmation").await;
+        assert_violation(
+            &mut pt,
+            "client methods completed before proxy confirmation",
+        )
+        .await;
     }
 }
 

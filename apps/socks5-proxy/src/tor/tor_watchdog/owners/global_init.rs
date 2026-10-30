@@ -379,7 +379,10 @@ impl GlobalInit {
 
     pub(super) fn complete_handoff(self: &Arc<Self>) -> Result<()> {
         self.release()?;
-        self.tunnel.try_lock().expect("слот запуска свободен").take();
+        self.tunnel
+            .try_lock()
+            .expect("слот запуска свободен")
+            .take();
         Ok(())
     }
 
@@ -562,12 +565,19 @@ mod tests {
                 tunnel: TorTunnel::create_unbootstrapped_with(Settings::default())?,
                 outcome: Ok(()),
             })
-        }).unwrap();
+        })
+        .unwrap();
         let tunnel = init.wait().await.unwrap();
-        assert!(RETAINED.lock().unwrap().as_ref().is_some_and(|root| Arc::ptr_eq(root, &init)));
+        assert!(RETAINED
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|root| Arc::ptr_eq(root, &init)));
         assert!(init.tunnel.lock().await.is_some());
         drop(tunnel);
-        GlobalInit::recover(Instant::now() + Duration::from_secs(5)).await.unwrap();
+        GlobalInit::recover(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
         assert!(RETAINED.lock().unwrap().is_none());
     }
 

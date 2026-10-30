@@ -28,71 +28,115 @@ pub(crate) enum PtReactorMessage {
     Reconfigured,
     /// Запрос транспортного метода.
     Spawn {
+        /// Имя запрашиваемого транспорта.
         pt: PtTransportName,
+        /// Канал для результата запроса.
         result: oneshot::Sender<err::Result<PtClientMethod>>,
     },
     /// Запрос подтверждённой остановки.
     Shutdown {
+        /// Канал для подтверждения завершения.
         result: oneshot::Sender<err::Result<()>>,
     },
 }
 
+/// Максимальное число слотов процессов управляемых PT, сохраняемых реактором.
 const MAX_PT_SLOTS: usize = 32;
 
-// Одна автоматическая попытка очистки на слот/сироту за эпоху begin_closing;
-// повтор возможен только по явной команде Shutdown (сброс счётчика).
-// Счётчик Failed-слота увеличивается при неудачном завершении очистки
-// (complete_task -> fail_cleanup), а не при старте очистки.
+/// Одна автоматическая попытка очистки на слот/сироту за эпоху begin_closing;
+/// повтор возможен только по явной команде Shutdown (сброс счётчика).
+/// Счётчик Failed-слота увеличивается при неудачном завершении очистки
+/// (complete_task -> fail_cleanup), а не при старте очистки.
 const MAX_CLEANUP_ATTEMPTS: u32 = 1;
 
-// Один слот на путь процесса; слот не освобождается при ошибке очистки.
+/// Один слот на путь процесса; слот не освобождается при ошибке очистки.
 struct Slot {
+    /// Развёрнутый путь исполняемого файла, уникальный ключ процесса.
     key: PathBuf,
+    /// Конфигурация, породившая текущий процесс.
     config: ManagedTransportOptions,
+    /// Текущее состояние жизненного цикла процесса.
     phase: Phase,
+    /// Новая конфигурация, ожидающая завершения текущей очистки.
     pending: Option<(ManagedTransportOptions, Option<ProxyProtocol>, u64)>,
+    /// Указывает, что процесс не должен оставаться опубликованным/перезапускаться.
     retire: bool,
+    /// Поколение конфигурации, при котором процесс был запущен.
     generation: u64,
-    // Счётчик исчерпанных автоматических попыток очистки Failed-слота.
+    /// Счётчик исчерпанных автоматических попыток очистки Failed-слота.
     cleanup_attempts: u32,
 }
 
-// Неожиданный процесс без слота: удерживается до исчерпания попыток очистки.
+/// Неожиданный процесс без слота: удерживается до исчерпания попыток очистки.
 struct Orphan {
+    /// Владение процессом сохраняется до подтверждённой очистки.
     pt: PluggableClientTransport,
+    /// Число уже использованных попыток очистки.
     attempts: u32,
 }
 
+/// Фаза жизненного цикла слота управляемого процесса.
 enum Phase {
+    /// Запуск процесса; sender позволяет отменить ожидание запуска.
     Starting(futures::channel::oneshot::Sender<()>),
+    /// Процесс запущен и обслуживает транспорт.
     Running(PluggableClientTransport),
+    /// Очистка выполняется отдельной задачей.
     Cleaning,
+    /// Очистка исчерпала автоматические попытки; процесс удерживается.
     Failed(PluggableClientTransport, PtError),
 }
 
+/// Результат завершившейся задачи вместе с ключом соответствующего слота.
 type TaskResult = (PathBuf, TaskOutcome);
+/// Итог запуска либо очистки процесса.
 enum TaskOutcome {
+    /// Результат запуска и, при ошибке/отмене, сохранённый владелец процесса.
     Started(
         err::Result<PluggableClientTransport>,
-        Option<PluggableClientTransport>,
+        Option<Box<PluggableClientTransport>>,
     ),
+    /// Результат очистки и сохранённый владелец процесса.
     Cleaned(err::Result<()>, PluggableClientTransport),
 }
+/// Асинхронная задача реактора, возвращающая результат запуска/очистки.
 type Task = Pin<Box<dyn Future<Output = TaskResult> + Send>>;
+
+/// Событие, выбранное реактором для обработки.
+enum Event {
+    /// Сообщение от запущенного транспорта.
+    Message(usize, err::Result<crate::ipc::PtMessage>),
+    /// Завершившаяся задача запуска либо очистки.
+    Task(Box<TaskResult>),
+    /// Полученная команда либо закрытие канала команд.
+    Command(Option<PtReactorMessage>),
+}
 
 /// Реактор владеет всеми процессами вплоть до подтверждения остановки.
 pub(crate) struct PtReactor<R> {
+    /// Runtime для запуска процессов.
     rt: R,
+    /// Процессы, индексируемые логически по пути.
     slots: Vec<Slot>,
+    /// Процессы, завершившиеся без соответствующего слота.
     orphans: Vec<Orphan>,
+    /// Все активные задачи запуска и очистки.
     tasks: FuturesUnordered<Task>,
+    /// Ожидающие запросы по имени транспорта.
     requests: HashMap<PtTransportName, Vec<oneshot::Sender<err::Result<PtClientMethod>>>>,
+    /// Общее опубликованное состояние PT.
     state: Arc<RwLock<PtSharedState>>,
+    /// Командный канал реактора.
     rx: UnboundedReceiver<PtReactorMessage>,
+    /// Каталог состояния для дочерних PT.
     state_dir: PathBuf,
+    /// Разрешатель конфигурационных путей.
     path_resolver: Arc<CfgPathResolver>,
+    /// Признак начала закрытия.
     closing: bool,
+    /// Признак отключения командного отправителя.
     disconnected: bool,
+    /// Ожидающие подтверждения Shutdown.
     waiters: Vec<oneshot::Sender<err::Result<()>>>,
 }
 
@@ -121,7 +165,7 @@ impl<R: Runtime> PtReactor<R> {
         }
     }
 
-    // До ожидания очистки скрываем опубликованные адреса и сигнализируем процесс.
+    /// Убирает методы процесса из общего состояния и запускает его очистку.
     fn clean(&mut self, key: PathBuf, mut pt: PluggableClientTransport) {
         {
             let mut state = self.state.write().expect("ptmgr state poisoned");
@@ -136,6 +180,7 @@ impl<R: Runtime> PtReactor<R> {
         }));
     }
 
+    /// Регистрирует слот и запускает асинхронный запуск процесса.
     fn start(
         &mut self,
         key: PathBuf,
@@ -159,11 +204,12 @@ impl<R: Runtime> PtReactor<R> {
         self.tasks.push(Box::pin(async move {
             let (result, retained) =
                 spawn_from_config(rt, dir, config, resolver, proxy, cancel_rx).await;
-            (key, TaskOutcome::Started(result, retained))
+            (key, TaskOutcome::Started(result, retained.map(Box::new)))
         }));
     }
 
-    fn fail_requests(&mut self, covers: &[PtTransportName], error: PtError) {
+    /// Отклоняет ожидающие запросы для указанных транспортов.
+    fn fail_requests(&mut self, covers: &[PtTransportName], error: &PtError) {
         for name in covers {
             for sender in self.requests.remove(name).into_iter().flatten() {
                 let _ = sender.send(Err(error.clone()));
@@ -173,6 +219,7 @@ impl<R: Runtime> PtReactor<R> {
 
     // Переходы слотов при закрытии и счётчик попыток описаны в функциях
     // closing_sweep / failed_slots_retry / fail_cleanup ниже (вне impl).
+    /// Переводит реактор в закрывающееся состояние и инициирует доступную очистку.
     fn begin_closing(&mut self) {
         if self.closing {
             // Повторный вход не перезапускает очистку: иначе исчерпанный
@@ -207,6 +254,7 @@ impl<R: Runtime> PtReactor<R> {
         }
     }
 
+    /// Применяет итог задачи, обновляя состояние слота и ожидающие запросы.
     fn complete_task(&mut self, key: PathBuf, outcome: TaskOutcome) {
         let Some(index) = self.slots.iter().position(|slot| slot.key == key) else {
             // Сохраняем неожиданный результат до подтверждения остановки;
@@ -216,9 +264,18 @@ impl<R: Runtime> PtReactor<R> {
                 TaskOutcome::Started(Err(_), Some(_)) | TaskOutcome::Cleaned(Err(_), _)
             );
             match outcome {
-                TaskOutcome::Started(Ok(pt), _)
-                | TaskOutcome::Started(Err(_), Some(pt))
-                | TaskOutcome::Cleaned(Err(_), pt) => {
+                TaskOutcome::Started(Ok(pt), _) => {
+                    self.orphans.push(Orphan { pt, attempts: 0 });
+                    warn!("PT cleanup result has no matching slot; owner retained");
+                }
+                TaskOutcome::Started(Err(_), Some(pt)) => {
+                    self.orphans.push(Orphan {
+                        pt: *pt,
+                        attempts: if attempted { MAX_CLEANUP_ATTEMPTS } else { 0 },
+                    });
+                    warn!("PT cleanup result has no matching slot; owner retained");
+                }
+                TaskOutcome::Cleaned(Err(_), pt) => {
                     self.orphans.push(Orphan {
                         pt,
                         attempts: if attempted { MAX_CLEANUP_ATTEMPTS } else { 0 },
@@ -230,66 +287,69 @@ impl<R: Runtime> PtReactor<R> {
             return;
         };
         match outcome {
-            TaskOutcome::Started(result, retained) => match result {
-                Ok(pt)
-                    if !self.closing
-                        && !self.slots[index].retire
-                        && !self.state.read().expect("ptmgr state poisoned").closed =>
-                {
-                    let covers = self.slots[index].config.protocols.clone();
-                    let mut state = self.state.write().expect("ptmgr state poisoned");
-                    if state.closed
-                        || state.generation != self.slots[index].generation
-                        || covers.iter().any(|name| {
-                            state.configured.get(name)
-                                != Some(&TransportOptions::Managed(
-                                    self.slots[index].config.clone(),
-                                ))
-                        })
+            TaskOutcome::Started(result, retained) => {
+                let retained = retained.map(|pt| *pt);
+                match result {
+                    Ok(pt)
+                        if !self.closing
+                            && !self.slots[index].retire
+                            && !self.state.read().expect("ptmgr state poisoned").closed =>
                     {
+                        let covers = self.slots[index].config.protocols.clone();
+                        let mut state = self.state.write().expect("ptmgr state poisoned");
+                        if state.closed
+                            || state.generation != self.slots[index].generation
+                            || covers.iter().any(|name| {
+                                state.configured.get(name)
+                                    != Some(&TransportOptions::Managed(
+                                        self.slots[index].config.clone(),
+                                    ))
+                            })
+                        {
+                            drop(state);
+                            self.fail_requests(
+                                &covers,
+                                &PtError::UnconfiguredTransportDueToConcurrentReconfiguration,
+                            );
+                            self.slots[index].phase = Phase::Cleaning;
+                            self.clean(key, pt);
+                            return;
+                        }
+                        for (name, method) in pt.transport_methods() {
+                            state.managed_cmethods.insert(name.clone(), method.clone());
+                            for sender in self.requests.remove(name).into_iter().flatten() {
+                                let _ = sender.send(Ok(method.clone()));
+                            }
+                        }
                         drop(state);
-                        self.fail_requests(
-                            &covers,
-                            PtError::UnconfiguredTransportDueToConcurrentReconfiguration,
-                        );
+                        self.fail_requests(&covers, &PtError::ChildGone);
+                        // Перезапуск/запуск сбрасывает счётчик попыток очистки.
+                        self.slots[index].cleanup_attempts = 0;
+                        self.slots[index].phase = Phase::Running(pt);
+                    }
+                    Ok(pt) => {
+                        if !self.closing {
+                            let covers = self.slots[index].config.protocols.clone();
+                            self.fail_requests(
+                                &covers,
+                                &PtError::UnconfiguredTransportDueToConcurrentReconfiguration,
+                            );
+                        }
                         self.slots[index].phase = Phase::Cleaning;
                         self.clean(key, pt);
-                        return;
                     }
-                    for (name, method) in pt.transport_methods() {
-                        state.managed_cmethods.insert(name.clone(), method.clone());
-                        for sender in self.requests.remove(name).into_iter().flatten() {
-                            let _ = sender.send(Ok(method.clone()));
+                    Err(e) => {
+                        let covers = self.slots[index].config.protocols.clone();
+                        self.fail_requests(&covers, &e);
+                        if let Some(pt) = retained {
+                            self.slots[index].phase = Phase::Cleaning;
+                            self.clean(key, pt);
+                        } else {
+                            self.slots.remove(index);
                         }
                     }
-                    drop(state);
-                    self.fail_requests(&covers, PtError::ChildGone);
-                    // Перезапуск/запуск сбрасывает счётчик попыток очистки.
-                    self.slots[index].cleanup_attempts = 0;
-                    self.slots[index].phase = Phase::Running(pt);
                 }
-                Ok(pt) => {
-                    if !self.closing {
-                        let covers = self.slots[index].config.protocols.clone();
-                        self.fail_requests(
-                            &covers,
-                            PtError::UnconfiguredTransportDueToConcurrentReconfiguration,
-                        );
-                    }
-                    self.slots[index].phase = Phase::Cleaning;
-                    self.clean(key, pt);
-                }
-                Err(e) => {
-                    let covers = self.slots[index].config.protocols.clone();
-                    self.fail_requests(&covers, e);
-                    if let Some(pt) = retained {
-                        self.slots[index].phase = Phase::Cleaning;
-                        self.clean(key, pt);
-                    } else {
-                        self.slots.remove(index);
-                    }
-                }
-            },
+            }
             TaskOutcome::Cleaned(Ok(()), _) => {
                 let slot = self.slots.remove(index);
                 if !self.closing {
@@ -309,7 +369,7 @@ impl<R: Runtime> PtReactor<R> {
                         } else {
                             self.fail_requests(
                                 &config.protocols,
-                                PtError::UnconfiguredTransportDueToConcurrentReconfiguration,
+                                &PtError::UnconfiguredTransportDueToConcurrentReconfiguration,
                             );
                         }
                     }
@@ -317,11 +377,12 @@ impl<R: Runtime> PtReactor<R> {
             }
             TaskOutcome::Cleaned(Err(e), pt) => {
                 let covered = fail_cleanup(&mut self.slots[index], pt, e.clone());
-                self.fail_requests(&covered, e);
+                self.fail_requests(&covered, &e);
             }
         }
     }
 
+    /// Завершает подтверждения Shutdown, когда исход очистки известен.
     fn finish_shutdown(&mut self) {
         if !self.closing {
             return;
@@ -361,44 +422,37 @@ impl<R: Runtime> PtReactor<R> {
             // процессы остаются на попечении отсоединённых потоков supervisor'а.
             return Ok(true);
         }
-        let mut messages = self
-            .slots
-            .iter_mut()
-            .enumerate()
-            .filter_map(|(i, slot)| match &mut slot.phase {
-                Phase::Running(pt) => Some(async move { (i, pt.next_message().await) }.boxed()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let mut next_message = if messages.is_empty() {
-            Either::Left(futures::future::pending())
-        } else {
-            Either::Right(futures::future::select_all(messages.iter_mut()).fuse())
+        let event = {
+            let mut messages = self
+                .slots
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(i, slot)| match &mut slot.phase {
+                    Phase::Running(pt) => Some(async move { (i, pt.next_message().await) }.boxed()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let mut next_message = if messages.is_empty() {
+                Either::Left(futures::future::pending())
+            } else {
+                Either::Right(futures::future::select_all(messages.iter_mut()).fuse())
+            };
+            let mut next_task = if self.tasks.is_empty() {
+                Either::Left(futures::future::pending())
+            } else {
+                Either::Right(self.tasks.next().fuse())
+            };
+            let mut next_command = if self.disconnected {
+                Either::Left(futures::future::pending())
+            } else {
+                Either::Right(self.rx.next().fuse())
+            };
+            select! {
+                (result, _, _) = next_message => Event::Message(result.0, result.1),
+                task = next_task => Event::Task(Box::new(task.expect("active task"))),
+                command = next_command => Event::Command(command),
+            }
         };
-        let mut next_task = if self.tasks.is_empty() {
-            Either::Left(futures::future::pending())
-        } else {
-            Either::Right(self.tasks.next().fuse())
-        };
-        let mut next_command = if self.disconnected {
-            Either::Left(futures::future::pending())
-        } else {
-            Either::Right(self.rx.next().fuse())
-        };
-        enum Event {
-            Message(usize, err::Result<crate::ipc::PtMessage>),
-            Task(TaskResult),
-            Command(Option<PtReactorMessage>),
-        }
-        let event = select! {
-            (result, _, _) = next_message => Event::Message(result.0, result.1),
-            task = next_task => Event::Task(task.expect("active task")),
-            command = next_command => Event::Command(command),
-        };
-        drop(next_message);
-        drop(messages);
-        drop(next_task);
-        drop(next_command);
         match event {
             Event::Message(index, result) => match result {
                 Ok(_) => {}
@@ -412,7 +466,10 @@ impl<R: Runtime> PtReactor<R> {
                     }
                 }
             },
-            Event::Task((key, outcome)) => self.complete_task(key, outcome),
+            Event::Task(task) => {
+                let (key, outcome) = *task;
+                self.complete_task(key, outcome)
+            }
             Event::Command(None) => {
                 self.disconnected = true;
                 self.begin_closing();
@@ -557,9 +614,7 @@ impl<R: Runtime> PtReactor<R> {
     }
 }
 
-// Переходы слотов при закрытии: Running/Starting/неисчерпанный Failed идут
-// в очистку, исчерпанный Failed остаётся терминальным. Возвращает слоты к
-// очистке.
+/// При закрытии переводит подходящие слоты в очистку; исчерпанные Failed остаются терминальными.
 fn closing_sweep(slots: &mut [Slot]) -> Vec<(PathBuf, PluggableClientTransport)> {
     let mut clean = Vec::new();
     for slot in slots {
@@ -586,9 +641,7 @@ fn closing_sweep(slots: &mut [Slot]) -> Vec<(PathBuf, PluggableClientTransport)>
     clean
 }
 
-// Явная команда Shutdown: сброс попыток и повторная очистка каждого
-// Failed-слота, в том числе когда реактор уже закрывается (мимо раннего
-// выхода begin_closing).
+/// Сбрасывает счётчики и выбирает Failed-слоты для явного повтора очистки.
 fn failed_slots_retry(slots: &mut [Slot]) -> Vec<(PathBuf, PluggableClientTransport)> {
     let mut retry = Vec::new();
     for slot in slots {
@@ -603,9 +656,7 @@ fn failed_slots_retry(slots: &mut [Slot]) -> Vec<(PathBuf, PluggableClientTransp
     retry
 }
 
-// Переход слота в Failed после неудачной очистки: первая неудача любой
-// очистки фиксируется как попытка; ожидающий перезапуск отменяется.
-// Возвращает затронутые протоколы для отказа их ожидающим запросам.
+/// Отмечает неудачу очистки, сохраняет процесс в Failed и возвращает отменённые протоколы.
 fn fail_cleanup(slot: &mut Slot, pt: PluggableClientTransport, e: PtError) -> Vec<PtTransportName> {
     let covered = slot
         .pending
@@ -741,7 +792,7 @@ mod lifecycle_tests {
         use tor_config_path::CfgPath;
         ManagedTransportOptions {
             protocols: Vec::new(),
-            path: CfgPath::new("pt".as_ref()),
+            path: CfgPath::new("pt".to_owned()),
             arguments: Vec::new(),
             run_on_startup: false,
         }
@@ -990,7 +1041,7 @@ mod lifecycle_tests {
         fn slot_config() -> ManagedTransportOptions {
             ManagedTransportOptions {
                 protocols: Vec::new(),
-                path: CfgPath::new("pt".as_ref()),
+                path: CfgPath::new("pt".to_owned()),
                 arguments: Vec::new(),
                 run_on_startup: false,
             }
@@ -1263,7 +1314,7 @@ mod lifecycle_tests {
                 // таймаута запуска; отмена Reconfigured приходит раньше.
                 let slow_config = ManagedTransportOptions {
                     protocols: vec![name.clone()],
-                    path: CfgPath::new("/bin/sh".as_ref()),
+                    path: CfgPath::new("/bin/sh".to_owned()),
                     arguments: vec![
                         "-c".into(),
                         format!(
@@ -1385,7 +1436,7 @@ mod lifecycle_tests {
                 // Spawn с тем же ключом: корректный PT-скрипт завершает протокол.
                 let ready_config = ManagedTransportOptions {
                     protocols: vec![name.clone()],
-                    path: CfgPath::new("/bin/sh".as_ref()),
+                    path: CfgPath::new("/bin/sh".to_owned()),
                     arguments: vec![
                         "-c".into(),
                         "echo 'VERSION 1'; \
