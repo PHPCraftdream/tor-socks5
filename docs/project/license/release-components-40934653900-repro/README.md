@@ -1,13 +1,14 @@
 # Воспроизведение run 40934653900
 
-Три соседних script-файла — полный toolkit: `analyze-safe.py`, `verify-safe-binaries.py`, `inspect-primary.py`. Считать этот каталог доверенным: два script явно загружают соседний `analyze-safe.py`, но не импортируют код проекта. Запускать Python в isolated mode `-I`; архивы и их содержимое не исполнять. Наблюдавшиеся сохранённые запуски всех трёх завершились с exit 0; финальный binary повтор после исправления формата Darwin показывает frameworks IOKit, CoreFoundation и SystemConfiguration, а не `Versions`. Результаты и ограничения — в [отчёте](../release-components-40934653900.md).
+Четыре соседних script-файла — toolkit: `analyze-safe.py`, `verify-safe-binaries.py`, `inspect-primary.py`, `prove-source-bytes.py`. Считать этот каталог доверенным: три script явно загружают соседний `analyze-safe.py`, но не импортируют код проекта. Запускать Python в isolated mode `-I`; архивы и их содержимое не исполнять. Сохранённые запуски первых трёх завершились с exit 0; финальный binary повтор после исправления формата Darwin показывает frameworks IOKit, CoreFoundation и SystemConfiguration, а не `Versions`. Два source-proof запуска также завершились с exit 0; подробности — в [source proof](source-proof.md), общий статус — в [отчёте](../release-components-40934653900.md).
 
 Финальные SHA-256 scripts:
 - `analyze-safe.py`: `e02523826493e5816d644bf77d802917bb7773b5d01c158ccb06227af8f43a43`.
 - `inspect-primary.py`: `f39b64ebe4c36f4d641c8c9d55c4c2f55a86cad555d08086fa6ca5351a151fa6`.
 - `verify-safe-binaries.py`: `8241b9a49ec1d70843e1d344a125f4d821662da86b27e4b76ff27cd45cffeb0a`.
+- `prove-source-bytes.py`: `967e9b1bc21c98934523ec00cf2403fe5b92b11035037a929224ed66bf481624`.
 
-Все команды ниже выполняются из этого каталога в Bash (на Windows — Git Bash); пути содержат четыре `..`. Нужны доверенные Python 3.12 и `gh`, предварительная аутентификация `gh` и доступ к artifacts. Убедитесь, что `../../../../target` существует, не содержит ссылок/reparse points в цепочке и не изменяется конкурентно. Скрипты не защищают от гонок. Не перезаписывайте и не удаляйте прежние evidence или outputs.
+Все команды ниже, кроме явно указанной команды source proof из корня worktree, выполняются из этого каталога в Bash (на Windows — Git Bash); пути содержат четыре `..`. Для локального анализа нужен доверенный Python 3.12; для получения artifacts дополнительно нужны `gh`, предварительная аутентификация и доступ к artifacts. Убедитесь, что `../../../../target` существует, не содержит ссылок/reparse points в цепочке и не изменяется конкурентно. Скрипты не защищают от гонок. Не перезаписывайте и не удаляйте прежние evidence или outputs.
 
 ## Аутентифицированное получение восьми ZIP
 
@@ -38,6 +39,16 @@ python -I inspect-primary.py --candidate ../../../../target/stage1-data-20261029
 Все exit 0: `inventory.json` — 824 outer, 2642 nested, 736 компонентов, 743 blockers; `primary.json` — 13 crates, 12 project/SDK файлов-кандидатов по имени (6 `LICENSE-*` и 6 workflow/аналитических файлов, не первичные лицензии), 10 строк CCADB; `summary.json` — семь совпадений receipt, все true, graph counts как в отчёте.
 
 Поле `project_sdk_license_files` имеет историческое имя: это результаты широкого filename-фильтра, а не классификация первичных лицензионных текстов. Наличие в этом списке workflow, аналитического документа или скрипта не подтверждает лицензионное обязательство и не увеличивает число проверенных первичных лицензий.
+
+## Source proof из корня worktree
+
+Для сохранённого candidate без сети, с новым свободным output непосредственно под `target`:
+
+```sh
+python -I docs/project/license/release-components-40934653900-repro/prove-source-bytes.py --candidate target/stage1-data-20261029/candidate.zip --target-root target --output target/source-proof-fresh
+```
+
+Два наблюдавшихся outputs `target/source-proof-20261030-a` и `target/source-proof-20261030-b` уже заняты; не использовать их повторно. Anchors, counts, digests, ограничения и точная граница доверия описаны в [source proof](source-proof.md); `PASS_DATA_ONLY` не является подтверждением production authority или legal review.
 
 ## Ограниченный анализ: свежие outputs
 

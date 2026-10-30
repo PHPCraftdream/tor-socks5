@@ -5,7 +5,7 @@
 Аналитический отчёт по ограниченному доступному evidence подготовлен; статус остаётся PARTIAL.
 Это не завершённый анализ состава или разрешение релиза.
 Подтверждены аутентифицированные метаданные API и независимо повторённый размер и SHA-256 локального ZIP; production origin не подтверждён.
-Сохранённые data-only inventory, primary и binary запуски завершились с exit 0; остальные 714 `.crate` не проверены.
+Сохранённые data-only inventory, primary и binary запуски завершились с exit 0; внутренности остальных 714 `.crate` не проверены. Новая source proof проверила checksums всех 727 архивов по lock, не раскрывая их.
 Финальный повтор binary завершился с exit 0; исправленное представление Darwin frameworks показывает IOKit, CoreFoundation и SystemConfiguration, а не `Versions`.
 Ранние локальные журналы получены небезопасным анализом архивов и не являются самостоятельной проверкой.
 Полные native inputs, юридические reviews и production origin остаются открыты.
@@ -28,7 +28,7 @@
 - Сообщение merge: `Merge ff8a4253b1b632a50d45d91bbe23fa86d2a7f5bc into b4a27a0cb806ce4efeef23aa94b375ce2f4222d1`. Run PR attempt 1, head `ff8a4253b1b632a50d45d91bbe23fa86d2a7f5bc`, workflow `400677266`, `.github/workflows/license-bundle.yml`.
 - [Commit API](https://api.github.com/repos/PHPCraftdream/tor-socks5/git/commits/67f82c1e107ab24e8fd22afb9fd12134ffa7f982), [PR API](https://api.github.com/repos/PHPCraftdream/tor-socks5/pulls/33), [run API](https://api.github.com/repos/PHPCraftdream/tor-socks5/actions/runs/40934653900), [workflow API](https://api.github.com/repos/PHPCraftdream/tor-socks5/actions/workflows/400677266).
 - Новый inventory сообщает совпадение самохеша project commit `67f82c1e107ab24e8fd22afb9fd12134ffa7f982`, tree `8c5be9171f2a2fa0f83dc42a60d9bb731d891d4c` и двух родителей выше; SDK commit `e754abaa88ce4f9745b4729652789ffc57f8ba4c` также совпал, SDK tree `263db1bd209e4151eb4deadf532d423d0bf2b41c`. Это наблюдение proof отдельно от подтверждённой предоставленными API-данными merge ancestry.
-- Самохеш commit из proof не равен проверке source bytes по доверенному GitHub tree; такая проверка ещё не выполнена. Ни она, ни ancestry не устанавливают production authority.
+- Последующая [source proof](release-components-40934653900-repro/source-proof.md) восстановила project и SDK trees из фактических source bytes и TAR modes и сверила их с предоставленными anchors; проверены также commit и родители. Два data-only запуска дали exit 0. Это не устанавливает production authority.
 - Новый SOCKS-код и vendor warning patch PR #30 не входят в рассматриваемую сборку; этот анализ не авторизует будущий объединённый release.
 
 ## Использованные материалы
@@ -77,9 +77,9 @@
 
 Общие assertions receipt: `source_digest` = `f8f9612d0bb2fb090da68a0722a401bf5b94312f86a7724922019c76a6c3fc44`,
 `SDK commit` = `e754abaa88ce4f9745b4729652789ffc57f8ba4c`, tag `v0.0.0-license-ci`.
-Source digest и build evidence digest не пересчитаны этой бинарной проверкой.
+Source digest и build evidence digest не пересчитывались той бинарной проверкой; последующая независимая [source proof](release-components-40934653900-repro/source-proof.md) пересчитала их и получила совпадение со всеми семью receipts.
 
-| Target | `build_evidence_digest` из receipt, не пересчитан |
+| Target | `build_evidence_digest` из receipt, позднее независимо пересчитан |
 | --- | --- |
 | `aarch64-apple-darwin` | `447d139cf97c5317e5414003d630c076bab577d00e57eea4bdc66a4d8358f2e5` |
 | `x86_64-apple-darwin` | `9d8b22c09090993f898ddd5f9b4133e80973dd54c8058c44dbef4013df855a1e` |
@@ -277,8 +277,8 @@ Outer: 824 записи, сумма размеров членов 878710567 ба
 - Оба файла присутствуют также у `resocks5-net`; это не устанавливает условия каждого файла.
 - Семь vendor с missing attributable notices перечислены выше; их source files присутствуют,
   но наличие исходников не разрешает вопрос пофайлового авторства и notices.
-- Нужно установить точные SDK bytes, происхождение, изменения и условия распространения.
-- Git proof показывает согласованность bytes, но не доверенное production origin.
+- Source proof связала сохранённые SDK bytes и TAR modes с предоставленным tree anchor; это не устанавливает production origin или условия распространения.
+- Git proof и пересчёт source bytes подтверждают соответствие закреплённому tree, но не доверенное production origin.
 - Для vendor проверить происхождение, авторство, notices и каждый затронутый файл.
 - Системные библиотеки и SDK зависят от платформы и конкретной toolchain.
 - Нужны точные версии, источники, права и применимые условия поставки.
@@ -320,7 +320,7 @@ Target review привязывается к четырём значениям id
 
 ## Воспроизведение ограниченных проверок
 
-Сохранённый toolkit из трёх scripts и полная инструкция получения восьми ZIP: [README](release-components-40934653900-repro/README.md). Прежние локальные scripts и их hashes относятся только к истории, не являются требуемыми инструментами воспроизведения. Новые scripts выполняются как доверенный код с `python -I`, без imports проекта; финальные SHA-256 приведены в README.
+Сохранённый toolkit из четырёх scripts, source proof и инструкция получения восьми ZIP: [README](release-components-40934653900-repro/README.md). Прежние локальные scripts и их hashes относятся только к истории, не являются требуемыми инструментами воспроизведения. Новые scripts выполняются как доверенный код с `python -I`, без imports проекта; финальные SHA-256 приведены в README.
 
 Для анализа выбран candidate ZIP размером 853866809 байт и семь binary ZIP общим размером 90240348 байт вместо retained размером 943666915 байт; retained не исследован.
 
@@ -330,8 +330,7 @@ Target review привязывается к четырём значениям id
 
 1. Расширить безопасный анализ на остальные 714 `.crate` и недостающие evidence;
    проверить native/static inputs и embedded data, не выводя их из графа.
-2. Использовать проверенные совпадения binary и receipt; retained bytes получить и проверить,
-   если это понадобится для production proof; пересчитать source и build evidence digests.
+2. Использовать проверенные совпадения binary и receipt и отдельно пересчитанные source и build evidence digests; retained bytes получить и проверить, если это понадобится для production proof.
 3. Установить native и platform inputs, состав и доступные исходники;
    после этого провести component, target и необходимые юридические reviews.
 4. Только затем проверить доверенный production origin и всю цепочку admission
