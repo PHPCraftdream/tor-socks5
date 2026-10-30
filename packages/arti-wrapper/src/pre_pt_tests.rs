@@ -5,7 +5,7 @@ use std::path::PathBuf;
 fn bootstrap_raw_guard_rejects_pre_pt_config_before_construction() {
     // stock-прокси пропускает PT: raw-конфигурация собирается локально,
     // без создания клиента и без сети.
-    let settings = Settings {
+    let mut settings = Settings {
         pre_endpoint: Some(Socks5PreEndpoint::new(
             "127.0.0.9:1087".parse().unwrap(),
             None,
@@ -15,7 +15,15 @@ fn bootstrap_raw_guard_rejects_pre_pt_config_before_construction() {
         extra_pt_protocols: vec!["obfs4".to_owned()],
         ..Default::default()
     };
+    // build_config подключает PT только при наличии моста; используем валидную obfs4-строку.
+    settings.bridges = vec![
+        "obfs4 192.0.2.1:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA iat-mode=0"
+            .parse()
+            .unwrap(),
+    ];
     let pre_pt_config = build_config(&settings).expect("stock pre-PT config builds");
+    assert!(!pre_pt_config.transports().is_empty());
+    assert!(pre_pt_config.channel().outbound_proxy().is_some());
     let error =
         pre_endpoint::checked_raw(pre_pt_config).expect_err("raw pre-PT one-shot must fail closed");
     assert!(error.to_string().contains("bootstrap_raw"));

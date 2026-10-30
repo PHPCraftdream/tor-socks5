@@ -468,7 +468,7 @@ impl<R: Runtime> PtReactor<R> {
             },
             Event::Task(task) => {
                 let (key, outcome) = *task;
-                self.complete_task(key, outcome)
+                self.complete_task(key, outcome);
             }
             Event::Command(None) => {
                 self.disconnected = true;

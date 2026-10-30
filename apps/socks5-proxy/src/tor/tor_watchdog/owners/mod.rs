@@ -335,9 +335,15 @@ impl OwnerRegistry {
                 if let Some(handle) = state.constructing.as_mut() {
                     let result = handle.await;
                     state.constructing.take();
-                    if let Ok(Ok(constructed)) = result {
-                        state.slot = Some(constructed.slot);
-                        state.tunnel = Some(constructed.tunnel);
+                    match result {
+                        Ok(Ok(constructed)) => {
+                            state.slot = Some(constructed.slot);
+                            state.tunnel = Some(constructed.tunnel);
+                        }
+                        Ok(Err(error)) if error.is::<ConstructorCancelled>() => {}
+                        Ok(Err(_)) | Err(_) => {
+                            return Err(anyhow!("ошибка создания Tor владельца при закрытии"));
+                        }
                     }
                 }
                 if let Some(tunnel) = state.tunnel.as_ref() {

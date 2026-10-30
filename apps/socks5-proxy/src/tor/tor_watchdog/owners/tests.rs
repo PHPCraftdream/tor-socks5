@@ -171,11 +171,47 @@ async fn close_deadline_retains_handle_for_retry() {
         .close_with_deadline(Instant::now() + Duration::from_secs(5))
         .await
         .is_err());
+    assert!(entry.state.lock().await.constructing.is_none());
+    assert!(entry.state.lock().await.tunnel.is_none());
     registry
         .close_with_deadline(Instant::now() + Duration::from_secs(5))
         .await
         .unwrap();
     assert!(entry.state.lock().await.constructing.is_none());
+}
+
+#[tokio::test]
+async fn close_reports_panicked_constructor_then_retry_completes() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry(dir.path());
+    let entry = registry
+        .reserve(Some(endpoint("panicked-close")))
+        .await
+        .unwrap()
+        .unwrap();
+    {
+        let mut state = entry.state.lock().await;
+        state.attempted = true;
+        state.constructing = Some(tokio::task::spawn_blocking(|| -> Result<Constructed> {
+            panic!("constructor panic secret");
+        }));
+    }
+
+    let error = registry
+        .close_with_deadline(Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "задача владельца завершилась ошибкой при закрытии"
+    );
+    assert!(!error.to_string().contains("constructor panic secret"));
+    assert!(entry.state.lock().await.constructing.is_none());
+    assert!(entry.state.lock().await.tunnel.is_none());
+    registry
+        .close_with_deadline(Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap();
 }
 
 // Проверяется только сохранение вручную установленного дескриптора.
@@ -212,6 +248,8 @@ async fn cancelled_wait_retains_blocking_constructor_until_close() {
     assert!(!closing.is_finished());
     release_tx.send(()).unwrap();
     assert!(closing.await.unwrap().is_err());
+    assert!(entry.state.lock().await.constructing.is_none());
+    assert!(entry.state.lock().await.tunnel.is_none());
     registry.close().await.unwrap();
     assert!(entry.state.lock().await.constructing.is_none());
 }

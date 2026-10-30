@@ -561,7 +561,7 @@ pub(crate) mod sealed {
             thread::Builder::new()
                 .name("pt-supervisor".into())
                 .spawn(move || {
-                    supervise(command, &launch_tx, &requests, &ident, &worker_completion)
+                    supervise(command, &launch_tx, &requests, &ident, &worker_completion);
                 })
                 .map_err(|e| PtError::ChildSpawnFailed {
                     path: path.clone(),
