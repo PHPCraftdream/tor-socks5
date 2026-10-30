@@ -3007,6 +3007,17 @@ mod test {
         tor_rtcompat::test_with_one_runtime!(|rt| async {
             let state_dir = tempfile::tempdir().unwrap();
             let cache_dir = tempfile::tempdir().unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                for directory in [&state_dir, &cache_dir] {
+                    std::fs::set_permissions(
+                        directory.path(),
+                        std::fs::Permissions::from_mode(0o700),
+                    )
+                    .unwrap();
+                }
+            }
             let cfg = TorClientConfigBuilder::from_directories(&state_dir, &cache_dir)
                 .build()
                 .unwrap();
