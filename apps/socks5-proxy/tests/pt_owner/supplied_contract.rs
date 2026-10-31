@@ -1,7 +1,7 @@
 // Перед запросом снимается пустой PID-снимок; затем успешный резерв none и
 // Записанный StorageAssigned link для plain сверяется с принятым TCP-носителем
 // и kernel inode ownership; cumulative watch используется только как readiness.
-//// Бюджеты — detection deadlines, не строгая общая длительность при OS block:
+// Бюджеты — detection deadlines, не строгая общая длительность при OS block:
 // async stages используют absolute 55с/40с. Terminal wait удерживает handles,
 // поэтому может превысить deadline; failure сохраняется. Sync setup не обещает
 // wallclock bound; при просрочке явный guard запрещает spawn. Execution pending.
@@ -10,6 +10,7 @@ use super::pt_contract::{
     cleanup_supplied_scenario, read_closed, socks_auth, socks_connect, spawn_supplied_recorder,
     spawn_supplied_trap, tcp_source_owned_by, Overruns,
 };
+use super::scenario_resources::{RecorderCounters, ScenarioCleanup};
 use super::*;
 use crate::server::owners::SelectionOutcome;
 use futures::FutureExt;
@@ -166,13 +167,15 @@ pub(crate) async fn run_supplied_config_positive() {
         GLOBAL_USER_ALLOWED,
         "рекордер1",
         events1_tx,
-        overruns.recorder1.clone(),
-        overruns.events.clone(),
-        panic_count.clone(),
-        panic_messages.clone(),
-        worker_timeouts.clone(),
-        worker_errors.clone(),
-        aborted_workers.clone(),
+        RecorderCounters {
+            accept_overrun: overruns.recorder1.clone(),
+            events_overrun: overruns.events.clone(),
+            panic_count: panic_count.clone(),
+            panic_messages: panic_messages.clone(),
+            worker_timeouts: worker_timeouts.clone(),
+            worker_errors: worker_errors.clone(),
+            aborted_workers: aborted_workers.clone(),
+        },
         None,
     );
     let (stop2_tx, stop2_rx) = tokio::sync::watch::channel(());
@@ -182,13 +185,15 @@ pub(crate) async fn run_supplied_config_positive() {
         ALT_USER_ALLOWED,
         "рекордер2",
         events2_tx,
-        overruns.recorder2.clone(),
-        overruns.events.clone(),
-        panic_count.clone(),
-        panic_messages.clone(),
-        worker_timeouts.clone(),
-        worker_errors.clone(),
-        aborted_workers.clone(),
+        RecorderCounters {
+            accept_overrun: overruns.recorder2.clone(),
+            events_overrun: overruns.events.clone(),
+            panic_count: panic_count.clone(),
+            panic_messages: panic_messages.clone(),
+            worker_timeouts: worker_timeouts.clone(),
+            worker_errors: worker_errors.clone(),
+            aborted_workers: aborted_workers.clone(),
+        },
         None,
     );
     let direct = Arc::new(setup.direct);
@@ -503,23 +508,23 @@ pub(crate) async fn run_supplied_config_positive() {
     let _ = known_children.refresh(dir.path());
     // Cleanup ВНЕ таймируемого региона: гарантирован на timeout/Err-путях
     // тела (см. шапку модуля и cleanup_supplied_scenario).
-    let cleanup = cleanup_supplied_scenario(
-        shutdown_tx.take(),
+    let cleanup = cleanup_supplied_scenario(ScenarioCleanup {
+        shutdown_tx: shutdown_tx.take(),
         stop1_tx,
         stop2_tx,
-        &mut server,
-        &mut recorder1,
-        &mut recorder2,
-        &mut trap,
-        direct,
-        &trap_accepts,
-        &overruns.trap,
+        server: &mut server,
+        recorder1: &mut recorder1,
+        recorder2: &mut recorder2,
+        trap: &mut trap,
+        trap_listener: direct,
+        trap_accepts: &trap_accepts,
+        trap_overrun: &overruns.trap,
         events1_rx,
         events2_rx,
         traps_rx,
         graceful_deadline,
         terminal_deadline,
-    )
+    })
     .await;
     let terminal_errors = if cleanup.server.is_err() {
         super::super::super::global_init::recover_contract_terminal().await
@@ -674,13 +679,15 @@ pub(crate) async fn run_supplied_config_negative() {
         GLOBAL_USER_ALLOWED,
         "рекордер1",
         events1_tx,
-        overruns.recorder1.clone(),
-        overruns.events.clone(),
-        panic_count.clone(),
-        panic_messages.clone(),
-        worker_timeouts.clone(),
-        worker_errors.clone(),
-        aborted_workers.clone(),
+        RecorderCounters {
+            accept_overrun: overruns.recorder1.clone(),
+            events_overrun: overruns.events.clone(),
+            panic_count: panic_count.clone(),
+            panic_messages: panic_messages.clone(),
+            worker_timeouts: worker_timeouts.clone(),
+            worker_errors: worker_errors.clone(),
+            aborted_workers: aborted_workers.clone(),
+        },
         None,
     );
     let (stop2_tx, stop2_rx) = tokio::sync::watch::channel(());
@@ -690,13 +697,15 @@ pub(crate) async fn run_supplied_config_negative() {
         ALT_USER_ALLOWED,
         "рекордер2",
         events2_tx,
-        overruns.recorder2.clone(),
-        overruns.events.clone(),
-        panic_count.clone(),
-        panic_messages.clone(),
-        worker_timeouts.clone(),
-        worker_errors.clone(),
-        aborted_workers.clone(),
+        RecorderCounters {
+            accept_overrun: overruns.recorder2.clone(),
+            events_overrun: overruns.events.clone(),
+            panic_count: panic_count.clone(),
+            panic_messages: panic_messages.clone(),
+            worker_timeouts: worker_timeouts.clone(),
+            worker_errors: worker_errors.clone(),
+            aborted_workers: aborted_workers.clone(),
+        },
         None,
     );
     let direct = Arc::new(setup.direct);
@@ -853,23 +862,23 @@ pub(crate) async fn run_supplied_config_negative() {
     .await;
     let _ = known_children.refresh(dir.path());
     // Cleanup ВНЕ таймируемого региона (см. шапку модуля).
-    let cleanup = cleanup_supplied_scenario(
-        Some(shutdown_tx),
+    let cleanup = cleanup_supplied_scenario(ScenarioCleanup {
+        shutdown_tx: Some(shutdown_tx),
         stop1_tx,
         stop2_tx,
-        &mut server,
-        &mut recorder1,
-        &mut recorder2,
-        &mut trap,
-        direct,
-        &trap_accepts,
-        &overruns.trap,
+        server: &mut server,
+        recorder1: &mut recorder1,
+        recorder2: &mut recorder2,
+        trap: &mut trap,
+        trap_listener: direct,
+        trap_accepts: &trap_accepts,
+        trap_overrun: &overruns.trap,
         events1_rx,
         events2_rx,
         traps_rx,
         graceful_deadline,
         terminal_deadline,
-    )
+    })
     .await;
     let terminal_errors = if cleanup.server.is_err() {
         super::super::super::global_init::recover_contract_terminal().await

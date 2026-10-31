@@ -1,3 +1,4 @@
+use super::scenario_resources::{RecorderCounters, ScenarioCleanup};
 use super::*;
 use futures::FutureExt;
 use tokio::io::AsyncReadExt;
@@ -141,15 +142,18 @@ pub(crate) fn spawn_supplied_recorder(
     allowed: &'static [&'static [u8]],
     label: &'static str,
     events_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-    accept_overrun: Arc<std::sync::atomic::AtomicUsize>,
-    events_overrun: Arc<std::sync::atomic::AtomicUsize>,
-    panic_count: Arc<std::sync::atomic::AtomicUsize>,
-    panic_messages: Arc<std::sync::Mutex<Vec<String>>>,
-    worker_timeouts: Arc<std::sync::atomic::AtomicUsize>,
-    worker_errors: Arc<std::sync::atomic::AtomicUsize>,
-    aborted_workers: Arc<std::sync::atomic::AtomicUsize>,
+    counters: RecorderCounters,
     #[cfg(test)] fault: Option<RecorderFault>,
 ) -> AbortOnDrop<()> {
+    let RecorderCounters {
+        accept_overrun,
+        events_overrun,
+        panic_count,
+        panic_messages,
+        worker_timeouts,
+        worker_errors,
+        aborted_workers,
+    } = counters;
     AbortOnDrop(tokio::spawn(async move {
         let mut stop_rx = stop_rx;
         #[cfg(test)]
@@ -164,10 +168,7 @@ pub(crate) fn spawn_supplied_recorder(
                     accepted = async {
                         #[cfg(test)]
                         if spawned && matches!(fault, Some(RecorderFault::AcceptError)) {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                "искусственный отказ accept",
-                            ));
+                            return Err(std::io::Error::other("искусственный отказ accept"));
                         }
                         listener.accept().await
                     } => {
@@ -245,13 +246,15 @@ async fn recorder_rejection_case(fault: RecorderFault) {
         &[],
         "control",
         tokio::sync::mpsc::channel(1).0,
-        Arc::new(AtomicUsize::new(0)),
-        Arc::new(AtomicUsize::new(0)),
-        panics.clone(),
-        Arc::new(std::sync::Mutex::new(Vec::new())),
-        worker_timeouts.clone(),
-        worker_errors.clone(),
-        aborted.clone(),
+        RecorderCounters {
+            accept_overrun: Arc::new(AtomicUsize::new(0)),
+            events_overrun: Arc::new(AtomicUsize::new(0)),
+            panic_count: panics.clone(),
+            panic_messages: Arc::new(std::sync::Mutex::new(Vec::new())),
+            worker_timeouts: worker_timeouts.clone(),
+            worker_errors: worker_errors.clone(),
+            aborted_workers: aborted.clone(),
+        },
         Some(fault),
     );
     let mut recorder = recorder;
@@ -387,23 +390,24 @@ pub(crate) struct SuppliedCleanup {
 
 // Cleanup использует абсолютные сроки сценария; незавершённые задачи остаются
 // в scope при terminal timeout, и такой исход явно отражается в результате.
-pub(crate) async fn cleanup_supplied_scenario(
-    mut shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    stop1_tx: tokio::sync::watch::Sender<()>,
-    stop2_tx: tokio::sync::watch::Sender<()>,
-    server: &mut AbortOnDrop<anyhow::Result<()>>,
-    recorder1: &mut AbortOnDrop<()>,
-    recorder2: &mut AbortOnDrop<()>,
-    trap: &mut AbortOnDrop<()>,
-    trap_listener: std::sync::Arc<TcpListener>,
-    trap_accepts: &std::sync::atomic::AtomicUsize,
-    trap_overrun: &std::sync::atomic::AtomicUsize,
-    mut events1_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-    mut events2_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-    mut traps_rx: tokio::sync::mpsc::Receiver<TcpStream>,
-    graceful_deadline: tokio::time::Instant,
-    terminal_deadline: tokio::time::Instant,
-) -> SuppliedCleanup {
+pub(crate) async fn cleanup_supplied_scenario(resources: ScenarioCleanup<'_>) -> SuppliedCleanup {
+    let ScenarioCleanup {
+        mut shutdown_tx,
+        stop1_tx,
+        stop2_tx,
+        server,
+        recorder1,
+        recorder2,
+        trap,
+        trap_listener,
+        trap_accepts,
+        trap_overrun,
+        mut events1_rx,
+        mut events2_rx,
+        mut traps_rx,
+        graceful_deadline,
+        terminal_deadline,
+    } = resources;
     if let Some(shutdown_tx) = shutdown_tx.take() {
         let _ = shutdown_tx.send(());
     }
@@ -522,13 +526,18 @@ pub(crate) fn owner_pids(dir: &std::path::Path) -> Vec<(std::path::PathBuf, u32)
         .collect()
 }
 
-// Положительный свидетель shutdown: обработчики abort_all роняют сокеты —
-// клиент видит 0 байт либо ошибку соединения.
+// Отмена owner может сначала отправить SOCKS failure reply. Дрейним не более
+// максимального ответа (262 байта), но закрытие доказывает только EOF/ошибка.
+// Общий срок ожидания задаётся вызывающим сценарием.
 pub(crate) async fn read_closed(client: &mut TcpStream) -> bool {
-    let mut byte = [0u8; 1];
-    match client.read(&mut byte).await {
-        Ok(0) | Err(_) => true,
-        Ok(_) => false,
+    let mut buffer = [0u8; 32];
+    let mut remaining = 262;
+    loop {
+        match client.read(&mut buffer).await {
+            Ok(0) | Err(_) => return true,
+            Ok(count) if count <= remaining => remaining -= count,
+            Ok(_) => return false,
+        }
     }
 }
 
