@@ -137,6 +137,99 @@ impl ProducerTasks {
         }
     }
 
+    #[cfg(test)]
+    pub(super) async fn recover_terminal() -> Result<()> {
+        let retained = RETAINED
+            .lock()
+            .map_err(|_| anyhow!("producer registry poisoned"))?
+            .clone();
+        if let Some(owner) = retained {
+            owner.abort();
+            let tasks = owner
+                .tasks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            for task in tasks {
+                let mut slot = task.handle.lock().await;
+                if let Some(handle) = slot.as_mut() {
+                    let result = handle.await;
+                    slot.take();
+                    if let Err(error) = result {
+                        if !error.is_cancelled() {
+                            owner
+                                .failure
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push(anyhow::Error::new(error));
+                        }
+                    }
+                }
+            }
+
+            let terminal_children = match &owner.children {
+                Some(children) => match children.join().await {
+                    Ok(()) => true,
+                    Err(error) if error.is::<crate::bridge_verifier::WorkerFailures>() => {
+                        owner
+                            .failure
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(error);
+                        true
+                    }
+                    Err(error) => {
+                        owner
+                            .failure
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(error);
+                        false
+                    }
+                },
+                None => match crate::bridge_verifier::join_blocking_workers().await {
+                    Ok(()) => true,
+                    Err(error) if error.is::<crate::bridge_verifier::WorkerFailures>() => {
+                        owner
+                            .failure
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(error);
+                        true
+                    }
+                    Err(error) => {
+                        owner
+                            .failure
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(error);
+                        false
+                    }
+                },
+            };
+            if !terminal_children {
+                return Err(anyhow!(
+                    "producer recovery retained non-terminal child failure"
+                ));
+            }
+
+            let mut root = RETAINED
+                .lock()
+                .map_err(|_| anyhow!("producer registry poisoned"))?;
+            if root
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &owner))
+            {
+                *root = None;
+            }
+            let failure =
+                std::mem::take(&mut *owner.failure.lock().unwrap_or_else(|e| e.into_inner()));
+            failure.into_result()
+        } else {
+            Ok(())
+        }
+    }
+
     pub(super) async fn recover() -> Result<()> {
         let owner = RETAINED
             .lock()

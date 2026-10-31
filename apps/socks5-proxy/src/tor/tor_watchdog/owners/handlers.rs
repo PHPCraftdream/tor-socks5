@@ -100,6 +100,49 @@ impl HandlerTasks {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(super) async fn recover_terminal() -> Result<()> {
+        let retained = RETAINED_HANDLERS
+            .lock()
+            .map_err(|_| anyhow!("хранилище обработчиков повреждено"))?
+            .clone();
+        if let Some(tasks) = retained {
+            tasks.begin_shutdown();
+            let mut joined = tasks.tasks.lock().await;
+            joined.abort_all();
+            let mut failures = Vec::new();
+            while let Some(result) = joined.join_next().await {
+                if let Err(error) = result {
+                    if !error.is_cancelled() {
+                        failures.push(error);
+                    }
+                }
+            }
+            drop(joined);
+
+            let mut root = RETAINED_HANDLERS
+                .lock()
+                .map_err(|_| anyhow!("хранилище обработчиков повреждено"))?;
+            if root
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &tasks))
+            {
+                *root = None;
+            }
+            if !failures.is_empty() {
+                return Err(anyhow!(
+                    "{} handler task(s) failed during terminal cleanup: {}",
+                    failures.len(),
+                    failures
+                        .into_iter()
+                        .map(|error| error.to_string())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ));
+            }
+        }
+        Ok(())
+    }
     pub(super) async fn shutdown(&self) -> Result<()> {
         self.begin_shutdown();
         let deadline = tokio::time::Instant::now() + HANDLER_JOIN_TIMEOUT;

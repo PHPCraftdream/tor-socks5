@@ -146,6 +146,9 @@ fn main() {
         .build()
         .unwrap();
     rt.block_on(server::owners::handler_tests::run_pt_owner_contract());
+    rt.block_on(server::owners::handler_tests::run_supplied_config_positive());
+    rt.block_on(server::owners::handler_tests::run_supplied_config_negative());
+    rt.block_on(server::owners::handler_tests::run_supplied_config_seeds_rejected());
 }
 
 #[cfg(not(target_os = "linux"))]
