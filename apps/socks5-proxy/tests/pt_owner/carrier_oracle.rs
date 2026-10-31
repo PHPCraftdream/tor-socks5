@@ -379,6 +379,11 @@ impl Oracle {
     }
 }
 
+pub(crate) async fn run_reuse_and_rejection_controls() {
+    tests::run_controls().await;
+    eprintln!("PT reuse/rejection controls: PASS");
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::pt_contract::spawn_supplied_recorder;
@@ -402,6 +407,10 @@ mod tests {
 
     #[tokio::test]
     async fn reuse_and_rejection_controls() {
+        run_controls().await;
+    }
+
+    pub(super) async fn run_controls() {
         let _serial = crate::server::owners::TEST_LIFECYCLE.lock().await;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = listener.local_addr().unwrap();
