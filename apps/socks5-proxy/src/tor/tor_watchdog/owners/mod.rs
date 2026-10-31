@@ -127,10 +127,8 @@ pub(crate) fn test_selection_probe() -> Arc<SelectionProbe> {
         .expect("реестр ещё не создан")
 }
 
-/// Task-local доставка наблюдения (id запроса, route-label) из select_admitted
-/// в reserve. Observation вне production-сигнатур: select_inner/reserve
-/// сохраняют прежние параметры; под not(test) task-local не существует и
-/// публикация пропускается.
+// Task-local доставка наблюдения из select_admitted в reserve.
+// Production-сигнатуры прежние; вне cfg(test) публикации нет.
 #[cfg(test)]
 tokio::task_local! {
     static SELECTION_OBS: Option<(usize, String)>;

@@ -543,7 +543,10 @@ impl GlobalInit {
         if let Some(current) = tunnel.as_ref() {
             if let Err(error) = current.shutdown().await {
                 shutdown_succeeded = false;
-                errors.push(error.context("не удалось завершить глобальный PT; туннель сохранён"));
+                errors.push(
+                    anyhow::Error::new(error)
+                        .context("не удалось завершить глобальный PT; туннель сохранён"),
+                );
             }
         }
         if shutdown_succeeded {
