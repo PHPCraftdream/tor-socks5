@@ -393,12 +393,21 @@ mod tcp_diag {
 
     /// Единая маршрутизация: capture-режим для тестов, иначе stderr.
     fn dispatch_emit(line: &str) {
-        let sequence = OBSERVATION_SEQUENCE
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
-                value.checked_add(1)
-            })
-            .ok()
-            .map(|value| value + 1);
+        let mut current = OBSERVATION_SEQUENCE.load(Ordering::SeqCst);
+        let sequence = loop {
+            let Some(next) = current.checked_add(1) else {
+                break None;
+            };
+            match OBSERVATION_SEQUENCE.compare_exchange(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break Some(next),
+                Err(observed) => current = observed,
+            }
+        };
         let line = format!("{line} seq={sequence:?}");
         if CAPTURE_MODE.with(|m| m.get()) {
             capture_emit(&line);
