@@ -15,7 +15,9 @@ impl std::fmt::Display for InitialPublishError {
 }
 impl std::error::Error for InitialPublishError {}
 
+// Потребитель — отдельный harness=false; обычный unit-test binary этот модуль не вызывает.
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 mod pt_contract {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -25,15 +27,19 @@ mod pt_contract {
 // Supplied-сценарии (negative/positive) вынесены в отдельный файл (лимиты
 // строк/записей); проводка — только объявление модуля и экспорт.
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 #[path = "../../../../tests/pt_owner/child_processes.rs"]
 mod child_processes;
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 #[path = "../../../../tests/pt_owner/supplied_contract.rs"]
 mod supplied_contract;
 
 #[cfg(target_os = "linux")]
+#[allow(unused_imports)]
 pub(crate) use pt_contract::{run_pt_owner_contract, run_supplied_config_seeds_rejected};
 #[cfg(target_os = "linux")]
+#[allow(unused_imports)]
 pub(crate) use supplied_contract::{run_supplied_config_negative, run_supplied_config_positive};
 
 // Bootstrap подменён; проверяется завершение сервера, а не сеть Tor.

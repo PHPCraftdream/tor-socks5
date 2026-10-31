@@ -3007,6 +3007,17 @@ mod test {
         tor_rtcompat::test_with_one_runtime!(|rt| async {
             let state_dir = tempfile::tempdir().unwrap();
             let cache_dir = tempfile::tempdir().unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                for directory in [&state_dir, &cache_dir] {
+                    std::fs::set_permissions(
+                        directory.path(),
+                        std::fs::Permissions::from_mode(0o700),
+                    )
+                    .unwrap();
+                }
+            }
             let cfg = TorClientConfigBuilder::from_directories(&state_dir, &cache_dir)
                 .build()
                 .unwrap();
@@ -3025,14 +3036,15 @@ mod test {
                 .unwrap(),
             );
             *client.client.retained_pt_mgr.lock().unwrap() = Some(Arc::clone(&manager));
-            let mut guard = client.client.inner.lock().unwrap();
-            *guard = Inner::Poisoned(Box::new(ErrorDetail::from(internal!(
-                "construction failed"
-            ))));
-            let (retained, channels) = client.client.pt_shutdown_snapshot(&guard);
-            assert!(Arc::ptr_eq(&manager, retained.as_ref().unwrap()));
-            assert!(channels.is_none());
-            drop(guard);
+            {
+                let mut guard = client.client.inner.lock().unwrap();
+                *guard = Inner::Poisoned(Box::new(ErrorDetail::from(internal!(
+                    "construction failed"
+                ))));
+                let (retained, channels) = client.client.pt_shutdown_snapshot(&guard);
+                assert!(Arc::ptr_eq(&manager, retained.as_ref().unwrap()));
+                assert!(channels.is_none());
+            }
             client.shutdown_pluggable_transports().await.unwrap();
         });
     }
