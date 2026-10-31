@@ -342,12 +342,14 @@ async fn handle_tcp_gated<T, F, Gate, G>(
 // модуль целиком отсутствует: ни вызовов, ни аллокаций, ни I/O.
 // Реэкспорт для тестов уровня server (accept-loop emission oracle).
 #[cfg(test)]
-pub(super) use tcp_diag::{set_capture_mode, take_capture};
+pub(super) use tcp_diag::{client_io_result, poll_observed, set_capture_mode, take_capture};
 #[cfg(test)]
 mod tcp_diag {
     use std::future::Future;
+    use std::io;
     use std::net::SocketAddr;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::task::{Context, Poll};
 
     /// Чистая функция форматирования одной строки диагностики.
@@ -369,12 +371,39 @@ mod tcp_diag {
         eprintln!("{line}");
     }
 
+    static OBSERVATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    pub(in super::super) fn client_io_result<T>(
+        local: Option<SocketAddr>,
+        peer: Option<SocketAddr>,
+        operation: &'static str,
+        offset: usize,
+        result: io::Result<T>,
+    ) -> io::Result<T> {
+        if let Err(error) = &result {
+            emit(&format!(
+                "tcp_client_error: local={local:?} peer={peer:?} \
+                 operation={operation} offset={offset} kind={:?} os={:?}",
+                error.kind(),
+                error.raw_os_error()
+            ));
+        }
+        result
+    }
+
     /// Единая маршрутизация: capture-режим для тестов, иначе stderr.
     fn dispatch_emit(line: &str) {
+        let sequence = OBSERVATION_SEQUENCE
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                value.checked_add(1)
+            })
+            .ok()
+            .map(|value| value + 1);
+        let line = format!("{line} seq={sequence:?}");
         if CAPTURE_MODE.with(|m| m.get()) {
-            capture_emit(line);
+            capture_emit(&line);
         } else {
-            stderr_emit(line);
+            stderr_emit(&line);
         }
     }
 
@@ -409,7 +438,7 @@ mod tcp_diag {
 
     /// Test-only future-обёртка: закрывает слепую зону между enqueue и первым
     /// poll — дроп до poll фиксируется как dropped_before_poll.
-    pub(super) struct PollObserved<F> {
+    pub(in super::super) struct PollObserved<F> {
         listener: Option<SocketAddr>,
         local: Option<SocketAddr>,
         peer: SocketAddr,
@@ -417,7 +446,7 @@ mod tcp_diag {
         inner: Pin<Box<F>>,
     }
 
-    pub(super) fn poll_observed<F: Future + Send>(
+    pub(in super::super) fn poll_observed<F: Future + Send>(
         listener: Option<SocketAddr>,
         local: Option<SocketAddr>,
         peer: SocketAddr,
