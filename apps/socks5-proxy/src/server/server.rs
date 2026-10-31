@@ -26,6 +26,8 @@ use crate::startup::{
 use crate::tor_watchdog::{spawn_bridge_failover_watchdog, spawn_tor_watchdog, TorHandle};
 use crate::{shutdown, upstream};
 use handlers::{HandlerRunGuard, RegistryRunGuard};
+#[cfg(all(test, target_os = "linux"))]
+use owners::handler_tests::carrier_oracle;
 
 /// Maximum concurrent SOCKS5 connections. Each may run an Argon2id verify
 /// (~5 MiB working memory, 2 passes), so unbounded spawns risk resource
@@ -743,6 +745,8 @@ async fn handle_client_with_connector<C: TorConnector + Send>(
                 req.reply(&mut client, Reply::Forbidden).await.ok();
                 return Ok(());
             }
+            #[cfg(all(test, target_os = "linux"))]
+            carrier_oracle::request(&client, &lease, &route, differs);
             let owner = if differs {
                 match tokio::time::timeout_at(
                     setup_deadline,
