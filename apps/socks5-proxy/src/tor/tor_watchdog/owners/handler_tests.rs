@@ -28,6 +28,10 @@ mod pt_contract {
 // строк/записей); проводка — только объявление модуля и экспорт.
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
+#[path = "../../../../tests/pt_owner/carrier_oracle.rs"]
+pub(crate) mod carrier_oracle;
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
 #[path = "../../../../tests/pt_owner/child_processes.rs"]
 mod child_processes;
 #[cfg(target_os = "linux")]

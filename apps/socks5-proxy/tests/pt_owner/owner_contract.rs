@@ -156,6 +156,7 @@ pub(crate) fn spawn_supplied_recorder(
     } = counters;
     AbortOnDrop(tokio::spawn(async move {
         let mut stop_rx = stop_rx;
+        let mut observation = super::carrier_oracle::recorder(&listener);
         #[cfg(test)]
         let fault = fault;
         let mut workers = tokio::task::JoinSet::new();
@@ -165,6 +166,7 @@ pub(crate) fn spawn_supplied_recorder(
             loop {
                 tokio::select! {
                     _ = stop_rx.changed() => break,
+                    () = super::carrier_oracle::poll_recorder(&mut observation) => {}
                     accepted = async {
                         #[cfg(test)]
                         if spawned && matches!(fault, Some(RecorderFault::AcceptError)) {
@@ -217,6 +219,7 @@ pub(crate) fn spawn_supplied_recorder(
             // Payload не читается и не журналируется: он может содержать секреты.
             panic_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        drop(observation);
         drain_workers_bounded(
             &mut workers,
             label,
@@ -542,6 +545,7 @@ pub(crate) async fn read_closed(client: &mut TcpStream) -> bool {
 }
 
 // Аутентификация SOCKS5-клиента (USER/PASS) на производственном слушателе.
+/// cancel-safe: NO — частичное рукопожатие терминально; отмена уничтожает сокет.
 pub(crate) async fn socks_auth(user: &str, pass: &str, address: std::net::SocketAddr) -> TcpStream {
     let mut client = TcpStream::connect(address).await.unwrap();
     client.write_all(&[5, 1, 2]).await.unwrap();
@@ -561,6 +565,7 @@ pub(crate) async fn socks_auth(user: &str, pass: &str, address: std::net::Socket
 // CONNECT к 1.1.1.1:443: публичный unicast, проходит адресный фильтр
 // (address.rs:316-328, 507-533), иначе отказ до bootstrap; рекордер при этом
 // видит адрес МОСТА 127.0.0.77:443 (передаётся PT in-band).
+/// cancel-safe: NO — частичный CONNECT не повторяется; caller уничтожает сокет.
 pub(crate) async fn socks_connect(client: &mut TcpStream) {
     client
         .write_all(&[5, 1, 0, 1, 1, 1, 1, 1, 1, 187])
@@ -591,6 +596,7 @@ pub(crate) async fn proxy_negotiate(stream: &mut TcpStream) -> std::io::Result<V
 }
 
 // Тело сессии после аутентификации: CONNECT к ловушке, носитель, дрейн.
+/// cancel-safe: нет — частичный протокол не повторяется; отмена закрывает owned socket.
 pub(crate) async fn proxy_serve(stream: &mut TcpStream, pass: Vec<u8>, report: impl Fn(Vec<u8>)) {
     let mut request = [0; 4];
     stream.read_exact(&mut request).await.unwrap();
@@ -605,9 +611,9 @@ pub(crate) async fn proxy_serve(stream: &mut TcpStream, pass: Vec<u8>, report: i
     let mut carrier = [0; 1];
     stream.read_exact(&mut carrier).await.unwrap();
     // Репортёр носителя: паника/переполнение решаются на месте вызова.
+    let observation = super::carrier_oracle::session(stream, &pass);
     report(pass);
-    let mut discard = [0; 1024];
-    while stream.read(&mut discard).await.unwrap_or(0) != 0 {}
+    super::carrier_oracle::drain(stream, observation).await;
 }
 
 // Kernel-backed witness: /proc/net/tcp общий для network namespace, а не

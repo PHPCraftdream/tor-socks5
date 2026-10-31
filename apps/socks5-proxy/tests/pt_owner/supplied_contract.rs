@@ -668,6 +668,11 @@ pub(crate) async fn run_supplied_config_negative() {
         tokio::time::Instant::now() < body_deadline,
         "подготовка превысила body deadline"
     );
+    let mut oracle = super::carrier_oracle::Oracle::arm(
+        setup.proxy.local_addr().unwrap(),
+        setup.proxy2_address,
+        setup.listener_address,
+    );
     let listener_address = setup.listener_address;
     let (events1_tx, mut events1_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     let (events2_tx, mut events2_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -807,52 +812,8 @@ pub(crate) async fn run_supplied_config_negative() {
         known_children
             .refresh(dir.path())
             .map_err(|_| "PT PID scan failed")?;
-        // Дрейн очередей носителей до пустоты: наблюдение свежих носителей
-        // привязано к НОВЫМ CONNECT, а не к событиям, уже лежавшим в каналах.
-        while events1_rx.try_recv().is_ok() {}
-        while events2_rx.try_recv().is_ok() {}
-        // Свежие носители = liveness-доказательство: global и alt живы и
-        // маршрутизируются через рекордеры прямо сейчас.
-        known_children
-            .refresh(dir.path())
-            .map_err(|_| "PT PID scan failed")?;
-        let mut global_alive = socks_auth("global", "pw", listener_address).await;
-        socks_connect(&mut global_alive).await;
-        if !tokio::time::timeout(Duration::from_secs(8), async {
-            let mut found = false;
-            while let Some(carrier) = events1_rx.recv().await {
-                if carrier == b"secret" {
-                    found = true;
-                    break;
-                }
-            }
-            found
-        })
-        .await
-        .map_err(|_| "свежий носитель secret не пришёл (8с)")?
-        {
-            return Err("рекордер1 закрыт без свежего носителя secret".into());
-        }
-        known_children
-            .refresh(dir.path())
-            .map_err(|_| "PT PID scan failed")?;
-        let mut alt_alive = socks_auth("alt", "pw", listener_address).await;
-        socks_connect(&mut alt_alive).await;
-        if !tokio::time::timeout(Duration::from_secs(8), async {
-            let mut found = false;
-            while let Some(carrier) = events2_rx.recv().await {
-                if carrier == b"second" {
-                    found = true;
-                    break;
-                }
-            }
-            found
-        })
-        .await
-        .map_err(|_| "свежий носитель second не пришёл (8с)")?
-        {
-            return Err("рекордер2 закрыт без свежего носителя second".into());
-        }
+        // Новый caller, фактический reserve и текущая сессия — разные свидетельства.
+        oracle.verify(listener_address, &setup.config_path).await?;
         Ok(())
     };
     let outcome = tokio::time::timeout_at(

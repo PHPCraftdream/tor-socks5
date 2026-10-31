@@ -5,6 +5,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
+#[derive(Default)]
 pub(crate) struct RecorderCounters {
     pub(crate) accept_overrun: Arc<AtomicUsize>,
     pub(crate) events_overrun: Arc<AtomicUsize>,

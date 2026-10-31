@@ -315,6 +315,8 @@ impl OwnerRegistry {
                 ),
                 Err(_) => (None, SelectionOutcome::ReserveFailed),
             };
+            #[cfg(target_os = "linux")]
+            handler_tests::carrier_oracle::reserved(identity, result.is_ok());
             self.selection_probe.publish(SelectionObservation {
                 request_id: *request_id,
                 route: route.clone(),
