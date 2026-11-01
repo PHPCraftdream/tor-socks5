@@ -431,3 +431,29 @@ pub(crate) async fn trap_control(
     .await
     .map_err(|_| "trap positive control deadline")?
 }
+
+/// cancel-safe: NO — cancellation drops the owned checkpoint socket; no retry.
+pub(crate) async fn audit_phase(label: &'static str) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    timeout_at(deadline, async {
+        let mut channel = tokio::net::TcpStream::connect("127.0.0.1:19053")
+            .await
+            .map_err(|_| "audit phase connection failed")?;
+        channel
+            .write_all(format!("PHASE {label}\n").as_bytes())
+            .await
+            .map_err(|_| "audit phase request failed")?;
+        let mut reply = [0; 3];
+        channel
+            .read_exact(&mut reply)
+            .await
+            .map_err(|_| "audit phase response failed")?;
+        if &reply != b"OK\n" {
+            return Err("audit phase response mismatch");
+        }
+        Ok::<(), &'static str>(())
+    })
+    .await
+    .expect("audit phase deadline elapsed")
+    .expect("audit phase exchange failed");
+}

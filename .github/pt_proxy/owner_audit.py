@@ -18,6 +18,12 @@ peers = {}
 interrupted = None
 snapshots = {tool: 0 for tool, _, _, _ in FAMILIES}
 packet_details = {tool: None for tool, _, _, _ in FAMILIES}
+phase_records = []
+PHASES = (
+    'owner-start', 'reuse-start', 'legacy-start',
+    'supplied-positive-start', 'supplied-negative-start',
+    'seeds-start', 'owner-end',
+)
 AUDIT_REASONS = frozenset((
     'oversized audit snapshot',
     'duplicate filter table',
@@ -278,6 +284,22 @@ def service(listener, ready):
         return
     reader, control = peers[ready]
     line = reader.readline(129)
+    if control is None and line.startswith('PHASE '):
+        label = line[6:-1]
+        require(line.endswith('\n') and label in PHASES,
+                'invalid audit phase label')
+        require(len(phase_records) < len(PHASES)
+                and label == PHASES[len(phase_records)],
+                'audit phase missing, repeated or out of order')
+        audit('iptables')
+        phase_records.append((label, packet_details['iptables']))
+        print(f'owner-audit phase={label} counter_units=packets,bytes '
+              f'counters={packet_details["iptables"]!r}', file=sys.stderr)
+        ready.sendall(b'OK\n')
+        reader.close()
+        ready.close()
+        del peers[ready]
+        return
     if control is None:
         match = re.fullmatch(r'BEGIN ([0-9]{1,5}) ([0-9]{1,5})\n', line)
         require(match is not None, 'invalid trap control registration')
@@ -440,6 +462,18 @@ import os
 import signal
 import socket
 
+def phase(label):
+    with socket.create_connection(('127.0.0.1', 19053), timeout=1) as connection:
+        connection.sendall(('PHASE ' + label + '\\n').encode('ascii'))
+        reply = b''
+        while len(reply) < 3:
+            part = connection.recv(3 - len(reply))
+            if not part:
+                raise RuntimeError('phase acknowledgment lost')
+            reply += part
+        if reply != b'OK\\n':
+            raise RuntimeError('phase acknowledgment invalid')
+phase('owner-start')
 channel = socket.create_connection(('127.0.0.1', 19053), timeout=1)
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server.settimeout(1)
@@ -464,6 +498,7 @@ accepted.settimeout(1)
 client.sendall(b'x')
 if accepted.recv(1) != b'x':
     raise RuntimeError('fault control TCP byte not delivered')
+phase('reuse-start')
 readiness, ready = os.pipe()
 child = os.fork()
 if child == 0:
@@ -482,6 +517,28 @@ os._exit(7)
     require(len(controls) == 1 and controls[0][3] and not protocol_complete(),
             'unfinished control was lost or manufactured complete')
 
+    require([label for label, _ in phase_records] == list(PHASES[:2]),
+            'fault control phase attribution missing or misleading')
+    first, second = [details for _, details in phase_records]
+    require(first is not None and second is not None
+            and not first['clipped_to_u64'] and not second['clipped_to_u64'],
+            'fault control phase counters missing')
+    require(first['output'][0] > 0 and first['output'][1] > 0
+            and first['output'] == first['loopback']
+            and first['output'] == first['classified_total']
+            and not first['live'] and not first['retired'],
+            'fault control checkpoint traffic accounting incorrect')
+    require(all(first[key] == (0, 0)
+                for key in ('dns_udp', 'dns_tcp', 'forbidden')),
+            'fault control checkpoint was not packet-clean')
+    require(second['output'] == second['classified_total']
+            and len(second['live']) == 1 and not second['retired']
+            and second['live'][0][1] == second['live'][0][2]
+            and second['live'][0][1][0] > 0,
+            'fault control live-tuple phase attribution incorrect')
+    require(all(second[key] == (0, 0)
+                for key in ('dns_udp', 'dns_tcp', 'forbidden')),
+            'fault control live-tuple phase was not packet-clean')
     counts = audit('iptables')
     require(counts[controls[0][2]][0][0] > 0
             and counts[controls[0][2]][0][1] > 0,
@@ -519,6 +576,7 @@ os._exit(7)
     command('iptables', '-X', controls[0][2])
     close_peers()
     controls.clear()
+    phase_records.clear()
 
 def main():
     require(os.getpid() == 1 and os.environ.get('GITHUB_ACTIONS') == 'true'
@@ -548,6 +606,9 @@ def main():
             except Exception as failure:
                 error = error or type(failure).__name__
             protocol_ok = protocol_complete()
+            phases_ok = [label for label, _ in phase_records] == list(PHASES)
+            print(f'owner-audit phase_sequence_complete={phases_ok}',
+                  file=sys.stderr)
             results = packet_audits(traffic=True)
             audit_ok = all(acquired and clean_ok
                            for acquired, clean_ok, _ in results.values())
@@ -555,6 +616,8 @@ def main():
                 close_peers()
             except Exception as failure:
                 error = error or type(failure).__name__
+            if not phases_ok:
+                error = error or 'IncompleteAuditPhases'
     print(f'owner-audit setup={setup_ok} owner_status={status!r} '
           f'cleanup={cleanup_ok} protocol={protocol_ok} packet_audit={audit_ok} '
           f'interrupted={interrupted!r} supervisor_error={error!r}', file=sys.stderr)

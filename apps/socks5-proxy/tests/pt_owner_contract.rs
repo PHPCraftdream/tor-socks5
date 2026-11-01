@@ -145,6 +145,9 @@ fn main() {
         .enable_all()
         .build()
         .unwrap();
+    rt.block_on(server::owners::handler_tests::http_peer::audit_phase(
+        "owner-start",
+    ));
     server::owners::handler_tests::run_session_ledger_controls();
     eprintln!("PT session ledger controls: PASS");
     rt.block_on(server::owners::handler_tests::run_recorder_actor_controls())
@@ -171,11 +174,29 @@ fn main() {
     eprintln!("PT supplied WebTunnel pre-proxy AUTH rejection: PASS");
     rt.block_on(server::owners::handler_tests::webtunnel_contract::run_connect_rejection());
     eprintln!("PT supplied WebTunnel pre-proxy CONNECT rejection: PASS");
+    rt.block_on(server::owners::handler_tests::http_peer::audit_phase(
+        "reuse-start",
+    ));
     rt.block_on(server::owners::handler_tests::carrier_oracle::run_reuse_and_rejection_controls());
+    rt.block_on(server::owners::handler_tests::http_peer::audit_phase(
+        "legacy-start",
+    ));
     rt.block_on(server::owners::handler_tests::run_pt_owner_contract());
+    rt.block_on(server::owners::handler_tests::http_peer::audit_phase(
+        "supplied-positive-start",
+    ));
     rt.block_on(server::owners::handler_tests::run_supplied_config_positive());
+    rt.block_on(server::owners::handler_tests::http_peer::audit_phase(
+        "supplied-negative-start",
+    ));
     rt.block_on(server::owners::handler_tests::run_supplied_config_negative());
+    rt.block_on(server::owners::handler_tests::http_peer::audit_phase(
+        "seeds-start",
+    ));
     rt.block_on(server::owners::handler_tests::run_supplied_config_seeds_rejected());
+    rt.block_on(server::owners::handler_tests::http_peer::audit_phase(
+        "owner-end",
+    ));
 }
 
 #[cfg(not(target_os = "linux"))]
