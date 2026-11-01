@@ -87,6 +87,72 @@ class Routing(unittest.TestCase):
         with self.assertRaisesRegex(p.MappingError, 'missing mapping: контракт PT'):
             p.pt_contract(read(installed), read(legacy))
 
+    def test_actual_audited_pt_contract_and_affected_routing(self):
+        root = Path(__file__).resolve().parents[2]
+        workflow = ".github/workflows/ci.yml"
+        audit = ".github/pt_proxy/owner_audit.py"
+        paths = set(p.PT_MARKERS) | {audit}
+        actual = {path: (root / path).read_text(encoding="utf-8") for path in paths}
+        read = lambda data: lambda path: data.get(path, "")
+        direct = {path: "\n".join(markers) for path, markers in p.PT_MARKERS.items()}
+        invocation = (
+            'exec unshare --net --pid --fork --mount-proc env '
+            'GITHUB_ACTIONS=true PT_PROXY_ISOLATED=yes python3 -I '
+            '.github/pt_proxy/owner_audit.py "$(<"$1/target/pt-owner-path")"'
+        )
+        self.assertIn(invocation, actual[workflow])
+        self.assertTrue(p.pt_contract(read(direct), read(actual)))
+        self.assertTrue(p.pt_contract(read(actual), read(actual)))
+        self.assertTrue(p.pt_contract(read({}), read(actual)))
+
+        broken_workflow = actual[workflow].replace(invocation, "")
+        broken = dict(actual, **{workflow: broken_workflow})
+        with self.assertRaisesRegex(p.MappingError, "missing mapping: контракт PT"):
+            p.pt_contract(read(direct), read(broken))
+        with self.assertRaisesRegex(p.MappingError, "missing mapping: контракт PT"):
+            p.pt_contract(read(actual), read(direct))
+        with self.assertRaisesRegex(p.MappingError, "missing mapping: контракт PT"):
+            p.pt_contract(read(direct), read(dict(actual, **{audit: ""})))
+        with self.assertRaisesRegex(p.MappingError, "missing mapping: контракт PT"):
+            p.pt_contract(read(dict(actual, **{audit: ""})), read(actual))
+
+        for path, markers in p.PT_AUDIT_MARKERS.items():
+            for marker in markers:
+                with self.subTest(path=path, marker=marker):
+                    broken = dict(actual, **{path: actual[path].replace(marker, "")})
+                    with self.assertRaisesRegex(p.MappingError, "missing mapping: контракт PT"):
+                        p.pt_contract(read(actual), read(broken))
+
+        before = actual[workflow].replace(invocation, 'echo "previous PT invocation"')
+        result = self.route(workflow, blobs={workflow: (before, actual[workflow])})
+        self.assertIn("pt-proxy", result["segments"])
+        self.assertFalse(result["full"])
+        for path in (
+            audit,
+            "apps/socks5-proxy/tests/pt_owner_contract.rs",
+            "apps/socks5-proxy/tests/pt_owner/http_peer.rs",
+            "apps/socks5-proxy/tests/pt_owner/webtunnel_contract.rs",
+            "apps/socks5-proxy/tests/pt_owner/child_processes.rs",
+            "apps/socks5-proxy/tests/pt_owner/scenario_resources.rs",
+            "apps/socks5-proxy/tests/pt_owner/carrier_oracle.rs",
+        ):
+            with self.subTest(path=path):
+                result = self.route(path)
+                self.assertIn("pt-proxy", result["segments"])
+                self.assertFalse(result["full"])
+
+        unknown = actual[workflow] + "\n  unmapped-owner-audit-job:\n    runs-on: ubuntu-latest\n"
+        with self.assertRaisesRegex(p.MappingError, "missing mapping: блок workflow"):
+            self.route(workflow, blobs={workflow: (actual[workflow], unknown)})
+        with self.assertRaisesRegex(p.MappingError, "missing mapping:"):
+            self.route("scripts/testing/unmapped-owner-audit.py")
+        blocks = p.workflow_blocks(actual[workflow])
+        self.assertIn("contains(fromJSON(needs.plan.outputs.plan).segments, 'pt-proxy')",
+                      blocks["pt-proxy-contract"])
+        self.assertIn(invocation, blocks["pt-proxy-contract"])
+        self.assertIn("pt-proxy-contract", blocks["required"])
+        self.assertIn("always()", blocks["required"])
+
     def test_proxy_auth_config(self):
         self.assertEqual(self.route("apps/socks5-proxy/src/main.rs")["packages"], ["socks5-proxy"])
         auth = self.route("packages/auth/src/lib.rs")
