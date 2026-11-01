@@ -665,145 +665,336 @@ class ReleaseWorkflowWiring(unittest.TestCase):
     substrings где угодно в файле."""
 
     def setUp(self):
-        with open(fx.RELEASE_YML, "r", encoding="utf-8") as f:
-            self.lines = f.read().splitlines()
-        self.jobs = self._job_blocks()
-        self.assertTrue({"validate", "build", "release"} <= set(self.jobs),
-                        self.jobs.keys())
+        self.release = self._read('.github/workflows/release.yml')
+        self.producer = self._read('.github/workflows/license-bundle.yml')
+        self.promotion = self._read('.github/workflows/license-promote.yml')
+        self.publisher = self._read('.github/release/publish-bundle.sh')
 
-    def _job_blocks(self):
-        # job-ключи — на отступе ровно 2 под "jobs:"; всё глубже — тело
-        jobs, cur = {}, None
-        for line in self.lines:
-            if (line.startswith("  ") and not line.startswith("   ")
-                    and line.rstrip().endswith(":")
-                    and ":" not in line.strip()[:-1]):
-                cur = line.strip()[:-1]
-                jobs[cur] = []
-            elif cur is not None:
-                jobs[cur].append(line)
-        return {k: "\n".join(v) for k, v in jobs.items()}
+    def _read(self, path):
+        with open(os.path.join(fx.REPO_ROOT, path), encoding='utf-8') as f:
+            return f.read()
 
-    def _top_block(self, key):
-        out, cur = [], False
-        for line in self.lines:
-            if line.strip() == key + ":":
-                cur = True
-                continue
-            if cur and line and not line[0].isspace():
-                break
-            if cur:
-                out.append(line)
-        return "\n".join(out)
+    def _code(self, text):
+        return '\n'.join(line.split('#', 1)[0].rstrip()
+                         for line in text.splitlines())
 
-    def _code_lines(self, block):
-        """Строки блока без комментариев: property-строки сравниваются без
-        учёта комментариев, чтобы «# id: tag» не подменял реальное id."""
-        return [line.split("#", 1)[0] for line in block.splitlines()]
+    def _top(self, text, key):
+        import re
+        match = re.search(r'(?m)^' + re.escape(key) + r':[ \t]*\n((?:(?:[ \t]+[^\n]*)?\n)*)',
+                          self._code(text) + '\n')
+        self.assertIsNotNone(match, key)
+        return match.group(1)
 
-    def test_validate_step_bindings(self):
-        val = self.jobs["validate"]
-        # id: tag — в ТОМ ЖЕ step, который запускает validate-tag.sh;
-        # сравнение по property-строкам БЕЗ комментариев
-        steps = val.split("\n      - ")
-        tag_steps = [s for s in steps if "validate-tag.sh" in s]
-        self.assertEqual(len(tag_steps), 1)
-        code = [c.strip() for c in self._code_lines(tag_steps[0])
-                if c.strip()]
-        self.assertIn("id: tag", code)
-        # job outputs ссылаются именно на этот step
-        self.assertIn("tag: ${{ steps.tag.outputs.tag }}", val)
-        self.assertIn("prerelease: ${{ steps.tag.outputs.prerelease }}", val)
+    def _jobs(self, text):
+        import re
+        block = self._top(text, 'jobs')
+        matches = list(re.finditer(r'(?m)^  ([\w-]+):\s*$', block))
+        return {m.group(1): block[m.end():matches[i + 1].start()
+                                  if i + 1 < len(matches) else len(block)]
+                for i, m in enumerate(matches)}
 
-    def test_publisher_env_needs_permissions(self):
-        rel = self.jobs["release"]
-        self.assertIn("needs: [validate, build]", rel)
-        # env публикации — из outputs validate-job'а и секретов
-        self.assertIn("TAG: ${{ needs.validate.outputs.tag }}", rel)
-        self.assertIn("PRERELEASE: ${{ needs.validate.outputs.prerelease }}", rel)
-        self.assertIn("REMOTE_REPO: ${{ github.repository }}", rel)
-        self.assertIn("GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}", rel)
-        self.assertIn("publish.sh", rel)
-        # contents: write — ТОЛЬКО у публикации
-        self.assertIn("contents: write", rel)
-        for job in ("validate", "build"):
-            self.assertNotIn("contents: write", self.jobs[job])
+    def _steps(self, job):
+        import re
+        return re.split(r'(?m)^      - ', job)[1:]
 
-    def test_top_level_permissions_read(self):
-        # top-level permissions: только read; write появляется ТОЛЬКО
-        # внутри release-job'а (проверено в предыдущем тесте)
-        perms = self._top_block("permissions")
-        self.assertIn("contents: read", perms)
-        self.assertNotIn("contents: write", perms)
+    def _contains_line(self, block, line):
+        self.assertIn(line, [s.strip() for s in self._code(block).splitlines()])
 
-    def test_matrix_runner_target_mapping(self):
-        # target→runner привязка по ФАКТИЧЕСКИМ include-записям (парами
-        # runner/target в одном элементе), а не по одному множеству targets
-        expected = [
-            ("ubuntu-latest", "x86_64-unknown-linux-gnu"),
-            ("ubuntu-latest", "x86_64-unknown-linux-musl"),
-            ("ubuntu-24.04-arm", "aarch64-unknown-linux-gnu"),
-            ("ubuntu-24.04-arm", "aarch64-unknown-linux-musl"),
-            ("windows-latest", "x86_64-pc-windows-msvc"),
-            ("macos-15-intel", "x86_64-apple-darwin"),
-            ("macos-15", "aarch64-apple-darwin"),
+    def _command(self, block, command, flags):
+        steps = [s for s in self._steps(block) if command in s]
+        self.assertEqual(len(steps), 1, command)
+        lines = [line.strip() for line in steps[0].splitlines() if command in line]
+        self.assertEqual(len(lines), 1, command)
+        for flag in flags:
+            self.assertIn(flag, lines[0], command)
+        return steps[0]
+
+    def _assert_release(self, text):
+        import re
+        jobs = self._jobs(text)
+        self.assertEqual(set(jobs), {'validate', 'license-audit', 'origin', 'release'})
+        self.assertEqual([s.strip() for s in self._top(text, 'on').splitlines() if s.strip()],
+                         ['push:', 'tags:', "- 'v*'"])
+        self.assertEqual([s.strip() for s in self._top(text, 'permissions').splitlines() if s.strip()],
+                         ['contents: read'])
+        val = jobs['validate']
+        steps = [s for s in self._steps(val) if 'bash .github/release/validate-tag.sh' in s]
+        self.assertEqual(len(steps), 1)
+        self._contains_line(steps[0], 'id: tag')
+        self._contains_line(steps[0], 'GH_REF_NAME: ${{ github.ref_name }}')
+        self._contains_line(steps[0], 'bash .github/release/validate-tag.sh "$GH_REF_NAME" > "$GITHUB_OUTPUT"')
+        for key in ('tag', 'prerelease'):
+            self._contains_line(val, key + ': ${{ steps.tag.outputs.' + key + ' }}')
+        audit = jobs['license-audit']
+        self.assertNotRegex(audit, r'(?m)^    needs:')
+        self._contains_line(audit, '- run: cargo deny --config .github/deny.toml check licenses')
+        self.assertIn('cargo metadata --locked --format-version 1 --filter-platform "$target"', audit)
+        rel = jobs['release']
+        self._contains_line(rel, 'needs: [validate, origin, license-audit]')
+        self._contains_line(jobs['origin'], 'needs: validate')
+        for job in ('origin', 'release'):
+            block = jobs[job]
+            for key in ('POLICY_SHA', 'BUILD_SHA', 'PROMOTION_RUN_ID', 'PROMOTION_ATTEMPT',
+                        'PROMOTION_ARTIFACT_ID', 'REVIEW_COMMIT', 'PRODUCER_RUN_ID',
+                        'PRODUCER_ATTEMPT', 'PRODUCER_ARTIFACT_ID'):
+                self._contains_line(block, key + ': ${{ vars.LICENSE_' + key + ' }}')
+            self._contains_line(block, 'TAG: ${{ needs.validate.outputs.tag }}')
+            self._contains_line(block, 'actions: read')
+            self._contains_line(block, 'ref: ${{ vars.LICENSE_POLICY_SHA }}')
+            self._contains_line(block, 'persist-credentials: false')
+            self._contains_line(block, '[ "$(git rev-parse HEAD)" = "$POLICY_SHA" ]')
+            self._command(block, 'provenance.py fetch-promotion', (
+                '--run-id "$PROMOTION_RUN_ID"', '--attempt "$PROMOTION_ATTEMPT"',
+                '--artifact-id "$PROMOTION_ARTIFACT_ID"', '--head-sha "$BUILD_SHA"',
+                '--policy-sha "$POLICY_SHA"', '--tag "$TAG"', '--review-commit "$REVIEW_COMMIT"',
+                '--producer-run-id "$PRODUCER_RUN_ID"', '--producer-attempt "$PRODUCER_ATTEMPT"',
+                '--producer-artifact-id "$PRODUCER_ARTIFACT_ID"', '--output target/promoted'))
+            self._contains_line(block, '[ "$tag_sha" = "$BUILD_SHA" ]')
+        self._contains_line(rel, 'PRERELEASE: ${{ needs.validate.outputs.prerelease }}')
+        self._contains_line(rel, 'REMOTE_REPO: ${{ github.repository }}')
+        publish = [s for s in self._steps(rel) if 'run: bash .github/release/publish-bundle.sh' in s]
+        self.assertEqual(len(publish), 1)
+        for line in ('ARTIFACTS_DIR: ${{ github.workspace }}/target/promoted/artifacts',
+                     'ORIGIN_DIR: ${{ github.workspace }}/target/promoted',
+                     'GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}'):
+            self._contains_line(publish[0], line)
+        self.assertLess(rel.index('provenance.py fetch-promotion'), rel.index('run: bash .github/release/publish-bundle.sh'))
+        self._contains_line(rel, 'contents: write')
+        for name, block in jobs.items():
+            if name != 'release':
+                self.assertNotRegex(block, r'(?m)^\s*contents:\s*write\s*$')
+        self.assertNotRegex(self._code(text), r'\bcargo\s+build\b')
+
+    def _assert_producer(self, text):
+        import re
+        jobs = self._jobs(text)
+        self.assertEqual(set(jobs), {'guard', 'plan', 'offline-tests', 'build', 'aggregate', 'required'})
+        self.assertNotIn('workflow_call:', self._top(text, 'on')); self.assertNotRegex(jobs['guard'], r'(?m)^    if:')
+        self._contains_line(jobs['guard'], '[ "$EVENT" = pull_request ] || { [ "$EVENT" = workflow_dispatch ] && [ "$REF" = refs/heads/main ]; }')
+        self._contains_line(jobs['plan'], 'needs: guard'); self.assertNotRegex(jobs['plan'], r'(?m)^    if:')
+        self.assertIn('--event pull_request --base "$BASE" --head "$HEAD"', jobs['plan']); self._contains_line(jobs['plan'], '''printf '%s\\n' '{"segments":["license-offline"]}' > "$RUNNER_TEMP/license-plan.json"''')
+        self.assertIn("require(e['PLAN_RESULT'] == 'success')", jobs['required']); self._contains_line(jobs['required'], 'if: always()'); self._contains_line(jobs['required'], 'needs: [guard, plan, offline-tests, build, aggregate]')
+        self._contains_line(jobs['build'], "if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'"); self._contains_line(jobs['build'], 'needs: [guard, plan]')
+        job_envs = {}
+        for name, job in jobs.items():
+            envs = re.findall(r'(?m)^    env:[ \t]*\n((?:(?: {6,}[^\n]*|[ \t]*)\n)*)',
+                              self._code(job) + '\n')
+            job_envs[name] = envs
+            for env in envs:
+                self.assertNotRegex(env, r'(?is)\$\{\{(?:(?!\}\}).)*\brunner\s*(?:\.|\[)')
+        self.assertEqual(len(job_envs['build']), 1)
+        self.assertEqual(re.findall(r'(?m)^      CARGO_HOME:[ \t]*(.*)$', job_envs['build'][0]),
+                         ['${{ github.workspace }}/target/license-cargo-home'])
+        self.assertEqual([s.strip() for s in self._top(text, 'permissions').splitlines() if s.strip()], ['contents: read'])
+        offline = jobs['offline-tests']; self._contains_line(offline, 'needs: [guard, plan]'); self._contains_line(offline, "if: always() && needs.guard.result == 'success' && needs.plan.result == 'success' && ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && contains(fromJSON(needs.plan.outputs.plan).segments, 'license-offline')))")
+        for suite in ('test_source_inventory.py', 'test_provenance.py'):
+            self._contains_line(offline, 'python3 -I .github/release/license/tests/unit/' + suite)
+        steps = self._steps(offline)
+        checkout = [i for i, s in enumerate(steps) if s.startswith('uses: actions/checkout@v7')]
+        sdk = [i for i, s in enumerate(steps) if s.startswith('uses: ./.github/actions/setup-local-sdk')]
+        suites = [i for i, s in enumerate(steps) if s.startswith('name: Run offline Python suites')]
+        chain = [i for i, s in enumerate(steps) if s.startswith('name: TEST-ONLY transport chain (not production authority)')]
+        self.assertEqual(len(checkout), 1); self.assertEqual(len(sdk), 1); self.assertEqual(len(suites), 1)
+        self._contains_line(steps[suites[0]], 'python3 -I .github/install/tests/test_release.py ReleaseWorkflowWiring')
+        self.assertEqual(len(chain), 1)
+        self.assertLess(checkout[0], sdk[0]); self.assertLess(sdk[0], suites[0]); self.assertLess(suites[0], chain[0])
+        self._contains_line(steps[chain[0]], 'run: python3 -I .github/release/license/tests/integration/test_release_chain.py')
+        self.assertNotRegex(steps[chain[0]], r'(?m)^\s*(?:if|continue-on-error):')
+        build = jobs['build']
+        entries = re.findall(r'(?m)^\s*-\s*\{([^{}]+)\}\s*$', build)
+        mapping = []
+        for entry in entries:
+            fields = dict(part.strip().split(':', 1) for part in entry.split(','))
+            mapping.append((fields['runner'].strip(), fields['target'].strip()))
+        self.assertEqual(mapping, [
+            ('ubuntu-latest', 'x86_64-unknown-linux-gnu'),
+            ('ubuntu-latest', 'x86_64-unknown-linux-musl'),
+            ('ubuntu-24.04-arm', 'aarch64-unknown-linux-gnu'),
+            ('ubuntu-24.04-arm', 'aarch64-unknown-linux-musl'),
+            ('windows-latest', 'x86_64-pc-windows-msvc'),
+            ('macos-15-intel', 'x86_64-apple-darwin'),
+            ('macos-15', 'aarch64-apple-darwin')])
+        self._contains_line(build, 'runs-on: ${{ matrix.runner }}')
+        for needle in ('admission.py snapshot --prepared target/license-prepared',
+                       'cargo build --locked --offline --release -p socks5-proxy --target "$TARGET"',
+                       'admission.py record --prepared target/license-prepared'):
+            self.assertIn(needle, build)
+        snapshot = build.index('admission.py snapshot --prepared target/license-prepared')
+        compile_at = build.index('cargo build --locked --offline --release -p socks5-proxy --target "$TARGET"')
+        record = build.index('admission.py record --prepared target/license-prepared')
+        self.assertLess(snapshot, compile_at); self.assertLess(compile_at, record)
+        with open(os.path.join(fx.REPO_ROOT, '.github', 'workflows', 'ci.yml'), encoding='utf-8') as f:
+            ci = f.read()
+        core = self._jobs(ci)['license-lifecycle']; self.assertNotIn('test_lifecycle.py', text)
+        self._contains_line(core, "if: github.event_name == 'pull_request' && contains(fromJSON(needs.plan.outputs.plan).segments, 'license-lifecycle')")
+        lifecycle = self._command(core, '.github/release/license/tests/integration/test_lifecycle.py', (
+            '--prepared target/license-prepared', '--project .', '--sdk ../resocks5',
+            '--registry-cache "$CARGO_HOME/registry/cache"', '--target "$TARGET"',
+            '--binary "$binary"', '--messages target/license-logs/build-messages.jsonl',
+            '--features target/license-logs/features.txt', '--toolchain target/license-logs/toolchain.txt',
+            '--native-evidence target/license-logs', '--expanded-before target/license-expanded-before.json'))
+        self._contains_line(lifecycle, "if: github.event_name == 'pull_request'")
+        self.assertLess(core.index('admission.py record --prepared target/license-prepared'), core.index('test_lifecycle.py'))
+        self.assertNotIn('--output', lifecycle)
+        evidence_upload = [s for s in self._steps(build) if 'name: license-evidence-${{ matrix.target }}' in s]
+        self.assertEqual(len(evidence_upload), 1); self.assertIn('            target/license-receipt\n', evidence_upload[0])
+        self.assertNotIn('lifecycle', evidence_upload[0])
+        self.assertIn('--expanded-before target/license-expanded-before.json', build[record:])
+        self._contains_line(build, 'cmp "$TOR_SOCKS5_SOURCE_INFO" target/license-logs/actual-source-info.txt')
+        self._contains_line(build, 'cmp "$TOR_SOCKS5_NOTICES" target/license-logs/actual-notices.txt')
+        aggregate = jobs['aggregate']
+        self._contains_line(aggregate, 'name: Retain release candidate')
+        self._contains_line(aggregate, 'needs: [build, offline-tests]')
+        diagnostics = [s for s in self._steps(aggregate) if 'name: license-bundle-candidate' in s]
+        self.assertEqual(len(diagnostics), 1)
+        self._contains_line(diagnostics[0], 'target/license-blockers.json')
+        self.assertNotIn('license-blockers.json', [line.strip() for line in diagnostics[0].splitlines()])
+        self._contains_line(aggregate, '[ "$BUILD_RESULT" = success ] && [ "$TEST_RESULT" = success ]')
+        self._contains_line(aggregate, 'cp "artifacts/$archive" "artifacts/$archive.sha256" target/retained-artifacts/')
+        self._contains_line(aggregate, 'cp -R "evidence/license-evidence-$target/license-receipt" "target/retained-evidence/license-evidence-$target/"')
+        self._command(aggregate, 'provenance.py seal ', ('--artifacts target/retained-artifacts',
+                      '--evidence target/retained-evidence', '--tag "$TAG"', '--output target/retained'))
+        self._contains_line(aggregate, 'name: license-retained-${{ github.run_id }}-${{ github.run_attempt }}')
+        self._contains_line(aggregate, 'path: target/retained/')
+        targets = re.search(r'for target in (.*); do', aggregate)
+        self.assertIsNotNone(targets); self.assertEqual(sorted(targets.group(1).split()), sorted(UNIX_TARGETS + WIN_TARGETS))
+
+    def _assert_promotion(self, text):
+        import re
+        self.assertEqual([s.strip() for s in self._top(text, 'on').splitlines() if re.match(r'^  [\w-]+:', s)], ['workflow_dispatch:'])
+        self.assertEqual([s.strip() for s in self._top(text, 'permissions').splitlines() if s.strip()], ['actions: read', 'contents: read'])
+        jobs = self._jobs(text)
+        self.assertEqual(set(jobs), {'promote'})
+        block = jobs['promote']
+        self._contains_line(block, "if: github.ref == 'refs/heads/main'")
+        self.assertNotRegex(block, r'\b(?:cargo|rustc|rustup)\b')
+        self.assertNotRegex(block, r'\bgh\s+')
+        self.assertNotRegex(block, r'\b(?:tar\s|gzip\s|zip\s|Compress-Archive|publish(?:-bundle)?\.sh)')
+        commands = [
+            'provenance.py fetch ',
+            'admission.py review ',
+            'provenance.py verify-origin ',
+            'cp target/retained/artifacts/* target/final-artifacts/',
+            'admission.py assemble --evidence target/final-evidence --artifacts target/final-artifacts --tag "$TAG" --output "target/final-artifacts/tor-socks5-$TAG-license-bundle.tar.gz"',
+            'admission.py verify-release --artifacts target/final-artifacts --tag "$TAG"',
+            'provenance.py seal-promotion',
+            'uses: actions/upload-artifact@v4']
+        for command in commands:
+            self.assertIn(command, block)
+        producer_flags = ('--run-id "$PRODUCER_RUN_ID"', '--attempt "$PRODUCER_ATTEMPT"',
+                          '--artifact-id "$PRODUCER_ARTIFACT_ID"', '--head-sha "$BUILD_SHA"', '--tag "$TAG"')
+        self._command(block, 'provenance.py fetch ', producer_flags + ('--output target/retained',))
+        self._command(block, 'provenance.py verify-origin ', producer_flags + ('--retained target/retained',))
+        self._command(block, 'admission.py review ', (
+            '--receipt "target/retained/evidence/license-evidence-$target/license-receipt"',
+            '--review "target/reviews/.github/release/license/reviews/$target.json"',
+            '--output "target/final-evidence/license-evidence-$target/license-receipt"'))
+        self._contains_line(block, 'ref: ${{ inputs.review_commit }}')
+        self._contains_line(block, 'path: target/reviews')
+        self._contains_line(block, 'REVIEW_COMMIT: ${{ inputs.review_commit }}')
+        self._contains_line(block, 'run: \'[ "$(git -C target/reviews rev-parse HEAD)" = "$REVIEW_COMMIT" ]\'')
+        self.assertLess(block.index('git -C target/reviews rev-parse HEAD'), block.index('admission.py review '))
+        self._command(block, 'provenance.py seal-promotion', (
+            '--producer-run-id "$PRODUCER_RUN_ID"', '--producer-attempt "$PRODUCER_ATTEMPT"',
+            '--producer-artifact-id "$PRODUCER_ARTIFACT_ID"', '--head-sha "$BUILD_SHA"',
+            '--tag "$TAG"', '--retained target/retained', '--artifacts target/final-artifacts',
+            '--evidence target/final-evidence', '--reviews target/reviews', '--review-commit "$REVIEW_COMMIT"', '--output target/promoted'))
+        positions = [block.index(command) for command in commands]
+        self.assertEqual(positions, sorted(positions))
+        self._contains_line(block, 'path: target/promoted/')
+        target_match = re.search(r'for target in (.*); do', block)
+        self.assertIsNotNone(target_match)
+        targets = target_match.group(1).split()
+        self.assertEqual(set(targets), set(UNIX_TARGETS) | set(WIN_TARGETS))
+        self.assertEqual(len(targets), 7)
+
+    def test_workflow_graph_and_producer(self):
+        self._assert_release(self.release)
+        self._assert_producer(self.producer)
+        self._assert_promotion(self.promotion)
+
+    def test_publisher_provenance_and_assets(self):
+        code = self._code(self.publisher)
+        self.assertIn('provenance.py', code)
+        self.assertIn('admission.py verify-release --artifacts "$ARTIFACTS_DIR" --tag "$TAG"', code)
+        self.assertIn('provenance.py verify-promotion', code)
+        for flag in ('--run-id "$PROMOTION_RUN_ID"', '--attempt "$PROMOTION_ATTEMPT"',
+                     '--artifact-id "$PROMOTION_ARTIFACT_ID"', '--head-sha "$BUILD_SHA"',
+                     '--policy-sha "$POLICY_SHA"', '--tag "$TAG"', '--review-commit "$REVIEW_COMMIT"',
+                     '--producer-run-id "$PRODUCER_RUN_ID"', '--producer-attempt "$PRODUCER_ATTEMPT"',
+                     '--producer-artifact-id "$PRODUCER_ARTIFACT_ID"', '--promoted "$ORIGIN_DIR"'):
+            self.assertIn(flag, code[code.index('provenance.py verify-promotion'):code.index('promotion provenance verification failed')])
+        self.assertLess(code.index('admission.py verify-release'), code.index('gh release create'))
+        self.assertLess(code.index('admission.py verify-release'), code.index('gh release upload'))
+        self.assertLess(code.index('admission.py verify-release'), code.index('gh api --method PATCH'))
+        self.assertIn('"$ORIGIN_DIR"', code)
+        self.assertLess(code.index('provenance.py'), code.index('gh release create'))
+        self.assertLess(code.index('provenance.py'), code.index('gh release upload'))
+        self.assertLess(code.index('provenance.py'), code.index('gh api --method PATCH'))
+        self.assertIn('tor-socks5-$TAG-$t.tar.gz tor-socks5-$TAG-$t.tar.gz.sha256', code)
+        self.assertIn('tor-socks5-$TAG-$t.zip tor-socks5-$TAG-$t.zip.sha256', code)
+        self.assertIn('tor-socks5-$TAG-license-bundle.tar.gz tor-socks5-$TAG-license-bundle.tar.gz.sha256', code)
+        self.assertIn('for f in $expected_files; do\n    gh release upload', code)
+        self.assertEqual(len(expected_names(TAG)) + 2, 16)
+        asset_check = code[code.index('check_assets() {'):code.index('check_asset_sizes() {')]
+        self.assertIn('($m[0].digest != $hashes[$n])', asset_check)
+        self.assertIn('($m[0].size // 0) <= 0', asset_check)
+        self.assertIn('(($m[0].size // null) | type) != "number"', asset_check)
+
+    def test_mutational_controls(self):
+        self._assert_release(self.release)
+        self._assert_producer(self.producer)
+        self._assert_promotion(self.promotion)
+        step_runner = self.producer.replace(
+            '        run: python3 -I .github/release/license/tests/integration/test_release_chain.py',
+            '        env:\n          TEMP_DIR: ${{ runner.temp }}\n'
+            '        run: python3 -I .github/release/license/tests/integration/test_release_chain.py', 1)
+        self.assertNotEqual(step_runner, self.producer)
+        self._assert_producer(step_runner)
+        cases = [
+            (self._assert_producer, self.producer.replace('    needs: guard\n    runs-on: ubuntu-latest', "    needs: guard\n    if: github.event_name == 'pull_request'\n    runs-on: ubuntu-latest", 1)),
+            (self._assert_producer, self.producer.replace('[ "$EVENT" = pull_request ] || { [ "$EVENT" = workflow_dispatch ] && [ "$REF" = refs/heads/main ]; }', 'true', 1)),
+            (self._assert_producer, self.producer.replace('CARGO_HOME: ${{ github.workspace }}/target/license-cargo-home', 'CARGO_HOME: ${{ runner.temp }}/license-cargo-home', 1)),
+            (self._assert_producer, self.producer.replace('    name: License tooling offline tests\n', '    name: License tooling offline tests\n    env:\n      TEMP_DIR: ${{ runner.temp }}\n', 1)),
+            (self._assert_producer, self.producer.replace('CARGO_HOME: ${{ github.workspace }}/target/license-cargo-home', 'CARGO_HOME: ~/.cargo', 1)),
+            (self._assert_producer, self.producer.replace('          python3 -I .github/install/tests/test_release.py ReleaseWorkflowWiring\n', '', 1)),
+            (self._assert_producer, self.producer.replace(self._jobs(self.producer)['offline-tests'], self._jobs(self.producer)['offline-tests'].replace('      - uses: ./.github/actions/setup-local-sdk\n', '', 1), 1)),
+            (self._assert_producer, self.producer.replace('run: python3 -I .github/release/license/tests/integration/test_release_chain.py', 'run: true', 1)),
+            (self._assert_producer, self.producer.replace('            target/license-blockers.json', '            license-blockers.json', 1)),
+            (self._assert_producer, self.producer.replace('          - {runner: macos-15, target: aarch64-apple-darwin, archive: tar.gz}\n', '', 1)),
+            (self._assert_producer, self.producer.replace('    needs: [guard, plan]\n    if: github.event_name', '    needs: guard\n    if: github.event_name', 1)), (self._assert_producer, self.producer.replace('{"segments":["license-offline"]}', '{"segments":[]}', 1)), (self._assert_producer, self.producer.replace(" && needs.plan.result == 'success'", '', 1)), (self._assert_producer, self.producer.replace('    if: always()\n    needs: [guard, plan, offline-tests, build, aggregate]', "    if: github.event_name == 'pull_request'\n    needs: [guard, plan, offline-tests, build, aggregate]", 1)),
+            (self._assert_release, self.release.replace('needs: [validate, origin, license-audit]', 'needs: [validate, origin]', 1)),
+            (self._assert_release, self.release.replace('run: bash .github/release/publish-bundle.sh', 'run: bash .github/release/publish.sh', 1)),
+            (self._assert_release, self.release.replace('ORIGIN_DIR: ${{ github.workspace }}/target/promoted', 'ORIGIN_DIR: ${{ github.workspace }}/target/promoted/artifacts', 1)),
+            (self._assert_release, self.release.replace('needs: [validate, origin, license-audit]', '# needs: [validate, origin, license-audit]\n    needs: [validate, origin]', 1)),
+            (self._assert_promotion, self.promotion.replace('set -euo pipefail', 'set -euo pipefail\n          cargo build --release', 1)),
         ]
-        entries, cur = [], None
-        for raw in self._code_lines(self.jobs["build"]):
-            s = raw.strip()
-            if s.startswith("- runner:"):
-                cur = {"runner": s.split(":", 1)[1].strip()}
-                entries.append(cur)
-            elif cur is not None and s.startswith("target:"):
-                cur["target"] = s.split(":", 1)[1].strip()
-        mapping = [(e["runner"], e.get("target")) for e in entries]
-        self.assertEqual(mapping, expected)
-        # каждая запись полная: без второй половины пары — fail
-        self.assertTrue(all(set(e) == {"runner", "target"}
-                            for e in entries), entries)
+        for check, altered in cases:
+            original = {self._assert_release: self.release, self._assert_producer: self.producer,
+                        self._assert_promotion: self.promotion}[check]
+            with self.subTest(check=check.__name__):
+                self.assertNotEqual(altered, original)
+                with self.assertRaises(AssertionError):
+                    check(altered)
 
     def test_portability_alpine_smoke_wiring(self):
         ci_path = os.path.join(fx.REPO_ROOT, ".github", "workflows", "ci.yml")
         with open(ci_path, "r", encoding="utf-8") as f:
             ci = f.read()
-        jobs, cur = {}, None
-        for line in ci.splitlines():
-            if (line.startswith("  ") and not line.startswith("   ")
-                    and line.rstrip().endswith(":")
-                    and ":" not in line.strip()[:-1]):
-                cur = line.strip()[:-1]
-                jobs[cur] = []
-            elif cur is not None:
-                jobs[cur].append(line)
-        block = "\\n".join(jobs["portability-diagnostics"])
+        jobs = self._jobs(ci); block = jobs["native-portability"]
         def assert_smoke_wiring(text):
             for expected in (
+                    'row: ${{ fromJSON(needs.plan.outputs.plan).native_rows }}', 'matrix.row.target', 'matrix.row.musl',
+                    'x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu',
+                    'readelf -l "$bin"', 'readelf -d "$bin"', '! grep -q INTERP', '! grep -q NEEDED',
                     'docker run --rm --network none --read-only',
-                    '--platform "$platform"',
-                    'dst=/socks5-proxy,readonly', 'alpine:3.22 /socks5-proxy --version',
-                    'x86_64-*) platform=linux/amd64',
-                    'aarch64-*) platform=linux/arm64',
-                    'if [ "$MUSL" = "true" ]; then'):
+                    'target=/app,readonly', 'alpine:3.22 /app --version', '"$bin" --version'):
                 if expected not in text:
                     raise AssertionError("missing Alpine smoke wiring: " + expected)
         assert_smoke_wiring(block)
+        self.assertNotEqual(block.replace("docker run", "podman run", 1), block)
         with self.assertRaises(AssertionError):
             assert_smoke_wiring(block.replace("docker run", "podman run", 1))
-
-    def test_tag_only_trigger_and_targets_present(self):
-        on_block = self._top_block("on")
-        self.assertIn("tags:", on_block)
-        self.assertIn("'v*'", on_block)
-        self.assertNotIn("pull_request", on_block)
-        self.assertNotIn("workflow_dispatch", on_block)
-        self.assertNotIn("branches:", on_block)
-        # сами таргеты присутствуют (пары runner/target — выше)
-        code = self._code_lines(self.jobs["build"])
-        found = {c.split(":", 1)[1].strip()
-                 for c in (x.strip() for x in code)
-                 if c.startswith("target:")}
-        self.assertEqual(found, set(UNIX_TARGETS) | set(WIN_TARGETS))
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

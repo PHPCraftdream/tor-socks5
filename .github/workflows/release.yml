@@ -1,10 +1,4 @@
-# Release — build native socks5-proxy binaries on tag push and publish a GitHub Release.
-# Complements ci.yml (fmt/clippy/test on branch push & PR); this one fires only on `v*` tags.
-#
-# Поток: validate -> build (7 targets) -> release (download-artifact, strict package validation).
-# Промежуточно создаётся DRAFT release; /releases/latest никогда не увидит релиз
-# без checksum'ов. github.ref_name попадает в shell только через env.
-
+# Release: verify a retained promotion and audit licenses before publishing.
 name: Release
 
 on:
@@ -71,123 +65,91 @@ jobs:
           tool: cargo-deny
       - run: cargo deny --config .github/deny.toml check licenses
 
-  build:
-    name: Build (${{ matrix.target }})
-    needs: [validate, license-audit]
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            archive: tar.gz
-          - runner: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            archive: tar.gz
-            musl: true
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            archive: tar.gz
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
-            archive: tar.gz
-            musl: true
-          - runner: windows-latest
-            target: x86_64-pc-windows-msvc
-            archive: zip
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
-            archive: tar.gz
-          - runner: macos-15
-            target: aarch64-apple-darwin
-            archive: tar.gz
+  origin:
+    name: Authenticate promotion (read-only)
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
     env:
-      GH_REF_NAME: ${{ needs.validate.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.validate.outputs.tag }}
+      POLICY_SHA: ${{ vars.LICENSE_POLICY_SHA }}
+      BUILD_SHA: ${{ vars.LICENSE_BUILD_SHA }}
+      PROMOTION_RUN_ID: ${{ vars.LICENSE_PROMOTION_RUN_ID }}
+      PROMOTION_ATTEMPT: ${{ vars.LICENSE_PROMOTION_ATTEMPT }}
+      PROMOTION_ARTIFACT_ID: ${{ vars.LICENSE_PROMOTION_ARTIFACT_ID }}
+      REVIEW_COMMIT: ${{ vars.LICENSE_REVIEW_COMMIT }}
+      PRODUCER_RUN_ID: ${{ vars.LICENSE_PRODUCER_RUN_ID }}
+      PRODUCER_ATTEMPT: ${{ vars.LICENSE_PRODUCER_ATTEMPT }}
+      PRODUCER_ARTIFACT_ID: ${{ vars.LICENSE_PRODUCER_ARTIFACT_ID }}
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup-local-sdk
-
-      - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Install musl tools
-        if: matrix.musl == true
-        run: sudo apt-get update && sudo apt-get install --yes musl-tools
-
-      - name: Build
-        run: cargo build --locked --release -p socks5-proxy --target ${{ matrix.target }}
-
-      - name: Alpine smoke (musl)
-        if: matrix.musl == true
-        shell: bash
+          ref: ${{ vars.LICENSE_POLICY_SHA }}
+          persist-credentials: false
+      - name: Verify policy checkout identity
         run: |
           set -euo pipefail
-          binary="$PWD/target/${{ matrix.target }}/release/socks5-proxy"
-          docker run --rm --network none --read-only --tmpfs /tmp --mount "type=bind,src=$binary,dst=/tor-socks5,readonly" alpine:3.22 /tor-socks5 --version
-
-      - name: Package (unix)
-        if: matrix.archive != 'zip'
-        shell: bash
+          [[ "$POLICY_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [ "$(git rev-parse HEAD)" = "$POLICY_SHA" ]
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Bind tag to build and fetch promotion
         run: |
           set -euo pipefail
-          src="target/${{ matrix.target }}/release/socks5-proxy"
-          archive="tor-socks5-$GH_REF_NAME-${{ matrix.target }}.tar.gz"
-          # Rename to product name inside the archive.
-          tmp="$(mktemp -d)"
-          cp "$src" "$tmp/tor-socks5"
-          tar czf "$archive" -C "$tmp" tor-socks5
-          shasum -a 256 "$archive" > "$archive.sha256"
-
-      - name: Package (windows)
-        if: matrix.archive == 'zip'
-        shell: pwsh
-        env:
-          GH_REF_NAME: ${{ needs.validate.outputs.tag }}
-        run: |
-          $src = "target/${{ matrix.target }}/release/socks5-proxy.exe"
-          $archive = "tor-socks5-$env:GH_REF_NAME-${{ matrix.target }}.zip"
-          $tmp = New-Item -ItemType Directory -Path ([System.IO.Path]::GetTempPath() + [System.Guid]::NewGuid().ToString())
-          Copy-Item $src "$tmp/tor-socks5.exe"
-          Compress-Archive -Path "$tmp/tor-socks5.exe" -DestinationPath $archive
-          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
-          "$hash *$archive" | Out-File -NoNewline -Encoding ascii "$archive.sha256"
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: tor-socks5-${{ matrix.target }}
-          path: |
-            tor-socks5-${{ needs.validate.outputs.tag }}-${{ matrix.target }}.tar.gz
-            tor-socks5-${{ needs.validate.outputs.tag }}-${{ matrix.target }}.tar.gz.sha256
-            tor-socks5-${{ needs.validate.outputs.tag }}-${{ matrix.target }}.zip
-            tor-socks5-${{ needs.validate.outputs.tag }}-${{ matrix.target }}.zip.sha256
-          if-no-files-found: error
+          [[ "$BUILD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$REVIEW_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          tag_sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)"
+          [ "$tag_sha" = "$BUILD_SHA" ]
+          python3 -I .github/release/license/provenance.py fetch-promotion --policy-sha "$POLICY_SHA" --run-id "$PROMOTION_RUN_ID" --attempt "$PROMOTION_ATTEMPT" --artifact-id "$PROMOTION_ARTIFACT_ID" --head-sha "$BUILD_SHA" --tag "$TAG" --review-commit "$REVIEW_COMMIT" --producer-run-id "$PRODUCER_RUN_ID" --producer-attempt "$PRODUCER_ATTEMPT" --producer-artifact-id "$PRODUCER_ARTIFACT_ID" --output target/promoted
 
   release:
     name: Publish GitHub Release
-    needs: [validate, build]
+    needs: [validate, origin, license-audit]
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: write
     env:
       TAG: ${{ needs.validate.outputs.tag }}
       PRERELEASE: ${{ needs.validate.outputs.prerelease }}
       REMOTE_REPO: ${{ github.repository }}
+      POLICY_SHA: ${{ vars.LICENSE_POLICY_SHA }}
+      BUILD_SHA: ${{ vars.LICENSE_BUILD_SHA }}
+      PROMOTION_RUN_ID: ${{ vars.LICENSE_PROMOTION_RUN_ID }}
+      PROMOTION_ATTEMPT: ${{ vars.LICENSE_PROMOTION_ATTEMPT }}
+      PROMOTION_ARTIFACT_ID: ${{ vars.LICENSE_PROMOTION_ARTIFACT_ID }}
+      REVIEW_COMMIT: ${{ vars.LICENSE_REVIEW_COMMIT }}
+      PRODUCER_RUN_ID: ${{ vars.LICENSE_PRODUCER_RUN_ID }}
+      PRODUCER_ATTEMPT: ${{ vars.LICENSE_PRODUCER_ATTEMPT }}
+      PRODUCER_ARTIFACT_ID: ${{ vars.LICENSE_PRODUCER_ARTIFACT_ID }}
     steps:
       - uses: actions/checkout@v7
-
-      - uses: actions/download-artifact@v8
         with:
-          path: artifacts
-          merge-multiple: true
-
+          ref: ${{ vars.LICENSE_POLICY_SHA }}
+          persist-credentials: false
+      - name: Verify policy checkout identity
+        run: |
+          set -euo pipefail
+          [[ "$POLICY_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [ "$(git rev-parse HEAD)" = "$POLICY_SHA" ]
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Re-fetch promotion
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag_sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)"
+          [ "$tag_sha" = "$BUILD_SHA" ]
+          python3 -I .github/release/license/provenance.py fetch-promotion --policy-sha "$POLICY_SHA" --run-id "$PROMOTION_RUN_ID" --attempt "$PROMOTION_ATTEMPT" --artifact-id "$PROMOTION_ARTIFACT_ID" --head-sha "$BUILD_SHA" --tag "$TAG" --review-commit "$REVIEW_COMMIT" --producer-run-id "$PRODUCER_RUN_ID" --producer-attempt "$PRODUCER_ATTEMPT" --producer-artifact-id "$PRODUCER_ARTIFACT_ID" --output target/promoted
       - name: Publish (draft -> release)
         env:
-          ARTIFACTS_DIR: ${{ github.workspace }}/artifacts
+          ARTIFACTS_DIR: ${{ github.workspace }}/target/promoted/artifacts
+          ORIGIN_DIR: ${{ github.workspace }}/target/promoted
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: bash .github/release/publish.sh
+        run: bash .github/release/publish-bundle.sh

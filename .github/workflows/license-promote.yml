@@ -1,0 +1,72 @@
+name: Promote retained license candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      producer_run_id: {description: Producer run ID, required: true, type: string}
+      producer_attempt: {description: Producer attempt, required: true, type: string}
+      producer_artifact_id: {description: Retained artifact ID, required: true, type: string}
+      build_sha: {description: Producer build commit SHA, required: true, type: string}
+      tag: {description: Release tag, required: true, type: string}
+      review_commit: {description: Commit containing review data, required: true, type: string}
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  promote:
+    name: Finalize retained release candidate
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PRODUCER_RUN_ID: ${{ inputs.producer_run_id }}
+      PRODUCER_ATTEMPT: ${{ inputs.producer_attempt }}
+      PRODUCER_ARTIFACT_ID: ${{ inputs.producer_artifact_id }}
+      BUILD_SHA: ${{ inputs.build_sha }}
+      TAG: ${{ inputs.tag }}
+      REVIEW_COMMIT: ${{ inputs.review_commit }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate review commit identity
+        run: '[[ "$REVIEW_COMMIT" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.review_commit }}
+          path: target/reviews
+          persist-credentials: false
+      - name: Verify review checkout identity
+        run: '[ "$(git -C target/reviews rev-parse HEAD)" = "$REVIEW_COMMIT" ]'
+      - name: Fetch authenticated retained bytes
+        run: |
+          set -euo pipefail
+          python3 -I .github/release/license/provenance.py fetch --run-id "$PRODUCER_RUN_ID" --attempt "$PRODUCER_ATTEMPT" --artifact-id "$PRODUCER_ARTIFACT_ID" --head-sha "$BUILD_SHA" --tag "$TAG" --output target/retained
+      - name: Finalize reviews as data
+        run: |
+          set -euo pipefail
+          for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-gnu aarch64-unknown-linux-musl x86_64-pc-windows-msvc x86_64-apple-darwin aarch64-apple-darwin; do
+            mkdir -p "target/final-evidence/license-evidence-$target"
+            python3 -I .github/release/license/admission.py review --receipt "target/retained/evidence/license-evidence-$target/license-receipt" --review "target/reviews/.github/release/license/reviews/$target.json" --output "target/final-evidence/license-evidence-$target/license-receipt"
+          done
+      - name: Independently re-fetch origin and admit final bundle
+        run: |
+          set -euo pipefail
+          python3 -I .github/release/license/provenance.py verify-origin --run-id "$PRODUCER_RUN_ID" --attempt "$PRODUCER_ATTEMPT" --artifact-id "$PRODUCER_ARTIFACT_ID" --head-sha "$BUILD_SHA" --tag "$TAG" --retained target/retained
+          mkdir target/final-artifacts
+          cp target/retained/artifacts/* target/final-artifacts/
+          python3 -I .github/release/license/admission.py assemble --evidence target/final-evidence --artifacts target/final-artifacts --tag "$TAG" --output "target/final-artifacts/tor-socks5-$TAG-license-bundle.tar.gz"
+          python3 -I .github/release/license/admission.py verify-release --artifacts target/final-artifacts --tag "$TAG"
+      - name: Seal promotion
+        run: python3 -I .github/release/license/provenance.py seal-promotion --producer-run-id "$PRODUCER_RUN_ID" --producer-attempt "$PRODUCER_ATTEMPT" --producer-artifact-id "$PRODUCER_ARTIFACT_ID" --head-sha "$BUILD_SHA" --tag "$TAG" --retained target/retained --artifacts target/final-artifacts --evidence target/final-evidence --reviews target/reviews --review-commit "$REVIEW_COMMIT" --output target/promoted
+      - uses: actions/upload-artifact@v4
+        with:
+          name: license-admitted-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/promoted/
+          if-no-files-found: error
+          include-hidden-files: true

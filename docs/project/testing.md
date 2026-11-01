@@ -1,155 +1,106 @@
-# Testing — tiered test model
+# Тестирование и выбор проверок
 
-The workspace runs about 1300 tests; running all of them on every push costs minutes
-and turns any flaky socket test into a release blocker. Tests are therefore tiered
-T0–T3: cheap structural checks always run, package-level tests run on what changed,
-and the full workspace (plus the flaky-hunt contour) runs rarely. The full
-specification, decisions and data live in
-[`docs/plans/test-tiers.md`](../plans/test-tiers.md).
+## Текущая политика
 
-| Tier | What runs | When | Rough cost |
-|---|---|---|---|
-| **T0** | `cargo fmt --all -- --check`; dir-entries and line-limit; CI-only: publish-guard, packageability, MSRV 1.92, Android arm64 build | always, on every hook run and CI run | seconds |
-| **T1** | T0 + tests, doctests and clippy of **affected packages and their reverse dependencies** (`scripts/testing/test-affected.sh`) | pre-push by default; PRs in CI (ubuntu + windows) | ~1 package: well under a minute after build |
-| **T2** | full `cargo nextest run --workspace` (profile `ci`) + `cargo test --doc --workspace` + clippy `--workspace`, on all three OS | push to `main`, tags, `upstream-*`, `FULL=1`, any `workflow_dispatch` | minutes on CI |
-| **T3** | T2 + flaky-hunt profile repeats + tests of the vendor crates that are **not** workspace members (`tor-chanmgr`, `tor-dirmgr`, `tor-dirclient`) + per-feature runs + a report | nightly schedule, see `.github/workflows/nightly.yml` | long; unattended |
+Обычный CI автоматически выбирает тесты по diff и графу зависимостей. Полный прогон выполняется в конце спринта только по отдельному явному триггеру. Неизвестное соответствие или недоказанная история дают ошибку, а не скрытый FULL.
 
-## Local workflow
+История уровней и решений: [test-tiers.md](../plans/test-tiers.md). Действующий выбор определяют `scripts/testing/ci_planner.py` и workflow, а не прежние правила автоматического T2 для main, tags или `upstream-*`.
 
-Enable the pre-push hook once per clone:
+| Контур | Проверки | Условие |
+|---|---|---|
+| Служебные | Форматирование, line-limit, dir-entries, publish-guard, packageability и проверка плана | Обязательные проверки CI |
+| Affected | Тесты, doctests, clippy затронутых пакетов и выбранные контрактные сегменты | Обычные PR, push и ручной `mode=affected` |
+| Sprint-full | Все workspace-пакеты через явные `-p`-списки; Rust-матрица Ubuntu, macOS и Windows | Footer конца спринта либо ручной `mode=sprint-full` |
+| Nightly | Ограниченные stress-, vendor- и feature-проверки | Отдельное расписание; не замена sprint-full и не полный workspace/3OS прогон |
+
+MSRV 1.92, Android, native-portability, installer, release и лицензионные проверки выбираются соответствующими сегментами плана. Они не являются безусловной частью каждого лёгкого CI-запуска.
+
+## Явный полный прогон
+
+Полный CI выбирается только:
+
+1. Точной отдельной строкой `CI-Full: sprint-end` в сообщении реального коммита проверяемого push/PR диапазона. Коммит может быть не последним.
+2. Через **Actions → CI → Run workflow → mode=sprint-full**. Footer в коммите для ручного полного запуска не требуется.
+
+Точный regex: `^CI-Full: sprint-end\r?$` для каждой строки сообщения после разбиения по `\n`. Допускается только завершающий `\r` от CRLF; регистр точный, один пробел после двоеточия, без начальных и конечных пробелов.
+
+Не являются триггером: подстрока в prose, содержимое кода/diff/README, название ветки, PR description и сообщение синтетического PR merge-коммита.
+
+```bash
+git commit -m "тема" -m "CI-Full: sprint-end"
+```
+
+Ручной **mode=affected** остаётся доступен, требует `base_ref` и игнорирует footer: ручной выбор режима имеет приоритет. На каждую обычную фичу полный прогон не назначается.
+
+Для PR `--head` — исходный `pull_request.head.sha`, а checkout — синтетический merge. Planner требует точные родители checkout: первый — base события, второй — исходный head. Произвольного родства недостаточно. Diff строится от merge-base исходных веток до фактического checkout; Cargo graph, blobs, документы и capabilities относятся к тому же checkout. Footer ищется отдельно только в исходных коммитах, без synthetic message.
+
+Для push база — `event.before`, head — текущий коммит; база должна быть его предком. Merge-push сохраняет сообщения исходных коммитов диапазона. При squash эти коммиты не входят в main-историю: для полного прогона footer нужен в итоговом squash message, не в PR description. Для ручного affected `base_ref` — явно заданная валидная точка сравнения, не обязательно предок head.
+
+Неизвестный ref, неправильные родители, несовпадение checkout/head или недоказанная push-история блокируют план. Они не превращаются в FULL или пустой зелёный результат.
+
+## Выбор сегментов и пакетов
+
+Planner сравнивает коммиты, а не staged/untracked изменения. Незакоммиченные Rust-исходники и манифесты, способные рассогласовать граф с выбранным деревом, отклоняются.
+
+- Изменения внутри workspace-пакета выбирают его и обратное замыкание зависимостей. Учитываются normal, dev, build и target-specific связи, включая patched зависимости и aliases.
+- README, обязательные examples и контрактная документация могут выбирать `docs-contract`; это не безусловный запуск всего Rust workspace. Обычные аналитические docs выбирают только необходимые лёгкие проверки.
+- Workflows, CI helpers, hooks, installers, release и license tooling имеют собственные mappings. `.github/**` не означает «тестов нет».
+- Manifest/lockfile, native flags, vendor и SDK изменения анализируются по соответствующим контрактам. Неизвестные критичные пути, в том числе неподдержанные `.config/**` или изменения toolchain, могут давать `missing mapping`, а не автоматический набор тестов.
+- Установленные guarded capabilities нельзя тихо удалить или отключить. Проверяются фактические обязательные файлы и consumers.
+- Ошибка Git, metadata, базы или mapping возвращает ненулевой код и диагностическое сообщение; готовый план не публикуется. Fallback на FULL отсутствует.
+
+Пустой список Rust-пакетов сам по себе не означает отсутствие всех проверок: остаются служебные и другие выбранные сегменты. Режимы wrapper `list`/`args` печатают пустой вывод, если список соответствующих Rust-пакетов пуст; строки `nothing to test` контракт не обещает.
+
+## Локальный wrapper и pre-push hook
+
+Агенты не запускают локальные tests/build/check/clippy/metadata без отдельного разрешения; проверки этой работы выполняются в GitHub CI. Команды ниже описывают интерфейс для осознанного ручного использования разработчиком, не обязательные действия агента.
+
+Подключение hook:
 
 ```bash
 git config core.hooksPath .githooks
 ```
 
-The hook (`.githooks/pre-push`) always runs fmt, then:
+Hook читает pushed refs из stdin. Перед проверками он подтверждает, что pushed commit совпадает с текущим `HEAD`; несколько разных commits/bases в одном push отклоняются. Deletion-only push завершается без fmt/tests. Для нового ref база вычисляется как `merge-base HEAD origin/main`; для существующего — используется remote SHA. Недоступная база блокирует push.
 
-- **T1 (default)** — asks `scripts/testing/test-affected.sh` for the affected packages and runs
-  clippy + tests + doctests for them only. A new ref uses `merge-base HEAD origin/main`;
-  missing `origin/main`, unavailable remote SHA, shallow history or multiple remote bases
-  force T2.
-- **T2 (`FULL=1`)** — full workspace run. Also forced when pushing `main`,
-  `upstream-*` or tags, or when the package selection fails (fail-safe: never
-  push untested because a script broke).
-
-`git push --no-verify` bypasses the hook — use it only in an emergency (e.g. a
-known-broken unrelated package), and fix the cause immediately after.
-
-Useful variables:
+Затем hook запускает fmt и структурные проверки, после них — wrapper. `FULL=1` явно передаёт wrapper `--full`; обычный вызов передаёт `--base`. Поскольку wrapper использует push-план, footer в диапазоне также может выбрать полный список пакетов. Это явный триггер, не fallback.
 
 ```bash
-TEST_AFFECTED_DRY=1 git push   # print the commands instead of running them
-FULL=1 git push                # force the full T2 run
+scripts/testing/test-affected.sh --base origin/main --mode list
+scripts/testing/test-affected.sh --base origin/main --mode args
+scripts/testing/test-affected.sh --base origin/main --mode run --kind all
+scripts/testing/test-affected.sh --base origin/main --mode run --kind test
+scripts/testing/test-affected.sh --full --mode run --kind all
+TEST_AFFECTED_DRY=1 git push
+FULL=1 git push
 ```
 
-### `--all-features` and vendored crates
+Без `--full` wrapper требует явный `--base`; автоматического поиска upstream/main внутри него нет. `--mode` принимает `list`, `args`, `run`; `--kind` — `test`, `clippy`, `all`. Проверки выполняются только для выданных планом `-p`-пакетов, на локальной ОС. Локальный полный список не создаёт трёхплатформенную CI-матрицу.
 
-Run `--all-features` for a vendored crate in its own cargo invocation, e.g.
-`cargo test -p tor-circmgr --all-features` (as the nightly job does). Never
-combine it with an app package (`cargo clippy -p tor-circmgr -p socks5-proxy
---all-features`): `--all-features` applies only to the listed packages, so
-`tor-circmgr` gets `vanguards`/`geoip` while `arti-client` does not, and
-`arti-client` fails to compile (`missing vanguard_config`, extra `country_code`
-argument). This is an upstream non-additive feature combination (see the
-`TODO GEOIP` note in `tor-circmgr`); `cargo check -p socks5-proxy --all-features`
-on its own builds fine.
+При наличии cargo-nextest используется nextest, иначе cargo test. Doctests запускаются отдельно для `library_packages`. `saturating-time` исключён: его поиск предела `SystemTime::max_value()` способен зависнуть на Windows; явный `cargo test --doc` не полагается только на manifest `doctest=false`.
 
-## Selecting affected packages
+`TEST_AFFECTED_DRY=1` печатает Rust-команды вместо их исполнения; это не подтверждение прохождения тестов. `git push --no-verify` обходит hook и не является исправлением причины отказа. Для автоматических агентов запрет локальных проверок сохраняется независимо от настройки hook.
 
-`scripts/testing/test-affected.sh` computes what to test:
+### Features и vendor
 
-```bash
-scripts/testing/test-affected.sh --base origin/main                 # list affected packages
-scripts/testing/test-affected.sh --mode args                        # print "-p a -p b ..."
-scripts/testing/test-affected.sh --mode run --kind all              # test + doctests + clippy
-scripts/testing/test-affected.sh --mode run --kind test             # tests only
-scripts/testing/test-affected.sh --full                             # force T2
-```
+`--all-features` для отдельного vendor-крейта не следует смешивать в одной Cargo-команде с app-пакетом. Например, `cargo clippy -p tor-circmgr -p socks5-proxy --all-features` может включить `vanguards`/`geoip` у tor-circmgr, но не соответствующие features arti-client. Это известная upstream non-additive комбинация (`TODO GEOIP`), а не основание ослаблять контракт или автоматически запускать весь workspace. Отдельные feature-проверки находятся в соответствующем CI-контуре.
 
-Selection rules:
+## GitHub CI
 
-1. Changed files = `git diff --name-only --no-renames <base>` (both sides of a rename;
-   read NUL-delimited with `core.quotePath=false` so spaces/non-ASCII paths survive).
-   Base = merge-base with upstream/`origin/main`/`main`, or `--base <ref>`; plus staged
-   and untracked files.
-2. A file inside a workspace member selects that package, then the closure over
-   **reverse** dependencies (normal + dev) is added — editing `persist-lock`
-   runs the tests of the eight packages that depend on it.
-3. Data files read by tests are mapped explicitly: `README.md` and
-   `tor-socks5.example.ktav` → `tor-socks5-config` + `socks5-proxy`;
-   `docs/architecture.md` and `docs/guide/**` → `socks5-proxy`;
-   `packages/proxy-config/examples/**` → `tor-socks5-config`.
-4. **Always FULL (T2):** root/member `Cargo.toml` or `Cargo.lock`, `rust-toolchain*`,
-   `.cargo/**`, `.config/**`, `scripts/testing/test-affected.sh`, `scripts/testing/**`, and
-   **any edit under `vendor/**`** — workspace member or not. Vendored crates reach the
-   workspace through registry coordinates too (e.g. `saturating-time` → `tor-netdoc` →
-   `tor-circmgr`), which member-prefix mapping alone would miss; one dependency/feature
-   graph means such edits can break unrelated packages.
-5. `docs/**` not listed above, `.github/**`, `.githooks/**`, other `scripts/**`:
-   no tests (T0 only). Empty selection prints "nothing to test" and exits 0.
-- `jq` failure, empty members, or Git/cargo-metadata failure means FULL (or a non-zero
-  exit translated to FULL by the hook/CI), never a silent empty plan.
-- Without explicit `--base`, detached HEAD and shallow clones force FULL even if Git
-  could return a merge-base. An explicit base must resolve to a local commit; otherwise
-  selection is FULL with a reason.
+`plan` исполняет `test_ci_planner.py` и `test_ci_integration.py`, затем `ci_planner.py`. Сводка содержит paths, reasons, full и full_trigger. Rust jobs получают `rust_rows` и явные `-p`-списки; JUnit artifact называется `junit-<target>`. MSRV, Android и прочие jobs запускаются только по выбранным сегментам.
 
-## Pre-push hook: pushed commit vs working tree
+`CI required` проверяет точный набор consumers: выбранные должны завершиться success, невыбранные — ожидаемым skipped. Failure, cancellation, неожиданный skip или отсутствующий consumer не дают зелёный итог.
 
-The hook tests the **working tree**. Before running anything it reads the pushed refs
-from stdin and compares each pushed `local_sha` with `git rev-parse HEAD`:
+В license-ветке есть отдельный `License required`; его нельзя путать с `CI required`. Реальный built-binary license lifecycle входит в `CI required` и выполняется только для PR. Явный footer-full PR не должен пропускать license-контракты, обязательные для того же affected PR. Ручной non-PR полный запуск не превращается в PR lifecycle.
 
-- if the pushed commit differs from the checked-out one, the push is **rejected** with a
-  warning — a green run would prove nothing about what is being pushed. Switch to the
-  branch first (`git switch <branch>`);
-- a push updating refs at several different commits is rejected outright;
-- branch deletions (null local sha) are skipped; a deletion-only push exits before fmt/tests;
-- emergencies: `git push --no-verify` only.
+Семицелевой producer остаётся отдельным trusted-main manual dispatch. Footer, PR или обычный полный CI не разрешают producer/promotion и не заменяют provenance, admission или юридическое approval. Branch protection должна учитывать оба разных check: `CI required` и `License required`.
 
-`cargo nextest` does not run doctests; the hook, CI and the test script run them separately with
-`cargo test --doc`. To test one package by hand:
+Nightly ведёт один tracking issue `Nightly tests failed`. Успешный полный результат его собственного набора закрывает issue; skipped jobs считаются неполным запуском. Актуальные расписание и ограниченный набор определены `.github/workflows/nightly.yml`.
 
-```bash
-cargo nextest run -p tor-socks5-config
-cargo test --doc -p tor-socks5-config
-```
+## Флейки и работа через rush/wrush
 
-`saturating-time` is excluded from doctest runs: its examples call `SystemTime::max_value()`, whose limit search never terminates on Windows (`doctest = false` in its manifest, but `cargo test --doc` ignores that flag and would hang).
+Падение теста исправляется на месте; retries в профиле `ci` остаются 0. Профиль flaky-hunt позволяет явно повторять выбранные проверки (`--stress-count N` или `--stress-duration`), но такой запуск не является доказательством исправления редкого сбоя без установленного механизма. Дополнительная нагрузка не назначается самовольно.
 
-## CI
+Реальные sockets и paused clocks проверяются с ограничением конкуренции группы `sockets-and-clocks` до четырёх потоков. Типичные направления расследования — Windows port reuse, clock pause/resume и RST вместо FIN; это гипотезы, не готовый диагноз.
 
-`.github/workflows/ci.yml` mirrors the tiers:
-
-- **plan** — runs `scripts/testing/test-affected.sh` (against the PR base sha) and publishes
-  the chosen tier and package list to the job summary; selection failure forces T2.
-- **fmt / clippy / test** — T1 jobs on PRs (ubuntu + windows, affected packages only),
-  T2 jobs (ubuntu + macOS + windows, `--workspace`, profile `ci`) on pushes to `main`
-  and on any manual dispatch (no reliable base to diff against); doctests run as a
-  separate step. The plan job also runs `scripts/testing/selftest.sh` (no cargo build).
-- Test jobs upload JUnit reports as artifacts `junit-t1-<os>` / `junit-t2-<os>`.
-- CI-only structural jobs: line-limit, dir-entries, publish-guard, packageability,
-  MSRV 1.92, Android arm64 build.
-
-The nightly contour (`.github/workflows/nightly.yml`) runs T3 on a schedule and, on
-failure, updates a single tracking issue **Nightly tests failed** instead of opening
-a new one per run; the issue is closed as recovered only when **every** job of the run
-succeeded — a run with skipped jobs counts as incomplete and leaves the issue (if any)
-untouched — see the workflow file for the current schedule and scope.
-
-## Flaky tests
-
-- A failing test is fixed where it stands; `retries` stay at 0 in the `ci` profile so
-  flakes cannot be masked.
-- To investigate: `cargo nextest run --profile flaky-hunt --stress-count N` (repeat
-  the whole run N times) or `--stress-duration 1h`; the profile prints every test's
-  output.
-- Suites with real sockets or paused clocks (`tor-socks5-dns`, `tor-circmgr`,
-  `tor-guardmgr`, `socks5-proxy`) run in the `sockets-and-clocks` nextest group capped
-  at 4 threads in every profile.
-- Typical causes here: Windows port reuse, clock pause/resume races, RST instead of
-  FIN on abrupt closes.
-
-## Convention for rush/wrush phases
-
-Agent-driven work phases test only their own packages (`cargo nextest run -p …`);
-one full T2 run (`FULL=1 git push` or the CI T2 on `main`) before merging covers the
-rest.
+Каждая rush/wrush-фаза изменяет свой scope и опирается на targeted CI затронутых сегментов. Полный прогон перед каждым merge не является стандартным шагом: он явно назначается в конце спринта footer или manual sprint-full. Запрет локального исполнения тестов агентами действует и внутри delegated worktrees.
