@@ -48,34 +48,34 @@ egress through an upstream SOCKS5 proxy instead of Tor, and install itself as an
 - **Install as a service** — systemd, OpenRC, launchd, Windows SCM, BSD `rc.d`.
 - **Non-blocking logging** to stderr / stdout / file, configurable level and per-target filters.
 
-## Глобальный маршрут `pre_socks5`
+## Global `pre_socks5` route
 
-При глобальном `pre_socks5` используются только явно заданные обычные мосты.
-Периодическое обслуживание проверяет каналы через тот же SOCKS5 с теми же
-учётными данными; Arti может повторно использовать уже открытый канал, поэтому
-это не всегда проверка новой доступности. При ошибке или несовместимой
-перезагрузке конфигурации действующий маршрут сохраняется. Смена адреса или учётных данных требует перезапуска.
-Watchdog при выполнении своих условий запрашивает закрытие открытых каналов
-существующего клиента; ожидающие подключения при этом не отменяются. Последующие
-запросы могут создать каналы заново через тот же pre. Это не замена клиента и не
-гарантия восстановления сети. Событие регрессии отмечает вызов границы, а
-модель проверяет только порядок операций, не маршрут настоящего клиента. Эти
-проверки не подтверждают закрытие и повторное открытие настоящего канала Tor.
-Отдельная CI-регрессия для реальных локальных каналов подготовлена, но её
-результат ещё не подтверждён. Для неё также подготовлены отрицательные мутации
-вызовов завершения каналов и переконфигурации. Она использует исходный архив Tor 0.4.9.15 с
-закреплённым SHA-256; подпись архива не проверялась, поэтому доверие ограничено
-источником и указанной контрольной суммой свежего выпуска.
-Прямые TCP-пробы, обнаружение и загрузка мостов,
-seed-мосты, PT, warm pool и отдельный circuit verifier не поддерживаются в этом
-режиме. При каждом проходе обслуживание рассматривает первые 30 мостов,
-не более восьми одновременно, с ожиданием каждого канала до 15 секунд;
-watchdog рассматривает первые восемь активных мостов. В pre-ветке события
-наблюдения маршрута не переносятся в хранилище здоровья мостов.
-DNS listener и onion services с глобальным pre несовместимы. Soft failover отключён:
-общая статистика не доказывает принадлежность наблюдения конкретному маршруту.
-Альтернативные владельцы учётных записей не обслуживаются глобальным циклом;
-их автоматическое восстановление в этой функции не реализовано.
+With global `pre_socks5`, only explicitly configured plain bridges are used.
+Periodic maintenance checks channels through the same SOCKS5 proxy with the same
+credentials; Arti may reuse an already open channel, so
+this is not always a fresh reachability check. On an error or an incompatible
+configuration reload, the current route is retained. Changing the address or credentials requires a restart.
+When its conditions are met, the watchdog requests closure of the existing client's
+open channels; pending connections are not cancelled. Subsequent
+requests may create channels again through the same pre-route. This neither replaces the client nor
+guarantees network recovery. The regression event records a call at the boundary, while
+the model checks only operation ordering, not a real client's route. These
+checks do not confirm closure and reopening of an actual Tor channel.
+A separate CI regression for real local channels has been prepared, but its
+result has not yet been confirmed. Negative mutations of the channel-termination
+and reconfiguration calls have also been prepared for it. It uses the Tor 0.4.9.15 source archive with
+a pinned SHA-256; the archive's signature was not verified, so trust is limited to
+the source and the stated checksum of the recent release.
+Direct TCP probes, bridge discovery and fetching,
+seed bridges, PT, the warm pool and the separate circuit verifier are not supported in this
+mode. On each pass, maintenance considers the first 30 bridges,
+at most eight concurrently, waiting up to 15 seconds for each channel;
+the watchdog considers the first eight active bridges. In the pre-route branch,
+route-observation events are not transferred to the bridge health store.
+The DNS listener and onion services are incompatible with global pre. Soft failover is disabled:
+aggregate statistics do not prove that an observation belongs to a particular route.
+Alternative account owners are not serviced by the global loop;
+automatic recovery for them is not implemented in this feature.
 
 ## Build
 
@@ -107,20 +107,20 @@ the limit when the rule was introduced are listed in the script's `BASELINE`
 with their current size: they may not grow, new ones may not appear, and an
 entry is lowered or deleted as the directory is split.
 
-## Установка готового бинарника
+## Installing a prebuilt binary
 
-Устанавливается **latest stable release** (не `main`, не prerelease) с проверкой SHA256
-до установки. На Unix файл заменяется атомарно; на Windows используется
-переименование с откатом при ошибке.
+The installer installs the **latest stable release** (not `main` or a prerelease), verifying SHA256
+before installation. On Unix, the file is replaced atomically; on Windows, replacement uses
+renaming with rollback on failure.
 
-Unix (Linux x86_64 GNU/glibc, macOS x86_64 и Apple Silicon):
+Unix (Linux x86_64 GNU/glibc, macOS x86_64 and Apple Silicon):
 
 ```bash
 curl -fsSL 'https://raw.githubusercontent.com/PHPCraftdream/tor-socks5/main/.github/install/install.sh' -o 'install.sh'
 sh './install.sh'
 ```
 
-Windows (x86_64, PowerShell 5.1 или 7):
+Windows (x86_64, PowerShell 5.1 or 7):
 
 ```powershell
 Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/PHPCraftdream/tor-socks5/main/.github/install/install.ps1' -OutFile '.\install.ps1'
@@ -128,89 +128,89 @@ powershell -NoProfile -ExecutionPolicy Bypass -File '.\install.ps1'
 # PowerShell 7: pwsh -NoProfile -File '.\install.ps1'
 ```
 
-- Каталог по умолчанию: `~/.local/bin` (Unix), `%LOCALAPPDATA%\Programs\tor-socks5` (Windows).
-- Свой каталог: `sh './install.sh' --install-dir "$HOME/bin"` / `powershell -NoProfile -File '.\install.ps1' -InstallDir "$HOME\bin"`.
-- PATH и конфигурационные файлы **не** изменяются; sudo/права администратора не требуются.
-- Автозапуск не настраивается; приложение установщиком не запускается.
-- Обновление работающего приложения: остановка не нужна. На Unix старый бинарник
-  атомарно заменяется (`rename`) — запущенный процесс продолжает работать со старой
-  версией; на Windows работающий `tor-socks5.exe` переименовывается в
-  `tor-socks5.exe.old.<уникальный суффикс>` и на его место ставится новый.
-- Запущенный процесс сам на новую версию не переключается — её используют
-  следующие запуски. Старые копии удаляются только при эксклюзивном доступе;
-  занятые или недоступные сохраняются до следующей установки. Очистка ограничена
-  зарезервированными именами `tor-socks5.exe.old.<32 hex>`.
-- Замена на Windows — транзакция с откатом (backup возвращается при сбое), а не
-  атомарный replace: теоретически возможен короткий интервал без canonical exe.
-- Поддерживаются ровно 4 таргета: Linux x86_64 GNU (**glibc** — Alpine/musl не поддерживаются),
-  macOS x86_64, macOS aarch64, Windows x86_64. ARM Linux/Windows и BSD — нет.
+- Default directory: `~/.local/bin` (Unix), `%LOCALAPPDATA%\Programs\tor-socks5` (Windows).
+- Custom directory: `sh './install.sh' --install-dir "$HOME/bin"` / `powershell -NoProfile -File '.\install.ps1' -InstallDir "$HOME\bin"`.
+- PATH and configuration files are **not** modified; sudo or administrator privileges are not required.
+- Automatic startup is not configured; the installer does not launch the application.
+- Updating a running application: no shutdown is required. On Unix, the old binary
+  is replaced atomically (`rename`) — the running process continues using the old
+  version; on Windows, the running `tor-socks5.exe` is renamed to
+  `tor-socks5.exe.old.<unique suffix>` and the new binary takes its place.
+- A running process does not switch to the new version automatically — subsequent
+  launches use it. Old copies are deleted only when exclusive access is available;
+  copies that are in use or inaccessible are kept until the next installation. Cleanup is limited to
+  the reserved names `tor-socks5.exe.old.<32 hex>`.
+- Replacement on Windows is a transaction with rollback (the backup is restored on failure), not
+  an atomic replacement: in theory, there may be a brief interval with no executable at the canonical path.
+- Exactly 4 targets are supported: Linux x86_64 GNU (**glibc** — Alpine/musl are not supported),
+  macOS x86_64, macOS aarch64, Windows x86_64. ARM Linux/Windows and BSD are not supported.
 
-### Каталог бинарника и каталог конфигурации независимы
+### The binary and configuration directories are independent
 
-Установщик только кладёт бинарник в каталог установки; он **не** запускает
-приложение и **не** создаёт конфигурационных файлов. Приложение при запуске ищет
-`tor-socks5.ktav` в **текущем рабочем каталоге**, откуда его запустили, а не рядом
-с бинарником: каталог бинарника и каталог конфигурации не связаны. Если
-`tor-socks5.ktav` в текущем каталоге нет, приложение само создаёт его с настройками
-по умолчанию при первом старте — там же появляется и `tor-socks5.bridges.ktav`.
+The installer only places the binary in the installation directory; it does **not** launch
+the application or create configuration files. At startup, the application looks for
+`tor-socks5.ktav` in the **current working directory** from which it was launched, not next
+to the binary: the binary and configuration directories are unrelated. If
+`tor-socks5.ktav` is missing from the current directory, the application creates it with default
+settings on first startup — `tor-socks5.bridges.ktav` is also created there.
 
-Так несколько узлов на одной машине используют разные настройки. Примеры
-независимых запусков из разных терминалов; каталог бинарника не обязан быть в PATH:
+This allows several nodes on one machine to use different settings. Examples of
+independent launches from separate terminals; the binary directory does not need to be in PATH:
 
 ```bash
 mkdir -p "$HOME/node-a" "$HOME/node-b"
-# Первый терминал: настройки в "$HOME/node-a/tor-socks5.ktav".
+# First terminal: settings in "$HOME/node-a/tor-socks5.ktav".
 cd "$HOME/node-a" && "$HOME/.local/bin/tor-socks5"
-# Второй терминал: настройки в "$HOME/node-b/tor-socks5.ktav".
+# Second terminal: settings in "$HOME/node-b/tor-socks5.ktav".
 cd "$HOME/node-b" && "$HOME/.local/bin/tor-socks5" --angel
 ```
 
 ```powershell
 New-Item -ItemType Directory -Force -Path "$HOME\node-a", "$HOME\node-b" -ErrorAction Stop
-# Первый терминал: настройки в "$HOME\node-a\tor-socks5.ktav".
+# First terminal: settings in "$HOME\node-a\tor-socks5.ktav".
 Set-Location -LiteralPath "$HOME\node-a" -ErrorAction Stop
 & "$env:LOCALAPPDATA\Programs\tor-socks5\tor-socks5.exe"
-# Второй терминал: настройки в "$HOME\node-b\tor-socks5.ktav".
+# Second terminal: settings in "$HOME\node-b\tor-socks5.ktav".
 Set-Location -LiteralPath "$HOME\node-b" -ErrorAction Stop
 & "$env:LOCALAPPDATA\Programs\tor-socks5\tor-socks5.exe"
 ```
 
-Явный путь всегда сильнее: `--config <path>` переопределяет `$TOR_SOCKS5_CONFIG`,
-а тот — файл в текущем каталоге. Режим `--angel` (Unix) фиксирует каталог запуска:
-все относительные пути (конфиг, bridges, pid-файл, логи) остаются привязанными к
-нему, как и в foreground.
+An explicit path always takes precedence: `--config <path>` overrides `$TOR_SOCKS5_CONFIG`,
+which in turn overrides the file in the current directory. The `--angel` mode (Unix) retains the launch directory:
+all relative paths (configuration, bridges, pid file, logs) remain relative to
+that directory, just as when running in the foreground.
 
-### Публикация релиза по тегу
+### Publishing a release by tag
 
-Поддерживаются теги формата `vX.Y.Z` (stable) и `vX.Y.Z-rc.N` (prerelease);
-build metadata (`+`) и ведущие нули (`v01.2.3`) не принимаются.
+Tags in the formats `vX.Y.Z` (stable) and `vX.Y.Z-rc.N` (prerelease) are supported;
+build metadata (`+`) and leading zeros (`v01.2.3`) are not accepted.
 
 ```bash
 git tag v0.3.0
 git push origin v0.3.0
 ```
 
-Публикация автоматическая — отдельного «ручного publish» нет. После push тега
-workflow `.github/workflows/release.yml`:
+Publication is automatic — there is no separate "manual publish" step. After a tag is pushed,
+the `.github/workflows/release.yml` workflow:
 
-- собирает 4 нативных бинарника (Linux x86_64 GNU, macOS x86_64, macOS aarch64,
-  Windows x86_64) и публикует **4 архива + 4 SHA256-файла**
-  (`tor-socks5-<тег>-<таргет>.tar.gz/.zip` + `.sha256`);
-- сначала всё попадает в **draft release**; перед загрузкой сверяются SHA256
-  локальных архивов с их checksum-файлами; после загрузки проверяются наличие,
-  размеры и статус всех 8 assets (4 архива + 4 SHA256); затем draft публикуется
+- builds 4 native binaries (Linux x86_64 GNU, macOS x86_64, macOS aarch64,
+  Windows x86_64) and publishes **4 archives + 4 SHA256 files**
+  (`tor-socks5-<tag>-<target>.tar.gz/.zip` + `.sha256`);
+- first stages everything in a **draft release**; before upload, the SHA256 hashes
+  of the local archives are checked against their checksum files; after upload, the presence,
+  sizes and status of all 8 assets (4 archives + 4 SHA256 files) are checked; then the draft is published
   (draft → published);
-- выбор stable-релиза для `/releases/latest` оставлен правилам GitHub (`legacy`):
-  публикация не назначает любой новый maintenance-тег принудительно как latest;
-  prerelease (`vX.Y.Z-rc.N`) публикуется с флагом prerelease и **никогда**
-  не становится latest;
-- повторный запуск по полностью опубликованному тегу — безопасный no-op:
-  файлы не перезаписываются и не удаляются; при возобновлении прерванного
-  запуска draft дозагружается и публикуется.
+- selection of the stable release for `/releases/latest` is left to GitHub's rules (`legacy`):
+  publication does not force every new maintenance tag to become latest;
+  a prerelease (`vX.Y.Z-rc.N`) is published with the prerelease flag and **never**
+  becomes latest;
+- rerunning for a fully published tag is a safe no-op:
+  files are neither overwritten nor deleted; when an interrupted run is resumed,
+  the draft's remaining assets are uploaded and the draft is published.
 
-Важно: реальная сборка релиза происходит при push тега **после merge** в `main`;
-в PR выполняется только offline-проверка хелперов (валидация тега, логика
-публикации с mock `gh`).
+Important: the actual release build happens when a tag is pushed **after merging** into `main`;
+PRs only run offline checks of the helpers (tag validation and publication
+logic with a mock `gh`).
 
 ## Quick start
 
@@ -338,32 +338,32 @@ auth.users_file:
 ## Destination policy: refuse .onion targets at the listener.
 security.block_onion: true
 
-## Контроль доступа клиентов: две независимые политики.
-## security.client_access.allowed_clients защищает слушатели SOCKS5/HTTP
-## CONNECT (CLI и Android FFI); dns_server.client_access.allowed_clients —
-## слушатели DNS (UDP+TCP). Каждое значение — одна скалярная строка,
-## разбираемая при загрузке.
+## Client access control: two independent policies.
+## security.client_access.allowed_clients protects the SOCKS5/HTTP
+## CONNECT listeners (CLI and Android FFI); dns_server.client_access.allowed_clients
+## protects the DNS listeners (UDP+TCP). Each value is a single scalar string,
+## parsed at load time.
 security.client_access.allowed_clients: *
 dns_server.client_access.allowed_clients: *
-## Грамматика: токены через запятую, каждый валидируется (в том числе
-## после ведущего *):
-## *  разрешить всем (значение по умолчанию, когда ключ отсутствует;
-##    явно пустая строка — ошибка загрузки, орфографии «запретить всем» нет)
-## loopback  строго в нижнем регистре: только 127.0.0.0/8 и ::1
-## точные IP: 192.168.1.5, 2001:db8::1
-## IPv4-wildcard октеты: 192.168.*.* (shorthand 192.168.* == 192.168.*.*)
-## IPv6-wildcard hextet'ы: 2001:db8:* (весь хвост после первых двух),
-##   2001:db8::* == 2001:db8:0:0:0:0:0:* (:: разворачивается в точные
-##   нули, никогда в wildcards)
-## mapped: ::ffff:192.168.*.* компилируется в эквивалентное IPv4-правило
-## Ошибки: имена хостов, CIDR, порты, zone ID, диапазоны, частичные *
-## (192.168.1*), ведущие нули. Имена никогда не резолвятся через DNS.
-## ACL прокси отклоняет пир до handshake (тихое закрытие соединения); при
-## включённой аутентификации после успешного логина дополнительно
-## применяется поле allowed_clients аккаунта из tor-socks5.users.ktav —
-## до любого исходящего трафика. См. docs/guide/auth.md и
+## Grammar: comma-separated tokens, each validated (including tokens
+## after a leading *):
+## *  allow everyone (the default when the key is absent;
+##    an explicitly empty string is a load error; there is no "deny all" syntax)
+## loopback  strictly lowercase: only 127.0.0.0/8 and ::1
+## exact IPs: 192.168.1.5, 2001:db8::1
+## IPv4 wildcard octets: 192.168.*.* (shorthand 192.168.* == 192.168.*.*)
+## IPv6 wildcard hextets: 2001:db8:* (any suffix after the first two),
+##   2001:db8::* == 2001:db8:0:0:0:0:0:* (:: expands to exact
+##   zeros, never wildcards)
+## mapped: ::ffff:192.168.*.* compiles to an equivalent IPv4 rule
+## Errors: hostnames, CIDR, ports, zone IDs, ranges, partial *
+## (192.168.1*), leading zeros. Names are never resolved through DNS.
+## The proxy ACL rejects a peer before the handshake (silently closing the connection); when
+## authentication is enabled, a successful login is followed by an additional check
+## against the account's allowed_clients field in tor-socks5.users.ktav —
+## before any outbound traffic. See docs/guide/auth.md and
 ## docs/guide/dns-server.md.
-## Пример с реальными значениями:
+## Example with concrete values:
 ## security.client_access.allowed_clients: 127.*, ::1
 ## dns_server.client_access.allowed_clients: loopback
 

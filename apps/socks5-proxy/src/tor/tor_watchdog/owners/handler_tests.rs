@@ -15,6 +15,78 @@ impl std::fmt::Display for InitialPublishError {
 }
 impl std::error::Error for InitialPublishError {}
 
+// Потребитель — отдельный harness=false; обычный unit-test binary этот модуль не вызывает.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+mod pt_contract {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/pt_owner/owner_contract.rs"
+    ));
+}
+// Supplied-сценарии (negative/positive) вынесены в отдельный файл (лимиты
+// строк/записей); проводка — только объявление модуля и экспорт.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+#[path = "../../../../tests/pt_owner/carrier_oracle.rs"]
+pub(crate) mod carrier_oracle;
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+#[path = "../../../../tests/pt_owner/child_processes.rs"]
+mod child_processes;
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+#[path = "../../../../tests/pt_owner/scenario_resources.rs"]
+mod scenario_resources;
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+#[path = "../../../../tests/pt_owner/supplied_contract.rs"]
+mod supplied_contract;
+
+#[cfg(target_os = "linux")]
+#[allow(unused_imports)]
+pub(crate) use pt_contract::{run_pt_owner_contract, run_supplied_config_seeds_rejected};
+#[cfg(target_os = "linux")]
+#[allow(unused_imports)]
+pub(crate) use supplied_contract::{run_supplied_config_negative, run_supplied_config_positive};
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn shutdown_witness_requires_eof_after_buffered_failure() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        stream
+            .write_all(&[5, 2, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        ready_tx.send(()).unwrap();
+        let _ = release_rx.await;
+    });
+    let mut client = TcpStream::connect(address).await.unwrap();
+    ready_rx.await.unwrap();
+    let pending = tokio::time::timeout(
+        Duration::from_millis(50),
+        pt_contract::read_closed(&mut client),
+    )
+    .await;
+    release_tx.send(()).unwrap();
+    let closed = tokio::time::timeout(
+        Duration::from_secs(5),
+        pt_contract::read_closed(&mut client),
+    )
+    .await;
+    peer.await.unwrap();
+    assert!(
+        pending.is_err(),
+        "буферизованный reply не доказывает закрытие"
+    );
+    assert!(matches!(closed, Ok(true)), "EOF после reply не подтверждён");
+}
+
 // Bootstrap подменён; проверяется завершение сервера, а не сеть Tor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_server_reports_final_flush_worker_panic() {

@@ -413,7 +413,10 @@ async fn invalid_reload_fails_before_readiness() {
             1,
             "pre_socks5 requires bridges.use_seeds and bridges.auto_fetch to be disabled",
         ),
-        (2, "pre_socks5 does not support pluggable transport bridges"),
+        (
+            2,
+            "pre_socks5 does not support pluggable transport bridges with unknown protocols",
+        ),
         (3, "pre_socks5 is incompatible with warm_pool.enabled"),
         (4, "pre несовместим с upstream"),
         (
@@ -426,10 +429,9 @@ async fn invalid_reload_fails_before_readiness() {
         match case {
             0 => changed.pre_socks5 = Some(proxy_config::EndpointOverride::Disabled),
             1 => changed.bridges.use_seeds = true,
-            2 => changed
-                .bridges
-                .lines
-                .push("obfs4 8.8.4.4:443 2222222222222222222222222222222222222222 cert=AAA".into()),
+            2 => changed.bridges.lines.push(
+                "unknownpt 8.8.4.4:443 2222222222222222222222222222222222222222 cert=AAA".into(),
+            ),
             3 => changed.warm_pool.enabled = true,
             4 => changed.upstream.enabled = true,
             5 => changed.bridges.auto_fetch = true,
@@ -461,6 +463,29 @@ async fn invalid_reload_fails_before_readiness() {
         assert_eq!(probe.entered.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(active.bridges, original);
     }
+}
+
+#[tokio::test]
+async fn unchanged_stock_pt_pre_rebuild_preserves_route_without_startup_probe() {
+    crate::tor_setup::FORBID_STARTUP_PROBE.scope((), async {
+        let mut cfg = Config::default();
+        cfg.bridges.use_seeds = false;
+        cfg.bridges.auto_fetch = false;
+        cfg.warm_pool.enabled = false;
+        cfg.pre_socks5 = Some(proxy_config::EndpointOverride::Endpoint(
+            "127.0.0.1:1080|alice:secret".parse().unwrap(),
+        ));
+        cfg.bridges.lines = vec![
+            "obfs4 8.8.4.4:443 2222222222222222222222222222222222222222 cert=AAA iat-mode=0".into(),
+            "webtunnel 8.8.8.8:443 3333333333333333333333333333333333333333 url=https://example.com/x ver=0.0.3".into(),
+        ];
+        let initial = crate::tor_setup::build_tor_settings(&cfg, None).await.unwrap();
+        let rebuilt = crate::tor_setup::build_tor_settings_preserving_live(&cfg, None, &initial.bridges).await.unwrap();
+        assert_eq!(rebuilt.pre_endpoint, initial.pre_endpoint);
+        assert_eq!(rebuilt.bridges, initial.bridges);
+        assert_eq!(rebuilt.pt_binary, initial.pt_binary);
+        assert!(rebuilt.stock_pt_proxy);
+    }).await;
 }
 
 #[tokio::test]

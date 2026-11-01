@@ -8,6 +8,7 @@ members = [
     "vendor/arti-client",
     "vendor/tor-circmgr",
     "vendor/tor-guardmgr",
+    "vendor/tor-ptmgr",
 ]
 
 # bridge-fetcher is in packages/* via glob
@@ -118,3 +119,10 @@ arti-client = { path = "vendor/arti-client" }
 ## latency-over-anonymity trade acceptable only in this personal-use fork;
 ## the default keeps behaviour identical to upstream.
 tor-circmgr = { path = "vendor/tor-circmgr" }
+## tor-ptmgr 0.47.0: локальная копия с квитанцией завершения PT и проверками
+## процессов (CI-задание pt-proxy-contract); без патча CI собирал бы
+## реестровую версию без этих изменений.
+tor-ptmgr = { path = "vendor/tor-ptmgr" }
+## Проверенные локальные версии PT и подготовка адреса carrier.
+ptrs-gesher-lyrebird = { path = "vendor/lyrebird" }
+ptrs-gesher-webtunnel = { path = "vendor/webtunnel" }

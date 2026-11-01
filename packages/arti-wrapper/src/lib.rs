@@ -25,8 +25,8 @@ use tor_linkspec::HasChanMethod;
 use tor_rtcompat::PreferredRuntime;
 
 /// Error type of every fallible operation in this crate, named for the
-/// phase that failed: assembling the client config
-/// ([`TorError::BuildConfig`]), parsing bridge or pluggable-transport
+/// phase that failed: assembling the client config ([`TorError::BuildConfig`]),
+/// parsing bridge or pluggable-transport
 /// settings ([`TorError::InvalidBridge`], [`TorError::InvalidPt`]),
 /// bootstrapping ([`TorError::Bootstrap`]), reconfiguring a live client
 /// ([`TorError::Reconfigure`]), opening streams ([`TorError::Connect`]),
@@ -36,6 +36,9 @@ use tor_rtcompat::PreferredRuntime;
 /// [`TorError::BridgeCheckProbeTimeout`]).
 #[derive(Debug, thiserror::Error)]
 pub enum TorError {
+    /// Pluggable transport shutdown did not complete.
+    #[error("failed to shut down pluggable transports")]
+    Shutdown,
     /// Creating the `TorClient` or waiting for it to reach a usable
     /// directory failed. Raised by every bootstrap path: `create_bootstrapped`,
     /// [`TorTunnel::create_unbootstrapped`]'s client construction, and
@@ -209,13 +212,14 @@ pub type BootstrapEventCallback = Arc<dyn Fn(BootstrapEvent) + Send + Sync>;
 pub struct Settings {
     /// Optional SOCKS5 pre-transport endpoint for owner-level routing. Credentials are redacted in Debug output.
     pub pre_endpoint: Option<Socks5PreEndpoint>,
+    /// Разрешает встроенному PT использовать SOCKS5 pre-маршрут.
+    pub stock_pt_proxy: bool,
     /// Bridges to use. When non-empty, the client will go through these
     /// instead of public guards.
     pub bridges: Vec<BridgeLine>,
     /// Path to a pluggable-transport binary (e.g. `lyrebird`/`obfs4proxy`).
     /// Required if any bridge specifies a transport other than `none`.
     pub pt_binary: Option<PathBuf>,
-
     /// Additional protocols supported by `pt_binary`, for probing inactive transports.
     pub extra_pt_protocols: Vec<String>,
     /// Base directory for arti's on-disk **state** and **cache**. When set,
@@ -284,6 +288,7 @@ impl Default for Settings {
         Self {
             bridges: Vec::new(),
             pre_endpoint: None,
+            stock_pt_proxy: false,
             pt_binary: None,
             extra_pt_protocols: Vec::new(),
             state_dir: None,
@@ -306,6 +311,7 @@ impl Settings {
     /// a client with only those set still behaves like the default one.
     pub fn is_default(&self) -> bool {
         self.pre_endpoint.is_none()
+            && !self.stock_pt_proxy
             && self.bridges.is_empty()
             && self.pt_binary.is_none()
             && self.extra_pt_protocols.is_empty()
@@ -396,6 +402,7 @@ impl TorTunnel {
 
     /// Bootstrap a Tor client applying the given [`Settings`].
     pub async fn bootstrap_with(settings: Settings) -> Result<Self> {
+        pre_endpoint::reject_one_shot_pre_pt(&settings)?;
         let pre = settings.pre_endpoint.clone();
         let iat_mode = settings.obfs4_iat_mode;
         let config = build_config(&settings)?;
@@ -403,10 +410,9 @@ impl TorTunnel {
         tunnel.pre_endpoint = Some(pre);
         Ok(tunnel)
     }
-
     /// Bootstrap using a pre-built `arti-client` config (escape hatch).
     pub async fn bootstrap_raw(config: TorClientConfig) -> Result<Self> {
-        Self::bootstrap_raw_with_mode(config, None).await
+        Self::bootstrap_raw_with_mode(pre_endpoint::checked_raw(config)?, None).await
     }
 
     async fn bootstrap_raw_with_mode(
@@ -425,7 +431,6 @@ impl TorTunnel {
             pre_endpoint: None,
         })
     }
-
     /// Forward this client's bootstrap events to `on_event` from a background
     /// Tokio task: the current status is emitted synchronously first (a
     /// subscriber always sees at least one `Progress` immediately), then one
@@ -469,6 +474,7 @@ impl TorTunnel {
         settings: Settings,
         on_event: Option<BootstrapEventCallback>,
     ) -> Result<Self> {
+        pre_endpoint::reject_one_shot_pre_pt(&settings)?;
         let iat_mode = settings.obfs4_iat_mode;
         let config = build_config(&settings)?;
         let mut tunnel = Self::create_unbootstrapped_with_mode(config, iat_mode)?;

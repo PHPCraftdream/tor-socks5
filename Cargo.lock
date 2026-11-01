@@ -4249,8 +4249,6 @@ dependencies = [
 [[package]]
 name = "ptrs-gesher-lyrebird"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27e7fe5a6a292b960c5a467e25cf7146ba07b50f5d14ae7696d1c8142ebd5d1b"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4259,6 +4257,7 @@ dependencies = [
  "futures",
  "libc",
  "log",
+ "percent-encoding",
  "ptrs-gesher-core",
  "ptrs-gesher-obfs4",
  "ptrs-gesher-webtunnel",
@@ -4267,10 +4266,12 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "tor-socks5-proto",
  "tracing",
  "tracing-core",
  "tracing-log",
  "tracing-subscriber",
+ "url",
  "windows-sys 0.61.2",
 ]
 
@@ -4317,8 +4318,6 @@ dependencies = [
 [[package]]
 name = "ptrs-gesher-webtunnel"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90a11756859f576c003a1df2e9784398053c625a3ee44c71052c4fea5c6f9b63"
 dependencies = [
  "base64",
  "getrandom 0.2.17",
@@ -7015,9 +7014,8 @@ dependencies = [
 [[package]]
 name = "tor-ptmgr"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0068103033ae2dcedf88691c4758b1e483dd31d325e4891f5e0d3bb41f24ecbc"
 dependencies = [
+ "anyhow",
  "async-trait",
  "cfg-if",
  "derive-deftly",
@@ -7028,6 +7026,7 @@ dependencies = [
  "oneshot-fused-workaround",
  "serde",
  "thiserror 2.0.18",
+ "tokio",
  "tor-async-utils",
  "tor-basic-utils",
  "tor-chanmgr",
@@ -7039,6 +7038,8 @@ dependencies = [
  "tor-rtcompat",
  "tor-socksproto",
  "tracing",
+ "tracing-subscriber",
+ "visibility",
  "web-time-compat",
 ]
 
