@@ -111,6 +111,39 @@ jobs:
           TOR_REAL_BINARY: ${{ steps.real-build.outputs.tor }}
         run: bash scripts/testing/real-tor-mutations.sh
 
+  license-audit:
+    name: Cargo license policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-local-sdk
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Capture Cargo workspace metadata (not a release build graph)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/license-inventory
+          for target in \
+            x86_64-unknown-linux-gnu \
+            x86_64-unknown-linux-musl \
+            aarch64-unknown-linux-gnu \
+            aarch64-unknown-linux-musl \
+            x86_64-pc-windows-msvc \
+            x86_64-apple-darwin \
+            aarch64-apple-darwin; do
+            cargo metadata --locked --format-version 1 --filter-platform "$target" \
+              > "target/license-inventory/cargo-metadata-$target.json"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pr-license-inventory
+          path: target/license-inventory/cargo-metadata-*.json
+          if-no-files-found: error
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny --config .github/deny.toml check licenses
+
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
