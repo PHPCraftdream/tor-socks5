@@ -161,7 +161,7 @@ jobs:
             ip6tables -A PT_AUDIT -p tcp --dport 53 -j RETURN
             ip6tables -A PT_AUDIT ! -d ::1/128 -j RETURN
             GITHUB_ACTIONS=true PT_PROXY_ISOLATED=yes python3 -I .github/pt_proxy/contract.py "$1/target/debug/socks5-proxy"
-            GITHUB_ACTIONS=true PT_PROXY_ISOLATED=yes "$(<"$1/target/pt-owner-path")"
+            exec unshare --net --pid --fork --mount-proc env GITHUB_ACTIONS=true PT_PROXY_ISOLATED=yes python3 -I .github/pt_proxy/owner_audit.py "$(<"$1/target/pt-owner-path")"
           ' bash "$GITHUB_WORKSPACE"
 
   fmt:

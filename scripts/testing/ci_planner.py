@@ -42,6 +42,25 @@ PT_MARKERS = {
     ".github/workflows/ci.yml": PT_LEGACY_MARKERS[".github/workflows/ci.yml"] + ("cargo test --locked -p socks5-proxy --test pt_owner_contract --no-run --message-format=json", ".github/pt_proxy/artifact.py", 'GITHUB_ACTIONS=true PT_PROXY_ISOLATED=yes "$(<"$1/target/pt-owner-path")"', "-p tor-ptmgr --features managed-pts,tor-channel-factory lifecycle_tests", "-p tor-ptmgr --features managed-pts,tor-channel-factory process_tests", "-p arti-client --features pt-client pt_shutdown_"),
 }
 
+PT_OWNER_DIRECT = 'GITHUB_ACTIONS=true PT_PROXY_ISOLATED=yes "$(<"$1/target/pt-owner-path")"'
+PT_OWNER_AUDIT = 'exec unshare --net --pid --fork --mount-proc env GITHUB_ACTIONS=true PT_PROXY_ISOLATED=yes python3 -I .github/pt_proxy/owner_audit.py "$(<"$1/target/pt-owner-path")"'
+PT_AUDIT_MARKERS = {
+    **PT_MARKERS,
+    ".github/workflows/ci.yml": tuple(
+        PT_OWNER_AUDIT if marker == PT_OWNER_DIRECT else marker
+        for marker in PT_MARKERS[".github/workflows/ci.yml"]
+    ),
+    ".github/pt_proxy/owner_audit.py": (
+        "def audit(tool):",
+        "command(tool + '-save', '-c', '-t', 'filter')",
+        "def protocol_complete():",
+        "def packet_audits(traffic=False):",
+        "signal.pidfd_send_signal(handle, signal.SIGKILL)",
+        "status, cleanup_ok, error = execute(listener, [sys.argv[1]])",
+        "results = packet_audits(traffic=True)",
+        "setup_ok and status == 0 and cleanup_ok and protocol_ok and audit_ok",
+    ),
+}
 
 def pt_contract(base_read, head_read):
     script = ".github/pt_proxy/contract.py"
@@ -52,8 +71,16 @@ def pt_contract(base_read, head_read):
     upgraded = bool(base_read("apps/socks5-proxy/tests/pt_owner_contract.rs") or
                     base_read(".github/pt_proxy/artifact.py") or
                     "--test pt_owner_contract" in base_read(workflow))
-    for read, required, markers_by_path in ((base_read, evidence or upgraded, PT_MARKERS if upgraded else PT_LEGACY_MARKERS),
-                                            (head_read, evidence or enabled, PT_MARKERS)):
+    def audited(read):
+        return bool(read(".github/pt_proxy/owner_audit.py") or
+                    ".github/pt_proxy/owner_audit.py" in read(workflow))
+    base_audited, head_audited = audited(base_read), audited(head_read)
+    base_markers = (PT_AUDIT_MARKERS if base_audited else
+                    PT_MARKERS if upgraded else PT_LEGACY_MARKERS)
+    head_markers = PT_AUDIT_MARKERS if base_audited or head_audited else PT_MARKERS
+    for read, required, markers_by_path in (
+            (base_read, evidence or upgraded or base_audited, base_markers),
+            (head_read, evidence or enabled or base_audited or head_audited, head_markers)):
         if required:
             for path, markers in markers_by_path.items():
                 text = read(path)

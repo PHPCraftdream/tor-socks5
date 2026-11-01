@@ -145,11 +145,58 @@ fn main() {
         .enable_all()
         .build()
         .unwrap();
+    rt.block_on(server::owners::handler_tests::http_peer::audit_phase(
+        "owner-start",
+    ));
+    server::owners::handler_tests::run_session_ledger_controls();
+    eprintln!("PT session ledger controls: PASS");
+    rt.block_on(server::owners::handler_tests::run_recorder_actor_controls())
+        .expect("recorder actor controls failed");
+    eprintln!("PT recorder producer controls: PASS");
+    rt.block_on(server::owners::handler_tests::run_queued_session_controls())
+        .expect("queued session helper controls failed");
+    eprintln!("PT queued session helper controls: PASS");
+    rt.block_on(server::owners::handler_tests::run_queue_integration_controls())
+        .expect("queued session integration controls failed");
+    eprintln!("PT queued session integration controls: PASS");
+    rt.block_on(server::owners::handler_tests::http_peer::run_controls())
+        .expect("HTTP peer controls failed");
+    eprintln!("PT HTTP peer controls: PASS");
+    rt.block_on(server::owners::handler_tests::webtunnel_contract::run_global());
+    eprintln!("PT supplied global WebTunnel: PASS");
+    rt.block_on(server::owners::handler_tests::webtunnel_contract::run_alternate());
+    eprintln!("PT supplied alternate WebTunnel retained carrier: PASS");
+    rt.block_on(server::owners::handler_tests::webtunnel_contract::run_same_address());
+    eprintln!("PT supplied same-address WebTunnel credential isolation: PASS");
+    rt.block_on(server::owners::handler_tests::webtunnel_contract::run_domain());
+    eprintln!("PT supplied domain-ATYP WebTunnel owner: PASS");
+    rt.block_on(server::owners::handler_tests::webtunnel_contract::run_auth_rejection());
+    eprintln!("PT supplied WebTunnel pre-proxy AUTH rejection: PASS");
+    rt.block_on(server::owners::handler_tests::webtunnel_contract::run_connect_rejection());
+    eprintln!("PT supplied WebTunnel pre-proxy CONNECT rejection: PASS");
+    rt.block_on(server::owners::handler_tests::http_peer::audit_phase(
+        "reuse-start",
+    ));
     rt.block_on(server::owners::handler_tests::carrier_oracle::run_reuse_and_rejection_controls());
+    rt.block_on(server::owners::handler_tests::http_peer::audit_phase(
+        "legacy-start",
+    ));
     rt.block_on(server::owners::handler_tests::run_pt_owner_contract());
+    rt.block_on(server::owners::handler_tests::http_peer::audit_phase(
+        "supplied-positive-start",
+    ));
     rt.block_on(server::owners::handler_tests::run_supplied_config_positive());
+    rt.block_on(server::owners::handler_tests::http_peer::audit_phase(
+        "supplied-negative-start",
+    ));
     rt.block_on(server::owners::handler_tests::run_supplied_config_negative());
+    rt.block_on(server::owners::handler_tests::http_peer::audit_phase(
+        "seeds-start",
+    ));
     rt.block_on(server::owners::handler_tests::run_supplied_config_seeds_rejected());
+    rt.block_on(server::owners::handler_tests::http_peer::audit_phase(
+        "owner-end",
+    ));
 }
 
 #[cfg(not(target_os = "linux"))]
