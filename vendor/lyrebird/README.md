@@ -37,11 +37,11 @@ For embedding, set the managed-transport environment and call
 tracing subscriber and safelog policy. The existing `lyrebird::run()` entry point
 continues to parse the standalone CLI options and configure its logging policy.
 
-## Исходящий прокси
+## Outbound proxy
 
-Локальная версия принимает `TOR_PT_PROXY` со схемой SOCKS5 и IP-адресом;
-неподдерживаемая схема или ошибочный URI отклоняются до запуска listener.
-Контракт процесса проверяется отдельно в CI; это не сквозная проверка Tor.
+The local version accepts `TOR_PT_PROXY` with the SOCKS5 scheme and an IP address;
+an unsupported scheme or invalid URI is rejected before the listener starts.
+The process contract is checked separately in CI; this is not an end-to-end Tor check.
 
 ## Usage (binary)
 
