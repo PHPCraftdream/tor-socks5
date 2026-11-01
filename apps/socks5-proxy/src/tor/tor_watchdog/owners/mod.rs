@@ -78,7 +78,7 @@ const OBSERVATION_CAP: usize = 64;
 
 #[cfg(test)]
 impl SelectionProbe {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let (events_tx, _events_rx) = tokio::sync::watch::channel(0usize);
         Self {
             next_request_id: std::sync::atomic::AtomicUsize::new(0),
@@ -95,7 +95,7 @@ impl SelectionProbe {
     }
 
     /// Публикация наблюдения + событие (watch = длина журнала).
-    fn publish(&self, observation: SelectionObservation) {
+    pub(crate) fn publish(&self, observation: SelectionObservation) {
         let mut log = self.observations.lock().unwrap();
         let (items, dropped) = &mut *log;
         if items.len() < OBSERVATION_CAP {
@@ -125,6 +125,25 @@ pub(crate) fn test_selection_probe() -> Arc<SelectionProbe> {
         .unwrap()
         .clone()
         .expect("реестр ещё не создан")
+}
+
+/// Synthetic controls must hold TEST_LIFECYCLE until this guard is dropped.
+#[cfg(test)]
+pub(crate) fn scoped_selection_probe(probe: Arc<SelectionProbe>) -> impl Drop {
+    struct Restore(Option<Arc<SelectionProbe>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let mut slot = LAST_SELECTION_PROBE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *slot = self.0.take();
+        }
+    }
+    let previous = LAST_SELECTION_PROBE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .replace(probe);
+    Restore(previous)
 }
 
 // Task-local доставка наблюдения из select_admitted в reserve.
@@ -315,8 +334,6 @@ impl OwnerRegistry {
                 ),
                 Err(_) => (None, SelectionOutcome::ReserveFailed),
             };
-            #[cfg(target_os = "linux")]
-            handler_tests::carrier_oracle::reserved(identity, result.is_ok());
             self.selection_probe.publish(SelectionObservation {
                 request_id: *request_id,
                 route: route.clone(),
@@ -329,6 +346,9 @@ impl OwnerRegistry {
                     SelectionOutcome::Global => SelectionEvent::Global,
                 },
             });
+            // Publish the journal record before the event lets readers check request_id.
+            #[cfg(target_os = "linux")]
+            handler_tests::carrier_oracle::reserved(*request_id, identity, result.is_ok());
         });
     }
 
