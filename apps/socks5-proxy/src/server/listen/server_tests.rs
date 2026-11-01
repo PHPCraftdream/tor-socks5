@@ -116,6 +116,8 @@ fn onion_state(name: &str, enabled: bool, allowed_onion: bool) -> AuthState {
         is_enabled: enabled,
         allowed_onion,
         allowed_clients: None,
+        pre_socks5: None,
+        post_socks5: None,
     };
     AuthState::build(&UsersConfig { users: vec![user] }).unwrap()
 }

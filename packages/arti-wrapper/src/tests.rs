@@ -1,7 +1,9 @@
 use super::*;
+use crate::pre_endpoint::channel_proves_endpoint;
 use arti_client::config::circ::CircMgrConfig;
 use std::path::PathBuf;
 use std::sync::Once;
+use tor_linkspec::ChannelMethod;
 
 /// Install rustls's process-wide `CryptoProvider` exactly once for this
 /// test binary, mirroring `install_crypto_provider()` in
@@ -24,6 +26,7 @@ fn ensure_crypto_provider() {
 #[test]
 fn settings_default_is_default() {
     let s = Settings::default();
+    assert!(s.pre_endpoint.is_none());
     assert!(s.is_default());
     assert!(s.bridges.is_empty());
     assert!(s.pt_binary.is_none());
@@ -48,6 +51,63 @@ fn settings_with_shorter_service_circuit_hops_is_not_default() {
         ..Default::default()
     };
     assert!(!settings.is_default());
+}
+
+#[test]
+fn build_config_routes_pre_proxy_and_redacts_credentials() {
+    for credentials in [None, Some(("owner".to_owned(), "top-secret".to_owned()))] {
+        let expected_uri = if credentials.is_some() {
+            "socks5://owner:top-secret@127.0.0.9:1087"
+        } else {
+            "socks5://127.0.0.9:1087"
+        };
+        let endpoint = Socks5PreEndpoint::new("127.0.0.9:1087".parse().unwrap(), credentials);
+        let debug = format!("{endpoint:?}");
+        assert!(!debug.contains("top-secret"));
+        let settings = Settings {
+            pre_endpoint: Some(endpoint),
+            ..Default::default()
+        };
+        let mut builder: TorClientConfigBuilder = TorClientConfig::builder();
+        pre_endpoint::configure_pre_endpoint(&mut builder, &settings)
+            .expect("SOCKS5 proxy configures");
+        let channel = builder.channel().build().expect("channel config builds");
+        let proxy = channel.outbound_proxy();
+        assert_eq!(proxy.expect("proxy configured").to_string(), expected_uri);
+        assert!(!format!("{settings:?}").contains("top-secret"));
+    }
+}
+
+#[test]
+fn build_config_rejects_unsupported_proxy_protocol_without_fallback() {
+    let settings = Settings {
+        pre_endpoint: Some(Socks5PreEndpoint::new(
+            "127.0.0.9:1087".parse().unwrap(),
+            None,
+        )),
+        pt_binary: Some(PathBuf::from("any-configured-pt")),
+        bridges: vec![
+            "obfs4 192.0.2.1:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA iat-mode=0"
+                .parse()
+                .unwrap(),
+        ],
+        ..Default::default()
+    };
+    let error = build_config(&settings).expect_err("PT combined with pre is unsupported");
+    assert!(error.to_string().contains("cannot guarantee routing"));
+}
+
+#[test]
+fn build_config_redacts_invalid_pre_proxy_credentials() {
+    let settings = Settings {
+        pre_endpoint: Some(Socks5PreEndpoint::new(
+            "127.0.0.9:1087".parse().unwrap(),
+            Some(("user".to_owned(), "x".repeat(256))),
+        )),
+        ..Default::default()
+    };
+    let error = build_config(&settings).expect_err("invalid URI userinfo is rejected");
+    assert!(!error.to_string().contains(&"x".repeat(256)));
 }
 
 #[test]
@@ -524,6 +584,7 @@ async fn verify_bridge_reachable_reports_bootstrap_timeout_for_an_unreachable_br
     );
 }
 
+#[cfg(test)]
 mod endpoint_proof {
     use super::*;
     use std::net::SocketAddr;
