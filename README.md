@@ -78,20 +78,20 @@ the limit when the rule was introduced are listed in the script's `BASELINE`
 with their current size: they may not grow, new ones may not appear, and an
 entry is lowered or deleted as the directory is split.
 
-## Установка готового бинарника
+## Installing a prebuilt binary
 
-Устанавливается **latest stable release** (не `main`, не prerelease) с проверкой SHA256
-до установки. На Unix файл заменяется атомарно; на Windows используется
-переименование с откатом при ошибке.
+The installer installs the **latest stable release** (not `main` or a prerelease), verifying SHA256
+before installation. On Unix, the file is replaced atomically; on Windows, replacement uses
+renaming with rollback on failure.
 
-Unix (Linux x86_64/aarch64 GNU/glibc и musl, macOS x86_64 и Apple Silicon):
+Unix (Linux x86_64/aarch64 GNU/glibc and musl, macOS x86_64 and Apple Silicon):
 
 ```bash
 curl -fsSL 'https://raw.githubusercontent.com/PHPCraftdream/tor-socks5/main/.github/install/install.sh' -o 'install.sh'
 sh './install.sh'
 ```
 
-Windows (x86_64, PowerShell 5.1 или 7):
+Windows (x86_64, PowerShell 5.1 or 7):
 
 ```powershell
 Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/PHPCraftdream/tor-socks5/main/.github/install/install.ps1' -OutFile '.\install.ps1'
@@ -99,89 +99,89 @@ powershell -NoProfile -ExecutionPolicy Bypass -File '.\install.ps1'
 # PowerShell 7: pwsh -NoProfile -File '.\install.ps1'
 ```
 
-- Каталог по умолчанию: `~/.local/bin` (Unix), `%LOCALAPPDATA%\Programs\tor-socks5` (Windows).
-- Свой каталог: `sh './install.sh' --install-dir "$HOME/bin"` / `powershell -NoProfile -File '.\install.ps1' -InstallDir "$HOME\bin"`.
-- PATH и конфигурационные файлы **не** изменяются; sudo/права администратора не требуются.
-- Автозапуск не настраивается; приложение установщиком не запускается.
-- Обновление работающего приложения: остановка не нужна. На Unix старый бинарник
-  атомарно заменяется (`rename`) — запущенный процесс продолжает работать со старой
-  версией; на Windows работающий `tor-socks5.exe` переименовывается в
-  `tor-socks5.exe.old.<уникальный суффикс>` и на его место ставится новый.
-- Запущенный процесс сам на новую версию не переключается — её используют
-  следующие запуски. Старые копии удаляются только при эксклюзивном доступе;
-  занятые или недоступные сохраняются до следующей установки. Очистка ограничена
-  зарезервированными именами `tor-socks5.exe.old.<32 hex>`.
-- Замена на Windows — транзакция с откатом (backup возвращается при сбое), а не
-  атомарный replace: теоретически возможен короткий интервал без canonical exe.
-- GNU выбирается только для известного legacy latest `v0.2.0`, только на x86_64 и только если `getconf GNU_LIBC_VERSION` явно подтверждает glibc; иначе установщик прекращает работу. Для новых Linux releases установщик всегда запрашивает статический musl archive на x86_64/aarch64, независимо от обнаружения libc (включая неизвестную libc); GNU archives доступны вручную.
-- Legacy latest ограничен `v0.2.0`: остальные исторические Linux assets не предполагаются и при их отсутствии установка завершится ошибкой. Установщик не запускает скачанный бинарник; SHA256 и структура архива проверяются до замены назначения, network/TLS/checksum failures не переключают target.
-- Статические musl binaries обычно работают на GNU и musl userspace, но требуют совместимое Linux kernel/CPU; минимальная версия ядра и поддержка старого оборудования не обещаются. GNU archives зависят от glibc baseline сборочного runner (минимальная версия не зафиксирована).
+- Default directory: `~/.local/bin` (Unix), `%LOCALAPPDATA%\Programs\tor-socks5` (Windows).
+- Custom directory: `sh './install.sh' --install-dir "$HOME/bin"` / `powershell -NoProfile -File '.\install.ps1' -InstallDir "$HOME\bin"`.
+- PATH and configuration files are **not** modified; sudo or administrator privileges are not required.
+- Automatic startup is not configured; the installer does not launch the application.
+- Updating a running application: no shutdown is required. On Unix, the old binary
+  is replaced atomically (`rename`) — the running process continues using the old
+  version; on Windows, the running `tor-socks5.exe` is renamed to
+  `tor-socks5.exe.old.<unique suffix>` and the new binary takes its place.
+- A running process does not switch to the new version automatically — subsequent
+  launches use it. Old copies are deleted only when exclusive access is available;
+  copies that are in use or inaccessible are kept until the next installation. Cleanup is limited to
+  the reserved names `tor-socks5.exe.old.<32 hex>`.
+- Replacement on Windows is a transaction with rollback (the backup is restored on failure), not
+  an atomic replacement: in theory, there may be a brief interval with no executable at the canonical path.
+- GNU is selected only for the known legacy latest release `v0.2.0`, only on x86_64, and only if `getconf GNU_LIBC_VERSION` explicitly confirms glibc; otherwise, the installer stops. For new Linux releases, the installer always requests a static musl archive for x86_64/aarch64, regardless of libc detection (including an unknown libc); GNU archives are available for manual download.
+- Legacy latest handling is limited to `v0.2.0`: other historical Linux assets are not assumed to exist, and installation fails if they are missing. The installer does not run the downloaded binary; SHA256 and the archive structure are checked before replacing the destination, and network/TLS/checksum failures do not cause a switch to another target.
+- Static musl binaries usually work on GNU and musl userspaces, but require a compatible Linux kernel and CPU; no minimum kernel version or support for older hardware is promised. GNU archives depend on the build runner's glibc baseline (no minimum version is pinned).
 
-### Каталог бинарника и каталог конфигурации независимы
+### The binary and configuration directories are independent
 
-Установщик только кладёт бинарник в каталог установки; он **не** запускает
-приложение и **не** создаёт конфигурационных файлов. Приложение при запуске ищет
-`tor-socks5.ktav` в **текущем рабочем каталоге**, откуда его запустили, а не рядом
-с бинарником: каталог бинарника и каталог конфигурации не связаны. Если
-`tor-socks5.ktav` в текущем каталоге нет, приложение само создаёт его с настройками
-по умолчанию при первом старте — там же появляется и `tor-socks5.bridges.ktav`.
+The installer only places the binary in the installation directory; it does **not** launch
+the application or create configuration files. At startup, the application looks for
+`tor-socks5.ktav` in the **current working directory** from which it was launched, not next
+to the binary: the binary and configuration directories are unrelated. If
+`tor-socks5.ktav` is missing from the current directory, the application creates it with default
+settings on first startup — `tor-socks5.bridges.ktav` is also created there.
 
-Так несколько узлов на одной машине используют разные настройки. Примеры
-независимых запусков из разных терминалов; каталог бинарника не обязан быть в PATH:
+This allows several nodes on one machine to use different settings. Examples of
+independent launches from separate terminals; the binary directory does not need to be in PATH:
 
 ```bash
 mkdir -p "$HOME/node-a" "$HOME/node-b"
-# Первый терминал: настройки в "$HOME/node-a/tor-socks5.ktav".
+# First terminal: settings in "$HOME/node-a/tor-socks5.ktav".
 cd "$HOME/node-a" && "$HOME/.local/bin/tor-socks5"
-# Второй терминал: настройки в "$HOME/node-b/tor-socks5.ktav".
+# Second terminal: settings in "$HOME/node-b/tor-socks5.ktav".
 cd "$HOME/node-b" && "$HOME/.local/bin/tor-socks5" --angel
 ```
 
 ```powershell
 New-Item -ItemType Directory -Force -Path "$HOME\node-a", "$HOME\node-b" -ErrorAction Stop
-# Первый терминал: настройки в "$HOME\node-a\tor-socks5.ktav".
+# First terminal: settings in "$HOME\node-a\tor-socks5.ktav".
 Set-Location -LiteralPath "$HOME\node-a" -ErrorAction Stop
 & "$env:LOCALAPPDATA\Programs\tor-socks5\tor-socks5.exe"
-# Второй терминал: настройки в "$HOME\node-b\tor-socks5.ktav".
+# Second terminal: settings in "$HOME\node-b\tor-socks5.ktav".
 Set-Location -LiteralPath "$HOME\node-b" -ErrorAction Stop
 & "$env:LOCALAPPDATA\Programs\tor-socks5\tor-socks5.exe"
 ```
 
-Явный путь всегда сильнее: `--config <path>` переопределяет `$TOR_SOCKS5_CONFIG`,
-а тот — файл в текущем каталоге. Режим `--angel` (Unix) фиксирует каталог запуска:
-все относительные пути (конфиг, bridges, pid-файл, логи) остаются привязанными к
-нему, как и в foreground.
+An explicit path always takes precedence: `--config <path>` overrides `$TOR_SOCKS5_CONFIG`,
+which in turn overrides the file in the current directory. The `--angel` mode (Unix) retains the launch directory:
+all relative paths (configuration, bridges, pid file, logs) remain relative to
+that directory, just as when running in the foreground.
 
-### Публикация релиза по тегу
+### Publishing a release by tag
 
-Поддерживаются теги формата `vX.Y.Z` (stable) и `vX.Y.Z-rc.N` (prerelease);
-build metadata (`+`) и ведущие нули (`v01.2.3`) не принимаются.
+Tags in the formats `vX.Y.Z` (stable) and `vX.Y.Z-rc.N` (prerelease) are supported;
+build metadata (`+`) and leading zeros (`v01.2.3`) are not accepted.
 
 ```bash
 git tag v0.3.0
 git push origin v0.3.0
 ```
 
-Публикация автоматическая — отдельного «ручного publish» нет. После push тега
-workflow `.github/workflows/release.yml`:
+Publication is automatic — there is no separate "manual publish" step. After a tag is pushed,
+the `.github/workflows/release.yml` workflow:
 
-- собирает 7 нативных бинарников (Linux x86_64 GNU/musl, Linux aarch64 GNU/musl, macOS x86_64/aarch64, Windows x86_64 MSVC) и публикует **7 архивов + 7 SHA256-файлов**
-  (`tor-socks5-<тег>-<таргет>.tar.gz/.zip` + `.sha256`);
-- сначала всё попадает в **draft release**; перед загрузкой сверяются SHA256
-  локальных архивов с их checksum-файлами; после загрузки проверяются наличие,
-  размеры и статус всех 14 assets (7 архивов + 7 SHA256); затем draft публикуется
+- builds 7 native binaries (Linux x86_64 GNU/musl, Linux aarch64 GNU/musl, macOS x86_64/aarch64, Windows x86_64 MSVC) and publishes **7 archives + 7 SHA256 files**
+  (`tor-socks5-<tag>-<target>.tar.gz/.zip` + `.sha256`);
+- first stages everything in a **draft release**; before upload, the SHA256 hashes
+  of the local archives are checked against their checksum files; after upload, the presence,
+  sizes and status of all 14 assets (7 archives + 7 SHA256 files) are checked; then the draft is published
   (draft → published);
-- выбор stable-релиза для `/releases/latest` оставлен правилам GitHub (`legacy`):
-  публикация не назначает любой новый maintenance-тег принудительно как latest;
-  prerelease (`vX.Y.Z-rc.N`) публикуется с флагом prerelease и **никогда**
-  не становится latest;
-- повторный запуск по тегу с полным комплектом из 14 опубликованных assets —
-  безопасный no-op: файлы не перезаписываются и не удаляются. Старый комплект
-  из 8 assets отклоняется без изменений; draft можно дозагрузить и опубликовать.
+- selection of the stable release for `/releases/latest` is left to GitHub's rules (`legacy`):
+  publication does not force every new maintenance tag to become latest;
+  a prerelease (`vX.Y.Z-rc.N`) is published with the prerelease flag and **never**
+  becomes latest;
+- rerunning for a tag with a complete set of 14 published assets is
+  a safe no-op: files are neither overwritten nor deleted. The old set
+  of 8 assets is rejected without changes; a draft can have its remaining assets uploaded and be published.
 
-Важно: реальная сборка релиза происходит при push тега **после merge** в `main`;
-в PR выполняется только offline-проверка хелперов (валидация тега, логика
-публикации с mock `gh`).
+Important: the actual release build happens when a tag is pushed **after merging** into `main`;
+PRs only run offline checks of the helpers (tag validation and publication
+logic with a mock `gh`).
 
 ## Quick start
 
@@ -309,32 +309,32 @@ auth.users_file:
 ## Destination policy: refuse .onion targets at the listener.
 security.block_onion: true
 
-## Контроль доступа клиентов: две независимые политики.
-## security.client_access.allowed_clients защищает слушатели SOCKS5/HTTP
-## CONNECT (CLI и Android FFI); dns_server.client_access.allowed_clients —
-## слушатели DNS (UDP+TCP). Каждое значение — одна скалярная строка,
-## разбираемая при загрузке.
+## Client access control: two independent policies.
+## security.client_access.allowed_clients protects the SOCKS5/HTTP
+## CONNECT listeners (CLI and Android FFI); dns_server.client_access.allowed_clients
+## protects the DNS listeners (UDP+TCP). Each value is a single scalar string,
+## parsed at load time.
 security.client_access.allowed_clients: *
 dns_server.client_access.allowed_clients: *
-## Грамматика: токены через запятую, каждый валидируется (в том числе
-## после ведущего *):
-## *  разрешить всем (значение по умолчанию, когда ключ отсутствует;
-##    явно пустая строка — ошибка загрузки, орфографии «запретить всем» нет)
-## loopback  строго в нижнем регистре: только 127.0.0.0/8 и ::1
-## точные IP: 192.168.1.5, 2001:db8::1
-## IPv4-wildcard октеты: 192.168.*.* (shorthand 192.168.* == 192.168.*.*)
-## IPv6-wildcard hextet'ы: 2001:db8:* (весь хвост после первых двух),
-##   2001:db8::* == 2001:db8:0:0:0:0:0:* (:: разворачивается в точные
-##   нули, никогда в wildcards)
-## mapped: ::ffff:192.168.*.* компилируется в эквивалентное IPv4-правило
-## Ошибки: имена хостов, CIDR, порты, zone ID, диапазоны, частичные *
-## (192.168.1*), ведущие нули. Имена никогда не резолвятся через DNS.
-## ACL прокси отклоняет пир до handshake (тихое закрытие соединения); при
-## включённой аутентификации после успешного логина дополнительно
-## применяется поле allowed_clients аккаунта из tor-socks5.users.ktav —
-## до любого исходящего трафика. См. docs/guide/auth.md и
+## Grammar: comma-separated tokens, each validated (including tokens
+## after a leading *):
+## *  allow everyone (the default when the key is absent;
+##    an explicitly empty string is a load error; there is no "deny all" syntax)
+## loopback  strictly lowercase: only 127.0.0.0/8 and ::1
+## exact IPs: 192.168.1.5, 2001:db8::1
+## IPv4 wildcard octets: 192.168.*.* (shorthand 192.168.* == 192.168.*.*)
+## IPv6 wildcard hextets: 2001:db8:* (any suffix after the first two),
+##   2001:db8::* == 2001:db8:0:0:0:0:0:* (:: expands to exact
+##   zeros, never wildcards)
+## mapped: ::ffff:192.168.*.* compiles to an equivalent IPv4 rule
+## Errors: hostnames, CIDR, ports, zone IDs, ranges, partial *
+## (192.168.1*), leading zeros. Names are never resolved through DNS.
+## The proxy ACL rejects a peer before the handshake (silently closing the connection); when
+## authentication is enabled, a successful login is followed by an additional check
+## against the account's allowed_clients field in tor-socks5.users.ktav —
+## before any outbound traffic. See docs/guide/auth.md and
 ## docs/guide/dns-server.md.
-## Пример с реальными значениями:
+## Example with concrete values:
 ## security.client_access.allowed_clients: 127.*, ::1
 ## dns_server.client_access.allowed_clients: loopback
 
