@@ -1,42 +1,42 @@
 # tor-socks5-client-acl
 
-Контроль доступа клиентов для локальных слушателей SOCKS5 и DNS:
-валидированный allow-список IP-адресов клиентов — небольшой слой без
-циклов зависимостей, общий для схемы конфигурации, auth-пути, DNS-сервера,
-CLI и Android FFI.
+Client access control for local SOCKS5 and DNS listeners:
+a validated allow-list of client IP addresses — a small layer free of
+dependency cycles, shared by the configuration schema, authentication path, DNS server,
+CLI and Android FFI.
 
-Весь список — одна скалярная строка (`AllowedClients`), разбираемая
-энергично при загрузке конфигурации: невалидное значение отвергается до
-старта слушателя, а не при соединении.
+The entire list is a single scalar string (`AllowedClients`), parsed
+eagerly when the configuration is loaded: an invalid value is rejected before
+the listener starts, not when a connection arrives.
 
-## Грамматика
+## Grammar
 
-Токены через запятую, каждый обрезается. Каждый токен валидируется,
-включая токены после `*`:
+Tokens are comma-separated, with surrounding whitespace trimmed from each. Every token is validated,
+including tokens after `*`:
 
-- `*` — разрешить всех клиентов.
-- `loopback` (строго в нижнем регистре) — только `127.0.0.0/8` и `::1`.
-- Точный литерал IPv4/IPv6 (`192.168.1.5`, `2001:db8::1`).
-- IPv4-wildcard: десятичные октеты или целый `*` на компонент
-  (`192.168.*.*`, shorthand `192.168.*` == `192.168.*.*`; shorthand —
-  меньше 4 компонентов с `*` в конце). Ведущие нули запрещены (`01` —
-  ошибка).
-- IPv6-wildcard: hex-группы или целый `*` на hextet (`2001:db8:*` =
-  префикс `2001:db8`, хвост любой; `2001:db8::*` = префикс `2001:db8`, пять нулевых hextet'ов
-  плюс любой последний). Не более одной компрессии `::`; сжатые hextet'ы —
-  всегда точные нули, никогда wildcards.
-- Mapped-wildcards: точечный IPv4-хвост разрешён ТОЛЬКО в точном
-  префиксе `::ffff:` (`::ffff:192.168.*.*`); wildcards сохраняются
-  пооктетно. Полная hextet-форма тоже поддерживается:
-  `0:0:0:0:0:ffff:192.168.*.*` (в т.ч. `0:0:0:0:0:ffff:c0a8:*`).
-  Обе компилируются в эквивалентное IPv4-правило. Любая другая IPv6-маска
-  остаётся чисто IPv6-правилом и не матчит IPv4-пиров.
+- `*` — allow all clients.
+- `loopback` (strictly lowercase) — only `127.0.0.0/8` and `::1`.
+- An exact IPv4/IPv6 literal (`192.168.1.5`, `2001:db8::1`).
+- IPv4 wildcards: decimal octets or a whole `*` per component
+  (`192.168.*.*`, shorthand `192.168.*` == `192.168.*.*`; shorthand uses
+  fewer than 4 components with a trailing `*`). Leading zeros are forbidden (`01` is
+  an error).
+- IPv6 wildcards: hex groups or a whole `*` per hextet (`2001:db8:*` =
+  prefix `2001:db8` with any suffix; `2001:db8::*` = prefix `2001:db8`, five zero hextets
+  and any final hextet). At most one `::` compression is allowed; compressed hextets
+  are always exact zeros, never wildcards.
+- Mapped wildcards: a dotted IPv4 suffix is allowed ONLY within the exact
+  prefix `::ffff:` (`::ffff:192.168.*.*`); wildcards are preserved
+  octet by octet. The fully expanded hextet form is also supported:
+  `0:0:0:0:0:ffff:192.168.*.*` (including `0:0:0:0:0:ffff:c0a8:*`).
+  Both compile to an equivalent IPv4 rule. Any other IPv6 mask
+  remains an IPv6-only rule and does not match IPv4 peers.
 
-Имена хостов, CIDR, порты, zone ID и диапазоны — ошибки разбора.
-Пир с IPv4-mapped IPv6-адресом (`::ffff:a.b.c.d`) нормализуется в
-обычный IPv4 до сопоставления; IPv4-compatible IPv6 — нет.
+Hostnames, CIDR, ports, zone IDs and ranges are parse errors.
+A peer with an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) is normalized to
+ordinary IPv4 before matching; IPv4-compatible IPv6 addresses are not.
 
-## Использование
+## Usage
 
 ```rust
 use client_acl::AllowedClients;
@@ -47,5 +47,5 @@ assert!(!acl.allows("10.0.0.1".parse().unwrap()));
 assert_eq!(acl.as_str(), "127.*, ::1");
 ```
 
-`Default` — `*` (разрешить всё): старые конфиги без новых ключей сохраняют
-прежнее поведение.
+`Default` is `*` (allow everyone): older configurations without the new keys retain
+their previous behavior.
