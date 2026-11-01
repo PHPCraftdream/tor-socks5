@@ -1,5 +1,81 @@
 use super::*;
 
+#[test]
+fn run_uses_effective_config_path() {
+    const CASE_ENV: &str = "TASK124_USERS_PATH_CASE";
+    if let Ok(case) = std::env::var(CASE_ENV) {
+        let config_path = match case.as_str() {
+            "default" | "env" => None,
+            "explicit" => Some(std::path::Path::new("explicit.ktav")),
+            _ => panic!("unexpected test case: {case}"),
+        };
+        run(
+            UsersAction::Add {
+                name: "alice".into(),
+                init: true,
+                allow_onion: false,
+                pre_socks5: None,
+                post_socks5: Some("none".into()),
+            },
+            config_path,
+            &mut fixed_prompt(""),
+        )
+        .unwrap();
+        return;
+    }
+
+    for (case, expected) in [
+        ("default", "tor-socks5.users.ktav"),
+        ("env", "env.users.ktav"),
+        ("explicit", "explicit.users.ktav"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .current_dir(dir.path())
+            .env(CASE_ENV, case)
+            .env("TOR_SOCKS5_CONFIG", "env.ktav")
+            .args([
+                "--exact",
+                "users_cli::tests::run_uses_effective_config_path",
+                "--nocapture",
+            ]);
+        if case == "default" {
+            command.env_remove("TOR_SOCKS5_CONFIG");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "child case {case} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let users = UsersConfig::load(&dir.path().join(expected)).unwrap();
+        let alice = users.find("alice").unwrap();
+        assert!(alice.is_enabled);
+        assert_eq!(alice.hash, INIT_SENTINEL);
+        assert_eq!(alice.post_socks5, Some(EndpointOverride::Disabled));
+        for name in [
+            "tor-socks5.users.ktav",
+            "env.users.ktav",
+            "explicit.users.ktav",
+        ] {
+            if name != expected {
+                assert!(
+                    !dir.path().join(name).exists(),
+                    "unexpected registry {name}"
+                );
+            }
+        }
+        for name in ["tor-socks5.ktav", "env.ktav", "explicit.ktav"] {
+            assert!(
+                !dir.path().join(name).exists(),
+                "unexpected main config {name}"
+            );
+        }
+    }
+}
+
 struct FixedPrompt {
     password: String,
     confirm: String,
