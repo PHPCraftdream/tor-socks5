@@ -702,7 +702,7 @@ async fn run_case(alternate: bool, same_address: bool, domain: bool, rejection: 
             owner: expected_owner,
         });
         let stream = &mut session.stream;
-        tcp_source_owned_by(&stream, pid)
+        tcp_source_owned_by(stream, pid)
             .map_err(|_| "carrier is not owned by the selected child")?;
         if session.credential != expected_credential {
             return Err("selected session credential mismatch");
@@ -807,7 +807,7 @@ async fn run_case(alternate: bool, same_address: bool, domain: bool, rejection: 
             }
             repeated_application = Some(repeated);
         }
-        if tcp_source_owned_by(&stream, 0).is_ok() {
+        if tcp_source_owned_by(stream, 0).is_ok() {
             return Err("wrong-PID ownership control accepted");
         }
         let mut discard = [0; 1024];
@@ -817,7 +817,7 @@ async fn run_case(alternate: bool, same_address: bool, domain: bool, rejection: 
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(_) => return Err("carrier liveness check failed"),
         }
-        tcp_source_owned_by(&stream, pid).map_err(|_| "current carrier ownership lost")?;
+        tcp_source_owned_by(stream, pid).map_err(|_| "current carrier ownership lost")?;
         if let (Some(global), Some(global_pid)) = (global_session.as_mut(), global_child) {
             let mut byte = [0; 1];
             match global.stream.try_read(&mut byte) {

@@ -17,6 +17,59 @@ controls = []
 peers = {}
 interrupted = None
 snapshots = {tool: 0 for tool, _, _, _ in FAMILIES}
+packet_details = {tool: None for tool, _, _, _ in FAMILIES}
+AUDIT_REASONS = frozenset((
+    'oversized audit snapshot',
+    'duplicate filter table',
+    'unexpected filter commit',
+    'content outside filter table',
+    'duplicate audit chain',
+    'unparsed audit line',
+    'undeclared audit chain',
+    'incomplete filter snapshot',
+    'audit chain or policy changed',
+    'audit hook or ordered rules changed',
+    'live control parent and dedicated counters disagree',
+    'audit packet or byte conservation failed',
+    'DNS or forbidden egress observed',
+    'owner window had no IPv4 traffic',
+))
+
+def diagnostic_reason(failure):
+    if type(failure) is RuntimeError and str(failure) in AUDIT_REASONS:
+        return str(failure)
+    return 'unclassified exception; message withheld'
+
+def counter_details(tool, counts):
+    limit = (1 << 64) - 1
+    clipped = False
+    def pair(value):
+        nonlocal clipped
+        clipped = clipped or any(number > limit for number in value)
+        return tuple(min(number, limit) for number in value)
+    live = [c for c in controls if tool == 'iptables' and c[3]]
+    retired = [c for c in controls if tool == 'iptables' and not c[3]]
+    classified = counts[CHAIN] + [counts[c[2]][0] for c in retired]
+    details = {
+        'output': pair(counts['OUTPUT'][0]),
+        'dns_udp': pair(counts[CHAIN][0]),
+        'dns_tcp': pair(counts[CHAIN][1]),
+        'forbidden': pair(counts[CHAIN][-2]),
+        'loopback': pair(counts[CHAIN][-1]),
+        'classified_total': pair(tuple(sum(c[i] for c in classified)
+                                       for i in (0, 1))),
+        'live': [
+            (controls.index(control), pair(counts[CHAIN][index]),
+             pair(counts[control[2]][0]))
+            for index, control in enumerate(live, start=2)
+        ],
+        'retired': [
+            (controls.index(control), pair(counts[control[2]][0]))
+            for control in retired
+        ],
+    }
+    details['clipped_to_u64'] = clipped
+    return details
 
 def require(ok, message):
     if not ok:
@@ -43,6 +96,7 @@ def expected(tool):
     return result
 
 def audit(tool):
+    packet_details[tool] = None
     text = command(tool + '-save', '-c', '-t', 'filter')
     snapshots[tool] += 1
     require(len(text) < 131072, 'oversized audit snapshot')
@@ -85,6 +139,7 @@ def audit(tool):
         name: ('ACCEPT' if name in ('INPUT', 'FORWARD', 'OUTPUT') else '-')
         for name in schema}, 'audit chain or policy changed')
     require(rules == schema, 'audit hook or ordered rules changed')
+    packet_details[tool] = counter_details(tool, counts)
     hook = counts['OUTPUT'][0]
     live = [c for c in controls if tool == 'iptables' and c[3]]
     for index, control in enumerate(live, start=2):
@@ -113,17 +168,22 @@ def packet_audits(traffic=False):
     for tool, _, _, _ in FAMILIES:
         before = snapshots[tool]
         error = None
+        reason = None
         try:
             clean(tool, traffic=(traffic and tool == 'iptables'))
             clean_ok = True
         except Exception as failure:
             clean_ok = False
             error = (type(failure).__name__, str(failure))
+            reason = diagnostic_reason(failure)
         acquired = snapshots[tool] == before + 1
         results[tool] = (acquired, clean_ok, error)
         print(f'owner-audit {tool}: snapshot={acquired} '
               f'packet_clean={clean_ok} '
-              f'error_type={None if error is None else error[0]!r}',
+              f'error_type={None if error is None else error[0]!r} '
+              f'invariant={reason!r} '
+              f'counter_units=packets,bytes '
+              f'counters={packet_details[tool]!r}',
               file=sys.stderr)
     return results
 
@@ -354,6 +414,23 @@ def require_packet_results(results, dirty):
         ) if tool in dirty else (True, True, None)
         require(result == expected_result,
                 'fault control snapshot or exact packet outcome mismatch')
+        details = packet_details[tool]
+        require(details is not None and not details['clipped_to_u64'],
+                'fault control bounded counter diagnostics missing')
+        require(details['output'] == details['classified_total'],
+                'fault control diagnostic conservation mismatch')
+        categories = (details['dns_udp'], details['dns_tcp'], details['forbidden'])
+        require(any(value != (0, 0) for value in categories) == (tool in dirty),
+                'fault control diagnostic packet categories mismatch')
+    require(diagnostic_reason(RuntimeError('DNS or forbidden egress observed'))
+            == 'DNS or forbidden egress observed',
+            'fault control fixed invariant diagnostic missing')
+    require(diagnostic_reason(RuntimeError('untrusted diagnostic text'))
+            == 'unclassified exception; message withheld',
+            'fault control untrusted diagnostic message exposed')
+    require(diagnostic_reason(ValueError('untrusted diagnostic text'))
+            == 'unclassified exception; message withheld',
+            'fault control foreign exception message exposed')
 
 def unfinished_control_fault(listener):
     require(not controls and not peers, 'fault control requires empty protocol state')
