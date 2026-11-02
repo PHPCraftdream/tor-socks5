@@ -45,6 +45,8 @@ jobs:
         with:
           python-version: '3.12'
       - uses: dtolnay/rust-toolchain@stable
+      - name: Test SDK contract rejection controls
+        run: python -I .github/actions/setup-local-sdk/verify.py --self-test
       - run: python -I scripts/testing/test_ci_planner.py
       - run: python -I scripts/testing/test_ci_integration.py
       - id: plan
@@ -122,6 +124,8 @@ jobs:
       - uses: ./.github/actions/setup-local-sdk
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Verify pinned SDK resolution without updating the lock
+        run: python3 -I .github/actions/setup-local-sdk/verify.py
       - name: Собрать поставляемый CLI и тест владельцев
         run: |
           set -euo pipefail
