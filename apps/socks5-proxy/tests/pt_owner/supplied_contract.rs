@@ -227,16 +227,18 @@ pub(crate) async fn run_supplied_config_positive() {
         no_upstream: false,
     };
     let mut server = AbortOnDrop(tokio::spawn(
-        super::super::super::global_init::RUN_SERVER_CONFIG.scope((), async move {
-            super::super::super::global_init::RUN_SERVER_SHUTDOWN
-                .scope(hook, async move {
-                    super::super::super::run_server(args, async {
-                        let _ = shutdown_rx.await;
+        crate::server::owners::construction_driver::inherit_scope(
+            super::super::super::global_init::RUN_SERVER_CONFIG.scope((), async move {
+                super::super::super::global_init::RUN_SERVER_SHUTDOWN
+                    .scope(hook, async move {
+                        super::super::super::run_server(args, async {
+                            let _ = shutdown_rx.await;
+                        })
+                        .await
                     })
                     .await
-                })
-                .await
-        }),
+            }),
+        ),
     ));
     // Таймируемый регион — ТОЛЬКО тело сценария; Err вместо unwrap где
     // практично (непрактичные unwrap внутри socks_auth/proxy-помощников —

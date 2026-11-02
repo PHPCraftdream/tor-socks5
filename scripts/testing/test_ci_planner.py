@@ -32,6 +32,145 @@ def graph():
     return p.Graph({"packages": packages, "workspace_members": ["proxy", "auth", "config", "acl", "bridge", "arti", "ffi"], "resolve": {"nodes": nodes}}, root)
 
 
+def domain_sources():
+    return {
+        ".github/pt_proxy/contract.py": (
+            "assert_failed\ntrap.assert_idle()\nassert_audit_clean()\n"
+            "audit_counts('iptables')[0] > 0\n"
+            "audit_counts('ip6tables')[2] > 0\nPROXY DONE\n"
+        ),
+        "apps/socks5-proxy/tests/pt_owner_contract.rs": (
+            "TOR_PT_MANAGED_TRANSPORT_VER\nPT_PROXY_ISOLATED\nlyrebird::run()\n"
+        ),
+        "apps/socks5-proxy/tests/pt_owner/owner_contract.rs": (
+            "run_pt_owner_contract\nOwnerRegistry::new\nproxy_connection\n"
+        ),
+        ".github/pt_proxy/artifact.py": (
+            "compiler-artifact\npt_owner_contract\n4 * 1024 * 1024\nlen(found) != 1\n"
+        ),
+        ".github/workflows/ci.yml": (
+            "pt-proxy-contract:\n.github/pt_proxy/contract.py\n"
+            "ip -6 addr add ::2/128 dev lo\nPT_AUDIT\n"
+            "cargo test --locked -p socks5-proxy --test pt_owner_contract "
+            "--no-run --message-format=json\n"
+            ".github/pt_proxy/artifact.py\n"
+            'exec unshare --net --pid --fork --mount-proc env '
+            'GITHUB_ACTIONS=true PT_PROXY_ISOLATED=yes python3 -I '
+            '.github/pt_proxy/owner_audit.py "$(<"$1/target/pt-owner-path")"\n'
+            "-p tor-ptmgr --features managed-pts,tor-channel-factory lifecycle_tests\n"
+            "-p tor-ptmgr --features managed-pts,tor-channel-factory process_tests\n"
+            "-p arti-client --features pt-client pt_shutdown_\n"
+        ),
+        ".github/pt_proxy/owner_audit.py": (
+            "direct_domain.py\nDirectDomain(\n"
+            "def audit(tool):\n"
+            "command(tool + '-save', '-c', '-t', 'filter')\n"
+            "def protocol_complete():\ndef packet_audits(traffic=False):\n"
+            "signal.pidfd_send_signal(handle, signal.SIGKILL)\n"
+            "status, cleanup_ok, error = execute(listener, [sys.argv[1]])\n"
+            "results = packet_audits(traffic=True)\n"
+            "setup_ok and status == 0 and cleanup_ok and protocol_ok "
+            "and audit_ok and domain_ok\n"
+        ),
+        ".github/pt_proxy/direct_domain.py": (
+            "class DirectDomain:\ndef authorize(\ndef bind(\ndef handle(\n"
+            "def rules(\ndef counts(\ndef setup(\ndef begin(\n"
+            "def finish(\ndef complete(\ndef dispose(\ndef regression(\n"
+        ),
+    }
+
+
+class PTGenerations(unittest.TestCase):
+    def read(self, data):
+        return lambda path: data.get(path, "")
+
+    def sources(self):
+        domain = domain_sources()
+        audited = dict(domain)
+        del audited[".github/pt_proxy/direct_domain.py"]
+        audit = ".github/pt_proxy/owner_audit.py"
+        audited[audit] = audited[audit].replace(
+            "direct_domain.py\nDirectDomain(\n", ""
+        ).replace(" and domain_ok", "")
+        direct = {path: "\n".join(markers) for path, markers in p.PT_MARKERS.items()}
+        legacy = {path: "\n".join(markers) for path, markers in p.PT_LEGACY_MARKERS.items()}
+        return ({}, legacy, direct, audited, domain)
+
+    def test_generation_transitions(self):
+        sources = self.sources()
+        for generation, source in enumerate(sources):
+            with self.subTest(generation=generation):
+                self.assertEqual(p.pt_generation(self.read(source)), generation)
+        for before, base in enumerate(sources):
+            for after, head in enumerate(sources):
+                with self.subTest(before=before, after=after):
+                    if after < before:
+                        with self.assertRaisesRegex(p.MappingError, "missing mapping: контракт PT"):
+                            p.pt_contract(self.read(base), self.read(head))
+                    else:
+                        self.assertEqual(
+                            p.pt_contract(self.read(base), self.read(head)), bool(after))
+
+    def test_domain_interface_markers_are_required(self):
+        domain = domain_sources()
+        module = ".github/pt_proxy/direct_domain.py"
+        expected = (
+            "class DirectDomain:", "def authorize(", "def bind(", "def handle(",
+            "def rules(", "def counts(", "def setup(", "def begin(",
+            "def finish(", "def complete(", "def dispose(", "def regression(",
+        )
+        for marker in expected:
+            with self.subTest(marker=marker):
+                self.assertIn(marker, p.PT_DOMAIN_MARKERS[module])
+                broken = dict(domain)
+                broken[module] = broken[module].replace(marker, "")
+                for base, head in ((domain, broken), (broken, domain)):
+                    with self.assertRaisesRegex(p.MappingError, "missing mapping: контракт PT"):
+                        p.pt_contract(self.read(base), self.read(head))
+
+    def test_domain_partials_and_required_marker_loss(self):
+        absent, legacy, direct, audited, domain = self.sources()
+        module = ".github/pt_proxy/direct_domain.py"
+        audit = ".github/pt_proxy/owner_audit.py"
+        workflow = ".github/workflows/ci.yml"
+        partials = [{module: domain[module]}, dict(audited, **{module: domain[module]})]
+        for path in (audit, workflow):
+            for reference in ("direct_domain.py", "DirectDomain(", "domain_ok"):
+                partial = dict(audited)
+                partial[path] = partial.get(path, "") + "\n" + reference + "\n"
+                partials.append(partial)
+        for marker in ("direct_domain.py", "DirectDomain(", " and domain_ok"):
+            partial = dict(domain)
+            partial[audit] = partial[audit].replace(marker, "")
+            partials.append(partial)
+        for path in domain:
+            partial = dict(domain)
+            del partial[path]
+            partials.append(partial)
+        for number, partial in enumerate(partials):
+            with self.subTest(partial=number):
+                self.assertEqual(p.pt_generation(self.read(partial)), 4)
+                for base, head in ((absent, partial), (audited, partial), (partial, domain)):
+                    with self.assertRaisesRegex(p.MappingError, "missing mapping: контракт PT"):
+                        p.pt_contract(self.read(base), self.read(head))
+        for path, markers in p.PT_DOMAIN_MARKERS.items():
+            for marker in markers:
+                broken = dict(domain)
+                broken[path] = broken[path].replace(marker, "")
+                with self.subTest(path=path, marker=marker):
+                    for base, head in ((domain, broken), (broken, domain)):
+                        with self.assertRaisesRegex(p.MappingError, "missing mapping: контракт PT"):
+                            p.pt_contract(self.read(base), self.read(head))
+
+    def test_historical_audited_upgrade(self):
+        _, _, direct, audited, domain = self.sources()
+        self.assertNotIn(".github/pt_proxy/direct_domain.py", audited)
+        self.assertEqual(p.pt_generation(self.read(audited)), 3)
+        self.assertTrue(p.pt_contract(self.read(audited), self.read(audited)))
+        self.assertTrue(p.pt_contract(self.read(direct), self.read(audited)))
+        self.assertTrue(p.pt_contract(self.read(audited), self.read(domain)))
+
+
 class Routing(unittest.TestCase):
     def setUp(self):
         self.g = graph()
@@ -40,7 +179,8 @@ class Routing(unittest.TestCase):
         return p.plan(self.g, paths, lambda path: blobs[path], mode, capabilities, event)
 
     def test_pt_proxy_contract_routing(self):
-        for path in (".github/pt_proxy/contract.py", "scripts/testing/ci_planner.py",
+        for path in (".github/pt_proxy/contract.py", ".github/pt_proxy/direct_domain.py",
+                     "scripts/testing/ci_planner.py",
                      "apps/socks5-proxy/src/main.rs", "apps/socks5-proxy/tests/pt_owner_contract.rs",
                      "apps/socks5-proxy/tests/pt_owner/owner_contract.rs", "vendor/tor-ptmgr/src/ipc.rs",
                      ".github/actions/setup-local-sdk/action.yml"):
@@ -87,13 +227,27 @@ class Routing(unittest.TestCase):
         with self.assertRaisesRegex(p.MappingError, 'missing mapping: контракт PT'):
             p.pt_contract(read(installed), read(legacy))
 
-    def test_actual_audited_pt_contract_and_affected_routing(self):
+    def test_actual_pt_contract_generation_and_affected_routing(self):
         root = Path(__file__).resolve().parents[2]
         workflow = ".github/workflows/ci.yml"
         audit = ".github/pt_proxy/owner_audit.py"
-        paths = set(p.PT_MARKERS) | {audit}
-        actual = {path: (root / path).read_text(encoding="utf-8") for path in paths}
+        module = ".github/pt_proxy/direct_domain.py"
+        paths = set(p.PT_DOMAIN_MARKERS) | {module}
+        actual = {}
+        for path in paths:
+            try:
+                actual[path] = (root / path).read_text(encoding="utf-8")
+            except FileNotFoundError:
+                actual[path] = ""
         read = lambda data: lambda path: data.get(path, "")
+        domain_evidence = bool(actual[module]) or any(
+            reference in actual[path]
+            for path in (audit, workflow)
+            for reference in ("direct_domain", "DirectDomain", "domain_ok")
+        )
+        expected_generation = 4 if domain_evidence else 3
+        self.assertEqual(p.pt_generation(read(actual)), expected_generation)
+        required = p.PT_DOMAIN_MARKERS if domain_evidence else p.PT_AUDIT_MARKERS
         direct = {path: "\n".join(markers) for path, markers in p.PT_MARKERS.items()}
         invocation = (
             'exec unshare --net --pid --fork --mount-proc env '
@@ -116,18 +270,20 @@ class Routing(unittest.TestCase):
         with self.assertRaisesRegex(p.MappingError, "missing mapping: контракт PT"):
             p.pt_contract(read(dict(actual, **{audit: ""})), read(actual))
 
-        for path, markers in p.PT_AUDIT_MARKERS.items():
+        for path, markers in required.items():
             for marker in markers:
                 with self.subTest(path=path, marker=marker):
                     broken = dict(actual, **{path: actual[path].replace(marker, "")})
-                    with self.assertRaisesRegex(p.MappingError, "missing mapping: контракт PT"):
-                        p.pt_contract(read(actual), read(broken))
+                    for base, head in ((actual, broken), (broken, actual)):
+                        with self.assertRaisesRegex(p.MappingError, "missing mapping: контракт PT"):
+                            p.pt_contract(read(base), read(head))
 
         before = actual[workflow].replace(invocation, 'echo "previous PT invocation"')
         result = self.route(workflow, blobs={workflow: (before, actual[workflow])})
         self.assertIn("pt-proxy", result["segments"])
         self.assertFalse(result["full"])
         for path in (
+            module,
             audit,
             "apps/socks5-proxy/tests/pt_owner_contract.rs",
             "apps/socks5-proxy/tests/pt_owner/http_peer.rs",

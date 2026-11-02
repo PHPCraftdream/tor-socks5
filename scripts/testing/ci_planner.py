@@ -62,31 +62,51 @@ PT_AUDIT_MARKERS = {
     ),
 }
 
+PT_DOMAIN_PATH = ".github/pt_proxy/direct_domain.py"
+PT_DOMAIN_GATE = "setup_ok and status == 0 and cleanup_ok and protocol_ok and audit_ok and domain_ok"
+PT_DOMAIN_MARKERS = {
+    **PT_AUDIT_MARKERS,
+    PT_DOMAIN_PATH: (
+        "class DirectDomain:", "def authorize(", "def bind(", "def handle(",
+        "def rules(", "def counts(", "def setup(", "def begin(",
+        "def finish(", "def complete(", "def dispose(", "def regression(",
+    ),
+    ".github/pt_proxy/owner_audit.py": PT_AUDIT_MARKERS[".github/pt_proxy/owner_audit.py"] + (
+        "direct_domain.py", "DirectDomain(", PT_DOMAIN_GATE,
+    ),
+}
+PT_GENERATIONS = ({}, PT_LEGACY_MARKERS, PT_MARKERS, PT_AUDIT_MARKERS, PT_DOMAIN_MARKERS)
+
+
+def pt_generation(read):
+    workflow = read(".github/workflows/ci.yml")
+    audit = read(".github/pt_proxy/owner_audit.py")
+    if (read(PT_DOMAIN_PATH) or
+            any(marker in text for text in (workflow, audit)
+                for marker in ("direct_domain", "DirectDomain", "domain_ok"))):
+        return 4
+    if audit or "owner_audit.py" in workflow:
+        return 3
+    if (read("apps/socks5-proxy/tests/pt_owner_contract.rs") or
+            read("apps/socks5-proxy/tests/pt_owner/owner_contract.rs") or
+            read(".github/pt_proxy/artifact.py") or
+            "--test pt_owner_contract" in workflow or PT_OWNER_DIRECT in workflow):
+        return 2
+    if read(".github/pt_proxy/contract.py") or "pt-proxy-contract:" in workflow:
+        return 1
+    return 0
+
+
 def pt_contract(base_read, head_read):
-    script = ".github/pt_proxy/contract.py"
-    workflow = ".github/workflows/ci.yml"
-    def installed(read):
-        return bool(read(script) or "pt-proxy-contract:" in read(workflow))
-    evidence, enabled = installed(base_read), installed(head_read)
-    upgraded = bool(base_read("apps/socks5-proxy/tests/pt_owner_contract.rs") or
-                    base_read(".github/pt_proxy/artifact.py") or
-                    "--test pt_owner_contract" in base_read(workflow))
-    def audited(read):
-        return bool(read(".github/pt_proxy/owner_audit.py") or
-                    ".github/pt_proxy/owner_audit.py" in read(workflow))
-    base_audited, head_audited = audited(base_read), audited(head_read)
-    base_markers = (PT_AUDIT_MARKERS if base_audited else
-                    PT_MARKERS if upgraded else PT_LEGACY_MARKERS)
-    head_markers = PT_AUDIT_MARKERS if base_audited or head_audited else PT_MARKERS
-    for read, required, markers_by_path in (
-            (base_read, evidence or upgraded or base_audited, base_markers),
-            (head_read, evidence or enabled or base_audited or head_audited, head_markers)):
-        if required:
-            for path, markers in markers_by_path.items():
-                text = read(path)
-                if not text or any(marker not in text for marker in markers):
-                    raise MappingError("missing mapping: контракт PT: " + path)
-    return enabled
+    before, after = pt_generation(base_read), pt_generation(head_read)
+    for read, generation in (
+            (base_read, before),
+            (head_read, max(before, after))):
+        for path, markers in PT_GENERATIONS[generation].items():
+            text = read(path)
+            if not text or any(marker not in text for marker in markers):
+                raise MappingError("missing mapping: контракт PT: " + path)
+    return bool(after)
 
 
 # Полный прогон выбирает ТОЧНЫЙ standalone footer в сообщении коммита:

@@ -1,5 +1,8 @@
 """GitHub-CI-only audit of the actual owner executable and its descendants."""
+import importlib.util
+import math
 import os
+from pathlib import Path
 import re
 import select
 import shlex
@@ -7,6 +10,21 @@ import signal
 import socket
 import subprocess
 import sys
+import time
+
+runtime = None
+
+
+def runtime_module():
+    path = Path(__file__).resolve().with_name('owner_runtime.py')
+    spec = importlib.util.spec_from_file_location('_owner_runtime', path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    require(Path(module.dd.__file__).resolve(strict=True) == path.with_name('direct_domain.py'),
+            'unexpected private domain module')
+    return module
+
 
 CHAIN = 'PT_OWNER'
 FAMILIES = (
@@ -16,6 +34,7 @@ FAMILIES = (
 controls = []
 peers = {}
 interrupted = None
+finalizing = False
 snapshots = {tool: 0 for tool, _, _, _ in FAMILIES}
 packet_details = {tool: None for tool, _, _, _ in FAMILIES}
 phase_records = []
@@ -103,6 +122,19 @@ def expected(tool):
 
 def audit(tool):
     packet_details[tool] = None
+    if tool == 'iptables' and runtime is not None:
+        try:
+            snapshot = runtime.snapshot()
+        except Exception:
+            # Even an expired/failed domain must not suppress the final kernel read.
+            command(tool + '-save', '-c', '-t', 'filter')
+            snapshots[tool] += 1
+            raise
+        snapshots[tool] += 1
+        counts = {name: list(rows) for name, rows in snapshot.data}
+        packet_details[tool] = counter_details(tool, counts)
+        packet_details[tool]['direct'] = runtime.domain.counts(snapshot)
+        return counts
     text = command(tool + '-save', '-c', '-t', 'filter')
     snapshots[tool] += 1
     require(len(text) < 131072, 'oversized audit snapshot')
@@ -369,7 +401,11 @@ def execute(listener, argv, trigger=False):
     error = None
     cleanup_ok = False
     try:
-        process = subprocess.Popen(argv, stdin=subprocess.PIPE if trigger else None)
+        process = subprocess.Popen(
+            argv, stdin=subprocess.PIPE if trigger else None,
+            env=runtime.environment() if runtime is not None else None)
+        if runtime is not None:
+            runtime.begin(process.pid, argv[0])
         if trigger:
             process.stdin.write(b'x')
             process.stdin.close()
@@ -377,9 +413,12 @@ def execute(listener, argv, trigger=False):
             reap(statuses)
             if process.pid in statuses:
                 break
-            ready, _, _ = select.select([listener, *peers], [], [], 0.05)
-            for endpoint in ready:
-                service(listener, endpoint)
+            if runtime is not None:
+                runtime.reactor.step()
+            else:
+                ready, _, _ = select.select([listener, *peers], [], [], 0.05)
+                for endpoint in ready:
+                    service(listener, endpoint)
     except Exception as failure:
         error = type(failure).__name__
     finally:
@@ -396,7 +435,8 @@ def on_signal(number, _frame):
     global interrupted
     if interrupted is None:
         interrupted = number
-        raise InterruptedError('owner supervisor interrupted')
+        if not finalizing:
+            raise InterruptedError('owner supervisor interrupted')
 
 def fault_controls(listener):
     global interrupted
@@ -579,6 +619,7 @@ os._exit(7)
     phase_records.clear()
 
 def main():
+    global runtime, finalizing
     require(os.getpid() == 1 and os.environ.get('GITHUB_ACTIONS') == 'true'
             and os.environ.get('PT_PROXY_ISOLATED') == 'yes',
             'owner audit requires isolated GitHub CI PID namespace init')
@@ -586,8 +627,12 @@ def main():
             and os.access(sys.argv[1], os.X_OK), 'invalid owner executable')
     for number in (signal.SIGTERM, signal.SIGINT, signal.SIGUSR1):
         signal.signal(number, on_signal)
+    deadline = float(os.environ['PT_OWNER_AUDIT_DEADLINE'])
+    require(math.isfinite(deadline) and 0 < deadline - time.monotonic() <= 240,
+            'invalid original owner audit deadline')
+    module = runtime_module()
     status, cleanup_ok, error = None, False, None
-    setup_ok, protocol_ok, audit_ok = False, False, False
+    setup_ok, protocol_ok, audit_ok, domain_ok = False, False, False, False
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         try:
             setup()
@@ -596,22 +641,48 @@ def main():
             fault_controls(listener)
             unfinished_control_fault(listener)
             calibrate()
+            module.calibrate(sys.modules[__name__], deadline)
+            domain = module.dd.DirectDomain(
+                deadline, lambda: expected('iptables'),
+                lambda: sum(bool(control[3]) for control in controls),
+                module.OwnerRuntime.unattached_allocation, cleanup_deadline=deadline + 15)
+            runtime = module.OwnerRuntime(sys.modules[__name__], listener, deadline, domain)
+            runtime.prepare()
             setup_ok = True
             status, cleanup_ok, error = execute(listener, [sys.argv[1]])
         except Exception as failure:
             error = type(failure).__name__
         finally:
+            finalizing = True
             try:
                 cleanup_ok = cleanup({}) and cleanup_ok
             except Exception as failure:
                 error = error or type(failure).__name__
-            protocol_ok = protocol_complete()
+            try:
+                if runtime is not None:
+                    runtime.finish()
+                protocol_ok = runtime is not None and runtime.protocol_complete()
+            except Exception as failure:
+                error = error or type(failure).__name__
             phases_ok = [label for label, _ in phase_records] == list(PHASES)
             print(f'owner-audit phase_sequence_complete={phases_ok}',
                   file=sys.stderr)
             results = packet_audits(traffic=True)
             audit_ok = all(acquired and clean_ok
                            for acquired, clean_ok, _ in results.values())
+            try:
+                domain_ok = runtime is not None and runtime.complete()
+            except Exception as failure:
+                error = error or type(failure).__name__
+            finally:
+                if runtime is not None:
+                    try:
+                        disposed = runtime.dispose()
+                        cleanup_ok = disposed and cleanup_ok
+                        domain_ok = disposed and domain_ok
+                    except Exception as failure:
+                        cleanup_ok = domain_ok = False
+                        error = error or type(failure).__name__
             try:
                 close_peers()
             except Exception as failure:
@@ -620,8 +691,8 @@ def main():
                 error = error or 'IncompleteAuditPhases'
     print(f'owner-audit setup={setup_ok} owner_status={status!r} '
           f'cleanup={cleanup_ok} protocol={protocol_ok} packet_audit={audit_ok} '
-          f'interrupted={interrupted!r} supervisor_error={error!r}', file=sys.stderr)
-    return 0 if (setup_ok and status == 0 and cleanup_ok and protocol_ok and audit_ok
+          f'domain={domain_ok} interrupted={interrupted!r} supervisor_error={error!r}', file=sys.stderr)
+    return 0 if (setup_ok and status == 0 and cleanup_ok and protocol_ok and audit_ok and domain_ok
                  and error is None and interrupted is None) else 1
 
 if __name__ == '__main__':

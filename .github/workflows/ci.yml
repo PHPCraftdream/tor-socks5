@@ -133,6 +133,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          timeout --signal=TERM --kill-after=15s 5m cargo test --locked -p socks5-proxy --bin socks5-proxy construction_
+          timeout --signal=TERM --kill-after=15s 5m cargo test --locked -p socks5-proxy --bin socks5-proxy direct_child_gate::tests
+          timeout --signal=TERM --kill-after=15s 5m cargo test --locked -p socks5-proxy --bin socks5-proxy owner_intent::tests
+          timeout --signal=TERM --kill-after=15s 5m cargo test --locked -p socks5-proxy --bin socks5-proxy owner_budget::tests
           timeout --signal=TERM --kill-after=15s 5m cargo test --locked -p tor-ptmgr --features managed-pts,tor-channel-factory lifecycle_tests
           timeout --signal=TERM --kill-after=15s 5m cargo test --locked -p tor-ptmgr --features managed-pts,tor-channel-factory process_tests
           timeout --signal=TERM --kill-after=15s 5m cargo test --locked -p arti-client --features pt-client pt_shutdown_
@@ -142,6 +146,7 @@ jobs:
           set -euo pipefail
           sudo unshare --net -- timeout --signal=TERM --kill-after=15s 4m bash -c '
             set -euo pipefail
+            export PT_OWNER_AUDIT_DEADLINE=$(python3 -I -c "import time; print(time.monotonic() + 240)")
             [ "$(ip -o link show | wc -l)" -eq 1 ]
             [ "$(ip -o link show | cut -d: -f2 | xargs)" = "lo" ]
             [ -z "$(ip -4 route show default)" ]
@@ -160,6 +165,7 @@ jobs:
             ip6tables -A PT_AUDIT -p udp --dport 53 -j RETURN
             ip6tables -A PT_AUDIT -p tcp --dport 53 -j RETURN
             ip6tables -A PT_AUDIT ! -d ::1/128 -j RETURN
+            unshare --net --pid --fork --mount-proc bash -euc "ip link set lo up; python3 -I .github/pt_proxy/tests/test_construction_adapter.py -v; exec python3 -I .github/pt_proxy/tests/test_owner_runtime.py -v"
             GITHUB_ACTIONS=true PT_PROXY_ISOLATED=yes python3 -I .github/pt_proxy/contract.py "$1/target/debug/socks5-proxy"
             exec unshare --net --pid --fork --mount-proc env GITHUB_ACTIONS=true PT_PROXY_ISOLATED=yes python3 -I .github/pt_proxy/owner_audit.py "$(<"$1/target/pt-owner-path")"
           ' bash "$GITHUB_WORKSPACE"

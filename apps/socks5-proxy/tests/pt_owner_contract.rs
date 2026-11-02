@@ -117,6 +117,45 @@ mod upstream;
 mod users_cli;
 
 #[cfg(target_os = "linux")]
+fn retain_evidence_cleanup(
+    runtime: &tokio::runtime::Runtime,
+    session: &mut server::owners::construction_driver::Session,
+) {
+    if !session.registries_closed() {
+        let settled = runtime.block_on(session.settle());
+        if settled.is_err() || !session.registries_closed() {
+            eprintln!("PT construction cleanup incomplete; retaining work for isolated supervisor");
+            runtime.block_on(session.hold_for_supervisor());
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_evidence_phase<F: std::future::Future<Output = ()> + 'static>(
+    runtime: &tokio::runtime::Runtime,
+    evidence: &mut Option<server::owners::construction_driver::Session>,
+    phase: u8,
+    budget: std::time::Duration,
+    work: F,
+) {
+    if let Some(session) = evidence {
+        let deadline = tokio::time::Instant::now() + budget;
+        let result = runtime.block_on(session.run_phase(phase, deadline, work));
+        if result.is_err() {
+            // Complete retained cleanup before reporting the scenario failure.
+            let terminal = runtime.block_on(session.finish());
+            retain_evidence_cleanup(runtime, session);
+            panic!(
+                "construction evidence phase failed (registries drained: {}, terminal evidence complete: {})",
+                session.registries_closed(), terminal.is_ok(),
+            );
+        }
+    } else {
+        runtime.block_on(work);
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn main() {
     if std::env::var_os("TOR_PT_MANAGED_TRANSPORT_VER").is_some() {
         let state = std::path::PathBuf::from(
@@ -132,7 +171,13 @@ fn main() {
             .enable_all()
             .build()
             .unwrap();
-        rt.block_on(lyrebird::run()).unwrap();
+        rt.block_on(async {
+            server::owners::owner_intent::gate_from_environment()
+                .await
+                .expect("managed-child owner readiness/gate failed");
+            lyrebird::run().await
+        })
+        .unwrap();
         return;
     }
     if std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true")
@@ -145,6 +190,9 @@ fn main() {
         .enable_all()
         .build()
         .unwrap();
+    let mut evidence = rt
+        .block_on(server::owners::construction_driver::Session::from_environment())
+        .expect("construction evidence setup failed");
     rt.block_on(server::owners::handler_tests::http_peer::audit_phase(
         "owner-start",
     ));
@@ -181,11 +229,23 @@ fn main() {
     rt.block_on(server::owners::handler_tests::http_peer::audit_phase(
         "legacy-start",
     ));
-    rt.block_on(server::owners::handler_tests::run_pt_owner_contract());
+    run_evidence_phase(
+        &rt,
+        &mut evidence,
+        0,
+        std::time::Duration::from_secs(90),
+        server::owners::handler_tests::run_pt_owner_contract(),
+    );
     rt.block_on(server::owners::handler_tests::http_peer::audit_phase(
         "supplied-positive-start",
     ));
-    rt.block_on(server::owners::handler_tests::run_supplied_config_positive());
+    run_evidence_phase(
+        &rt,
+        &mut evidence,
+        1,
+        std::time::Duration::from_secs(55),
+        server::owners::handler_tests::run_supplied_config_positive(),
+    );
     rt.block_on(server::owners::handler_tests::http_peer::audit_phase(
         "supplied-negative-start",
     ));
@@ -194,6 +254,14 @@ fn main() {
         "seeds-start",
     ));
     rt.block_on(server::owners::handler_tests::run_supplied_config_seeds_rejected());
+    if let Some(session) = &mut evidence {
+        let terminal = rt.block_on(session.finish());
+        if terminal.is_err() {
+            retain_evidence_cleanup(&rt, session);
+            panic!("construction evidence terminal reconciliation failed");
+        }
+        eprintln!("PT construction evidence stream: PASS");
+    }
     rt.block_on(server::owners::handler_tests::http_peer::audit_phase(
         "owner-end",
     ));
