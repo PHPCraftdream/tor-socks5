@@ -1,16 +1,13 @@
-use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
-
 use anyhow::{anyhow, bail, Context, Result};
 use arti_wrapper::{Settings, TorTunnel};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-
 static RETAINED: StdMutex<Option<Arc<GlobalInit>>> = StdMutex::new(None);
 static SETTINGS: StdMutex<Option<Arc<SettingsInit>>> = StdMutex::new(None);
-
 // Подменяет сетевые этапы запуска; проверка не является сквозным тестом Tor.
 #[cfg(test)]
 pub(super) struct StartupHook {
@@ -23,20 +20,18 @@ pub(super) struct StartupHook {
         )>,
     >,
 }
-
 #[cfg(test)]
 tokio::task_local! {
     pub(super) static RUN_SERVER_STARTUP: Arc<StartupHook>;
     pub(super) static RUN_SERVER_SHUTDOWN: Arc<ShutdownHook>;
+    pub(super) static RUN_SERVER_CONFIG: ();
 }
-
 #[cfg(test)]
 pub(super) struct ShutdownHook {
     pub settings: Settings,
     pub writer: crate::bridge_store_writer::StoreWriter,
     pub ready: StdMutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
-
 pub(super) fn launch_background() -> bool {
     #[cfg(test)]
     if RUN_SERVER_SHUTDOWN.try_with(|_| ()).is_ok() {
@@ -44,7 +39,6 @@ pub(super) fn launch_background() -> bool {
     }
     true
 }
-
 pub(super) fn server_ready() {
     #[cfg(test)]
     let _ = RUN_SERVER_SHUTDOWN.try_with(|hook| {
@@ -53,7 +47,6 @@ pub(super) fn server_ready() {
         }
     });
 }
-
 pub(super) fn init_server_tracing(
     cfg: &crate::config::Config,
 ) -> (
@@ -69,7 +62,6 @@ pub(super) fn init_server_tracing(
     crate::startup::install_crypto_provider();
     (Some(guard), sink)
 }
-
 pub(super) fn init_store_writer(path: Option<&std::path::Path>) {
     #[cfg(test)]
     if RUN_SERVER_STARTUP.try_with(|_| ()).is_ok() || RUN_SERVER_SHUTDOWN.try_with(|_| ()).is_ok() {
@@ -77,7 +69,6 @@ pub(super) fn init_store_writer(path: Option<&std::path::Path>) {
     }
     crate::bridge_store_writer::init_global(path);
 }
-
 pub(super) async fn close_store_writer() -> Option<Result<()>> {
     #[cfg(test)]
     if let Ok(writer) = RUN_SERVER_SHUTDOWN.try_with(|hook| hook.writer.clone()) {
@@ -89,7 +80,6 @@ pub(super) async fn close_store_writer() -> Option<Result<()>> {
     }
     crate::bridge_store_writer::close_global().await
 }
-
 fn cleanup_budget() -> Duration {
     #[cfg(test)]
     if RUN_SERVER_STARTUP.try_with(|_| ()).is_ok() {
@@ -97,11 +87,9 @@ fn cleanup_budget() -> Duration {
     }
     Duration::from_secs(5)
 }
-
 pub(super) struct SettingsInit {
     handle: Mutex<Option<JoinHandle<Result<Settings>>>>,
 }
-
 impl SettingsInit {
     pub(super) fn start(
         cfg: crate::config::Config,
@@ -118,6 +106,15 @@ impl SettingsInit {
                 Ok(hook.settings.clone())
             });
         }
+        // Реальная сборка настроек идёт раньше подмены ShutdownHook: новый
+        // контракный тест вкладывает RUN_SERVER_CONFIG в RUN_SERVER_SHUTDOWN.
+        #[cfg(test)]
+        if RUN_SERVER_CONFIG.try_with(|_| ()).is_ok() {
+            let runtime = tokio::runtime::Handle::current();
+            return Self::start_job(move || {
+                runtime.block_on(crate::tor_setup::build_tor_settings(&cfg, path.as_deref()))
+            });
+        }
         #[cfg(test)]
         if let Ok(settings) = RUN_SERVER_SHUTDOWN.try_with(|hook| hook.settings.clone()) {
             return Self::start_job(move || Ok(settings));
@@ -127,7 +124,6 @@ impl SettingsInit {
             runtime.block_on(crate::tor_setup::build_tor_settings(&cfg, path.as_deref()))
         })
     }
-
     fn start_job(job: impl FnOnce() -> Result<Settings> + Send + 'static) -> Result<Arc<Self>> {
         let mut root = SETTINGS
             .lock()
@@ -145,7 +141,6 @@ impl SettingsInit {
         drop(slot);
         Ok(init)
     }
-
     /// cancel-safe: да — дескриптор остаётся в корневом слоте при отмене ожидания.
     pub(super) async fn wait(self: &Arc<Self>) -> Result<Settings> {
         let mut slot = self.handle.lock().await;
@@ -157,7 +152,6 @@ impl SettingsInit {
         self.release()?;
         result.context("задача подготовки настроек завершилась аварийно")?
     }
-
     fn release(self: &Arc<Self>) -> Result<()> {
         let mut root = SETTINGS
             .lock()
@@ -170,7 +164,6 @@ impl SettingsInit {
         }
         Ok(())
     }
-
     pub(super) async fn recover(deadline: Instant) -> Result<()> {
         let init = SETTINGS
             .lock()
@@ -194,8 +187,70 @@ impl SettingsInit {
         }
         Ok(())
     }
+    #[cfg(test)]
+    async fn recover_terminal() -> Result<()> {
+        let init = SETTINGS
+            .lock()
+            .map_err(|_| anyhow!("хранилище настроек повреждено"))?
+            .clone();
+        if let Some(init) = init {
+            let mut slot = init.handle.lock().await;
+            if let Some(handle) = slot.as_mut() {
+                let result = handle.await;
+                slot.take();
+                init.release()?;
+                result.context("задача подготовки настроек завершилась аварийно")??;
+            } else {
+                init.release()?;
+            }
+        }
+        Ok(())
+    }
 }
-
+#[cfg(test)]
+pub(super) async fn recover_contract_all() -> Vec<String> {
+    let mut errors = Vec::new();
+    if let Err(error) = SettingsInit::recover(Instant::now() + Duration::from_secs(5)).await {
+        errors.push(format!("settings: {error}"));
+    }
+    if let Err(error) = GlobalInit::recover(Instant::now() + Duration::from_secs(5)).await {
+        errors.push(format!("global: {error}"));
+    }
+    if let Err(error) = super::producers::ProducerTasks::recover().await {
+        errors.push(format!("producers: {error}"));
+    }
+    if let Err(error) = super::handlers::HandlerTasks::recover().await {
+        errors.push(format!("handlers: {error}"));
+    }
+    if let Err(error) = super::owners::OwnerRegistry::recover_retained_with_deadline(
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    {
+        errors.push(format!("owners: {error}"));
+    }
+    errors
+}
+#[cfg(test)]
+pub(super) async fn recover_contract_terminal() -> Vec<String> {
+    let mut errors = Vec::new();
+    if let Err(error) = SettingsInit::recover_terminal().await {
+        errors.push(format!("settings: {error}"));
+    }
+    if let Err(error) = GlobalInit::recover_terminal().await {
+        errors.push(format!("global: {error}"));
+    }
+    if let Err(error) = super::producers::ProducerTasks::recover_terminal().await {
+        errors.push(format!("producers: {error}"));
+    }
+    if let Err(error) = super::handlers::HandlerTasks::recover_terminal().await {
+        errors.push(format!("handlers: {error}"));
+    }
+    if let Err(error) = super::owners::OwnerRegistry::recover_retained_terminal().await {
+        errors.push(format!("owners: {error}"));
+    }
+    errors
+}
 pub(super) async fn recover_startup() -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(5);
     SettingsInit::recover(deadline).await?;
@@ -204,7 +259,6 @@ pub(super) async fn recover_startup() -> Result<()> {
     super::handlers::HandlerTasks::recover().await?;
     super::owners::OwnerRegistry::recover_retained_with_deadline(deadline).await
 }
-
 /// Ожидает задачу запуска или восстанавливает её после сигнала завершения.
 /// Очистка создаётся только после сигнала, поэтому её срок начинается тогда же.
 pub(super) async fn wait_startup<T, C, F>(
@@ -231,7 +285,6 @@ where
         Some(result) => result.map(Some),
     }
 }
-
 pub(super) async fn stop_startup() -> Result<()> {
     // Подготовка настроек и запуск Tor делят пять секунд; восстановление
     // производителей имеет отдельные пять секунд (всего не более десяти).
@@ -244,21 +297,22 @@ pub(super) async fn stop_startup() -> Result<()> {
     producers
 }
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(300);
-
+struct Constructed {
+    tunnel: TorTunnel,
+    outcome: Result<()>,
+}
 pub(super) struct GlobalInit {
     cancel: CancellationToken,
-    handle: Mutex<Option<JoinHandle<Result<TorTunnel>>>>,
+    handle: Mutex<Option<JoinHandle<Result<Constructed>>>>,
     cleanup: Mutex<Option<JoinHandle<()>>>,
+    tunnel: Mutex<Option<TorTunnel>>,
 }
-
 pub(super) struct InitGuard(pub(super) Arc<GlobalInit>);
-
 impl Drop for InitGuard {
     fn drop(&mut self) {
         self.0.cancel.cancel();
     }
 }
-
 #[derive(Debug)]
 struct ConstructorCancelled;
 impl std::fmt::Display for ConstructorCancelled {
@@ -267,12 +321,10 @@ impl std::fmt::Display for ConstructorCancelled {
     }
 }
 impl std::error::Error for ConstructorCancelled {}
-
 impl GlobalInit {
     pub(super) fn cancel(&self) {
         self.cancel.cancel();
     }
-
     pub(super) fn start(settings: Settings) -> Result<Arc<Self>> {
         #[cfg(test)]
         if let Ok(hook) = RUN_SERVER_STARTUP.try_with(Arc::clone) {
@@ -284,17 +336,24 @@ impl GlobalInit {
                     let (entered, release) = hook.gate.lock().unwrap().take().unwrap();
                     let _ = entered.send(());
                     let _ = release.recv();
-                    drop(tunnel);
-                    Err(anyhow::Error::new(ConstructorCancelled))
+                    Ok(Constructed {
+                        tunnel,
+                        outcome: Err(anyhow::Error::new(ConstructorCancelled)),
+                    })
                 });
             }
         }
         #[cfg(test)]
-        if RUN_SERVER_SHUTDOWN.try_with(|_| ()).is_ok() {
+        if RUN_SERVER_SHUTDOWN.try_with(|_| ()).is_ok()
+            || RUN_SERVER_CONFIG.try_with(|_| ()).is_ok()
+        {
             let runtime = tokio::runtime::Handle::current();
             return Self::start_job(move |_| {
                 let _entered = runtime.enter();
-                Ok(TorTunnel::create_unbootstrapped_with(settings)?)
+                Ok(Constructed {
+                    tunnel: TorTunnel::create_unbootstrapped_with(settings)?,
+                    outcome: Ok(()),
+                })
             });
         }
         let runtime = tokio::runtime::Handle::current();
@@ -303,20 +362,19 @@ impl GlobalInit {
             let deadline = Instant::now() + BOOTSTRAP_TIMEOUT;
             let tunnel = TorTunnel::create_unbootstrapped_with(settings)?;
             runtime.block_on(async {
-                tokio::select! {
+                let outcome = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => Err(anyhow::Error::new(ConstructorCancelled)),
                     result = tokio::time::timeout_at(deadline, tunnel.wait_bootstrapped()) => {
-                        result.context("истёк срок запуска глобального Tor")??;
-                        Ok(tunnel)
+                        result.context("истёк срок запуска глобального Tor").and_then(|result| result.map_err(anyhow::Error::from))
                     }
-                }
+                };
+                Ok(Constructed { tunnel, outcome })
             })
         })
     }
-
     fn start_job(
-        job: impl FnOnce(CancellationToken) -> Result<TorTunnel> + Send + 'static,
+        job: impl FnOnce(CancellationToken) -> Result<Constructed> + Send + 'static,
     ) -> Result<Arc<Self>> {
         let mut root = RETAINED
             .lock()
@@ -328,6 +386,7 @@ impl GlobalInit {
             cancel: CancellationToken::new(),
             handle: Mutex::new(None),
             cleanup: Mutex::new(None),
+            tunnel: Mutex::new(None),
         });
         // Корень устанавливается до запуска; между установкой и сохранением дескриптора нет await.
         let mut handle = init.handle.try_lock().expect("новый слот свободен");
@@ -337,7 +396,6 @@ impl GlobalInit {
         drop(handle);
         Ok(init)
     }
-
     /// cancel-safe: да — дескриптор остаётся в корневом слоте при отмене ожидания.
     pub(super) async fn wait(self: &Arc<Self>) -> Result<TorTunnel> {
         let mut slot = self.handle.lock().await;
@@ -347,10 +405,31 @@ impl GlobalInit {
         // При отмене ожидания дескриптор остаётся в корневом слоте.
         let result = handle.await;
         slot.take();
-        self.release()?;
-        result.context("задача запуска Tor завершилась аварийно")?
+        let constructed = match result.context("задача запуска Tor завершилась аварийно")?
+        {
+            Ok(value) => value,
+            Err(error) => {
+                self.release()?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = constructed.outcome {
+            *self.tunnel.try_lock().expect("слот запуска свободен") = Some(constructed.tunnel);
+            drop(slot);
+            Self::recover(Instant::now() + cleanup_budget()).await?;
+            return Err(error);
+        }
+        *self.tunnel.try_lock().expect("слот запуска свободен") = Some(constructed.tunnel.clone());
+        Ok(constructed.tunnel)
     }
-
+    pub(super) fn complete_handoff(self: &Arc<Self>) -> Result<()> {
+        self.release()?;
+        self.tunnel
+            .try_lock()
+            .expect("слот запуска свободен")
+            .take();
+        Ok(())
+    }
     fn release(self: &Arc<Self>) -> Result<()> {
         let mut root = RETAINED
             .lock()
@@ -363,7 +442,6 @@ impl GlobalInit {
         }
         Ok(())
     }
-
     pub(super) async fn recover(deadline: Instant) -> Result<()> {
         let init = RETAINED
             .lock()
@@ -386,14 +464,28 @@ impl GlobalInit {
             slot.take();
             match result.context("задача запуска Tor завершилась аварийно")?
             {
-                Ok(tunnel) => {
-                    *cleanup = Some(tokio::task::spawn_blocking(move || drop(tunnel)));
+                Ok(constructed) => {
+                    *init.tunnel.try_lock().expect("слот запуска свободен") =
+                        Some(constructed.tunnel);
                 }
                 Err(error) if error.is::<ConstructorCancelled>() => {}
                 Err(error) => {
                     init.release()?;
                     return Err(error);
                 }
+            }
+        }
+        {
+            let mut tunnel = tokio::time::timeout_at(deadline, init.tunnel.lock())
+                .await
+                .context("истёк срок ожидания очистки глобального Tor")?;
+            if let Some(current) = tunnel.as_ref() {
+                tokio::time::timeout_at(deadline, current.shutdown())
+                    .await
+                    .context("истёк срок завершения глобального PT")??;
+            }
+            if let Some(current) = tunnel.take() {
+                *cleanup = Some(tokio::task::spawn_blocking(move || drop(current)));
             }
         }
         if let Some(handle) = cleanup.as_mut() {
@@ -406,8 +498,87 @@ impl GlobalInit {
         init.release()?;
         Ok(())
     }
+    #[cfg(test)]
+    async fn recover_terminal() -> Result<()> {
+        let init = RETAINED
+            .lock()
+            .map_err(|_| anyhow!("хранилище запуска Tor повреждено"))?
+            .clone();
+        let Some(init) = init else {
+            return Ok(());
+        };
+        init.cancel.cancel();
+        let mut handle = init.handle.lock().await;
+        let mut cleanup = init.cleanup.lock().await;
+        let mut errors = Vec::new();
+        if let Some(task) = handle.as_mut() {
+            let result = task.await;
+            handle.take();
+            match result.context("задача запуска Tor завершилась аварийно")
+            {
+                Ok(Ok(constructed)) => {
+                    *init.tunnel.lock().await = Some(constructed.tunnel);
+                    match constructed.outcome {
+                        Ok(()) => {}
+                        Err(error) if error.is::<ConstructorCancelled>() => {}
+                        Err(error) => errors.push(error),
+                    }
+                }
+                Ok(Err(error)) if error.is::<ConstructorCancelled>() => {}
+                Ok(Err(error)) => errors.push(error),
+                Err(error) => errors.push(error),
+            }
+        }
+        if let Some(task) = cleanup.as_mut() {
+            let result = task.await;
+            cleanup.take();
+            if let Err(error) =
+                result.context("задача очистки глобального Tor завершилась аварийно")
+            {
+                errors.push(error);
+            }
+        }
+        let mut tunnel = init.tunnel.lock().await;
+        let mut shutdown_succeeded = true;
+        if let Some(current) = tunnel.as_ref() {
+            if let Err(error) = current.shutdown().await {
+                shutdown_succeeded = false;
+                errors.push(
+                    anyhow::Error::new(error)
+                        .context("не удалось завершить глобальный PT; туннель сохранён"),
+                );
+            }
+        }
+        if shutdown_succeeded {
+            if let Some(current) = tunnel.take() {
+                *cleanup = Some(tokio::task::spawn_blocking(move || drop(current)));
+            }
+        }
+        let no_live_tunnel = tunnel.is_none();
+        drop(tunnel);
+        if let Some(task) = cleanup.as_mut() {
+            let result = task.await;
+            cleanup.take();
+            if let Err(error) =
+                result.context("задача очистки глобального Tor завершилась аварийно")
+            {
+                errors.push(error);
+            }
+        }
+        if no_live_tunnel {
+            init.release()?;
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow!(errors
+                .into_iter()
+                .map(|error| format!("{error:#}"))
+                .collect::<Vec<_>>()
+                .join("; ")))
+        }
+    }
 }
-
 #[cfg(test)]
 pub(super) fn startup_snapshot(global: bool) -> (bool, bool) {
     if global {
@@ -420,11 +591,9 @@ pub(super) fn startup_snapshot(global: bool) -> (bool, bool) {
         (SETTINGS.lock().unwrap().is_some(), false)
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_during_settings_retains_blocked_job() {
         let _lifecycle = super::super::owners::TEST_LIFECYCLE.lock().await;
@@ -462,7 +631,6 @@ mod tests {
         assert!(retained);
         assert!(SETTINGS.lock().unwrap().is_none());
     }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_during_global_init_cancels_and_retains_blocked_job() {
         let _lifecycle = super::super::owners::TEST_LIFECYCLE.lock().await;
@@ -505,7 +673,31 @@ mod tests {
         assert!(cancelled && retained);
         assert!(RETAINED.lock().unwrap().is_none());
     }
-
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handoff_keeps_tunnel_rooted_until_recovery() {
+        let _lifecycle = super::super::owners::TEST_LIFECYCLE.lock().await;
+        let runtime = tokio::runtime::Handle::current();
+        let init = GlobalInit::start_job(move |_| {
+            let _entered = runtime.enter();
+            Ok(Constructed {
+                tunnel: TorTunnel::create_unbootstrapped_with(Settings::default())?,
+                outcome: Ok(()),
+            })
+        })
+        .unwrap();
+        let tunnel = init.wait().await.unwrap();
+        assert!(RETAINED
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|root| Arc::ptr_eq(root, &init)));
+        assert!(init.tunnel.lock().await.is_some());
+        drop(tunnel);
+        GlobalInit::recover(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(RETAINED.lock().unwrap().is_none());
+    }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_wait_retains_job_until_recovery() {
         let _lifecycle = super::super::owners::TEST_LIFECYCLE.lock().await;

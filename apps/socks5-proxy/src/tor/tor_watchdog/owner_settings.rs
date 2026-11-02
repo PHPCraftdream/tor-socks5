@@ -6,6 +6,18 @@ pub(crate) fn restricted_owner_settings(
     cfg: &Config,
     config_path: Option<&Path>,
 ) -> Result<Settings> {
+    restricted_owner_settings_with_override(
+        cfg,
+        config_path,
+        std::env::var_os("TOR_PT_BINARY").as_deref(),
+    )
+}
+
+fn restricted_owner_settings_with_override(
+    cfg: &Config,
+    config_path: Option<&Path>,
+    pt_override: Option<&std::ffi::OsStr>,
+) -> Result<Settings> {
     if cfg.dns_server.enabled || cfg.onion_services.iter().any(|service| service.enabled) {
         bail!("pre_socks5 is incompatible with DNS listener, onion services, or upstream egress");
     }
@@ -18,8 +30,12 @@ pub(crate) fn restricted_owner_settings(
     for line in &cfg.bridges.lines {
         if !line.starts_with(bridge_probe::DNS_HINT_PREFIX) {
             let bridge: BridgeLine = line.parse().context("parsing configured bridge")?;
-            if bridge.transport.is_some() {
-                bail!("pre_socks5 does not support pluggable transport bridges");
+            if bridge
+                .transport
+                .as_deref()
+                .is_some_and(|p| !matches!(p, "obfs4" | "webtunnel"))
+            {
+                bail!("pre_socks5 does not support pluggable transport bridges with unknown protocols");
             }
         }
     }
@@ -31,14 +47,28 @@ pub(crate) fn restricted_owner_settings(
     if bridges.is_empty() {
         bail!("pre_socks5 requires at least one explicitly configured usable plain bridge");
     }
-    Ok(Settings {
+    let needs_pt = bridges.iter().any(|b| b.transport.is_some());
+    let override_path = pt_binary_override_from(pt_override);
+    let pt_binary = if needs_pt {
+        Some(match &override_path {
+            Some(path) => path.clone(),
+            None => std::env::current_exe().context("resolving current_exe for PT")?,
+        })
+    } else {
+        None
+    };
+    let settings = Settings {
         bridges,
         state_dir: Some(arti_base_dir(config_path)),
         pre_endpoint: None,
-        pt_binary: None,
+        pt_binary,
+        stock_pt_proxy: needs_pt && override_path.is_none(),
         extra_pt_protocols: Vec::new(),
+        obfs4_iat_mode: cfg.bridges.iat_mode_override(),
         ..settings_for_config(cfg)
-    })
+    };
+    settings.validate_stock_pt_proxy()?;
+    Ok(settings)
 }
 
 /// Проверяет отличающиеся действующие pre-маршруты до сетевых операций.
@@ -68,6 +98,43 @@ pub(crate) fn validate_owner_routes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_external_override_rejected_for_pt_but_plain_is_unchanged() {
+        let mut cfg = Config::default();
+        cfg.bridges.use_seeds = false;
+        cfg.bridges.auto_fetch = false;
+        cfg.warm_pool.enabled = false;
+        let external = std::ffi::OsStr::new("external-pt");
+        cfg.bridges.lines = vec!["8.8.8.8:443 1111111111111111111111111111111111111111".into()];
+        let plain = restricted_owner_settings_with_override(&cfg, None, Some(external)).unwrap();
+        assert!(plain.pt_binary.is_none());
+        assert!(!plain.stock_pt_proxy);
+        cfg.bridges.lines.push(
+            "obfs4 8.8.4.4:443 2222222222222222222222222222222222222222 cert=AAA iat-mode=0".into(),
+        );
+        assert!(restricted_owner_settings_with_override(&cfg, None, Some(external)).is_err());
+        let current = std::env::current_exe().unwrap();
+        assert!(
+            restricted_owner_settings_with_override(&cfg, None, Some(current.as_os_str())).is_err()
+        );
+        let stock = restricted_owner_settings_with_override(&cfg, None, None).unwrap();
+        assert!(stock.stock_pt_proxy);
+        assert_eq!(stock.pt_binary, Some(current));
+    }
+
+    #[test]
+    fn restricted_owner_rejects_unknown_raw_transport_before_filtering() {
+        let mut cfg = Config::default();
+        cfg.bridges.use_seeds = false;
+        cfg.bridges.auto_fetch = false;
+        cfg.warm_pool.enabled = false;
+        cfg.bridges.lines = vec![
+            "8.8.8.8:443 1111111111111111111111111111111111111111".into(),
+            "unknownpt [2001:db8::20]:443 2222222222222222222222222222222222222222".into(),
+        ];
+        assert!(restricted_owner_settings(&cfg, None).is_err());
+    }
 
     #[test]
     fn restricted_owner_template_rejects_unusable_bridges() {

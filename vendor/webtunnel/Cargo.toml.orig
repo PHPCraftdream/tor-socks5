@@ -1,0 +1,40 @@
+[package]
+name = "ptrs-gesher-webtunnel"
+version = "0.7.0"
+edition = "2021"
+rust-version = "1.92"
+license = "MIT OR Apache-2.0"
+description = "WebTunnel pluggable transport: TLS + HTTP/1.1 Upgrade with raw-byte payload (ptrs-gesher framework)"
+keywords = ["tor", "censorship", "webtunnel", "pluggable-transport"]
+categories = ["network-programming", "cryptography"]
+repository = "https://github.com/PHPCraftdream/ptrs-gesher"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+name = "webtunnel"
+
+[dependencies]
+ptrs = { package = "ptrs-gesher-core", path = "../core", version = "0.7.0" }
+tokio = { version = "1", features = ["net", "io-util", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+webpki-roots = "0.26"
+httparse = "1"
+thiserror = "2"
+tracing = "0.1"
+getrandom = "0.2"
+base64 = "0.22"
+url = "2"
+hickory-resolver = { version = "0.26.1", default-features = false, features = ["https-ring", "tokio", "webpki-roots"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "io-util", "net", "test-util"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1"
+
+[[bench]]
+name = "webtunnel_bench"
+harness = false
