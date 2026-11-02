@@ -28,6 +28,13 @@ mod retry;
 #[path = "server_statistics_tests.rs"]
 mod statistics;
 
+#[path = "listeners/server_tcp_exchange.rs"]
+mod tcp_exchange_io;
+use tcp_exchange_io::tcp_exchange;
+
+#[path = "listeners/server_diag_regression_tests.rs"]
+mod diag_regressions;
+
 pub(super) fn question(host: &str, kind: RecordType) -> Query {
     Query::query(Name::from_ascii(host).unwrap(), kind)
 }
@@ -170,43 +177,6 @@ impl<S: AsyncRead + Unpin> AsyncRead for ReadObserver<'_, S> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         self.get_mut().poll_read(cx, buf)
-    }
-}
-
-async fn tcp_exchange(stream: &mut TcpStream, message: &Message) -> Message {
-    let bytes = message.to_vec().unwrap();
-    // Deliberately split the length prefix and body, using real TCP. NODELAY
-    // keeps every fragment its own segment; with Nagle on, each tiny write would
-    // wait for the server's delayed ACK (about 40 ms each on Linux).
-    stream.set_nodelay(true).unwrap();
-    let prefix = u16::try_from(bytes.len()).unwrap().to_be_bytes();
-    stream.write_all(&prefix[..1]).await.unwrap();
-    stream.write_all(&prefix[1..]).await.unwrap();
-    for chunk in bytes.chunks(3) {
-        stream.write_all(chunk).await.unwrap();
-    }
-    // Диагностика Windows RST: production read_framed_message под наблюдателем;
-    // при сбое печатаем реально прочитанные байты, монотонное время и адреса.
-    let started = std::time::Instant::now();
-    let local = stream.local_addr().ok();
-    let peer = stream.peer_addr().ok();
-    let (frame, bytes_read) = {
-        let mut observed = ReadObserver::new(stream);
-        let frame = wire::read_framed_message(&mut observed, Duration::from_secs(5)).await;
-        (frame, observed.read)
-    };
-    match frame {
-        Ok(Some(body)) => Message::from_vec(&body).unwrap(),
-        Ok(None) => panic!(
-            "tcp response: EOF instead of reply: elapsed={:?}, bytes_read={bytes_read}, local={local:?}, peer={peer:?}",
-            started.elapsed()
-        ),
-        Err(error) => panic!(
-            "tcp response read failed: elapsed={:?}, bytes_read={bytes_read}, kind={:?}, raw_os_error={:?}, local={local:?}, peer={peer:?}, error={error}",
-            started.elapsed(),
-            error.kind(),
-            error.raw_os_error()
-        ),
     }
 }
 
