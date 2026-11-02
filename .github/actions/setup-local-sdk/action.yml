@@ -6,7 +6,7 @@ runs:
     - uses: actions/checkout@v7
       with:
         repository: PHPCraftdream/resocks5
-        ref: v0.3.0
+        ref: 1375fef64f029db24dc7d604051e0dd557570f30
         path: .ci-deps/resocks5
         persist-credentials: false
     - shell: bash
