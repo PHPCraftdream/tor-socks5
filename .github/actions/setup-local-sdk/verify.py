@@ -8,9 +8,9 @@ import tomllib
 import unittest
 from pathlib import Path
 
-COMMIT = "1375fef64f029db24dc7d604051e0dd557570f30"
+COMMIT = "b1b08bedc41c2c22fc9f6c609a58519c7aea097b"
 NAME = "resocks5-net"
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 DEPENDENCIES = {"base64", "socket2", "tokio"}
 
 
@@ -33,7 +33,7 @@ def check(root, sdk, lock, metadata, sdk_head, expected_manifest):
     require(
         root["workspace"]["dependencies"][NAME] == {
             "path": "../resocks5/crates/resocks5-net",
-            "version": "=0.4.0",
+            "version": "=0.4.1",
             "default-features": False,
         },
         "workspace SDK dependency contract mismatch",
@@ -121,7 +121,7 @@ class ContractTests(unittest.TestCase):
                     "ktav": "0.8.0",
                     NAME: {
                         "path": "../resocks5/crates/resocks5-net",
-                        "version": "=0.4.0",
+                        "version": "=0.4.1",
                         "default-features": False,
                     },
                 },
@@ -173,12 +173,14 @@ class ContractTests(unittest.TestCase):
         self.validate()
 
     def test_rejects_wrong_checkout(self):
-        with self.assertRaisesRegex(ValueError, "commit"):
-            self.validate(head="0" * 40)
+        for head in ("0" * 40, "1375fef64f029db24dc7d604051e0dd557570f30"):
+            with self.subTest(head=head):
+                with self.assertRaisesRegex(ValueError, "commit"):
+                    self.validate(head=head)
 
     def test_rejects_old_lock_and_registry_source(self):
         for field, value, message in (
-            ("version", "0.3.0", "version"),
+            ("version", "0.4.0", "version"),
             ("source", "registry+unexpected", "path-sourced"),
             ("checksum", "unexpected", "path-sourced"),
         ):
@@ -190,7 +192,7 @@ class ContractTests(unittest.TestCase):
 
     def test_rejects_changed_resolution(self):
         mutations = (
-            ("version", "0.3.0", "version"),
+            ("version", "0.4.0", "version"),
             ("source", "git+unexpected", "path-sourced"),
             ("manifest_path", str(self.manifest.parent / "other.toml"),
              "path mismatch"),
@@ -237,7 +239,7 @@ class ContractTests(unittest.TestCase):
 
     def test_rejects_wrong_sdk_version(self):
         sdk = copy.deepcopy(self.sdk)
-        sdk["workspace"]["package"]["version"] = "0.3.0"
+        sdk["workspace"]["package"]["version"] = "0.4.0"
         with self.assertRaisesRegex(ValueError, "workspace version"):
             self.validate(sdk=sdk)
 

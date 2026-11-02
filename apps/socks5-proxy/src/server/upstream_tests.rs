@@ -33,6 +33,7 @@ enum Bnd {
     V4,
     V6,
     Domain,
+    EmptyDomain,
 }
 
 impl Bnd {
@@ -45,7 +46,8 @@ impl Bnd {
                 v.extend_from_slice(&[0, 0]);
                 v
             }
-            Bnd::Domain => vec![ATYP_DOMAIN, 0, 0, 0],
+            Bnd::Domain => vec![ATYP_DOMAIN, 3, b'b', b'n', b'd', 0, 0],
+            Bnd::EmptyDomain => vec![ATYP_DOMAIN, 0, 0, 0],
         }
     }
 }
@@ -218,6 +220,22 @@ async fn bnd_addr_domain_is_drained() {
     let mut payload = [0u8; 4];
     s.read_exact(&mut payload).await.unwrap();
     assert_eq!(&payload, b"tail");
+}
+
+#[tokio::test]
+async fn empty_bnd_addr_domain_is_rejected() {
+    let (addr, handle) = fake_upstream(false, false, REP_SUCCESS, Bnd::EmptyDomain, b"").await;
+    let up = Upstream::new(addr, None);
+    let result = up.connect("example.com", 443).await;
+    assert_eq!(
+        handle.await.unwrap(),
+        Some(("example.com".to_string(), 443))
+    );
+    let err = failure(result);
+    match typed(&err) {
+        ConnectError::Protocol(ProtocolViolation::Socks5EmptyBoundDomain) => {}
+        other => panic!("unexpected: {other:?}"),
+    }
 }
 
 #[tokio::test]
