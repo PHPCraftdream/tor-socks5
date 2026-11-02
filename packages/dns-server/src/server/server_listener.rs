@@ -1,6 +1,8 @@
 //! Admission and scoped socket ownership. No backend queue and no detached tasks.
 use std::future::Future;
+#[cfg(test)]
 use std::io;
+#[cfg(test)]
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -24,20 +26,26 @@ const CONNECTION_LIFETIME: Duration = Duration::from_secs(300);
 type Work = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 pub(super) trait TcpIo: AsyncRead + AsyncWrite + Unpin {
+    #[cfg(test)]
     fn local_addr(&self) -> io::Result<SocketAddr>;
+    #[cfg(test)]
     fn peer_addr(&self) -> io::Result<SocketAddr>;
+    #[cfg(test)]
     fn set_nodelay(&self, enabled: bool) -> io::Result<()>;
 }
 
 impl TcpIo for TcpStream {
+    #[cfg(test)]
     fn local_addr(&self) -> io::Result<SocketAddr> {
         TcpStream::local_addr(self)
     }
 
+    #[cfg(test)]
     fn peer_addr(&self) -> io::Result<SocketAddr> {
         TcpStream::peer_addr(self)
     }
 
+    #[cfg(test)]
     fn set_nodelay(&self, enabled: bool) -> io::Result<()> {
         TcpStream::set_nodelay(self, enabled)
     }
