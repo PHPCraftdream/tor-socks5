@@ -81,7 +81,7 @@ criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 proptest = "1"
 rusqlite = { version = "0.39", features = ["backup"] }
 # Use the same pinned SDK source as CI and release builds.
-resocks5-net = { path = "../resocks5/crates/resocks5-net", version = "=0.4.0", default-features = false }
+resocks5-net = { path = "../resocks5/crates/resocks5-net", version = "=0.4.1", default-features = false }
 
 [profile.release]
 lto = "thin"
