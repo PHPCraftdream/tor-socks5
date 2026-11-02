@@ -10,6 +10,15 @@ on:
   schedule:
     - cron: "17 2 * * *"
   workflow_dispatch:
+    inputs:
+      preset:
+        description: "Standard Nightly or one partial Windows DNS diagnostic attempt"
+        required: false
+        default: standard
+        type: choice
+        options:
+          - standard
+          - windows-dns-rst
 
 concurrency:
   group: nightly-tests
@@ -37,8 +46,24 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: ${{ github.event_name == 'workflow_dispatch' && inputs.preset == 'windows-dns-rst' && fromJSON('["windows-latest"]') || fromJSON('["ubuntu-latest","windows-latest","macos-latest"]') }}
     steps:
+      - name: Validate Nightly preset
+        env:
+          NIGHTLY_EVENT: ${{ github.event_name }}
+          NIGHTLY_PRESET: ${{ inputs.preset }}
+        run: |
+          case "$NIGHTLY_EVENT:$NIGHTLY_PRESET" in
+            schedule:*|workflow_dispatch:|workflow_dispatch:standard)
+              ;;
+            workflow_dispatch:windows-dns-rst)
+              ;;
+            *)
+              echo "Unsupported Nightly event or preset" >&2
+              exit 1
+              ;;
+          esac
+        shell: bash
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-local-sdk
       - uses: dtolnay/rust-toolchain@stable
@@ -51,10 +76,20 @@ jobs:
         if: runner.os == 'macOS'
         run: sudo ifconfig lo0 alias 127.0.0.2 up
         shell: bash
-      - run: >-
+      - name: Run standard flaky hunt
+        if: github.event_name != 'workflow_dispatch' || inputs.preset != 'windows-dns-rst'
+        run: >-
           cargo nextest run --profile flaky-hunt --stress-count 10
           -p tor-socks5-dns -p tor-circmgr -p tor-guardmgr -p socks5-proxy
           --locked
+        shell: bash
+      - name: Run partial Windows DNS RST diagnostic
+        if: github.event_name == 'workflow_dispatch' && inputs.preset == 'windows-dns-rst'
+        run: |
+          set -o pipefail
+          cargo nextest run --profile flaky-hunt --stress-count 10 \
+            --retries 0 -p tor-socks5-dns --locked 2>&1 |
+            tee windows-dns-rst.log
         shell: bash
       # .config/nextest.toml defines [profile.flaky-hunt.junit] with
       # target/nextest/flaky-hunt/junit.xml, so the upload publishes the
@@ -65,12 +100,19 @@ jobs:
           name: junit-flaky-hunt-${{ matrix.os }}
           path: target/nextest/flaky-hunt/junit.xml
           if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.preset == 'windows-dns-rst'
+        with:
+          name: diagnostic-windows-dns-rst-raw
+          path: windows-dns-rst.log
+          if-no-files-found: ignore
 
   # Vendored crates that are NOT workspace members (coverage gap in
   # `cargo test --workspace`). The lockfile will change when the extra
   # members are added, so no --locked here.
   vendor-extra:
     name: Vendored extras (ubuntu)
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.preset == '' || inputs.preset == 'standard'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -100,6 +142,7 @@ jobs:
   # tor-socks5-config (packages/proxy-config), arti-wrapper (packages/arti-wrapper).
   features:
     name: Feature matrix (ubuntu)
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.preset == '' || inputs.preset == 'standard'))
     runs-on: ubuntu-latest
     env:
       CARGO_BUILD_JOBS: "2"
@@ -128,9 +171,32 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       # No checkout in this job, so gh needs the repository spelled out.
       GH_REPO: ${{ github.repository }}
+      NIGHTLY_EVENT: ${{ github.event_name }}
+      NIGHTLY_PRESET: ${{ inputs.preset }}
     steps:
       - name: Summarize and manage the failure issue
         run: |
+          case "$NIGHTLY_EVENT:$NIGHTLY_PRESET" in
+            schedule:*|workflow_dispatch:|workflow_dispatch:standard)
+              ;;
+            workflow_dispatch:windows-dns-rst)
+              {
+                echo "## Partial diagnostic: windows-dns-rst"
+                echo ""
+                echo "Windows DNS package flaky-hunt result: ${{ needs.flaky-hunt.result }}"
+                echo "Only the complete tor-socks5-dns package was selected, for 10 stress iterations with zero retries."
+                echo "Other operating systems, other packages, vendored extras and feature checks were deliberately omitted."
+                echo "Raw diagnostic output and JUnit are retained by the flaky-hunt job when available."
+                echo "This is not a full Nightly result; success does not establish an RST cause or fix."
+                echo "The normal Nightly failure issue is untouched."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+              ;;
+            *)
+              echo "Invalid Nightly selection; the normal failure issue is untouched." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+              ;;
+          esac
           # NOTE: needs.<matrix-job>.result is the WORST outcome across the
           # matrix (any failure/cancelled surfaces); per-OS detail is in the
           # uploaded artifacts and run logs, not in needs.*.result.
