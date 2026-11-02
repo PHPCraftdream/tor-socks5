@@ -237,6 +237,38 @@ impl Coordinator {
         Ok(())
     }
 
+    pub(super) fn append_failure_projection(&self, output: &mut String) {
+        use std::fmt::Write as _;
+
+        let _ = writeln!(
+            output,
+            "coordinator present=true incoming_present={} active_present={} failed={} stopped={} allocation_count={}",
+            self.incoming.is_some(),
+            self.active.is_some(),
+            self.failure,
+            self.stop.is_cancelled(),
+            self.allocations.len(),
+        );
+        for allocation in self.allocations.iter().take(CAPACITY) {
+            let delivery = &allocation.delivery;
+            let evidence = &delivery.evidence;
+            let _ = writeln!(
+                output,
+                "allocation phase={} registry={:?} request={} journal={} identity={:?} slot={:?} receipt_transaction={:?} used_attempted={} producer_ack_sent_local={} failed={}",
+                allocation.phase,
+                delivery.receipt.as_ref().map(|receipt| receipt.registry),
+                evidence.request_id,
+                evidence.journal_sequence,
+                evidence.identity,
+                evidence.storage.as_ref().map(|storage| storage.slot),
+                delivery.receipt.as_ref().map(|receipt| receipt.transaction),
+                allocation.used,
+                delivery.producer_ack_sent,
+                delivery.failure.is_some(),
+            );
+        }
+    }
+
     pub(super) fn pause_requests(&mut self) {
         self.incoming.take();
     }

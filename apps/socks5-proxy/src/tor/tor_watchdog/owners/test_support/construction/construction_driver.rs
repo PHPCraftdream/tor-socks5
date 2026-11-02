@@ -216,6 +216,7 @@ pub(crate) struct Session {
     hook: Option<HookGuard>,
     registrations: Option<mpsc::Receiver<Registration>>,
     failure: Option<&'static str>,
+    failure_projection: Option<String>,
     coordinator: Option<super::owner_intent::Coordinator>,
 }
 
@@ -230,6 +231,7 @@ impl Session {
             hook: None,
             registrations: None,
             failure: None,
+            failure_projection: None,
             coordinator: None,
         }
     }
@@ -265,7 +267,68 @@ impl Session {
                 .is_none_or(|owner| !owner.has_active())
     }
 
+    fn project_before_fail(&self, reason: &'static str) -> String {
+        use std::fmt::Write as _;
+
+        let category = match reason {
+            "owner scenario panicked" => "owner-scenario-panicked",
+            "construction phase deadline" => "construction-phase-deadline",
+            "construction context open failed" => "construction-context-open-failed",
+            "construction receiver failed" => "construction-receiver-failed",
+            "construction delivery failed" => "construction-delivery-failed",
+            "owner intent failed" => "owner-intent-failed",
+            "owner readiness rejected" => "owner-readiness-rejected",
+            "owner readiness request failed" => "owner-readiness-request-failed",
+            _ => "present",
+        };
+        let state = match self.client.state() {
+            WireState::Ready => "ready",
+            WireState::InFlight => "in-flight",
+            WireState::Failed => "failed",
+            WireState::Finished => "finished",
+        };
+        let mut output = String::new();
+        let _ = writeln!(
+            output,
+            "PT construction before-driver-fail category={} wire_state={} wire_error_present={} work_present={} hook_present={} registration_receiver_present={} record_count={}",
+            category,
+            state,
+            self.client.last_error().is_some(),
+            self.work.is_some(),
+            self.hook.is_some(),
+            self.registrations.is_some(),
+            self.records.len(),
+        );
+        for (index, record) in self.records.iter().take(REGISTRY_CAP).enumerate() {
+            let _ = writeln!(
+                output,
+                "record index={} enabled={} closed={} finished={} registry_cancelled={}",
+                index,
+                record.enabled,
+                record.closed,
+                record.finished,
+                record.registration.retained.cancel.is_cancelled(),
+            );
+            record
+                .registration
+                .consumer
+                .append_failure_projection(&mut output, index);
+        }
+        match &self.coordinator {
+            Some(owner) => owner.append_failure_projection(&mut output),
+            None => {
+                let _ = writeln!(output, "coordinator present=false");
+            }
+        }
+        output
+    }
+
     fn fail(&mut self, reason: &'static str) {
+        if self.failure.is_none() {
+            let projection = self.project_before_fail(reason);
+            let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), projection.as_bytes());
+            self.failure_projection = Some(projection);
+        }
         self.failure.get_or_insert(reason);
         if let Some(owner) = &mut self.coordinator {
             owner.stop();

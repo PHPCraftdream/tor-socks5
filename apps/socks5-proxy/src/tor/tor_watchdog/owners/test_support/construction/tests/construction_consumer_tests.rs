@@ -803,3 +803,147 @@ async fn finish_drains_cancelled_buffered_producer_as_producer_gone() {
     };
     tokio::join!(server, client);
 }
+
+#[tokio::test]
+async fn failure_projection_preserves_first_receipt_and_pending_second_export() {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let listener = listener(deadline).await;
+    let address = listener.local_addr().unwrap();
+    let probe = Arc::new(SelectionProbe::new());
+    let mut consumer = Consumer::install(Arc::clone(&probe), 7, 0, deadline).unwrap();
+
+    let server = async {
+        let mut stream = accept(&listener, deadline).await;
+        assert_eq!(integer(&confirmed(&mut stream, 1, deadline).await, 3), 7);
+        assert_eq!(confirmed(&mut stream, 2, deadline).await[1], b'R');
+        eof(&mut stream, deadline).await;
+    };
+    let client = async {
+        let mut client = Client::new(connect(address, deadline).await, deadline);
+        open(&mut consumer, &mut client, deadline).await;
+        let mut reserved = observation();
+        reserved.route = "SECRET_ROUTE_SENTINEL".into();
+        let (produced, delivered) = timeout_at(deadline, async {
+            tokio::join!(
+                probe.publish_construction(reserved, true, Some(true), None, None),
+                consumer.next(&mut client),
+            )
+        })
+        .await
+        .unwrap();
+        produced.unwrap();
+        let receipt = delivered.unwrap();
+        assert_eq!(receipt.transaction, 2);
+        assert_eq!(receipt.registry, 7);
+        assert_eq!(receipt.operation, Operation::Reserved);
+        assert_eq!(receipt.journal_sequence, 1);
+
+        let storage = super::super::construction_export::StorageEvidence {
+            base: std::path::PathBuf::from("/PRIVATE_PATH_SENTINEL"),
+            allocated: std::path::PathBuf::from("/PRIVATE_PATH_SENTINEL/owners-v1/3"),
+            slot: 3,
+        };
+        let mut producer = Box::pin(probe.export_storage(
+            (0, "SECRET_ROUTE_SENTINEL".into(), true),
+            41,
+            storage,
+            true,
+            deadline,
+        ));
+        assert!(futures::poll!(producer.as_mut()).is_pending());
+        std::future::poll_fn(|cx| consumer.poll_receive(cx))
+            .await
+            .unwrap();
+        assert_eq!(consumer.deliveries.len(), 2);
+        assert!(consumer.pending.is_some());
+        consumer.failure = Some(Error::Wire(WireError::Denied(
+            "DENIED_SECRET_SENTINEL".into(),
+        )));
+        let before = probe.construction_export_snapshot();
+        assert_eq!(before.progress.len(), 2);
+        assert!(before.progress[0].acknowledged);
+        assert!(before.progress[0].failure.is_none());
+        assert!(!before.progress[1].acknowledged);
+        assert!(before.progress[1].failure.is_none());
+        let pending = consumer.pending.as_ref().unwrap() as *const Envelope;
+        let mut first = String::new();
+        consumer.append_failure_projection(&mut first, 0);
+        let mut second = String::new();
+        consumer.append_failure_projection(&mut second, 0);
+        assert_eq!(first, second);
+        assert_eq!(
+            pending,
+            consumer.pending.as_ref().unwrap() as *const Envelope,
+        );
+        assert!(!consumer
+            .pending
+            .as_ref()
+            .unwrap()
+            .acknowledgement
+            .is_closed());
+        assert_eq!(probe.construction_export_snapshot(), before);
+        assert!(futures::poll!(producer.as_mut()).is_pending());
+        assert!(first.contains("registry=7"));
+        assert!(first.contains("pending_envelope=true delivery_count=2 failed=true"));
+        assert!(first.contains("receipt_transaction=Some(2)"));
+        assert!(first.contains("receipt_operation=reserved producer_ack_sent_local=true"));
+        assert!(first.contains("request=0 journal=2 identity=Some(41) slot=Some(3)"));
+        assert!(first.contains("receipt_operation=absent producer_ack_sent_local=false"));
+        for forbidden in [
+            "SECRET_ROUTE_SENTINEL",
+            "PRIVATE_PATH_SENTINEL",
+            "DENIED_SECRET_SENTINEL",
+        ] {
+            assert!(!first.contains(forbidden));
+        }
+
+        consumer.reject_pending();
+        let error = timeout_at(deadline, producer.as_mut())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "construction export acknowledgement rejected",
+        );
+        let after = probe.construction_export_snapshot();
+        assert_eq!(
+            after.failure,
+            Some("construction export acknowledgement rejected"),
+        );
+        assert_eq!(after.progress.len(), 2);
+        assert_eq!(after.progress[0], before.progress[0]);
+        assert!(after.progress[0].acknowledged);
+        assert!(after.progress[0].failure.is_none());
+        assert_eq!(after.progress[1].evidence, before.progress[1].evidence);
+        assert!(after.progress[1].queued);
+        assert!(!after.progress[1].acknowledged);
+        assert_eq!(
+            after.progress[1].failure,
+            Some("construction export acknowledgement rejected"),
+        );
+        assert!(consumer.pending.is_none());
+        assert_eq!(consumer.deliveries[0].receipt.as_ref(), Some(&receipt));
+        assert!(consumer.deliveries[0].producer_ack_sent);
+        assert!(consumer.deliveries[0].failure.is_none());
+        assert!(consumer.deliveries[1].receipt.is_none());
+        assert!(!consumer.deliveries[1].producer_ack_sent);
+        assert_eq!(
+            consumer.deliveries[1].failure,
+            Some(Error::ProducerIncomplete),
+        );
+        assert_eq!(
+            consumer.failure,
+            Some(Error::Wire(WireError::Denied(
+                "DENIED_SECRET_SENTINEL".into(),
+            ))),
+        );
+        drop(producer);
+        drop(client.into_stream());
+    };
+    timeout_at(deadline, async {
+        tokio::join!(server, client);
+    })
+    .await
+    .unwrap();
+}

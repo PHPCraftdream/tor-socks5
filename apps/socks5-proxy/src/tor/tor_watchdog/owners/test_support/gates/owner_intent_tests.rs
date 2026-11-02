@@ -4,6 +4,16 @@ use super::*;
 use std::time::Duration;
 use tokio::sync::oneshot;
 
+fn measured_future<T: 'static>(
+    mut future: Pin<Box<dyn Future<Output = T>>>,
+    polls: Arc<std::sync::atomic::AtomicUsize>,
+) -> Pin<Box<dyn Future<Output = T>>> {
+    Box::pin(poll_fn(move |cx| {
+        polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        future.as_mut().poll(cx)
+    }))
+}
+
 fn fixture() -> (tempfile::TempDir, Delivery, PathBuf, PathBuf) {
     let directory = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(directory.path()).unwrap();
@@ -163,6 +173,8 @@ async fn unregistered_and_configured_children_never_send_owner_intent() {
 
 #[tokio::test]
 async fn cancelled_active_intent_remains_owned_until_explicit_settlement() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     let deadline = Instant::now() + Duration::from_secs(5);
     let (_directory, delivery, leaf, executable) = fixture();
     let supervisor = listener(deadline).await;
@@ -183,7 +195,7 @@ async fn cancelled_active_intent_remains_owned_until_explicit_settlement() {
         assert_eq!(
             stream.read(&mut byte).await.unwrap(),
             0,
-            "stopped intent authorized child"
+            "stopped intent authorized child",
         );
     };
     let peer = async {
@@ -200,6 +212,9 @@ async fn cancelled_active_intent_remains_owned_until_explicit_settlement() {
             .await
             .unwrap();
         owner.start(request, 0, deadline).unwrap();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let transaction = owner.active.take().unwrap();
+        owner.active = Some(measured_future(transaction, Arc::clone(&polls)));
         let mut active = Box::pin(poll_fn(|cx| owner.poll_active(cx)));
         tokio::select! {
             result = &mut active => panic!("INTENT completed before hold: {result:?}"),
@@ -207,10 +222,41 @@ async fn cancelled_active_intent_remains_owned_until_explicit_settlement() {
         }
         drop(active);
         assert!(owner.has_active());
+        let before_calibration = polls.load(Ordering::SeqCst);
+        assert!(before_calibration > 0);
+        assert!(futures::poll!(Box::pin(poll_fn(|cx| owner.poll_active(cx)))).is_pending());
+        let baseline = polls.load(Ordering::SeqCst);
+        assert_eq!(baseline, before_calibration + 1);
+        let transaction = owner.active.as_ref().unwrap().as_ref().get_ref()
+            as *const dyn Future<Output = Result<()>>;
+        let mut first = String::new();
+        owner.append_failure_projection(&mut first);
+        let mut second = String::new();
+        owner.append_failure_projection(&mut second);
+        assert_eq!(polls.load(Ordering::SeqCst), baseline);
+        assert_eq!(first, second);
+        assert!(std::ptr::eq(
+            transaction,
+            owner.active.as_ref().unwrap().as_ref().get_ref(),
+        ));
+        assert!(first.contains(
+            "incoming_present=false active_present=true failed=false stopped=false allocation_count=1"
+        ));
+        assert!(
+            first.contains("registry=Some(1) request=0 journal=2 identity=Some(1) slot=Some(1)")
+        );
+        assert!(first.contains("receipt_transaction=Some(3) used_attempted=true"));
+        assert!(first.contains("producer_ack_sent_local=true failed=false"));
+        assert!(!first.contains("fixture-child"));
+        assert!(!owner.stop.is_cancelled());
+        assert!(owner.allocations[0].used);
+        assert!(futures::poll!(Box::pin(poll_fn(|cx| owner.poll_active(cx)))).is_pending());
+        assert_eq!(polls.load(Ordering::SeqCst), baseline + 1);
         owner.stop();
         assert!(owner.has_active());
         release_tx.send(()).unwrap();
         assert!(owner.settle().await.is_err());
+        assert!(polls.load(Ordering::SeqCst) > baseline + 1);
         assert!(!owner.has_active());
         assert!(!owner.phase_complete(0));
         assert!(owner.settle().await.is_err());
@@ -220,4 +266,70 @@ async fn cancelled_active_intent_remains_owned_until_explicit_settlement() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn failure_projection_does_not_poll_or_replace_partial_incoming_request() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let ready = listener(deadline).await;
+    let address = ready.local_addr().unwrap();
+    let supervisor = listener(deadline).await;
+    let mut owner = Coordinator::new(
+        ready,
+        PathBuf::from("/PRIVATE_EXECUTABLE_SENTINEL"),
+        supervisor.local_addr().unwrap(),
+    );
+    let mut child = timeout_at(deadline, TcpStream::connect(address))
+        .await
+        .unwrap()
+        .unwrap();
+    timeout_at(deadline, child.write_all(b"READY "))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(futures::poll!(Box::pin(poll_fn(|cx| owner.poll_request(cx, deadline)))).is_pending());
+    let polls = Arc::new(AtomicUsize::new(0));
+    let incoming = owner.incoming.take().unwrap();
+    owner.incoming = Some(measured_future(incoming, Arc::clone(&polls)));
+    assert!(futures::poll!(Box::pin(poll_fn(|cx| owner.poll_request(cx, deadline)))).is_pending());
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+    let incoming = owner.incoming.as_ref().unwrap().as_ref().get_ref()
+        as *const dyn Future<Output = Result<Request>>;
+    let mut first = String::new();
+    owner.append_failure_projection(&mut first);
+    let mut second = String::new();
+    owner.append_failure_projection(&mut second);
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+    assert_eq!(first, second);
+    assert!(std::ptr::eq(
+        incoming,
+        owner.incoming.as_ref().unwrap().as_ref().get_ref(),
+    ));
+    assert!(first.contains(
+        "incoming_present=true active_present=false failed=false stopped=false allocation_count=0"
+    ));
+    assert!(!first.contains("PRIVATE_EXECUTABLE_SENTINEL"));
+    assert!(!owner.stop.is_cancelled());
+    assert!(futures::poll!(Box::pin(poll_fn(|cx| owner.poll_request(cx, deadline)))).is_pending());
+    assert_eq!(polls.load(Ordering::SeqCst), 2);
+    timeout_at(
+        deadline,
+        child.write_all(b"2f5041525449414c5f504154485f53454e54494e454c\n"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let request = timeout_at(deadline, poll_fn(|cx| owner.poll_request(cx, deadline)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(polls.load(Ordering::SeqCst) > 2);
+    assert_eq!(request.leaf, PathBuf::from("/PARTIAL_PATH_SENTINEL"));
+    assert!(owner.incoming.is_none());
+    assert!(owner.active.is_none());
+    assert!(owner.allocations.is_empty());
+    assert!(futures::poll!(Box::pin(supervisor.accept())).is_pending());
+    drop(request);
 }
