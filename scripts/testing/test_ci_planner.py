@@ -797,24 +797,72 @@ class CommitFooter(unittest.TestCase):
 
 
 class PullRequestSource(unittest.TestCase):
-    def git_merge(self, parents_line):
+    def git_merge(self, parents_line, calls=None, ancestry_error=False):
         def git(*args):
+            if calls is not None:
+                calls.append(args)
             if args[0] == "rev-list":
                 return parents_line
+            if args[:2] == ("merge-base", "--is-ancestor"):
+                if ancestry_error or (
+                        args[2] != args[3] and args[2:] != ("base", "target")):
+                    raise p.MappingError("unproved ancestry")
+                return b""
             if args[0] == "merge-base":
-                return b"mb\n"
+                return b"actual-mb\n" if args[1] == "target" else b"mb\n"
             if args[-1] == "HEAD^{commit}":
                 return b"merge\n"
-            return (args[-1].removesuffix("^{commit}") + "\n").encode()
+            ref = args[-1].removesuffix("^{commit}")
+            if ref == "missing":
+                raise p.MappingError("unknown commit")
+            return (ref + "\n").encode()
         return git
+
     def test_merge_checkout_parents_prove_source_and_base(self):
         git = self.git_merge(b"merge base source\n")
         self.assertEqual(p.comparison("pull_request", "affected", "base", "source", "", git), "mb")
+
+    def test_forward_target_uses_actual_target_merge_base(self):
+        calls = []
+        git = self.git_merge(b"merge target source\n", calls)
+        self.assertEqual(
+            p.comparison("pull_request", "affected", "base", "source", "", git),
+            "actual-mb")
+        proof = ("merge-base", "--is-ancestor", "base", "target")
+        selection = ("merge-base", "target", "source")
+        self.assertIn(proof, calls)
+        self.assertIn(selection, calls)
+        self.assertLess(calls.index(proof), calls.index(selection))
+        self.assertNotIn(("merge-base", "base", "source"), calls)
+
     def test_parent_mismatch_is_rejected(self):
-        for line in (b"merge other source\n", b"merge base other\n", b"merge\n"):
+        for line in (
+                b"merge other source\n", b"merge base other\n", b"merge\n",
+                b"merge base\n", b"merge base source extra\n",
+                b"merge source target\n", b"other base source\n"):
             with self.subTest(parents=line):
                 with self.assertRaises(p.MappingError):
                     p.comparison("pull_request", "affected", "base", "source", "", self.git_merge(line))
+
+    def test_invalid_event_bases_fail_before_comparison_selection(self):
+        for base in ("", "0000", "missing", "unrelated", "newer"):
+            with self.subTest(base=base):
+                calls = []
+                git = self.git_merge(b"merge target source\n", calls)
+                with self.assertRaises(p.MappingError):
+                    p.comparison("pull_request", "affected", base, "source", "", git)
+                self.assertNotIn(("merge-base", "target", "source"), calls)
+        with self.assertRaises(p.MappingError):
+            p.comparison("pull_request", "affected", "base", "source", "",
+                         self.git_merge(b"merge target source\n", ancestry_error=True))
+
+    def test_missing_or_wrong_requested_head_is_rejected(self):
+        for head in ("", "0000", "missing", "other", "merge"):
+            with self.subTest(head=head):
+                with self.assertRaises(p.MappingError):
+                    p.comparison("pull_request", "affected", "base", head, "",
+                                 self.git_merge(b"merge target source\n"))
+
     def test_non_pr_still_requires_exact_checkout(self):
         def git(*args):
             if args[0] == "rev-list":

@@ -270,10 +270,88 @@ class External(unittest.TestCase):
         self.assertIsNone(result["full_trigger"])
         # paths — из merge-дерева: тесты исполняются в нём.
         self.assertEqual(result["paths"], sorted(["packages/auth/src/lib.rs", "packages/proxy-config/src/lib.rs"]))
-        # Негативы: base не первый родитель; head=checkout (не проходит merge-proof); push head≠checkout.
-        self.planner("--event", "pull_request", "--base", self.base, "--head", source, ok=False)
+        stale = self.planner("--event", "pull_request", "--base", self.base, "--head", source)
+        self.assertEqual(stale, result)
+        # The checkout itself is not the requested source head.
         self.planner("--event", "pull_request", "--base", target, "--head", merge, ok=False)
         self.planner("--event", "push", "--base", target, "--head", source, ok=False)
+
+    def test_forward_target_selects_actual_merge_base_and_checkout_tree(self):
+        event_base = self.base
+        self.put("packages/auth/src/lib.rs", "shared auth\n")
+        self.commit("shared history\n\nCI-Full: sprint-end")
+        shared = self.head()
+        self.git("checkout", "-q", "-b", "forward-source")
+        self.put("packages/proxy-config/src/lib.rs", "source config\n")
+        self.commit("source config")
+        source = self.head()
+        self.git("checkout", "-q", "-b", "approved-side", event_base)
+        self.put("docs/approved-target.md", "approved target change\n")
+        self.commit("approved target change")
+        approved = self.head()
+        self.git("checkout", "-q", shared)
+        self.git("merge", "--no-ff", "-q", "-m", "approved target merge", approved)
+        target = self.head()
+        self.git("merge", "--no-ff", "-q", "-m", "synthetic PR merge", source)
+        checkout = self.head()
+        self.assertEqual(
+            self.git("rev-list", "--parents", "-n", "1", checkout).split(),
+            [checkout, target, source])
+        self.assertEqual(self.git("merge-base", target, source).strip(), shared)
+        self.assertNotEqual(shared, event_base)
+        result = self.planner("--event", "pull_request", "--base", event_base,
+                              "--head", source)
+        current = self.planner("--event", "pull_request", "--base", target,
+                               "--head", source)
+        self.assertEqual(result, current)
+        self.assertEqual(result["paths"], [
+            "docs/approved-target.md", "packages/proxy-config/src/lib.rs"])
+        self.assertFalse(result["full"])
+        self.assertIsNone(result["full_trigger"])
+        for base in ("", ZERO, "missing-ref", source, checkout):
+            with self.subTest(base=base):
+                self.planner("--event", "pull_request", "--base", base,
+                             "--head", source, ok=False)
+        for head in ("", ZERO, "missing-ref", target, checkout):
+            with self.subTest(head=head):
+                self.planner("--event", "pull_request", "--base", event_base,
+                             "--head", head, ok=False)
+        self.git("checkout", "-q", "-b", "unrelated-event", event_base)
+        self.put("docs/unrelated-event.md", "unrelated branch\n")
+        self.commit("unrelated event base")
+        unrelated = self.head()
+        self.git("checkout", "-q", checkout)
+        self.planner("--event", "pull_request", "--base", unrelated,
+                     "--head", source, ok=False)
+        self.git("checkout", "-q", target)
+        self.planner("--event", "pull_request", "--base", event_base,
+                     "--head", source, ok=False)
+
+    def test_forward_target_does_not_accept_partial_generation_four_contract(self):
+        event_base = self.base
+        for path, markers in p.PT_DOMAIN_MARKERS.items():
+            if path == ".github/workflows/ci.yml":
+                markers = p.TOR_MARKERS[path] + markers
+            self.put(path, "\n".join(markers) + "\n")
+        self.commit("install complete generation four contract")
+        shared = self.head()
+        self.git("checkout", "-q", "-b", "partial-domain-source")
+        domain = p.PT_DOMAIN_PATH
+        text = (self.root / domain).read_text(encoding="utf-8")
+        self.assertIn("def bind(", text)
+        self.put(domain, text.replace("def bind(", "def missing_bind(", 1))
+        self.commit("remove required domain interface")
+        source = self.head()
+        self.git("checkout", "-q", shared)
+        self.put("docs/forward-target.md", "forward target\n")
+        self.commit("advance target")
+        target = self.head()
+        self.git("merge", "--no-ff", "-q", "-m", "partial contract PR merge", source)
+        for base in (event_base, target):
+            with self.subTest(base=base):
+                failure = self.planner("--event", "pull_request", "--base", base,
+                                       "--head", source, ok=False)
+                self.assertIn("контракт PT: " + domain, failure.stderr)
 
     def test_plan_uses_merge_checkout_tree(self):
         # Контрпример: target уже установил guarded capability, source — на старой декларации (старое чтение

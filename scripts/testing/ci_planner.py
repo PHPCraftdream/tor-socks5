@@ -166,14 +166,22 @@ def comparison(event, mode, base, head, base_ref, git):
         raise MappingError("неизвестное событие")
     if mode == "sprint-full" and event != "workflow_dispatch":
         raise MappingError("sprint-full разрешён только вручную")
+    if not head or not head.strip("0"):
+        raise MappingError("missing requested head")
     requested = git("rev-parse", "--verify", head + "^{commit}").decode().strip()
     checkout = git("rev-parse", "--verify", "HEAD^{commit}").decode().strip()
-    # Для PR checkout — synthetic merge: первый родитель обязан быть base, второй — исходным head.
-    # Произвольное родство не доказывает source/base: только точное совпадение родителей.
+    # The event base may precede a forward-updated synthetic merge target.
+    # Its ancestry must be proved before selecting the actual first parent.
     if event == "pull_request":
         parents = git("rev-list", "--parents", "-n", "1", checkout).decode().split()
-        if len(parents) != 3 or parents[1] != base or parents[2] != requested:
+        if len(parents) != 3 or parents[0] != checkout or parents[2] != requested:
             raise MappingError("checkout не является PR merge с указанными base/head")
+        if not base or not base.strip("0"):
+            raise MappingError("не задана база сравнения")
+        event_base = git("rev-parse", "--verify", base + "^{commit}").decode().strip()
+        if not merge_base_is_ancestor(git, event_base, parents[1]):
+            raise MappingError("event base is not an ancestor of the PR merge target")
+        base = parents[1]
     elif requested != checkout:
         raise MappingError("checkout HEAD не совпадает с --head")
     if mode == "sprint-full":
