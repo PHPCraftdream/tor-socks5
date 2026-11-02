@@ -270,7 +270,52 @@ pub(crate) async fn run_supplied_config_positive() {
             Ok::<(), String>(())
         })
         .await
-        .map_err(|_| "ловушка не набрана после plain CONNECT (8с)")??;
+        .map_err(|_| {
+            let (observations, dropped) = probe.snapshot();
+            let snapshot = probe.construction_export_snapshot();
+            let child_marker_count = scan_child_pids(dir.path())
+                .ok()
+                .map(|children| children.len());
+            eprintln!(
+                concat!(
+                    "PT supplied plain timeout before cleanup: ",
+                    "journal_count={} dropped={} export_installed={} ",
+                    "export_closed={} export_failed={} creation_attempts={} ",
+                    "trap_accepts={} child_pid_marker_count={:?}"
+                ),
+                observations.len(),
+                dropped,
+                snapshot.installed,
+                snapshot.closed,
+                snapshot.failure.is_some(),
+                snapshot.creation_attempts,
+                trap_accepts.load(std::sync::atomic::Ordering::Relaxed),
+                child_marker_count,
+            );
+            for progress in &snapshot.progress {
+                let evidence = &progress.evidence;
+                eprintln!(
+                    concat!(
+                        "PT supplied plain producer: journal_sequence={} ",
+                        "request_id={} identity={:?} event={:?} outcome={:?} ",
+                        "explicit_disabled={} effective_none={:?} storage_slot={:?} ",
+                        "queued={} acknowledged={} failed={}"
+                    ),
+                    evidence.journal_sequence,
+                    evidence.request_id,
+                    evidence.identity,
+                    evidence.event,
+                    evidence.outcome,
+                    evidence.explicit_disabled,
+                    evidence.effective_none,
+                    evidence.storage.as_ref().map(|storage| storage.slot),
+                    progress.queued,
+                    progress.acknowledged,
+                    progress.failure.is_some(),
+                );
+            }
+            "ловушка не набрана после plain CONNECT (8с)"
+        })??;
         let (plain_observations, dropped) = probe.snapshot();
         let plain_observation = plain_observations
             .iter()
