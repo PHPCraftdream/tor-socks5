@@ -31,6 +31,9 @@ mod owner_budget;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "test_support/gates/owner_intent.rs"]
 pub(crate) mod owner_intent;
+#[cfg(test)]
+#[path = "test_support/construction/owner_lifecycle.rs"]
+mod owner_lifecycle;
 mod storage;
 
 static RETAINED: std::sync::Mutex<Option<Arc<OwnerRegistry>>> = std::sync::Mutex::new(None);
@@ -187,6 +190,8 @@ pub(super) const SETUP_DEADLINE: Duration = Duration::from_secs(120);
 struct Entry {
     pre: Option<Socks5PreEndpoint>,
     state: Mutex<EntryState>,
+    #[cfg(test)]
+    lifecycle: Arc<owner_lifecycle::Journal>,
 }
 
 #[derive(Debug)]
@@ -387,6 +392,8 @@ impl OwnerRegistry {
                 }
                 let entry = Arc::new(Entry {
                     pre,
+                    #[cfg(test)]
+                    lifecycle: Arc::new(owner_lifecycle::Journal::default()),
                     state: Mutex::new(EntryState {
                         slot: None,
                         constructing: None,
@@ -454,67 +461,109 @@ impl OwnerRegistry {
             let entry_identity = Arc::as_ptr(&entry) as usize;
             #[cfg(test)]
             let selection = SELECTION_OBS.try_with(|obs| obs.clone()).ok().flatten();
+            #[cfg(test)]
+            let lifecycle = Arc::clone(&entry.lifecycle);
+            #[cfg(test)]
+            lifecycle.start(owner_lifecycle::Context {
+                probe: Arc::as_ptr(&self.selection_probe) as usize,
+                entry: Arc::as_ptr(&entry) as usize,
+                initiator: selection.as_ref().map(|selection| selection.0),
+            });
             state.attempted = true;
             state.constructing = Some(tokio::task::spawn_blocking(move || {
                 // Системный вызов нельзя прервать, пока он выполняется.
-                let _guard = runtime.enter();
-                let deadline = Instant::now() + SETUP_DEADLINE;
                 #[cfg(test)]
-                let storage = storage::acquire_with_quarantine(&base, &quarantine)?;
-                #[cfg(not(test))]
-                let storage = storage::acquire(&base)?;
-                #[cfg(test)]
-                let selection_probe = selection_probe;
-                #[cfg(test)]
-                if let Some((request_id, route, explicit_disabled)) = selection {
-                    runtime.block_on(selection_probe.export_storage(
-                        (request_id, route, explicit_disabled),
-                        entry_identity,
-                        construction_export::StorageEvidence {
-                            base: base.clone(),
-                            allocated: storage.state.clone(),
+                let worker = lifecycle.begin(owner_lifecycle::Stage::Worker, None);
+                let result: Result<Constructed> = (|| {
+                    let _guard = runtime.enter();
+                    let deadline = Instant::now() + SETUP_DEADLINE;
+                    #[cfg(test)]
+                    let storage = lifecycle.sync(owner_lifecycle::Stage::Storage, || {
+                        storage::acquire_with_quarantine(&base, &quarantine)
+                    })?;
+                    #[cfg(not(test))]
+                    let storage = storage::acquire(&base)?;
+                    #[cfg(test)]
+                    let selection_probe = selection_probe;
+                    #[cfg(test)]
+                    lifecycle.sync(owner_lifecycle::Stage::Export, || {
+                        if let Some((request_id, route, explicit_disabled)) = selection {
+                            runtime.block_on(selection_probe.export_storage(
+                                (request_id, route, explicit_disabled),
+                                entry_identity,
+                                construction_export::StorageEvidence {
+                                    base: base.clone(),
+                                    allocated: storage.state.clone(),
+                                    slot: storage.slot,
+                                },
+                                settings.pre_endpoint.is_none(),
+                                deadline,
+                            ))
+                        } else {
+                            selection_probe
+                                .construction_export
+                                .require_observed_construction()
+                        }
+                    })?;
+                    settings.state_dir = Some(storage.state);
+                    settings.cache_dir = Some(storage.cache);
+                    #[cfg(test)]
+                    let tunnel = lifecycle.sync(owner_lifecycle::Stage::Create, || {
+                        construction_export::create_tunnel(&selection_probe, settings)
+                    })?;
+                    #[cfg(not(test))]
+                    let tunnel = TorTunnel::create_unbootstrapped_with(settings)
+                        .map_err(|_| anyhow!("не удалось создать Tor владельца"))?;
+                    runtime.block_on(async {
+                        #[cfg(test)]
+                        let outcome = owner_lifecycle::bootstrap(
+                            &lifecycle,
+                            &cancel,
+                            deadline,
+                            async {
+                                if let Some(hook) = bootstrap_hook {
+                                    hook().await;
+                                    return Ok(());
+                                }
+                                tunnel.wait_bootstrapped().await
+                                    .map_err(|_| anyhow!("не удалось запустить Tor владельца"))
+                            },
+                        )
+                        .await;
+
+                        #[cfg(not(test))]
+                        let outcome = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => Err(anyhow::Error::new(ConstructorCancelled)),
+                            result = tokio::time::timeout_at(deadline, async {
+                                tunnel.wait_bootstrapped().await
+                                    .map_err(|_| anyhow!("не удалось запустить Tor владельца"))
+                            }) => result.map_err(|_| anyhow!("истёк срок запуска Tor владельца")).and_then(|result| result),
+                        };
+                        Ok(Constructed {
+                            tunnel,
                             slot: storage.slot,
-                        },
-                        settings.pre_endpoint.is_none(),
-                        deadline,
-                    ))?;
-                } else {
-                    selection_probe
-                        .construction_export
-                        .require_observed_construction()?;
-                }
-                settings.state_dir = Some(storage.state);
-                settings.cache_dir = Some(storage.cache);
-                #[cfg(test)]
-                let tunnel = construction_export::create_tunnel(&selection_probe, settings)?;
-                #[cfg(not(test))]
-                let tunnel = TorTunnel::create_unbootstrapped_with(settings)
-                    .map_err(|_| anyhow!("не удалось создать Tor владельца"))?;
-                runtime.block_on(async {
-                    let outcome = tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => Err(anyhow::Error::new(ConstructorCancelled)),
-                        result = tokio::time::timeout_at(deadline, async {
-                            #[cfg(test)]
-                            if let Some(hook) = bootstrap_hook {
-                                hook().await;
-                                return Ok(());
-                            }
-                            tunnel.wait_bootstrapped().await
-                                .map_err(|_| anyhow!("не удалось запустить Tor владельца"))
-                        }) => result.map_err(|_| anyhow!("истёк срок запуска Tor владельца")).and_then(|result| result),
-                    };
-                    Ok(Constructed {
-                        tunnel,
-                        slot: storage.slot,
-                        outcome,
+                            outcome,
+                        })
                     })
-                })
+                })();
+                #[cfg(test)]
+                worker.finish_result(&result);
+                result
             }));
         }
         if let Some(handle) = state.constructing.as_mut() {
-            // Ожидание по ссылке безопасно при отмене: дескриптор остаётся в записи до завершения.
+            #[cfg(test)]
+            let observed = entry.lifecycle.begin(
+                owner_lifecycle::Stage::Select,
+                SELECTION_OBS
+                    .try_with(|observation| observation.as_ref().map(|value| value.0))
+                    .ok()
+                    .flatten(),
+            );
             let result = handle.await;
+            #[cfg(test)]
+            observed.finish_join(&result);
             state.constructing.take();
             let constructed = match result {
                 Ok(Ok(value)) => value,
@@ -586,7 +635,9 @@ impl OwnerRegistry {
             for entry in entries {
                 let mut state = entry.state.lock().await;
                 if let Some(handle) = state.constructing.as_mut() {
+                    let observed = entry.lifecycle.begin(owner_lifecycle::Stage::Recover, None);
                     let result = handle.await;
+                    observed.finish_join(&result);
                     state.constructing.take();
                     match result {
                         Ok(Ok(constructed)) => {
@@ -719,7 +770,11 @@ impl OwnerRegistry {
             pending.push(async move {
                 let mut state = entry.state.lock().await;
                 if let Some(handle) = state.constructing.as_mut() {
+                    #[cfg(test)]
+                    let observed = entry.lifecycle.begin(owner_lifecycle::Stage::Close, None);
                     let result = handle.await;
+                    #[cfg(test)]
+                    observed.finish_join(&result);
                     state.constructing.take();
                     match result {
                         Ok(Ok(constructed)) => {
