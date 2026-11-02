@@ -237,6 +237,10 @@ impl Session {
     /// Private CI metadata projects the supervisor's remaining existing four-minute budget.
     /// It is not product configuration and never raises the external timeout.
     /// cancel-safe: YES — cancellation drops only the not-yet-registered socket.
+    #[allow(
+        dead_code,
+        reason = "Called by the pt_owner_contract main, not binary unit tests."
+    )]
     pub(crate) async fn from_environment() -> Result<Option<Self>> {
         let Some(deadline) = super::owner_budget::from_environment()? else {
             return Ok(None);
@@ -324,17 +328,16 @@ impl Session {
     async fn register(&mut self, registration: Registration) {
         let index = self.insert(registration);
         let record = &mut self.records[index];
-        if self.failure.is_none() {
-            if record
+        if self.failure.is_none()
+            && record
                 .registration
                 .consumer
                 .open(&mut self.client)
                 .await
                 .is_ok()
-            {
-                record.enabled = true;
-                return;
-            }
+        {
+            record.enabled = true;
+            return;
         }
         self.fail("construction context open failed");
     }
@@ -408,7 +411,7 @@ impl Session {
             enum Event<T> {
                 Work(T),
                 Child(Result<super::owner_intent::Request>),
-                Registration(Option<Registration>),
+                Registration(Option<Box<Registration>>),
                 Ready(usize, Result<(), super::construction_consumer::Error>),
                 Deadline,
             }
@@ -420,7 +423,9 @@ impl Session {
                 tokio::select! {
                     biased;
                     result = work.as_mut() => Event::Work(result),
-                    registration = receiver.recv(), if accepting => Event::Registration(registration),
+                    registration = receiver.recv(), if accepting => {
+                        Event::Registration(registration.map(Box::new))
+                    }
                     ready = poll_fn(|cx| poll_ready(records, cx)), if self.failure.is_none() => {
                         Event::Ready(ready.0, ready.1)
                     }
@@ -446,7 +451,7 @@ impl Session {
                 }
                 Event::Child(Err(_)) => self.fail("owner readiness request failed"),
                 Event::Registration(Some(registration)) => {
-                    let index = self.insert(registration);
+                    let index = self.insert(*registration);
                     if self.failure.is_some() {
                         self.fail("construction registration after failure");
                         continue;
@@ -626,6 +631,10 @@ impl Session {
 
     /// A terminal cleanup failure must not unwind the last owners of running work.
     /// The existing isolated supervisor timeout terminates this failed harness.
+    #[allow(
+        dead_code,
+        reason = "Called by pt_owner_contract cleanup, not binary unit tests."
+    )]
     pub(crate) async fn hold_for_supervisor(&mut self) {
         poll_fn(|_| {
             let _retained = &self.records;

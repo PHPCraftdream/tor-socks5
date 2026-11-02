@@ -220,14 +220,14 @@ impl Export {
 
     fn enqueue(
         &self,
-        sequence: Option<usize>,
-        dropped: usize,
+        journal: (Option<usize>, usize),
         observation: SelectionObservation,
         explicit_disabled: bool,
         effective_none: Option<bool>,
         storage: Option<StorageEvidence>,
         constructor_deadline: Option<Instant>,
     ) -> Result<Option<Ticket>> {
+        let (sequence, dropped) = journal;
         let mut slot = self.session.lock().unwrap();
         let Some(session) = slot.as_mut() else {
             return Ok(None);
@@ -454,8 +454,7 @@ impl SelectionProbe {
             };
             let _ = self.events_tx.send(items.len());
             self.construction_export.enqueue(
-                sequence,
-                *dropped,
+                (sequence, *dropped),
                 observation,
                 explicit_disabled,
                 effective_none,
@@ -471,32 +470,25 @@ impl SelectionProbe {
 
     pub(super) async fn export_storage(
         &self,
-        request_id: usize,
-        route: String,
-        explicit_disabled: bool,
+        selection: (usize, String, bool),
         identity: usize,
-        base: &Path,
-        allocated: &Path,
-        slot: usize,
+        storage: StorageEvidence,
         effective_none: bool,
         deadline: Instant,
     ) -> Result<()> {
+        let (request_id, route, explicit_disabled) = selection;
         self.publish_construction(
             SelectionObservation {
                 request_id,
                 route,
                 identity: Some(identity),
-                storage_slot: Some(slot),
+                storage_slot: Some(storage.slot),
                 outcome: SelectionOutcome::Reserved,
                 event: SelectionEvent::StorageAssigned,
             },
             explicit_disabled,
             Some(effective_none),
-            Some(StorageEvidence {
-                base: base.to_path_buf(),
-                allocated: allocated.to_path_buf(),
-                slot,
-            }),
+            Some(storage),
             Some(deadline),
         )
         .await

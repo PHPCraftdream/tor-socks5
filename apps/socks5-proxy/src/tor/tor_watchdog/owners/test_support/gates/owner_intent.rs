@@ -19,8 +19,16 @@ use super::{SelectionEvent, SelectionOutcome};
 const MAX_PATH: usize = 2048;
 const MAX_REQUEST: usize = MAX_PATH * 2 + 7;
 const CAPACITY: usize = 32;
+#[allow(
+    dead_code,
+    reason = "Used by harness environment entrypoints, not binary unit tests."
+)]
 pub(crate) const OWNER_ADDRESS: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 19054);
+#[allow(
+    dead_code,
+    reason = "Used by harness environment entrypoints, not binary unit tests."
+)]
 const SUPERVISOR_ADDRESS: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 19053);
 
@@ -62,7 +70,7 @@ fn hex(bytes: &[u8]) -> String {
 
 fn decode(bytes: &[u8]) -> Result<Vec<u8>> {
     ensure!(
-        !bytes.is_empty() && bytes.len() <= MAX_PATH * 2 && bytes.len() % 2 == 0,
+        !bytes.is_empty() && bytes.len() <= MAX_PATH * 2 && bytes.len().is_multiple_of(2),
         "owner readiness path bound"
     );
     let nibble = |byte| match byte {
@@ -71,7 +79,7 @@ fn decode(bytes: &[u8]) -> Result<Vec<u8>> {
         _ => Err(anyhow!("owner readiness requires lowercase hex")),
     };
     let mut raw = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let byte = (nibble(pair[0])? << 4) | nibble(pair[1])?;
         ensure!(byte != 0, "owner readiness path NUL");
         raw.push(byte);
@@ -187,6 +195,10 @@ impl Coordinator {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "Called by harness Session::from_environment, not binary unit tests."
+    )]
     pub(super) async fn bind(deadline: Instant) -> Result<Self> {
         let listener = timeout_at(deadline, TcpListener::bind(OWNER_ADDRESS)).await??;
         Ok(Self::new(
@@ -353,6 +365,10 @@ impl Coordinator {
 
 /// cancel-safe: NO — retain until completion; an error must terminate this child.
 /// Absence of TOR_PT_PROXY selects coordination, never authorization.
+#[allow(
+    dead_code,
+    reason = "Called by the managed pt_owner_contract main, not binary unit tests."
+)]
 pub(crate) async fn gate_from_environment() -> Result<()> {
     let Some(deadline) = super::owner_budget::from_environment()? else {
         return Ok(());

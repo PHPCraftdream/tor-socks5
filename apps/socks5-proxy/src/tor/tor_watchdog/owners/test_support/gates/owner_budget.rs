@@ -53,6 +53,10 @@ fn project(absolute: u128, uptime: &str, budget_ms: u64, anchor: Instant) -> Res
 
 /// Private inherited absolute CLOCK_BOOTTIME boundary, not a fresh child duration.
 /// Synchronous procfs reading is not preemptible; the external guardian is unchanged.
+#[allow(
+    dead_code,
+    reason = "Called by harness environment entrypoints, not binary unit tests."
+)]
 pub(super) fn from_environment() -> Result<Option<Instant>> {
     let Some(budget) = std::env::var_os("PT_OWNER_EVIDENCE_BUDGET_MS") else {
         ensure!(

@@ -468,13 +468,13 @@ impl OwnerRegistry {
                 #[cfg(test)]
                 if let Some((request_id, route, explicit_disabled)) = selection {
                     runtime.block_on(selection_probe.export_storage(
-                        request_id,
-                        route,
-                        explicit_disabled,
+                        (request_id, route, explicit_disabled),
                         entry_identity,
-                        &base,
-                        &storage.state,
-                        storage.slot,
+                        construction_export::StorageEvidence {
+                            base: base.clone(),
+                            allocated: storage.state.clone(),
+                            slot: storage.slot,
+                        },
                         settings.pre_endpoint.is_none(),
                         deadline,
                     ))?;

@@ -50,7 +50,7 @@ async fn transaction(stream: &mut TcpStream, number: usize, deadline: Instant) -
         assert_eq!(fields[3], body.len().to_string());
         let hex = fields[4].as_bytes();
         assert!(!hex.is_empty() && hex.len() <= 96 && hex.len() % 2 == 0);
-        for pair in hex.chunks_exact(2) {
+        for pair in hex.as_chunks::<2>().0 {
             body.push(u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap());
         }
         assert!(body.len() <= size);

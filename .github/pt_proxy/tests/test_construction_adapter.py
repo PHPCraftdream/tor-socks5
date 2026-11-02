@@ -524,6 +524,9 @@ class ConstructionControls(unittest.TestCase):
         try:
             f.domain.setup()
             root = f.domain.root
+            initial_entries = frozenset(root.iterdir())
+            self.assertIn(root / "cgroup.procs", initial_entries)
+            self.assertFalse(any(path.is_dir() for path in initial_entries))
             listener.bind(("127.0.0.1", 0))
             listener.listen(1)
             listener.settimeout(dd.remaining(f.domain.deadline))
@@ -531,13 +534,13 @@ class ConstructionControls(unittest.TestCase):
                 listener.getsockname(), timeout=dd.remaining(f.domain.deadline))
             server, _ = listener.accept()
             dd.socket_owned(server, f.domain.owner.pid)
-            self.assertEqual(list(root.iterdir()), [])
+            self.assertEqual(frozenset(root.iterdir()), initial_entries)
             with self.assertRaises(dd.Denied) as failure:
                 f.domain.authorize(
                     server, allocation.allocated, leaf, f.phase)
             self.assertEqual(str(failure.exception), "intent-allocation")
             self.assertEqual(f.domain.records, [])
-            self.assertEqual(list(root.iterdir()), [])
+            self.assertEqual(frozenset(root.iterdir()), initial_entries)
             self.assertEqual(f.line(b"CE CONFIRM 3\n"), b"CE CONFIRMED 3\n")
             record = f.domain.authorize(
                 server, allocation.allocated, leaf, f.phase)
@@ -546,7 +549,7 @@ class ConstructionControls(unittest.TestCase):
             self.assertTrue(record.created)
             self.assertEqual(f.domain.records, [record])
             self.assertEqual(record.group, root / "direct-0")
-            self.assertEqual(list(root.iterdir()), [record.group])
+            self.assertEqual(frozenset(root.iterdir()), initial_entries | {record.group})
             self.assertEqual(f.domain.members(record.group), [])
         finally:
             if server is not None:

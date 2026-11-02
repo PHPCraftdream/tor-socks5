@@ -97,7 +97,7 @@ fn decode_group(frame: &[u8]) -> io::Result<PathBuf> {
     }
 
     let mut raw = Vec::with_capacity(encoded.len() / 2);
-    for pair in encoded.chunks_exact(2) {
+    for pair in encoded.as_chunks::<2>().0 {
         let byte = (nibble(pair[0])? << 4) | nibble(pair[1])?;
         if byte == 0 {
             return Err(invalid("GROUP path contains NUL"));
@@ -108,6 +108,10 @@ fn decode_group(frame: &[u8]) -> io::Result<PathBuf> {
     Ok(PathBuf::from(OsString::from_vec(raw)))
 }
 
+#[allow(
+    dead_code,
+    reason = "Used by real harness migration; unit tests inject migration."
+)]
 fn canonical_directory(path: &Path, deadline: Instant) -> io::Result<PathBuf> {
     if !path.is_absolute() {
         return Err(invalid("group directory must be absolute"));
@@ -128,6 +132,10 @@ fn canonical_directory(path: &Path, deadline: Instant) -> io::Result<PathBuf> {
 // Matches direct_domain.py self_migrate/canonical under the same trusted,
 // supervisor-owned stable-tree assumption. Canonicalize followed by open does
 // not defend against an attacker concurrently replacing filesystem entries.
+#[allow(
+    dead_code,
+    reason = "Used by real harness migration; unit tests inject migration."
+)]
 fn self_migrate(group: &Path, deadline: Instant) -> io::Result<()> {
     let group = canonical_directory(group, deadline)?;
     let mount = canonical_directory(Path::new("/sys/fs/cgroup"), deadline)?;
@@ -184,6 +192,10 @@ fn self_migrate(group: &Path, deadline: Instant) -> io::Result<()> {
 ///
 /// Synchronous filesystem calls detect expiry before and after each call; they
 /// cannot be preempted. An external process/job lifetime bound remains necessary.
+#[allow(
+    dead_code,
+    reason = "Called by the managed pt_owner_contract child, not binary unit tests."
+)]
 pub(super) async fn direct_child_gate(address: SocketAddr, deadline: Instant) -> io::Result<()> {
     direct_child_gate_with_migration(address, deadline, |group| self_migrate(group, deadline)).await
 }
