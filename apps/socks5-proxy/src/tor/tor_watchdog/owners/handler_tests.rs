@@ -36,12 +36,36 @@ pub(crate) mod carrier_oracle;
 mod child_processes;
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
+#[path = "../../../../tests/pt_owner/http_peer.rs"]
+pub(crate) mod http_peer;
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
 #[path = "../../../../tests/pt_owner/scenario_resources.rs"]
 mod scenario_resources;
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
 #[path = "../../../../tests/pt_owner/supplied_contract.rs"]
 mod supplied_contract;
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+#[path = "../../../../tests/pt_owner/webtunnel_contract.rs"]
+pub(crate) mod webtunnel_contract;
+
+#[cfg(target_os = "linux")]
+#[allow(unused_imports)]
+pub(crate) use child_processes::wt_recorder::run_controls as run_recorder_actor_controls;
+
+#[cfg(target_os = "linux")]
+#[allow(unused_imports)]
+pub(crate) use child_processes::wt_recorder::run_queued_session_controls;
+
+#[cfg(target_os = "linux")]
+#[allow(unused_imports)]
+pub(crate) use child_processes::wt_recorder::run_queue_integration_controls;
+
+#[cfg(target_os = "linux")]
+#[allow(unused_imports)]
+pub(crate) use scenario_resources::session_ledger::run_controls as run_session_ledger_controls;
 
 #[cfg(target_os = "linux")]
 #[allow(unused_imports)]

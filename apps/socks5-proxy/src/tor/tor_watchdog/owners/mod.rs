@@ -10,6 +10,27 @@ use tokio_util::sync::CancellationToken;
 
 use crate::tor_watchdog::TorHandle;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "test_support/construction/construction_consumer.rs"]
+pub(crate) mod construction_consumer;
+#[cfg(all(test, target_os = "linux"))]
+#[path = "test_support/construction/construction_driver.rs"]
+pub(crate) mod construction_driver;
+#[cfg(test)]
+#[path = "test_support/construction/construction_export.rs"]
+pub(crate) mod construction_export;
+#[cfg(all(test, target_os = "linux"))]
+#[path = "test_support/construction/construction_wire.rs"]
+pub(crate) mod construction_wire;
+#[cfg(all(test, target_os = "linux"))]
+#[path = "test_support/gates/direct_child_gate.rs"]
+pub(crate) mod direct_child_gate;
+#[cfg(all(test, target_os = "linux"))]
+#[path = "test_support/gates/owner_budget.rs"]
+mod owner_budget;
+#[cfg(all(test, target_os = "linux"))]
+#[path = "test_support/gates/owner_intent.rs"]
+pub(crate) mod owner_intent;
 mod storage;
 
 static RETAINED: std::sync::Mutex<Option<Arc<OwnerRegistry>>> = std::sync::Mutex::new(None);
@@ -59,6 +80,10 @@ pub(crate) struct SelectionProbe {
     next_request_id: std::sync::atomic::AtomicUsize,
     /// bounded-журнал: кап 64 записей; при переполнении растёт только счётчик.
     observations: std::sync::Mutex<(Vec<SelectionObservation>, usize)>,
+    construction_export: construction_export::Export,
+    #[cfg(target_os = "linux")]
+    registry_retention:
+        std::sync::Mutex<Option<std::sync::Weak<construction_driver::RetainedRegistry>>>,
     /// watch-счётчик длины журнала. tokio 1.52.3 (локальные исходники
     /// ~/.cargo/registry .../tokio-1.52.3/src/sync/watch.rs): Sender::send
     /// возвращает SendError только при receiver_count() == 0 (watch.rs:1064-1066),
@@ -78,11 +103,14 @@ const OBSERVATION_CAP: usize = 64;
 
 #[cfg(test)]
 impl SelectionProbe {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let (events_tx, _events_rx) = tokio::sync::watch::channel(0usize);
         Self {
             next_request_id: std::sync::atomic::AtomicUsize::new(0),
             observations: std::sync::Mutex::new((Vec::new(), 0)),
+            construction_export: construction_export::Export::default(),
+            #[cfg(target_os = "linux")]
+            registry_retention: std::sync::Mutex::new(None),
             events_tx,
             _events_rx,
         }
@@ -95,7 +123,7 @@ impl SelectionProbe {
     }
 
     /// Публикация наблюдения + событие (watch = длина журнала).
-    fn publish(&self, observation: SelectionObservation) {
+    pub(crate) fn publish(&self, observation: SelectionObservation) {
         let mut log = self.observations.lock().unwrap();
         let (items, dropped) = &mut *log;
         if items.len() < OBSERVATION_CAP {
@@ -127,11 +155,30 @@ pub(crate) fn test_selection_probe() -> Arc<SelectionProbe> {
         .expect("реестр ещё не создан")
 }
 
+/// Synthetic controls must hold TEST_LIFECYCLE until this guard is dropped.
+#[cfg(test)]
+pub(crate) fn scoped_selection_probe(probe: Arc<SelectionProbe>) -> impl Drop {
+    struct Restore(Option<Arc<SelectionProbe>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let mut slot = LAST_SELECTION_PROBE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *slot = self.0.take();
+        }
+    }
+    let previous = LAST_SELECTION_PROBE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .replace(probe);
+    Restore(previous)
+}
+
 // Task-local доставка наблюдения из select_admitted в reserve.
 // Production-сигнатуры прежние; вне cfg(test) публикации нет.
 #[cfg(test)]
 tokio::task_local! {
-    static SELECTION_OBS: Option<(usize, String)>;
+    static SELECTION_OBS: Option<(usize, String, bool)>;
 }
 
 const CAPACITY: usize = 16;
@@ -212,12 +259,8 @@ impl OwnerRegistry {
         // new_with_template используется и в production; инструментация — только
         // под cfg(test), чтобы не трогать production-путь.
         #[cfg(test)]
-        let selection_probe: Arc<SelectionProbe> = {
-            let probe = Arc::new(SelectionProbe::new());
-            *LAST_SELECTION_PROBE.lock().unwrap() = Some(Arc::clone(&probe));
-            probe
-        };
-        Ok(Self {
+        let selection_probe = Arc::new(SelectionProbe::new());
+        let registry = Self {
             global_pre,
             global,
             settings: template.ok(),
@@ -233,10 +276,18 @@ impl OwnerRegistry {
             bootstrap_hook: None,
             #[cfg(test)]
             selection_probe,
-        })
+        };
+        #[cfg(all(test, target_os = "linux"))]
+        construction_driver::attach(&registry)?;
+        #[cfg(test)]
+        {
+            *LAST_SELECTION_PROBE.lock().unwrap() = Some(Arc::clone(&registry.selection_probe));
+        }
+        Ok(registry)
     }
 
-    /// cancel-safe: YES — отмена сохраняет запущенный конструктор в записи реестра.
+    /// cancel-safe: NO with a test export — cancellation retains failed acknowledgements.
+    /// Without an export, cancellation retains registry-owned constructors.
     pub(super) async fn select_admitted(&self, lease: &auth::AdmissionLease) -> Result<Owner> {
         let pre = match lease.pre_socks5() {
             None => self.global_pre.clone(),
@@ -264,7 +315,11 @@ impl OwnerRegistry {
                 }
             };
             let request_id = self.selection_probe.next_request_id();
-            Some((request_id, route))
+            let explicit_disabled = matches!(
+                lease.pre_socks5(),
+                Some(proxy_config::EndpointOverride::Disabled)
+            );
+            Some((request_id, route, explicit_disabled))
         };
         let selection = async {
             tokio::select! {
@@ -286,14 +341,14 @@ impl OwnerRegistry {
         self.cancel.cancelled().await;
     }
 
-    /// Отмена до завершения резервирования не создаёт частичную запись.
+    /// With an export installed, cancellation after reserve retains its journal fact and a failed acknowledgement.
     async fn reserve(&self, pre: Option<Socks5PreEndpoint>) -> Result<Option<Arc<Entry>>> {
         let result = self.reserve_inner(pre).await;
         // Публикация наблюдения ТОЛЬКО ПОСЛЕ фактического результата reserve;
         // отсутствие task-local scope (unit-тесты owners/tests.rs вызывают
         // select_inner напрямую) — публикация пропускается.
         #[cfg(test)]
-        self.publish_reserve_outcome(&result);
+        self.publish_reserve_outcome(&result).await?;
         result
     }
 
@@ -302,34 +357,8 @@ impl OwnerRegistry {
     /// Err -> ReserveFailed, Ok(Some(entry)) -> Reserved с identity =
     /// opaque Arc::as_ptr записи. Route-label — только адрес, credentials
     /// не хранятся.
-    fn publish_reserve_outcome(&self, result: &Result<Option<Arc<Entry>>>) {
-        let _ = SELECTION_OBS.try_with(|obs| {
-            let Some((request_id, route)) = obs else {
-                return;
-            };
-            let (identity, outcome) = match result {
-                Ok(None) => (None, SelectionOutcome::Global),
-                Ok(Some(entry)) => (
-                    Some(Arc::as_ptr(entry) as usize),
-                    SelectionOutcome::Reserved,
-                ),
-                Err(_) => (None, SelectionOutcome::ReserveFailed),
-            };
-            #[cfg(target_os = "linux")]
-            handler_tests::carrier_oracle::reserved(identity, result.is_ok());
-            self.selection_probe.publish(SelectionObservation {
-                request_id: *request_id,
-                route: route.clone(),
-                identity,
-                storage_slot: None,
-                outcome,
-                event: match outcome {
-                    SelectionOutcome::Reserved => SelectionEvent::Reserved,
-                    SelectionOutcome::ReserveFailed => SelectionEvent::ReserveFailed,
-                    SelectionOutcome::Global => SelectionEvent::Global,
-                },
-            });
-        });
+    async fn publish_reserve_outcome(&self, result: &Result<Option<Arc<Entry>>>) -> Result<()> {
+        self.export_reserve_outcome(result).await
     }
 
     /// Тело reserve без публикаций (вся логика прежняя).
@@ -373,11 +402,12 @@ impl OwnerRegistry {
         }
     }
 
-    /// cancel-safe: YES — резервирование атомарно, а конструктор остаётся в записи;
-    /// повторное ожидание продолжит работу или сообщит ошибку. Семантика выбора
-    /// не менялась: наблюдение публикуется в reserve ПОСЛЕ фактического
-    /// результата и вне сигнатур (task-local, cfg(test)); не(test)-путь
-    /// компиляционно не тронут.
+    /// cancel-safe: NO with a test export — cancellation may fail its acknowledgement.
+    /// Constructors remain owned by the entry after selection cancellation.
+    /// An installed test export adds a cancellable reserve acknowledgement.
+    /// Cancellation there preserves the reservation and journal observation,
+    /// marks the export failed, and does not start this request's constructor.
+    /// Production builds have no export or additional acknowledgement boundary.
     async fn select_inner(&self, pre: Option<Socks5PreEndpoint>) -> Result<Owner> {
         let entry = match self.reserve(pre).await {
             // global-путь: reserve вернул None — отдельный исход (не резервирование записи).
@@ -436,18 +466,28 @@ impl OwnerRegistry {
                 #[cfg(test)]
                 let selection_probe = selection_probe;
                 #[cfg(test)]
-                if let Some((request_id, route)) = selection {
-                    selection_probe.publish(SelectionObservation {
-                        request_id,
-                        route,
-                        identity: Some(entry_identity),
-                        storage_slot: Some(storage.slot),
-                        outcome: SelectionOutcome::Reserved,
-                        event: SelectionEvent::StorageAssigned,
-                    });
+                if let Some((request_id, route, explicit_disabled)) = selection {
+                    runtime.block_on(selection_probe.export_storage(
+                        (request_id, route, explicit_disabled),
+                        entry_identity,
+                        construction_export::StorageEvidence {
+                            base: base.clone(),
+                            allocated: storage.state.clone(),
+                            slot: storage.slot,
+                        },
+                        settings.pre_endpoint.is_none(),
+                        deadline,
+                    ))?;
+                } else {
+                    selection_probe
+                        .construction_export
+                        .require_observed_construction()?;
                 }
                 settings.state_dir = Some(storage.state);
                 settings.cache_dir = Some(storage.cache);
+                #[cfg(test)]
+                let tunnel = construction_export::create_tunnel(&selection_probe, settings)?;
+                #[cfg(not(test))]
                 let tunnel = TorTunnel::create_unbootstrapped_with(settings)
                     .map_err(|_| anyhow!("не удалось создать Tor владельца"))?;
                 runtime.block_on(async {
@@ -665,6 +705,14 @@ impl OwnerRegistry {
             state.closed = true;
             state.entries.clone()
         };
+        Self::close_entries(&self.global, &self.close_failed, entries).await
+    }
+
+    async fn close_entries(
+        global_handle: &TorHandle,
+        close_failed: &std::sync::atomic::AtomicBool,
+        entries: Vec<Arc<Entry>>,
+    ) -> Result<()> {
         use futures::stream::{FuturesUnordered, StreamExt};
         let mut pending = FuturesUnordered::new();
         for entry in entries {
@@ -691,7 +739,11 @@ impl OwnerRegistry {
                         .map_err(|_| anyhow!("ошибка завершения PT"))?;
                 }
                 if let Some(tunnel) = state.tunnel.take() {
-                    state.teardown = Some(tokio::task::spawn_blocking(move || drop(tunnel)));
+                    let span = tracing::Span::current();
+                    state.teardown = Some(tokio::task::spawn_blocking(move || {
+                        let _entered = span.enter();
+                        drop(tunnel);
+                    }));
                 }
                 if let Some(handle) = state.teardown.as_mut() {
                     let result = handle.await;
@@ -703,7 +755,7 @@ impl OwnerRegistry {
         }
         // Global handle remains in its shared slot on receipt failure or cancellation.
         let global = async {
-            if let Some(tunnel) = self.global.tunnel().await {
+            if let Some(tunnel) = global_handle.tunnel().await {
                 tunnel
                     .shutdown()
                     .await
@@ -714,16 +766,12 @@ impl OwnerRegistry {
         let (global_result, ()) = tokio::join!(global, async {
             while let Some(result) = pending.next().await {
                 if result.is_err() {
-                    self.close_failed
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    close_failed.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         });
         global_result?;
-        if self
-            .close_failed
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-        {
+        if close_failed.swap(false, std::sync::atomic::Ordering::Relaxed) {
             bail!("задача владельца завершилась ошибкой при закрытии");
         }
         Ok(())
@@ -749,4 +797,5 @@ impl Owner {
 #[cfg(test)]
 pub(crate) mod handler_tests;
 #[cfg(test)]
+#[path = "test_support/mod.rs"]
 mod tests;

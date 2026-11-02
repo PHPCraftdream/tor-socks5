@@ -42,24 +42,71 @@ PT_MARKERS = {
     ".github/workflows/ci.yml": PT_LEGACY_MARKERS[".github/workflows/ci.yml"] + ("cargo test --locked -p socks5-proxy --test pt_owner_contract --no-run --message-format=json", ".github/pt_proxy/artifact.py", 'GITHUB_ACTIONS=true PT_PROXY_ISOLATED=yes "$(<"$1/target/pt-owner-path")"', "-p tor-ptmgr --features managed-pts,tor-channel-factory lifecycle_tests", "-p tor-ptmgr --features managed-pts,tor-channel-factory process_tests", "-p arti-client --features pt-client pt_shutdown_"),
 }
 
+PT_OWNER_DIRECT = 'GITHUB_ACTIONS=true PT_PROXY_ISOLATED=yes "$(<"$1/target/pt-owner-path")"'
+PT_OWNER_AUDIT = 'exec unshare --net --pid --fork --mount-proc env GITHUB_ACTIONS=true PT_PROXY_ISOLATED=yes python3 -I .github/pt_proxy/owner_audit.py "$(<"$1/target/pt-owner-path")"'
+PT_AUDIT_MARKERS = {
+    **PT_MARKERS,
+    ".github/workflows/ci.yml": tuple(
+        PT_OWNER_AUDIT if marker == PT_OWNER_DIRECT else marker
+        for marker in PT_MARKERS[".github/workflows/ci.yml"]
+    ),
+    ".github/pt_proxy/owner_audit.py": (
+        "def audit(tool):",
+        "command(tool + '-save', '-c', '-t', 'filter')",
+        "def protocol_complete():",
+        "def packet_audits(traffic=False):",
+        "signal.pidfd_send_signal(handle, signal.SIGKILL)",
+        "status, cleanup_ok, error = execute(listener, [sys.argv[1]])",
+        "results = packet_audits(traffic=True)",
+        "setup_ok and status == 0 and cleanup_ok and protocol_ok and audit_ok",
+    ),
+}
+
+PT_DOMAIN_PATH = ".github/pt_proxy/direct_domain.py"
+PT_DOMAIN_GATE = "setup_ok and status == 0 and cleanup_ok and protocol_ok and audit_ok and domain_ok"
+PT_DOMAIN_MARKERS = {
+    **PT_AUDIT_MARKERS,
+    PT_DOMAIN_PATH: (
+        "class DirectDomain:", "def authorize(", "def bind(", "def handle(",
+        "def rules(", "def counts(", "def setup(", "def begin(",
+        "def finish(", "def complete(", "def dispose(", "def regression(",
+    ),
+    ".github/pt_proxy/owner_audit.py": PT_AUDIT_MARKERS[".github/pt_proxy/owner_audit.py"] + (
+        "direct_domain.py", "DirectDomain(", PT_DOMAIN_GATE,
+    ),
+}
+PT_GENERATIONS = ({}, PT_LEGACY_MARKERS, PT_MARKERS, PT_AUDIT_MARKERS, PT_DOMAIN_MARKERS)
+
+
+def pt_generation(read):
+    workflow = read(".github/workflows/ci.yml")
+    audit = read(".github/pt_proxy/owner_audit.py")
+    if (read(PT_DOMAIN_PATH) or
+            any(marker in text for text in (workflow, audit)
+                for marker in ("direct_domain", "DirectDomain", "domain_ok"))):
+        return 4
+    if audit or "owner_audit.py" in workflow:
+        return 3
+    if (read("apps/socks5-proxy/tests/pt_owner_contract.rs") or
+            read("apps/socks5-proxy/tests/pt_owner/owner_contract.rs") or
+            read(".github/pt_proxy/artifact.py") or
+            "--test pt_owner_contract" in workflow or PT_OWNER_DIRECT in workflow):
+        return 2
+    if read(".github/pt_proxy/contract.py") or "pt-proxy-contract:" in workflow:
+        return 1
+    return 0
+
 
 def pt_contract(base_read, head_read):
-    script = ".github/pt_proxy/contract.py"
-    workflow = ".github/workflows/ci.yml"
-    def installed(read):
-        return bool(read(script) or "pt-proxy-contract:" in read(workflow))
-    evidence, enabled = installed(base_read), installed(head_read)
-    upgraded = bool(base_read("apps/socks5-proxy/tests/pt_owner_contract.rs") or
-                    base_read(".github/pt_proxy/artifact.py") or
-                    "--test pt_owner_contract" in base_read(workflow))
-    for read, required, markers_by_path in ((base_read, evidence or upgraded, PT_MARKERS if upgraded else PT_LEGACY_MARKERS),
-                                            (head_read, evidence or enabled, PT_MARKERS)):
-        if required:
-            for path, markers in markers_by_path.items():
-                text = read(path)
-                if not text or any(marker not in text for marker in markers):
-                    raise MappingError("missing mapping: контракт PT: " + path)
-    return enabled
+    before, after = pt_generation(base_read), pt_generation(head_read)
+    for read, generation in (
+            (base_read, before),
+            (head_read, max(before, after))):
+        for path, markers in PT_GENERATIONS[generation].items():
+            text = read(path)
+            if not text or any(marker not in text for marker in markers):
+                raise MappingError("missing mapping: контракт PT: " + path)
+    return bool(after)
 
 
 # Полный прогон выбирает ТОЧНЫЙ standalone footer в сообщении коммита:
@@ -119,14 +166,22 @@ def comparison(event, mode, base, head, base_ref, git):
         raise MappingError("неизвестное событие")
     if mode == "sprint-full" and event != "workflow_dispatch":
         raise MappingError("sprint-full разрешён только вручную")
+    if not head or not head.strip("0"):
+        raise MappingError("missing requested head")
     requested = git("rev-parse", "--verify", head + "^{commit}").decode().strip()
     checkout = git("rev-parse", "--verify", "HEAD^{commit}").decode().strip()
-    # Для PR checkout — synthetic merge: первый родитель обязан быть base, второй — исходным head.
-    # Произвольное родство не доказывает source/base: только точное совпадение родителей.
+    # The event base may precede a forward-updated synthetic merge target.
+    # Its ancestry must be proved before selecting the actual first parent.
     if event == "pull_request":
         parents = git("rev-list", "--parents", "-n", "1", checkout).decode().split()
-        if len(parents) != 3 or parents[1] != base or parents[2] != requested:
+        if len(parents) != 3 or parents[0] != checkout or parents[2] != requested:
             raise MappingError("checkout не является PR merge с указанными base/head")
+        if not base or not base.strip("0"):
+            raise MappingError("не задана база сравнения")
+        event_base = git("rev-parse", "--verify", base + "^{commit}").decode().strip()
+        if not merge_base_is_ancestor(git, event_base, parents[1]):
+            raise MappingError("event base is not an ancestor of the PR merge target")
+        base = parents[1]
     elif requested != checkout:
         raise MappingError("checkout HEAD не совпадает с --head")
     if mode == "sprint-full":

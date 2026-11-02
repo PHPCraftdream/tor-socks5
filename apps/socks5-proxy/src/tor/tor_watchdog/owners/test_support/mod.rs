@@ -9,7 +9,7 @@ fn endpoint(password: &str) -> Socks5PreEndpoint {
     )
 }
 
-fn registry(dir: &std::path::Path) -> OwnerRegistry {
+pub(super) fn registry(dir: &std::path::Path) -> OwnerRegistry {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let settings = Settings {
         pre_endpoint: Some(endpoint("global")),
