@@ -1,0 +1,378 @@
+name: License bundle candidate
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag for candidate archives
+        type: string
+        required: true
+permissions:
+  contents: read
+
+env:
+  GIT_CONFIG_COUNT: '1'
+  GIT_CONFIG_KEY_0: core.autocrlf
+  GIT_CONFIG_VALUE_0: 'false'
+  TAG: ${{ inputs.tag || 'v0.0.0-license-ci' }}
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Проверить источник запуска
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          [ "$EVENT" = pull_request ] || { [ "$EVENT" = workflow_dispatch ] && [ "$REF" = refs/heads/main ]; }
+
+  plan:
+    needs: guard
+    runs-on: ubuntu-latest
+    outputs:
+      plan: ${{ steps.plan.outputs.plan }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-local-sdk
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          # Для PR — исходный head; push/dispatch — текущий checkout (github.sha), event.before не используется как head
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = pull_request ]; then
+            python3 -I scripts/testing/ci_planner.py --event pull_request --base "$BASE" --head "$HEAD" > "$RUNNER_TEMP/license-plan.json"
+          else
+            printf '%s\n' '{"segments":["license-offline"]}' > "$RUNNER_TEMP/license-plan.json"
+          fi
+          python3 -I - "$RUNNER_TEMP/license-plan.json" "$GITHUB_OUTPUT" <<'PY'
+          import json, sys
+          with open(sys.argv[1], encoding='utf-8') as f:
+              plan = json.load(f)
+          if not isinstance(plan, dict) or not isinstance(plan.get('segments'), list) or not all(isinstance(x, str) for x in plan['segments']):
+              raise ValueError('некорректные сегменты плана')
+          with open(sys.argv[2], 'a', encoding='utf-8') as f:
+              f.write('plan=' + json.dumps(plan, separators=(',', ':')) + '\n')
+          PY
+
+  offline-tests:
+    name: License tooling offline tests
+    needs: [guard, plan]
+    if: always() && needs.guard.result == 'success' && needs.plan.result == 'success' && ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && contains(fromJSON(needs.plan.outputs.plan).segments, 'license-offline')))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require trusted main for dispatched production
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        run: exit 1
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-local-sdk
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run offline Python suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash_path="$BASH"
+          if command -v cygpath >/dev/null 2>&1; then bash_path="$(cygpath -w "$BASH")"; fi
+          export LICENSE_TEST_BASH="$bash_path"
+          python3 -I .github/release/license/tests/unit/test_bundle.py
+          python3 -I .github/release/license/tests/unit/test_admission.py
+          python3 -I .github/release/license/tests/unit/test_publish_bundle.py
+          python3 -I .github/release/license/tests/unit/test_source_inventory.py
+          python3 -I .github/release/license/tests/unit/test_provenance.py
+          python3 -I .github/release/license/tests/unit/test_workflow_portability.py
+          python3 -I .github/install/tests/test_release.py PublisherTests
+          python3 -I .github/install/tests/test_release.py ReleaseWorkflowWiring
+      - name: TEST-ONLY transport chain (not production authority)
+        run: python3 -I .github/release/license/tests/integration/test_release_chain.py
+
+  build:
+    name: License build (${{ matrix.target }})
+    needs: [guard, plan]
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - {runner: ubuntu-latest, target: x86_64-unknown-linux-gnu, archive: tar.gz}
+          - {runner: ubuntu-latest, target: x86_64-unknown-linux-musl, archive: tar.gz, musl: true}
+          - {runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, archive: tar.gz}
+          - {runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, archive: tar.gz, musl: true}
+          - {runner: windows-latest, target: x86_64-pc-windows-msvc, archive: zip}
+          - {runner: macos-15-intel, target: x86_64-apple-darwin, archive: tar.gz}
+          - {runner: macos-15, target: aarch64-apple-darwin, archive: tar.gz}
+    env:
+      CARGO_BUILD_JOBS: 2
+      TARGET: ${{ matrix.target }}
+      CARGO_HOME: ${{ github.workspace }}/target/license-cargo-home
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/license-build
+      TOR_SOCKS5_NOTICES: ${{ github.workspace }}/target/license-prepared/NOTICES.txt
+      TOR_SOCKS5_SOURCE_INFO: ${{ github.workspace }}/target/license-prepared/SOURCE-INFO.txt
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: ./.github/actions/setup-local-sdk
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install musl tools
+        if: matrix.musl == true
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+      - name: Test workflow Bash portability
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash_path="$BASH"
+          if command -v cygpath >/dev/null 2>&1; then bash_path="$(cygpath -w "$BASH")"; fi
+          LICENSE_TEST_BASH="$bash_path" python3 -I .github/release/license/tests/unit/test_workflow_portability.py
+      - name: Fetch and capture source before build
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR" target/license-logs
+          cargo fetch --locked
+          set --
+          if [ -f .github/release/license/reviews/components.json ]; then
+            set -- "$@" --reviews .github/release/license/reviews/components.json
+          fi
+          python -I .github/release/license/bundle.py prepare --project . --sdk ../resocks5 --registry-cache "$CARGO_HOME/registry/cache" --output "$GITHUB_WORKSPACE/target/license-prepared" --tag "$TAG" --project-commit "$GITHUB_SHA" "$@"
+          python -I .github/release/license/admission.py snapshot --prepared target/license-prepared --registry-cache "$CARGO_HOME/registry/cache" --output target/license-expanded-before.json
+      - name: Build release and collect evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc -vV > target/license-logs/toolchain.txt
+          cargo tree --locked --offline -p socks5-proxy --target "$TARGET" -e features > target/license-logs/features.txt
+          cargo build --locked --offline --release -p socks5-proxy --target "$TARGET" --message-format=json-render-diagnostics > target/license-logs/build-messages.jsonl 2> target/license-logs/build-stderr.txt
+      - name: Capture native outputs and linkage observations
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/license-logs/native
+          python -I - "$CARGO_TARGET_DIR/$TARGET/release/build" target/license-logs/native <<'PY'
+          import hashlib, json, pathlib, shutil, sys
+          source, dest = map(pathlib.Path, sys.argv[1:])
+          records = []
+          if source.is_dir():
+              for path in sorted(source.rglob('*')):
+                  if not path.is_file() or path.is_symlink():
+                      continue
+                  rel = path.relative_to(source)
+                  if path.name in ('output', 'stderr', 'invoked.timestamp'):
+                      target = dest / rel
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      shutil.copyfile(path, target)
+                  elif 'out' in rel.parts:
+                      h = hashlib.sha256()
+                      with path.open('rb') as f:
+                          for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                              h.update(chunk)
+                      records.append({'path': rel.as_posix(), 'size': path.stat().st_size, 'sha256': h.hexdigest()})
+          (dest / 'output-hashes.json').write_text(json.dumps(records, sort_keys=True, indent=2) + '\n', encoding='utf-8')
+          PY
+          binary="$CARGO_TARGET_DIR/$TARGET/release/socks5-proxy"
+          if [ "$RUNNER_OS" = Windows ]; then binary="$binary.exe"; fi
+          {
+            echo 'Diagnostic only: verbose Cargo output and native build outputs are not a complete linker input trace.'
+            echo 'BLOCKER: complete native/static link input and platform SDK provenance require admission review.'
+            if [ -f "$binary" ]; then
+              if command -v readelf >/dev/null 2>&1; then readelf -d "$binary" || true; fi
+              if command -v otool >/dev/null 2>&1; then otool -L "$binary" || true; fi
+              if command -v dumpbin >/dev/null 2>&1; then dumpbin /dependents "$binary" || true; fi
+            fi
+          } > target/license-logs/linkage.txt 2>&1
+      - name: Snapshot receipt and compare sources after build
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="$CARGO_TARGET_DIR/$TARGET/release/socks5-proxy"
+          if [ "$RUNNER_OS" = Windows ]; then binary="$binary.exe"; fi
+          set --
+          review_file=".github/release/license/reviews/$TARGET.json"
+          if [ -f "$review_file" ]; then
+            set -- "$@" --review "$review_file"
+          fi
+          python -I .github/release/license/admission.py record --prepared target/license-prepared --project . --sdk ../resocks5 --registry-cache "$CARGO_HOME/registry/cache" --target "$TARGET" --binary "$binary" --messages target/license-logs/build-messages.jsonl --features target/license-logs/features.txt --toolchain target/license-logs/toolchain.txt --native-evidence target/license-logs --expanded-before target/license-expanded-before.json --output target/license-receipt "$@"
+      - name: Compare embedded recipient information
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="$CARGO_TARGET_DIR/$TARGET/release/socks5-proxy"
+          if [ "$RUNNER_OS" = Windows ]; then binary="$binary.exe"; fi
+          "$binary" --licenses > target/license-logs/actual-notices.txt
+          "$binary" --source-info > target/license-logs/actual-source-info.txt
+          cmp "$TOR_SOCKS5_NOTICES" target/license-logs/actual-notices.txt
+          cmp "$TOR_SOCKS5_SOURCE_INFO" target/license-logs/actual-source-info.txt
+      - name: Test recipient information interface
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline -p socks5-proxy --test recipient_information --target "$TARGET"
+      - name: Alpine smoke (musl)
+        if: matrix.musl == true
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="$CARGO_TARGET_DIR/$TARGET/release/socks5-proxy"
+          docker run --rm --network none --read-only --tmpfs /tmp --mount "type=bind,src=$binary,dst=/tor-socks5,readonly" alpine:3.22 /tor-socks5 --version
+      - name: Package Unix binary
+        if: matrix.archive != 'zip'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/license-package artifacts
+          cp "$CARGO_TARGET_DIR/$TARGET/release/socks5-proxy" target/license-package/tor-socks5
+          archive="tor-socks5-$TAG-$TARGET.tar.gz"
+          tar czf "artifacts/$archive" -C target/license-package tor-socks5
+          (cd artifacts && shasum -a 256 "$archive" > "$archive.sha256")
+      - name: Package Windows binary
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force target/license-package, artifacts | Out-Null
+          Copy-Item "$env:CARGO_TARGET_DIR/$env:TARGET/release/socks5-proxy.exe" target/license-package/tor-socks5.exe
+          $archive = "tor-socks5-$env:TAG-$env:TARGET.zip"
+          Compress-Archive -Path target/license-package/tor-socks5.exe -DestinationPath "artifacts/$archive"
+          $hash = (Get-FileHash "artifacts/$archive" -Algorithm SHA256).Hash.ToLower()
+          "$hash *$archive" | Out-File -NoNewline -Encoding ascii "artifacts/$archive.sha256"
+      - name: Upload evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: license-evidence-${{ matrix.target }}
+          path: |
+            target/license-prepared
+            target/license-expanded-before.json
+            target/license-receipt
+            target/license-logs
+          if-no-files-found: warn
+      - name: Upload binary candidate
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: license-binaries-${{ matrix.target }}
+          path: artifacts/*
+          if-no-files-found: warn
+
+  required:
+    name: License required
+    if: always()
+    needs: [guard, plan, offline-tests, build, aggregate]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Проверить обязательные результаты
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          GUARD: ${{ needs.guard.result }}
+          PLAN_RESULT: ${{ needs.plan.result }}
+          PLAN: ${{ needs.plan.outputs.plan }}
+          OFFLINE: ${{ needs.offline-tests.result }}
+          BUILD: ${{ needs.build.result }}
+          AGGREGATE: ${{ needs.aggregate.result }}
+        run: |
+          python3 -I - <<'PY'
+          import json, os
+          e = os.environ
+          def require(ok):
+              if not ok:
+                  raise SystemExit('обязательные проверки не выполнены')
+          require(e['GUARD'] == 'success')
+          if e['EVENT'] == 'pull_request':
+              require(e['PLAN_RESULT'] == 'success')
+              plan = json.loads(e['PLAN'])
+              segments = plan['segments']
+              require(isinstance(segments, list) and all(isinstance(x, str) for x in segments))
+              require(e['OFFLINE'] == ('success' if 'license-offline' in segments else 'skipped'))
+              require(e['BUILD'] == 'skipped' and e['AGGREGATE'] == 'skipped')
+          else:
+              require(e['EVENT'] == 'workflow_dispatch' and e['REF'] == 'refs/heads/main')
+              require(e['PLAN_RESULT'] == 'success')
+              require(all(e[x] == 'success' for x in ('OFFLINE', 'BUILD', 'AGGREGATE')))
+          PY
+
+  aggregate:
+    name: Retain release candidate
+    needs: [build, offline-tests]
+    if: always() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Download evidence
+        uses: actions/download-artifact@v8
+        with:
+          pattern: license-evidence-*
+          path: evidence
+      - name: Download binaries
+        uses: actions/download-artifact@v8
+        with:
+          pattern: license-binaries-*
+          path: artifacts
+          merge-multiple: true
+      - name: Assemble candidate and report admission blockers
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence artifacts target/candidate
+          python3 -I .github/release/license/admission.py assemble --evidence evidence --artifacts artifacts --tag "$TAG" --output "target/candidate/tor-socks5-$TAG-license-bundle.tar.gz"
+          echo 'Candidate retained for independent legal review and promotion.'
+      - name: Upload candidate diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: license-bundle-candidate
+          path: |
+            target/candidate
+            target/license-blockers.json
+          if-no-files-found: warn
+      - name: Require successful builds and offline tests
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          TEST_RESULT: ${{ needs.offline-tests.result }}
+        run: |
+          set -euo pipefail
+          [ "$BUILD_RESULT" = success ] && [ "$TEST_RESULT" = success ]
+      - name: Prepare exact retained inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/retained-artifacts target/retained-evidence
+          for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-gnu aarch64-unknown-linux-musl x86_64-pc-windows-msvc x86_64-apple-darwin aarch64-apple-darwin; do
+            extension=tar.gz
+            if [ "$target" = x86_64-pc-windows-msvc ]; then extension=zip; fi
+            archive="tor-socks5-$TAG-$target.$extension"
+            cp "artifacts/$archive" "artifacts/$archive.sha256" target/retained-artifacts/
+            mkdir -p "target/retained-evidence/license-evidence-$target"
+            cp -R "evidence/license-evidence-$target/license-receipt" "target/retained-evidence/license-evidence-$target/"
+          done
+      - name: Seal retained candidate
+        run: python3 -I .github/release/license/provenance.py seal --artifacts target/retained-artifacts --evidence target/retained-evidence --tag "$TAG" --output target/retained
+      - name: Upload retained candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: license-retained-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/retained/
+          if-no-files-found: error
+          include-hidden-files: true

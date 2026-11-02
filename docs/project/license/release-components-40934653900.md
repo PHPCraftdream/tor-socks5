@@ -1,0 +1,443 @@
+# Компоненты release candidate run 40934653900
+
+## Статус: PARTIAL
+
+Аналитический отчёт по ограниченному доступному evidence подготовлен; статус остаётся PARTIAL.
+Это не завершённый анализ состава или разрешение релиза.
+Подтверждены аутентифицированные метаданные API и независимо повторённый размер и SHA-256 локального ZIP; production origin не подтверждён.
+Сохранённые data-only inventory, primary и binary запуски завершились с exit 0; внутренности остальных 714 `.crate` не проверены. Новая source proof проверила checksums всех 727 архивов по lock, не раскрывая их.
+Финальный повтор binary завершился с exit 0; исправленное представление Darwin frameworks показывает IOKit, CoreFoundation и SystemConfiguration, а не `Versions`.
+Ранние локальные журналы получены небезопасным анализом архивов и не являются самостоятельной проверкой.
+Полные native inputs, юридические reviews и production origin остаются открыты.
+Остаются незавершёнными анализ состава и обязательств, reviews и проверка production origin.
+
+## Идентификация и уровень доверия
+
+- Run: `40934653900`; событие PR, attempt `1`, результат `success`.
+- Точный SHA головы PR: `ff8a4253b1b632a50d45d91bbe23fa86d2a7f5bc`.
+- Аутентифицированные метаданные API подтверждены по предоставленным данным.
+- Artifact API ID: `12932028389`; размер `853866809` байт.
+- SHA-256 из API: `75a58bb9393525b64f083105113771680bb561e1ff2f28f337fa584954b847d4`.
+- Локальный ZIP независимо подтверждён: 853866809 байт и тот же SHA-256, что в API.
+- [Run API](https://api.github.com/repos/PHPCraftdream/tor-socks5/actions/runs/40934653900); [artifact API](https://api.github.com/repos/PHPCraftdream/tor-socks5/actions/artifacts/12932028389).
+- Retained artifact `12931503823` не скачан и его байты не исследованы.
+- Семь binary ZIP скачаны; их наличие не доказывает состав и происхождение.
+- Запуск PR, даже успешный, не является доверенной production authority.
+- Наличие диаграмм, checksum или receipt не заменяет проверку origin.
+- Аутентифицированные API-данные устанавливают PR merge ancestry: source commit `67f82c1e107ab24e8fd22afb9fd12134ffa7f982`, tree `8c5be9171f2a2fa0f83dc42a60d9bb731d891d4c`; родители `b4a27a0cb806ce4efeef23aa94b375ce2f4222d1` и `ff8a4253b1b632a50d45d91bbe23fa86d2a7f5bc`.
+- Сообщение merge: `Merge ff8a4253b1b632a50d45d91bbe23fa86d2a7f5bc into b4a27a0cb806ce4efeef23aa94b375ce2f4222d1`. Run PR attempt 1, head `ff8a4253b1b632a50d45d91bbe23fa86d2a7f5bc`, workflow `400677266`, `.github/workflows/license-bundle.yml`.
+- [Commit API](https://api.github.com/repos/PHPCraftdream/tor-socks5/git/commits/67f82c1e107ab24e8fd22afb9fd12134ffa7f982), [PR API](https://api.github.com/repos/PHPCraftdream/tor-socks5/pulls/33), [run API](https://api.github.com/repos/PHPCraftdream/tor-socks5/actions/runs/40934653900), [workflow API](https://api.github.com/repos/PHPCraftdream/tor-socks5/actions/workflows/400677266).
+- Новый inventory сообщает совпадение самохеша project commit `67f82c1e107ab24e8fd22afb9fd12134ffa7f982`, tree `8c5be9171f2a2fa0f83dc42a60d9bb731d891d4c` и двух родителей выше; SDK commit `e754abaa88ce4f9745b4729652789ffc57f8ba4c` также совпал, SDK tree `263db1bd209e4151eb4deadf532d423d0bf2b41c`. Это наблюдение proof отдельно от подтверждённой предоставленными API-данными merge ancestry.
+- Последующая [source proof](release-components-40934653900-repro/source-proof.md) восстановила project и SDK trees из фактических source bytes и TAR modes и сверила их с предоставленными anchors; проверены также commit и родители. Два data-only запуска дали exit 0. Это не устанавливает production authority.
+- Новый SOCKS-код и vendor warning patch PR #30 не входят в рассматриваемую сборку; этот анализ не авторизует будущий объединённый release.
+
+## Использованные материалы
+
+- Описание процесса: `release-bundle.md`.
+- Исторический анализ: `license-evidence-40856561166-analysis.md`.
+- Прочитанные фрагменты контрактов: `.github/release/license/admission.py` строки 1–180 и `.github/release/license/bundle.py` строки 1–90.
+- Описание origin и SDK: `docs/project/license/release-bundle.md`, строки 18–30.
+- Защищённый журнал повторного анализа: `target/stage1-analysis-data-20261029/analysis.log`.
+- JSON-записи журнала прочитаны отдельно data-only Python `-I`, без исполнения project code.
+- Сохранённые диагностические журналы: `inventory.txt`, `all-targets.txt`,
+  `binaries-and-graphs.txt`; их прежний способ разбора не считается безопасным.
+- Исторический анализ восьми пакетов относится к другому run и другому набору bytes.
+- Его собственная оговорка: происхождение старого ZIP независимо не установлено.
+- Перенос правовых вопросов допустим; перенос подтверждения состава — нет.
+- Архивы проверены ограниченными локальными скриптами; данный шаг читал только сводку как данные.
+- Тесты, сборки и валидаторы проекта не запускались.
+
+## Семь целей: проверенные бинарные bytes
+
+Наблюдавшийся сохранённый `verify-safe-binaries.py` с `python -I` дал exit 0:
+семь совпадений receipt, все true; graph counts соответствуют таблице ниже. Финальный повтор после исправления формата Darwin завершился с exit 0; frameworks: IOKit, CoreFoundation и SystemConfiguration, не `Versions`.
+Для каждого скачанного ZIP проверены размер и SHA-256 по закреплённым значениям;
+вложенный executable имеет указанные bytes и совпадает с `binary_sha256` receipt.
+Это проверка совпадения bytes, не доказательство состава, origin или compliance.
+
+| Target | Artifact ID | ZIP байт | ZIP SHA-256 |
+| --- | --- | ---: | --- |
+| `aarch64-apple-darwin` | [12931773573](https://api.github.com/repos/PHPCraftdream/tor-socks5/actions/artifacts/12931773573) | 12126824 | `bcf0edb870c0dfeb1ec71bf6262328885226ae489ddd81a6493277bde63b78f8` |
+| `x86_64-apple-darwin` | [12930598391](https://api.github.com/repos/PHPCraftdream/tor-socks5/actions/artifacts/12930598391) | 12678740 | `351d145d890ee0d8a7de555af7a2e176c693c5a621636ba0a669e571cb7af8fd` |
+| `x86_64-pc-windows-msvc` | [12929435820](https://api.github.com/repos/PHPCraftdream/tor-socks5/actions/artifacts/12929435820) | 12747241 | `807a36536fc8c7558829dc3c1ba89a6f22579307c6a3a8e0e0d34cf76531b393` |
+| `aarch64-unknown-linux-musl` | [12927756356](https://api.github.com/repos/PHPCraftdream/tor-socks5/actions/artifacts/12927756356) | 12982288 | `46861aea32f692039d5d5ce4286265a15c1adcf3244e2e8b4de0a8c78bbc9025` |
+| `aarch64-unknown-linux-gnu` | [12926432069](https://api.github.com/repos/PHPCraftdream/tor-socks5/actions/artifacts/12926432069) | 13007952 | `8d6909f2f42b902bdced58f91cd1a96559da5a0ed08b31f1835e88657d35803c` |
+| `x86_64-unknown-linux-gnu` | [12925166590](https://api.github.com/repos/PHPCraftdream/tor-socks5/actions/artifacts/12925166590) | 13223590 | `fd759bd0516de84edb2b3599fc3389d8240947fa228d10a27913ad4bc6506d87` |
+| `x86_64-unknown-linux-musl` | [12924449353](https://api.github.com/repos/PHPCraftdream/tor-socks5/actions/artifacts/12924449353) | 13473713 | `bc92c80fa638e9ef5f1fe77b6f7dfcadc8f2b16ec5bc4a6e2777685cda2f4c44` |
+
+| Target | Binary байт | Binary SHA-256 / receipt match |
+| --- | ---: | --- |
+| `aarch64-apple-darwin` | 36355568 | `e452ccd04ab22cd614f29dbdd1ebce4952f13db9a61370e5c751db9e06e90de4` |
+| `x86_64-apple-darwin` | 37581112 | `507e1c1349837eb7e52eb4a87002e02ee7ab8e209ddbb25f3c0031849132a326` |
+| `x86_64-pc-windows-msvc` | 36523520 | `132cf698d1841cfe4123abc95e891e9e60153d893fb46a4ba5a5b505c7090746` |
+| `aarch64-unknown-linux-musl` | 39124368 | `78e051c957228fea7f719d394f6827d0d50e06691d9f725ffb488692521e9673` |
+| `aarch64-unknown-linux-gnu` | 39885872 | `3e263cdeab6638502e83fdb89cb7878623592f177b450e49dc25fac1cbc4efe8` |
+| `x86_64-unknown-linux-gnu` | 40749864 | `f8ee9ffd9a58e0578f92b2c6df84a5754bcfb9b61c5bf3d6895dc5e48baf0ab1` |
+| `x86_64-unknown-linux-musl` | 40647872 | `2b2184d890ca902c286039ef19a9eae863528ce4fb363cfa3a6c6ce5cfa4bd66` |
+
+Общие assertions receipt: `source_digest` = `f8f9612d0bb2fb090da68a0722a401bf5b94312f86a7724922019c76a6c3fc44`,
+`SDK commit` = `e754abaa88ce4f9745b4729652789ffc57f8ba4c`, tag `v0.0.0-license-ci`.
+Source digest и build evidence digest не пересчитывались той бинарной проверкой; последующая независимая [source proof](release-components-40934653900-repro/source-proof.md) пересчитала их и получила совпадение со всеми семью receipts.
+
+| Target | `build_evidence_digest` из receipt, позднее независимо пересчитан |
+| --- | --- |
+| `aarch64-apple-darwin` | `447d139cf97c5317e5414003d630c076bab577d00e57eea4bdc66a4d8358f2e5` |
+| `x86_64-apple-darwin` | `9d8b22c09090993f898ddd5f9b4133e80973dd54c8058c44dbef4013df855a1e` |
+| `x86_64-pc-windows-msvc` | `6b298fdf8a35f45718bae4a2afd8e1bdc414f310fd7cd3abf4405af01212fe1e` |
+| `aarch64-unknown-linux-musl` | `d8ebedeadce1b4847e3a0b406e39e9201c6824191603e45b13d917d26fa24a3e` |
+| `aarch64-unknown-linux-gnu` | `e36c10caae8c10defe9bbf494119a9512618f98682763b9904d08fb22ae6ac6c` |
+| `x86_64-unknown-linux-gnu` | `f322276ca62c2a711fb028bdda2be89b0b75089c4b7ee7ab0a26d7a5197fa703` |
+| `x86_64-unknown-linux-musl` | `09fbda25cf92becce41c2e46b33a8a43b57daae0189aabd7fe992ecd29f9e830` |
+
+### Cargo messages и сохранённая диагностика linkage
+
+Числа — compiler-artifact / уникальные package ID / build-script-executed;
+каждый граф также содержит одно `build-finished`. Это не бинарный linker trace.
+
+| Target | Три числа | `linked_libs` из build-script-executed |
+| --- | --- | --- |
+| `aarch64-apple-darwin` | 574 / 503 / 44 | ring, sqlite3, SystemConfiguration |
+| `x86_64-apple-darwin` | 572 / 504 / 43 | ring, sqlite3, SystemConfiguration |
+| `x86_64-pc-windows-msvc` | 592 / 521 / 46 | ring, sqlite3, winapi, iphlpapi |
+| `aarch64-unknown-linux-gnu` | 569 / 499 / 43 | ring, sqlite3 |
+| `aarch64-unknown-linux-musl` | 569 / 499 / 43 | ring, sqlite3 |
+| `x86_64-unknown-linux-gnu` | 567 / 500 / 42 | ring, sqlite3 |
+| `x86_64-unknown-linux-musl` | 567 / 500 / 42 | ring, sqlite3 |
+
+Во всех графах ring 0.17.14 сообщает `static=ring_core_0_17_14_` и
+`static=ring_core_0_17_14__test`; libsqlite3-sys 0.37.0 сообщает `static=sqlite3`.
+На Apple system-configuration-sys сообщает `framework=SystemConfiguration`.
+На Windows ipconfig сообщает `iphlpapi`, winapi сообщает `dylib=` для
+advapi32, cfgmgr32, credui, gdi32, kernel32, msimg32, ole32, opengl32,
+secur32, shell32, user32 и winspool. Это directives, не доказанные PE imports.
+Сообщение build script не доказывает, что все перечисленные библиотеки оказались в binary.
+`openssl-src` и `zstd-sys` присутствуют как source candidates; в этих выбранных графах
+соответствующие compiler artifacts не указаны, их нельзя объявлять слинкованными.
+
+Отдельно сохранённый `linkage.txt` сообщает для GNU NEEDED libgcc_s, libm,
+libc и соответствующий ld-linux; для aarch64 musl — нет dynamic section,
+для x86_64 musl — dynamic section без перечисленных NEEDED; для обеих Apple целей —
+IOKit, CoreFoundation, SystemConfiguration, iconv и System.
+Для Windows readelf сообщает ошибку «не ELF»: он непригоден для анализа PE.
+Независимый разбор platform imports для всех целей отсутствует; binaries не исполнялись.
+Даже сохранённый `linkage.txt` — диагностика, а не полный static/native input trace.
+
+## Проверенный ограниченный inventory исходников
+
+Сохранённый `analyze-safe.py` с поддержкой GNU longname завершился с exit 0; его inventory содержит 736 компонентов и 743 blockers.
+Подтверждённый локальный ZIP совпадает по размеру и SHA-256 с API metadata.
+Outer: 824 записи, сумма размеров членов 878710567 байт, распакованный поток 879482880 байт.
+Все семь nested candidate имеют размер 120341965 и одинаковый SHA-256:
+`c2787211e957ac6e1cac1d0b2fbf34e24cd0444b835febed8aef63e7e9dafa5e`.
+Один nested inventory: 2642 записи, сумма размеров членов 142009557 байт,
+распакованный поток 144199680 байт. Совпадение hash не доказывает binary composition.
+
+Подсчёт строго по префиксам путей вложенного candidate:
+- `sources/.../registry/`: 727 записей; `candidates/`: 1212 записей.
+- `project/`: 518, в том числе `project/vendor/`: 162; без vendor: 356.
+- `sdk/`: 178. Всего по этим префиксам: 2635 записей.
+- Строковые метки журнала `contains_registry` = 733 и `contains_candidate` = 1214
+  не являются категориями путей: они считают вхождения подстрок в любых именах.
+- Аналогично `contains_source` = 2638 не означает 2638 исходных файлов.
+- Из 727 registry `.crate` отдельно проверены внутренности 13 выбранных; 714 не исследованы.
+
+### MANIFEST, blockers и информация получателю
+
+- `MANIFEST.json`: 736 компонентов по префиксам ID: 727 registry, 7 vendor,
+  1 project и 1 sdk; отдельного поля `kind` в этих записях нет.
+- `BLOCKERS.json`: 743 записи; missing attributable notice для всех семи vendor:
+  `arti-client`, `saturating-time`, `tor-chanmgr`, `tor-circmgr`,
+  `tor-dirclient`, `tor-dirmgr`, `tor-guardmgr`.
+- Отсутствуют component reviews, в том числе для project, sdk и registry.
+- `REVIEWS.json`: `components: {}`; это не юридическое одобрение.
+- `SOURCE-INFO.txt` указывает тестовый tag и путь к исходникам в candidate;
+  он прямо предупреждает, что inventory не доказывает linkage и ссылка не гарантирует сохранность.
+- Собственная лицензия проекта `MIT OR Apache-2.0` не лицензирует автоматически зависимости.
+- Наличие исходников, notices и candidate texts не доказывает включение в binary,
+  полноту corresponding source, права третьих лиц или выполнение обязательств.
+
+### Примеры сохранённых candidate texts
+
+Ниже SHA-256 сохранённых файлов; 13 выбранных `.crate` теперь отдельно проверены.
+Для восьми ранее изученных пакетов первичные hashes совпадают с таблицей и прошлым анализом;
+это не подтверждает состав бинарника и не означает автоматического approval.
+
+| Пакет и файл | SHA-256 |
+| --- | --- |
+| `colored-2.2.0/LICENSE` | `fab3dd6bdab226f1c08630b1dd917e11fcb4ec5e1e020e2c16f83a0a13863e85` |
+| `option-ext-0.2.0/LICENSE.txt` | `66a3107d5ad6a058aab753eaac2047ccb2ed0e39465dd0fe5844da3e300d5172` |
+| `priority-queue-2.7.0/LGPL-3.0-or-later.txt` | `da7eabb7bafdf7d3ae5e9f223aa5bdc1eece45ac569dc21b3b037520b4464768` |
+| `priority-queue-2.7.0/MPL-2.0.txt` | `c73cc0c27b0f24d5612e76bf83b5845c4fbd0374a1a8483f3d16befe58a60c9a` |
+| `webpki-roots-0.26.11/LICENSE` | `e271993808fec50ab29350b39539cdec611a9103f827e0aa26d61da70e2d33f8` |
+| `webpki-roots-1.0.7/LICENSE` | `e271993808fec50ab29350b39539cdec611a9103f827e0aa26d61da70e2d33f8` |
+| `xxhash-rust-0.8.18/LICENSE` | `c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566` |
+| `async_executors-0.7.0/LICENSE` | `88d9b4eb60579c191ec391ca04c16130572d7eedc4a86daa58bf28c6e14c9bcd` |
+| `notify-8.2.0/LICENSE-CC0` | `e0456cbab4f7b5e7203e678faff37eadbdfef02e822db3b7a52a1dd9d3dc514a` |
+| `ring-0.17.14/LICENSE` | `b3d734001a94efff3579978d953391aa7115f877657d25eb54037a43875d078a` |
+| `ring-0.17.14/LICENSE-BoringSSL` | `005fc765ddc5115da796cca915baa9557abae13ff35e0a47c47affc56f6c414d` |
+| `ring-0.17.14/LICENSE-other-bits` | `f025ccfb7dfb6bdfedc75ca0f67acc69e6fb4998143d834f7c2f38a29989680f` |
+| `openssl-src-300.6.1+3.6.3/openssl/LICENSE.txt` | `7d5450cb2d142651b8afa315b5f238efc805dad827d91ba367d8516bc9d49e7a` |
+| `liblzma-sys-0.4.7/xz/COPYING` | `616a3ad264ce29b8f1cb97e53037b139d406899ca8d1f799651e17bfa09830b8` |
+| `zstd-sys-2.0.16+zstd.1.5.7/zstd/LICENSE` | `7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8` |
+
+У native candidates имеются и другие тексты; эти примеры не исчерпывают их права и notices.
+
+## Условные лицензионные обязательства
+
+Ниже описаны вопросы при соответствующем распространении, а не итог review.
+Версии и условия сопоставлены с выбранными первичными файлами текущего candidate.
+Все восемь ранее изученных пакетов присутствуют как `compiler-artifact` типа `lib`
+во всех семи проверенных Cargo-графах; build graph не доказывает итоговую линковку.
+
+### MPL-2.0: colored и option-ext
+
+- Исторический анализ указывает `colored 2.2.0` и `option-ext 0.2.0`.
+- При применимости MPL §§3.1–3.4 сохранить применимые notices и текст лицензии.
+- Распространяемый covered source и изменения предоставить на условиях MPL.
+- Для executable сообщить, как получить соответствующий covered source.
+- Способ должен быть разумным; плата не выше стоимости распространения.
+- Установить конкретные covered файлы, изменения и долговременную доступность.
+- Ни включение в binary, ни достаточность исходников здесь не установлены.
+
+### priority-queue: выбор альтернативы
+
+- Исторический `priority-queue 2.7.0`: `LGPL-3.0-or-later OR MPL-2.0`.
+- Какая ветвь выбрана для конкретного распространения, не установлено.
+- Если применима выбранная MPL, оценить обязательства §§3.1–3.4 выше.
+- Если выбрана LGPL и распространяется Combined Work, оценить §4 целиком.
+- Нужны применимые notices, копии LGPL и GPL и разрешённые права модификации.
+- По §4(d)(0) обеспечить Minimal Corresponding Source и Application Code,
+  позволяющие перекомпоновку на предусмотренных условиях, либо по §4(d)(1)
+  использовать соответствующий совместимый механизм разделяемой библиотеки.
+- Installation Information по §4(e) требуется только при установленных условиях GPL §6.
+- Вариант и работоспособность замены или перелинковки не проверены.
+- Внутри выбранного crate единственный GPL-именованный путь — LGPL-текст;
+  отдельный GPL-именованный файл не найден в этом crate, не во всём bundle.
+- Общий `NOTICES.txt` может содержать GPL от других компонентов; его отсутствие не утверждается.
+- При необходимости текст GPL и применимые материалы нужно обеспечить и проверить.
+
+### LLVM exception
+
+- Официальный LLVM `LICENSE.TXT` захвачен: `target/llvm-primary-20261030-c/LICENSE.TXT`, commit `e9996a2e210d021783d597d99ccd3199b0885d49`, blob `fa6ac540007032cbd0ec772a1c72e6cb5527a4fe`, 15141 bytes, SHA-256 `8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee`; capture и provenance: [materials README](release-components-40934653900-repro/materials/README.md).
+- Цепочка источника установлена от официального llvm.org к его ссылке на llvm/llvm-project. Это идентификация источника, не разрешение выбора пакетной лицензии; четыре manifest сохраняют `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`, без выбора.
+- Исключение (210–213) действует только для компиляции YOUR source с embedded Software в Object form YOUR source; только §§4(a), 4(b), 4(d), не §4(c). GPLv2 условие (215–222) относится только к Combined Software при судебном конфликте. Reference TEXT hash `268872b9816f90fd8e85db5a28d33f8150ebb8dd016653fb39ef1f94f2686bc5` остаётся для других 12 distinct ссылок; применимость к четырём не установлена.
+
+### webpki-roots, CDLA и CCADB
+
+- Исторический анализ рассматривает версии `0.26.11` и `1.0.7`.
+- Дополнительные материалы CCADB, pins, provenance и ограничения описаны в [materials evidence README](release-components-40934653900-repro/materials/README.md); p/q ledger не изменён. Запрос текущего raw `curl -L --max-filesize 262144 -D - https://www.ccadb.org/rootstores/usage` отклонён с точным сообщением `ERROR command is not allowed for security reasons`; отказ не обходить. Исторический repository supplement не доказывает официальную identity или исторический grant; современная официальная parent page не является raw. Data/Results не классифицированы автоматически, approval отсутствует.
+- 0.26.11 переэкспортирует данные родительской зависимости; 1.0.7 содержит исходную таблицу trust anchors и комментарии к сертификатам. Наличие исходников не доказывает наличие этих данных в конкретном binary.
+- CDLA-Permissive-2.0 §2.1: при sharing Data текст соглашения доступен с Data.
+- §3.1 не налагает ограничений или обязательств на Results.
+- Является ли конкретный распространяемый материал Data или Results, неизвестно.
+- [Snapshot страницы CCADB, commit 499b881 от 2025-02-03](https://github.com/mozilla/www.ccadb.org/blob/499b8818c174030e979041842d1d4cfb5fcbda89/rootstores/usage.md) (не утверждение, что это current master) заявляет CDLA-Permissive 2.0, attribution при redistribution/use в derived works и запрет endorsement/promotion без prior written permission; см. raw capture и exact pins в materials README. Это формулировки страницы, не полный текст CDLA.
+- Для двух usage-текстов пины 110/112 предшествовали просмотрам 116/118; domain 106 был просмотрен до pin 114, это нарушение. История b не является корректной pin-before-read для всего каталога; прежнее provenance-обобщение отозвано. Исторический snapshot `ed227276` от 2024-02-05 допускает redistribution/use с ограничением endorsement/promotion и disclaimer; он не current и не доказывает условия исторического grant.
+- Выяснить происхождение, атрибуцию, notices и запрет подразумеваемого endorsement.
+- В текущем `NOTICES.txt` найдено 10 совпадений `CCADB`, включая исторический анализ;
+  это не доказательство достаточной атрибуции, но и не её полное отсутствие. Внешний snapshot и точные pins см. в [materials evidence README](release-components-40934653900-repro/materials/README.md).
+- [CCADB Data Usage Terms snapshot](https://www.ccadb.org/rootstores/usage#ccadb-data-usage-terms) и
+  [текст CDLA](https://cdla.dev/permissive-2-0/) оценивать отдельно.
+- Бинарное наличие самих данных не наблюдалось при этой проверке.
+- Статус наличия текста страницы в evidence дополнен, но два исходных blocker `external_ccadb_terms_not_saved` в ledger не сняты; никакого вывода о применимости к конкретному получению/распространению, Data-vs-Results, достаточности attribution или compliance нет.
+- Само преобразование данных не доказывает классификацию Results.
+- Процедурная история CCADB capture сохранена: первоначальная директория `ccadb-capture-20261030-a` не имела pin до семантического чтения; поздние pins это нарушение не исправляют. В b порядок pin-before-read соблюдён для usage-текстов, но нарушен для domain evidence; детали и исправление прежнего обобщения — в materials README.
+
+### Прочие исторические записи
+
+- `xxhash-rust 0.8.18`: BSL-1.0; учитывать исключение для machine-executable object code.
+- Для исходных копий сохранить соответствующие copyright и текст лицензии.
+- `async_executors 0.7.0`: Unlicense; оценить права третьих лиц и notices.
+- `notify 8.2.0`: CC0-1.0; патенты и товарные знаки отдельно от отказа от прав.
+- Для каждого сначала установить распространяемый материал и отдельные условия файлов.
+
+## Первичные native материалы выбранных crate
+
+Сохранённый `inspect-primary.py`: exit 0, 13 crates, 12 project/SDK license files и 10 строк с CCADB.
+Он проверил отдельные файлы и ограниченные excerpts внутри 13 архивов,
+но не установил доступность исходников получателю или полную линковку.
+
+- `ring-0.17.14/LICENSE`, SHA-256 `b3d734001a94efff3579978d953391aa7115f877657d25eb54037a43875d078a`, строки 1–5:
+  новые файлы ISC, отдельные материалы BoringSSL — Apache-2.0; `LICENSE-other-bits`
+  содержит ISC notice, а `LICENSE-BoringSSL` — Apache текст. Сохранить применимые notices;
+  наличие build-script directives не доказывает включение каждого файла в executable.
+- `libsqlite3-sys-0.37.0/LICENSE`, SHA-256 `c10c1f27337546471e5f7e4e97fdd398b35b9d4e126115dcd22de8d8e65abf6f`,
+  содержит MIT-разрешение wrapper с copyright rusqlite developers.
+  `sqlite3/sqlite3.c`, SHA-256 `9512509b1bccb7461f79bea8aad6280ae4699e925fa4804381b71f59e7efb0c5`,
+  содержит заявление SQLite о public domain; оно не устанавливает автоматически права на wrapper,
+  SQLCipher, сторонние файлы или происхождение реально использованного исходника.
+  Build script сообщает `static=sqlite3`, но точные native bytes ещё надо связать со сборкой.
+- `liblzma-sys-0.4.7/xz/COPYING`, SHA-256 `616a3ad264ce29b8f1cb97e53037b139d406899ca8d1f799651e17bfa09830b8`,
+  строки 5–8: разные файлы имеют разные условия, liblzma указан как 0BSD.
+  В архиве также есть GPL и LGPL тексты: нельзя слепо применять root license ко всему дереву.
+- `zstd-sys-2.0.16+zstd.1.5.7/zstd/LICENSE`, SHA-256 `7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8`, — BSD;
+  `zstd/COPYING`, SHA-256 `f9c375a1be4a41f7b70301dd83c91cb89e41567478859b77eef375a52d782505`, — GPL.
+  Документацию об альтернативных условиях оценивать по конкретным файлам; пока это source-only evidence.
+- `openssl-src-300.6.1+3.6.3/openssl/LICENSE.txt`, SHA-256 `7d5450cb2d142651b8afa315b5f238efc805dad827d91ba367d8516bc9d49e7a`,
+  содержит Apache-2.0 для исходников OpenSSL 3.6.3; вложенные сторонние файлы могут иметь иные условия.
+  Это source-only evidence, не утверждение о включении OpenSSL в binary.
+
+## SDK, vendor и platform inputs
+
+- SDK commit по описанию процесса: `e754abaa88ce4f9745b4729652789ffc57f8ba4c`, отдельно от project commit.
+- SDK root `LICENSE-APACHE`: `dd167cc6194c64ee2e08ba4207aab12d75f02673a5e85be2b2a4ea9fd0dcb76b`.
+- SDK root `LICENSE-MIT`: `b9106b1c862ad319e1f2fd14a3844653938121ad9691716715292681642eeed4`.
+- Оба файла присутствуют также у `resocks5-net`; это не устанавливает условия каждого файла.
+- Семь vendor с missing attributable notices перечислены выше; их source files присутствуют,
+  но наличие исходников не разрешает вопрос пофайлового авторства и notices.
+- Source proof связала сохранённые SDK bytes и TAR modes с предоставленным tree anchor; это не устанавливает production origin или условия распространения.
+- Git proof и пересчёт source bytes подтверждают соответствие закреплённому tree, но не доверенное production origin.
+- Для vendor проверить происхождение, авторство, notices и каждый затронутый файл.
+- Системные библиотеки и SDK зависят от платформы и конкретной toolchain.
+- Нужны точные версии, источники, права и применимые условия поставки.
+- Статические библиотеки и генерируемые native inputs требуют отдельного trace.
+- Build logs и output hashes — диагностика, а не полный перечень linker inputs.
+
+## Контракт component и target review
+
+- Component review связывает `source_digest` и `selected_license`.
+- Нужны непустые обоснование `rationale` и `obligations`.
+- Списки `notices`, `evidence`, `retained_notices`, `corresponding_source`
+  содержат ссылки на payload и SHA-256 соответствующих байтов.
+- Сохранение всех candidate texts не означает принятие юридического решения.
+- Для vendor без candidate texts необходима пофайловая attribution review.
+- Поддерживаемый кодом набор лицензий ограничен; MPL, CDLA и LGPL блокируются.
+- Привязка bytes не доказывает полноту обязательств и не создаёт review.
+- Component digest проекта исключает review control для устранения цикла.
+- Общий receipt `source_digest` включает исходные bytes, modes и Git proof.
+- Поэтому эти две identity нельзя считать одним и тем же digest.
+
+Target review привязывается к четырём значениям identity:
+`source_digest`, `binary_sha256`, `target`, `build_evidence_digest`.
+Для каждого target нужны четыре отдельные категории evidence:
+
+1. `native-link-inputs` — фактические native и static inputs.
+2. `platform-toolchain-inputs` — происхождение и условия платформы и toolchain.
+3. `build-input-correspondence` — соответствие исходников, сборки и бинарных bytes.
+4. `recipient-source-availability` — доступность необходимых исходников получателю.
+
+Для каждой категории нужны path, sha256, obligations и reviewer rationale.
+Отсутствие evidence остаётся blocker; формальная привязка не заменяет review.
+Ни component reviews, ни target reviews здесь не утверждаются как одобренные.
+
+## Инцидент и хронология
+
+Изначально artifact скачали в `stage1-data-20261029/` в корне worktree, а scripts записали в соседний `stage1-scripts-20261029/`; это было вне разрешённого `target/`. `inventory.py`, `inspect.py` и `inspect-target.py` выполнили до требуемых hardened limits: это несоблюдение требований безопасной обработки недоверенных архивов. Затем собственные каталоги перенесли под `target/`, но последующее перемещение и hardened repeat не исправляют нарушение задним числом. Небезопасные legacy-процедуры больше никогда не запускать; evidence и журналы сохранены.
+
+Первый запуск нового analyzer отказал на виртуальном PAX-маркере `././@PaxHeader`; добавлена точная поддержка только этого metadata-маркера. Новые primary запуски a/b отказали на GNU longname `L` размером 102 в OpenSSL. Добавлена ограниченная поддержка `L` до 513 байт с одним завершающим NUL и проверкой пути; `K`, ссылки и sparse по-прежнему запрещены, проверки типов и путей не ослаблены. Неудачные outputs a/b сохранены как evidence; последующий inventory с GNU L завершился с exit 0.
+
+## Воспроизведение ограниченных проверок
+
+Сохранённый toolkit из четырёх scripts, source proof и инструкция получения восьми ZIP: [README](release-components-40934653900-repro/README.md). Прежние локальные scripts и их hashes относятся только к истории, не являются требуемыми инструментами воспроизведения. Новые scripts выполняются как доверенный код с `python -I`, без imports проекта; финальные SHA-256 приведены в README.
+
+Для анализа выбран candidate ZIP размером 853866809 байт и семь binary ZIP общим размером 90240348 байт вместо retained размером 943666915 байт; retained не исследован.
+
+Наблюдавшиеся результаты: `target/repro-saved-inventory-20261029-d/inventory.json` — 824 outer, 2642 nested, 736 компонентов, 743 blockers; `target/repro-saved-primary-20261029-c/primary.json` — 13 crates, 12 project/SDK файлов-кандидатов по имени (6 `LICENSE-*` и 6 workflow/аналитических файлов, не первичные лицензии), 10 строк CCADB; `target/repro-saved-binaries-20261029-c/summary.json` — семь совпадений receipt, все true, graph counts как выше. Все три запуска exit 0. Команды и безопасные свежие имена для повторов приведены в README.
+
+## Минимальные следующие действия
+
+1. Для всех 727 `.crate` теперь сохранён отдельный [анализ именованных первичных материалов](release-components-40934653900-repro/materials/README.md): архивы/копии, содержательные записи и parent-пересчёты p/q. Продолжить конкретные missing/external blockers и полный per-file/native/static/embedded scope; наличие этого этапа не доказывает состав бинарника и не является юридическим одобрением.
+2. Использовать проверенные совпадения binary и receipt и отдельно пересчитанные source и build evidence digests; retained bytes получить и проверить, если это понадобится для production proof.
+3. Установить native и platform inputs, состав и доступные исходники;
+   после этого провести component, target и необходимые юридические reviews.
+4. Только затем проверить доверенный production origin и всю цепочку admission
+   по правилам защищённого main, policy SHA, API и точным artifact ID.
+5. До устранения всех блокеров не создавать tag и не выпускать релиз.
+
+**Итог: PARTIAL.** Доказательств состава, compliance и production authority недостаточно.
+
+## Сохранённые native/toolchain свидетельства семи целей
+
+Ниже интегрирован исправленный handoff задачи 76. Его локальная копия: `target/native-evidence-40934653900-task76-corrected-20261030/REPORT.ru.md`, 23360 байт, SHA-256 `871dd3754800c6bbe9c699dfff091df2aad0c294282acdfb4c487b24510a41c8`. Parent сверил восемь Linux path/size/hash с индексом `summary.json` (250518 байт, SHA-256 `674863e7596c34790a1617a8aae9b362bb8a0ea78ba1a95fb03c259c0725ba01`). Пути worktree в handoff обозначают историческое размещение inputs; это не публикация raw captures.
+
+### Вывод
+
+**#53 остаётся PARTIAL; #56 не закрыта.** Это отчёт о сохранённых свидетельствах сборки/бинарных файлов для run `40934653900`, а не инвентаризация Cargo-кандидатов, юридическое одобрение, установление production-origin или полный граф входов линковщика. Внешний артефакт: ID `12932028389`, 853,866,809 байт, SHA-256 `75a58bb9393525b64f083105113771680bb561e1ff2f28f337fa584954b847d4`. Сохранённый артефакт `943666915` отсутствует. ZIP/TAR не открывались.
+
+Источники и точные ссылки, приведённые ниже из закреплённого исходного отчёта: `../license-external-terms-20261030/target/repro-saved-binaries-20261029-c/summary.json`; `../license-external-terms-20261030/target/stage1-data-20261029/all-targets.txt` строки 35–42, 103–110, 140–147, 181–188, 217–224, 285–292, 343–350; `../license-external-terms-20261030/target/source-proof-20261030-a/proof.json:15876–15940`; `docs/project/license/release-components-40934653900-repro/source-proof.md:9–14,33–47`; `docs/project/license/release-components-40934653900.md:252–262`. Эти ссылки наследуются из закреплённого исходного отчёта и не означают, что raw материалы повторно проверялись в этой корректирующей сессии.
+
+Исходный отчёт `target/native-evidence-40934653900-task76-20261030-final/REPORT.md` прочитан после проверки SHA-256 `a695530630e704b54c180d8685ab0276edbaf034229afeb69581a9544a0b38bc` и размера 19601 байт. Он здесь не изменялся. Совпадение хеша подтверждает лишь сохранность исходного файла, а не процедурную корректность прежней работы.
+
+Пины исследования материалов: `summary.json` — 1711 байт, SHA-256 `8daf33662c94c5dd1b8d64d54a6e9c6877b106e22920e6a845dc64713aae4a88`; `research.json` — 96454549 байт, SHA-256 `43f39d841bf58b128c07f5cecd7359209e0cb1cd6da019c82328e1ab5b81d2a6` (пины/результаты наследуются из закреплённого исходного отчёта, повторного хеширования в этой корректирующей сессии не было). Сводка: 727/727 registry-архивов проверено, ноль ошибок сканирования, 6182 уникальных сохранённых текста; 164 отсутствующих отдельных branch-материала, 83 отсутствующие в архивном инвентаре ссылки, четыре LLVM exception-текста не найдены в сохранённых материалах. Это выводы о материалах исходников, не свидетельство линковки, содержимого дистрибутива компилятора или одобрения.
+
+Материалы `toolchain.txt` и `linkage.txt` доступны как исторические plain-текстовые выдержки в `all-targets.txt`/`binaries-and-graphs.txt`, а не как отдельно восстановленные raw captures. Для каждого из семи target `targets/<target>/native-evidence/build-stderr.txt` — индексированный archive member с путём/размером/хешем из матрицы, но standalone raw capture отсутствует среди просмотренных разрешённых входов. Аналогично, все восемь Linux `native/**/output` ниже — индексированные archive members; standalone raw captures отсутствуют среди просмотренных разрешённых входов. Это граница проверенных входов, не утверждение, что данные отсутствуют повсюду. Это handoff о недостающих captures; восстановление/извлечение не выполнялось.
+
+Пути ниже — члены дерева сохранённого кандидата `targets/<target>/`; хеши исполняемых файлов и доказательств относятся к сохранённым записям. Материалы `toolchain.txt`, `native-evidence/linkage.txt`, `native-evidence/build-stderr.txt` и перечисленные файлы `native-evidence/native/**` записаны в индексе/свидетельствах, но не образуют полный трассируемый граф native-входов.
+
+| Цель; ID артефакта | Исполняемый файл; байты / SHA-256 | toolchain.txt SHA-256 | linkage.txt SHA-256 | build-stderr.txt: размер; SHA-256 | Наблюдения и ограничения |
+|---|---|---|---|---|---|
+| `aarch64-apple-darwin`; `12931773573` | `tor-socks5`; 36,355,568 / `e452ccd04ab22cd614f29dbdd1ebce4952f13db9a61370e5c751db9e06e90de4` | 192 B `e003fd3d385fcd0de16bc6b049124efb20207831dd810fd4ab39ff079bbb12a5` | 870 B `b86fbe5ac38691e5d16ab0a36957b224a80d05a0d91224faa5aa922464b1f2be` | 24,775; `9bb90e3b6326e75b1403aedf2f844fc18d9bb205666cdf581bc34de071b44c21` | linkage называет IOKit, CoreFoundation, SystemConfiguration, libiconv, libSystem. Сообщения Cargo содержат директивы ring/sqlite3/SystemConfiguration. Точный SDK/framework и полный набор статических входов не установлены. |
+| `x86_64-apple-darwin`; `12930598391` | `tor-socks5`; 37,581,112 / `507e1c1349837eb7e52eb4a87002e02ee7ab8e209ddbb25f3c0031849132a326` | 191 B `bf1658636877f9403ad0a32419fc3b0da3d3164f3585a184108063f8499d7434` | 869 B `e0489b7eea787911e1a219f1cbd06d0e19a79abc2727225ad0a7f5c3f7cf4759` | 24,833; `c0c825c8d99aaf23e1f7ccaf8f341af07207f6a9149b8ea22dccc510ba364fdb` | Те же записанные имена framework/library и ограничения, что для Apple arm64; точный SDK и полный native trace неизвестны. |
+| `x86_64-pc-windows-msvc`; `12929435820` | `tor-socks5.exe`; 36,523,520 / `132cf698d1841cfe4123abc95e891e9e60153d893fb46a4ba5a5b505c7090746` | 194 B `341fed434cf52bd9ba5ab2f3507dbd943a2062212028574e529fc3e7e5ecd7a8` | 276 B `0da1d98dc0cb607f5fd51b618334c0f389d40a3adeb402e8faf5beaab7fd5192` | 25,370; `ffd90acf27ff966081f8e1e9baefd4affa84d05ee678567673a376cd5ab23ba1` | Сохранённый результат readelf: «not ELF». Данных PE import table нет; состояние Windows imports — **UNKNOWN**. Это исправляет ошибочную формулировку прежнего `final_text` «PE imports отсутствуют»: наблюдались только отсутствие свидетельства PE-import и результат readelf «not ELF», а не отсутствие импортов. Сообщения о ring/sqlite3/winapi/iphlpapi — директивы, не импорты. Версии MSVC/linker/runtime/SDK неизвестны. |
+| `aarch64-unknown-linux-musl`; `12927756356` | `tor-socks5`; 39,124,368 / `78e051c957228fea7f719d394f6827d0d50e06691d9f725ffb488692521e9673` | 197 B `ba203e33fe4a5b8e05147bb6e57fb1ddace26d9f799f357420b666887dd7e2f1` | 242 B `948f9b6efa68bacbe8e2a407154f9839d820f9847115e9d6bf737551922bcb9a` | 24,539; `575146d3c63772d371cce575b04422f8a69a86ce76857a3930dd62dc40ab9257` | «There is no dynamic section». Не устанавливает версию musl, статическое содержимое или native provenance. |
+| `aarch64-unknown-linux-gnu`; `12926432069` | `tor-socks5`; 39,885,872 / `3e263cdeab6638502e83fdb89cb7878623592f177b450e49dc25fac1cbc4efe8` | 197 B `ba203e33fe4a5b8e05147bb6e57fb1ddace26d9f799f357420b666887dd7e2f1` | 1,896 B `fd4ea033f72f79e82206dd7035820a24b6ea7384fda8d0d13cbb21879d47b1b1` | 24,539; `085064ee1862f9ce3d2bf7fc14c3124910ab4eacf29880b30e3ba05efb82a081` | NEEDED: `libgcc_s.so.1`, `libm.so.6`, `libc.so.6`, `ld-linux-aarch64.so.1`. Версии GNU runtime/toolchain и статические входы неизвестны. |
+| `x86_64-unknown-linux-gnu`; `12925166590` | `tor-socks5`; 40,749,864 / `f8ee9ffd9a58e0578f92b2c6df84a5754bcfb9b61c5bf3d6895dc5e48baf0ab1` | 196 B `f22d5e4e9ced367e774ce5bc140d9e6b1235c1882fec80d011044851f3ae6369` | 1,897 B `c16560a6cd68c1faff470112becf528233a0c3e7a0d084540e6a630c5ab047be` | 24,596; `1a4abf7c74ee0262f95cb977498d650e8a0cdc90bf35b4b444bc1fa19061d08b` | NEEDED: `libgcc_s.so.1`, `libm.so.6`, `libc.so.6`, `ld-linux-x86-64.so.2`. Версии GNU runtime/toolchain и статические входы неизвестны. |
+| `x86_64-unknown-linux-musl`; `12924449353` | `tor-socks5`; 40,647,872 / `2b2184d890ca902c286039ef19a9eae863528ce4fb363cfa3a6c6ce5cfa4bd66` | 196 B `f22d5e4e9ced367e774ce5bc140d9e6b1235c1882fec80d011044851f3ae6369` | 1,310 B `69b564668c4be0f897b8b6a538c90c1e2e34e058843633d60a12e1e13e21798a` | 24,596; `847669bd7cbbeb9520afdfdf50a432566034435eb81ddc50146727aa4a6b5326` | Dynamic section есть, NEEDED-записей нет; это не доказывает конкретное musl/статическое происхождение. |
+
+Все семь записей toolchain сообщают rustc `1.99.1`, commit `58cf8f9c35b355199727627d07ae34a4e2846d67`, LLVM `23.1.1`. Записанные host для Apple/Windows/GNU соответствуют target; обе musl-записи указывают GNU host соответствующей архитектуры. Это наблюдения из файлов, не независимая проверка установленного компилятора, stdlib/runtime или всех входов. MSRV не является фактической версией компилятора.
+
+Хеши `build_evidence_digest` из proof.json и число файлов:
+
+| Цель | digest | Файлов |
+|---|---|---:|
+| `aarch64-apple-darwin` | `447d139cf97c5317e5414003d630c076bab577d00e57eea4bdc66a4d8358f2e5` | 115 |
+| `aarch64-unknown-linux-gnu` | `e36c10caae8c10defe9bbf494119a9512618f98682763b9904d08fb22ae6ac6c` | 112 |
+| `aarch64-unknown-linux-musl` | `d8ebedeadce1b4847e3a0b406e39e9201c6824191603e45b13d917d26fa24a3e` | 112 |
+| `x86_64-apple-darwin` | `9d8b22c09090993f898ddd5f9b4133e80973dd54c8058c44dbef4013df855a1e` | 115 |
+| `x86_64-pc-windows-msvc` | `6b298fdf8a35f45718bae4a2afd8e1bdc414f310fd7cd3abf4405af01212fe1e` | 124 |
+| `x86_64-unknown-linux-gnu` | `f322276ca62c2a711fb028bdda2be89b0b75089c4b7ee7ab0a26d7a5197fa703` | 112 |
+| `x86_64-unknown-linux-musl` | `09fbda25cf92becce41c2e46b33a8a43b57daae0189aabd7fe992ecd29f9e830` | 112 |
+
+Сводка saved-binaries содержит целевые member paths/размеры/хеши: Apple arm64 lines 1549–1557, 2227–2229; GNU arm64 2257–2265, 2917–2919; musl arm64 2947–2955, 3607–3609; Apple x86 3637–3645, 4315–4317; Windows 4345–4353, 5077–5079; GNU x86 5107–5115, 5767–5769; musl x86 5797–5805, 6457–6459. Это индекс членов, не самостоятельное чтение каждого файла. Записи digest — агрегированные доказательства receipts, не карта хешей каждого raw member.
+
+### Native/toolchain, материалы и ограничения
+
+| Семейство | Что наблюдалось | Не установлено |
+|---|---|---|
+| Rust/LLVM | Семь записей toolchain выше. | Происхождение дистрибутива компилятора/LLVM и его license/package manifest. Четыре отсутствующих LLVM exception-текста в registry-материалах не доказывают, что отсутствует исключение, применимое к использованному компилятору. |
+| stdlib/compiler-builtins/unwind | Отдельного per-target package/license manifest нет. | Точные артефакты, версии, copyright/license notices, хеши и фактическое использование. Версия toolchain не заменяет эти данные. |
+| GNU/musl runtime | GNU ELF содержит указанные динамические NEEDED; musl arm64 без dynamic section, x86 musl без NEEDED. | Точная дистрибуция/версия/лицензия runtime и полная трассировка статических входов. |
+| MSVC/Windows | Есть Windows target и capture native build output ring/sqlite/winapi. | Версии MSVC linker/toolset, CRT, Windows SDK, лицензии и PE import table; Windows imports остаются UNKNOWN. |
+| Apple SDK/frameworks | linkage именует IOKit, CoreFoundation, SystemConfiguration, libiconv, libSystem. `binaries-and-graphs.txt:8–12,21–25` сообщает compatibility/current versions: IOKit 1.0.0/275.0.0; CoreFoundation 150.0.0/3502.1.255; SystemConfiguration 1.0.0/1351.120.3; iconv 7.0.0/7.0.0; libSystem 1.0.0/1351.0.0. | Эти значения не являются версией SDK, происхождением/лицензией SDK package или полным графом статических/native входов. |
+
+Cargo-сообщения сообщают для ring `0.17.14` директивы `static=ring_core_0_17_14_` и `static=ring_core_0_17_14__test`, для libsqlite3-sys `0.37.0` — `static=sqlite3`; test-директива не доказывает наличие test-библиотеки в финальном бинарнике. Apple запрашивает SystemConfiguration; Windows содержит директивы iphlpapi и `dylib=`. Директивы не подтверждают итоговые imports. Кандидаты исходников `openssl-src`/`zstd-sys` не доказывают линковку. Полного графа static/native linker inputs нет.
+
+Родительские материалы сообщают ring `LICENSE` SHA-256 `b3d734001a94efff3579978d953391aa7115f877657d25eb54037a43875d078a` (ISC-файлы отдельно от Apache-2.0 BoringSSL); также упомянуты `LICENSE-BoringSSL` и `LICENSE-other-bits`. `libsqlite3-sys` `LICENSE` SHA-256 `c10c1f27337546471e5f7e4e97fdd398b35b9d4e126115dcd22de8d8e65abf6f` — лицензия/copyright MIT обёртки; `sqlite3/sqlite3.c` SHA-256 `9512509b1bccb7461f79bea8aad6280ae4699e925fa4804381b71f59e7efb0c5` указывает public-domain status. Это сведения об исходных материалах, не точных native bytes в бинарях.
+
+#### Восемь Linux native output records
+
+Ниже точные пути, размеры и SHA-256 из разрешённого индекса `summary.json`; номера строк относятся к этому файлу. Индексированный archive member не равен отдельно читаемому capture и не доказывает присутствие/линковку объектов в исполняемом файле.
+
+| Цель | Пакет / путь | Байты | SHA-256 | Строки summary.json |
+|---|---|---:|---|---|
+| `aarch64-unknown-linux-gnu` | `targets/aarch64-unknown-linux-gnu/native-evidence/native/libsqlite3-sys-43caa778f99d306e/output` | 2800 | `8f2a4e148a3e08666ad6c5a1e54187e0636d7c94e0c594762306753ddf863eb5` | 2545–2547 |
+| то же | `targets/aarch64-unknown-linux-gnu/native-evidence/native/ring-06d78f2d5463b481/output` | 7333 | `566e50c9cf149dabbf39f8cde849b72888fd68f53e942a852923cb123c732e14` | 2659–2661 |
+| `aarch64-unknown-linux-musl` | `targets/aarch64-unknown-linux-musl/native-evidence/native/libsqlite3-sys-b3f1c9f25bc5e311/output` | 3036 | `5bcebb17bc1886c0506db439bb37b911a3d8982d111ce9c02c6b2368e2a87285` | 3235–3237 |
+| то же | `targets/aarch64-unknown-linux-musl/native-evidence/native/ring-5b9c8b9d0c6fb9a6/output` | 7490 | `46bcd6af9f98aa8749bdb1eb72fb4273e8eb0a439dbdd738c5c15b8df1cc9630` | 3349–3351 |
+| `x86_64-unknown-linux-gnu` | `targets/x86_64-unknown-linux-gnu/native-evidence/native/libsqlite3-sys-8f8cf1c8240c276c/output` | 2774 | `4b56c157e31b020367639932aebd44ece7e67e0b44222f1d16be89862cd6a077` | 5395–5397 |
+| то же | `targets/x86_64-unknown-linux-gnu/native-evidence/native/ring-3a91efdcc3b8a52d/output` | 7316 | `d89255c83f816c2e2397b58e9c380dccfd27fa98e1b4391901123611217f5635` | 5509–5511 |
+| `x86_64-unknown-linux-musl` | `targets/x86_64-unknown-linux-musl/native-evidence/native/libsqlite3-sys-5ea49f2c969c7c4c/output` | 4294 | `4da1c88d54defd5e9f2fcd13acb67cbf64bb73bf855a362251613abab10c19b9` | 6085–6087 |
+| то же | `targets/x86_64-unknown-linux-musl/native-evidence/native/ring-d39c1e356df5d320/output` | 8329 | `00cff73611bd7f9f38df9ca703043abb9aabecfdc994299163f6128c987fbbcb` | 6199–6201 |
+
+Для Apple arm64 индексирует `libsqlite3-sys-377d37a63ce0fd29/output` SHA-256 `81a63de22a7b4ba261429cfeb2cdc0d3f0ac06830331f345261dc752d067702e` (1837–1839) и `ring-f957787254a34d2c/output` `7b80bf7f4288cea16a2bb7173ac073cfd4eeee4ebd64b3dd2774c6ff0af22747` (1951–1953). Windows: `libsqlite3-sys-41f49751baff0676/output` `d7a8db6ebd668d816520ee3430fb28a8b66ca700f3a79a602bb750a65467a900` (4651–4653), `ring-5456e3b1b7f3bda0/output` `29474fc32d9e4aab3db515c9fa2a4e1f187c31adf27d9f231e76be1d00f2a195` (4783–4785), `winapi-c7e04be40f3bbf47/output` `71561baf3a8972c100b664d0a611facbabfdd289b538a9c3f2479f3236e7c84f` (4981–4983). Все перечисленное — записи индекса; raw captures отдельно не проверялись.
+
+### Процедурный инцидент
+
+Предыдущая дочерняя сессия `97367124-8234-483a-a097-2d425c9e45fb$$call_aea316c6a36f4c9eaef0385bf33e9d17` нарушила заданную границу чтения: msg2/6 выполнили широкое `ls` внешнего target на depth 2; msg28–31 — glob/content grep по всему внешнему target вне разрешённого объёма; msg7/12–13 прочитали summaries и msg26–27 — research семантически до проверки пинов в msg46–47. Эти нарушения реальны и не исправляются последующим совпадением хешей. Хеш исходного отчёта доказывает только его сохранность, не ретроспективную процедурную корректность. Транскрипт и другие деревья в этой работе повторно не читались.
+
+### Материалы, provenance и пробелы
+
+Source proof связывает общий исходный commit/tree для семи receipts: `67f82c1e107ab24e8fd22afb9fd12134ffa7f982` / `8c5be9171f2a2fa0f83dc42a60d9bb731d891d4c`; SDK commit/tree `e754abaa88ce4f9745b4729652789ffc57f8ba4c` / `263db1bd209e4151eb4deadf532d423d0bf2b41c`. Эти привязки и совпадения receipts описывают сохранённые свидетельства старого PR run, не доказывают composition source-to-binary и не относятся к будущему релизу.
+
+Инвентарь кандидата — отдельная инвентаризация исходников: 736 компонентов, 743 blockers, пустые reviews, семь vendor notice gaps. Декларации и присутствие в registry archive не доказывают линковку. Открытые legal reviews и production origin остаются открытыми; этот отчёт не снимает blockers и не является юридическим одобрением или подтверждением полного связанного графа.
+
+### Минимальные действия для #54
+
+1. **Сохранённый run `40934653900`:** только разрешённое ограниченное безопасное восстановление уже закреплённого артефакта. Сверить каждый member path/hash с `repro-saved-binaries-20261029-c/summary.json`; отдельно получить точные raw bytes, особенно семь `toolchain.txt`, `native-evidence/linkage.txt`, `native-evidence/build-stderr.txt` и выбранные `native-evidence/native/**/output`. Подтвердить receipt bindings; зафиксировать пробелы в compiler/runtime/SDK артефактах. Не запускать legacy parsers и не перезаписывать доказательства. Это характеризует сохранённые члены, но не восстанавливает отсутствующие входные байты и не доказывает состав старого бинарника задним числом.
+2. **Только будущий релиз:** producer сохраняет и связывает receipt с точными per-target compiler+LLVM identity/license, manifest/hash stdlib/compiler-builtins/unwind, релевантными native objects/generated inputs, linker/runtime/SDK package identity и notices, а также платформенными import/load результатами. Для GNU/musl — runtime distribution/version и static/dynamic provenance; Windows — MSVC linker/CRT/SDK и PE imports; Apple — SDK/framework source/version/license package. Узкое добавление свидетельств, не широкая пересборка: новая сборка доказывает только собственные артефакты, не старый run.
+3. Отдельно разрешить component notices/reviews и production origin; native capture сам по себе не даёт legal approval или production authority. #53 и #56 не закрыты.
+
+### Источники и проверка
+
+Точные ссылки на разрешённые inputs, summary.json, proof.json, исторические plain excerpts и component materials приведены в начале отчёта и наследуются из закреплённого исходного отчёта; raw содержимое этих материалов повторно не проверялось в этой корректирующей сессии. Никаких тестов, сборок, валидаторов проекта, сети, CI, разбора/извлечения архивов не выполнялось.
+
+Только изменённый/созданный файл: `target/native-evidence-40934653900-task76-corrected-20261030/REPORT.ru.md`.
