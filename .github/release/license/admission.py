@@ -360,11 +360,20 @@ def collect(directory, limit=bundle.MAX_TOTAL):
     if directory.is_symlink() or not directory.is_dir():
         raise ValueError('missing receipt directory')
     result = {}
+    total = 0
     for p in directory.rglob('*'):
         if p.is_symlink():
             raise ValueError('linked receipt entry')
         if p.is_file():
-            result[bundle.safe(p.relative_to(directory).as_posix())] = read(p, limit)
+            if len(result) >= bundle.MAX_ENTRIES:
+                raise ValueError('too many receipt entries')
+            if total + p.stat().st_size > bundle.MAX_TOTAL:
+                raise ValueError('receipt bundle too large')
+            data = read(p, limit)
+            if total + len(data) > bundle.MAX_TOTAL:
+                raise ValueError('receipt bundle too large')
+            total += len(data)
+            result[bundle.safe(p.relative_to(directory).as_posix())] = data
         elif not p.is_dir():
             raise ValueError('nonregular receipt entry')
     return result

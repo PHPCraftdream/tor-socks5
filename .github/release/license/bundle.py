@@ -60,7 +60,11 @@ def strict_json(data):
                 raise ValueError('duplicate JSON key: ' + key)
             result[key] = value
         return result
-    return json.loads(data, object_pairs_hook=pairs)
+
+    def reject_constant(value):
+        raise ValueError('invalid JSON constant: ' + value)
+
+    return json.loads(data, object_pairs_hook=pairs, parse_constant=reject_constant)
 
 
 def encoded(obj):
@@ -385,10 +389,12 @@ def canonical_reports(payload, components, tag):
                         '\nProvenance: ' + provenance + '\n').encode('utf-8'))
         for path in c['candidates']:
             try:
-                payload[path].decode('utf-8')
+                text = payload[path].decode('utf-8')
             except UnicodeDecodeError:
                 problems.append(c['id'] + ': invalid UTF-8 candidate: ' + path)
                 continue
+            if not text.strip():
+                problems.append(c['id'] + ': empty candidate text: ' + path)
             notices.extend([('\n--- ' + c['id'] + ' ' + path + ' ---\n').encode('utf-8'), payload[path], b'\n'])
     url = 'https://github.com/PHPCraftdream/tor-socks5/releases/download/' + tag + '/tor-socks5-' + tag + '-license-bundle.tar.gz'
     source_info = ('Tag: ' + tag + '\nDownload the tagged bundle: ' + url + '\n'

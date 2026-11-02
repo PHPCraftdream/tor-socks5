@@ -232,5 +232,181 @@ class BundleTests(unittest.TestCase):
             bundle.read_tar(buf.getvalue())
 
 
+    def test_strict_json_rejects_nonstandard_constants(self):
+        for value in ('NaN', 'Infinity', '-Infinity'):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, 'invalid JSON constant'):
+                    bundle.strict_json('{"value":' + value + '}')
+        self.assertEqual(
+            {'value': [None, True, False, 1, 1.5]},
+            bundle.strict_json('{"value":[null,true,false,1,1.5]}'),
+        )
+
+    def test_strict_json_rejects_duplicate_nested_keys(self):
+        for text in (
+            '{"outer":{"x":1,"x":2}}',
+            '{"items":[{"x":1,"x":2}]}',
+        ):
+            with self.subTest(text=text):
+                with self.assertRaisesRegex(ValueError, 'duplicate JSON key: x'):
+                    bundle.strict_json(text)
+
+    def test_strict_json_rejects_malformed_json(self):
+        for text in ('', '{', '{"x":}', '{"x":1', '[1,]'):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    bundle.strict_json(text)
+
+    def test_canonical_reports_blocks_empty_candidate_with_matching_review(self):
+        notice_path = 'sources/v1/project/vendor/patch/NOTICE'
+        for candidate in (b'', b' \t\r\n'):
+            with self.subTest(candidate=candidate):
+                data = dict(self.payload)
+                data[notice_path] = candidate
+                components, _, _ = bundle.reconstruct(data, 'v1')
+                vendor = next(c for c in components if c['id'] == 'vendor:patch')
+                reviews = bundle.strict_json(self.payload['REVIEWS.json'])
+                record = reviews['components']['vendor:patch']
+                record['source_digest'] = vendor['source_digest']
+                for field in ('notices', 'retained_notices', 'evidence',
+                              'corresponding_source', 'attribution_review'):
+                    for reference in record[field]:
+                        if reference['path'] == notice_path:
+                            reference['sha256'] = bundle.digest(candidate)
+
+                self.assertEqual([], bundle.blockers(components, reviews, data))
+                notices, _, problems = bundle.canonical_reports(data, components, 'v1')
+                self.assertEqual(
+                    ['vendor:patch: empty candidate text: ' + notice_path],
+                    problems,
+                )
+                section = (
+                    '\n--- vendor:patch ' + notice_path + ' ---\n'
+                ).encode('utf-8') + candidate + b'\n'
+                self.assertIn(section, notices)
+
+    def test_prepare_and_verify_material_blocker(self):
+        from unittest import mock
+
+        notice_path = 'sources/v1/project/vendor/patch/NOTICE'
+        modes = bundle.strict_json(self.payload['SOURCE-MODES.json'])
+        root = Path(self.temp.name)
+
+        for index, material in enumerate((b'valid terms', b'', b' \t\r\n')):
+            with self.subTest(material=material):
+                payload = {
+                    p: data for p, data in self.payload.items()
+                    if p.startswith('sources/')
+                }
+                payload[notice_path] = material
+                components, inventory, copies = bundle.reconstruct(payload, 'v1')
+                payload.update(copies)
+                proofs = payload_proofs(payload, 'v1', modes)
+                payload['GIT-SOURCES.json'] = bundle.encoded(proofs)
+
+                reviews = bundle.strict_json(self.payload['REVIEWS.json'])
+                for component in components:
+                    record = reviews['components'][component['id']]
+                    record['source_digest'] = component['source_digest']
+                    for field in ('notices', 'evidence', 'retained_notices',
+                                  'corresponding_source', 'attribution_review'):
+                        for reference in record[field]:
+                            reference['sha256'] = bundle.digest(
+                                payload[reference['path']]
+                            )
+
+                self.assertEqual([], bundle.blockers(components, reviews, payload))
+                expected = ([] if index == 0 else [
+                    'vendor:patch: empty candidate text: ' + notice_path
+                ])
+                review_path = root / ('reviews-' + str(index) + '.json')
+                review_path.write_bytes(bundle.encoded(reviews))
+                output = root / ('prepared-' + str(index))
+                project_commit = proofs['project']['commit']
+                sdk_commit = proofs['sdk']['commit']
+
+                with mock.patch.object(bundle, 'SDK_COMMIT', sdk_commit), \
+                        mock.patch.object(
+                            bundle, 'MODES',
+                            {p: int(mode[-3:], 8) for p, mode in modes.items()}
+                        ):
+                    with mock.patch.object(
+                            bundle, 'build',
+                            return_value=(payload, components, inventory)
+                    ) as build:
+                        actual = bundle.prepare(
+                            root, root, root, output, 'v1', review_path,
+                            project_commit
+                        )
+                    build.assert_called_once_with(
+                        root, root, root, 'v1', project_commit
+                    )
+                    self.assertEqual(expected, actual)
+
+                    path = output / 'candidate.tar.gz'
+                    archived = bundle.read_tar(
+                        path.read_bytes(), files_only=True, limit=bundle.MAX_TOTAL
+                    )
+                    self.assertEqual(material, archived[notice_path])
+                    self.assertEqual(
+                        bundle.encoded(proofs), archived['GIT-SOURCES.json']
+                    )
+                    self.assertEqual(
+                        reviews, bundle.strict_json(archived['REVIEWS.json'])
+                    )
+                    self.assertEqual(
+                        modes, bundle.strict_json(archived['SOURCE-MODES.json'])
+                    )
+                    self.assertEqual(
+                        expected,
+                        bundle.strict_json((output / 'BLOCKERS.json').read_bytes())
+                    )
+                    self.assertEqual(
+                        expected, bundle.strict_json(archived['BLOCKERS.json'])
+                    )
+                    self.assertEqual(
+                        expected,
+                        bundle.verify_format(path, project_commit, sdk_commit)
+                    )
+                    with self.assertRaisesRegex(
+                            ValueError, 'source commit mismatch: project'
+                    ):
+                        bundle.verify_format(path, '0' * 40, sdk_commit)
+
+                    cases = [
+                        ('NOTICES.txt', b'forged', 'canonical report mismatch')
+                    ]
+                    if expected:
+                        cases.append((
+                            'BLOCKERS.json', bundle.encoded([]),
+                            'blocker report mismatch'
+                        ))
+
+                    for field, value, message in cases:
+                        with self.subTest(field=field):
+                            altered = dict(archived)
+                            altered[field] = value
+                            manifest = bundle.strict_json(
+                                altered.pop('MANIFEST.json')
+                            )
+                            manifest['files'] = [
+                                {
+                                    'path': p,
+                                    'size': len(data),
+                                    'sha256': bundle.digest(data),
+                                }
+                                for p, data in sorted(altered.items())
+                            ]
+                            altered['MANIFEST.json'] = bundle.encoded(manifest)
+                            forged_path = root / (
+                                'forged-' + str(index) + '-' + field + '.tar.gz'
+                            )
+                            bundle.pack(altered, forged_path)
+                            with self.assertRaisesRegex(ValueError, message):
+                                bundle.verify_format(
+                                    forged_path, project_commit, sdk_commit
+                                )
+
+
 if __name__ == '__main__':
     unittest.main()

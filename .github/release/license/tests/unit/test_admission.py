@@ -234,5 +234,56 @@ class AdmissionTests(unittest.TestCase):
                 admission.checksum(data, name, invalid.encode())
 
 
+    def test_collect_enforces_total_size_and_entry_count(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            (directory / 'a.txt').write_bytes(b'aaa')
+            (directory / 'b.txt').write_bytes(b'bbb')
+            with mock.patch.object(admission.bundle, 'MAX_TOTAL', 5), \
+                 mock.patch.object(admission.bundle, 'MAX_ENTRIES', 2):
+                with self.assertRaisesRegex(ValueError, 'receipt bundle too large'):
+                    admission.collect(directory, limit=5)
+
+                (directory / 'b.txt').write_bytes(b'bb')
+                self.assertEqual(
+                    {'a.txt': b'aaa', 'b.txt': b'bb'},
+                    admission.collect(directory, limit=5),
+                )
+
+                (directory / 'c.txt').write_bytes(b'')
+                with self.assertRaisesRegex(ValueError, 'too many receipt entries'):
+                    admission.collect(directory, limit=5)
+
+    def test_collect_preserves_separate_per_file_limit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            (directory / 'a.txt').write_bytes(b'aaa')
+            with mock.patch.object(admission.bundle, 'MAX_TOTAL', 8):
+                with self.assertRaisesRegex(
+                        ValueError, 'missing, linked or oversized file'
+                ):
+                    admission.collect(directory, limit=2)
+
+                (directory / 'a.txt').write_bytes(b'aa')
+                (directory / 'b.txt').write_bytes(b'bb')
+                self.assertEqual(
+                    {'a.txt': b'aa', 'b.txt': b'bb'},
+                    admission.collect(directory, limit=2),
+                )
+
+    def test_collect_accounts_for_actual_bytes_after_read(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            source = directory / 'a.txt'
+            source.write_bytes(b'a')
+            with mock.patch.object(admission.bundle, 'MAX_TOTAL', 5), \
+                 mock.patch.object(
+                     admission, 'read', return_value=b'123456'
+                 ) as read:
+                with self.assertRaisesRegex(ValueError, 'receipt bundle too large'):
+                    admission.collect(directory, limit=8)
+                read.assert_called_once_with(source, 8)
+
+
 if __name__ == '__main__':
     unittest.main()
