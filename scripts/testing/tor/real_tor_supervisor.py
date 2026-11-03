@@ -86,17 +86,7 @@ class TorSupervisor:
     def _quote(path):
         return '"' + path.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
-    def start(self):
-        if self.process is not None or self._closed:
-            raise SupervisorError("Tor fixture cannot be restarted")
-        self._check()
-        self._temp = tempfile.TemporaryDirectory(prefix="tor-control-", dir="/tmp")
-        root = self._temp.name
-        data = os.path.join(root, "data")
-        control = os.path.join(root, "control")
-        cookie_path = os.path.join(root, "cookie")
-        config_path = os.path.join(root, "torrc")
-        os.mkdir(data, 0o700)
+    def _write_config(self, data, control, cookie_path, config_path):
         with open(config_path, "w", encoding="utf-8") as config:
             config.write(
                 "RunAsDaemon 0\n"
@@ -108,14 +98,33 @@ class TorSupervisor:
                 "SocksPort 0\n"
                 "DisableNetwork 1\n"
             )
+
+    def _launch(self, config_path, extra=()):
+        if self.process is not None or self._closed:
+            raise SupervisorError("Tor fixture cannot be restarted")
         self._log = tempfile.TemporaryFile(mode="w+b")
         self._check()
         self.process = subprocess.Popen(
-            [self.binary, "-f", config_path],
+            [self.binary, "-f", config_path, *extra],
             stdin=subprocess.DEVNULL,
             stdout=self._log,
             stderr=self._log,
         )
+
+
+    def start(self):
+        if self.process is not None or self._closed:
+            raise SupervisorError("Tor fixture cannot be restarted")
+        self._check()
+        self._temp = tempfile.TemporaryDirectory(prefix="tor-control-", dir="/tmp")
+        root = self._temp.name
+        data = os.path.join(root, "data")
+        control = os.path.join(root, "control")
+        cookie_path = os.path.join(root, "cookie")
+        config_path = os.path.join(root, "torrc")
+        os.mkdir(data, 0o700)
+        self._write_config(data, control, cookie_path, config_path)
+        self._launch(config_path)
         while True:
             self._check()
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -215,17 +224,7 @@ class TorSupervisor:
         self.version = version.decode("ascii")
         return self.version
 
-    def close(self):
-        if self._closed:
-            return
-        socket_failed = False
-        if self._socket is not None:
-            sock, self._socket = self._socket, None
-            try:
-                sock.close()
-            except OSError:
-                socket_failed = True
-        self._cookie = None
+    def _stop_child(self):
         cleanup_deadline = min(self.deadline + 5.0, time.monotonic() + 5.0)
         if self.process is not None:
             if self.process.poll() is None:
@@ -253,6 +252,19 @@ class TorSupervisor:
             if self.process.poll() is None:
                 raise CleanupError("owned Tor child remains alive")
             self.process.wait(timeout=0)
+
+    def close(self):
+        if self._closed:
+            return
+        socket_failed = False
+        if self._socket is not None:
+            sock, self._socket = self._socket, None
+            try:
+                sock.close()
+            except OSError:
+                socket_failed = True
+        self._cookie = None
+        self._stop_child()
         if self._log is not None:
             self._log.close()
             self._log = None
