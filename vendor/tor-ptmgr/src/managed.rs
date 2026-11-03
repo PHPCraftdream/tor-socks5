@@ -22,6 +22,12 @@ use tor_linkspec::PtTransportName;
 use tor_rtcompat::Runtime;
 use tracing::warn;
 
+/// Bounded, secret-free observations for retained managed transactions.
+#[path = "managed/diagnostics.rs"]
+mod diagnostics;
+
+use diagnostics::{Facts, Outcome, Stage};
+
 /// Команды реактору.
 pub(crate) enum PtReactorMessage {
     /// Уведомление об изменении конфигурации.
@@ -63,6 +69,8 @@ struct Slot {
     retire: bool,
     /// Поколение конфигурации, при котором процесс был запущен.
     generation: u64,
+    /// Opaque identity of this slot lifetime, independent of its path and generation.
+    diagnostic_id: diagnostics::Id,
     /// Счётчик исчерпанных автоматических попыток очистки Failed-слота.
     cleanup_attempts: u32,
 }
@@ -88,7 +96,7 @@ enum Phase {
 }
 
 /// Результат завершившейся задачи вместе с ключом соответствующего слота.
-type TaskResult = (PathBuf, TaskOutcome);
+type TaskResult = (PathBuf, TaskOutcome, diagnostics::Ticket);
 /// Итог запуска либо очистки процесса.
 enum TaskOutcome {
     /// Результат запуска и, при ошибке/отмене, сохранённый владелец процесса.
@@ -116,6 +124,11 @@ enum Event {
 pub(crate) struct PtReactor<R> {
     /// Runtime для запуска процессов.
     rt: R,
+    /// Opaque identity of this reactor lifetime.
+    diagnostic_id: diagnostics::Id,
+    /// Bounded test receipts for actual queued transactions.
+    #[cfg(test)]
+    diagnostic_traces: Vec<Arc<diagnostics::Trace>>,
     /// Процессы, индексируемые логически по пути.
     slots: Vec<Slot>,
     /// Процессы, завершившиеся без соответствующего слота.
@@ -141,6 +154,27 @@ pub(crate) struct PtReactor<R> {
 }
 
 impl<R: Runtime> PtReactor<R> {
+    /// Capture one queued transaction and optionally retain its bounded test receipt.
+    fn diagnostic_ticket(
+        &mut self,
+        slot: diagnostics::Id,
+        generation: Option<u64>,
+        cleanup: bool,
+    ) -> diagnostics::Ticket {
+        let ticket = diagnostics::Ticket::new(diagnostics::Context {
+            manager: self.diagnostic_id,
+            transaction: diagnostics::id(),
+            slot,
+            generation,
+            cleanup,
+        });
+        #[cfg(test)]
+        if self.diagnostic_traces.len() < 64 {
+            self.diagnostic_traces.push(Arc::clone(&ticket.trace));
+        }
+        ticket
+    }
+
     /// Создаёт реактор.
     pub(crate) fn new(
         rt: R,
@@ -151,6 +185,9 @@ impl<R: Runtime> PtReactor<R> {
     ) -> Self {
         Self {
             rt,
+            diagnostic_id: diagnostics::id(),
+            #[cfg(test)]
+            diagnostic_traces: Vec::new(),
             slots: Vec::new(),
             orphans: Vec::new(),
             tasks: FuturesUnordered::new(),
@@ -167,16 +204,53 @@ impl<R: Runtime> PtReactor<R> {
 
     /// Убирает методы процесса из общего состояния и запускает его очистку.
     fn clean(&mut self, key: PathBuf, mut pt: PluggableClientTransport) {
+        let captured = self
+            .slots
+            .iter()
+            .find(|slot| slot.key == key)
+            .map(|slot| (slot.diagnostic_id, slot.generation));
+        let ticket = self.diagnostic_ticket(
+            captured.and_then(|value| value.0),
+            captured.map(|value| value.1),
+            true,
+        );
         {
             let mut state = self.state.write().expect("ptmgr state poisoned");
             for name in pt.transport_methods().keys() {
                 state.managed_cmethods.remove(name);
             }
         }
-        let _ = pt.begin_shutdown();
+        let signal_ok = pt.begin_shutdown().is_ok();
+        ticket.trace.event(
+            Stage::Signal,
+            if signal_ok {
+                Outcome::Ok
+            } else {
+                Outcome::Error
+            },
+            Facts {
+                owner_present: Some(true),
+                ..Facts::default()
+            },
+        );
         self.tasks.push(Box::pin(async move {
+            ticket
+                .trace
+                .event(Stage::Worker, Outcome::Begin, Facts::default());
             let result = pt.shutdown().await;
-            (key, TaskOutcome::Cleaned(result, pt))
+            ticket.trace.event(
+                Stage::WorkerReturn,
+                if result.is_ok() {
+                    Outcome::Ok
+                } else {
+                    Outcome::Error
+                },
+                Facts {
+                    owner_present: Some(true),
+                    ..Facts::default()
+                },
+            );
+            (key, TaskOutcome::Cleaned(result, pt), ticket)
         }));
     }
 
@@ -189,6 +263,7 @@ impl<R: Runtime> PtReactor<R> {
         generation: u64,
     ) {
         let (cancel, cancel_rx) = futures::channel::oneshot::channel();
+        let diagnostic_id = diagnostics::id();
         self.slots.push(Slot {
             key: key.clone(),
             config: config.clone(),
@@ -196,15 +271,36 @@ impl<R: Runtime> PtReactor<R> {
             pending: None,
             retire: false,
             generation,
+            diagnostic_id,
             cleanup_attempts: 0,
         });
+        let ticket = self.diagnostic_ticket(diagnostic_id, Some(generation), false);
         let rt = self.rt.clone();
         let dir = self.state_dir.clone();
         let resolver = self.path_resolver.clone();
         self.tasks.push(Box::pin(async move {
+            ticket
+                .trace
+                .event(Stage::Worker, Outcome::Begin, Facts::default());
             let (result, retained) =
-                spawn_from_config(rt, dir, config, resolver, proxy, cancel_rx).await;
-            (key, TaskOutcome::Started(result, retained.map(Box::new)))
+                spawn_from_config(rt, dir, config, resolver, proxy, cancel_rx, &ticket.trace).await;
+            ticket.trace.event(
+                Stage::WorkerReturn,
+                if result.is_ok() {
+                    Outcome::Ok
+                } else {
+                    Outcome::Error
+                },
+                Facts {
+                    owner_present: Some(result.is_ok() || retained.is_some()),
+                    ..Facts::default()
+                },
+            );
+            (
+                key,
+                TaskOutcome::Started(result, retained.map(Box::new)),
+                ticket,
+            )
         }));
     }
 
@@ -255,10 +351,39 @@ impl<R: Runtime> PtReactor<R> {
     }
 
     /// Применяет итог задачи, обновляя состояние слота и ожидающие запросы.
-    fn complete_task(&mut self, key: PathBuf, outcome: TaskOutcome) {
+    fn complete_task(
+        &mut self,
+        key: PathBuf,
+        outcome: TaskOutcome,
+        mut ticket: diagnostics::Ticket,
+    ) {
+        let received_slot = self.slots.iter().find(|slot| slot.key == key);
+        let slot_generation = received_slot.map(|slot| slot.generation);
+        let owner_present = match &outcome {
+            TaskOutcome::Started(result, retained) => result.is_ok() || retained.is_some(),
+            TaskOutcome::Cleaned(_, _) => true,
+        };
+        ticket.trace.event(
+            Stage::Receipt,
+            match &outcome {
+                TaskOutcome::Started(Ok(_), _) | TaskOutcome::Cleaned(Ok(()), _) => Outcome::Ok,
+                _ => Outcome::Error,
+            },
+            Facts {
+                slot_generation,
+                owner_present: Some(owner_present),
+                ..Facts::default()
+            },
+        );
         let Some(index) = self.slots.iter().position(|slot| slot.key == key) else {
             // Сохраняем неожиданный результат до подтверждения остановки;
             // уже очищавшийся процесс повторно не сигнализируем.
+            let retained_after_apply = matches!(
+                &outcome,
+                TaskOutcome::Started(Ok(_), _)
+                    | TaskOutcome::Started(Err(_), Some(_))
+                    | TaskOutcome::Cleaned(Err(_), _)
+            );
             let attempted = matches!(
                 outcome,
                 TaskOutcome::Started(Err(_), Some(_)) | TaskOutcome::Cleaned(Err(_), _)
@@ -284,6 +409,17 @@ impl<R: Runtime> PtReactor<R> {
                 }
                 TaskOutcome::Started(Err(_), None) | TaskOutcome::Cleaned(Ok(()), _) => {}
             }
+            ticket.finish(
+                if retained_after_apply {
+                    Outcome::Retained
+                } else {
+                    Outcome::Removed
+                },
+                Facts {
+                    owner_present: Some(retained_after_apply),
+                    ..Facts::default()
+                },
+            );
             return;
         };
         match outcome {
@@ -297,15 +433,29 @@ impl<R: Runtime> PtReactor<R> {
                     {
                         let covers = self.slots[index].config.protocols.clone();
                         let mut state = self.state.write().expect("ptmgr state poisoned");
-                        if state.closed
-                            || state.generation != self.slots[index].generation
-                            || covers.iter().any(|name| {
+                        let valid = !state.closed
+                            && state.generation == self.slots[index].generation
+                            && !covers.iter().any(|name| {
                                 state.configured.get(name)
                                     != Some(&TransportOptions::Managed(
                                         self.slots[index].config.clone(),
                                     ))
-                            })
-                        {
+                            });
+                        ticket.trace.event(
+                            Stage::Validation,
+                            if valid {
+                                Outcome::Ok
+                            } else {
+                                Outcome::Rejected
+                            },
+                            Facts {
+                                slot_generation: Some(self.slots[index].generation),
+                                state_generation: Some(state.generation),
+                                owner_present: Some(true),
+                                ..Facts::default()
+                            },
+                        );
+                        if !valid {
                             drop(state);
                             self.fail_requests(
                                 &covers,
@@ -313,19 +463,61 @@ impl<R: Runtime> PtReactor<R> {
                             );
                             self.slots[index].phase = Phase::Cleaning;
                             self.clean(key, pt);
+                            ticket.finish(
+                                Outcome::Retained,
+                                Facts {
+                                    slot_generation,
+                                    owner_present: Some(true),
+                                    ..Facts::default()
+                                },
+                            );
                             return;
                         }
+                        let mut methods = 0usize;
+                        let mut local_sends = 0usize;
                         for (name, method) in pt.transport_methods() {
                             state.managed_cmethods.insert(name.clone(), method.clone());
+                            methods = methods.saturating_add(1);
                             for sender in self.requests.remove(name).into_iter().flatten() {
-                                let _ = sender.send(Ok(method.clone()));
+                                if sender.send(Ok(method.clone())).is_ok() {
+                                    local_sends = local_sends.saturating_add(1);
+                                }
                             }
                         }
+                        ticket.trace.event(
+                            Stage::Publication,
+                            Outcome::Published,
+                            Facts {
+                                slot_generation: Some(self.slots[index].generation),
+                                state_generation: Some(state.generation),
+                                owner_present: Some(true),
+                                count: methods,
+                                ..Facts::default()
+                            },
+                        );
+                        ticket.trace.event(
+                            Stage::Reserved,
+                            Outcome::Ok,
+                            Facts {
+                                owner_present: Some(true),
+                                count: local_sends,
+                                ..Facts::default()
+                            },
+                        );
                         drop(state);
                         self.fail_requests(&covers, &PtError::ChildGone);
                         // Перезапуск/запуск сбрасывает счётчик попыток очистки.
                         self.slots[index].cleanup_attempts = 0;
                         self.slots[index].phase = Phase::Running(pt);
+                        ticket.finish(
+                            Outcome::Published,
+                            Facts {
+                                slot_generation,
+                                owner_present: Some(true),
+                                count: methods,
+                                ..Facts::default()
+                            },
+                        );
                     }
                     Ok(pt) => {
                         if !self.closing {
@@ -337,32 +529,86 @@ impl<R: Runtime> PtReactor<R> {
                         }
                         self.slots[index].phase = Phase::Cleaning;
                         self.clean(key, pt);
+                        ticket.trace.event(
+                            Stage::Validation,
+                            Outcome::Rejected,
+                            Facts {
+                                slot_generation,
+                                owner_present: Some(true),
+                                ..Facts::default()
+                            },
+                        );
+                        ticket.finish(
+                            Outcome::Retained,
+                            Facts {
+                                slot_generation,
+                                owner_present: Some(true),
+                                ..Facts::default()
+                            },
+                        );
                     }
                     Err(e) => {
                         let covers = self.slots[index].config.protocols.clone();
                         self.fail_requests(&covers, &e);
+                        let retained_owner = retained.is_some();
                         if let Some(pt) = retained {
                             self.slots[index].phase = Phase::Cleaning;
                             self.clean(key, pt);
                         } else {
                             self.slots.remove(index);
                         }
+                        ticket.finish(
+                            if retained_owner {
+                                Outcome::Retained
+                            } else {
+                                Outcome::Removed
+                            },
+                            Facts {
+                                slot_generation,
+                                owner_present: Some(retained_owner),
+                                ..Facts::default()
+                            },
+                        );
                     }
                 }
             }
             TaskOutcome::Cleaned(Ok(()), _) => {
                 let slot = self.slots.remove(index);
+                ticket.finish(
+                    Outcome::Removed,
+                    Facts {
+                        slot_generation: Some(slot.generation),
+                        owner_present: Some(false),
+                        ..Facts::default()
+                    },
+                );
                 if !self.closing {
                     if let Some((config, proxy, generation)) = slot.pending {
                         let valid = {
                             let state = self.state.read().expect("ptmgr state poisoned");
-                            !state.closed
+                            let valid = !state.closed
                                 && state.generation == generation
                                 && state.outbound_proxy == proxy
                                 && config.protocols.iter().all(|name| {
                                     state.configured.get(name)
                                         == Some(&TransportOptions::Managed(config.clone()))
-                                })
+                                });
+                            ticket.trace.event(
+                                Stage::Pending,
+                                if valid {
+                                    Outcome::Ok
+                                } else {
+                                    Outcome::Rejected
+                                },
+                                Facts {
+                                    slot_generation,
+                                    state_generation: Some(state.generation),
+                                    pending_generation: Some(generation),
+                                    owner_present: Some(false),
+                                    ..Facts::default()
+                                },
+                            );
+                            valid
                         };
                         if valid {
                             self.start(key, config, proxy, generation);
@@ -378,6 +624,14 @@ impl<R: Runtime> PtReactor<R> {
             TaskOutcome::Cleaned(Err(e), pt) => {
                 let covered = fail_cleanup(&mut self.slots[index], pt, e.clone());
                 self.fail_requests(&covered, &e);
+                ticket.finish(
+                    Outcome::Retained,
+                    Facts {
+                        slot_generation,
+                        owner_present: Some(true),
+                        ..Facts::default()
+                    },
+                );
             }
         }
     }
@@ -457,6 +711,27 @@ impl<R: Runtime> PtReactor<R> {
             Event::Message(index, result) => match result {
                 Ok(_) => {}
                 Err(e) => {
+                    let (diagnostic_slot, diagnostic_generation) = {
+                        let slot = &self.slots[index];
+                        (slot.diagnostic_id, slot.generation)
+                    };
+                    let mut diagnostic =
+                        self.diagnostic_ticket(diagnostic_slot, Some(diagnostic_generation), false);
+                    diagnostic.trace.event(
+                        Stage::Message,
+                        Outcome::Error,
+                        Facts {
+                            owner_present: Some(true),
+                            ..Facts::default()
+                        },
+                    );
+                    diagnostic.finish(
+                        Outcome::Retained,
+                        Facts {
+                            owner_present: Some(true),
+                            ..Facts::default()
+                        },
+                    );
                     warn!("PT stopped: {}", e);
                     let slot = &mut self.slots[index];
                     let key = slot.key.clone();
@@ -467,8 +742,8 @@ impl<R: Runtime> PtReactor<R> {
                 }
             },
             Event::Task(task) => {
-                let (key, outcome) = *task;
-                self.complete_task(key, outcome);
+                let (key, outcome, ticket) = *task;
+                self.complete_task(key, outcome, ticket);
             }
             Event::Command(None) => {
                 self.disconnected = true;
@@ -677,6 +952,8 @@ fn slots_terminal(slots: &[Slot]) -> bool {
 }
 
 /// Запускает процесс, сохраняя владельца при ошибке или отмене.
+/// cancel-safe: NO for resumable use — launch cancellation is terminal;
+/// the existing returned retained owner remains responsible for cleanup.
 async fn spawn_from_config<R: Runtime>(
     rt: R,
     state_dir: PathBuf,
@@ -684,10 +961,12 @@ async fn spawn_from_config<R: Runtime>(
     path_resolver: Arc<CfgPathResolver>,
     outbound_proxy: Option<ProxyProtocol>,
     cancel: futures::channel::oneshot::Receiver<()>,
+    trace: &diagnostics::Trace,
 ) -> (
     err::Result<PluggableClientTransport>,
     Option<PluggableClientTransport>,
 ) {
+    trace.event(Stage::SetupBegin, Outcome::Begin, Facts::default());
     let setup = (|| -> err::Result<PluggableClientTransport> {
         let binary_path =
             cfg.path
@@ -719,18 +998,67 @@ async fn spawn_from_config<R: Runtime>(
         ))
     })();
     let mut pt = match setup {
-        Ok(pt) => pt,
-        Err(e) => return (Err(e), None),
+        Ok(pt) => {
+            trace.event(
+                Stage::SetupEnd,
+                Outcome::Ok,
+                Facts {
+                    owner_present: Some(true),
+                    ..Facts::default()
+                },
+            );
+            pt
+        }
+        Err(error) => {
+            trace.event(
+                Stage::SetupEnd,
+                Outcome::Error,
+                Facts {
+                    owner_present: Some(false),
+                    ..Facts::default()
+                },
+            );
+            return (Err(error), None);
+        }
     };
+    trace.event(Stage::LaunchBegin, Outcome::Begin, Facts::default());
     let result = {
         let launch = pt.launch(rt).fuse();
         let cancel = cancel.fuse();
         futures::pin_mut!(launch, cancel);
-        select! { result = launch => result, _ = cancel => Err(PtError::ChildGone) }
+        select! {
+            result = launch => {
+                let outcome = match &result {
+                    Ok(()) => Outcome::Ok,
+                    Err(PtError::Timeout) => Outcome::Deadline,
+                    Err(_) => Outcome::Error,
+                };
+                trace.event(
+                    Stage::LaunchEnd,
+                    outcome,
+                    Facts {
+                        owner_present: Some(true),
+                        ..Facts::default()
+                    },
+                );
+                result
+            },
+            _ = cancel => {
+                trace.event(
+                    Stage::LaunchEnd,
+                    Outcome::Cancelled,
+                    Facts {
+                        owner_present: Some(true),
+                        ..Facts::default()
+                    },
+                );
+                Err(PtError::ChildGone)
+            },
+        }
     };
     match result {
         Ok(()) => (Ok(pt), None),
-        Err(e) => (Err(e), Some(pt)),
+        Err(error) => (Err(error), Some(pt)),
     }
 }
 
@@ -843,6 +1171,7 @@ mod lifecycle_tests {
             pending: None,
             retire: false,
             generation: 0,
+            diagnostic_id: diagnostics::id(),
             cleanup_attempts: MAX_CLEANUP_ATTEMPTS,
         };
         assert!(slots_terminal(&[failed]));
@@ -854,6 +1183,7 @@ mod lifecycle_tests {
             pending: None,
             retire: false,
             generation: 0,
+            diagnostic_id: diagnostics::id(),
             cleanup_attempts: MAX_CLEANUP_ATTEMPTS,
         };
         assert!(!slots_terminal(&[cleaning]));
@@ -871,6 +1201,7 @@ mod lifecycle_tests {
             pending: None,
             retire: false,
             generation: 0,
+            diagnostic_id: diagnostics::id(),
             cleanup_attempts: 0,
         }
     }
@@ -967,6 +1298,7 @@ mod lifecycle_tests {
     // Реальные проверки актора реактора запускаются только в CI на unix.
     #[cfg(unix)]
     mod reactor_process {
+        include!("managed/diagnostic_tests.rs");
         use super::*;
         use crate::ipc::sealed::AsyncPtChild;
         use std::process::Command;
@@ -1137,6 +1469,7 @@ mod lifecycle_tests {
                     pending: None,
                     retire: false,
                     generation: 0,
+                    diagnostic_id: diagnostics::id(),
                     cleanup_attempts: MAX_CLEANUP_ATTEMPTS,
                 });
                 let (ack, ack_rx) = oneshot::channel::<err::Result<()>>();
@@ -1180,6 +1513,7 @@ mod lifecycle_tests {
                     pending: None,
                     retire: false,
                     generation: 0,
+                    diagnostic_id: diagnostics::id(),
                     cleanup_attempts: 0,
                 });
                 let (ack, ack_rx) = oneshot::channel::<err::Result<()>>();
@@ -1238,6 +1572,7 @@ mod lifecycle_tests {
                     pending: None,
                     retire: false,
                     generation: 0,
+                    diagnostic_id: diagnostics::id(),
                     cleanup_attempts: 0,
                 });
                 // Включаем seam ошибки первого shutdown(); флаг сбрасывается
@@ -1263,6 +1598,24 @@ mod lifecycle_tests {
                         && r.slots[0].cleanup_attempts == 1
                 })
                 .await;
+                let first_cleanup = Arc::clone(&reactor.diagnostic_traces[0]);
+                assert!(first_cleanup.context().cleanup);
+                assert_eq!(first_cleanup.context().generation, Some(0));
+                assert_eq!(
+                    emitted_record(&first_cleanup, Stage::WorkerReturn).outcome,
+                    Outcome::Error,
+                );
+                assert_eq!(
+                    emitted_record(&first_cleanup, Stage::WorkerReturn)
+                        .facts
+                        .owner_present,
+                    Some(true),
+                );
+                assert_eq!(
+                    emitted_record(&first_cleanup, Stage::Apply).outcome,
+                    Outcome::Retained,
+                );
+                private_output(&first_cleanup, &["test-forced shutdown error"]);
                 // Ребёнок ещё не reap-нут: запрос остановки детерминированно
                 // не доставлен supervisor'у (seam), значит wait не начат.
                 assert!(
@@ -1294,6 +1647,22 @@ mod lifecycle_tests {
                     |r| r.slots.is_empty(),
                 )
                 .await;
+                let second_cleanup = &reactor.diagnostic_traces[1];
+                assert!(second_cleanup.context().cleanup);
+                assert_eq!(second_cleanup.context().slot, first_cleanup.context().slot);
+                assert_eq!(second_cleanup.context().generation, Some(0));
+                assert_ne!(
+                    second_cleanup.context().transaction,
+                    first_cleanup.context().transaction,
+                );
+                assert_eq!(
+                    emitted_record(second_cleanup, Stage::WorkerReturn).outcome,
+                    Outcome::Ok,
+                );
+                assert_eq!(
+                    emitted_record(second_cleanup, Stage::Apply).outcome,
+                    Outcome::Removed,
+                );
                 // Ребёнок reap-нут supervisor'ом при успешной очистке.
                 assert!(
                     completion.load(std::sync::atomic::Ordering::Acquire),
@@ -1374,6 +1743,12 @@ mod lifecycle_tests {
                 })
                 .await;
                 // Барьер и launch-future продвигаются одновременно; Starting ещё не означает spawn.
+                let first_trace = Arc::clone(&reactor.diagnostic_traces[0]);
+                assert_eq!(first_trace.context().generation, Some(0));
+                assert_eq!(
+                    emitted_record(&first_trace, Stage::Queued).outcome,
+                    Outcome::Begin,
+                );
                 let pid = {
                     let observed = Box::pin(async {
                         for _ in 0..50 {
@@ -1395,6 +1770,21 @@ mod lifecycle_tests {
                         }
                     }
                 };
+                assert_eq!(
+                    emitted_record(&first_trace, Stage::SetupEnd).outcome,
+                    Outcome::Ok,
+                );
+                assert_eq!(
+                    emitted_record(&first_trace, Stage::LaunchBegin).outcome,
+                    Outcome::Begin,
+                );
+                assert!(
+                    !first_trace
+                        .snapshot()
+                        .records
+                        .iter()
+                        .any(|record| { record.stage == Stage::WorkerReturn })
+                );
                 let proc_entry = std::path::PathBuf::from("/proc").join(pid.to_string());
                 // Универсального unix-наблюдения за чужим процессом через /proc нет:
                 // это Linux-специфичные проверки CI-носителя.
@@ -1464,6 +1854,37 @@ mod lifecycle_tests {
                     matches!(r1, Err(PtError::ChildGone)),
                     "отмена запуска обязана дать Err(ChildGone), получено {r1:?}"
                 );
+                assert_eq!(
+                    emitted_record(&first_trace, Stage::LaunchEnd).outcome,
+                    Outcome::Cancelled,
+                );
+                assert_eq!(
+                    emitted_record(&first_trace, Stage::WorkerReturn)
+                        .facts
+                        .owner_present,
+                    Some(true),
+                );
+                assert_eq!(
+                    emitted_record(&first_trace, Stage::Apply).outcome,
+                    Outcome::Retained,
+                );
+                let first_cleanup = reactor
+                    .diagnostic_traces
+                    .iter()
+                    .find(|trace| {
+                        trace.context().cleanup
+                            && trace.context().slot == first_trace.context().slot
+                    })
+                    .expect("actual retained cleanup transaction");
+                assert_eq!(first_cleanup.context().generation, Some(0));
+                assert_eq!(
+                    emitted_record(first_cleanup, Stage::WorkerReturn).outcome,
+                    Outcome::Ok,
+                );
+                assert_eq!(
+                    emitted_record(first_cleanup, Stage::Apply).outcome,
+                    Outcome::Removed,
+                );
                 // Восстановление конфигурации (новое поколение) и повторный
                 // Spawn с тем же ключом: корректный PT-скрипт завершает протокол.
                 let ready_config = ManagedTransportOptions {
@@ -1504,6 +1925,34 @@ mod lifecycle_tests {
                 assert!(
                     r2.is_ok(),
                     "метод после перезапуска обязан быть Ok, получено {r2:?}"
+                );
+                let published = reactor
+                    .diagnostic_traces
+                    .iter()
+                    .find(|trace| {
+                        !trace.context().cleanup
+                            && trace.context().generation == Some(2)
+                            && trace
+                                .snapshot()
+                                .records
+                                .iter()
+                                .any(|record| record.stage == Stage::Publication)
+                    })
+                    .expect("actual published restart transaction");
+                assert_ne!(
+                    published.context().transaction,
+                    first_trace.context().transaction,
+                );
+                assert_ne!(published.context().slot, first_trace.context().slot);
+                let validation = emitted_record(published, Stage::Validation);
+                assert_eq!(validation.outcome, Outcome::Ok);
+                assert_eq!(validation.facts.slot_generation, Some(2));
+                assert_eq!(validation.facts.state_generation, Some(2));
+                assert_eq!(emitted_record(published, Stage::Publication).facts.count, 1,);
+                assert_eq!(emitted_record(published, Stage::Reserved).facts.count, 1);
+                assert_eq!(
+                    emitted_record(published, Stage::Apply).outcome,
+                    Outcome::Published,
                 );
                 // Финальное закрытие: Running -> очистка -> терминация.
                 let (ack, ack_rx) = oneshot::channel::<err::Result<()>>();

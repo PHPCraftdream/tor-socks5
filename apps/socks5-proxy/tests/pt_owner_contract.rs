@@ -185,6 +185,15 @@ fn main() {
     {
         return;
     }
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_new("off,tor_ptmgr::managed_diagnostics=info")
+                .expect("valid managed PT diagnostics filter"),
+        )
+        .with_ansi(false)
+        .with_writer(std::io::stderr)
+        .try_init()
+        .expect("managed PT diagnostics subscriber initialization failed");
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
