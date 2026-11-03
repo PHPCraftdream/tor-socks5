@@ -813,6 +813,7 @@ producer-md-flavor producer-md-period producer-md-disagreement
 producer-md-membership producer-flavor-flags producer-admitted-descriptor
 producer-descriptor-disagreement producer-descriptor-digest
 producer-owned-descriptor producer-owned-ed25519
+producer-owned-http producer-owned-admission producer-owned-admitted
 producer-served-microdescriptor producer-microdescriptor-disagreement
 producer-negative-descriptor-changed producer-negative-md-changed
 producer-negative-consensus-changed producer-consensus-not-executed
@@ -927,6 +928,21 @@ class DiagnosticControls(unittest.TestCase):
             "Tor authority failure detail:"
             " type=consensus gate=quorum-window-missed\n",
         )
+
+        for label in (
+            "producer-owned-http",
+            "producer-owned-admission",
+            "producer-owned-admitted",
+        ):
+            with self.subTest(category=label):
+                with self.assertRaises(p.ProducerError) as failure:
+                    p.require(False, label)
+                self.assertEqual(
+                    self.capture_failure(failure.exception),
+                    "Tor authority consensus failed: producer\n"
+                    "Tor authority failure detail:"
+                    " type=producer gate=" + label + "\n",
+                )
 
     def test_unknown_and_private_payloads_are_not_formatted(self):
         calls = []
@@ -1133,7 +1149,7 @@ def main():
             for failure in producer_failures:
                 print(failure, file=sys.stderr)
             return 1
-        print("Tor relay producer mechanism controls passed: 23")
+        print("Tor relay producer mechanism controls passed: 25")
         network = p.implementation(c)(binary, gencert, deadline)
         p.run_live(network, c)
         print("Tor three-authority current consensus controls passed: 1")

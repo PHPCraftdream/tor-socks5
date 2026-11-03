@@ -480,15 +480,29 @@ def implementation(c):
                 status, owned = node.artifact(
                     b"/tor/server/fp/" + identity.encode("ascii")
                 )
-                require(
-                    status == 200 and owned == body,
-                    "producer-owned-descriptor",
+                require(status == 200, "producer-owned-http")
+                owned_digest, owned_ed, _owned_ntor = descriptor(
+                    owned, node, role, self.target_port
+                )
+                written_identity = c.bounded_file(
+                    node.data / "fingerprint-ed25519"
                 )
                 require(
-                    c.bounded_file(
-                        node.data / "fingerprint-ed25519"
-                    ) == node.name.encode("ascii") + b" " + ed + b"\n",
+                    written_identity
+                    == node.name.encode("ascii") + b" " + ed + b"\n"
+                    and written_identity
+                    == node.name.encode("ascii") + b" " + owned_ed + b"\n",
                     "producer-owned-ed25519",
+                )
+                status, _response = node._exchange(b"/tor/", owned)
+                require(status == 200, "producer-owned-admission")
+                owned_path = (
+                    b"/tor/server/d/"
+                    + owned_digest.hex().upper().encode("ascii")
+                )
+                require(
+                    node.artifact(owned_path) == (200, owned),
+                    "producer-owned-admitted",
                 )
                 md_path = (
                     b"/tor/micro/d/" + encoded(md[identity]["md"])
@@ -886,15 +900,57 @@ def controls(c):
                 def exchange(node, index, path, payload=None):
                     if payload is not None:
                         self.assertEqual(path, b"/tor/")
-                        self.assertEqual(
-                            payload,
-                            b"\xef\xbb\xbf" + network.packet[2][1],
+                        if payload.startswith(b"\xef\xbb\xbf"):
+                            self.assertEqual(
+                                payload,
+                                b"\xef\xbb\xbf" + network.packet[2][1],
+                            )
+                            state["posts"].append(index)
+                            node._last_reason = state["reason"]
+                            if state["after_post"] is not None:
+                                state["after_post"](index)
+                            return state["status"], b""
+                        latest_path = (
+                            b"/tor/server/fp/"
+                            + node.relay.fingerprint.encode("ascii")
                         )
-                        state["posts"].append(index)
-                        node._last_reason = state["reason"]
-                        if state["after_post"] is not None:
-                            state["after_post"](index)
-                        return state["status"], b""
+                        self.assertEqual(
+                            payload, state["documents"][latest_path]
+                        )
+                        state.setdefault("generation_posts", []).append(index)
+                        status = state.get("generation_status", 200)
+                        rejected_ntor = state.get("rejected_generation_ntor")
+                        if rejected_ntor is not None:
+                            submitted_ntor = re.findall(
+                                rb"^ntor-onion-key (\S+)$",
+                                payload,
+                                re.MULTILINE,
+                            )
+                            self.assertEqual(len(submitted_ntor), 1)
+                            if submitted_ntor[0] == rejected_ntor:
+                                status = 400
+                        state.setdefault("generation_submissions", []).append((
+                            index,
+                            node.relay.fingerprint,
+                            payload,
+                            status,
+                        ))
+                        node._last_reason = (
+                            b"Descriptor accepted" if status == 200
+                            else b"Mechanism admission rejected"
+                        )
+                        if status == 200:
+                            marker = b"\nrouter-signature\n"
+                            self.assertEqual(payload.count(marker), 1)
+                            signed = payload[
+                                :payload.index(marker) + len(marker)
+                            ]
+                            digest = hashlib.sha1(signed).hexdigest().upper()
+                            if state.get("generation_cache", True):
+                                state["documents"][
+                                    b"/tor/server/d/" + digest.encode("ascii")
+                                ] = payload
+                        return status, b""
                     override = state["overrides"].get((index, path))
                     if override is not None:
                         return override
@@ -1381,7 +1437,7 @@ def controls(c):
                                 0, b"/tor/server/fp/"
                                 + node.relay.fingerprint.encode("ascii")
                             )] = (200, state["descriptors"][1])
-                            label = "producer-owned-descriptor"
+                            label = "producer-descriptor-router"
                         elif variant == "owned-ed":
                             (
                                 node.data / "fingerprint-ed25519"
@@ -1444,6 +1500,228 @@ def controls(c):
                             ProducerError, "^" + label + "$"
                         ):
                             network.prove()
+
+        def test_central_latest_generation_is_not_selected_generation(self):
+            with self.fixture() as (network, state):
+                selected = tuple(state["descriptors"])
+                selected_md = tuple(state["microdescriptors"])
+                selected_paths = []
+                latest_paths = []
+                latest_bodies = []
+                for index, node in enumerate(network.nodes):
+                    original = selected[index]
+                    marker = b"\nrouter-signature\n"
+                    signed_end = original.index(marker) + len(marker)
+                    expected_selected = hashlib.sha1(
+                        original[:signed_end]
+                    ).digest()
+                    selected_row = rows(network.baseline)[
+                        node.relay.fingerprint
+                    ]
+                    self.assertEqual(
+                        selected_row["digest"], expected_selected
+                    )
+                    selected_paths.append(
+                        b"/tor/server/d/"
+                        + expected_selected.hex().upper().encode("ascii")
+                    )
+                    latest = original.replace(
+                        b"\nrouter-signature\n",
+                        b"\npublished 1970-01-02 00:00:02\n"
+                        b"uptime 2\n"
+                        b"bandwidth 1000000 2000000 300000\n"
+                        b"router-signature\n",
+                        1,
+                    )
+                    if index == 2:
+                        old_ntor = encoded(bytes([12]) * 32)
+                        rotated_ntor = encoded(bytes([43]) * 32)
+                        self.assertEqual(
+                            latest.count(b"ntor-onion-key " + old_ntor + b"\n"),
+                            1,
+                        )
+                        latest = latest.replace(
+                            b"ntor-onion-key " + old_ntor + b"\n",
+                            b"ntor-onion-key " + rotated_ntor + b"\n",
+                            1,
+                        )
+                        self.assertNotEqual(old_ntor, rotated_ntor)
+                    latest_signed_end = (
+                        latest.index(marker) + len(marker)
+                    )
+                    expected_latest = hashlib.sha1(
+                        latest[:latest_signed_end]
+                    ).digest()
+                    self.assertNotEqual(latest, original)
+                    self.assertNotEqual(
+                        expected_latest, expected_selected
+                    )
+                    latest_path = (
+                        b"/tor/server/fp/"
+                        + node.relay.fingerprint.encode("ascii")
+                    )
+                    state["documents"][latest_path] = latest
+                    latest_bodies.append(latest)
+                    latest_paths.append((
+                        b"/tor/server/d/"
+                        + expected_latest.hex().upper().encode("ascii"),
+                        latest,
+                    ))
+                self.assertEqual(
+                    network.prove(), "owned-three-relay-producer"
+                )
+                self.assertEqual(
+                    state["generation_posts"], [0, 1, 2]
+                )
+                self.assertEqual(
+                    state["generation_submissions"],
+                    [
+                        (
+                            index,
+                            node.relay.fingerprint,
+                            latest_bodies[index],
+                            200,
+                        )
+                        for index, node in enumerate(network.nodes)
+                    ],
+                )
+                for index, entry in enumerate(network.packet):
+                    self.assertEqual(entry[0], selected_paths[index])
+                    self.assertEqual(entry[1], selected[index])
+                    self.assertEqual(entry[3], selected_md[index])
+                    self.assertEqual(
+                        state["documents"][entry[0]], selected[index]
+                    )
+                    latest_path, latest = latest_paths[index]
+                    self.assertEqual(
+                        state["documents"][latest_path], latest
+                    )
+                self.assertEqual(
+                    network.producer_negative(),
+                    "bom-descriptor-admission-rejected",
+                )
+                self.assertEqual(state["posts"], [0, 1, 2])
+
+        def test_central_latest_generation_rejects_invalid_witnesses(self):
+            cases = (
+                ("http", "producer-owned-http"),
+                ("owner", "producer-descriptor-identity"),
+                ("ed", "producer-owned-ed25519"),
+                ("ntor", "producer-owned-admission"),
+                ("endpoint", "producer-descriptor-router"),
+                ("policy", "producer-port-only-policy"),
+                ("algorithm", "producer-field"),
+                ("admission", "producer-owned-admission"),
+                ("cache", "producer-owned-admitted"),
+            )
+            for variant, label in cases:
+                with self.subTest(category=variant):
+                    with self.fixture() as (network, state):
+                        node = network.nodes[2]
+                        path = (
+                            b"/tor/server/fp/"
+                            + node.relay.fingerprint.encode("ascii")
+                        )
+                        body = state["documents"][path]
+                        mutated = None
+                        if variant == "http":
+                            state["overrides"][(2, path)] = (404, b"")
+                        elif variant == "owner":
+                            state["documents"][path] = body.replace(
+                                node.relay.fingerprint.encode("ascii"),
+                                b"F" * 40,
+                            )
+                        elif variant == "ed":
+                            state["documents"][path] = body.replace(
+                                encoded(bytes([11]) * 32),
+                                encoded(bytes([41]) * 32),
+                            )
+                        elif variant == "ntor":
+                            original_ntor = encoded(bytes([12]) * 32)
+                            rejected_ntor = encoded(bytes([42]) * 32)
+                            original_line = (
+                                b"ntor-onion-key " + original_ntor + b"\n"
+                            )
+                            rejected_line = (
+                                b"ntor-onion-key " + rejected_ntor + b"\n"
+                            )
+                            self.assertEqual(body.count(original_line), 1)
+                            mutated = body.replace(
+                                original_line, rejected_line, 1
+                            )
+                            self.assertNotEqual(mutated, body)
+                            self.assertEqual(
+                                mutated.count(rejected_line), 1
+                            )
+                            state["documents"][path] = mutated
+                            state["rejected_generation_ntor"] = rejected_ntor
+                        elif variant == "endpoint":
+                            state["documents"][path] = body.replace(
+                                b"127.0.0.1", b"127.0.0.2", 1
+                            )
+                        elif variant == "policy":
+                            state["documents"][path] = body.replace(
+                                b"reject *:*", b"accept *:*"
+                            )
+                        elif variant == "algorithm":
+                            state["documents"][path] = body.replace(
+                                b"master-key-ed25519 ",
+                                b"master-key-unsupported ",
+                            )
+                        elif variant == "admission":
+                            state["generation_status"] = 400
+                        else:
+                            state["generation_cache"] = False
+                            state["documents"][path] = body.replace(
+                                b"\nrouter-signature\n",
+                                b"\nuptime 2\nrouter-signature\n",
+                                1,
+                            )
+                        with self.assertRaisesRegex(
+                            ProducerError, "^" + label + "$"
+                        ):
+                            network.prove()
+                        self.assertIsNone(network.packet)
+                        if variant == "ntor":
+                            self.assertNotIn(
+                                "generation_status", state
+                            )
+                            self.assertEqual(
+                                state["generation_posts"], [0, 1, 2]
+                            )
+                            self.assertEqual(
+                                state["generation_submissions"],
+                                [
+                                    (
+                                        0,
+                                        network.nodes[0].relay.fingerprint,
+                                        state["descriptors"][0],
+                                        200,
+                                    ),
+                                    (
+                                        1,
+                                        network.nodes[1].relay.fingerprint,
+                                        state["descriptors"][1],
+                                        200,
+                                    ),
+                                    (
+                                        2,
+                                        node.relay.fingerprint,
+                                        mutated,
+                                        400,
+                                    ),
+                                ],
+                            )
+                            selected_path = (
+                                b"/tor/server/d/"
+                                + rows(network.baseline)[
+                                    node.relay.fingerprint
+                                ]["digest"].hex().upper().encode("ascii")
+                            )
+                            self.assertEqual(
+                                state["documents"][selected_path],
+                                state["descriptors"][2],
+                            )
 
         def test_central_microdescriptor_counterfactuals(self):
             for variant in (
@@ -1777,6 +2055,6 @@ def run_controls(c):
             )
             failures.append(category + " " + identity)
     return (
-        result.testsRun == 23 and result.wasSuccessful(),
+        result.testsRun == 25 and result.wasSuccessful(),
         tuple(failures),
     )
