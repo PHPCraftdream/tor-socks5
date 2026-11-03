@@ -75,12 +75,55 @@ PT_DOMAIN_MARKERS = {
         "direct_domain.py", "DirectDomain(", PT_DOMAIN_GATE,
     ),
 }
-PT_GENERATIONS = ({}, PT_LEGACY_MARKERS, PT_MARKERS, PT_AUDIT_MARKERS, PT_DOMAIN_MARKERS)
+PT_DOMAIN_SPLIT_PATHS = (
+    ".github/pt_proxy/tests/domain/ownership.py",
+    ".github/pt_proxy/tests/domain/reactor.py",
+    ".github/pt_proxy/tests/domain/controls.py",
+)
+PT_DOMAIN_SPLIT_ANCHOR = ' / "tests" / "domain" / "ownership.py"'
+PT_DOMAIN_SPLIT_MARKERS = {
+    **PT_DOMAIN_MARKERS,
+    PT_DOMAIN_PATH: (
+        "class Denied(", "class ControlFailure(", "class Pin:",
+        "class Allocation:", "class Snapshot:", "class Record:",
+        "def identity(", "def socket_owned(", "def calibration_rules(",
+        "def freeze_schema(", "def intent_frame(", "def self_migrate(",
+        "def _gate_transaction(", "def direct_child_gate(",
+        "from importlib.machinery import SourceFileLoader",
+        PT_DOMAIN_SPLIT_ANCHOR,
+        ' / "tests" / "domain" / "reactor.py"',
+        ' / "tests" / "domain" / "controls.py"',
+        ").exec_module(sys.modules[__name__])",
+    ),
+    PT_DOMAIN_SPLIT_PATHS[0]: tuple(
+        marker for marker in PT_DOMAIN_MARKERS[PT_DOMAIN_PATH]
+        if marker != "def regression("
+    ),
+    PT_DOMAIN_SPLIT_PATHS[1]: (
+        "class Peer:", "class Reactor:", "def service(", "def step(",
+        "peer = Peer(self, connection)",
+        "self.selector.select(remaining(end))",
+    ),
+    PT_DOMAIN_SPLIT_PATHS[2]: (
+        "def _probe(", "class Actor:", "class SyntheticEvidence:",
+        "class ControlEpoch:", "class ControlRun:", "def regression(",
+        "runpy.run_path(",
+    ),
+}
+PT_GENERATIONS = (
+    {}, PT_LEGACY_MARKERS, PT_MARKERS, PT_AUDIT_MARKERS,
+    PT_DOMAIN_MARKERS, PT_DOMAIN_SPLIT_MARKERS,
+)
 
 
 def pt_generation(read):
     workflow = read(".github/workflows/ci.yml")
     audit = read(".github/pt_proxy/owner_audit.py")
+    if (
+        any(read(path) for path in PT_DOMAIN_SPLIT_PATHS)
+        or PT_DOMAIN_SPLIT_ANCHOR in read(PT_DOMAIN_PATH)
+    ):
+        return 5
     if (read(PT_DOMAIN_PATH) or
             any(marker in text for text in (workflow, audit)
                 for marker in ("direct_domain", "DirectDomain", "domain_ok"))):
@@ -575,13 +618,19 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
             if not sdk:
                 raise MappingError("missing mapping: SDK отсутствует в графе")
             seed(sdk, path)
-        elif path in ("scripts/testing/ci_planner.py", "scripts/testing/test_ci_planner.py", "scripts/testing/test_ci_integration.py", "scripts/testing/selftest.sh", "scripts/testing/test-affected.sh", "scripts/check-line-limit.sh", "scripts/check-dir-entries.sh", ".githooks/pre-push"):
+        elif path in ("scripts/testing/ci_planner.py", "scripts/testing/test_ci_planner/run.py", "scripts/testing/test_ci_planner/domain_cases.py", "scripts/testing/test_ci_integration.py", "scripts/testing/selftest.sh", "scripts/testing/test-affected.sh", "scripts/check-line-limit.sh", "scripts/check-dir-entries.sh", ".githooks/pre-push"):
+            add("fast", path)
+        elif path == "scripts/testing/test_ci_planner.py":
+            old, new = blobs(path)
+            if not old or new != "":
+                raise MappingError("missing mapping: " + path)
             add("fast", path)
         elif path in (
                 "scripts/testing/real-tor-channel.sh",
                 "scripts/testing/real-tor-mutations.sh",
                 "scripts/testing/real_tor_supervisor.py",
-                "scripts/testing/test_real_tor_supervisor.py"):
+                "scripts/testing/test_real_tor_supervisor.py",
+                "scripts/testing/tor/authority/producer.py"):
             old, new = blobs(path)
             if not old or new != "":
                 raise MappingError("missing mapping: " + path)
@@ -597,7 +646,12 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
                 "scripts/testing/tor/authority/test_startup.py",
                 "scripts/testing/tor/authority/consensus.py",
                 "scripts/testing/tor/authority/test_consensus.py",
-                "scripts/testing/tor/authority/producer.py"):
+                "scripts/testing/tor/authority/producer/entry.py",
+                "scripts/testing/tor/authority/producer/diagnostics.py",
+                "scripts/testing/tor/authority/producer/controls/fixture.py",
+                "scripts/testing/tor/authority/producer/controls/descriptors.py",
+                "scripts/testing/tor/authority/producer/controls/admission.py",
+                "scripts/testing/tor/authority/producer/controls/readiness.py"):
             add("tor", path)
         elif path.startswith(".github/pt_proxy/"):
             add("pt-proxy", path)
@@ -659,7 +713,7 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
     # Граница PT зависит от исполняемого proxy и его зависимостей.
     pt_roots = graph.named({"ptrs-gesher-lyrebird", "ptrs-gesher-webtunnel", "tor-socks5-proto", "tor-ptmgr", "arti-wrapper", "arti-client"})
     pt_upstream = graph.closure(pt_roots, graph.forward) if pt_roots else set()
-    if seeds & pt_upstream or any(path.startswith(("apps/socks5-proxy/", "vendor/lyrebird/", "vendor/webtunnel/", "packages/socks5-proto/", ".github/actions/setup-local-sdk/")) or path in ("scripts/testing/ci_planner.py", "scripts/testing/test_ci_planner.py", "scripts/testing/test_ci_integration.py") for path in paths):
+    if seeds & pt_upstream or any(path.startswith(("apps/socks5-proxy/", "vendor/lyrebird/", "vendor/webtunnel/", "packages/socks5-proto/", ".github/actions/setup-local-sdk/")) or path in ("scripts/testing/ci_planner.py", "scripts/testing/test_ci_planner.py", "scripts/testing/test_ci_planner/run.py", "scripts/testing/test_ci_planner/domain_cases.py", "scripts/testing/test_ci_integration.py") for path in paths):
         add("pt-proxy", "изменена граница PT или её зависимость")
     if mode == "sprint-full":
         selected = set(graph.members)

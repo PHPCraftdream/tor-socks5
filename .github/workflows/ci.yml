@@ -47,7 +47,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Test SDK contract rejection controls
         run: python -I .github/actions/setup-local-sdk/verify.py --self-test
-      - run: python -I scripts/testing/test_ci_planner.py
+      - run: python -I scripts/testing/test_ci_planner/run.py
       - run: python -I scripts/testing/test_ci_integration.py
       - id: plan
         env:
@@ -194,7 +194,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Check first-party Rust files stay under 1000 lines
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Test first-party line-limit enforcement
+        run: sh scripts/testing/selftest.sh
+      - name: Check maintained first-party source files stay within 1000 lines
+        if: always()
         run: sh scripts/check-line-limit.sh
 
   dir-entries:
