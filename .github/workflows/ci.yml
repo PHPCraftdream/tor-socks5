@@ -501,7 +501,7 @@ jobs:
       - shell: bash
         run: |
           python3 -I -c 'from pathlib import Path; p=Path("Cargo.toml"); s=p.read_text(encoding="utf-8"); marker="    \"vendor/tor-guardmgr\","; assert s.count(marker)==1; p.write_text(s.replace(marker, marker + "\n    \"vendor/tor-chanmgr\",\n    \"vendor/tor-dirmgr\",\n    \"vendor/tor-dirclient\","), encoding="utf-8")'
-          cargo test -p tor-chanmgr -p tor-dirclient -p tor-dirmgr --features tor-dirmgr/static
+          cargo test -p tor-chanmgr -p tor-dirclient -p tor-dirmgr --features tor-dirmgr/static,tor-chanmgr/pt-client
           cargo test -p tor-circmgr --all-features
 
   features:
