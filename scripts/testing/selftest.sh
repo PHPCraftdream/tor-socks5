@@ -199,6 +199,7 @@ class LineLimit(unittest.TestCase):
         self.assertIn("cannot inspect 'owned/nested.py'", self.guard(2))
         (self.root / "owned").rmdir()
         (self.root / "owned").symlink_to("missing-directory")
+        self.put(".gitignore", b"owned\n")
         self.assertIn("symlink parent", self.guard(2))
 
     def test_empty_and_staged_deleted_source(self):
