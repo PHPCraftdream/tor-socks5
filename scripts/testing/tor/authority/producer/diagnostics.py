@@ -74,6 +74,7 @@ def report_runtime_failure(error, stage):
         TypeError: "type",
         KeyError: "key",
         AttributeError: "attribute",
+        AssertionError: "assertion",
     }
     category = categories.get(error_type, "unknown")
     gate = "unknown"

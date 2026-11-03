@@ -277,4 +277,130 @@ def build(c, s, entry, deadline, report):
                 self.assertNotIn("private-path-key-nonce", output.getvalue())
             self.assertEqual(calls, [])
 
+            registry_identity = (
+                "StreamWire."
+                "test_actual_dispatcher_fixed_labels_and_privacy"
+            )
+            run_suite = entry["_run_stream_control_suite"]
+
+            class Probe(unittest.TestCase):
+                def test_probe(self):
+                    raise s.StreamError("stream-peer")
+
+            probe = Probe("test_probe")
+            registry = {
+                id(probe): (probe, registry_identity),
+            }
+            output = io.StringIO()
+            with mock.patch.object(sys, "stderr", output):
+                accepted = run_suite(
+                    unittest.TestSuite([probe]), registry, 1, report
+                )
+            self.assertFalse(accepted)
+            self.assertEqual(
+                output.getvalue(),
+                "Tor owned stream mechanism ERROR "
+                + registry_identity + "\n"
+                "Tor authority consensus failed: stream-controls\n"
+                "Tor authority failure detail:"
+                " type=stream gate=stream-peer\n",
+            )
+
+            class PrivateAssertion(AssertionError):
+                def __str__(self):
+                    calls.append("assertion-str")
+                    raise AssertionError("must-not-format")
+
+                def __repr__(self):
+                    calls.append("assertion-repr")
+                    raise AssertionError("must-not-format")
+
+            class PrivateProbe(unittest.TestCase):
+                def id(self):
+                    calls.append("test-id")
+                    raise AssertionError("must-not-format")
+
+                def __str__(self):
+                    calls.append("test-str")
+                    raise AssertionError("must-not-format")
+
+                def test_probe(self):
+                    with self.subTest(private=Private()):
+                        raise PrivateAssertion(Private())
+
+            probe = PrivateProbe("test_probe")
+            registry = {
+                id(probe): (probe, registry_identity),
+            }
+            output = io.StringIO()
+            with mock.patch.object(sys, "stderr", output):
+                accepted = run_suite(
+                    unittest.TestSuite([probe]), registry, 1, report
+                )
+            self.assertFalse(accepted)
+            self.assertEqual(
+                output.getvalue(),
+                "Tor owned stream mechanism ERROR "
+                + registry_identity + "\n"
+                "Tor authority consensus failed: stream-controls\n"
+                "Tor authority failure detail:"
+                " type=unknown gate=unknown\n",
+            )
+            self.assertEqual(calls, [])
+
+            class AssertionProbe(unittest.TestCase):
+                def test_probe(self):
+                    raise AssertionError(Private())
+
+            probe = AssertionProbe("test_probe")
+            output = io.StringIO()
+            with mock.patch.object(sys, "stderr", output):
+                accepted = run_suite(
+                    unittest.TestSuite([probe]), {}, 1, report
+                )
+            self.assertFalse(accepted)
+            self.assertEqual(
+                output.getvalue(),
+                "Tor owned stream mechanism FAIL <unknown-test>\n"
+                "Tor authority consensus failed: stream-controls\n"
+                "Tor authority failure detail:"
+                " type=assertion gate=unknown\n",
+            )
+            self.assertEqual(calls, [])
+
+            class SuccessfulProbe(unittest.TestCase):
+                def test_probe(self):
+                    self.assertTrue(True)
+
+            probe = SuccessfulProbe("test_probe")
+            registry = {
+                id(probe): (probe, registry_identity),
+            }
+            output = io.StringIO()
+            with mock.patch.object(sys, "stderr", output):
+                accepted = run_suite(
+                    unittest.TestSuite([probe]), registry, 1, report
+                )
+            self.assertTrue(accepted)
+            self.assertEqual(output.getvalue(), "")
+
+            probe = SuccessfulProbe("test_probe")
+            registry = {
+                id(probe): (probe, registry_identity),
+            }
+            output = io.StringIO()
+            with mock.patch.object(sys, "stderr", output):
+                accepted = run_suite(
+                    unittest.TestSuite([probe]), registry, 2, report
+                )
+            self.assertFalse(accepted)
+            self.assertEqual(
+                output.getvalue(),
+                "Tor owned stream mechanism ERROR <unknown-test>\n"
+                "Tor authority consensus failed: stream-controls\n"
+                "Tor authority failure detail:"
+                " type=stream gate=stream-controls\n",
+            )
+            self.assertEqual(calls, [])
+
     return Controls
