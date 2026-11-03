@@ -819,6 +819,11 @@ producer-negative-descriptor-changed producer-negative-md-changed
 producer-negative-consensus-changed producer-consensus-not-executed
 producer-positive-not-executed producer-negative-not-executed
 producer-quorum-not-executed producer-target-unreleased
+producer-missing-bandwidth producer-readiness-single-use
+producer-readiness-budget producer-readiness-cache-missing
+producer-readiness-regression producer-readiness-same-period
+producer-readiness-disagreement producer-readiness-not-advanced
+producer-readiness-unexpected-period producer-readiness-framing
 """.split())
 
 CONSENSUS_FAILURE_GATES = frozenset("""
@@ -840,7 +845,7 @@ child-unreaped stream-unreleased directory-unreleased socket-unreleased
 
 FAILURE_STAGES = frozenset({
     "prepare", "launch", "consensus", "votes", "quorum",
-    "producer", "producer-negative",
+    "producer", "producer-negative", "producer-readiness",
 })
 
 
@@ -933,6 +938,10 @@ class DiagnosticControls(unittest.TestCase):
             "producer-owned-http",
             "producer-owned-admission",
             "producer-owned-admitted",
+            "producer-missing-bandwidth",
+            "producer-readiness-budget",
+            "producer-readiness-unexpected-period",
+            "producer-readiness-framing",
         ):
             with self.subTest(category=label):
                 with self.assertRaises(p.ProducerError) as failure:
@@ -1149,7 +1158,7 @@ def main():
             for failure in producer_failures:
                 print(failure, file=sys.stderr)
             return 1
-        print("Tor relay producer mechanism controls passed: 25")
+        print("Tor relay producer mechanism controls passed: 33")
         network = p.implementation(c)(binary, gencert, deadline)
         p.run_live(network, c)
         print("Tor three-authority current consensus controls passed: 1")
