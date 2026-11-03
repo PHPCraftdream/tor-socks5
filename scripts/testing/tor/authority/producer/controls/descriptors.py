@@ -349,6 +349,22 @@ def build():
                             "ServerDNSDetectHijacking 0\n", text
                         )
                         self.assertEqual(
+                            text.count(
+                                "CircuitsAvailableTimeout 60 seconds\n"
+                            ),
+                            1,
+                        )
+                        for line in (
+                            "DisableNetwork 0\n",
+                            "PublishServerDescriptor 1\n",
+                            "SocksPort 0\n",
+                            "DirCache 1\n",
+                        ):
+                            self.assertEqual(text.count(line), 1)
+                        self.assertNotIn(
+                            "__DisablePredictedCircuits", text
+                        )
+                        self.assertEqual(
                             (
                                 data / "producer-resolv.conf"
                             ).read_bytes(),

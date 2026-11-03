@@ -282,6 +282,7 @@ def implementation(c):
                 "TestingDirAuthVoteExitIsStrict 1\n"
                 "TestingMinFastFlagThreshold 0 bytes\n"
                 "TestingMinTimeToReportBandwidth 0 seconds\n"
+                "CircuitsAvailableTimeout 60 seconds\n"
             )
             self.config_path.write_text(text, encoding="utf-8")
             self._config_bytes = self.config_path.read_bytes()
