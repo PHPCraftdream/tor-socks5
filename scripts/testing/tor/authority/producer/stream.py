@@ -633,6 +633,8 @@ def extend(Base, c):
         def close(self):
             if self.closed:
                 return
+            if self.stream is None:
+                return super().close()
             if self.cleanup_failed:
                 raise c.a.s.CleanupError("owned stream network cleanup failed")
             self.anchor_dependencies()
