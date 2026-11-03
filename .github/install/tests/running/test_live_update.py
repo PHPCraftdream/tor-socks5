@@ -213,7 +213,7 @@ class ShLiveUpdateTests(unittest.TestCase):
         # fakebin по умолчанию: x86_64 + sysctl_arm=0 => на Darwin target
         # x86_64-apple-darwin; имя архива строго совпадает с ключом scenario
         target = ("x86_64-apple-darwin" if SH_OS_NAME == "Darwin"
-                  else "x86_64-unknown-linux-gnu")
+                  else "x86_64-unknown-linux-musl")
         archive_name = "tor-socks5-%s-%s.tar.gz" % (fx.MOCK_TAG, target)
         archive_path = os.path.join(dl, archive_name)
         with open(self.new_exe, "rb") as f:

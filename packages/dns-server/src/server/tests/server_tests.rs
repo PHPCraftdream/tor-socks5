@@ -6,7 +6,7 @@ use hickory_proto::rr::{Name, RData, Record, RecordType};
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
@@ -173,26 +173,47 @@ impl<S: AsyncRead + Unpin> AsyncRead for ReadObserver<'_, S> {
     }
 }
 
-async fn tcp_exchange(stream: &mut TcpStream, message: &Message) -> Message {
+// Приватный тестовый seam: статический dispatch, без публичного API.
+trait ExchangeIo: AsyncRead + AsyncWrite + Unpin {
+    fn prepare(&self) -> io::Result<()>;
+    fn endpoints(&self) -> (Option<SocketAddr>, Option<SocketAddr>);
+}
+
+impl ExchangeIo for TcpStream {
+    fn prepare(&self) -> io::Result<()> {
+        self.set_nodelay(true)
+    }
+
+    fn endpoints(&self) -> (Option<SocketAddr>, Option<SocketAddr>) {
+        (self.local_addr().ok(), self.peer_addr().ok())
+    }
+}
+
+/// cancel-safe: NO — отмена может оставить частично записанный frame;
+/// вызывающий тест прекращает обмен и уничтожает stream.
+async fn tcp_exchange<S: ExchangeIo>(stream: &mut S, message: &Message) -> Message {
     let bytes = message.to_vec().unwrap();
     // Deliberately split the length prefix and body, using real TCP. NODELAY
     // keeps every fragment its own segment; with Nagle on, each tiny write would
     // wait for the server's delayed ACK (about 40 ms each on Linux).
-    stream.set_nodelay(true).unwrap();
+    stream.prepare().unwrap();
+    let (local, peer) = stream.endpoints();
     let prefix = u16::try_from(bytes.len()).unwrap().to_be_bytes();
-    stream.write_all(&prefix[..1]).await.unwrap();
-    stream.write_all(&prefix[1..]).await.unwrap();
-    for chunk in bytes.chunks(3) {
-        stream.write_all(chunk).await.unwrap();
+    let result = stream.write_all(&prefix[..1]).await;
+    listener::client_io_result(local, peer, "prefix_write", 0, result).unwrap();
+    let result = stream.write_all(&prefix[1..]).await;
+    listener::client_io_result(local, peer, "prefix_write", 1, result).unwrap();
+    for (index, chunk) in bytes.chunks(3).enumerate() {
+        let result = stream.write_all(chunk).await;
+        listener::client_io_result(local, peer, "body_write", index * 3, result).unwrap();
     }
     // Диагностика Windows RST: production read_framed_message под наблюдателем;
     // при сбое печатаем реально прочитанные байты, монотонное время и адреса.
     let started = std::time::Instant::now();
-    let local = stream.local_addr().ok();
-    let peer = stream.peer_addr().ok();
     let (frame, bytes_read) = {
         let mut observed = ReadObserver::new(stream);
         let frame = wire::read_framed_message(&mut observed, Duration::from_secs(5)).await;
+        let frame = listener::client_io_result(local, peer, "response_read", observed.read, frame);
         (frame, observed.read)
     };
     match frame {
@@ -207,6 +228,116 @@ async fn tcp_exchange(stream: &mut TcpStream, message: &Message) -> Message {
             error.kind(),
             error.raw_os_error()
         ),
+    }
+}
+
+struct FailingBodyWrite {
+    writes: usize,
+}
+
+impl ExchangeIo for FailingBodyWrite {
+    fn prepare(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn endpoints(&self) -> (Option<SocketAddr>, Option<SocketAddr>) {
+        (
+            Some("127.0.0.1:44444".parse().unwrap()),
+            Some("127.0.0.1:5353".parse().unwrap()),
+        )
+    }
+}
+
+impl AsyncRead for FailingBodyWrite {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        panic!("чтение ответа достигнуто после введённой ошибки записи")
+    }
+}
+
+impl AsyncWrite for FailingBodyWrite {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.writes += 1;
+        if self.writes == 3 {
+            Poll::Ready(Err(io::Error::from_raw_os_error(10054)))
+        } else {
+            Poll::Ready(Ok(bytes.len()))
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn tcp_exchange_marks_body_error_before_unwind_drop() {
+    fn sequence(line: &str) -> u64 {
+        line.rsplit_once(" seq=Some(")
+            .unwrap()
+            .1
+            .strip_suffix(')')
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    for drop_before_error in [true, false] {
+        listener::take_capture();
+        listener::set_capture_mode(true);
+        let mut stream = FailingBodyWrite { writes: 0 };
+        let (client, server) = stream.endpoints();
+        let request = request("localhost.", RecordType::A, 818);
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+            let mut queued = Some(listener::poll_observed(
+                server,
+                server,
+                client.unwrap(),
+                std::future::pending::<()>(),
+            ));
+            if drop_before_error {
+                drop(queued.take());
+            }
+            tcp_exchange(&mut stream, &request).await;
+            drop(queued);
+        }))
+        .await;
+        listener::set_capture_mode(false);
+        let lines = listener::take_capture();
+        assert!(outcome.is_err());
+        assert_eq!(stream.writes, 3);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        let error = lines
+            .iter()
+            .find(|line| line.starts_with("tcp_client_error:"))
+            .expect("реальная запись body в tcp_exchange должна дать marker до panic");
+        let dropped = lines
+            .iter()
+            .find(|line| line.contains("state=dropped_before_poll"))
+            .unwrap();
+        assert!(error.contains("local=Some(127.0.0.1:44444)"));
+        assert!(error.contains("peer=Some(127.0.0.1:5353)"));
+        assert!(error.contains("operation=body_write offset=0"));
+        assert!(error.contains("os=Some(10054)"));
+        assert!(dropped.contains("local=Some(127.0.0.1:5353)"));
+        assert!(dropped.contains("peer=127.0.0.1:44444"));
+        assert_ne!(sequence(dropped), sequence(error));
+        assert_eq!(
+            sequence(dropped) < sequence(error),
+            drop_before_error,
+            "{lines:?}"
+        );
     }
 }
 

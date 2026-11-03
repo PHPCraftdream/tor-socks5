@@ -1,199 +1,42 @@
 #!/bin/sh
-# Pre-push gate: formatting always; tests tiered per docs/plans/test-tiers.md.
-#
-# Enable once per clone:
-#     git config core.hooksPath .githooks
-#
-# Tiers:
-#   T1 (default)  fmt + clippy/tests of affected packages only
-#                 (scripts/testing/test-affected.sh)
-#   T2 (FULL)     fmt + clippy --workspace + full nextest/cargo test + doctests
-#
-# FULL is forced when:
-#   - FULL=1 is set in the environment, or
-#   - pushing refs/heads/main, refs/heads/upstream-*, or refs/tags/*, or
-#   - the affected-package selection fails (fail-safe), or
-#   - scripts/testing/test-affected.sh itself reports FULL.
-#
-# TEST_AFFECTED_DRY=1 prints the commands instead of running them.
-#
-# Bypass in an emergency only: `git push --no-verify`.
-set -e
-
-# Bound compiler memory; callers can override these defaults.
-: "${CARGO_BUILD_JOBS:=2}"
-: "${CARGO_PROFILE_DEV_DEBUG:=0}"
-: "${CARGO_PROFILE_TEST_DEBUG:=0}"
+# Локальные проверки и план пакетов CI; ошибки блокируют push.
+set -eu
+: "${CARGO_BUILD_JOBS:=2}" "${CARGO_PROFILE_DEV_DEBUG:=0}" "${CARGO_PROFILE_TEST_DEBUG:=0}"
 export CARGO_BUILD_JOBS CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG
-export TEST_AFFECTED_DRY
-
-dry="${TEST_AFFECTED_DRY:-0}"
-run_cmd() {
-	if [ "$dry" = "1" ]; then
-		echo "dry-run: $*"
-	else
-		echo "pre-push: running: $*"
-		"$@"
-	fi
+run() {
+    if [ "${TEST_AFFECTED_DRY:-0}" = 1 ]; then echo "dry-run: $*"; else "$@"; fi
 }
-
-# Housekeeping only; skipped in the dry run.
-sweep_old_builds() {
-	[ "$dry" = "1" ] && return 0
-	cargo sweep --time 7 2>/dev/null || true
-}
-
-# Full T2 run shared by all FULL paths.
-run_full() {
-	run_cmd cargo clippy --locked --workspace --all-targets -- -D warnings
-	if command -v cargo-nextest >/dev/null 2>&1 || cargo nextest --version >/dev/null 2>&1; then
-		run_cmd cargo nextest run --workspace --locked
-	else
-		run_cmd cargo test --locked --workspace
-	fi
-	run_cmd cargo test --doc --workspace --exclude saturating-time --locked
-	echo "pre-push: OK (T2)"
-}
-
-# ---------------------------------------------------------------- stdin: refs
-
-full=0
-full_reason=""
-base_remote_sha=""
-new_ref=0
-zero_sha=0000000000000000000000000000000000000000
-push_local_sha=""
-push_mismatch=0
-base_seen=""
+zero=0000000000000000000000000000000000000000
+base=""
+head=""
+new=0
 updates=0
-
-while read -r _local_ref local_sha remote_ref remote_sha; do
-	case "$local_sha" in
-	$zero_sha|"") continue ;;
-	esac
-	[ -n "$remote_ref" ] || continue
-	updates=$((updates + 1))
-	# An annotated tag object differs from the commit it points at.
-	local_commit=$(git rev-parse --verify --quiet "$local_sha^{commit}" 2>/dev/null) || local_commit=$local_sha
-	if [ -z "$push_local_sha" ]; then push_local_sha=$local_commit; elif [ "$push_local_sha" != "$local_commit" ]; then push_mismatch=1; fi
-	case "$remote_ref" in
-	refs/heads/main|refs/heads/upstream-*|refs/tags/*) full=1; full_reason="push to $remote_ref" ;;
-	esac
-	case "$remote_sha" in
-	$zero_sha|"") new_ref=1 ;;
-	*)
-		if ! git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
-			full=1; full_reason="remote sha $remote_sha is not available locally"
-		fi
-		if [ -z "$base_seen" ]; then base_seen=$remote_sha; elif [ "$base_seen" != "$remote_sha" ]; then full=1; full_reason="multiple remote bases in one push"; fi
-		base_remote_sha=$remote_sha
-		;;
-	esac
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [ "$local_sha" != "$zero" ] || continue
+    updates=$((updates + 1))
+    commit=$(git rev-parse --verify "$local_sha^{commit}")
+    [ -z "$head" ] || [ "$head" = "$commit" ] || { echo 'pre-push: multiple commits' >&2; exit 1; }
+    head=$commit
+    if [ "$remote_sha" = "$zero" ]; then
+        new=1
+    else
+        [ -z "$base" ] || [ "$base" = "$remote_sha" ] || { echo 'pre-push: multiple bases' >&2; exit 1; }
+        base=$remote_sha
+    fi
 done
-
-if [ "$updates" -eq 0 ]; then
-	echo "pre-push: deletion-only push; no checks"
-	exit 0
+[ "$updates" -gt 0 ] || exit 0
+[ "$head" = "$(git rev-parse --verify 'HEAD^{commit}')" ] || { echo 'pre-push: checkout differs from pushed commit' >&2; exit 1; }
+run cargo fmt --all -- --check
+run sh scripts/check-dir-entries.sh
+run sh scripts/check-line-limit.sh
+if [ "${FULL:-0}" = 1 ]; then
+    sh scripts/testing/test-affected.sh --full --mode run --kind all
+else
+    if [ "$new" = 1 ]; then
+        [ -z "$base" ] || { echo 'pre-push: mixed new and existing refs' >&2; exit 1; }
+        base=$(git merge-base HEAD origin/main) || { echo 'pre-push: no base' >&2; exit 1; }
+    fi
+    [ -n "$base" ] || { echo 'pre-push: no base' >&2; exit 1; }
+    sh scripts/testing/test-affected.sh --base "$base" --mode run --kind all
 fi
-head_sha=$(git rev-parse HEAD 2>/dev/null) || head_sha=""
-if [ "$push_mismatch" -eq 1 ]; then
-	echo "pre-push: ERROR: refs target different commits; push one at a time or use --no-verify" >&2
-	exit 1
-fi
-if [ -n "$push_local_sha" ] && [ "$push_local_sha" != "$head_sha" ]; then
-	echo "pre-push: WARNING: проверяется рабочее дерево, отправляемый коммит отличается" >&2
-	echo "pre-push: run 'git switch <branch>' or bypass with --no-verify" >&2
-	exit 1
-fi
-if [ "$new_ref" -eq 1 ] && [ "$full" -eq 0 ]; then
-	base_remote_sha=""
-	base_seen=""
-	if git rev-parse --verify --quiet origin/main >/dev/null 2>&1 && [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" != true ]; then
-		base_seen=$(git merge-base HEAD origin/main 2>/dev/null) || base_seen=""
-		base_remote_sha=$base_seen
-		if [ -z "$base_remote_sha" ]; then full=1; full_reason="no merge-base with origin/main"; fi
-	else
-		full=1; full_reason="origin/main unavailable or repository shallow"
-	fi
-fi
-
-if [ "$full" -eq 0 ] && [ "${FULL:-0}" = "1" ]; then
-	full=1
-	full_reason="FULL=1"
-fi
-
-# ---------------------------------------------------------------- fmt (always)
-
-run_cmd cargo fmt --all -- --check
-
-# Structure rules CI enforces (tracked files only: commit new folders first).
-run_cmd sh scripts/check-dir-entries.sh
-run_cmd sh scripts/check-line-limit.sh
-
-# ---------------------------------------------------------------- tier: T2
-
-if [ "$full" -eq 1 ]; then
-	echo "pre-push: tier T2 (FULL): $full_reason; all workspace packages"
-	run_full
-	sweep_old_builds
-	exit 0
-fi
-
-# ---------------------------------------------------------------- tier: T1
-
-base_args=""
-if [ "$full" -eq 0 ] && [ -n "$base_remote_sha" ]; then
-	base_args="--base $base_remote_sha"
-fi
-if [ "$full" -eq 0 ] && [ -z "$base_args" ]; then
-	full=1
-	full_reason="no remote base available"
-fi
-if [ "$full" -eq 1 ]; then
-	echo "pre-push: tier T2 (FULL): $full_reason; all workspace packages"
-	run_full
-	sweep_old_builds
-	exit 0
-fi
-
-plan=$(sh scripts/testing/test-affected.sh --mode list $base_args) && plan_rc=0 || plan_rc=$?
-if [ "$plan_rc" -ne 0 ]; then
-	echo "pre-push: WARNING: package selection failed (rc=$plan_rc), falling back to FULL (T2)" >&2
-	echo "pre-push: tier T2 (FULL): selection failure fail-safe; all workspace packages"
-	run_full
-	sweep_old_builds
-	exit 0
-fi
-
-if [ "$plan" = "FULL" ]; then
-	echo "pre-push: tier T2 (FULL): test-affected.sh reports FULL; all workspace packages"
-	run_full
-	sweep_old_builds
-	exit 0
-fi
-
-if [ -z "$plan" ]; then
-	echo "pre-push: tier T1: nothing to test (no affected packages)"
-	echo "pre-push: OK (T1, empty)"
-	sweep_old_builds
-	exit 0
-fi
-
-# Build -p args from the package list (one per line).
-pargs=""
-while IFS= read -r p; do
-	if [ -n "$p" ]; then
-		pargs="$pargs -p $p"
-	fi
-done <<HOOK_EOF
-$plan
-HOOK_EOF
-pargs=${pargs# }
-
-echo "pre-push: tier T1 (affected):$pargs"
-run_cmd cargo clippy $pargs --all-targets --locked -- -D warnings
-run_cmd sh scripts/testing/test-affected.sh $base_args --mode run --kind all
-
-echo "pre-push: OK (T1)"
-
-sweep_old_builds
+if [ "${TEST_AFFECTED_DRY:-0}" != 1 ]; then cargo sweep --time 7 2>/dev/null || true; fi

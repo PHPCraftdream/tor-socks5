@@ -1,8 +1,7 @@
 # Release — build native socks5-proxy binaries on tag push and publish a GitHub Release.
 # Complements ci.yml (fmt/clippy/test on branch push & PR); this one fires only on `v*` tags.
 #
-# Поток: validate (формат тега) -> build (4 таргета, upload-artifact) ->
-# release (download-artifact, проверка комплекта через publish.sh, draft -> publish).
+# Поток: validate -> build (7 targets) -> release (download-artifact, strict package validation).
 # Промежуточно создаётся DRAFT release; /releases/latest никогда не увидит релиз
 # без checksum'ов. github.ref_name попадает в shell только через env.
 
@@ -50,6 +49,17 @@ jobs:
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+            musl: true
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            archive: tar.gz
+            musl: true
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
@@ -73,8 +83,20 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Install musl tools
+        if: matrix.musl == true
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+
       - name: Build
         run: cargo build --locked --release -p socks5-proxy --target ${{ matrix.target }}
+
+      - name: Alpine smoke (musl)
+        if: matrix.musl == true
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="$PWD/target/${{ matrix.target }}/release/socks5-proxy"
+          docker run --rm --network none --read-only --tmpfs /tmp --mount "type=bind,src=$binary,dst=/tor-socks5,readonly" alpine:3.22 /tor-socks5 --version
 
       - name: Package (unix)
         if: matrix.archive != 'zip'

@@ -181,7 +181,7 @@ def _stub_source(module_filename):
 
 
 def make_fakebin(area, name, os_name="Linux", machine="x86_64",
-                 sysctl_arm="0", hash_tools=("sha256sum",)):
+                 sysctl_arm="0", hash_tools=("sha256sum",), libc="gnu"):
     """Урезанный PATH-каталог: stub'ы uname/sysctl/curl + выбранные реальные
     hash-утилиты (symlink на настоящие бинарники — не fake hash output)."""
     bin_dir = area.subdir(name)
@@ -209,6 +209,14 @@ def make_fakebin(area, name, os_name="Linux", machine="x86_64",
     else:
         sysctl_body += '    print(%r)\n' % str(sysctl_arm)
     write_executable(bin_dir, "sysctl", sysctl_body + 'else: sys.exit(1)\n')
+    # Isolated libc evidence tools make libc selection deterministic on CI hosts.
+    getconf_body = ('\nimport sys\n'
+                    'if sys.argv[1:] == ["GNU_LIBC_VERSION"] and %r in ("gnu", "mixed"): print("glibc 2.39")\n'
+                    'else: sys.exit(1)\n' % libc)
+    write_executable(bin_dir, "getconf", getconf_body)
+    write_executable(bin_dir, "ldd", '\nimport sys\nprint(%r)\n' %
+                     ("musl libc (x86_64)" if libc in ("musl", "mixed")
+                      else "unknown libc" if libc == "unknown" else "glibc"))
     def link_real(target, link):
         try:
             os.symlink(target, link)
