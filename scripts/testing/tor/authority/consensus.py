@@ -282,17 +282,34 @@ class VotingNode(a.AuthorityNode):
             ) is not None,
             "request-path",
         )
+        return self._exchange(path)
+
+    def _exchange(self, path, payload=None):
+        require(
+            payload is None
+            or isinstance(payload, bytes) and len(payload) <= LIMIT,
+            "request-limit",
+        )
+        self._check()
         endpoint = self._identity_and_listeners()
         self._http = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             self._http.settimeout(min(0.05, self._remaining()))
             self._http.connect(endpoint)
             require(self._http.getpeername() == endpoint, "http-peer")
+            method = b"GET" if payload is None else b"POST"
+            length = (
+                b"" if payload is None
+                else b"Content-Length: "
+                + str(len(payload)).encode("ascii") + b"\r\n"
+            )
             self._http_send(
-                b"GET " + path + b" HTTP/1.0\r\n"
+                method + b" " + path + b" HTTP/1.0\r\n"
                 b"Host: 127.0.0.1\r\n"
                 b"Accept-Encoding: identity\r\n"
-                b"Connection: close\r\n\r\n"
+                b"Connection: close\r\n"
+                + length + b"\r\n"
+                + (b"" if payload is None else payload)
             )
             response = bytearray()
             while True:
@@ -304,8 +321,11 @@ class VotingNode(a.AuthorityNode):
             header, separator, body = bytes(response).partition(b"\r\n\r\n")
             require(separator and len(header) <= 8192, "http-header")
             lines = header.split(b"\r\n")
-            match = re.fullmatch(rb"HTTP/1\.0 ([0-9]{3}) [^\r\n]*", lines[0])
+            match = re.fullmatch(
+                rb"HTTP/1\.0 ([0-9]{3}) ([^\r\n]*)", lines[0]
+            )
             require(match is not None, "http-status")
+            self._last_reason = match[2]
             fields = {}
             for line in lines[1:]:
                 key, separator, value = line.partition(b":")
@@ -323,7 +343,10 @@ class VotingNode(a.AuthorityNode):
                     fields[b"content-length"] == str(len(body)).encode("ascii"),
                     "http-length",
                 )
-            require(self._identity_and_listeners() == endpoint, "listener-changed")
+            require(
+                self._identity_and_listeners() == endpoint,
+                "listener-changed",
+            )
             self._check()
             return int(match[1]), body
         finally:
@@ -341,6 +364,8 @@ class VotingNode(a.AuthorityNode):
 
 
 class Network:
+    node_type = VotingNode
+
     def __init__(self, binary, gencert, deadline):
         require(math.isfinite(deadline), "invalid-deadline")
         self.binary = binary
@@ -392,7 +417,7 @@ class Network:
             "independent-identities",
         )
         for index in range(3):
-            node = VotingNode(
+            node = self.node_type(
                 self.binary, self.deadline,
                 self.relays[index], self.materials[index], index,
             )

@@ -205,6 +205,7 @@ class Routing(unittest.TestCase):
         for path in (
             "scripts/testing/tor/authority/consensus.py",
             "scripts/testing/tor/authority/test_consensus.py",
+            "scripts/testing/tor/authority/producer.py",
         ):
             with self.subTest(path=path):
                 result = self.route(path)
@@ -217,6 +218,9 @@ class Routing(unittest.TestCase):
             "scripts/testing/tor/authority/consensus.py.bak",
             "scripts/testing/tor/authority/nested/consensus.py",
             "scripts/testing/tor/authority/test_consensus_extra.py",
+            "scripts/testing/tor/authority/producer.py.bak",
+            "scripts/testing/tor/authority/nested/producer.py",
+            "scripts/testing/tor/authority/producer_extra.py",
         ):
             with self.subTest(path=path):
                 with self.assertRaises(p.MappingError):

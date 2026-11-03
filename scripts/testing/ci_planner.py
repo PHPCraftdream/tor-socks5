@@ -596,7 +596,8 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
                 "scripts/testing/tor/authority/startup.py",
                 "scripts/testing/tor/authority/test_startup.py",
                 "scripts/testing/tor/authority/consensus.py",
-                "scripts/testing/tor/authority/test_consensus.py"):
+                "scripts/testing/tor/authority/test_consensus.py",
+                "scripts/testing/tor/authority/producer.py"):
             add("tor", path)
         elif path.startswith(".github/pt_proxy/"):
             add("pt-proxy", path)

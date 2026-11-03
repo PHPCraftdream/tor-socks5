@@ -25,6 +25,7 @@ def load(name, path):
 
 
 c = load("authority_consensus_checks", Path(__file__).with_name("consensus.py"))
+p = load("authority_producer_checks", Path(__file__).with_name("producer.py"))
 
 
 def date(value):
@@ -821,17 +822,19 @@ def main():
             report_failures(result)
             return 1
         print("Tor authority consensus mechanism controls passed: 15")
-        network = c.Network(binary, gencert, deadline)
-        with network:
-            network.start()
-            if network.positive() != "three-authority-consensus":
-                raise c.ConsensusError("positive-not-executed")
-            if network.negative() != "one-of-three-vote-quorum-rejected":
-                raise c.ConsensusError("negative-not-executed")
-            witnesses = network.witnesses()
-        c.released(witnesses)
+        producer_ok, producer_failures = p.run_controls(c)
+        if not producer_ok:
+            print("Tor relay producer mechanism controls failed", file=sys.stderr)
+            for failure in producer_failures:
+                print(failure, file=sys.stderr)
+            return 1
+        print("Tor relay producer mechanism controls passed: 23")
+        network = p.implementation(c)(binary, gencert, deadline)
+        p.run_live(network, c)
         print("Tor three-authority current consensus controls passed: 1")
         print("Tor one-of-three vote quorum rejection controls passed: 1")
+        print("Tor owned guard middle exit producer controls passed: 1")
+        print("Tor BOM descriptor admission rejection controls passed: 1")
         return 0
     except (c.a.s.Cancelled, c.a.m.Cancelled):
         print("Tor authority consensus cancelled", file=sys.stderr)
@@ -844,7 +847,10 @@ def main():
         return 1
     except Exception:
         stage = network.stage if network is not None else "prepare"
-        if stage not in {"prepare", "launch", "consensus", "votes", "quorum"}:
+        if stage not in {
+            "prepare", "launch", "consensus", "votes", "quorum",
+            "producer", "producer-negative",
+        }:
             stage = "prepare"
         print("Tor authority consensus failed: " + stage, file=sys.stderr)
         return 1
