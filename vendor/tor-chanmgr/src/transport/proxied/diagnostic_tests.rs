@@ -354,3 +354,8 @@ fn handshake_pending_read_drop_does_not_poll_again() {
         },
     );
 }
+
+/// Provider and selected-plugin regressions using the existing stream witnesses.
+#[cfg(feature = "pt-client")]
+#[path = "provider_tests.rs"]
+mod provider_tests;
