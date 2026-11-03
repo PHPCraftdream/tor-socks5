@@ -201,6 +201,27 @@ class Routing(unittest.TestCase):
                 self.assertEqual(result["packages"], [])
 
 
+    def test_authority_consensus_paths_route_exactly(self):
+        for path in (
+            "scripts/testing/tor/authority/consensus.py",
+            "scripts/testing/tor/authority/test_consensus.py",
+        ):
+            with self.subTest(path=path):
+                result = self.route(path)
+                self.assertEqual(result["segments"], ["fast", "tor"])
+                self.assertFalse(result["full"])
+                self.assertEqual(result["packages"], [])
+
+    def test_unknown_authority_consensus_paths_fail_closed(self):
+        for path in (
+            "scripts/testing/tor/authority/consensus.py.bak",
+            "scripts/testing/tor/authority/nested/consensus.py",
+            "scripts/testing/tor/authority/test_consensus_extra.py",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(p.MappingError):
+                    self.route(path)
+
     def test_unknown_authority_material_paths_fail_closed(self):
         for path in (
             "scripts/testing/tor/authority/unknown.py",

@@ -15,6 +15,7 @@ ip link set lo up
 python3 -I scripts/testing/tor/test_real_tor_supervisor.py
 python3 -I scripts/testing/tor/authority/test_materials.py
 python3 -I scripts/testing/tor/authority/test_startup.py
+python3 -I scripts/testing/tor/authority/test_consensus.py
 work=$(mktemp -d)
 pids=()
 cleanup() {
