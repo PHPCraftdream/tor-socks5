@@ -11,7 +11,7 @@ set -euo pipefail
 [ -z "$(ip -4 route show default)" ]
 [ -z "$(ip -6 route show default)" ]
 ip link set lo up
-python3 -I scripts/testing/test_real_tor_supervisor.py
+python3 -I scripts/testing/tor/test_real_tor_supervisor.py
 work=$(mktemp -d)
 pids=()
 cleanup() {

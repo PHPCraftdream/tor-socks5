@@ -18,15 +18,15 @@ REQUIRED_DOCS = ("README.md", "tor-socks5.example.ktav",
 
 CONTRACT_MANIFEST = ".config/ci-contracts.toml"
 LICENSE_DOCS = frozenset({".github/release/license/README.md"})
-TOR_ANCHORS = ("scripts/testing/real-tor-channel.sh", "scripts/testing/real-tor-mutations.sh",
+TOR_ANCHORS = ("scripts/testing/tor/real-tor-channel.sh", "scripts/testing/tor/real-tor-mutations.sh",
                "apps/socks5-proxy/src/bridges/bridge_maintenance/real_channel_tests.rs")
 TOR_MARKERS = {
     "apps/socks5-proxy/src/bridges/bridge_maintenance.rs": ('#[cfg(test)]\n#[path = "bridge_maintenance/real_channel_tests.rs"]\nmod real_channel_tests;',),
     "packages/arti-wrapper/src/lib.rs": ('pub use arti_client::config::BridgeConfigBuilder;', 'pub use tor_chanmgr::ChannelUsage;', '        chanmgr.terminate_all_channels();\n', '        self.inner\n            .reconfigure(&config, Reconfigure::AllOrNothing)\n            .map_err(TorError::Reconfigure)?;\n'),
     TOR_ANCHORS[0]: ('TOR_REAL_ISOLATED', 'real_channel_heal_and_config_selection', '--ignored --exact'),
-    TOR_ANCHORS[1]: ('for mutation in terminate reconfigure', 'scripts/testing/real-tor-channel.sh', 'GITHUB_ACTIONS'),
+    TOR_ANCHORS[1]: ('for mutation in terminate reconfigure', 'scripts/testing/tor/real-tor-channel.sh', 'GITHUB_ACTIONS'),
     TOR_ANCHORS[2]: ('#[ignore', 'async fn real_channel_heal_and_config_selection()', 'ChannelUsage::UserTraffic'),
-    ".github/workflows/ci.yml": ("capabilities.real_tor_channel", "scripts/testing/real-tor-channel.sh", "scripts/testing/real-tor-mutations.sh"),
+    ".github/workflows/ci.yml": ("capabilities.real_tor_channel", "scripts/testing/tor/real-tor-channel.sh", "scripts/testing/tor/real-tor-mutations.sh"),
 }
 
 
@@ -582,6 +582,15 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
                 "scripts/testing/real-tor-mutations.sh",
                 "scripts/testing/real_tor_supervisor.py",
                 "scripts/testing/test_real_tor_supervisor.py"):
+            old, new = blobs(path)
+            if not old or new != "":
+                raise MappingError("missing mapping: " + path)
+            add("tor", path)
+        elif path in (
+                "scripts/testing/tor/real-tor-channel.sh",
+                "scripts/testing/tor/real-tor-mutations.sh",
+                "scripts/testing/tor/real_tor_supervisor.py",
+                "scripts/testing/tor/test_real_tor_supervisor.py"):
             add("tor", path)
         elif path.startswith(".github/pt_proxy/"):
             add("pt-proxy", path)

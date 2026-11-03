@@ -491,16 +491,68 @@ class Routing(unittest.TestCase):
 
     def test_real_tor_supervisor_paths_are_explicit(self):
         for path in (
-                "scripts/testing/real_tor_supervisor.py",
-                "scripts/testing/test_real_tor_supervisor.py"):
+                "scripts/testing/tor/real_tor_supervisor.py",
+                "scripts/testing/tor/test_real_tor_supervisor.py"):
             with self.subTest(path=path):
                 result = self.route(path)
                 self.assertIn("tor", result["segments"])
                 self.assertNotIn("rust", result["segments"])
                 self.assertFalse(result["full"])
         with self.assertRaisesRegex(p.MappingError, "missing mapping"):
-            self.route("scripts/testing/unknown_tor_supervisor.py")
+            self.route("scripts/testing/tor/unknown_tor_supervisor.py")
 
+
+    def test_legacy_tor_deletions_route_to_tor(self):
+        for path in (
+                "scripts/testing/real-tor-channel.sh",
+                "scripts/testing/real-tor-mutations.sh",
+                "scripts/testing/real_tor_supervisor.py",
+                "scripts/testing/test_real_tor_supervisor.py"):
+            with self.subTest(path=path):
+                result = self.route(
+                    path, blobs={path: ("legacy fixture\n", "")})
+                self.assertIn("tor", result["segments"])
+                self.assertNotIn("rust", result["segments"])
+                self.assertFalse(result["full"])
+
+    def test_legacy_tor_paths_require_actual_deletion(self):
+        for path in (
+                "scripts/testing/real-tor-channel.sh",
+                "scripts/testing/real-tor-mutations.sh",
+                "scripts/testing/real_tor_supervisor.py",
+                "scripts/testing/test_real_tor_supervisor.py"):
+            for old, new in (
+                    ("", ""),
+                    ("legacy fixture\n", "legacy fixture\n"),
+                    ("legacy fixture\n", "modified fixture\n"),
+                    ("", "new fixture\n")):
+                with self.subTest(path=path, old=old, new=new):
+                    with self.assertRaisesRegex(
+                            p.MappingError, "missing mapping"):
+                        self.route(path, blobs={path: (old, new)})
+
+    def test_legacy_tor_deletion_and_canonical_addition(self):
+        for legacy, canonical in (
+                ("scripts/testing/real-tor-channel.sh",
+                 "scripts/testing/tor/real-tor-channel.sh"),
+                ("scripts/testing/real-tor-mutations.sh",
+                 "scripts/testing/tor/real-tor-mutations.sh"),
+                ("scripts/testing/real_tor_supervisor.py",
+                 "scripts/testing/tor/real_tor_supervisor.py"),
+                ("scripts/testing/test_real_tor_supervisor.py",
+                 "scripts/testing/tor/test_real_tor_supervisor.py")):
+            with self.subTest(legacy=legacy):
+                result = self.route(
+                    legacy,
+                    canonical,
+                    blobs={
+                        legacy: ("legacy fixture\n", ""),
+                        canonical: ("", "canonical fixture\n"),
+                    },
+                )
+                self.assertIn("tor", result["segments"])
+                self.assertNotIn("rust", result["segments"])
+                self.assertFalse(result["full"])
 
     def test_contracts_and_native(self):
         self.assertNotIn("tor", self.route("apps/socks5-proxy/src/commands/auth.rs")["segments"])
