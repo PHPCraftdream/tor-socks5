@@ -359,3 +359,7 @@ fn handshake_pending_read_drop_does_not_poll_again() {
 #[cfg(feature = "pt-client")]
 #[path = "provider_tests.rs"]
 mod provider_tests;
+
+/// Dispatch, privacy, filtering, and bounded-terminal regressions.
+#[path = "backend_tests.rs"]
+mod backend_tests;

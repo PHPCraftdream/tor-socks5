@@ -177,7 +177,7 @@ pub(super) fn finish(attempt: &mut Option<Attempt>, outcome: Outcome) {
 }
 
 /// Register fixed metadata outside the dispatcher callback.
-fn emission_callsite() -> &'static tracing::callsite::DefaultCallsite {
+pub(super) fn emission_callsite() -> &'static tracing::callsite::DefaultCallsite {
     tracing::callsite! {
         name: "pt_connector",
         kind: tracing::metadata::Kind::EVENT,
