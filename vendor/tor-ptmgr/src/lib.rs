@@ -56,6 +56,16 @@ pub mod ipc;
 #[cfg(feature = "managed-pts")]
 mod managed;
 
+/// Consumer-side observations for transport method and factory availability.
+#[cfg(feature = "tor-channel-factory")]
+#[path = "availability.rs"]
+mod availability;
+
+/// Actual availability consumer regressions selected by the existing lifecycle filter.
+#[cfg(all(test, feature = "tor-channel-factory", feature = "managed-pts"))]
+#[path = "availability_tests.rs"]
+mod lifecycle_tests_availability;
+
 use crate::config::{TransportConfig, TransportOptions};
 use crate::err::PtError;
 #[cfg(feature = "managed-pts")]
@@ -424,22 +434,48 @@ impl PtClientMethod {
 }
 
 #[cfg(feature = "tor-channel-factory")]
-#[async_trait]
-impl<R: Runtime> tor_chanmgr::factory::AbstractPtMgr for PtMgr<R> {
-    async fn factory_for_transport(
+impl<R: Runtime> PtMgr<R> {
+    /// Observe the actual retained lookup and construct its original factory.
+    async fn factory_from_lookup<F>(
         &self,
-        transport: &PtTransportName,
-    ) -> Result<Option<Arc<dyn ChannelFactory + Send + Sync>>, Arc<dyn AbstractPtError>> {
-        let cmethod = match self.get_cmethod_for_transport(transport).await {
-            Err(e) => return Err(Arc::new(e)),
-            Ok(None) => return Ok(None),
-            Ok(Some(m)) => m,
+        lookup: F,
+    ) -> Result<Option<Arc<dyn ChannelFactory + Send + Sync>>, Arc<dyn AbstractPtError>>
+    where
+        F: std::future::Future<Output = Result<Option<PtClientMethod>, PtError>> + Send,
+    {
+        let mut observation = availability::Request::new();
+        let cmethod = match lookup.await {
+            Err(e) => {
+                observation.error(&e);
+                return Err(Arc::new(e));
+            }
+            Ok(None) => {
+                observation.absent();
+                return Ok(None);
+            }
+            Ok(Some(m)) => {
+                observation.method();
+                m
+            }
         };
 
         let proxy = ExternalProxyPlugin::new(self.runtime.clone(), cmethod.endpoint, cmethod.kind);
         let factory = ChanBuilder::new_client(self.runtime.clone(), proxy);
         // FIXME(eta): Should we cache constructed factories? If no: should this still be an Arc?
         // FIXME(eta): Should we track what transports are live somehow, so we can shut them down?
+        observation.factory();
         Ok(Some(Arc::new(factory)))
+    }
+}
+
+#[cfg(feature = "tor-channel-factory")]
+#[async_trait]
+impl<R: Runtime> tor_chanmgr::factory::AbstractPtMgr for PtMgr<R> {
+    async fn factory_for_transport(
+        &self,
+        transport: &PtTransportName,
+    ) -> Result<Option<Arc<dyn ChannelFactory + Send + Sync>>, Arc<dyn AbstractPtError>> {
+        self.factory_from_lookup(self.get_cmethod_for_transport(transport))
+            .await
     }
 }

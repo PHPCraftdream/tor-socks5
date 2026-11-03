@@ -1,5 +1,9 @@
 //! Admission and scoped socket ownership. No backend queue and no detached tasks.
 use std::future::Future;
+#[cfg(test)]
+use std::io;
+#[cfg(test)]
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,6 +12,7 @@ use arti_wrapper::TorTunnel;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use hickory_proto::op::Message;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Semaphore;
 use tokio::time::{timeout, Instant};
@@ -19,6 +24,32 @@ pub(super) const MAX_TCP_CONNECTIONS: usize = 64;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECTION_LIFETIME: Duration = Duration::from_secs(300);
 type Work = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+pub(super) trait TcpIo: AsyncRead + AsyncWrite + Unpin {
+    #[cfg(test)]
+    fn local_addr(&self) -> io::Result<SocketAddr>;
+    #[cfg(test)]
+    fn peer_addr(&self) -> io::Result<SocketAddr>;
+    #[cfg(test)]
+    fn set_nodelay(&self, enabled: bool) -> io::Result<()>;
+}
+
+impl TcpIo for TcpStream {
+    #[cfg(test)]
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        TcpStream::local_addr(self)
+    }
+
+    #[cfg(test)]
+    fn peer_addr(&self) -> io::Result<SocketAddr> {
+        TcpStream::peer_addr(self)
+    }
+
+    #[cfg(test)]
+    fn set_nodelay(&self, enabled: bool) -> io::Result<()> {
+        TcpStream::set_nodelay(self, enabled)
+    }
+}
 
 /// cancel-safe: yes — recv_from consumes only complete datagrams; child work is
 /// owned in this collection and dropped with this loop (including all permits).
@@ -238,12 +269,13 @@ pub(super) async fn tcp_loop_gated<T, F, MakeGate, Gate, G, Completed>(
 // after pausing time. Production always uses an immediately-ready gate.
 /// cancel-safe: yes for terminal cancellation only — gates, partial
 /// read_exact/write_all frames and the owned stream are dropped, never resumed.
-async fn handle_tcp_gated<T, F, Gate, G>(
-    mut stream: TcpStream,
+pub(super) async fn handle_tcp_gated<S, T, F, Gate, G>(
+    mut stream: S,
     ctx: QueryCtx<T>,
     backend: Arc<Semaphore>,
     mut gate: Gate,
 ) where
+    S: TcpIo,
     T: Fn() -> F + Send + Clone + 'static,
     F: Future<Output = Option<TorTunnel>> + Send + 'static,
     Gate: FnMut() -> G,
@@ -342,7 +374,12 @@ async fn handle_tcp_gated<T, F, Gate, G>(
 // модуль целиком отсутствует: ни вызовов, ни аллокаций, ни I/O.
 // Реэкспорт для тестов уровня server (accept-loop emission oracle).
 #[cfg(test)]
-pub(super) use tcp_diag::{set_capture_mode, take_capture};
+pub(super) use tcp_diag::{capture_snapshot, set_capture_mode, take_capture};
+
+#[cfg(test)]
+pub(super) fn emit_client_diag(line: &str) {
+    tcp_diag::emit(line);
+}
 #[cfg(test)]
 mod tcp_diag {
     use std::future::Future;
@@ -401,7 +438,7 @@ mod tcp_diag {
         error: &std::io::Error,
     ) -> String {
         format!(
-            "tcp_accept_error: listener={listener:?} kind={:?} os={:?} error={error}",
+            "tcp_accept_error: listener={listener:?} kind={:?} os={:?}",
             error.kind(),
             error.raw_os_error()
         )
@@ -480,6 +517,10 @@ mod tcp_diag {
         CAPTURE.with(|c| c.borrow_mut().drain(..).collect())
     }
 
+    pub(in super::super) fn capture_snapshot() -> Vec<String> {
+        CAPTURE.with(|capture| capture.borrow().clone())
+    }
+
     pub(super) struct TcpDiagGuard {
         local: Option<SocketAddr>,
         peer: Option<SocketAddr>,
@@ -516,22 +557,13 @@ mod tcp_diag {
             self.stage = s;
         }
 
-        /// Последний terminal непосредственно перед Drop побеждает.
-        pub(super) fn terminal(&mut self, t: &str) {
-            self.terminal = Some(t.to_string());
-        }
-
-        pub(super) fn record_write(&mut self) {
-            self.observed_writes = self.observed_writes.saturating_add(1);
-        }
-    }
-
-    impl Drop for TcpDiagGuard {
-        fn drop(&mut self) {
-            let terminal = match &self.terminal {
-                Some(t) => t.as_str(),
-                None => "unclassified_drop",
-            };
+        /// The first terminal is emitted immediately and exactly once.
+        /// Drop emits only when no terminal was classified, including cancellation.
+        pub(super) fn terminal(&mut self, terminal: &str) {
+            if self.terminal.is_some() {
+                return;
+            }
+            self.terminal = Some(terminal.to_string());
             let line = format_diag(
                 &self.local,
                 &self.peer,
@@ -541,6 +573,54 @@ mod tcp_diag {
             );
             (self.emit)(&line);
         }
+
+        pub(super) fn record_write(&mut self) {
+            self.observed_writes = self.observed_writes.saturating_add(1);
+        }
+    }
+
+    impl Drop for TcpDiagGuard {
+        fn drop(&mut self) {
+            if self.terminal.is_some() {
+                return;
+            }
+            let line = format_diag(
+                &self.local,
+                &self.peer,
+                self.stage,
+                "unclassified_drop",
+                self.observed_writes,
+            );
+            (self.emit)(&line);
+        }
+    }
+
+    #[test]
+    fn first_terminal_is_not_replaced_or_duplicated_by_cleanup() {
+        take_capture();
+        let (local, peer) = endpoints();
+        let mut guard = TcpDiagGuard::with_emit(local, peer, capture_emit);
+        guard.stage("read");
+        guard.record_write();
+        guard.terminal("read_error(kind=ConnectionReset,os=Some(10054))");
+        let first = capture_snapshot();
+        assert_eq!(first.len(), 1);
+        guard.terminal("eof");
+        assert_eq!(capture_snapshot(), first);
+        drop(guard);
+        assert_eq!(take_capture(), first);
+        assert!(first[0].contains("stage=read"));
+        assert!(first[0].contains("observed_writes=1"));
+    }
+
+    #[test]
+    fn accept_error_does_not_format_private_error_contents() {
+        let error =
+            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "private-error-content");
+        assert_eq!(
+            format_accept_error(&None, &error),
+            "tcp_accept_error: listener=None kind=ConnectionReset os=None"
+        );
     }
 
     fn endpoints() -> (Option<SocketAddr>, Option<SocketAddr>) {
@@ -557,6 +637,7 @@ mod tcp_diag {
         let mut guard = TcpDiagGuard::with_emit(local, peer, capture_emit);
         guard.stage("read");
         guard.terminal("eof");
+        assert_eq!(capture_snapshot().len(), 1);
         drop(guard);
         let lines = take_capture();
         assert_eq!(lines.len(), 1, "got: {lines:?}");
@@ -575,6 +656,12 @@ mod tcp_diag {
         guard.stage("write");
         guard.record_write();
         guard.terminal("read_error(kind=ConnectionReset,os=Some(10054))");
+        let before_cleanup = capture_snapshot();
+        assert_eq!(before_cleanup.len(), 1);
+        assert!(before_cleanup[0].contains("observed_writes=1"));
+        assert!(
+            before_cleanup[0].contains("terminal=read_error(kind=ConnectionReset,os=Some(10054))")
+        );
         drop(guard);
         let lines = take_capture();
         assert_eq!(lines.len(), 1, "got: {lines:?}");

@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -69,9 +70,37 @@ class External(unittest.TestCase):
         self.put(p.CONTRACT_MANIFEST, "real_tor_channel = true\n")
         for path, markers in p.TOR_MARKERS.items():
             self.put(path, "\n".join(markers) + "\n")
+        for path in p.TOR_STREAM_SOURCES:
+            self.put(path, "stream source fixture\n")
         self.git("init", "-q")
         self.commit("начало")
         self.base = self.git("rev-parse", "HEAD").strip()
+
+    def test_stream_source_removal_fails_real_planner(self):
+        paths = (
+            "packages/arti-wrapper/tests/owned_stream.rs",
+            "packages/arti-wrapper/tests/owned_stream/consumer.rs",
+            "packages/arti-wrapper/tests/owned_stream/protocol.rs",
+            "packages/arti-wrapper/tests/owned_stream/mechanisms.rs",
+            "scripts/testing/tor/artifact.py",
+            "scripts/testing/tor/test_artifact.py",
+            "scripts/testing/tor/authority/producer/stream.py",
+            "scripts/testing/tor/authority/producer/stream_wire.py",
+            "scripts/testing/tor/authority/producer/operation.py",
+            "scripts/testing/tor/authority/producer/controls/suite.py",
+            "scripts/testing/tor/authority/producer/controls/stream.py",
+            "scripts/testing/tor/authority/producer/controls/stream_lifecycle.py",
+        )
+        for path in paths:
+            with self.subTest(path=path):
+                original = (self.root / path).read_text(encoding="utf-8")
+                self.git("rm", path)
+                self.commit("remove mandatory stream source")
+                self.push(ok=False)
+                self.put(path, original)
+                self.commit("restore mandatory stream source")
+        result = self.push()
+        self.assertTrue(result["capabilities"]["real_tor_channel"])
 
     def put(self, path, text):
         target = self.root / path
@@ -389,7 +418,7 @@ class External(unittest.TestCase):
         self.push(ok=False)
 
     def test_capability_git_removal_and_absence(self):
-        anchors = ("scripts/testing/real-tor-channel.sh", "scripts/testing/real-tor-mutations.sh",
+        anchors = ("scripts/testing/tor/real-tor-channel.sh", "scripts/testing/tor/real-tor-mutations.sh",
                    "apps/socks5-proxy/src/bridges/bridge_maintenance/real_channel_tests.rs")
         self.git("rm", anchors[0])
         self.commit("remove one anchor")
@@ -728,6 +757,186 @@ class External(unittest.TestCase):
         self.assertNotIn("dry-run: cargo clippy", failed.stdout)
         self.assertNotIn("dry-run: cargo test", failed.stdout)
         self.assertNotIn("dry-run: cargo nextest", failed.stdout)
+
+
+class NightlyPreset(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.workflow = (SOURCE / ".github/workflows/nightly.yml").read_text(encoding="utf-8")
+        cls.blocks = p.workflow_blocks(cls.workflow)
+
+    def script(self, name):
+        marker = "      - name: " + name + "\n"
+        self.assertEqual(self.workflow.count(marker), 1)
+        step = self.workflow.split(marker, 1)[1]
+        step = re.split(r"^      - ", step, maxsplit=1, flags=re.MULTILINE)[0]
+        match = re.search(r"^        run: \|\n((?:          .*\n|\n)+)", step, re.MULTILINE)
+        self.assertIsNotNone(match, name)
+        return "".join(line[10:] if line.startswith("          ") else line
+                       for line in match.group(1).splitlines(keepends=True))
+
+    def execute(self, script, event="workflow_dispatch", preset="", results=None,
+                cargo_status=0, existing=0):
+        results = results or {
+            "flaky-hunt": "success", "vendor-extra": "success", "features": "success"}
+        values = {
+            **{"needs." + job + ".result": result for job, result in results.items()},
+            "github.server_url": "https://github.invalid",
+            "github.repository": "example/repository",
+            "github.run_id": "141",
+        }
+        for key, value in values.items():
+            script = script.replace("${{ " + key + " }}", value)
+        self.assertNotIn("${{", script)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            cargo = bin_dir / "cargo"
+            cargo.write_text(
+                '#!/bin/sh\nprintf "%s\\n" "$@" > "$ARGV_LOG"\n'
+                'printf "raw stdout\\n"\nprintf "raw stderr\\n" >&2\n'
+                'exit "$CARGO_STATUS"\n', encoding="utf-8")
+            cargo.chmod(0o755)
+            gh = bin_dir / "gh"
+            gh.write_text(
+                '#!/bin/sh\nprintf "%s\\n" "$*" >> "$GH_LOG"\n'
+                'case "$*" in\n'
+                '  *length*) printf "%s\\n" "$EXISTING" ;;\n'
+                '  *number*) printf "42\\n" ;;\n'
+                'esac\n', encoding="utf-8")
+            gh.chmod(0o755)
+            env = dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ["PATH"],
+                       NIGHTLY_EVENT=event, NIGHTLY_PRESET=preset,
+                       GITHUB_STEP_SUMMARY=str(root / "summary"),
+                       ARGV_LOG=str(root / "argv"), GH_LOG=str(root / "gh"),
+                       CARGO_STATUS=str(cargo_status), EXISTING=str(existing))
+            result = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script],
+                                    cwd=root, env=env, text=True, encoding="utf-8",
+                                    capture_output=True)
+            files = {path.name: path.read_text(encoding="utf-8")
+                     for path in root.iterdir() if path.is_file()}
+            return result, files
+
+    def test_selection_validation_and_injection_rejection(self):
+        script = self.script("Validate Nightly preset")
+        for event, preset in (("schedule", ""), ("workflow_dispatch", ""),
+                              ("workflow_dispatch", "standard"),
+                              ("workflow_dispatch", "windows-dns-rst")):
+            with self.subTest(event=event, preset=preset):
+                result, files = self.execute(script, event, preset)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(files, {})
+        for preset in ("unknown", "WINDOWS-DNS-RST", "windows-dns-rst ",
+                       "$(touch injected)", "standard\nwindows-dns-rst"):
+            with self.subTest(preset=preset):
+                result, files = self.execute(script, preset=preset)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Unsupported Nightly", result.stderr)
+                self.assertEqual(files, {})
+
+    def test_workflow_wiring(self):
+        self.assertIn('- cron: "17 2 * * *"', self.workflow)
+        self.assertIn("group: nightly-tests\n", self.workflow)
+        self.assertIn("cancel-in-progress: false", self.workflow)
+        self.assertIn("default: standard\n", self.workflow)
+        self.assertIn("options:\n          - standard\n          - windows-dns-rst\n",
+                      self.workflow)
+        self.assertEqual(set(key for key in self.blocks if not key.startswith("@")),
+                         {"flaky-hunt", "vendor-extra", "features", "report"})
+        flaky = self.blocks["flaky-hunt"]
+        diagnostic = "github.event_name == 'workflow_dispatch' && inputs.preset == 'windows-dns-rst'"
+        self.assertIn(
+            "os: ${{ " + diagnostic +
+            """ && fromJSON('["windows-latest"]') || fromJSON('["ubuntu-latest","windows-latest","macos-latest"]') }}""",
+            flaky)
+        self.assertLess(flaky.index("name: Validate Nightly preset"),
+                        flaky.index("uses: actions/checkout@"))
+        self.assertIn("if: " + diagnostic, flaky)
+        self.assertIn(
+            "if: github.event_name != 'workflow_dispatch' || inputs.preset != 'windows-dns-rst'",
+            flaky)
+        standard = ("if: github.event_name == 'schedule' || "
+                    "(github.event_name == 'workflow_dispatch' && "
+                    "(inputs.preset == '' || inputs.preset == 'standard'))")
+        for job in ("vendor-extra", "features"):
+            self.assertIn(standard, self.blocks[job])
+        self.assertIn("needs: [flaky-hunt, vendor-extra, features]", self.blocks["report"])
+        self.assertIn("if: always()", self.blocks["report"])
+        self.assertIn("NIGHTLY_EVENT: ${{ github.event_name }}", flaky)
+        self.assertIn("NIGHTLY_PRESET: ${{ inputs.preset }}", flaky)
+        self.assertIn("NIGHTLY_EVENT: ${{ github.event_name }}", self.blocks["report"])
+        self.assertIn("NIGHTLY_PRESET: ${{ inputs.preset }}", self.blocks["report"])
+        self.assertNotIn("inputs.", self.script("Validate Nightly preset"))
+        self.assertNotIn("inputs.", self.script("Summarize and manage the failure issue"))
+        self.assertIn(
+            "cargo nextest run --profile flaky-hunt --stress-count 10\n"
+            "          -p tor-socks5-dns -p tor-circmgr -p tor-guardmgr -p socks5-proxy\n"
+            "          --locked", flaky)
+        self.assertIn("name: junit-flaky-hunt-${{ matrix.os }}", flaky)
+        self.assertIn("path: target/nextest/flaky-hunt/junit.xml", flaky)
+        self.assertIn("if: always()\n        with:\n          name: junit-flaky-hunt-", flaky)
+        self.assertIn("if: always() && " + diagnostic, flaky)
+        self.assertIn("name: diagnostic-windows-dns-rst-raw\n          path: windows-dns-rst.log",
+                      flaky)
+
+    def test_diagnostic_command_and_failure_evidence(self):
+        script = self.script("Run partial Windows DNS RST diagnostic")
+        expected = ["nextest", "run", "--profile", "flaky-hunt", "--stress-count",
+                    "10", "--retries", "0", "-p", "tor-socks5-dns", "--locked"]
+        for status in (0, 37):
+            with self.subTest(status=status):
+                result, files = self.execute(script, preset="windows-dns-rst",
+                                             cargo_status=status)
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertEqual(files["argv"].splitlines(), expected)
+                self.assertEqual(files["windows-dns-rst.log"], "raw stdout\nraw stderr\n")
+                self.assertEqual(result.stdout, files["windows-dns-rst.log"])
+                self.assertNotIn("gh", files)
+
+    def test_diagnostic_and_invalid_report_never_touch_issue(self):
+        script = self.script("Summarize and manage the failure issue")
+        for outcome in ("success", "failure", "cancelled", "skipped"):
+            with self.subTest(outcome=outcome):
+                result, files = self.execute(
+                    script, preset="windows-dns-rst",
+                    results={"flaky-hunt": outcome, "vendor-extra": "skipped", "features": "skipped"},
+                    existing=1)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("gh", files)
+                self.assertIn("Partial diagnostic: windows-dns-rst", files["summary"])
+                self.assertIn("result: " + outcome, files["summary"])
+                self.assertIn("deliberately omitted", files["summary"])
+                self.assertIn("success does not establish an RST cause or fix", files["summary"])
+        result, files = self.execute(script, preset="unknown", existing=1)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("gh", files)
+
+    def test_standard_report_preserves_issue_lifecycle(self):
+        script = self.script("Summarize and manage the failure issue")
+        for event, preset in (("schedule", ""), ("workflow_dispatch", ""),
+                              ("workflow_dispatch", "standard")):
+            for outcome, existing, action in (
+                    ("failure", 0, "issue create"), ("failure", 1, "issue comment"),
+                    ("cancelled", 1, "issue comment"), ("success", 1, "issue close"),
+                    ("skipped", 1, None)):
+                with self.subTest(event=event, preset=preset, outcome=outcome, existing=existing):
+                    result, files = self.execute(
+                        script, event, preset,
+                        results={"flaky-hunt": outcome, "vendor-extra": "success", "features": "success"},
+                        existing=existing)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    calls = files["gh"]
+                    self.assertIn("issue list", calls)
+                    if action:
+                        self.assertIn(action, calls)
+                    if outcome != "success":
+                        self.assertNotIn("issue close", calls)
+                        self.assertNotIn("recovered:", calls)
+                    if outcome == "skipped":
+                        self.assertNotIn("issue comment", calls)
+                        self.assertNotIn("issue create", calls)
+                        self.assertIn("Incomplete run", files["summary"])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,896 @@
+"""CI-only mechanism and genuine three-authority consensus controls."""
+
+from datetime import datetime, timezone
+import importlib.util
+import io
+import math
+import os
+from pathlib import Path
+import re
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from types import SimpleNamespace
+import unittest
+from unittest import mock
+
+
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+c = load("authority_consensus_checks", Path(__file__).with_name("consensus.py"))
+p = load(
+    "authority_producer_checks",
+    Path(__file__).with_name("producer") / "entry.py",
+)
+
+
+def date(value):
+    return datetime.fromtimestamp(
+        value, timezone.utc
+    ).strftime("%Y-%m-%d %H:%M:%S").encode("ascii")
+
+
+def source_line(node):
+    return (
+        b"dir-source " + node.name.encode("ascii")
+        + b" " + node.identity.encode("ascii")
+        + b" " + node.address.encode("ascii")
+        + b" " + node.address.encode("ascii") + b" "
+        + str(node.dir_port).encode("ascii")
+        + b" " + str(node.or_port).encode("ascii") + b"\n"
+    )
+
+
+def vote_body(node, period):
+    return (
+        b"network-status-version 3\n"
+        b"vote-status vote\n"
+        b"valid-after " + date(period) + b"\n"
+        + node.certificate
+        + source_line(node)
+        + b"directory-signature " + node.identity.encode("ascii")
+        + b" " + b"F" * 40 + b"\n"
+        b"-----BEGIN SIGNATURE-----\n"
+        b"mechanism-only\n"
+        b"-----END SIGNATURE-----\n"
+    )
+
+
+def consensus_body(nodes, period, signers=2):
+    body = (
+        b"network-status-version 3\n"
+        b"vote-status consensus\n"
+        b"valid-after " + date(period) + b"\n"
+        b"fresh-until " + date(period + c.INTERVAL) + b"\n"
+        b"valid-until " + date(period + c.INTERVAL * c.VALID_INTERVALS) + b"\n"
+        b"voting-delay 20 20\n"
+    )
+    for index, node in enumerate(nodes):
+        body += source_line(node)
+        body += b"vote-digest " + ("%040X" % (index + 1)).encode("ascii") + b"\n"
+    for node in nodes[:signers]:
+        body += (
+            b"directory-signature " + node.identity.encode("ascii")
+            + b" " + b"F" * 40 + b"\n"
+            b"-----BEGIN SIGNATURE-----\n"
+            b"mechanism-only\n"
+            b"-----END SIGNATURE-----\n"
+        )
+    return body
+
+
+class Wire:
+    def __init__(self, response):
+        self.response = bytearray(response)
+        self.sent = bytearray()
+        self.closed = False
+        self.endpoint = None
+
+    def settimeout(self, timeout):
+        if not 0 < timeout <= 0.05:
+            raise AssertionError("unbounded-socket")
+
+    def connect(self, endpoint):
+        self.endpoint = endpoint
+
+    def getpeername(self):
+        return self.endpoint
+
+    def send(self, payload):
+        count = min(3, len(payload))
+        self.sent.extend(payload[:count])
+        return count
+
+    def recv(self, count):
+        result = bytes(self.response[:count])
+        del self.response[:count]
+        return result
+
+    def close(self):
+        self.closed = True
+
+    def fileno(self):
+        return -1 if self.closed else 1
+
+
+class Controls(unittest.TestCase):
+    def node(self, implementation=c, index=0, deadline=None):
+        if deadline is None:
+            deadline = time.monotonic() + 60
+        relay = SimpleNamespace(
+            deadline=deadline, fingerprint=("%040X" % (index + 101)),
+        )
+        material = SimpleNamespace(
+            deadline=deadline,
+            metadata={"v3_identity_fingerprint": "%040X" % (index + 201)},
+        )
+        node = implementation.VotingNode(
+            "/fixture/tor", deadline, relay, material, index,
+        )
+        node.or_port = 19001 + index * 2
+        node.dir_port = 19002 + index * 2
+        node.certificate = (
+            b"mechanism-only-certificate-" + str(index).encode("ascii") + b"\n"
+        )
+        return node
+
+    def process(self):
+        process = mock.Mock(returncode=None)
+        process.poll.side_effect = lambda: process.returncode
+
+        def terminate():
+            process.returncode = -15
+
+        process.terminate.side_effect = terminate
+        process.wait.side_effect = lambda **_kwargs: process.returncode
+        return process
+
+    def prepared_network(self, implementation=c, deadline=None):
+        if deadline is None:
+            deadline = time.monotonic() + 60
+        network = implementation.Network(
+            "/fixture/tor", "/fixture/gencert", deadline,
+        )
+        for index in range(3):
+            node = self.node(implementation, index, deadline)
+            node._temp = tempfile.TemporaryDirectory(prefix="consensus-mechanism-")
+            node.data = Path(node._temp.name)
+            node._log = tempfile.TemporaryFile()
+            node.process = self.process()
+            node.config_path = node.data / "torrc"
+            node.config_path.write_bytes(b"mechanism-only-unchanged-config\n")
+            node._config_bytes = node.config_path.read_bytes()
+            network.nodes.append(node)
+            network.active.append(node)
+        return network
+
+    def test_http_eof_framing_and_partial_io(self):
+        with self.node() as node:
+            wire = Wire(b"HTTP/1.0 200 OK\r\nContent-Encoding: identity\r\n\r\nbody")
+            endpoint = (node.address, node.dir_port)
+            with mock.patch.object(node, "_identity_and_listeners", return_value=endpoint):
+                with mock.patch.object(c.socket, "socket", return_value=wire):
+                    self.assertEqual(
+                        node.request(b"/tor/status-vote/current/consensus"),
+                        (200, b"body"),
+                    )
+            self.assertTrue(wire.closed)
+            self.assertIn(
+                b"GET /tor/status-vote/current/consensus HTTP/1.0\r\n",
+                wire.sent,
+            )
+
+    def test_http_rejects_truncation_encoding_duplicate_and_transfer(self):
+        responses = (
+            b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nbody",
+            b"HTTP/1.0 200 OK\r\nContent-Encoding: gzip\r\n\r\nbody",
+            b"HTTP/1.0 200 OK\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\nbody",
+            b"HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nbody",
+            b"HTTP/1.0 200 OK\r\n",
+        )
+        for response in responses:
+            with self.subTest(category="bad-response"):
+                with self.node() as node:
+                    wire = Wire(response)
+                    with mock.patch.object(
+                        node, "_identity_and_listeners",
+                        return_value=(node.address, node.dir_port),
+                    ):
+                        with mock.patch.object(c.socket, "socket", return_value=wire):
+                            with self.assertRaises(c.ConsensusError):
+                                node.request(b"/tor/status-vote/current/consensus")
+                    self.assertTrue(wire.closed)
+
+    def test_request_path_is_fixed_and_no_socket_on_bad_path(self):
+        with self.node() as node:
+            with mock.patch.object(c.socket, "socket") as create:
+                with self.assertRaises(c.ConsensusError):
+                    node.request(b"/arbitrary")
+                create.assert_not_called()
+
+    def test_source_parser_rejects_duplicate_authorities(self):
+        with self.node() as node:
+            line = source_line(node)
+            with self.assertRaises(c.ConsensusError):
+                c.sources(line + line)
+        network = self.prepared_network()
+        try:
+            body = consensus_body(network.nodes, 86400)
+            c.consensus_metadata(body, network.nodes, 86401)
+            node = network.nodes[0]
+            original = source_line(node)
+            for column in (3, 4):
+                fields = original.rstrip(b"\n").split(b" ")
+                fields[column] = b"127.0.0.2"
+                changed_line = b" ".join(fields) + b"\n"
+                changed = body.replace(original, changed_line, 1)
+                self.assertNotEqual(changed, body)
+                with self.assertRaisesRegex(
+                    c.ConsensusError, "^consensus-binding$"
+                ):
+                    c.consensus_metadata(changed, network.nodes, 86401)
+        finally:
+            network.close()
+
+    def test_vote_requires_generated_identity_certificate_and_period(self):
+        with self.node() as node:
+            period = 86400
+            body = vote_body(node, period)
+            c.vote_metadata(body, node, period)
+            for column in (3, 4):
+                original = source_line(node)
+                fields = original.rstrip(b"\n").split(b" ")
+                fields[column] = b"127.0.0.2"
+                changed = body.replace(
+                    original, b" ".join(fields) + b"\n", 1
+                )
+                self.assertNotEqual(changed, body)
+                with self.assertRaisesRegex(
+                    c.ConsensusError, "^vote-binding$"
+                ):
+                    c.vote_metadata(changed, node, period)
+            for changed, expected in (
+                (body.replace(node.certificate, b"other-certificate\n"), period),
+                (body.replace(node.identity.encode("ascii"), b"E" * 40), period),
+                (body, period + 1),
+            ):
+                with self.subTest(category="bad-binding"):
+                    with self.assertRaises(c.ConsensusError):
+                        c.vote_metadata(changed, node, expected)
+
+    def test_shared_deadline_and_sticky_cancellation_use_actual_guard(self):
+        isolated = load(
+            "authority_consensus_guard_copy",
+            Path(__file__).with_name("consensus.py"),
+        )
+        network = isolated.Network("/fixture/tor", "/fixture/gencert", 12)
+        with mock.patch.object(isolated.a.time, "monotonic", return_value=12):
+            with self.assertRaises(isolated.a.s.DeadlineExceeded):
+                network.check()
+        self.assertEqual(network.deadline, 12)
+        isolated.a.s.cancelled = True
+        with self.assertRaises(isolated.a.s.Cancelled):
+            network.check()
+        self.assertTrue(isolated.a.s.cancelled)
+
+    def test_receive_cancellation_unwinds_owned_resources_in_order(self):
+        isolated = load(
+            "authority_consensus_cancel_copy",
+            Path(__file__).with_name("consensus.py"),
+        )
+        node = self.node(isolated)
+        events = []
+        network = isolated.Network(
+            "/fixture/tor", "/fixture/gencert", node.deadline,
+        )
+        network.nodes.append(node)
+        network.active.append(node)
+        node._temp = tempfile.TemporaryDirectory(prefix="consensus-control-")
+        root = Path(node._temp.name)
+        node._log = tempfile.TemporaryFile()
+        log = node._log
+        control, control_peer = socket.socketpair()
+        http, http_peer = socket.socketpair()
+        node._socket = control
+        process = mock.Mock(returncode=None)
+        process.poll.side_effect = lambda: process.returncode
+        node.process = process
+
+        def retained():
+            self.assertTrue(root.is_dir())
+            self.assertFalse(log.closed)
+            self.assertIs(node.process, process)
+
+        class Receiving:
+            def settimeout(inner, timeout):
+                self.assertGreater(timeout, 0)
+                self.assertLessEqual(timeout, 0.05)
+
+            def recv(inner, _count):
+                retained()
+                self.assertEqual(events, [])
+                events.append("cancel")
+                isolated.a.s.cancelled = True
+                raise socket.timeout()
+
+            def close(inner):
+                http.close()
+
+            def fileno(inner):
+                return http.fileno()
+
+        node._http = Receiving()
+
+        def terminate():
+            retained()
+            self.assertEqual(control.fileno(), -1)
+            self.assertEqual(http.fileno(), -1)
+            self.assertEqual(events, ["cancel"])
+            events.append("terminate")
+            process.returncode = -15
+
+        def wait(*, timeout):
+            retained()
+            self.assertGreaterEqual(timeout, 0)
+            self.assertLessEqual(timeout, 5)
+            self.assertIsNotNone(process.returncode)
+            if events == ["cancel", "terminate"]:
+                events.append("reap")
+            return process.returncode
+
+        process.terminate.side_effect = terminate
+        process.wait.side_effect = wait
+        try:
+            with self.assertRaises(isolated.a.s.Cancelled):
+                with network:
+                    node._receive(1)
+            self.assertEqual(events, ["cancel", "terminate", "reap"])
+            self.assertFalse(root.exists())
+            self.assertTrue(log.closed)
+            self.assertTrue(isolated.a.s.cancelled)
+        finally:
+            control_peer.close()
+            http_peer.close()
+            if not network.closed:
+                process.returncode = -15
+                network.close()
+
+    def test_group_kills_and_reaps_all_before_any_file_cleanup(self):
+        network = self.prepared_network()
+        events = []
+        roots = [node.data for node in network.nodes]
+        logs = [node._log for node in network.nodes]
+        processes = [node.process for node in network.nodes]
+
+        def retained():
+            self.assertTrue(all(root.is_dir() for root in roots))
+            self.assertTrue(all(not log.closed for log in logs))
+
+        for index, process in enumerate(processes):
+            def terminate(i=index):
+                retained()
+                events.append(("term", i))
+
+            def kill(p=process, i=index):
+                retained()
+                self.assertEqual(
+                    [event for event in events if event[0] == "term"],
+                    [("term", 0), ("term", 1), ("term", 2)],
+                )
+                events.append(("kill", i))
+                p.returncode = -9
+
+            def wait(*, timeout, p=process, i=index):
+                if any(item.returncode is None for item in processes):
+                    retained()
+                if p.returncode is None:
+                    raise subprocess.TimeoutExpired("mechanism-only", timeout)
+                events.append(("reap", i))
+                return p.returncode
+
+            process.terminate.side_effect = terminate
+            process.kill.side_effect = kill
+            process.wait.side_effect = wait
+        try:
+            network.close()
+            self.assertTrue(all(process.returncode == -9 for process in processes))
+            self.assertTrue(all(not root.exists() for root in roots))
+            self.assertTrue(all(log.closed for log in logs))
+            self.assertTrue(network.closed)
+        finally:
+            if not network.closed:
+                for process in processes:
+                    process.returncode = -9
+                network.close()
+
+    def test_unreaped_group_retains_every_directory_and_material(self):
+        network = self.prepared_network()
+        node = network.nodes[0]
+        roots = [item.data for item in network.nodes]
+        logs = [item._log for item in network.nodes]
+        node.process.poll.return_value = None
+        node.process.poll.side_effect = None
+        node.process.terminate.side_effect = None
+        node.process.wait.side_effect = subprocess.TimeoutExpired("mechanism-only", 0)
+        material = SimpleNamespace(process=None, close=mock.Mock())
+        network.materials.append(material)
+        try:
+            with self.assertRaises(c.a.s.CleanupError):
+                network.close()
+            self.assertTrue(all(root.is_dir() for root in roots))
+            self.assertTrue(all(not log.closed for log in logs))
+            material.close.assert_not_called()
+            self.assertFalse(network.closed)
+        finally:
+            node.process.returncode = -9
+            node.process.poll.return_value = -9
+            node.process.wait.side_effect = None
+            node.process.wait.return_value = -9
+            network.close()
+
+    def test_positive_correlates_quorum_identities_votes_cache_and_serving(self):
+        for variant in ("good", "one-signature", "duplicate-source", "cache", "admitted"):
+            with self.subTest(category=variant):
+                network = self.prepared_network()
+                period = 86400
+                body = consensus_body(network.nodes, period)
+                if variant == "one-signature":
+                    body = consensus_body(network.nodes, period, signers=1)
+                if variant == "duplicate-source":
+                    body = body.replace(
+                        network.nodes[1].identity.encode("ascii"),
+                        network.nodes[0].identity.encode("ascii"),
+                    )
+                votes = {
+                    node.identity: vote_body(node, period)
+                    for node in network.nodes
+                }
+                paths = {
+                    b"/tor/status-vote/current/d/"
+                    + ("%040X" % (index + 1)).encode("ascii"): votes[node.identity]
+                    for index, node in enumerate(network.nodes)
+                }
+                for index, node in enumerate(network.nodes):
+                    (node.data / "cached-consensus").write_bytes(
+                        b"different" if variant == "cache" and index == 1 else body
+                    )
+
+                    def request(path, owner=node, position=index):
+                        if path == b"/tor/status-vote/current/consensus":
+                            return 200, body
+                        if path == b"/tor/status-vote/current/authority":
+                            return 200, votes[owner.identity]
+                        self.assertIn(path, paths)
+                        admitted = paths[path]
+                        if variant == "admitted" and position == 1:
+                            admitted += b"different"
+                        return 200, admitted
+
+                    node.request = mock.Mock(side_effect=request)
+                try:
+                    with mock.patch.object(c.time, "time", return_value=period + 1):
+                        if variant == "good":
+                            self.assertEqual(
+                                network.positive(), "three-authority-consensus"
+                            )
+                            self.assertEqual(network.baseline, body)
+                            self.assertEqual(len(network.metadata[3]), 3)
+                            for node in network.nodes:
+                                self.assertEqual(node.request.call_count, 5)
+                        else:
+                            with self.assertRaises(c.ConsensusError):
+                                network.positive()
+                finally:
+                    network.close()
+
+    def test_negative_rejects_missing_marker_stale_vote_and_new_consensus(self):
+        for variant in (
+            "good", "missing-marker", "stale-vote",
+            "new-consensus", "pending", "no-rotation",
+        ):
+            with self.subTest(category=variant):
+                isolated = load(
+                    "authority_consensus_negative_" + variant.replace("-", "_"),
+                    Path(__file__).with_name("consensus.py"),
+                )
+                network = self.prepared_network(isolated, deadline=14)
+                period = 86550
+                boundary = 86640
+                baseline = consensus_body(network.nodes, period)
+                network.baseline = baseline
+                network.metadata = isolated.consensus_metadata(
+                    baseline, network.nodes, period + 1,
+                )
+                survivor = network.nodes[0]
+                vote = vote_body(
+                    survivor, boundary - c.INTERVAL if variant == "stale-vote" else boundary
+                )
+                (survivor.data / "cached-consensus").write_bytes(baseline)
+                (survivor.data / "v3-status-votes").write_bytes(vote)
+                clock = {"mono": 10.0, "wall": boundary - 60.0}
+                log_calls = 0
+                requests = []
+
+                def private_log(_owner):
+                    nonlocal log_calls
+                    log_calls += 1
+                    if log_calls == 1 or variant == "missing-marker":
+                        return b""
+                    return isolated.SHORTAGE + b"\n"
+
+                def request(path):
+                    requests.append(path)
+                    if path == b"/tor/status-vote/next/authority":
+                        self.assertTrue(
+                            all(node.process.returncode is not None
+                                for node in network.nodes[1:])
+                        )
+                        clock["wall"] = boundary + 1
+                        return 200, vote
+                    if path == b"/tor/status-vote/current/authority":
+                        return (
+                            200,
+                            b"previous-vote" if variant == "no-rotation" else vote,
+                        )
+                    if path == b"/tor/status-vote/next/consensus":
+                        return (200, b"minority") if variant == "pending" else (404, b"")
+                    self.assertEqual(path, b"/tor/status-vote/current/consensus")
+                    return (
+                        200,
+                        b"new-minority-consensus" if variant == "new-consensus"
+                        else baseline,
+                    )
+
+                def advance(_duration):
+                    clock["mono"] += 1
+                    self.assertLessEqual(clock["mono"], 15)
+
+                survivor.request = mock.Mock(side_effect=request)
+                try:
+                    with mock.patch.object(isolated.time, "monotonic", side_effect=lambda: clock["mono"]):
+                        with mock.patch.object(isolated.time, "time", side_effect=lambda: clock["wall"]):
+                            with mock.patch.object(isolated.time, "sleep", side_effect=advance):
+                                with mock.patch.object(isolated.a, "_private_log", side_effect=private_log):
+                                    if variant == "good":
+                                        self.assertEqual(
+                                            network.negative(),
+                                            "one-of-three-vote-quorum-rejected",
+                                        )
+                                        self.assertIn(
+                                            b"/tor/status-vote/current/authority",
+                                            requests,
+                                        )
+                                        self.assertIsNone(survivor.process.returncode)
+                                    elif variant in ("missing-marker", "no-rotation"):
+                                        with self.assertRaises(isolated.a.s.DeadlineExceeded):
+                                            network.negative()
+                                    else:
+                                        with self.assertRaises(isolated.ConsensusError):
+                                            network.negative()
+                finally:
+                    network.close()
+
+    def test_consensus_requires_exact_private_timing_profile(self):
+        network = self.prepared_network()
+        try:
+            period = 86400
+            body = consensus_body(network.nodes, period)
+            metadata = c.consensus_metadata(body, network.nodes, period + 1)
+            self.assertEqual(metadata[:3], (86400, 86520, 86760))
+            for name, value in (
+                (b"fresh-until", period + 300),
+                (b"valid-until", period + 900),
+            ):
+                changed = re.sub(
+                    rb"(?m)^" + name + rb" [^\n]+$",
+                    name + b" " + date(value),
+                    body,
+                )
+                self.assertNotEqual(changed, body)
+                with self.assertRaisesRegex(
+                    c.ConsensusError, "^consensus-interval$"
+                ):
+                    c.consensus_metadata(
+                        changed, network.nodes, period + 1
+                    )
+        finally:
+            network.close()
+
+
+    def test_next_round_regression_aligned_intervening_and_offset(self):
+        aligned = (86400, 86520, 86760, {})
+        intervening = (86550, 86670, 86910, {})
+        self.assertEqual(c.next_round(aligned), 86520)
+        self.assertEqual(c.next_round(intervening), 86640)
+        self.assertNotEqual(c.next_round(intervening), intervening[1])
+        self.assertEqual(c.period_after(86550, 120, 17), 86657)
+        self.assertEqual(c.period_after(172799, 120, 0), 172800)
+        self.assertEqual(c.period_after(86640, 120, 0), 86760)
+
+    def test_quorum_window_edges_before_and_after_owned_stop(self):
+        c.require_window(86640, 86599.999)
+        for value in (86600, 86600.001, 86640):
+            with self.subTest(category="closed-window"):
+                with self.assertRaises(c.ConsensusError):
+                    c.require_window(86640, value)
+        network = self.prepared_network()
+        baseline = consensus_body(network.nodes, 86550)
+        network.baseline = baseline
+        network.metadata = c.consensus_metadata(baseline, network.nodes, 86551)
+        values = iter((86599.0, 86600.0))
+        survivor = network.nodes[0]
+        survivor.request = mock.Mock()
+        try:
+            with mock.patch.object(c.time, "time", side_effect=lambda: next(values)):
+                with self.assertRaisesRegex(c.ConsensusError, "^quorum-window-missed$"):
+                    network.negative()
+            self.assertTrue(
+                all(node.process.returncode is not None for node in network.nodes[1:])
+            )
+            survivor.request.assert_not_called()
+            self.assertIsNone(survivor.process.returncode)
+        finally:
+            network.close()
+
+    def test_start_preparation_cancellation_owns_multiple_real_guards(self):
+        isolated = load(
+            "authority_consensus_prepare_copy",
+            Path(__file__).with_name("consensus.py"),
+        )
+        network = isolated.Network(
+            "/fixture/tor", "/fixture/gencert", time.monotonic() + 60,
+        )
+        launches = []
+        witnesses = []
+        events = []
+
+        def launch(argv, **kwargs):
+            ordinal = len(launches)
+            process = mock.Mock(returncode=None)
+            process.poll.side_effect = lambda: process.returncode
+            launches.append(process)
+            if ordinal == 1:
+                owner = network.relays[0]
+                root = Path(owner._temp.name)
+                fingerprint = " ".join(["AAAA"] * 10)
+                kwargs["stdout"].write(
+                    (isolated.a.NICKNAME + " " + fingerprint + "\n").encode("ascii")
+                )
+                kwargs["stdout"].flush()
+                stream = owner._log
+            else:
+                owner = network.materials[-1]
+                root = Path(owner._temp.name)
+                stream = owner._input
+            witnesses.append((process, stream, root))
+
+            def retained():
+                self.assertTrue(root.is_dir())
+                self.assertFalse(stream.closed)
+                self.assertEqual(owner.deadline, network.deadline)
+
+            def terminate():
+                retained()
+                events.append(("term", ordinal))
+                process.returncode = -15
+
+            waits = 0
+
+            def wait(*, timeout):
+                nonlocal waits
+                if owner._closed:
+                    self.assertIsNotNone(process.returncode)
+                    self.assertTrue(stream.closed)
+                    self.assertFalse(root.exists())
+                    self.assertEqual(owner.deadline, network.deadline)
+                else:
+                    retained()
+                self.assertGreaterEqual(timeout, 0)
+                if process.returncode is None:
+                    waits += 1
+                    self.assertEqual(waits, 1)
+                    if ordinal == 2:
+                        self.assertEqual(len(network.materials), 2)
+                        self.assertEqual(len(network.relays), 1)
+                        self.assertTrue(all(item[2].is_dir() for item in witnesses))
+                        isolated.a.m.cancelled = True
+                        isolated.a.s.cancelled = True
+                        events.append(("cancel", ordinal))
+                        raise subprocess.TimeoutExpired("mechanism-only", timeout)
+                    process.returncode = 0
+                return process.returncode
+
+            process.terminate.side_effect = terminate
+            process.wait.side_effect = wait
+            return process
+
+        def validate(material):
+            material.metadata = {
+                "v3_identity_fingerprint": "%040X" % len(network.materials),
+            }
+
+        try:
+            with mock.patch.object(isolated.a.m.subprocess, "Popen", side_effect=launch):
+                with mock.patch.object(
+                    isolated.a.m.AuthorityMaterials, "_validate", validate,
+                ):
+                    with self.assertRaises(isolated.a.m.Cancelled):
+                        with network:
+                            network.start()
+            self.assertEqual(len(launches), 3)
+            self.assertEqual(events, [("cancel", 2), ("term", 2)])
+            self.assertTrue(network.closed)
+            for process, stream, root in witnesses:
+                self.assertIsNotNone(process.returncode)
+                self.assertTrue(stream.closed)
+                self.assertFalse(root.exists())
+            self.assertTrue(isolated.a.s.cancelled)
+            self.assertTrue(isolated.a.m.cancelled)
+        finally:
+            if not network.closed:
+                for process in launches:
+                    process.returncode = -15
+                network.close()
+
+    def test_actual_config_rewrite_keeps_three_bindings_and_offline_separation(self):
+        network = c.Network(
+            "/fixture/tor", "/fixture/gencert", time.monotonic() + 60,
+        )
+        with tempfile.TemporaryDirectory(prefix="consensus-config-") as root_name:
+            root = Path(root_name)
+            candidates = []
+            for index in range(3):
+                node = self.node(index=index, deadline=network.deadline)
+                relay_root = root / ("relay" + str(index))
+                keys = relay_root / "keys"
+                keys.mkdir(parents=True, mode=0o700)
+                (keys / "secret_id_key").write_bytes(b"mechanism-only-relay")
+                material_root = root / ("material" + str(index))
+                material_root.mkdir(mode=0o700)
+                (material_root / "authority_certificate").write_bytes(node.certificate)
+                (material_root / "authority_signing_key").write_bytes(
+                    b"mechanism-only-online-signing"
+                )
+                (material_root / "authority_identity_key").write_bytes(
+                    b"mechanism-only-encrypted-offline"
+                )
+                node.relay.data = relay_root
+                node.relay._closed = False
+                node.relay.process = SimpleNamespace(returncode=0)
+                node.materials._closed = False
+                node.materials.process = SimpleNamespace(returncode=0)
+                node.materials._check_file = lambda name, base=material_root: base / name
+                node.candidates = []
+                for _kind in range(2):
+                    reservation = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    candidates.append(reservation)
+                    node.candidates.append(reservation)
+                    reservation.bind(("127.0.0.1", 0))
+                node.or_port, node.dir_port = [
+                    item.getsockname()[1] for item in node.candidates
+                ]
+                network.nodes.append(node)
+            for node in network.nodes:
+                node.peers = network.nodes
+            try:
+                for index, node in enumerate(network.nodes):
+                    data = root / ("online" + str(index))
+                    data.mkdir(mode=0o700)
+                    config = root / ("torrc" + str(index))
+                    with mock.patch.object(
+                        c.a.m, "certificate_metadata",
+                        return_value=node.materials.metadata,
+                    ):
+                        node._write_config(
+                            str(data), str(root / ("control" + str(index))),
+                            str(root / ("cookie" + str(index))), str(config),
+                        )
+                    text = config.read_text(encoding="utf-8")
+                    actual = [
+                        line for line in text.splitlines()
+                        if line.startswith("DirAuthority ")
+                    ]
+                    expected = [
+                        "DirAuthority " + peer.name
+                        + " orport=" + str(peer.or_port)
+                        + " v3ident=" + peer.identity
+                        + " " + peer.address + ":" + str(peer.dir_port)
+                        + " " + peer.relay.fingerprint
+                        for peer in network.nodes
+                    ]
+                    self.assertEqual(actual, expected)
+                    self.assertIn("PublishServerDescriptor 1\n", text)
+                    self.assertNotIn("PublishServerDescriptor 0\n", text)
+                    self.assertIn("TestingV3AuthVotingStartOffset 0\n", text)
+                    for line in (
+                        "V3AuthVotingInterval 120 seconds\n",
+                        "V3AuthNIntervalsValid 3\n",
+                        "TestingV3AuthInitialVotingInterval 120 seconds\n",
+                        "V3AuthVoteDelay 20 seconds\n",
+                        "V3AuthDistDelay 20 seconds\n",
+                        "TestingV3AuthInitialVoteDelay 20 seconds\n",
+                        "TestingV3AuthInitialDistDelay 20 seconds\n",
+                    ):
+                        self.assertEqual(text.count(line), 1)
+                    self.assertIn("RunAsDaemon 0\n", text)
+                    self.assertIn("SocksPort 0\n", text)
+                    self.assertIn("UseDefaultFallbackDirs 0\n", text)
+                    self.assertEqual(
+                        (data / "keys" / "authority_certificate").read_bytes(),
+                        node.certificate,
+                    )
+                    self.assertEqual(
+                        (data / "keys" / "authority_signing_key").read_bytes(),
+                        b"mechanism-only-online-signing",
+                    )
+                    self.assertEqual(
+                        (data / "keys" / "secret_id_key").read_bytes(),
+                        b"mechanism-only-relay",
+                    )
+                    self.assertFalse((data / "keys" / "authority_identity_key").exists())
+                    self.assertTrue(
+                        node.materials._check_file("authority_identity_key").exists()
+                    )
+                    self.assertEqual(config.read_bytes(), node._config_bytes)
+            finally:
+                network.close()
+                for candidate in candidates:
+                    candidate.close()
+
+
+def cancel(signum, frame):
+    c.a.s.cancelled = True
+    c.a.m.cancelled = True
+
+
+def report_failures(result):
+    allowed = set(unittest.defaultTestLoader.getTestCaseNames(Controls))
+    for category, entries in (("FAIL", result.failures), ("ERROR", result.errors)):
+        for test, _traceback in entries:
+            case = getattr(test, "test_case", test)
+            method = getattr(case, "_testMethodName", None)
+            identity = (
+                "Controls." + method
+                if type(case) is Controls and method in allowed
+                else "<unknown-test>"
+            )
+            print(category + " " + identity, file=sys.stderr)
+
+
+from importlib.machinery import SourceFileLoader
+
+_operation_loader = SourceFileLoader(
+    "authority_consensus_operation",
+    str(Path(__file__).with_name("producer") / "operation.py"),
+)
+exec(
+    _operation_loader.get_code("authority_consensus_operation"),
+    globals(),
+)
+
+diagnostic_path = Path(__file__).with_name("producer") / "diagnostics.py"
+diagnostic_spec = importlib.util.spec_from_file_location(
+    "authority_consensus_diagnostics", diagnostic_path
+)
+diagnostic_module = importlib.util.module_from_spec(diagnostic_spec)
+diagnostic_module.__dict__.update({
+    name: value for name, value in globals().items()
+    if not name.startswith("__")
+})
+diagnostic_spec.loader.exec_module(diagnostic_module)
+PRODUCER_FAILURE_GATES = diagnostic_module.PRODUCER_FAILURE_GATES
+CONSENSUS_FAILURE_GATES = diagnostic_module.CONSENSUS_FAILURE_GATES
+FAILURE_STAGES = diagnostic_module.FAILURE_STAGES
+report_runtime_failure = diagnostic_module.report_runtime_failure
+DiagnosticControls = diagnostic_module.DiagnosticControls
+
+if __name__ == "__main__":
+    raise SystemExit(main())

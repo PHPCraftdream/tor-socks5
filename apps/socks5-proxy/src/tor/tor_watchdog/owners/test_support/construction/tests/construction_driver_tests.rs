@@ -615,3 +615,139 @@ async fn cancelled_phase_keeps_work_after_finish_deadline_until_settlement() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn first_fail_projects_before_rejection_without_polling_retained_work() {
+    use super::super::{SelectionEvent, SelectionObservation, SelectionOutcome};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let _serial = super::super::TEST_LIFECYCLE.lock().await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let listener = listener(deadline).await;
+    let address = listener.local_addr().unwrap();
+
+    let server = async {
+        let mut stream = accept(&listener, deadline).await;
+        assert_eq!(confirmed(&mut stream, 1, deadline).await[1], b'O');
+        eof(&mut stream, deadline).await;
+    };
+    let client = async {
+        let mut session = Session::new(connect(address, deadline).await, deadline);
+        session.start(0, deadline).unwrap();
+        let scope = Arc::clone(&session.hook.as_ref().unwrap().0);
+        let directory = tempfile::tempdir().unwrap();
+        let registry = ACTIVE
+            .scope(scope, async {
+                super::super::tests::registry(directory.path())
+            })
+            .await;
+        let registration = session.registrations.as_mut().unwrap().try_recv().unwrap();
+        let index = session.insert(registration);
+        session.records[index]
+            .registration
+            .consumer
+            .open(&mut session.client)
+            .await
+            .unwrap();
+        session.records[index].enabled = true;
+
+        let probe = Arc::clone(&registry.selection_probe);
+        let observation = SelectionObservation {
+            request_id: 9,
+            route: "DRIVER_SECRET_SENTINEL".into(),
+            identity: Some(91),
+            storage_slot: None,
+            outcome: SelectionOutcome::Reserved,
+            event: SelectionEvent::Reserved,
+        };
+        let mut producer =
+            Box::pin(probe.publish_construction(observation, true, Some(true), None, None));
+        assert!(futures::poll!(producer.as_mut()).is_pending());
+        poll_fn(|cx| {
+            session.records[index]
+                .registration
+                .consumer
+                .poll_receive(cx)
+        })
+        .await
+        .unwrap();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
+        session.work = Some(Box::pin(async move {
+            resume_rx.await.unwrap();
+            Ok(())
+        }));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let measured_polls = Arc::clone(&polls);
+        let mut work = session.work.take().unwrap();
+        session.work = Some(Box::pin(poll_fn(move |cx| {
+            measured_polls.fetch_add(1, Ordering::SeqCst);
+            work.as_mut().poll(cx)
+        })));
+        assert!(futures::poll!(session.work.as_mut().unwrap().as_mut()).is_pending());
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        let work_pointer = session.work.as_ref().unwrap().as_ref().get_ref()
+            as *const dyn Future<Output = std::thread::Result<()>>;
+        let export_before = probe.construction_export_snapshot();
+        assert!(!registry.cancel.is_cancelled());
+        assert!(session.records[index].registration.consumer.has_pending());
+
+        session.fail("construction delivery failed");
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert!(std::ptr::eq(
+            work_pointer,
+            session.work.as_ref().unwrap().as_ref().get_ref(),
+        ));
+        let first = session.failure_projection.as_ref().unwrap().clone();
+        assert!(first.contains(
+            "PT construction before-driver-fail category=construction-delivery-failed wire_state=ready"
+        ));
+        assert!(first.contains(
+            "work_present=true hook_present=true registration_receiver_present=true record_count=1"
+        ));
+        assert!(first.contains(
+            "record index=0 enabled=true closed=false finished=false registry_cancelled=false"
+        ));
+        assert!(first.contains(
+            "registry=1 opened=true stopped=false pending_envelope=true delivery_count=1 failed=false"
+        ));
+        assert!(first.contains("request=9 journal=1 identity=Some(91)"));
+        assert!(first.contains("producer_ack_sent_local=false failed=false"));
+        assert!(!first.contains("DRIVER_SECRET_SENTINEL"));
+        assert!(registry.cancel.is_cancelled());
+        assert!(!session.records[index].enabled);
+        assert!(!session.records[index].registration.consumer.has_pending());
+        assert!(!resume_tx.is_closed());
+        assert_eq!(probe.construction_export_snapshot(), export_before);
+
+        session.fail("owner scenario panicked");
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert_eq!(session.failure, Some("construction delivery failed"));
+        assert_eq!(session.failure_projection.as_ref(), Some(&first));
+        assert!(!resume_tx.is_closed());
+        assert!(futures::poll!(session.work.as_mut().unwrap().as_mut()).is_pending());
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+        let error = timeout_at(deadline, producer.as_mut())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "construction export acknowledgement rejected",
+        );
+        assert!(!probe.construction_export_snapshot().progress[0].acknowledged);
+        drop(producer);
+        resume_tx.send(()).unwrap();
+        session.work.as_mut().unwrap().as_mut().await.unwrap();
+        assert_eq!(polls.load(Ordering::SeqCst), 3);
+        session.work.take();
+        session.end_scope();
+        session.registrations.take();
+        registry.close_with_deadline(deadline).await.unwrap();
+        drop(session);
+    };
+    timeout_at(deadline, async {
+        tokio::join!(server, client);
+    })
+    .await
+    .unwrap();
+}

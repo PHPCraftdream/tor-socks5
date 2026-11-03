@@ -18,17 +18,46 @@ REQUIRED_DOCS = ("README.md", "tor-socks5.example.ktav",
 
 CONTRACT_MANIFEST = ".config/ci-contracts.toml"
 LICENSE_DOCS = frozenset({".github/release/license/README.md"})
-TOR_ANCHORS = ("scripts/testing/real-tor-channel.sh", "scripts/testing/real-tor-mutations.sh",
+TOR_ANCHORS = ("scripts/testing/tor/real-tor-channel.sh", "scripts/testing/tor/real-tor-mutations.sh",
                "apps/socks5-proxy/src/bridges/bridge_maintenance/real_channel_tests.rs")
 TOR_MARKERS = {
     "apps/socks5-proxy/src/bridges/bridge_maintenance.rs": ('#[cfg(test)]\n#[path = "bridge_maintenance/real_channel_tests.rs"]\nmod real_channel_tests;',),
     "packages/arti-wrapper/src/lib.rs": ('pub use arti_client::config::BridgeConfigBuilder;', 'pub use tor_chanmgr::ChannelUsage;', '        chanmgr.terminate_all_channels();\n', '        self.inner\n            .reconfigure(&config, Reconfigure::AllOrNothing)\n            .map_err(TorError::Reconfigure)?;\n'),
     TOR_ANCHORS[0]: ('TOR_REAL_ISOLATED', 'real_channel_heal_and_config_selection', '--ignored --exact'),
-    TOR_ANCHORS[1]: ('for mutation in terminate reconfigure', 'scripts/testing/real-tor-channel.sh', 'GITHUB_ACTIONS'),
+    TOR_ANCHORS[1]: ('for mutation in terminate reconfigure', 'scripts/testing/tor/real-tor-channel.sh', 'GITHUB_ACTIONS'),
     TOR_ANCHORS[2]: ('#[ignore', 'async fn real_channel_heal_and_config_selection()', 'ChannelUsage::UserTraffic'),
-    ".github/workflows/ci.yml": ("capabilities.real_tor_channel", "scripts/testing/real-tor-channel.sh", "scripts/testing/real-tor-mutations.sh"),
+    ".github/workflows/ci.yml": ("capabilities.real_tor_channel", "scripts/testing/tor/real-tor-channel.sh", "scripts/testing/tor/real-tor-mutations.sh"),
 }
 
+
+TOR_MARKERS[".github/workflows/ci.yml"] += (
+    "cargo test -p arti-wrapper --test owned_stream --locked --no-run --message-format=json",
+    'python3 -I scripts/testing/tor/artifact.py select "$work/stream-artifacts.json"',
+    'TOR_REAL_STREAM_BINARY="${{ steps.real-build.outputs.stream }}"',
+)
+TOR_MARKERS[TOR_ANCHORS[0]] += (
+    ': "${TOR_REAL_STREAM_BINARY:?}"',
+    '"$TOR_REAL_STREAM_BINARY" --ignored --list --format terse | python3 -I scripts/testing/tor/artifact.py ignored',
+    '"$TOR_REAL_STREAM_BINARY" --nocapture | python3 -I scripts/testing/tor/artifact.py mechanisms',
+)
+TOR_MARKERS[TOR_ANCHORS[1]] += (
+    ': "${TOR_REAL_STREAM_BINARY:?}"',
+    'TOR_REAL_STREAM_BINARY="$TOR_REAL_STREAM_BINARY" \\',
+)
+TOR_STREAM_SOURCES = (
+    "packages/arti-wrapper/tests/owned_stream.rs",
+    "packages/arti-wrapper/tests/owned_stream/consumer.rs",
+    "packages/arti-wrapper/tests/owned_stream/protocol.rs",
+    "packages/arti-wrapper/tests/owned_stream/mechanisms.rs",
+    "scripts/testing/tor/artifact.py",
+    "scripts/testing/tor/test_artifact.py",
+    "scripts/testing/tor/authority/producer/stream.py",
+    "scripts/testing/tor/authority/producer/stream_wire.py",
+    "scripts/testing/tor/authority/producer/operation.py",
+    "scripts/testing/tor/authority/producer/controls/suite.py",
+    "scripts/testing/tor/authority/producer/controls/stream.py",
+    "scripts/testing/tor/authority/producer/controls/stream_lifecycle.py",
+)
 
 PT_LEGACY_MARKERS = {
     ".github/pt_proxy/contract.py": ("assert_failed", "trap.assert_idle()", "assert_audit_clean()", "audit_counts('iptables')[0] > 0", "audit_counts('ip6tables')[2] > 0", "PROXY DONE"),
@@ -75,12 +104,55 @@ PT_DOMAIN_MARKERS = {
         "direct_domain.py", "DirectDomain(", PT_DOMAIN_GATE,
     ),
 }
-PT_GENERATIONS = ({}, PT_LEGACY_MARKERS, PT_MARKERS, PT_AUDIT_MARKERS, PT_DOMAIN_MARKERS)
+PT_DOMAIN_SPLIT_PATHS = (
+    ".github/pt_proxy/tests/domain/ownership.py",
+    ".github/pt_proxy/tests/domain/reactor.py",
+    ".github/pt_proxy/tests/domain/controls.py",
+)
+PT_DOMAIN_SPLIT_ANCHOR = ' / "tests" / "domain" / "ownership.py"'
+PT_DOMAIN_SPLIT_MARKERS = {
+    **PT_DOMAIN_MARKERS,
+    PT_DOMAIN_PATH: (
+        "class Denied(", "class ControlFailure(", "class Pin:",
+        "class Allocation:", "class Snapshot:", "class Record:",
+        "def identity(", "def socket_owned(", "def calibration_rules(",
+        "def freeze_schema(", "def intent_frame(", "def self_migrate(",
+        "def _gate_transaction(", "def direct_child_gate(",
+        "from importlib.machinery import SourceFileLoader",
+        PT_DOMAIN_SPLIT_ANCHOR,
+        ' / "tests" / "domain" / "reactor.py"',
+        ' / "tests" / "domain" / "controls.py"',
+        ").exec_module(sys.modules[__name__])",
+    ),
+    PT_DOMAIN_SPLIT_PATHS[0]: tuple(
+        marker for marker in PT_DOMAIN_MARKERS[PT_DOMAIN_PATH]
+        if marker != "def regression("
+    ),
+    PT_DOMAIN_SPLIT_PATHS[1]: (
+        "class Peer:", "class Reactor:", "def service(", "def step(",
+        "peer = Peer(self, connection)",
+        "self.selector.select(remaining(end))",
+    ),
+    PT_DOMAIN_SPLIT_PATHS[2]: (
+        "def _probe(", "class Actor:", "class SyntheticEvidence:",
+        "class ControlEpoch:", "class ControlRun:", "def regression(",
+        "runpy.run_path(",
+    ),
+}
+PT_GENERATIONS = (
+    {}, PT_LEGACY_MARKERS, PT_MARKERS, PT_AUDIT_MARKERS,
+    PT_DOMAIN_MARKERS, PT_DOMAIN_SPLIT_MARKERS,
+)
 
 
 def pt_generation(read):
     workflow = read(".github/workflows/ci.yml")
     audit = read(".github/pt_proxy/owner_audit.py")
+    if (
+        any(read(path) for path in PT_DOMAIN_SPLIT_PATHS)
+        or PT_DOMAIN_SPLIT_ANCHOR in read(PT_DOMAIN_PATH)
+    ):
+        return 5
     if (read(PT_DOMAIN_PATH) or
             any(marker in text for text in (workflow, audit)
                 for marker in ("direct_domain", "DirectDomain", "domain_ok"))):
@@ -134,6 +206,9 @@ def contract_capability(base_read, head_read):
     if after is None or (before is True and after is not True) or (evidence and not after):
         raise MappingError("missing mapping: real Tor capability declaration removed or inconsistent")
     if after:
+        for path in TOR_STREAM_SOURCES:
+            if not head_read(path):
+                raise MappingError("missing mapping: real Tor stream source: " + path)
         for path, markers in TOR_MARKERS.items():
             text = head_read(path)
             if not text or any(marker not in text for marker in markers):
@@ -575,9 +650,48 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
             if not sdk:
                 raise MappingError("missing mapping: SDK отсутствует в графе")
             seed(sdk, path)
-        elif path in ("scripts/testing/ci_planner.py", "scripts/testing/test_ci_planner.py", "scripts/testing/test_ci_integration.py", "scripts/testing/selftest.sh", "scripts/testing/test-affected.sh", "scripts/check-line-limit.sh", "scripts/check-dir-entries.sh", ".githooks/pre-push"):
+        elif path in ("scripts/testing/ci_planner.py", "scripts/testing/test_ci_planner/run.py", "scripts/testing/test_ci_planner/domain_cases.py", "scripts/testing/test_ci_integration.py", "scripts/testing/selftest.sh", "scripts/testing/test-affected.sh", "scripts/check-line-limit.sh", "scripts/check-dir-entries.sh", ".githooks/pre-push"):
             add("fast", path)
-        elif path in ("scripts/testing/real-tor-channel.sh", "scripts/testing/real-tor-mutations.sh"):
+        elif path == "scripts/testing/test_ci_planner.py":
+            old, new = blobs(path)
+            if not old or new != "":
+                raise MappingError("missing mapping: " + path)
+            add("fast", path)
+        elif path in (
+                "scripts/testing/real-tor-channel.sh",
+                "scripts/testing/real-tor-mutations.sh",
+                "scripts/testing/real_tor_supervisor.py",
+                "scripts/testing/test_real_tor_supervisor.py",
+                "scripts/testing/tor/authority/producer.py"):
+            old, new = blobs(path)
+            if not old or new != "":
+                raise MappingError("missing mapping: " + path)
+            add("tor", path)
+        elif path in (
+                "scripts/testing/tor/real-tor-channel.sh",
+                "scripts/testing/tor/real-tor-mutations.sh",
+                "scripts/testing/tor/real_tor_supervisor.py",
+                "scripts/testing/tor/test_real_tor_supervisor.py",
+                "scripts/testing/tor/artifact.py",
+                "scripts/testing/tor/test_artifact.py",
+                "scripts/testing/tor/authority/materials.py",
+                "scripts/testing/tor/authority/test_materials.py",
+                "scripts/testing/tor/authority/startup.py",
+                "scripts/testing/tor/authority/test_startup.py",
+                "scripts/testing/tor/authority/consensus.py",
+                "scripts/testing/tor/authority/test_consensus.py",
+                "scripts/testing/tor/authority/producer/entry.py",
+                "scripts/testing/tor/authority/producer/diagnostics.py",
+                "scripts/testing/tor/authority/producer/stream.py",
+                "scripts/testing/tor/authority/producer/stream_wire.py",
+                "scripts/testing/tor/authority/producer/operation.py",
+                "scripts/testing/tor/authority/producer/controls/stream.py",
+                "scripts/testing/tor/authority/producer/controls/stream_lifecycle.py",
+                "scripts/testing/tor/authority/producer/controls/suite.py",
+                "scripts/testing/tor/authority/producer/controls/fixture.py",
+                "scripts/testing/tor/authority/producer/controls/descriptors.py",
+                "scripts/testing/tor/authority/producer/controls/admission.py",
+                "scripts/testing/tor/authority/producer/controls/readiness.py"):
             add("tor", path)
         elif path.startswith(".github/pt_proxy/"):
             add("pt-proxy", path)
@@ -639,7 +753,7 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
     # Граница PT зависит от исполняемого proxy и его зависимостей.
     pt_roots = graph.named({"ptrs-gesher-lyrebird", "ptrs-gesher-webtunnel", "tor-socks5-proto", "tor-ptmgr", "arti-wrapper", "arti-client"})
     pt_upstream = graph.closure(pt_roots, graph.forward) if pt_roots else set()
-    if seeds & pt_upstream or any(path.startswith(("apps/socks5-proxy/", "vendor/lyrebird/", "vendor/webtunnel/", "packages/socks5-proto/", ".github/actions/setup-local-sdk/")) or path in ("scripts/testing/ci_planner.py", "scripts/testing/test_ci_planner.py", "scripts/testing/test_ci_integration.py") for path in paths):
+    if seeds & pt_upstream or any(path.startswith(("apps/socks5-proxy/", "vendor/lyrebird/", "vendor/webtunnel/", "packages/socks5-proto/", ".github/actions/setup-local-sdk/")) or path in ("scripts/testing/ci_planner.py", "scripts/testing/test_ci_planner.py", "scripts/testing/test_ci_planner/run.py", "scripts/testing/test_ci_planner/domain_cases.py", "scripts/testing/test_ci_integration.py") for path in paths):
         add("pt-proxy", "изменена граница PT или её зависимость")
     if mode == "sprint-full":
         selected = set(graph.members)

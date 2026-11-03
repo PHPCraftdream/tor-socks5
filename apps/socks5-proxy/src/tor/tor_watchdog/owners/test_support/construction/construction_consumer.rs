@@ -91,6 +91,55 @@ impl Consumer {
         self.terminal.as_ref()
     }
 
+    pub(super) fn append_failure_projection(&self, output: &mut String, record: usize) {
+        use std::fmt::Write as _;
+
+        let _ = writeln!(
+            output,
+            "consumer record={} registry={} opened={} stopped={} pending_envelope={} delivery_count={} failed={} terminal_present={}",
+            record,
+            self.registry,
+            self.opened,
+            self.stopped,
+            self.pending.is_some(),
+            self.deliveries.len(),
+            self.failure.is_some(),
+            self.terminal.is_some(),
+        );
+        for delivery in self.deliveries.iter().take(CAPACITY) {
+            let evidence = &delivery.evidence;
+            let operation =
+                delivery
+                    .receipt
+                    .as_ref()
+                    .map_or("absent", |receipt| match receipt.operation {
+                        Operation::Open => "open",
+                        Operation::Reserved => "reserved",
+                        Operation::Assigned => "assigned",
+                        Operation::Global => "global",
+                        Operation::Failed => "failed",
+                        Operation::End => "end",
+                        Operation::Finish => "finish",
+                    });
+            let _ = writeln!(
+                output,
+                "delivery record={} request={} journal={} identity={:?} slot={:?} receipt_present={} receipt_registry={:?} receipt_transaction={:?} receipt_journal={:?} receipt_operation={} producer_ack_sent_local={} failed={}",
+                record,
+                evidence.request_id,
+                evidence.journal_sequence,
+                evidence.identity,
+                evidence.storage.as_ref().map(|storage| storage.slot),
+                delivery.receipt.is_some(),
+                delivery.receipt.as_ref().map(|receipt| receipt.registry),
+                delivery.receipt.as_ref().map(|receipt| receipt.transaction),
+                delivery.receipt.as_ref().map(|receipt| receipt.journal_sequence),
+                operation,
+                delivery.producer_ack_sent,
+                delivery.failure.is_some(),
+            );
+        }
+    }
+
     fn fail(&mut self, error: Error) -> Error {
         self.failure.get_or_insert(error.clone());
         error

@@ -2,7 +2,7 @@
 # Fail if a first-party directory holds more than MAX_ENTRIES direct entries
 # (files plus sub-directories). Enforced by CI (.github/workflows/ci.yml,
 # dir-entries job); together with scripts/check-line-limit.sh (at most 1000
-# lines per Rust file) it is the project's code-structure rule: small folders,
+# physical lines per first-party code file) it is the project's structure rule:
 # small files, so a reader can hold a directory in their head.
 #
 # Counts what git tracks, so the result is the same locally and in CI. A new

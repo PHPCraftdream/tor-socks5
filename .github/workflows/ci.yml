@@ -47,8 +47,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Test SDK contract rejection controls
         run: python -I .github/actions/setup-local-sdk/verify.py --self-test
-      - run: python -I scripts/testing/test_ci_planner.py
+      - run: python -I scripts/testing/test_ci_planner/run.py
       - run: python -I scripts/testing/test_ci_integration.py
+      - run: python -I scripts/testing/tor/test_artifact.py
       - id: plan
         env:
           EVENT: ${{ github.event_name }}
@@ -98,20 +99,28 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           cargo test -p socks5-proxy --bin socks5-proxy --locked --no-run --message-format=json > "$work/artifacts.json"
           python3 -I -c 'import json,sys; p=sys.argv[1]; a=[x["executable"] for l in open(p) if (x:=json.loads(l)).get("reason")=="compiler-artifact" and x.get("target",{}).get("name")=="socks5-proxy" and x.get("profile",{}).get("test") and x.get("executable")]; assert len(a)==1, a; open(sys.argv[2], "w").write(a[0])' "$work/artifacts.json" "$work/test-path"
+          cargo test -p arti-wrapper --test owned_stream --locked --no-run --message-format=json > "$work/stream-artifacts.json"
+          python3 -I scripts/testing/tor/artifact.py select "$work/stream-artifacts.json" > "$work/stream-path"
           echo "tor=$work/tor-0.4.9.15/src/app/tor" >> "$GITHUB_OUTPUT"
+          test -x "$work/tor-0.4.9.15/src/tools/tor-gencert"
+          echo "gencert=$work/tor-0.4.9.15/src/tools/tor-gencert" >> "$GITHUB_OUTPUT"
           echo "test=$(<"$work/test-path")" >> "$GITHUB_OUTPUT"
+          echo "stream=$(<"$work/stream-path")" >> "$GITHUB_OUTPUT"
       - name: Проверить в сетевом пространстве без внешних интерфейсов
         shell: bash
         run: |
           set -euo pipefail
           command -v unshare
           command -v ip
-          sudo unshare --net -- timeout --signal=TERM --kill-after=15s 10m env GITHUB_ACTIONS=true TOR_REAL_ISOLATED=yes TOR_REAL_BINARY="${{ steps.real-build.outputs.tor }}" TOR_REAL_TEST_BINARY="${{ steps.real-build.outputs.test }}" bash scripts/testing/real-tor-channel.sh
+          deadline=$(python3 -I -c 'import time; print(time.monotonic() + 600)')
+          sudo unshare --net -- timeout --signal=TERM --kill-after=15s 10m env GITHUB_ACTIONS=true TOR_REAL_ISOLATED=yes TOR_REAL_DEADLINE="$deadline" TOR_REAL_BINARY="${{ steps.real-build.outputs.tor }}" TOR_REAL_GENCERT_BINARY="${{ steps.real-build.outputs.gencert }}" TOR_REAL_TEST_BINARY="${{ steps.real-build.outputs.test }}" TOR_REAL_STREAM_BINARY="${{ steps.real-build.outputs.stream }}" bash scripts/testing/tor/real-tor-channel.sh
       - name: Проверить отрицательные мутации в изоляции
         shell: bash
         env:
           TOR_REAL_BINARY: ${{ steps.real-build.outputs.tor }}
-        run: bash scripts/testing/real-tor-mutations.sh
+          TOR_REAL_GENCERT_BINARY: ${{ steps.real-build.outputs.gencert }}
+          TOR_REAL_STREAM_BINARY: ${{ steps.real-build.outputs.stream }}
+        run: bash scripts/testing/tor/real-tor-mutations.sh
 
   pt-proxy-contract:
     needs: plan
@@ -190,7 +199,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Check first-party Rust files stay under 1000 lines
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Test first-party line-limit enforcement
+        run: sh scripts/testing/selftest.sh
+      - name: Check maintained first-party source files stay within 1000 lines
+        if: always()
         run: sh scripts/check-line-limit.sh
 
   dir-entries:
@@ -501,7 +516,7 @@ jobs:
       - shell: bash
         run: |
           python3 -I -c 'from pathlib import Path; p=Path("Cargo.toml"); s=p.read_text(encoding="utf-8"); marker="    \"vendor/tor-guardmgr\","; assert s.count(marker)==1; p.write_text(s.replace(marker, marker + "\n    \"vendor/tor-chanmgr\",\n    \"vendor/tor-dirmgr\",\n    \"vendor/tor-dirclient\","), encoding="utf-8")'
-          cargo test -p tor-chanmgr -p tor-dirclient -p tor-dirmgr --features tor-dirmgr/static
+          cargo test -p tor-chanmgr -p tor-dirclient -p tor-dirmgr --features tor-dirmgr/static,tor-chanmgr/pt-client
           cargo test -p tor-circmgr --all-features
 
   features:

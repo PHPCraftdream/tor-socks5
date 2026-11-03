@@ -327,6 +327,56 @@ async fn construction_case(accept_storage: bool) {
     assert_eq!(snapshot.creation_attempts, usize::from(accept_storage));
     assert!(snapshot.progress[0].acknowledged);
     assert_eq!(snapshot.progress[1].acknowledged, accept_storage);
+    {
+        use super::super::owner_lifecycle::{Kind, Outcome, Stage};
+        let entry = registry.state.lock().await.entries[0].clone();
+        let lifecycle = entry.lifecycle.snapshot();
+        assert_eq!(lifecycle.suppressed, 0);
+        assert!(!lifecycle.suppression_reported);
+        let returned: Vec<_> = lifecycle
+            .records
+            .iter()
+            .filter(|record| record.kind == Kind::Returned)
+            .map(|record| (record.stage, record.outcome))
+            .collect();
+        let expected = if accept_storage {
+            vec![
+                (Stage::Storage, Outcome::Ok),
+                (Stage::Export, Outcome::Ok),
+                (Stage::Create, Outcome::Ok),
+                (Stage::Bootstrap, Outcome::Ok),
+                (Stage::Worker, Outcome::Ok),
+                (Stage::Select, Outcome::Ok),
+            ]
+        } else {
+            vec![
+                (Stage::Storage, Outcome::Ok),
+                (Stage::Export, Outcome::Error),
+                (Stage::Worker, Outcome::Error),
+                (Stage::Select, Outcome::Error),
+            ]
+        };
+        assert_eq!(returned, expected);
+        for record in &lifecycle.records {
+            assert_eq!(record.context.initiator, Some(reserved.request_id));
+            assert_eq!(Some(record.context.entry), reserved.identity);
+            assert_eq!(record.context.probe, Arc::as_ptr(&probe) as usize,);
+        }
+        if accept_storage {
+            assert!(lifecycle.first_failure.is_none());
+        } else {
+            let first = lifecycle.first_failure.unwrap();
+            assert_eq!(first.stage, Stage::Export);
+            assert_eq!(first.outcome, Outcome::Error);
+        }
+        if !accept_storage {
+            let error = match &selection {
+                Err(error) => error,
+                Ok(_) => panic!("rejected storage acknowledgement must fail selection"),
+            };
+            assert_eq!(error.to_string(), "конструктор Tor завершился ошибкой",);
+        }
+    }
     drop(selection);
     drop(lease);
     if accept_storage {
@@ -417,6 +467,43 @@ async fn reuse_preserves_the_original_construction_request() {
         acknowledge(reservation, true);
         release_tx.send(()).unwrap();
         drop(second.await.unwrap());
+        {
+            use super::super::owner_lifecycle::{Kind, Outcome, Stage};
+            let entry = registry.state.lock().await.entries[0].clone();
+            let lifecycle = entry.lifecycle.snapshot();
+            assert!(lifecycle.suppression_reported);
+            assert!(lifecycle.suppressed >= 1);
+            assert!(lifecycle.first_failure.is_none());
+            assert!(lifecycle.records.iter().all(|record| {
+                record.context.initiator == Some(original.request_id)
+                    && Some(record.context.entry) == original.identity
+            }));
+            let abandoned = lifecycle
+                .records
+                .iter()
+                .find(|record| record.stage == Stage::Select && record.kind == Kind::Abandoned)
+                .unwrap();
+            assert_eq!(abandoned.outcome, Outcome::Dropped);
+            assert_eq!(abandoned.waiter, Some(original.request_id));
+            let returned = lifecycle
+                .records
+                .iter()
+                .find(|record| record.stage == Stage::Select && record.kind == Kind::Returned)
+                .unwrap();
+            assert_eq!(returned.outcome, Outcome::Ok);
+            assert_eq!(returned.waiter, Some(reused.request_id));
+            assert!(abandoned.sequence < returned.sequence);
+            assert_eq!(
+                lifecycle
+                    .records
+                    .iter()
+                    .filter(|record| {
+                        record.stage == Stage::Create && record.kind == Kind::Returned
+                    })
+                    .count(),
+                1,
+            );
+        }
 
         assert!(matches!(
             receiver.try_recv(),
@@ -453,4 +540,9 @@ async fn reuse_preserves_the_original_construction_request() {
     tokio::time::timeout_at(deadline, body).await.unwrap();
     drop(lease);
     registry.close_with_deadline(deadline).await.unwrap();
+}
+
+mod owner_lifecycle_regressions {
+    use super::*;
+    include!("owner_lifecycle_tests.rs");
 }
