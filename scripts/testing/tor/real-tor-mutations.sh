@@ -3,6 +3,7 @@ set -euo pipefail
 [ "${GITHUB_ACTIONS:-}" = true ] || exit 1
 : "${TOR_REAL_BINARY:?}"
 : "${TOR_REAL_GENCERT_BINARY:?}"
+: "${TOR_REAL_STREAM_BINARY:?}"
 : "${GITHUB_WORKSPACE:?}"
 cd "$GITHUB_WORKSPACE"
 source_file="$GITHUB_WORKSPACE/packages/arti-wrapper/src/lib.rs"
@@ -50,6 +51,7 @@ PY
         TOR_REAL_BINARY="$TOR_REAL_BINARY" \
         TOR_REAL_GENCERT_BINARY="$TOR_REAL_GENCERT_BINARY" \
         TOR_REAL_TEST_BINARY="$binary" \
+        TOR_REAL_STREAM_BINARY="$TOR_REAL_STREAM_BINARY" \
         bash scripts/testing/tor/real-tor-channel.sh \
         > "$work/$mutation.log" 2>&1
     status=$?

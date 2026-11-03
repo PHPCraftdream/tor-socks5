@@ -63,7 +63,7 @@ def build():
             )
             return (
                 b"router " + node.name.encode("ascii")
-                + b" 127.0.0.1 "
+                + b" " + node.address.encode("ascii") + b" "
                 + str(node.or_port).encode("ascii") + b" 0 "
                 + str(node.dir_port).encode("ascii") + b"\n"
                 b"fingerprint "
@@ -133,7 +133,7 @@ def build():
                     node._config_bytes = b"mechanism-only-config\n"
                     node.config_path.write_bytes(node._config_bytes)
                     node._identity_and_listeners = mock.Mock(
-                        return_value=("127.0.0.1", node.dir_port)
+                        return_value=(node.address, node.dir_port)
                     )
                     network.active.append(node)
                 state["descriptors"] = [
@@ -174,7 +174,8 @@ def build():
                         body += (
                             b"dir-source " + node.name.encode("ascii")
                             + b" " + node.identity.encode("ascii")
-                            + b" 127.0.0.1 127.0.0.1 "
+                            + b" " + node.address.encode("ascii")
+                            + b" " + node.address.encode("ascii") + b" "
                             + str(node.dir_port).encode("ascii")
                             + b" " + str(node.or_port).encode("ascii")
                             + b"\nvote-digest "
@@ -203,7 +204,7 @@ def build():
                             + b" " + identity
                             + (b"" if micro else b" " + encoded(digest))
                             + b" " + date(86400)
-                            + b" 127.0.0.1 "
+                            + b" " + node.address.encode("ascii") + b" "
                             + str(node.or_port).encode("ascii")
                             + b" " + str(node.dir_port).encode("ascii")
                             + b"\n"

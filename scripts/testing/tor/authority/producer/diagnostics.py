@@ -51,6 +51,7 @@ child-unreaped stream-unreleased directory-unreleased socket-unreleased
 FAILURE_STAGES = frozenset({
     "prepare", "launch", "consensus", "votes", "quorum",
     "producer", "producer-negative", "producer-readiness",
+    "stream", "stream-controls",
 })
 
 
@@ -59,6 +60,7 @@ def report_runtime_failure(error, stage):
         stage = "prepare"
     error_type = type(error)
     categories = {
+        p.StreamError: "stream",
         p.ProducerError: "producer",
         c.ConsensusError: "consensus",
         c.a.StartupError: "startup",
@@ -78,6 +80,7 @@ def report_runtime_failure(error, stage):
     allowed = (
         PRODUCER_FAILURE_GATES if error_type is p.ProducerError
         else CONSENSUS_FAILURE_GATES if error_type is c.ConsensusError
+        else p.STREAM_FAILURE_GATES if error_type is p.StreamError
         else None
     )
     if allowed is not None:
@@ -120,7 +123,8 @@ class DiagnosticControls(unittest.TestCase):
             "md": bytes(32),
         }
         node = SimpleNamespace(
-            name="localA", or_port=21001, dir_port=21002,
+            name="localA", address="127.0.0.1",
+            or_port=21001, dir_port=21002,
         )
         with self.assertRaises(p.ProducerError) as producer_failure:
             p.check_row(row, node, "guard", True)
@@ -158,6 +162,12 @@ class DiagnosticControls(unittest.TestCase):
                     " type=producer gate=" + label + "\n",
                 )
 
+        self.assertEqual(
+            self.capture_failure(p.StreamError("stream-peer"), "stream"),
+            "Tor authority consensus failed: stream\n"
+            "Tor authority failure detail: type=stream gate=stream-peer\n",
+        )
+
     def test_unknown_and_private_payloads_are_not_formatted(self):
         calls = []
 
@@ -183,6 +193,9 @@ class DiagnosticControls(unittest.TestCase):
             pass
 
         for error, category in (
+            (p.StreamError("private-path-or-key"), "stream"),
+            (p.StreamError("stream-peer", PrivateValue()), "stream"),
+            (p.StreamError(PrivateValue()), "stream"),
             (p.ProducerError("private-path-or-key"), "producer"),
             (p.ProducerError("producer-field", "private"), "producer"),
             (p.ProducerError(PrivateValue()), "producer"),
@@ -203,6 +216,12 @@ class DiagnosticControls(unittest.TestCase):
 
     def test_main_failure_status_and_special_handlers_are_preserved(self):
         cases = (
+            (
+                p.StreamError("stream-peer"),
+                1,
+                "Tor authority consensus failed: stream\n"
+                "Tor authority failure detail: type=stream gate=stream-peer\n",
+            ),
             (
                 p.ProducerError("producer-md-cache"),
                 1,
@@ -250,7 +269,10 @@ class DiagnosticControls(unittest.TestCase):
         )
         for error, expected_status, expected_error in cases:
             with self.subTest(category=type(error)):
-                network = SimpleNamespace(stage="producer")
+                network = SimpleNamespace(
+                    stage="stream"
+                    if type(error) is p.StreamError else "producer"
+                )
                 output = io.StringIO()
                 errors = io.StringIO()
                 results = [
@@ -269,6 +291,7 @@ class DiagnosticControls(unittest.TestCase):
                     "TOR_REAL_DEADLINE": str(time.monotonic() + 60),
                     "TOR_REAL_BINARY": "/fixture/tor",
                     "TOR_REAL_GENCERT_BINARY": "/fixture/gencert",
+                    "TOR_REAL_STREAM_BINARY": "/fixture/owned_stream",
                 }
                 with mock.patch.dict(os.environ, environment):
                     with mock.patch.object(
@@ -277,10 +300,15 @@ class DiagnosticControls(unittest.TestCase):
                         with mock.patch.object(
                             signal, "signal", return_value=None,
                         ):
-                            with mock.patch.object(
-                                p, "run_controls",
-                                return_value=(True, ()),
-                            ) as producer_controls:
+                            with (
+                                mock.patch.object(
+                                    p, "run_controls",
+                                    return_value=(True, ()),
+                                ) as producer_controls,
+                                mock.patch.object(
+                                    p, "run_stream_controls", return_value=True,
+                                ) as stream_controls,
+                            ):
                                 with mock.patch.object(
                                     p, "implementation",
                                     return_value=mock.Mock(
@@ -288,7 +316,7 @@ class DiagnosticControls(unittest.TestCase):
                                     ),
                                 ):
                                     with mock.patch.object(
-                                        p, "run_live", side_effect=error,
+                                        p, "run_stream_live", side_effect=error,
                                     ) as operation:
                                         with mock.patch.object(
                                             sys, "stdout", output,
@@ -296,12 +324,22 @@ class DiagnosticControls(unittest.TestCase):
                                             with mock.patch.object(
                                                 sys, "stderr", errors,
                                             ):
-                                                status = main()
+                                                with mock.patch.object(
+                                                    Path, "is_file",
+                                                    return_value=True,
+                                                ):
+                                                    status = main()
                 self.assertEqual(status, expected_status)
                 self.assertEqual(errors.getvalue(), expected_error)
                 self.assertEqual(runner.run.call_count, 2)
                 producer_controls.assert_called_once_with(c)
-                operation.assert_called_once_with(network, c)
+                stream_controls.assert_called_once_with(
+                    c, float(environment["TOR_REAL_DEADLINE"]),
+                    report_runtime_failure,
+                )
+                operation.assert_called_once_with(
+                    network, c, "/fixture/owned_stream"
+                )
                 self.assertNotIn(
                     "Tor owned guard middle exit producer controls passed",
                     output.getvalue(),

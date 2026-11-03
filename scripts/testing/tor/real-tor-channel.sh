@@ -6,12 +6,15 @@ set -euo pipefail
 : "${TOR_REAL_BINARY:?}"
 : "${TOR_REAL_GENCERT_BINARY:?}"
 : "${TOR_REAL_TEST_BINARY:?}"
+: "${TOR_REAL_STREAM_BINARY:?}"
 : "${TOR_REAL_DEADLINE:?}"
 [ "$(ip -o link show | wc -l)" -eq 1 ]
 [ "$(ip -o link show | awk '{print $2}')" = 'lo:' ]
 [ -z "$(ip -4 route show default)" ]
 [ -z "$(ip -6 route show default)" ]
 ip link set lo up
+"$TOR_REAL_STREAM_BINARY" --ignored --list --format terse | python3 -I scripts/testing/tor/artifact.py ignored
+"$TOR_REAL_STREAM_BINARY" --nocapture | python3 -I scripts/testing/tor/artifact.py mechanisms
 python3 -I scripts/testing/tor/test_real_tor_supervisor.py
 python3 -I scripts/testing/tor/authority/test_materials.py
 python3 -I scripts/testing/tor/authority/test_startup.py

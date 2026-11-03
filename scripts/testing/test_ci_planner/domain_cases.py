@@ -176,3 +176,80 @@ class PTGenerations(unittest.TestCase):
         self.assertTrue(p.pt_contract(self.read(audited), self.read(domain)))
 
 
+
+
+class TorStreamRouting(unittest.TestCase):
+    def test_exact_stream_helpers_select_tor(self):
+        paths = (
+            "scripts/testing/tor/artifact.py",
+            "scripts/testing/tor/test_artifact.py",
+            "scripts/testing/tor/authority/producer/stream.py",
+            "scripts/testing/tor/authority/producer/stream_wire.py",
+            "scripts/testing/tor/authority/producer/operation.py",
+            "scripts/testing/tor/authority/producer/controls/suite.py",
+            "scripts/testing/tor/authority/producer/controls/stream.py",
+            "scripts/testing/tor/authority/producer/controls/stream_lifecycle.py",
+        )
+        for path in paths:
+            with self.subTest(path=path):
+                result = p.plan(graph(), [path], lambda name: ("", "source\n"))
+                self.assertEqual(result["segments"], ["fast", "tor"])
+                self.assertEqual(result["packages"], [])
+                self.assertFalse(result["full"])
+
+    def test_similarly_named_stream_helpers_fail_closed(self):
+        paths = (
+            "scripts/testing/tor/artifact.py.bak",
+            "scripts/testing/tor/test_artifact_extra.py",
+            "scripts/testing/tor/authority/producer/stream_extra.py",
+            "scripts/testing/tor/authority/producer/operation.py.bak",
+            "scripts/testing/tor/authority/producer/controls/suite_extra.py",
+            "scripts/testing/tor/authority/producer/nested/stream.py",
+            "scripts/testing/tor/authority/producer/controls/stream.py.bak",
+            "scripts/testing/tor/authority/producer/controls/stream_lifecycle_extra.py",
+        )
+        for path in paths:
+            with self.subTest(path=path):
+                with self.assertRaises(p.MappingError):
+                    p.plan(graph(), [path], lambda name: ("", "source\n"))
+
+    def test_owned_stream_rust_paths_select_existing_tor_job(self):
+        for suffix in (
+            "owned_stream.rs",
+            "owned_stream/consumer.rs",
+            "owned_stream/protocol.rs",
+            "owned_stream/mechanisms.rs",
+        ):
+            path = "packages/arti-wrapper/tests/" + suffix
+            with self.subTest(path=path):
+                result = p.plan(graph(), [path], lambda name: ("", "source\n"))
+                self.assertIn("tor", result["segments"])
+                self.assertIn("arti-wrapper", result["packages"])
+                self.assertFalse(result["full"])
+
+    def test_enabled_capability_requires_every_stream_source(self):
+        installed = {
+            path: "\n".join(markers) + "\n"
+            for path, markers in p.TOR_MARKERS.items()
+        }
+        installed[p.CONTRACT_MANIFEST] = "real_tor_channel = true\n"
+        for path in p.TOR_STREAM_SOURCES:
+            installed[path] = "source\n"
+        read = lambda data: lambda path: data.get(path, "")
+        self.assertTrue(p.contract_capability(read({}), read(installed)))
+        for path in p.TOR_STREAM_SOURCES:
+            broken = dict(installed)
+            del broken[path]
+            with self.subTest(missing=path):
+                with self.assertRaises(p.MappingError):
+                    p.contract_capability(read(installed), read(broken))
+        for path in (
+            ".github/workflows/ci.yml",
+            "scripts/testing/tor/real-tor-channel.sh",
+            "scripts/testing/tor/real-tor-mutations.sh",
+        ):
+            broken = dict(installed)
+            broken[path] = broken[path].replace("TOR_REAL_STREAM_BINARY", "")
+            with self.subTest(disconnected=path):
+                with self.assertRaises(p.MappingError):
+                    p.contract_capability(read(installed), read(broken))

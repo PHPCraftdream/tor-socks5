@@ -30,6 +30,35 @@ TOR_MARKERS = {
 }
 
 
+TOR_MARKERS[".github/workflows/ci.yml"] += (
+    "cargo test -p arti-wrapper --test owned_stream --locked --no-run --message-format=json",
+    'python3 -I scripts/testing/tor/artifact.py select "$work/stream-artifacts.json"',
+    'TOR_REAL_STREAM_BINARY="${{ steps.real-build.outputs.stream }}"',
+)
+TOR_MARKERS[TOR_ANCHORS[0]] += (
+    ': "${TOR_REAL_STREAM_BINARY:?}"',
+    '"$TOR_REAL_STREAM_BINARY" --ignored --list --format terse | python3 -I scripts/testing/tor/artifact.py ignored',
+    '"$TOR_REAL_STREAM_BINARY" --nocapture | python3 -I scripts/testing/tor/artifact.py mechanisms',
+)
+TOR_MARKERS[TOR_ANCHORS[1]] += (
+    ': "${TOR_REAL_STREAM_BINARY:?}"',
+    'TOR_REAL_STREAM_BINARY="$TOR_REAL_STREAM_BINARY" \\',
+)
+TOR_STREAM_SOURCES = (
+    "packages/arti-wrapper/tests/owned_stream.rs",
+    "packages/arti-wrapper/tests/owned_stream/consumer.rs",
+    "packages/arti-wrapper/tests/owned_stream/protocol.rs",
+    "packages/arti-wrapper/tests/owned_stream/mechanisms.rs",
+    "scripts/testing/tor/artifact.py",
+    "scripts/testing/tor/test_artifact.py",
+    "scripts/testing/tor/authority/producer/stream.py",
+    "scripts/testing/tor/authority/producer/stream_wire.py",
+    "scripts/testing/tor/authority/producer/operation.py",
+    "scripts/testing/tor/authority/producer/controls/suite.py",
+    "scripts/testing/tor/authority/producer/controls/stream.py",
+    "scripts/testing/tor/authority/producer/controls/stream_lifecycle.py",
+)
+
 PT_LEGACY_MARKERS = {
     ".github/pt_proxy/contract.py": ("assert_failed", "trap.assert_idle()", "assert_audit_clean()", "audit_counts('iptables')[0] > 0", "audit_counts('ip6tables')[2] > 0", "PROXY DONE"),
     ".github/workflows/ci.yml": ("pt-proxy-contract:", ".github/pt_proxy/contract.py", "ip -6 addr add ::2/128 dev lo", "PT_AUDIT"),
@@ -177,6 +206,9 @@ def contract_capability(base_read, head_read):
     if after is None or (before is True and after is not True) or (evidence and not after):
         raise MappingError("missing mapping: real Tor capability declaration removed or inconsistent")
     if after:
+        for path in TOR_STREAM_SOURCES:
+            if not head_read(path):
+                raise MappingError("missing mapping: real Tor stream source: " + path)
         for path, markers in TOR_MARKERS.items():
             text = head_read(path)
             if not text or any(marker not in text for marker in markers):
@@ -640,6 +672,8 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
                 "scripts/testing/tor/real-tor-mutations.sh",
                 "scripts/testing/tor/real_tor_supervisor.py",
                 "scripts/testing/tor/test_real_tor_supervisor.py",
+                "scripts/testing/tor/artifact.py",
+                "scripts/testing/tor/test_artifact.py",
                 "scripts/testing/tor/authority/materials.py",
                 "scripts/testing/tor/authority/test_materials.py",
                 "scripts/testing/tor/authority/startup.py",
@@ -648,6 +682,12 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
                 "scripts/testing/tor/authority/test_consensus.py",
                 "scripts/testing/tor/authority/producer/entry.py",
                 "scripts/testing/tor/authority/producer/diagnostics.py",
+                "scripts/testing/tor/authority/producer/stream.py",
+                "scripts/testing/tor/authority/producer/stream_wire.py",
+                "scripts/testing/tor/authority/producer/operation.py",
+                "scripts/testing/tor/authority/producer/controls/stream.py",
+                "scripts/testing/tor/authority/producer/controls/stream_lifecycle.py",
+                "scripts/testing/tor/authority/producer/controls/suite.py",
                 "scripts/testing/tor/authority/producer/controls/fixture.py",
                 "scripts/testing/tor/authority/producer/controls/descriptors.py",
                 "scripts/testing/tor/authority/producer/controls/admission.py",

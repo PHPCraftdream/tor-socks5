@@ -145,8 +145,8 @@ def consensus_metadata(data, nodes, now):
         fields, digest = entries[node.identity]
         require(
             fields[1] == node.name.encode("ascii")
-            and fields[3] == b"127.0.0.1"
-            and fields[4] == b"127.0.0.1"
+            and fields[3] == node.address.encode("ascii")
+            and fields[4] == node.address.encode("ascii")
             and fields[5] == str(node.dir_port).encode("ascii")
             and fields[6] == str(node.or_port).encode("ascii")
             and digest is not None,
@@ -174,7 +174,8 @@ def vote_metadata(data, node, valid_after):
     fields, _digest = entries[node.identity]
     require(
         fields[1] == node.name.encode("ascii")
-        and fields[4] == b"127.0.0.1"
+        and fields[3] == node.address.encode("ascii")
+        and fields[4] == node.address.encode("ascii")
         and fields[5] == str(node.dir_port).encode("ascii")
         and fields[6] == str(node.or_port).encode("ascii"),
         "vote-binding",
@@ -222,16 +223,19 @@ class VotingNode(a.AuthorityNode):
             "Nickname " + self.name + "\n",
             1,
         )
-        text = text.replace(
-            "ORPort 127.0.0.1:" + str(old_or) + "\n",
-            "ORPort 127.0.0.1:" + str(self.or_port) + "\n",
-            1,
-        )
-        text = text.replace(
-            "DirPort 127.0.0.1:" + str(old_dir) + "\n",
-            "DirPort 127.0.0.1:" + str(self.dir_port) + "\n",
-            1,
-        )
+        for kind, previous, selected in (
+            ("ORPort", old_or, self.or_port),
+            ("DirPort", old_dir, self.dir_port),
+        ):
+            original = (
+                kind + " " + self.address + ":" + str(previous) + "\n"
+            )
+            require(text.count(original) == 1, "baseline-config")
+            text = text.replace(
+                original,
+                kind + " " + self.address + ":" + str(selected) + "\n",
+                1,
+            )
         lines = text.splitlines(keepends=True)
         require(
             sum(line.startswith("DirAuthority ") for line in lines) == 1,
@@ -241,7 +245,7 @@ class VotingNode(a.AuthorityNode):
             "DirAuthority " + peer.name
             + " orport=" + str(peer.or_port)
             + " v3ident=" + peer.identity
-            + " 127.0.0.1:" + str(peer.dir_port)
+            + " " + peer.address + ":" + str(peer.dir_port)
             + " " + peer.relay.fingerprint + "\n"
             for peer in self.peers
         )
@@ -299,6 +303,7 @@ class VotingNode(a.AuthorityNode):
         )
         self._check()
         endpoint = self._identity_and_listeners()
+        require(endpoint == (self.address, self.dir_port), "http-peer")
         self._http = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             self._http.settimeout(min(0.05, self._remaining()))
@@ -312,7 +317,7 @@ class VotingNode(a.AuthorityNode):
             )
             self._http_send(
                 method + b" " + path + b" HTTP/1.0\r\n"
-                b"Host: 127.0.0.1\r\n"
+                b"Host: " + self.address.encode("ascii") + b"\r\n"
                 b"Accept-Encoding: identity\r\n"
                 b"Connection: close\r\n"
                 + length + b"\r\n"

@@ -42,7 +42,8 @@ def source_line(node):
     return (
         b"dir-source " + node.name.encode("ascii")
         + b" " + node.identity.encode("ascii")
-        + b" 127.0.0.1 127.0.0.1 "
+        + b" " + node.address.encode("ascii")
+        + b" " + node.address.encode("ascii") + b" "
         + str(node.dir_port).encode("ascii")
         + b" " + str(node.or_port).encode("ascii") + b"\n"
     )
@@ -174,7 +175,7 @@ class Controls(unittest.TestCase):
     def test_http_eof_framing_and_partial_io(self):
         with self.node() as node:
             wire = Wire(b"HTTP/1.0 200 OK\r\nContent-Encoding: identity\r\n\r\nbody")
-            endpoint = ("127.0.0.1", node.dir_port)
+            endpoint = (node.address, node.dir_port)
             with mock.patch.object(node, "_identity_and_listeners", return_value=endpoint):
                 with mock.patch.object(c.socket, "socket", return_value=wire):
                     self.assertEqual(
@@ -201,7 +202,7 @@ class Controls(unittest.TestCase):
                     wire = Wire(response)
                     with mock.patch.object(
                         node, "_identity_and_listeners",
-                        return_value=("127.0.0.1", node.dir_port),
+                        return_value=(node.address, node.dir_port),
                     ):
                         with mock.patch.object(c.socket, "socket", return_value=wire):
                             with self.assertRaises(c.ConsensusError):
@@ -220,12 +221,42 @@ class Controls(unittest.TestCase):
             line = source_line(node)
             with self.assertRaises(c.ConsensusError):
                 c.sources(line + line)
+        network = self.prepared_network()
+        try:
+            body = consensus_body(network.nodes, 86400)
+            c.consensus_metadata(body, network.nodes, 86401)
+            node = network.nodes[0]
+            original = source_line(node)
+            for column in (3, 4):
+                fields = original.rstrip(b"\n").split(b" ")
+                fields[column] = b"127.0.0.2"
+                changed_line = b" ".join(fields) + b"\n"
+                changed = body.replace(original, changed_line, 1)
+                self.assertNotEqual(changed, body)
+                with self.assertRaisesRegex(
+                    c.ConsensusError, "^consensus-binding$"
+                ):
+                    c.consensus_metadata(changed, network.nodes, 86401)
+        finally:
+            network.close()
 
     def test_vote_requires_generated_identity_certificate_and_period(self):
         with self.node() as node:
             period = 86400
             body = vote_body(node, period)
             c.vote_metadata(body, node, period)
+            for column in (3, 4):
+                original = source_line(node)
+                fields = original.rstrip(b"\n").split(b" ")
+                fields[column] = b"127.0.0.2"
+                changed = body.replace(
+                    original, b" ".join(fields) + b"\n", 1
+                )
+                self.assertNotEqual(changed, body)
+                with self.assertRaisesRegex(
+                    c.ConsensusError, "^vote-binding$"
+                ):
+                    c.vote_metadata(changed, node, period)
             for changed, expected in (
                 (body.replace(node.certificate, b"other-certificate\n"), period),
                 (body.replace(node.identity.encode("ascii"), b"E" * 40), period),
@@ -771,7 +802,7 @@ class Controls(unittest.TestCase):
                         "DirAuthority " + peer.name
                         + " orport=" + str(peer.or_port)
                         + " v3ident=" + peer.identity
-                        + " 127.0.0.1:" + str(peer.dir_port)
+                        + " " + peer.address + ":" + str(peer.dir_port)
                         + " " + peer.relay.fingerprint
                         for peer in network.nodes
                     ]
@@ -834,81 +865,16 @@ def report_failures(result):
             print(category + " " + identity, file=sys.stderr)
 
 
-def main():
-    if (
-        os.environ.get("GITHUB_ACTIONS") != "true"
-        or os.environ.get("TOR_REAL_ISOLATED") != "yes"
-    ):
-        print("Tor authority consensus requires isolated CI", file=sys.stderr)
-        return 1
-    try:
-        deadline = float(os.environ["TOR_REAL_DEADLINE"])
-        binary = os.environ["TOR_REAL_BINARY"]
-        gencert = os.environ["TOR_REAL_GENCERT_BINARY"]
-        if not math.isfinite(deadline) or deadline <= time.monotonic():
-            raise ValueError()
-    except (KeyError, ValueError):
-        print("Tor authority consensus invalid operation input", file=sys.stderr)
-        return 1
-    previous = {
-        sig: signal.signal(sig, cancel)
-        for sig in (signal.SIGTERM, signal.SIGINT)
-    }
-    network = None
-    try:
-        suite = unittest.defaultTestLoader.loadTestsFromTestCase(Controls)
-        result = unittest.TextTestRunner(stream=io.StringIO()).run(suite)
-        if result.testsRun != 16 or not result.wasSuccessful():
-            print("Tor authority consensus mechanism controls failed", file=sys.stderr)
-            report_failures(result)
-            return 1
-        print("Tor authority consensus mechanism controls passed: 16")
-        diagnostic_suite = unittest.defaultTestLoader.loadTestsFromTestCase(
-            DiagnosticControls
-        )
-        diagnostic_result = unittest.TextTestRunner(
-            stream=io.StringIO()
-        ).run(diagnostic_suite)
-        if (
-            diagnostic_result.testsRun != 3
-            or not diagnostic_result.wasSuccessful()
-        ):
-            print(
-                "Tor authority failure diagnostic controls failed",
-                file=sys.stderr,
-            )
-            return 1
-        print("Tor authority failure diagnostic controls passed: 3")
-        producer_ok, producer_failures = p.run_controls(c)
-        if not producer_ok:
-            print("Tor relay producer mechanism controls failed", file=sys.stderr)
-            for failure in producer_failures:
-                print(failure, file=sys.stderr)
-            return 1
-        print("Tor relay producer mechanism controls passed: 36")
-        network = p.implementation(c)(binary, gencert, deadline)
-        p.run_live(network, c)
-        print("Tor three-authority current consensus controls passed: 1")
-        print("Tor one-of-three vote quorum rejection controls passed: 1")
-        print("Tor owned guard middle exit producer controls passed: 1")
-        print("Tor BOM descriptor admission rejection controls passed: 1")
-        return 0
-    except (c.a.s.Cancelled, c.a.m.Cancelled):
-        print("Tor authority consensus cancelled", file=sys.stderr)
-        return 143
-    except (c.a.s.DeadlineExceeded, c.a.m.DeadlineExceeded):
-        print("Tor authority consensus deadline", file=sys.stderr)
-        return 1
-    except (c.a.s.CleanupError, c.a.m.CleanupError):
-        print("Tor authority consensus cleanup", file=sys.stderr)
-        return 1
-    except Exception as error:
-        stage = network.stage if network is not None else "prepare"
-        return report_runtime_failure(error, stage)
-    finally:
-        for sig, handler in previous.items():
-            signal.signal(sig, handler)
+from importlib.machinery import SourceFileLoader
 
+_operation_loader = SourceFileLoader(
+    "authority_consensus_operation",
+    str(Path(__file__).with_name("producer") / "operation.py"),
+)
+exec(
+    _operation_loader.get_code("authority_consensus_operation"),
+    globals(),
+)
 
 diagnostic_path = Path(__file__).with_name("producer") / "diagnostics.py"
 diagnostic_spec = importlib.util.spec_from_file_location(

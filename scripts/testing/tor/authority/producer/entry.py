@@ -22,6 +22,15 @@ LIMIT = 1048576
 REJECTION = b"descriptor(s) or extrainfo(s) not valid UTF-8 or had BOM."
 ROLES = ("guard", "middle", "exit")
 
+_stream_path = Path(__file__).with_name("stream.py")
+_stream_spec = importlib.util.spec_from_file_location(
+    "producer_owned_stream", _stream_path
+)
+_stream = importlib.util.module_from_spec(_stream_spec)
+_stream_spec.loader.exec_module(_stream)
+StreamError = _stream.StreamError
+STREAM_FAILURE_GATES = _stream.FAILURE_GATES
+
 
 class ProducerError(RuntimeError):
     pass
@@ -112,7 +121,7 @@ def rows(data, micro=False):
 def check_row(row, node, role, micro, allow_initial_zero=False):
     require(
         row["name"] == node.name.encode("ascii")
-        and row["address"] == b"127.0.0.1"
+        and row["address"] == node.address.encode("ascii")
         and row["or"] == str(node.or_port).encode("ascii")
         and row["dir"] == str(node.dir_port).encode("ascii"),
         "producer-router-binding",
@@ -155,7 +164,7 @@ def descriptor(body, node, role, port):
     header = field(body, rb"^router ([^\n]+)$").split()
     require(
         header == [
-            node.name.encode("ascii"), b"127.0.0.1",
+            node.name.encode("ascii"), node.address.encode("ascii"),
             str(node.or_port).encode("ascii"), b"0",
             str(node.dir_port).encode("ascii"),
         ],
@@ -243,6 +252,20 @@ def microdescriptor(body, digest, ed, ntor, role, port):
 
 def implementation(c):
     class Node(c.VotingNode):
+        def __init__(self, binary, deadline, relay, materials, index):
+            require(
+                type(index) is int and 0 <= index < 3,
+                "producer-topology",
+            )
+            super().__init__(binary, deadline, relay, materials, index)
+            self._address = (
+                "127.0.0.2", "127.0.0.3", "127.0.0.4"
+            )[index]
+
+        @property
+        def address(self):
+            return self._address
+
         def _write_config(self, data, control, cookie_path, config_path):
             super()._write_config(data, control, cookie_path, config_path)
             require(
@@ -742,10 +765,10 @@ def implementation(c):
             self.admission_checked = True
             return "bom-descriptor-admission-rejected"
 
-    return Network
+    return _stream.extend(Network, c)
 
 
-def run_live(network, c):
+def run_live(network, c, *, _consumer=None):
     with network:
         network.start()
         require(
@@ -763,6 +786,8 @@ def run_live(network, c):
             and network.admission_checked,
             "producer-negative-not-executed",
         )
+        if _consumer is not None:
+            _consumer(network)
         require(
             network.negative() == "one-of-three-vote-quorum-rejected",
             "producer-quorum-not-executed",
@@ -786,98 +811,22 @@ def load_copy():
     return module
 
 
-def controls(c):
-    Network = implementation(c)
-    Node = Network.node_type
+from importlib.machinery import SourceFileLoader
 
-    fixture_path = Path(__file__).with_name("controls") / "fixture.py"
-    fixture_spec = importlib.util.spec_from_file_location(
-        "producer_fixture_controls", fixture_path
+_suite_loader = SourceFileLoader(
+    "producer_control_suites",
+    str(Path(__file__).with_name("controls") / "suite.py"),
+)
+exec(
+    _suite_loader.get_code("producer_control_suites"),
+    globals(),
+)
+
+
+def run_stream_live(network, c, binary):
+    run_live(
+        network, c,
+        _consumer=lambda owned: owned.consume(binary),
     )
-    fixture_module = importlib.util.module_from_spec(fixture_spec)
-    fixture_module.__dict__.update({
-        name: value for name, value in globals().items()
-        if not name.startswith("__")
-    })
-    fixture_module.c = c
-    fixture_module.Network = Network
-    fixture_module.Node = Node
-    fixture_spec.loader.exec_module(fixture_module)
-    Wire, Base = fixture_module.build()
-
-    descriptor_path = Path(__file__).with_name("controls") / "descriptors.py"
-    descriptor_spec = importlib.util.spec_from_file_location(
-        "producer_descriptor_controls", descriptor_path
-    )
-    descriptor_module = importlib.util.module_from_spec(descriptor_spec)
-    descriptor_module.__dict__.update({
-        name: value for name, value in globals().items()
-        if not name.startswith("__")
-    })
-    descriptor_module.c = c
-    descriptor_module.Network = Network
-    descriptor_module.Node = Node
-    descriptor_module.Wire = Wire
-    descriptor_module.Base = Base
-    descriptor_spec.loader.exec_module(descriptor_module)
-    Base = descriptor_module.build()
-
-    admission_path = Path(__file__).with_name("controls") / "admission.py"
-    admission_spec = importlib.util.spec_from_file_location(
-        "producer_admission_controls", admission_path
-    )
-    admission_module = importlib.util.module_from_spec(admission_spec)
-    admission_module.__dict__.update({
-        name: value for name, value in globals().items()
-        if not name.startswith("__")
-    })
-    admission_module.c = c
-    admission_module.Network = Network
-    admission_module.Node = Node
-    admission_module.Wire = Wire
-    admission_module.Base = Base
-    admission_spec.loader.exec_module(admission_module)
-    Base = admission_module.build()
-
-    readiness_path = Path(__file__).with_name("controls") / "readiness.py"
-    readiness_spec = importlib.util.spec_from_file_location(
-        "producer_readiness_controls", readiness_path
-    )
-    readiness_module = importlib.util.module_from_spec(readiness_spec)
-    readiness_module.__dict__.update({
-        name: value for name, value in globals().items()
-        if not name.startswith("__")
-    })
-    readiness_module.c = c
-    readiness_module.Network = Network
-    readiness_module.Node = Node
-    readiness_module.Wire = Wire
-    readiness_module.Base = Base
-    readiness_spec.loader.exec_module(readiness_module)
-    return readiness_module.build()
-
-
-def run_controls(c):
-    case = controls(c)
-    suite = unittest.defaultTestLoader.loadTestsFromTestCase(case)
-    result = unittest.TextTestRunner(
-        stream=io.StringIO()
-    ).run(suite)
-    allowed = set(unittest.defaultTestLoader.getTestCaseNames(case))
-    failures = []
-    for category, entries in (
-        ("FAIL", result.failures), ("ERROR", result.errors)
-    ):
-        for test, traceback in entries:
-            actual = getattr(test, "test_case", test)
-            name = getattr(actual, "_testMethodName", None)
-            identity = (
-                "ProducerControls." + name
-                if type(actual) is case and name in allowed
-                else "<unknown-test>"
-            )
-            failures.append(category + " " + identity)
-    return (
-        result.testsRun == 36 and result.wasSuccessful(),
-        tuple(failures),
-    )
+    network.stream.released()
+    return network.stream

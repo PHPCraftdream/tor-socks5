@@ -70,9 +70,37 @@ class External(unittest.TestCase):
         self.put(p.CONTRACT_MANIFEST, "real_tor_channel = true\n")
         for path, markers in p.TOR_MARKERS.items():
             self.put(path, "\n".join(markers) + "\n")
+        for path in p.TOR_STREAM_SOURCES:
+            self.put(path, "stream source fixture\n")
         self.git("init", "-q")
         self.commit("начало")
         self.base = self.git("rev-parse", "HEAD").strip()
+
+    def test_stream_source_removal_fails_real_planner(self):
+        paths = (
+            "packages/arti-wrapper/tests/owned_stream.rs",
+            "packages/arti-wrapper/tests/owned_stream/consumer.rs",
+            "packages/arti-wrapper/tests/owned_stream/protocol.rs",
+            "packages/arti-wrapper/tests/owned_stream/mechanisms.rs",
+            "scripts/testing/tor/artifact.py",
+            "scripts/testing/tor/test_artifact.py",
+            "scripts/testing/tor/authority/producer/stream.py",
+            "scripts/testing/tor/authority/producer/stream_wire.py",
+            "scripts/testing/tor/authority/producer/operation.py",
+            "scripts/testing/tor/authority/producer/controls/suite.py",
+            "scripts/testing/tor/authority/producer/controls/stream.py",
+            "scripts/testing/tor/authority/producer/controls/stream_lifecycle.py",
+        )
+        for path in paths:
+            with self.subTest(path=path):
+                original = (self.root / path).read_text(encoding="utf-8")
+                self.git("rm", path)
+                self.commit("remove mandatory stream source")
+                self.push(ok=False)
+                self.put(path, original)
+                self.commit("restore mandatory stream source")
+        result = self.push()
+        self.assertTrue(result["capabilities"]["real_tor_channel"])
 
     def put(self, path, text):
         target = self.root / path

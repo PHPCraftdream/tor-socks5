@@ -387,16 +387,17 @@ def membership(pid):
     return value
 
 
-def socket_owned(connection, pid):
+def socket_owned(connection, pid, *, peer_address='127.0.0.1',
+                 local_address='127.0.0.1', evidence=None):
     require(connection.family == socket.AF_INET, 'channel-family')
 
-    def endpoint(address):
-        require(address[0] == '127.0.0.1', 'channel-address')
+    def endpoint(address, expected):
+        require(address[0] == expected, 'channel-address')
         return (socket.inet_aton(address[0])[::-1].hex().upper()
                 + f':{address[1]:04X}')
 
-    source = endpoint(connection.getpeername())
-    destination = endpoint(connection.getsockname())
+    source = endpoint(connection.getpeername(), peer_address)
+    destination = endpoint(connection.getsockname(), local_address)
     rows = bounded('/proc/net/tcp', 1024 * 1024).decode('ascii').splitlines()
     require(0 < len(rows) <= 8192, 'tcp-bound')
     matches = []
@@ -406,18 +407,25 @@ def socket_owned(connection, pid):
         if (fields[1], fields[2], fields[3]) == (source, destination, '01'):
             matches.append(fields[9])
     require(len(matches) == 1 and matches[0].isdigit(), 'channel-tuple')
+    require(int(matches[0]) > 0, 'channel-owner')
     target = f'socket:[{matches[0]}]'
     with os.scandir(f'/proc/{pid}/fd') as entries:
         paths = list(itertools.islice(entries, 257))
     require(len(paths) <= 256, 'descriptor-bound')
-    found = False
+    descriptors = []
     for entry in paths:
         try:
-            found = found or os.readlink(entry.path) == target
+            if os.readlink(entry.path) == target:
+                descriptors.append(entry.name)
         except FileNotFoundError:
             continue
-    require(found, 'channel-owner')
-
+    require(descriptors, 'channel-owner')
+    if evidence is not None:
+        require(type(evidence) is list and not evidence, 'channel-owner')
+        evidence.append((
+            connection.getpeername(), connection.getsockname(),
+            int(matches[0]), tuple(sorted(descriptors)),
+        ))
 
 class Pin:
     def __init__(self, pid, *, self_owner=False):

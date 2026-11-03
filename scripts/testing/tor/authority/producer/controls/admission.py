@@ -345,9 +345,12 @@ def build():
                             state["documents"][path] = mutated
                             state["rejected_generation_ntor"] = rejected_ntor
                         elif variant == "endpoint":
-                            state["documents"][path] = body.replace(
-                                b"127.0.0.1", b"127.0.0.2", 1
+                            changed = body.replace(
+                                node.address.encode("ascii"),
+                                network.nodes[0].address.encode("ascii"), 1,
                             )
+                            self.assertNotEqual(changed, body)
+                            state["documents"][path] = changed
                         elif variant == "policy":
                             state["documents"][path] = body.replace(
                                 b"reject *:*", b"accept *:*"
@@ -532,7 +535,7 @@ def build():
                 payload = b"\xef\xbb\xbf" + body
                 with mock.patch.object(
                     node, "_identity_and_listeners",
-                    return_value=("127.0.0.1", node.dir_port),
+                    return_value=(node.address, node.dir_port),
                 ):
                     with mock.patch.object(
                         c.socket, "socket", return_value=wire
@@ -541,7 +544,7 @@ def build():
                 self.assertEqual(
                     bytes(wire.sent),
                     b"POST /tor/ HTTP/1.0\r\n"
-                    b"Host: 127.0.0.1\r\n"
+                    b"Host: " + node.address.encode("ascii") + b"\r\n"
                     b"Accept-Encoding: identity\r\n"
                     b"Connection: close\r\n"
                     b"Content-Length: "
@@ -557,7 +560,7 @@ def build():
                 path = b"/tor/status-vote/current/consensus"
                 with mock.patch.object(
                     node, "_identity_and_listeners",
-                    return_value=("127.0.0.1", node.dir_port),
+                    return_value=(node.address, node.dir_port),
                 ):
                     with mock.patch.object(
                         c.socket, "socket", return_value=wire
@@ -568,10 +571,40 @@ def build():
                 self.assertEqual(
                     bytes(wire.sent),
                     b"GET " + path + b" HTTP/1.0\r\n"
-                    b"Host: 127.0.0.1\r\n"
+                    b"Host: " + node.address.encode("ascii") + b"\r\n"
                     b"Accept-Encoding: identity\r\n"
                     b"Connection: close\r\n\r\n",
                 )
+                self.assertTrue(wire.closed)
+                wrong = ("127.0.0.1", node.dir_port)
+                with mock.patch.object(
+                    node, "_identity_and_listeners", return_value=wrong
+                ):
+                    with mock.patch.object(c.socket, "socket") as create:
+                        with self.assertRaisesRegex(
+                            c.ConsensusError, "^http-peer$"
+                        ):
+                            node.request(path)
+                        create.assert_not_called()
+                wire = Wire(b"HTTP/1.0 200 OK\r\n\r\nbody")
+                with mock.patch.object(
+                    node, "_identity_and_listeners",
+                    return_value=(node.address, node.dir_port),
+                ):
+                    with mock.patch.object(
+                        wire, "getpeername", return_value=wrong
+                    ):
+                        with mock.patch.object(
+                            c.socket, "socket", return_value=wire
+                        ):
+                            with self.assertRaisesRegex(
+                                c.ConsensusError, "^http-peer$"
+                            ):
+                                node.request(path)
+                self.assertEqual(
+                    wire.endpoint, (node.address, node.dir_port)
+                )
+                self.assertEqual(bytes(wire.sent), b"")
                 self.assertTrue(wire.closed)
                 with mock.patch.object(c.socket, "socket") as create:
                     with self.assertRaises(c.ConsensusError):
@@ -645,7 +678,7 @@ def build():
             try:
                 with mock.patch.object(
                     node, "_identity_and_listeners",
-                    return_value=("127.0.0.1", node.dir_port),
+                    return_value=(node.address, node.dir_port),
                 ):
                     with mock.patch.object(
                         isolated.socket, "socket", return_value=wire

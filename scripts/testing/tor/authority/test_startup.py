@@ -162,21 +162,33 @@ class Controls(unittest.TestCase):
                     a._fingerprint(data)
 
     def test_listener_parser_rejects_other_or_ambiguous_endpoints(self):
-        self.assertEqual(
-            a.AuthorityNode._listener(b'"127.0.0.1:19002"', 19002),
-            ("127.0.0.1", 19002),
-        )
-        for value in (
-            b"",
-            b'"0.0.0.0:19002"',
-            b'"127.0.0.1:19003"',
-            b'"127.0.0.1:19002" "127.0.0.1:19003"',
-            b"127.0.0.1:19002",
-            b'"127.0.0.1:0"',
-        ):
-            with self.subTest(category="bad-listener"):
-                with self.assertRaises(a.StartupError):
-                    a.AuthorityNode._listener(value, 19002)
+        with self.node() as owner:
+            self.assertEqual(owner.address, "127.0.0.1")
+            self.assertEqual(
+                owner._listener(b'"127.0.0.1:19002"', 19002),
+                ("127.0.0.1", 19002),
+            )
+            for value in (
+                b"",
+                b'"0.0.0.0:19002"',
+                b'"127.0.0.2:19002"',
+                b'"127.0.0.1:19003"',
+                b'"127.0.0.1:19002" "127.0.0.1:19003"',
+                b"127.0.0.1:19002",
+                b'"127.0.0.1:0"',
+                b'"127.0.0.1:019002"',
+                b'"[::1]:19002"',
+            ):
+                with self.subTest(category="bad-listener"):
+                    with self.assertRaisesRegex(
+                        a.StartupError, "^owned-listener$"
+                    ):
+                        owner._listener(value, 19002)
+            for expected in (0, 65536, True, "19002"):
+                with self.assertRaisesRegex(
+                    a.StartupError, "^owned-listener$"
+                ):
+                    owner._listener(b'"127.0.0.1:19002"', expected)
 
     def test_getinfo_requires_exact_key_and_terminator(self):
         with self.node() as owner:
@@ -245,6 +257,12 @@ class Controls(unittest.TestCase):
                 b"Accept-Encoding: identity\r\n"
                 b"Connection: close\r\n\r\n",
             )
+            with mock.patch.object(a.socket, "socket") as create:
+                with self.assertRaisesRegex(
+                    a.StartupError, "^owned-listener$"
+                ):
+                    owner._fetch(("127.0.0.2", owner.dir_port))
+                create.assert_not_called()
 
     def test_http_rejects_wrong_body_framing_status_and_eof(self):
         with self.node() as sample:
@@ -455,6 +473,7 @@ class Controls(unittest.TestCase):
             wire = CancelWire(http_socket)
             resources["http"] = wire
             owner.certificate = b"mechanism-only-public-body\n"
+            owner.dir_port = 19002
 
             with mock.patch.object(
                 implementation.socket, "socket", return_value=wire

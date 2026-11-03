@@ -5,8 +5,8 @@ def build():
             body = self.body(node)
             descriptor(body, node, "exit", 23456)
             changed = SimpleNamespace(
-                name=node.name, or_port=node.or_port,
-                dir_port=node.dir_port,
+                name=node.name, address=node.address,
+                or_port=node.or_port, dir_port=node.dir_port,
                 relay=SimpleNamespace(fingerprint="F" * 40),
             )
             with self.assertRaisesRegex(
@@ -15,19 +15,77 @@ def build():
                 descriptor(body, changed, "exit", 23456)
 
         def test_descriptor_router_endpoint_binding(self):
-            node = self.node()
-            body = self.body(node)
-            for old, new in (
-                (b"127.0.0.1", b"127.0.0.2"),
-                (b"21001", b"21009"),
-            ):
-                with self.subTest(category="endpoint"):
+            for index, address in enumerate((
+                "127.0.0.2", "127.0.0.3", "127.0.0.4"
+            )):
+                with self.node(index) as node:
+                    self.assertEqual(node.address, address)
+                    body = self.body(node)
+                    descriptor(body, node, "exit", 23456)
+                    for replacement in (
+                        b"127.0.0.1",
+                        ("127.0.0.%d" % (2 + (index + 1) % 3)).encode(
+                            "ascii"
+                        ),
+                    ):
+                        changed = body.replace(
+                            node.address.encode("ascii"), replacement, 1
+                        )
+                        self.assertNotEqual(changed, body)
+                        with self.assertRaisesRegex(
+                            ProducerError, "^producer-descriptor-router$"
+                        ):
+                            descriptor(changed, node, "exit", 23456)
+                    changed = body.replace(
+                        str(node.or_port).encode("ascii"), b"29999", 1
+                    )
+                    self.assertNotEqual(changed, body)
                     with self.assertRaisesRegex(
                         ProducerError, "^producer-descriptor-router$"
                     ):
-                        descriptor(
-                            body.replace(old, new), node, "exit", 23456
-                        )
+                        descriptor(changed, node, "exit", 23456)
+                    values = {
+                        b"process/pid": b"27",
+                        b"fingerprint": node.relay.fingerprint.encode("ascii"),
+                        b"net/listeners/or": (
+                            '"%s:%d"' % (address, node.or_port)
+                        ).encode("ascii"),
+                        b"net/listeners/dir": (
+                            '"%s:%d"' % (address, node.dir_port)
+                        ).encode("ascii"),
+                    }
+                    with mock.patch.object(
+                        node, "process", SimpleNamespace(pid=27)
+                    ):
+                        with mock.patch.object(
+                            node, "_info", side_effect=values.__getitem__
+                        ):
+                            self.assertEqual(
+                                node._identity_and_listeners(),
+                                (address, node.dir_port),
+                            )
+                            for key, label in (
+                                (b"process/pid", "owned-process"),
+                                (b"fingerprint", "relay-identity"),
+                                (b"net/listeners/or", "owned-listener"),
+                                (b"net/listeners/dir", "owned-listener"),
+                            ):
+                                original = values[key]
+                                values[key] = (
+                                    b"28" if key == b"process/pid"
+                                    else b"F" * 40 if key == b"fingerprint"
+                                    else original.replace(
+                                        address.encode("ascii"),
+                                        b"127.0.0.1", 1,
+                                    )
+                                )
+                                try:
+                                    with self.assertRaisesRegex(
+                                        c.a.StartupError, "^" + label + "$"
+                                    ):
+                                        node._identity_and_listeners()
+                                finally:
+                                    values[key] = original
 
         def test_port_only_policy_rejects_host_only_and_extra_ports(self):
             node = self.node()
@@ -115,7 +173,8 @@ def build():
         def test_role_and_bandwidth_mutants(self):
             node = self.node()
             good = {
-                "name": b"localA", "address": b"127.0.0.1",
+                "name": b"localA",
+                "address": node.address.encode("ascii"),
                 "or": b"21001", "dir": b"21002",
                 "flags": {b"Running", b"Valid", b"Fast", b"Guard"},
                 "bandwidth": 1,
@@ -123,6 +182,13 @@ def build():
                 "md": bytes([1]) * 32,
             }
             check_row(good, node, "guard", True)
+            for address in (b"127.0.0.1", b"127.0.0.3"):
+                changed = dict(good, address=address)
+                for micro in (False, True):
+                    with self.assertRaisesRegex(
+                        ProducerError, "^producer-router-binding$"
+                    ):
+                        check_row(changed, node, "guard", micro)
             for key, value in (
                 ("flags", {b"Running", b"Valid", b"Guard"}),
                 ("flags", good["flags"] | {b"Exit"}),
@@ -324,6 +390,42 @@ def build():
                         text = node.config_path.read_text(
                             encoding="utf-8"
                         )
+                        expected_address = (
+                            "127.0.0.2", "127.0.0.3", "127.0.0.4"
+                        )[index]
+                        self.assertEqual(node.address, expected_address)
+                        for line in (
+                            "Address " + expected_address,
+                            "ORPort " + expected_address + ":"
+                            + str(node.or_port),
+                            "DirPort " + expected_address + ":"
+                            + str(node.dir_port),
+                        ):
+                            self.assertEqual(
+                                text.splitlines().count(line), 1
+                            )
+                        expected_authorities = [
+                            "DirAuthority " + peer.name
+                            + " orport=" + str(peer.or_port)
+                            + " v3ident=" + peer.identity
+                            + " " + peer.address + ":" + str(peer.dir_port)
+                            + " " + peer.relay.fingerprint
+                            for peer in network.nodes
+                        ]
+                        self.assertEqual(
+                            [
+                                line for line in text.splitlines()
+                                if line.startswith("DirAuthority ")
+                            ],
+                            expected_authorities,
+                        )
+                        self.assertTrue(all(
+                            item.getsockname()[0] == "127.0.0.1"
+                            for item in node.candidates
+                        ))
+                        self.assertNotIn("Address 127.0.0.1\n", text)
+                        self.assertNotIn("ORPort 127.0.0.1:", text)
+                        self.assertNotIn("DirPort 127.0.0.1:", text)
                         self.assertIn(
                             "TestingDirAuthVoteGuard $"
                             + network.nodes[0].relay.fingerprint
@@ -435,6 +537,38 @@ def build():
 
         def test_central_good_proof_and_admission_negative(self):
             with self.fixture() as (network, state):
+                self.assertEqual(
+                    [node.address for node in network.nodes],
+                    ["127.0.0.2", "127.0.0.3", "127.0.0.4"],
+                )
+                original = network.baseline
+                for node in network.nodes:
+                    source = next(
+                        line for line in original.splitlines()
+                        if line.startswith(
+                            b"dir-source " + node.name.encode("ascii") + b" "
+                        )
+                    )
+                    for column in (3, 4):
+                        for replacement in (
+                            b"127.0.0.1",
+                            network.nodes[
+                                (network.nodes.index(node) + 1) % 3
+                            ].address.encode("ascii"),
+                        ):
+                            fields = source.split(b" ")
+                            fields[column] = replacement
+                            changed = original.replace(
+                                source + b"\n",
+                                b" ".join(fields) + b"\n", 1,
+                            )
+                            self.assertNotEqual(changed, original)
+                            with self.assertRaisesRegex(
+                                c.ConsensusError, "^consensus-binding$"
+                            ):
+                                c.consensus_metadata(
+                                    changed, network.nodes, 86401
+                                )
                 self.assertEqual(
                     network.prove(), "owned-three-relay-producer"
                 )

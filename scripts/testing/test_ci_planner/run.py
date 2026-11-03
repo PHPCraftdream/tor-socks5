@@ -772,6 +772,8 @@ jobs:
         self.assertNotIn('tor', self.route(mode='sprint-full', capabilities={'real_tor_channel': False})['segments'])
         installed = {path: '\n'.join(markers) for path, markers in p.TOR_MARKERS.items()}
         installed[p.CONTRACT_MANIFEST] = 'real_tor_channel = true\n'
+        for path in p.TOR_STREAM_SOURCES:
+            installed[path] = "source\n"
         self.assertTrue(p.contract_capability(read({}), read(installed)))
         manifest = Path(__file__).resolve().parents[2] / p.CONTRACT_MANIFEST
         if p.tomllib.loads(manifest.read_text(encoding='utf-8'))['real_tor_channel']:

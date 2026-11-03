@@ -163,6 +163,10 @@ class AuthorityNode(s.TorSupervisor):
         self._proved = False
         self.rejection = None
 
+    @property
+    def address(self):
+        return "127.0.0.1"
+
     def _write_config(self, data, control, cookie_path, config_path):
         self._check()
         if (
@@ -196,7 +200,7 @@ class AuthorityNode(s.TorSupervisor):
             self._check()
             reservation = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self._reservations.append(reservation)
-            reservation.bind(("127.0.0.1", 0))
+            reservation.bind((self.address, 0))
         self.or_port, self.dir_port = [
             reservation.getsockname()[1]
             for reservation in self._reservations
@@ -217,10 +221,10 @@ class AuthorityNode(s.TorSupervisor):
             "CookieAuthentication 1\n"
             "CookieAuthFile " + self._quote(cookie_path) + "\n"
             "SocksPort 0\n"
-            "Address 127.0.0.1\n"
+            "Address " + self.address + "\n"
             "AddressDisableIPv6 1\n"
-            "ORPort 127.0.0.1:" + str(self.or_port) + "\n"
-            "DirPort 127.0.0.1:" + str(self.dir_port) + "\n"
+            "ORPort " + self.address + ":" + str(self.or_port) + "\n"
+            "DirPort " + self.address + ":" + str(self.dir_port) + "\n"
             "TestingTorNetwork 1\n"
             "AuthoritativeDirectory 1\n"
             "V3AuthoritativeDirectory 1\n"
@@ -233,7 +237,7 @@ class AuthorityNode(s.TorSupervisor):
             "DirAuthority " + NICKNAME
             + " orport=" + str(self.or_port)
             + " v3ident=" + metadata["v3_identity_fingerprint"]
-            + " 127.0.0.1:" + str(self.dir_port)
+            + " " + self.address + ":" + str(self.dir_port)
             + " " + self.relay.fingerprint + "\n"
             "DisableNetwork 0\n",
             encoding="utf-8",
@@ -260,12 +264,21 @@ class AuthorityNode(s.TorSupervisor):
         self._check()
         return value
 
-    @staticmethod
-    def _listener(value, expected):
-        match = re.fullmatch(rb'"127\.0\.0\.1:([1-9][0-9]{0,4})"', value)
-        if match is None or int(match[1]) != expected or expected > 65535:
+    def _listener(self, value, expected):
+        if (
+            type(value) is not bytes
+            or type(expected) is not int
+            or not 1 <= expected <= 65535
+        ):
             raise StartupError("owned-listener")
-        return "127.0.0.1", expected
+        pattern = (
+            rb'"' + re.escape(self.address.encode("ascii"))
+            + rb':([1-9][0-9]{0,4})"'
+        )
+        match = re.fullmatch(pattern, value)
+        if match is None or int(match[1]) != expected:
+            raise StartupError("owned-listener")
+        return self.address, expected
 
     def _identity_and_listeners(self):
         pid = self._info(b"process/pid")
@@ -335,6 +348,8 @@ class AuthorityNode(s.TorSupervisor):
         self._check()
 
     def _fetch(self, endpoint):
+        if endpoint != (self.address, self.dir_port):
+            raise StartupError("owned-listener")
         self._http = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             self._http.settimeout(min(0.05, self._remaining()))
@@ -343,7 +358,7 @@ class AuthorityNode(s.TorSupervisor):
                 raise StartupError("http-peer")
             self._http_send(
                 b"GET /tor/keys/authority HTTP/1.0\r\n"
-                b"Host: 127.0.0.1\r\n"
+                b"Host: " + self.address.encode("ascii") + b"\r\n"
                 b"Accept-Encoding: identity\r\n"
                 b"Connection: close\r\n\r\n"
             )

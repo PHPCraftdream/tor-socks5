@@ -95,7 +95,8 @@ def build():
                             + b"dir-source "
                             + node.name.encode("ascii")
                             + b" " + node.identity.encode("ascii")
-                            + b" 127.0.0.1 127.0.0.1 "
+                            + b" " + node.address.encode("ascii")
+                            + b" " + node.address.encode("ascii") + b" "
                             + str(node.dir_port).encode("ascii")
                             + b" " + str(node.or_port).encode("ascii")
                             + b"\ndirectory-signature "
