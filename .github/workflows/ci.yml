@@ -99,6 +99,8 @@ jobs:
           cargo test -p socks5-proxy --bin socks5-proxy --locked --no-run --message-format=json > "$work/artifacts.json"
           python3 -I -c 'import json,sys; p=sys.argv[1]; a=[x["executable"] for l in open(p) if (x:=json.loads(l)).get("reason")=="compiler-artifact" and x.get("target",{}).get("name")=="socks5-proxy" and x.get("profile",{}).get("test") and x.get("executable")]; assert len(a)==1, a; open(sys.argv[2], "w").write(a[0])' "$work/artifacts.json" "$work/test-path"
           echo "tor=$work/tor-0.4.9.15/src/app/tor" >> "$GITHUB_OUTPUT"
+          test -x "$work/tor-0.4.9.15/src/tools/tor-gencert"
+          echo "gencert=$work/tor-0.4.9.15/src/tools/tor-gencert" >> "$GITHUB_OUTPUT"
           echo "test=$(<"$work/test-path")" >> "$GITHUB_OUTPUT"
       - name: Проверить в сетевом пространстве без внешних интерфейсов
         shell: bash
@@ -107,11 +109,12 @@ jobs:
           command -v unshare
           command -v ip
           deadline=$(python3 -I -c 'import time; print(time.monotonic() + 600)')
-          sudo unshare --net -- timeout --signal=TERM --kill-after=15s 10m env GITHUB_ACTIONS=true TOR_REAL_ISOLATED=yes TOR_REAL_DEADLINE="$deadline" TOR_REAL_BINARY="${{ steps.real-build.outputs.tor }}" TOR_REAL_TEST_BINARY="${{ steps.real-build.outputs.test }}" bash scripts/testing/tor/real-tor-channel.sh
+          sudo unshare --net -- timeout --signal=TERM --kill-after=15s 10m env GITHUB_ACTIONS=true TOR_REAL_ISOLATED=yes TOR_REAL_DEADLINE="$deadline" TOR_REAL_BINARY="${{ steps.real-build.outputs.tor }}" TOR_REAL_GENCERT_BINARY="${{ steps.real-build.outputs.gencert }}" TOR_REAL_TEST_BINARY="${{ steps.real-build.outputs.test }}" bash scripts/testing/tor/real-tor-channel.sh
       - name: Проверить отрицательные мутации в изоляции
         shell: bash
         env:
           TOR_REAL_BINARY: ${{ steps.real-build.outputs.tor }}
+          TOR_REAL_GENCERT_BINARY: ${{ steps.real-build.outputs.gencert }}
         run: bash scripts/testing/tor/real-tor-mutations.sh
 
   pt-proxy-contract:

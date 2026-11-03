@@ -268,16 +268,40 @@ class Controls(unittest.TestCase):
             "ERROR <unknown-test>\n",
         )
 
-    def test_cancellation_unwinds_context(self):
-        owner = self.owner()
+    def _cancellation_control(self, on_check=None):
+        spec = importlib.util.spec_from_file_location(
+            "real_tor_supervisor_cancellation",
+            Path(__file__).with_name("real_tor_supervisor.py"),
+        )
+        implementation = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(implementation)
+        owner = implementation.TorSupervisor(
+            "/fixture/tor", time.monotonic() + 60
+        )
         owner._socket = Wire()
         wire = owner._socket
-        with mock.patch.object(s, "cancelled", True):
-            with self.assertRaises(s.Cancelled):
-                with owner:
-                    owner._check()
+        implementation.cancelled = True
+        with self.assertRaises(implementation.Cancelled):
+            with owner:
+                if on_check is not None:
+                    on_check()
+                owner._check()
         self.assertTrue(wire.closed)
         self.assertTrue(owner._closed)
+
+    def test_cancellation_unwinds_context(self):
+        self._cancellation_control()
+        spec = importlib.util.spec_from_file_location(
+            "real_tor_supervisor_cancellation_runner", Path(__file__)
+        )
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        case = runner.Controls("test_cancellation_unwinds_context")
+        self.assertFalse(runner.s.cancelled)
+        case._cancellation_control(
+            on_check=lambda: runner.cancel(None, None)
+        )
+        self.assertTrue(runner.s.cancelled)
 
 
 def owned_resources(owner):

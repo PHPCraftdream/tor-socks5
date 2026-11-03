@@ -4,6 +4,7 @@ set -euo pipefail
 # Скрипт выполняется только внутри отдельного сетевого пространства имён CI.
 [ "${GITHUB_ACTIONS:-}" = true ] && [ "${TOR_REAL_ISOLATED:-}" = yes ] || exit 1
 : "${TOR_REAL_BINARY:?}"
+: "${TOR_REAL_GENCERT_BINARY:?}"
 : "${TOR_REAL_TEST_BINARY:?}"
 : "${TOR_REAL_DEADLINE:?}"
 [ "$(ip -o link show | wc -l)" -eq 1 ]
@@ -12,6 +13,7 @@ set -euo pipefail
 [ -z "$(ip -6 route show default)" ]
 ip link set lo up
 python3 -I scripts/testing/tor/test_real_tor_supervisor.py
+python3 -I scripts/testing/tor/authority/test_materials.py
 work=$(mktemp -d)
 pids=()
 cleanup() {

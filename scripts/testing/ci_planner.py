@@ -590,7 +590,9 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
                 "scripts/testing/tor/real-tor-channel.sh",
                 "scripts/testing/tor/real-tor-mutations.sh",
                 "scripts/testing/tor/real_tor_supervisor.py",
-                "scripts/testing/tor/test_real_tor_supervisor.py"):
+                "scripts/testing/tor/test_real_tor_supervisor.py",
+                "scripts/testing/tor/authority/materials.py",
+                "scripts/testing/tor/authority/test_materials.py"):
             add("tor", path)
         elif path.startswith(".github/pt_proxy/"):
             add("pt-proxy", path)

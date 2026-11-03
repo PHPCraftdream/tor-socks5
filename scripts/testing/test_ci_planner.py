@@ -178,6 +178,27 @@ class Routing(unittest.TestCase):
     def route(self, *paths, blobs=None, mode="affected", capabilities=None, event="pull_request"):
         return p.plan(self.g, paths, lambda path: blobs[path], mode, capabilities, event)
 
+    def test_authority_material_paths_route_exactly(self):
+        for path in (
+            "scripts/testing/tor/authority/materials.py",
+            "scripts/testing/tor/authority/test_materials.py",
+        ):
+            with self.subTest(path=path):
+                result = self.route(path)
+                self.assertEqual(result["segments"], ["fast", "tor"])
+                self.assertFalse(result["full"])
+                self.assertEqual(result["packages"], [])
+
+    def test_unknown_authority_material_paths_fail_closed(self):
+        for path in (
+            "scripts/testing/tor/authority/unknown.py",
+            "scripts/testing/tor/authority/materials.py.bak",
+            "scripts/testing/tor/authority/nested/materials.py",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(p.MappingError):
+                    self.route(path)
+
     def test_pt_proxy_contract_routing(self):
         for path in (".github/pt_proxy/contract.py", ".github/pt_proxy/direct_domain.py",
                      "scripts/testing/ci_planner.py",

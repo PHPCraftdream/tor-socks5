@@ -2,6 +2,7 @@
 set -euo pipefail
 [ "${GITHUB_ACTIONS:-}" = true ] || exit 1
 : "${TOR_REAL_BINARY:?}"
+: "${TOR_REAL_GENCERT_BINARY:?}"
 : "${GITHUB_WORKSPACE:?}"
 cd "$GITHUB_WORKSPACE"
 source_file="$GITHUB_WORKSPACE/packages/arti-wrapper/src/lib.rs"
@@ -46,7 +47,9 @@ PY
     set +e
     sudo unshare --net -- timeout --signal=TERM --kill-after=15s 10m env \
         GITHUB_ACTIONS=true TOR_REAL_ISOLATED=yes TOR_REAL_DEADLINE="$deadline" \
-        TOR_REAL_BINARY="$TOR_REAL_BINARY" TOR_REAL_TEST_BINARY="$binary" \
+        TOR_REAL_BINARY="$TOR_REAL_BINARY" \
+        TOR_REAL_GENCERT_BINARY="$TOR_REAL_GENCERT_BINARY" \
+        TOR_REAL_TEST_BINARY="$binary" \
         bash scripts/testing/tor/real-tor-channel.sh \
         > "$work/$mutation.log" 2>&1
     status=$?
