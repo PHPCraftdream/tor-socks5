@@ -187,7 +187,9 @@ fn main() {
     }
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_new("off,tor_ptmgr::managed_diagnostics=info")
+            tracing_subscriber::EnvFilter::try_new(
+                "off,tor_ptmgr::managed_diagnostics=info,tor_chanmgr::pt_connector_diagnostics=info",
+            )
                 .expect("valid managed PT diagnostics filter"),
         )
         .with_ansi(false)

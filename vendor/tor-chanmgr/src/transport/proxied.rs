@@ -30,6 +30,17 @@ use tor_socksproto::{
 };
 use tracing::trace;
 
+/// Attempt-local observations for selected PT proxy connections.
+#[path = "proxied/diagnostics.rs"]
+mod diagnostics;
+
+use diagnostics::{Attempt, Outcome, Stage};
+
+/// Actual handshake regressions with scripted futures I/O.
+#[cfg(test)]
+#[path = "proxied/diagnostic_tests.rs"]
+mod diagnostic_tests;
+
 #[cfg(feature = "pt-client")]
 use super::TransportImplHelper;
 #[cfg(feature = "pt-client")]
@@ -83,20 +94,35 @@ pub(crate) async fn connect_via_proxy<R: NetStreamProvider + Send + Sync>(
     protocol: &Protocol,
     target: &PtTargetAddr,
 ) -> Result<R::Stream, ProxyError> {
+    connect_via_proxy_observed(runtime, proxy, protocol, target, None).await
+}
+
+/// Run the existing proxy operation with optional selected-PT observation.
+async fn connect_via_proxy_observed<R: NetStreamProvider + Send + Sync>(
+    runtime: &R,
+    proxy: &SocketAddr,
+    protocol: &Protocol,
+    target: &PtTargetAddr,
+    mut observation: Option<Attempt>,
+) -> Result<R::Stream, ProxyError> {
     trace!(
         "Launching a proxied connection to {} via proxy at {} using {:?}",
         target, proxy, protocol
     );
-    // We don't (yet) use any custom options on the socket.
     let connect_options = Default::default();
+    diagnostics::begin(&mut observation, Stage::Dial);
     let stream = runtime
         .connect(proxy, &connect_options)
         .await
-        .map_err(|e| ProxyError::ProxyConnect(Arc::new(e)))?;
+        .map_err(|e| {
+            diagnostics::finish(&mut observation, Outcome::DialError);
+            ProxyError::ProxyConnect(Arc::new(e))
+        })?;
+    diagnostics::ok(&mut observation, Stage::Dial);
 
     match protocol {
         Protocol::Socks(version, auth) => {
-            do_socks_handshake::<R>(stream, version, auth, target).await
+            do_socks_handshake(stream, version, auth, target, observation).await
         }
         Protocol::HttpConnect { auth } => {
             do_http_connect_handshake::<R>(stream, auth, target).await
@@ -104,27 +130,38 @@ pub(crate) async fn connect_via_proxy<R: NetStreamProvider + Send + Sync>(
     }
 }
 
-/// Perform SOCKS proxy handshake.
-async fn do_socks_handshake<R: NetStreamProvider + Send + Sync>(
-    mut stream: R::Stream,
+/// Perform the existing SOCKS handshake with optional PT-local observation.
+///
+/// cancel-safe: NO for resumable use — abandonment destroys the owned stream.
+async fn do_socks_handshake<S>(
+    mut stream: S,
     version: &SocksVersion,
     auth: &SocksAuth,
     target: &PtTargetAddr,
-) -> Result<R::Stream, ProxyError> {
+    observation: Option<Attempt>,
+) -> Result<S, ProxyError>
+where
+    S: futures::io::AsyncRead + futures::io::AsyncWrite + Unpin,
+{
+    let mut observation = observation;
+    diagnostics::begin(&mut observation, Stage::Negotiate);
+
     let (target_addr, target_port): (SocksAddr, u16) = match target {
         PtTargetAddr::IpPort(a) => (SocksAddr::Ip(a.ip()), a.port()),
         #[cfg(feature = "pt-client")]
         PtTargetAddr::HostPort(host, port) => (
-            SocksAddr::Hostname(
-                host.clone()
-                    .try_into()
-                    .map_err(ProxyError::InvalidSocksAddr)?,
-            ),
+            SocksAddr::Hostname(host.clone().try_into().map_err(|e| {
+                diagnostics::finish(&mut observation, Outcome::Invalid);
+                ProxyError::InvalidSocksAddr(e)
+            })?),
             *port,
         ),
         #[cfg(feature = "pt-client")]
         PtTargetAddr::None => (SocksAddr::Ip(NO_ADDR), 1),
-        _ => return Err(ProxyError::UnrecognizedAddr),
+        _ => {
+            diagnostics::finish(&mut observation, Outcome::Invalid);
+            return Err(ProxyError::UnrecognizedAddr);
+        }
     };
 
     let request = SocksRequest::new(
@@ -134,36 +171,69 @@ async fn do_socks_handshake<R: NetStreamProvider + Send + Sync>(
         target_port,
         auth.clone(),
     )
-    .map_err(ProxyError::InvalidSocksRequest)?;
+    .map_err(|e| {
+        diagnostics::finish(&mut observation, Outcome::Invalid);
+        ProxyError::InvalidSocksRequest(e)
+    })?;
     let mut handshake = SocksClientHandshake::new(request);
-
     let mut buf = tor_socksproto::Buffer::new();
+
     let reply = loop {
         use tor_socksproto::NextStep as NS;
-        match handshake.step(&mut buf).map_err(ProxyError::SocksProto)? {
+        diagnostics::begin(&mut observation, Stage::Decode);
+        let step = handshake.step(&mut buf).map_err(|e| {
+            diagnostics::finish(&mut observation, Outcome::ProtocolError);
+            ProxyError::SocksProto(e)
+        })?;
+        diagnostics::ok(&mut observation, Stage::Decode);
+        match step {
             NS::Send(send) => {
-                stream.write_all(&send).await?;
-                stream.flush().await?;
+                diagnostics::begin(&mut observation, Stage::Send);
+                stream.write_all(&send).await.map_err(|e| {
+                    diagnostics::finish(&mut observation, Outcome::IoError);
+                    ProxyError::from(e)
+                })?;
+                diagnostics::ok(&mut observation, Stage::Send);
+
+                diagnostics::begin(&mut observation, Stage::Flush);
+                stream.flush().await.map_err(|e| {
+                    diagnostics::finish(&mut observation, Outcome::IoError);
+                    ProxyError::from(e)
+                })?;
+                diagnostics::ok(&mut observation, Stage::Flush);
             }
             NS::Finished(fin) => {
-                break fin
-                    .into_output_forbid_pipelining()
-                    .map_err(ProxyError::SocksProto)?;
+                break fin.into_output_forbid_pipelining().map_err(|e| {
+                    diagnostics::finish(&mut observation, Outcome::ProtocolError);
+                    ProxyError::SocksProto(e)
+                })?;
             }
             NS::Recv(mut recv) => {
-                let n = stream.read(recv.buf()).await?;
-                recv.note_received(n).map_err(ProxyError::SocksProto)?;
+                diagnostics::begin(&mut observation, Stage::Receive);
+                let n = stream.read(recv.buf()).await.map_err(|e| {
+                    diagnostics::finish(&mut observation, Outcome::IoError);
+                    ProxyError::from(e)
+                })?;
+                diagnostics::ok(&mut observation, Stage::Receive);
+                recv.note_received(n).map_err(|e| {
+                    diagnostics::finish(&mut observation, Outcome::ProtocolError);
+                    ProxyError::SocksProto(e)
+                })?;
             }
         }
     };
 
+    diagnostics::begin(&mut observation, Stage::Status);
     let status = reply.status();
     trace!("SOCKS handshake succeeded, status {:?}", status);
-
     if status != SocksStatus::SUCCEEDED {
+        diagnostics::finish(&mut observation, Outcome::Rejected);
         return Err(ProxyError::SocksError(status));
     }
-
+    diagnostics::ok(&mut observation, Stage::Status);
+    diagnostics::ok(&mut observation, Stage::Negotiate);
+    diagnostics::begin(&mut observation, Stage::Returned);
+    diagnostics::finish(&mut observation, Outcome::Ok);
     Ok(stream)
 }
 
@@ -457,14 +527,17 @@ impl<R: NetStreamProvider + Send + Sync> TransportImplHelper for ExternalProxyPl
     type Stream = R::Stream;
 
     async fn connect(&self, target: &OwnedChanTarget) -> crate::Result<(PeerAddr, R::Stream)> {
+        let mut observation = Attempt::new();
         let pt_target = match target.chan_method() {
             ChannelMethod::Direct(_) => {
+                observation.finish(Outcome::Invalid);
                 return Err(crate::Error::UnusableTarget(bad_api_usage!(
                     "Used pluggable transport for a TCP connection."
                 )));
             }
             ChannelMethod::Pluggable(target) => target,
             other => {
+                observation.finish(Outcome::Invalid);
                 return Err(crate::Error::UnusableTarget(bad_api_usage!(
                     "Used unknown, unsupported, transport {:?} for a TCP connection.",
                     other,
@@ -477,11 +550,20 @@ impl<R: NetStreamProvider + Send + Sync> TransportImplHelper for ExternalProxyPl
         };
         let protocol =
             settings_to_protocol(self.proxy_version, encode_settings(pt_target.settings()))
-                .map_err(into_err)?;
-        let stream =
-            connect_via_proxy(&self.runtime, &self.proxy_addr, &protocol, pt_target.addr())
-                .await
-                .map_err(into_err)?;
+                .map_err(|e| {
+                    observation.finish(Outcome::Invalid);
+                    into_err(e)
+                })?;
+        observation.ok(Stage::Prepare);
+        let stream = connect_via_proxy_observed(
+            &self.runtime,
+            &self.proxy_addr,
+            &protocol,
+            pt_target.addr(),
+            Some(observation),
+        )
+        .await
+        .map_err(into_err)?;
 
         Ok((pt_target.into(), stream))
     }
