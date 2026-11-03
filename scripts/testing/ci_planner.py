@@ -577,7 +577,11 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
             seed(sdk, path)
         elif path in ("scripts/testing/ci_planner.py", "scripts/testing/test_ci_planner.py", "scripts/testing/test_ci_integration.py", "scripts/testing/selftest.sh", "scripts/testing/test-affected.sh", "scripts/check-line-limit.sh", "scripts/check-dir-entries.sh", ".githooks/pre-push"):
             add("fast", path)
-        elif path in ("scripts/testing/real-tor-channel.sh", "scripts/testing/real-tor-mutations.sh"):
+        elif path in (
+                "scripts/testing/real-tor-channel.sh",
+                "scripts/testing/real-tor-mutations.sh",
+                "scripts/testing/real_tor_supervisor.py",
+                "scripts/testing/test_real_tor_supervisor.py"):
             add("tor", path)
         elif path.startswith(".github/pt_proxy/"):
             add("pt-proxy", path)

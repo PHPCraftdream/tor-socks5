@@ -489,6 +489,19 @@ class Routing(unittest.TestCase):
         self.assertNotIn("tor", result["segments"])
         self.assertNotIn("license-lifecycle", result["segments"])
 
+    def test_real_tor_supervisor_paths_are_explicit(self):
+        for path in (
+                "scripts/testing/real_tor_supervisor.py",
+                "scripts/testing/test_real_tor_supervisor.py"):
+            with self.subTest(path=path):
+                result = self.route(path)
+                self.assertIn("tor", result["segments"])
+                self.assertNotIn("rust", result["segments"])
+                self.assertFalse(result["full"])
+        with self.assertRaisesRegex(p.MappingError, "missing mapping"):
+            self.route("scripts/testing/unknown_tor_supervisor.py")
+
+
     def test_contracts_and_native(self):
         self.assertNotIn("tor", self.route("apps/socks5-proxy/src/commands/auth.rs")["segments"])
         self.assertIn("tor", self.route("apps/socks5-proxy/src/tor/channel.rs")["segments"])
