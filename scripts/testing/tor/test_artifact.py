@@ -126,17 +126,16 @@ class ArtifactControls(unittest.TestCase):
             a.select(io.BytesIO(b"x" * (a.LINE_LIMIT + 1)), self.root)
 
     def test_exact_ignored_inventory(self):
-        good = (
-            "real_private_stream::owned_three_hop_round_trip: test\n"
-            "\n1 test, 0 benchmarks\n"
-        )
+        good = "real_private_stream::owned_three_hop_round_trip: test\n"
         a.ignored(io.BytesIO(good.encode()))
         for bad in (
             "",
             "0 tests, 0 benchmarks\n",
             good.replace("owned_three_hop_round_trip", "other"),
-            good.replace("1 test", "2 tests"),
+            good.replace(": test", ": benchmark"),
+            good + good,
             good + "other: test\n",
+            good + "\n1 test, 0 benchmarks\n",
         ):
             with self.subTest(inventory=bad):
                 with self.assertRaises(ValueError):

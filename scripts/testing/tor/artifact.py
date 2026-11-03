@@ -98,7 +98,7 @@ def select(stream, root=ROOT):
 
 def ignored(stream):
     actual = [line.strip() for line in lines(stream) if line.strip()]
-    expected = [REAL_TEST + ": test", "1 test, 0 benchmarks"]
+    expected = [REAL_TEST + ": test"]
     if actual != expected:
         raise ValueError("Expected exactly the owned three-hop ignored test")
 
