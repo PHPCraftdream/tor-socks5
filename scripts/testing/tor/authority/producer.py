@@ -504,6 +504,7 @@ def implementation(c):
                     == node.name.encode("ascii") + b" " + owned_ed + b"\n",
                     "producer-owned-ed25519",
                 )
+                owned = owned.rstrip(b"\n") + b"\n"
                 status, _response = node._exchange(b"/tor/", owned)
                 require(status == 200, "producer-owned-admission")
                 owned_path = (
@@ -1092,9 +1093,14 @@ def controls(c):
                             b"/tor/server/fp/"
                             + node.relay.fingerprint.encode("ascii")
                         )
-                        self.assertEqual(
-                            payload, state["documents"][latest_path]
-                        )
+                        latest = state["documents"][latest_path]
+                        trailer = b"\n-----END SIGNATURE-----"
+                        prefix, separator, suffix = latest.partition(trailer)
+                        self.assertTrue(separator)
+                        self.assertTrue(suffix)
+                        self.assertEqual(suffix.replace(b"\n", b""), b"")
+                        canonical = prefix + separator + b"\n"
+                        self.assertIn(payload, (latest, canonical))
                         state.setdefault("generation_posts", []).append(index)
                         status = state.get("generation_status", 200)
                         rejected_ntor = state.get("rejected_generation_ntor")
@@ -1127,7 +1133,7 @@ def controls(c):
                             if state.get("generation_cache", True):
                                 state["documents"][
                                     b"/tor/server/d/" + digest.encode("ascii")
-                                ] = payload
+                                ] = canonical
                         return status, b""
                     override = state["overrides"].get((index, path))
                     if override is not None:
@@ -1678,6 +1684,98 @@ def controls(c):
                             ProducerError, "^" + label + "$"
                         ):
                             network.prove()
+
+        def test_central_latest_generation_parser_terminal_framing(self):
+            with self.fixture() as (network, state):
+                selected = tuple(state["descriptors"])
+                selected_md = tuple(state["microdescriptors"])
+                expected = []
+                for index, node in enumerate(network.nodes):
+                    latest_path = (
+                        b"/tor/server/fp/"
+                        + node.relay.fingerprint.encode("ascii")
+                    )
+                    canonical = selected[index].replace(
+                        b"\nrouter-signature\n",
+                        b"\nuptime 2\nrouter-signature\n",
+                        1,
+                    )
+                    generated = canonical + b"\n"
+                    self.assertNotEqual(generated, canonical)
+                    digest = descriptor(
+                        canonical, node, ROLES[index], network.target_port
+                    )[0]
+                    self.assertEqual(
+                        descriptor(
+                            generated, node, ROLES[index],
+                            network.target_port,
+                        )[0],
+                        digest,
+                    )
+                    digest_path = (
+                        b"/tor/server/d/"
+                        + digest.hex().upper().encode("ascii")
+                    )
+                    self.assertNotIn(digest_path, state["documents"])
+                    state["documents"][latest_path] = generated
+                    expected.append((digest_path, canonical))
+
+                self.assertEqual(
+                    network.prove(), "owned-three-relay-producer"
+                )
+                self.assertEqual(state["generation_posts"], [0, 1, 2])
+                self.assertEqual(
+                    state["generation_submissions"],
+                    [
+                        (
+                            index,
+                            node.relay.fingerprint,
+                            expected[index][1],
+                            200,
+                        )
+                        for index, node in enumerate(network.nodes)
+                    ],
+                )
+                for index, entry in enumerate(network.packet):
+                    self.assertEqual(entry[1], selected[index])
+                    self.assertEqual(entry[3], selected_md[index])
+                    path, canonical = expected[index]
+                    self.assertEqual(state["documents"][path], canonical)
+                    self.assertNotEqual(canonical, selected[index])
+
+        def test_central_latest_generation_200_without_retention_fails(self):
+            with self.fixture() as (network, state):
+                state["generation_cache"] = False
+                node = network.nodes[0]
+                latest_path = (
+                    b"/tor/server/fp/"
+                    + node.relay.fingerprint.encode("ascii")
+                )
+                canonical = state["documents"][latest_path].replace(
+                    b"\nrouter-signature\n",
+                    b"\nuptime 2\nrouter-signature\n",
+                    1,
+                )
+                state["documents"][latest_path] = canonical + b"\n"
+                digest = descriptor(
+                    canonical, node, ROLES[0], network.target_port
+                )[0]
+                digest_path = (
+                    b"/tor/server/d/"
+                    + digest.hex().upper().encode("ascii")
+                )
+                self.assertNotIn(digest_path, state["documents"])
+                with self.assertRaisesRegex(
+                    ProducerError, "^producer-owned-admitted$"
+                ):
+                    network.prove()
+                self.assertIsNone(network.packet)
+                self.assertEqual(state["generation_posts"], [0])
+                self.assertEqual(
+                    state["generation_submissions"],
+                    [(0, node.relay.fingerprint, canonical, 200)],
+                )
+                self.assertNotIn(digest_path, state["documents"])
 
         def test_central_latest_generation_is_not_selected_generation(self):
             with self.fixture() as (network, state):
@@ -2856,6 +2954,6 @@ def run_controls(c):
             )
             failures.append(category + " " + identity)
     return (
-        result.testsRun == 33 and result.wasSuccessful(),
+        result.testsRun == 35 and result.wasSuccessful(),
         tuple(failures),
     )

@@ -1158,7 +1158,7 @@ def main():
             for failure in producer_failures:
                 print(failure, file=sys.stderr)
             return 1
-        print("Tor relay producer mechanism controls passed: 33")
+        print("Tor relay producer mechanism controls passed: 35")
         network = p.implementation(c)(binary, gencert, deadline)
         p.run_live(network, c)
         print("Tor three-authority current consensus controls passed: 1")
