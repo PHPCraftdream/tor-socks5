@@ -562,3 +562,7 @@ fn plugin_pending_dial_drop_records_one_abandonment_without_repoll() {
         },
     );
 }
+
+/// Actual timeout-facility composition with connector cancellation and cleanup.
+#[path = "deadline_tests.rs"]
+mod deadline_tests;
