@@ -19,7 +19,10 @@ use tracing::{debug, error, info, warn};
 use crate::config::{Config, Loaded, SecurityConfig};
 use crate::conn_health::{spawn_conn_health_logger, ConnHealthCounters};
 use crate::dns_wiring::{convert_custom_doh_providers, convert_dns_overrides, dns_cache_path};
-use crate::startup::{init_tracing, install_crypto_provider};
+use crate::startup::{
+    init_tracing, install_crypto_provider, reject_unsupported_account_endpoints,
+    reject_unsupported_endpoint,
+};
 use crate::tor_setup::build_tor_settings;
 use crate::tor_watchdog::{spawn_bridge_failover_watchdog, spawn_tor_watchdog, TorHandle};
 use crate::{shutdown, upstream};
@@ -84,6 +87,12 @@ pub(crate) async fn run_server(
         Loaded::Defaults(_) => (None, "built-in defaults".to_string()),
     };
     let cfg = loaded.into_config();
+    for (scope, setting) in [
+        ("global pre_socks5", &cfg.pre_socks5),
+        ("global post_socks5", &cfg.post_socks5),
+    ] {
+        reject_unsupported_endpoint(setting, scope)?;
+    }
 
     // Held until the server shuts down so the non-blocking log writer
     // keeps flushing for the whole run. The observation sink captures
@@ -112,6 +121,7 @@ pub(crate) async fn run_server(
     // back to the legacy NO_AUTH path.
     let users_path = UsersConfig::resolve_path(config_path.as_deref());
     let users = UsersConfig::load(&users_path).context("loading users registry")?;
+    reject_unsupported_account_endpoints(&users)?;
     let auth_state = if users.users.is_empty() {
         info!(path = %users_path.display(), "no users configured — SOCKS5 will accept anonymous clients");
         None

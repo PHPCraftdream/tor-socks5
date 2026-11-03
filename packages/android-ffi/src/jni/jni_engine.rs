@@ -1,5 +1,33 @@
 use super::*;
 
+#[cfg(any(target_os = "android", test))]
+fn reject_unimplemented_global_socks5_endpoints(config: &Config) -> Result<(), String> {
+    use proxy_config::EndpointOverride;
+
+    if [&config.pre_socks5, &config.post_socks5]
+        .iter()
+        .any(|setting| matches!(setting, Some(EndpointOverride::Endpoint(_))))
+    {
+        return Err("Android SOCKS5 global pre_socks5/post_socks5 endpoints are not supported yet; refusing startup to prevent direct connections".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "android", test))]
+fn reject_unimplemented_account_socks5_endpoints(users: &UsersConfig) -> Result<(), String> {
+    use proxy_config::EndpointOverride;
+
+    for user in users.users.iter().filter(|user| user.is_enabled) {
+        if [&user.pre_socks5, &user.post_socks5]
+            .iter()
+            .any(|setting| matches!(setting, Some(EndpointOverride::Endpoint(_))))
+        {
+            return Err("Android SOCKS5 account pre_socks5/post_socks5 endpoints are not supported yet; refusing startup to prevent direct connections".to_owned());
+        }
+    }
+    Ok(())
+}
+
 /// How long `nativeStop` waits for the engine thread (unchanged 10s contract).
 const STOP_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -25,7 +53,11 @@ pub(crate) fn main_engine_settings(
 }
 
 #[cfg(test)]
-mod tests {
+#[path = "jni_engine_guard_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+mod settings_tests {
     use super::main_engine_settings;
 
     #[test]
@@ -190,6 +222,12 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
             }
         };
 
+        #[cfg(target_os = "android")]
+        if let Err(message) = reject_unimplemented_global_socks5_endpoints(cfg) {
+            let _ = env.throw_new("java/lang/IllegalStateException", &message);
+            return Err(anyhow::anyhow!(message));
+        }
+
         // 3a. One-time process init. Must run before any `tracing::info!`/
         // `warn!`/`error!` call below (step 7a's auth-decision logging in
         // particular): with no global `tracing` subscriber installed yet,
@@ -309,6 +347,11 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
                     let _ = env.throw_new("java/lang/RuntimeException", &msg);
                     e
                 })?;
+            #[cfg(target_os = "android")]
+            if let Err(message) = reject_unimplemented_account_socks5_endpoints(&users) {
+                let _ = env.throw_new("java/lang/IllegalStateException", &message);
+                return Err(anyhow::anyhow!(message));
+            }
             if users.users.is_empty() {
                 let msg = format!(
                     "auth is enabled but the users registry is empty: {}",

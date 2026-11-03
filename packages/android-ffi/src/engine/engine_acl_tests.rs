@@ -284,6 +284,8 @@ fn user_acl_state(acl: Option<&str>) -> Arc<auth::AuthState> {
         is_enabled: true,
         allowed_onion: false,
         allowed_clients: acl.map(|s| s.parse().expect("valid allow-list")),
+        pre_socks5: None,
+        post_socks5: None,
     };
     Arc::new(auth::AuthState::build(&auth::UsersConfig { users: vec![user] }).unwrap())
 }

@@ -15,7 +15,7 @@ use arti_client::config::pt::TransportConfigBuilder;
 use arti_client::config::{BridgeConfigBuilder, CfgPath, Reconfigure, TorClientConfigBuilder};
 use arti_client::{DataStream, TorClient, TorClientConfig};
 use bridge_line::BridgeLine;
-use tor_linkspec::{ChannelMethod, HasChanMethod};
+use tor_linkspec::HasChanMethod;
 use tor_rtcompat::PreferredRuntime;
 
 /// Error type of every fallible operation in this crate, named for the
@@ -63,6 +63,14 @@ pub enum TorError {
         #[source]
         source: arti_client::Error,
     },
+
+    /// SOCKS5 CONNECT negotiation over a Tor-opened stream failed.
+    #[error("post-SOCKS5 CONNECT failed: {0}")]
+    PostSocks(#[source] socks5_proto::client::Error),
+
+    /// The absolute post-SOCKS stream deadline elapsed.
+    #[error("post-SOCKS5 connection deadline elapsed")]
+    PostSocksTimeout,
 
     /// A bridge line could not be turned into arti's `BridgeConfig`:
     /// either its serialised form (after any obfs4 `iat-mode` override)
@@ -193,6 +201,8 @@ pub type BootstrapEventCallback = Arc<dyn Fn(BootstrapEvent) + Send + Sync>;
 /// Bootstrap-time settings for [`TorTunnel`].
 #[derive(Debug, Clone)]
 pub struct Settings {
+    /// Optional SOCKS5 pre-transport endpoint for owner-level routing. Credentials are redacted in Debug output.
+    pub pre_endpoint: Option<Socks5PreEndpoint>,
     /// Bridges to use. When non-empty, the client will go through these
     /// instead of public guards.
     pub bridges: Vec<BridgeLine>,
@@ -267,6 +277,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             bridges: Vec::new(),
+            pre_endpoint: None,
             pt_binary: None,
             extra_pt_protocols: Vec::new(),
             state_dir: None,
@@ -288,7 +299,8 @@ impl Settings {
     /// hints rather than behaviour, so they are deliberately not compared —
     /// a client with only those set still behaves like the default one.
     pub fn is_default(&self) -> bool {
-        self.bridges.is_empty()
+        self.pre_endpoint.is_none()
+            && self.bridges.is_empty()
             && self.pt_binary.is_none()
             && self.extra_pt_protocols.is_empty()
             && self.min_bandwidth_percentile == 0
@@ -573,7 +585,7 @@ impl TorTunnel {
         // only reliable carrier check: the `check_match` inside
         // `get_or_launch` compares relay identities, which different bridge
         // lines (e.g. two webtunnel endpoints of one relay) can share.
-        Ok(channel_proves_endpoint(
+        Ok(pre_endpoint::channel_proves_endpoint(
             &chan.target().chan_method(),
             &target.chan_method(),
         ))
@@ -828,7 +840,12 @@ fn fatal_protocol_error_hook(error: &arti_client::Error) {
     );
 }
 
+mod post_endpoint;
+mod pre_endpoint;
 mod validate;
+pub use post_endpoint::connect_post_socks;
+pub use pre_endpoint::Socks5PreEndpoint;
+pub use socks5_proto::client::Credentials as PostSocksCredentials;
 use validate::{
     validate_circuit_hops, validate_min_bandwidth_percentile, validate_service_circuit_hops,
 };
@@ -841,10 +858,11 @@ fn build_config(settings: &Settings) -> Result<TorClientConfig> {
 
     let mut builder: TorClientConfigBuilder = TorClientConfig::builder();
 
+    pre_endpoint::configure_pre_endpoint(&mut builder, settings)?;
+
     builder
         .stream_timeouts()
         .initial_connect_timeout(settings.initial_connect_timeout);
-
     // Patience for slow bridges. arti's default download schedules are tuned
     // for fast public relays; over a slow/marginal obfs4 or webtunnel bridge
     // the consensus / certificates / microdescriptors arrive slowly and the
@@ -959,31 +977,6 @@ fn build_config(settings: &Settings) -> Result<TorClientConfig> {
     builder
         .build()
         .map_err(|e| TorError::BuildConfig(e.to_string()))
-}
-
-/// Whether a channel's actual connection method proves it reaches a target
-/// requested with `requested`.
-///
-/// Pure decision function for [`TorTunnel::warm_bridge`]: a direct channel
-/// counts when its handshake actually used one of the requested addresses
-/// (`Channel::target()` is filtered down to the address really used, so this
-/// is an intersection, mirroring `PeerInfo::matches_chan_method` in
-/// tor-proto); a pluggable-transport channel counts only on an exact
-/// transport/address/settings match. Anything else — different endpoint,
-/// different transport class — is not proof.
-pub(crate) fn channel_proves_endpoint(
-    actual: &tor_linkspec::ChannelMethod,
-    requested: &tor_linkspec::ChannelMethod,
-) -> bool {
-    match (actual, requested) {
-        (ChannelMethod::Direct(actual_addrs), ChannelMethod::Direct(requested_addrs)) => {
-            actual_addrs.iter().any(|a| requested_addrs.contains(a))
-        }
-        (ChannelMethod::Pluggable(actual), ChannelMethod::Pluggable(requested)) => {
-            actual == requested
-        }
-        _ => false,
-    }
 }
 
 #[cfg(test)]
