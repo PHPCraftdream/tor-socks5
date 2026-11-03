@@ -11,11 +11,14 @@ static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 
 /// Allocate an identity without wrapping or changing product state.
 pub(super) fn id() -> Id {
-    NEXT_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-            value.checked_add(1)
-        })
-        .ok()
+    let mut current = NEXT_ID.load(Ordering::Relaxed);
+    loop {
+        let next = current.checked_add(1)?;
+        match NEXT_ID.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(value) => return Some(value),
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 /// Immutable ownership context captured when work is queued.
@@ -220,17 +223,46 @@ pub(super) fn render(record: &Record) -> String {
     )
 }
 
-/// Send an accepted line through the common bounded-output path.
-fn emit(state: &mut State, line: String) {
+/// Register the fixed diagnostic callsite before entering a dispatcher callback.
+pub(super) fn emission_callsite() -> &'static tracing::callsite::DefaultCallsite {
+    tracing::callsite! {
+        name: "managed_pt",
+        kind: tracing::metadata::Kind::EVENT,
+        target: "tor_ptmgr::managed_diagnostics",
+        level: tracing::Level::INFO,
+        fields: message,
+    }
+}
+
+/// Filter each accepted root event against the current dispatcher.
+fn emit(state: &mut State, line: &str) {
     #[cfg(test)]
-    state.emitted.push(line.clone());
+    state.emitted.push(line.to_owned());
     #[cfg(not(test))]
     let _ = state;
-    tracing::info!(
-        target: "tor_ptmgr::managed_diagnostics",
-        parent: None,
-        message = %line,
-    );
+
+    if tracing::Level::INFO > tracing::level_filters::STATIC_MAX_LEVEL {
+        return;
+    }
+
+    let callsite = emission_callsite();
+    let metadata = tracing::callsite::Callsite::metadata(callsite);
+
+    tracing::dispatcher::get_default(|dispatch| {
+        if !dispatch.enabled(metadata) {
+            return;
+        }
+
+        let message = metadata
+            .fields()
+            .field("message")
+            .expect("managed diagnostic metadata includes message");
+        let displayed = tracing::field::display(line);
+        let fields = [(&message, Some(&displayed as &dyn tracing::field::Value))];
+        let values = metadata.fields().value_set(&fields);
+        let event = tracing::Event::new_child_of(None, metadata, &values);
+        dispatch.event(&event);
+    });
 }
 
 impl Trace {
@@ -282,7 +314,7 @@ impl Trace {
                 state.suppression_reported = true;
                 emit(
                     &mut state,
-                    format!(
+                    &format!(
                         "managed_pt manager={:?} transaction={:?} \
                          suppression=at_least_one_duplicate terminal_stage_reserved=true",
                         self.context.manager, self.context.transaction,
@@ -292,13 +324,13 @@ impl Trace {
             if first_failure {
                 emit(
                     &mut state,
-                    format!("{} reserved_first_failure=true", render(&record)),
+                    &format!("{} reserved_first_failure=true", render(&record)),
                 );
             }
             return;
         }
         state.records[stage.index()] = Some(record);
-        emit(&mut state, render(&record));
+        emit(&mut state, &render(&record));
     }
 
     /// Obtain a test receipt without consuming any product observation.

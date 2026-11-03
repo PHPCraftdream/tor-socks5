@@ -575,6 +575,17 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for DiagnosticBuffer {
     fn make_writer(&'a self) -> Self::Writer {
         self.clone()
     }
+
+    fn make_writer_for(&'a self, metadata: &tracing::Metadata<'_>) -> Self::Writer {
+        if metadata.target() == "tor_ptmgr::managed_diagnostics" {
+            assert_eq!(
+                metadata.callsite(),
+                tracing::callsite::Identifier(diagnostics::emission_callsite()),
+                "formatted diagnostics must use the callsite whose stale interest is injected",
+            );
+        }
+        self.clone()
+    }
 }
 
 impl DiagnosticBuffer {
@@ -590,9 +601,10 @@ impl DiagnosticBuffer {
     }
 }
 
-/// Require real bounded tracing output, subscriber filtering, and root-parent isolation.
+/// Exercise real formatting and stale-interest states only in an exact test process.
 #[test]
-fn diagnostic_tracing_backend_is_bounded_filtered_and_parentless() {
+#[ignore = "Executed by the exact-process backend regression"]
+fn diagnostic_tracing_backend_process_fixture() {
     let buffer = DiagnosticBuffer::default();
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
@@ -607,6 +619,9 @@ fn diagnostic_tracing_backend_is_bounded_filtered_and_parentless() {
         let _entered = parent.enter();
 
         tracing::info!("parent_capture_control");
+        let callsite = diagnostics::emission_callsite();
+        tracing::callsite::Callsite::set_interest(callsite, tracing::subscriber::Interest::never());
+        assert!(callsite.interest().is_never());
         diagnostic_emitted_bounds_reserve_first_failure_and_terminal();
     });
 
@@ -699,9 +714,49 @@ fn diagnostic_tracing_backend_is_bounded_filtered_and_parentless() {
         .finish();
 
     tracing::subscriber::with_default(off_subscriber, || {
+        let callsite = diagnostics::emission_callsite();
+        tracing::callsite::Callsite::set_interest(
+            callsite,
+            tracing::subscriber::Interest::always(),
+        );
+        assert!(callsite.interest().is_always());
         diagnostic_emitted_bounds_reserve_first_failure_and_terminal();
     });
     assert!(off_buffer.text().is_empty());
+}
+
+/// Run every backend assertion once in a process isolated from other callsite rebuilds.
+#[test]
+fn diagnostic_tracing_backend_is_bounded_filtered_and_parentless() {
+    let (_, module) = module_path!()
+        .split_once("::")
+        .expect("test module includes its crate prefix");
+    let fixture = format!("{module}::diagnostic_tracing_backend_process_fixture");
+    let output = std::process::Command::new(
+        std::env::current_exe().expect("current managed test executable"),
+    )
+    .arg("--exact")
+    .arg(&fixture)
+    .arg("--ignored")
+    .arg("--nocapture")
+    .arg("--color=never")
+    .output()
+    .expect("isolated diagnostic backend fixture completes");
+    assert!(output.status.success(), "diagnostic backend fixture failed");
+
+    let stdout = String::from_utf8(output.stdout).expect("test harness stdout is UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("diagnostic stderr is UTF-8");
+    assert!(stdout.contains("running 1 test"));
+    assert!(stdout.contains(&fixture));
+    assert!(stdout.contains("1 passed; 0 failed; 0 ignored"));
+    assert!(
+        !stdout.contains("managed_pt "),
+        "managed diagnostics bypassed the formatting subscriber through stdout"
+    );
+    assert!(
+        stderr.is_empty(),
+        "managed diagnostics bypassed the formatting subscriber through stderr"
+    );
 }
 
 /// Exercise the bounded policy in an isolated test process with tracing disabled.

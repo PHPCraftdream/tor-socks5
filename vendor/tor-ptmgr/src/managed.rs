@@ -473,8 +473,8 @@ impl<R: Runtime> PtReactor<R> {
                             );
                             return;
                         }
-                        let mut methods = 0usize;
-                        let mut local_sends = 0usize;
+                        let mut methods = 0_usize;
+                        let mut local_sends = 0_usize;
                         for (name, method) in pt.transport_methods() {
                             state.managed_cmethods.insert(name.clone(), method.clone());
                             methods = methods.saturating_add(1);
