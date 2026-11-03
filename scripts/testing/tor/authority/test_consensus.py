@@ -6,6 +6,7 @@ import io
 import math
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import subprocess
@@ -67,8 +68,8 @@ def consensus_body(nodes, period, signers=2):
         b"network-status-version 3\n"
         b"vote-status consensus\n"
         b"valid-after " + date(period) + b"\n"
-        b"fresh-until " + date(period + 300) + b"\n"
-        b"valid-until " + date(period + 900) + b"\n"
+        b"fresh-until " + date(period + c.INTERVAL) + b"\n"
+        b"valid-until " + date(period + c.INTERVAL * c.VALID_INTERVALS) + b"\n"
         b"voting-delay 20 20\n"
     )
     for index, node in enumerate(nodes):
@@ -471,7 +472,7 @@ class Controls(unittest.TestCase):
                 )
                 network = self.prepared_network(isolated, deadline=14)
                 period = 86550
-                boundary = 86700
+                boundary = 86640
                 baseline = consensus_body(network.nodes, period)
                 network.baseline = baseline
                 network.metadata = isolated.consensus_metadata(
@@ -479,7 +480,7 @@ class Controls(unittest.TestCase):
                 )
                 survivor = network.nodes[0]
                 vote = vote_body(
-                    survivor, boundary - 300 if variant == "stale-vote" else boundary
+                    survivor, boundary - c.INTERVAL if variant == "stale-vote" else boundary
                 )
                 (survivor.data / "cached-consensus").write_bytes(baseline)
                 (survivor.data / "v3-status-votes").write_bytes(vote)
@@ -546,27 +547,54 @@ class Controls(unittest.TestCase):
                 finally:
                     network.close()
 
+    def test_consensus_requires_exact_private_timing_profile(self):
+        network = self.prepared_network()
+        try:
+            period = 86400
+            body = consensus_body(network.nodes, period)
+            metadata = c.consensus_metadata(body, network.nodes, period + 1)
+            self.assertEqual(metadata[:3], (86400, 86520, 86760))
+            for name, value in (
+                (b"fresh-until", period + 300),
+                (b"valid-until", period + 900),
+            ):
+                changed = re.sub(
+                    rb"(?m)^" + name + rb" [^\n]+$",
+                    name + b" " + date(value),
+                    body,
+                )
+                self.assertNotEqual(changed, body)
+                with self.assertRaisesRegex(
+                    c.ConsensusError, "^consensus-interval$"
+                ):
+                    c.consensus_metadata(
+                        changed, network.nodes, period + 1
+                    )
+        finally:
+            network.close()
+
+
     def test_next_round_regression_aligned_intervening_and_offset(self):
-        aligned = (86400, 86700, 87300, {})
-        intervening = (86550, 86850, 87450, {})
-        self.assertEqual(c.next_round(aligned), 86700)
-        self.assertEqual(c.next_round(intervening), 86700)
+        aligned = (86400, 86520, 86760, {})
+        intervening = (86550, 86670, 86910, {})
+        self.assertEqual(c.next_round(aligned), 86520)
+        self.assertEqual(c.next_round(intervening), 86640)
         self.assertNotEqual(c.next_round(intervening), intervening[1])
-        self.assertEqual(c.period_after(86550, 300, 17), 86717)
-        self.assertEqual(c.period_after(172799, 300, 0), 172800)
-        self.assertEqual(c.period_after(86700, 300, 0), 87000)
+        self.assertEqual(c.period_after(86550, 120, 17), 86657)
+        self.assertEqual(c.period_after(172799, 120, 0), 172800)
+        self.assertEqual(c.period_after(86640, 120, 0), 86760)
 
     def test_quorum_window_edges_before_and_after_owned_stop(self):
-        c.require_window(86700, 86659.999)
-        for value in (86660, 86660.001, 86700):
+        c.require_window(86640, 86599.999)
+        for value in (86600, 86600.001, 86640):
             with self.subTest(category="closed-window"):
                 with self.assertRaises(c.ConsensusError):
-                    c.require_window(86700, value)
+                    c.require_window(86640, value)
         network = self.prepared_network()
         baseline = consensus_body(network.nodes, 86550)
         network.baseline = baseline
         network.metadata = c.consensus_metadata(baseline, network.nodes, 86551)
-        values = iter((86659.0, 86660.0))
+        values = iter((86599.0, 86600.0))
         survivor = network.nodes[0]
         survivor.request = mock.Mock()
         try:
@@ -751,6 +779,16 @@ class Controls(unittest.TestCase):
                     self.assertIn("PublishServerDescriptor 1\n", text)
                     self.assertNotIn("PublishServerDescriptor 0\n", text)
                     self.assertIn("TestingV3AuthVotingStartOffset 0\n", text)
+                    for line in (
+                        "V3AuthVotingInterval 120 seconds\n",
+                        "V3AuthNIntervalsValid 3\n",
+                        "TestingV3AuthInitialVotingInterval 120 seconds\n",
+                        "V3AuthVoteDelay 20 seconds\n",
+                        "V3AuthDistDelay 20 seconds\n",
+                        "TestingV3AuthInitialVoteDelay 20 seconds\n",
+                        "TestingV3AuthInitialDistDelay 20 seconds\n",
+                    ):
+                        self.assertEqual(text.count(line), 1)
                     self.assertIn("RunAsDaemon 0\n", text)
                     self.assertIn("SocksPort 0\n", text)
                     self.assertIn("UseDefaultFallbackDirs 0\n", text)
@@ -820,11 +858,11 @@ def main():
     try:
         suite = unittest.defaultTestLoader.loadTestsFromTestCase(Controls)
         result = unittest.TextTestRunner(stream=io.StringIO()).run(suite)
-        if result.testsRun != 15 or not result.wasSuccessful():
+        if result.testsRun != 16 or not result.wasSuccessful():
             print("Tor authority consensus mechanism controls failed", file=sys.stderr)
             report_failures(result)
             return 1
-        print("Tor authority consensus mechanism controls passed: 15")
+        print("Tor authority consensus mechanism controls passed: 16")
         diagnostic_suite = unittest.defaultTestLoader.loadTestsFromTestCase(
             DiagnosticControls
         )
@@ -847,7 +885,7 @@ def main():
             for failure in producer_failures:
                 print(failure, file=sys.stderr)
             return 1
-        print("Tor relay producer mechanism controls passed: 35")
+        print("Tor relay producer mechanism controls passed: 36")
         network = p.implementation(c)(binary, gencert, deadline)
         p.run_live(network, c)
         print("Tor three-authority current consensus controls passed: 1")

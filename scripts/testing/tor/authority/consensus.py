@@ -22,6 +22,8 @@ a = _load("authority_consensus_startup", Path(__file__).with_name("startup.py"))
 LIMIT = 1048576
 HEX = rb"[0-9A-F]{40}"
 OFFSET = 0
+INTERVAL = 120
+VALID_INTERVALS = 3
 SHORTAGE = b"We don't have enough votes to generate a consensus: 1 of 2"
 
 
@@ -75,7 +77,7 @@ def period_after(now, interval, offset):
 def next_round(metadata):
     valid_after, fresh_until, _valid_until, _entries = metadata
     interval = fresh_until - valid_after
-    require(interval == 300, "consensus-interval")
+    require(interval == INTERVAL, "consensus-interval")
     return period_after(int(valid_after), int(interval), OFFSET)
 
 
@@ -127,7 +129,11 @@ def consensus_metadata(data, nodes, now):
         valid_after <= now < fresh_until < valid_until,
         "consensus-not-current",
     )
-    require(fresh_until - valid_after == 300, "consensus-interval")
+    require(
+        fresh_until - valid_after == INTERVAL
+        and valid_until - valid_after == INTERVAL * VALID_INTERVALS,
+        "consensus-interval",
+    )
     require(
         one(data, rb"^voting-delay (\d+ \d+)$") == b"20 20",
         "consensus-delays",
@@ -251,10 +257,11 @@ class VotingNode(a.AuthorityNode):
         )
         text += (
             "V3AuthUseLegacyKey 0\n"
-            "V3AuthVotingInterval 300 seconds\n"
+            "V3AuthVotingInterval 120 seconds\n"
+            "V3AuthNIntervalsValid 3\n"
             "V3AuthVoteDelay 20 seconds\n"
             "V3AuthDistDelay 20 seconds\n"
-            "TestingV3AuthInitialVotingInterval 150 seconds\n"
+            "TestingV3AuthInitialVotingInterval 120 seconds\n"
             "TestingV3AuthInitialVoteDelay 20 seconds\n"
             "TestingV3AuthInitialDistDelay 20 seconds\n"
             "TestingV3AuthVotingStartOffset 0\n"

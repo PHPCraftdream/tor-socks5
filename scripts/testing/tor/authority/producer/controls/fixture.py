@@ -167,8 +167,8 @@ def build():
                         b"network-status-version 3" + flavor + b"\n"
                         b"vote-status consensus\nvalid-after "
                         + date(period) + b"\nfresh-until "
-                        + date(period + 300) + b"\nvalid-until "
-                        + date(period + 900) + b"\nvoting-delay 20 20\n"
+                        + date(period + c.INTERVAL) + b"\nvalid-until "
+                        + date(period + c.INTERVAL * c.VALID_INTERVALS) + b"\nvoting-delay 20 20\n"
                     )
                     for index, node in enumerate(network.nodes):
                         body += (

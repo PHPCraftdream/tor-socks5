@@ -24,8 +24,8 @@ def build():
                 def render(body, period, zero=False, weights=False):
                     values = {
                         b"valid-after": date(period),
-                        b"fresh-until": date(period + 300),
-                        b"valid-until": date(period + 900),
+                        b"fresh-until": date(period + c.INTERVAL),
+                        b"valid-until": date(period + c.INTERVAL * c.VALID_INTERVALS),
                     }
                     result = re.sub(
                         rb"(?m)^(valid-after|fresh-until|valid-until) "
@@ -50,10 +50,10 @@ def build():
                         c.stamp(result, b"valid-after"), period
                     )
                     self.assertEqual(
-                        c.stamp(result, b"fresh-until"), period + 300
+                        c.stamp(result, b"fresh-until"), period + c.INTERVAL
                     )
                     self.assertEqual(
-                        c.stamp(result, b"valid-until"), period + 900
+                        c.stamp(result, b"valid-until"), period + c.INTERVAL * c.VALID_INTERVALS
                     )
                     return result
 
@@ -175,6 +175,69 @@ def build():
                     pause.assert_not_called()
                 self.assertIsNone(network.packet)
 
+        def test_readiness_delayed_generations_fit_private_grid(self):
+            starts = tuple(86400 + phase for phase in range(120))
+            starts += (172799, 172800, 172801)
+            for start in starts:
+                with self.subTest(start=start):
+                    with self.readiness_fixture() as (network, state):
+                        clock = state["readiness_clock"]
+                        original_mono = clock["mono"]
+                        deadline = network.deadline
+                        first = c.period_after(start, 120, 0)
+                        clock["wall"] = first + 1
+                        clock["mono"] = original_mono + first + 1 - start
+                        state["readiness_publish"](
+                            first, zero=True, install_baseline=True
+                        )
+                        periods = []
+                        original_positive = c.Network.positive
+
+                        def advance():
+                            network.check()
+                            self.assertIsNone(network.packet)
+                            self.assertLess(len(periods), 2)
+                            period = c.next_round(network.metadata)
+                            delta = period + 1 - clock["wall"]
+                            self.assertGreater(delta, 0)
+                            clock["wall"] += delta
+                            clock["mono"] += delta
+                            periods.append(period)
+                            state["readiness_publish"](
+                                period, zero=len(periods) == 1
+                            )
+
+                        with mock.patch.object(
+                            network, "pause", side_effect=advance
+                        ):
+                            with mock.patch.object(
+                                c.Network, "positive",
+                                autospec=True,
+                                side_effect=original_positive,
+                            ) as positive:
+                                self.assertEqual(
+                                    network.await_ready(),
+                                    "owned-three-relay-producer",
+                                )
+                        self.assertEqual(
+                            periods, [first + 120, first + 240]
+                        )
+                        self.assertEqual(positive.call_count, 2)
+                        self.assertEqual(network.metadata[0], periods[-1])
+                        self.assertIsNotNone(network.packet)
+                        boundary = c.next_round(network.metadata)
+                        self.assertEqual(boundary, first + 360)
+                        self.assertLess(
+                            clock["mono"] + boundary - clock["wall"],
+                            deadline,
+                        )
+                        self.assertEqual(network.deadline, deadline)
+                        self.assertEqual(
+                            network.producer_negative(),
+                            "bom-descriptor-admission-rejected",
+                        )
+
+
         def test_readiness_requires_new_verified_generation(self):
             with self.readiness_fixture() as (network, state):
                 clock = state["readiness_clock"]
@@ -184,9 +247,9 @@ def build():
                 def advance():
                     network.check()
                     self.assertEqual(events, [])
-                    clock["wall"] += 150
-                    clock["mono"] += 150
-                    state["readiness_publish"](86700)
+                    clock["wall"] += 90
+                    clock["mono"] += 90
+                    state["readiness_publish"](86640)
                     events.append("published")
 
                 with mock.patch.object(
@@ -203,9 +266,9 @@ def build():
                         )
                 positive.assert_called_once_with(network)
                 self.assertEqual(events, ["published"])
-                self.assertEqual(network.metadata[0], 86700)
+                self.assertEqual(network.metadata[0], 86640)
                 self.assertEqual(
-                    c.next_round(network.metadata), 87000
+                    c.next_round(network.metadata), 86760
                 )
                 self.assertIsNotNone(network.packet)
                 self.assertEqual(
@@ -213,7 +276,7 @@ def build():
                     state["readiness_deadline"],
                 )
                 self.assertLess(
-                    clock["mono"] + 87000 - clock["wall"],
+                    clock["mono"] + 86760 - clock["wall"],
                     network.deadline,
                 )
                 self.assertEqual(
@@ -249,7 +312,7 @@ def build():
                                     path.write_bytes(render(body, 86400))
                                 elif variant == "disagreement":
                                     path.write_bytes(render(
-                                        body, 86700 + index * 300
+                                        body, 86640 + index * c.INTERVAL
                                     ))
 
                         with mock.patch.object(
@@ -280,13 +343,13 @@ def build():
                             self.assertEqual(events, [])
                             events.append("published-one")
                             body = state["readiness_render"](
-                                old, 86700, weights=True
+                                old, 86640, weights=True
                             )
                             weights = state["readiness_weights"]
                             if variant == "validity":
                                 body = re.sub(
                                     rb"(?m)^fresh-until [^\n]+$",
-                                    b"fresh-until 1970-01-02 00:05:00",
+                                    b"fresh-until 1970-01-02 00:04:00",
                                     body,
                                 )
                             elif variant == "voter":
@@ -392,7 +455,7 @@ def build():
                                     / "cached-consensus"
                                 ).write_bytes(
                                     state["readiness_render"](
-                                        old, 86700, weights=weights
+                                        old, 86640, weights=weights
                                     )
                                 )
                                 events.append("one-future")
@@ -400,13 +463,13 @@ def build():
                                 self.assertEqual(clock["wall"], 86551)
                                 self.assertIsNone(network.packet)
                                 state["readiness_publish"](
-                                    86700, weights=weights
+                                    86640, weights=weights
                                 )
                                 events.append("all-future")
                             elif events == ["one-future", "all-future"]:
                                 self.assertIsNone(network.packet)
-                                clock["wall"] += 150
-                                clock["mono"] += 150
+                                clock["wall"] += 90
+                                clock["mono"] += 90
                                 events.append("current")
                             else:
                                 self.fail("unexpected-readiness-pause")
@@ -428,7 +491,7 @@ def build():
                             ["one-future", "all-future", "current"],
                         )
                         positive.assert_called_once_with(network)
-                        self.assertEqual(network.metadata[0], 86700)
+                        self.assertEqual(network.metadata[0], 86640)
                         self.assertIsNotNone(network.packet)
                         self.assertEqual(
                             network.deadline,

@@ -878,6 +878,6 @@ def run_controls(c):
             )
             failures.append(category + " " + identity)
     return (
-        result.testsRun == 35 and result.wasSuccessful(),
+        result.testsRun == 36 and result.wasSuccessful(),
         tuple(failures),
     )

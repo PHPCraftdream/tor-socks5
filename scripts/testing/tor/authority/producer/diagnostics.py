@@ -255,7 +255,7 @@ class DiagnosticControls(unittest.TestCase):
                 errors = io.StringIO()
                 results = [
                     SimpleNamespace(
-                        testsRun=15, wasSuccessful=lambda: True,
+                        testsRun=16, wasSuccessful=lambda: True,
                     ),
                     SimpleNamespace(
                         testsRun=3, wasSuccessful=lambda: True,
