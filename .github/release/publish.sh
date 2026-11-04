@@ -55,8 +55,8 @@ vt_out="$(bash "$script_dir/validate-tag.sh" "$TAG")" || fail "тег '$TAG' н�
 vt_pre="$(printf '%s\n' "$vt_out" | sed -n 's/^prerelease=//p')"
 [ "$vt_pre" = "$PRERELEASE" ] || fail "класс тега (validate-tag.sh: prerelease=$vt_pre) не совпадает с PRERELEASE=$PRERELEASE"
 
-# Ожидаемые ассеты: 2 цели tar.gz (Unix), 1 zip (Windows) — итого 4 таргета, 8 файлов.
-UNIX_TARGETS="x86_64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin"
+# === Ожидаемые assets: 6 Linux targets + 2 Apple targets + 1 Windows target ===
+UNIX_TARGETS="x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-gnu aarch64-unknown-linux-musl x86_64-apple-darwin aarch64-apple-darwin"
 WIN_TARGETS="x86_64-pc-windows-msvc"
 
 # === Шаг 1: строгая локальная проверка комплекта (без сети) ===
@@ -90,7 +90,7 @@ for f in $expected_files; do
 done
 
 # Каждая запись каталога (dotglob: включая hidden, dangling symlinks, подкаталоги)
-# обязана быть одним из 8 ожидаемых имён. Лишнее не удаляем — только fail.
+# обязана быть одним из 14 ожидаемых имён. Лишнее не удаляем — только fail.
 actual_count=0
 for p in "$ARTIFACTS_DIR"/*; do
   actual_count=$((actual_count + 1))
@@ -134,7 +134,7 @@ for f in $expected_files; do
 done
 echo "Шаг 1: комплект из $expected_count файлов и контрольные суммы в порядке."
 
-# Заранее (до ПЕРВОГО gh-вызова) строим manifest размеров ВСЕХ 8 локальных
+# Заранее (до ПЕРВОГО gh-вызова) строим manifest размеров ВСЕХ 14 локальных
 # файлов, включая .sha256 — чтобы сетевые шаги не зависели от локального stat.
 sizes_json='{}'
 for f in $expected_files; do
@@ -145,7 +145,8 @@ done
 
 shopt -u dotglob nullglob
 
-# Имена ассетов для jq — построчно (word splitting безопасен: только [A-Za-z0-9.-]).
+# Имена ассетов для jq — построчно; для 7-target manifest legacy-комплект
+# намеренно не принимается по cardinality: его нельзя отличить от partial upload.
 names_json="$(printf '%s\n' $expected_files | jq -Rn '[inputs]')"
 
 # === Шаг 2: read-only — состояние релиза на remote (только через gh) ===
@@ -183,7 +184,7 @@ case "$state" in
 esac
 
 # === Общая проверка ассетов по ответу API ===
-# Для КАЖДОГО из 8 ожидаемых имён: ровно один asset, .size — число > 0,
+# Для КАЖДОГО из 14 ожидаемых имён: ровно один asset, .size — число > 0,
 # .state == "uploaded". Аргумент: JSON объекта release (stdin).
 # Вывод: список «плохих» имён (пустая строка = всё в порядке).
 check_assets() {
@@ -206,7 +207,7 @@ check_assets() {
 # размерами локальных файлов (сравнение чисел байтов/размеров; для published
 # не используется — rebuild недетерминирован).
 # Аргументы: report (JSON release, stdin) и sizes_json (готовый manifest
-# размеров всех 8 файлов, включая .sha256).
+# размеров всех 14 файлов, включая .sha256).
 check_asset_sizes() {
   local report="$1" sizes_json="$2"
   printf '%s' "$report" | jq -r --argjson sizes "$sizes_json" '
@@ -218,7 +219,7 @@ check_asset_sizes() {
   ' || fail "не удалось сверить размеры ассетов (jq)"
 }
 
-# === Шаг 3: draft-ветка — загрузка своих 8 ассетов и публикация ===
+# === Шаг 3: draft-ветка — загрузка своих 14 ассетов и публикация ===
 
 # Узкая проверка state релиза перед мутацией/после неё (НЕ атомарная защита
 # от любых внешних гонок). Аргументы: report (stdin) и ожидаемый числовой id.
@@ -276,7 +277,7 @@ upload_and_publish() {
   printf '%s' "$body" | gh api --method PATCH "repos/$REMOTE_REPO/releases/$release_id" --input - \
     || fail "PATCH публикации не удался; НЕ утверждаем, что релиз остался draft — сервер мог применить изменение до сбоя сети; безопасный повторный запуск распознает published и сделает no-op"
 
-  # Readback: сервер обязан подтвердить draft=false, класс и все 8 ассетов.
+  # Readback: сервер обязан подтвердить draft=false, класс и все 14 ассетов.
   report="$(gh api "repos/$REMOTE_REPO/releases/$release_id")" \
     || fail "не удалось перечитать релиз после PATCH"
   # Typed-сравнение через jq (не shell-текст): id/tag/draft=false/prerelease.
@@ -292,6 +293,9 @@ case "$state" in
     info="$(printf '%s' "$releases_json" | jq -c --arg tag "$TAG" '
       (if (type == "array") and ((.[0]? // null | type) == "array") then flatten else . end)
       | map(select(.tag_name == $tag))[0]')"
+    # Для совпадающих 7-target manifest требуется полный новый комплект.
+    # Старые 4-target релизы неотличимы от частичной загрузки нового комплекта;
+    # безопаснее отказать, чем принимать их по числу или составу ассетов.
     bad="$(check_assets "$info")"
     [ -z "$bad" ] || fail "релиз $TAG уже PUBLISHED, но ассеты неполны/невалидны: $bad; перезапись/удаление запрещены — исправьте вручную"
     is_pre="$(printf '%s' "$info" | jq -r '.prerelease | tostring')" || fail "jq: prerelease"

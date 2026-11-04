@@ -53,7 +53,7 @@ class ShInstallTests(unittest.TestCase):
 
     def build(self, os_name="Linux", machine="x86_64", sysctl_arm="0",
               hash_tools=None, member=None, checksum=None,
-              scenario_kw=None, archive_kw=None):
+              scenario_kw=None, archive_kw=None, libc="gnu"):
         if hash_tools is None:
             # macOS runners не имеют coreutils: берём то, что реально есть
             hash_tools = (("sha256sum",) if shutil.which("sha256sum")
@@ -61,12 +61,21 @@ class ShInstallTests(unittest.TestCase):
         # Неизвестная ОС (SunOS и т.п.): ассет-placeholder — валидный Linux,
         # платформу отвергает САМ installer (stub uname) ДО сети. Ошибку
         # placeholder-выбора в Python НЕ маскируем.
-        target = {"Linux": "x86_64-unknown-linux-gnu",
+        target = {"Linux": "%s-unknown-linux-musl" %
+                  ("aarch64" if machine in ("aarch64", "arm64") else "x86_64"),
                   "Darwin": "aarch64-apple-darwin" if
-                            (machine in ("arm64", "aarch64") or sysctl_arm == "1")
-                            else "x86_64-apple-darwin"}.get(os_name) \
+                  (machine in ("arm64", "aarch64") or sysctl_arm == "1")
+                  else "x86_64-apple-darwin"}.get(os_name) \
             or "x86_64-unknown-linux-gnu"
-        archive_name = "tor-socks5-%s-%s.tar.gz" % (fx.MOCK_TAG, target)
+        scenario_kw = scenario_kw or {}
+        latest_url = scenario_kw.get("latest_final_url", "https://github.com/%s/%s/releases/tag/%s" %
+                                    (fx.OWNER, fx.REPO, fx.MOCK_TAG))
+        tag = latest_url.rsplit("/", 1)[-1]
+        legacy = (os_name == "Linux" and machine in ("x86_64", "amd64")
+                  and libc == "gnu" and tag == "v0.2.0")
+        if legacy:
+            target = "x86_64-unknown-linux-gnu"
+        archive_name = "tor-socks5-%s-%s.tar.gz" % (tag, target)
         # Каждый build — НОВЫЙ уникальный namespace (bin/bin-data/dl/home/log):
         # symlinks и fixture files/логи не переиспользуются между сценариями.
         self._build_n += 1
@@ -87,7 +96,7 @@ class ShInstallTests(unittest.TestCase):
                            else checksum.encode("utf-8"))
         bin_dir, scen, log = fx.make_fakebin(
             ns, "bin", os_name=os_name, machine=machine,
-            sysctl_arm=sysctl_arm, hash_tools=hash_tools)
+            sysctl_arm=sysctl_arm, hash_tools=hash_tools, libc=libc)
         kw = {"files": {archive_name: archive_path,
                         archive_name + ".sha256": sum_path}}
         kw.update(scenario_kw or {})
@@ -197,8 +206,8 @@ class ShInstallTests(unittest.TestCase):
     # --- платформа/arch: fail ДО скачивания ----------------------------
 
     def test_wrong_platform_fails_before_download(self):
-        for os_name, machine in (("SunOS", "x86_64"), ("Linux", "aarch64"),
-                                 ("Linux", "i686"), ("Darwin", "i386")):
+        for os_name, machine in (("SunOS", "x86_64"), ("Linux", "i686"),
+                                 ("Darwin", "i386")):
             with self.subTest(platform="%s/%s" % (os_name, machine)):
                 ctx = self.build(os_name=os_name, machine=machine)
                 p = self.install(ctx)
@@ -207,40 +216,184 @@ class ShInstallTests(unittest.TestCase):
 
     def test_target_selection(self):
         cases = [
-            # (os, machine, sysctl, ожидаемый target в URL скачивания)
-            ("Linux", "x86_64", "0", "x86_64-unknown-linux-gnu"),
-            ("Darwin", "x86_64", "0", "x86_64-apple-darwin"),      # Intel
-            ("Darwin", "x86_64", "1", "aarch64-apple-darwin"),     # Rosetta
-            ("Darwin", "arm64", "0", "aarch64-apple-darwin"),
+            # (os, machine, sysctl, libc, expected archive target)
+            ("Linux", "x86_64", "0", "gnu", "x86_64-unknown-linux-musl"),
+            ("Linux", "amd64", "0", "musl", "x86_64-unknown-linux-musl"),
+            ("Linux", "aarch64", "0", "gnu", "aarch64-unknown-linux-musl"),
+            ("Linux", "arm64", "0", "musl", "aarch64-unknown-linux-musl"),
+            ("Darwin", "x86_64", "0", "gnu", "x86_64-apple-darwin"),
+            ("Darwin", "x86_64", "1", "gnu", "aarch64-apple-darwin"),
+            ("Darwin", "arm64", "0", "gnu", "aarch64-apple-darwin"),
         ]
-        for os_name, machine, sysctl, target in cases:
+        for os_name, machine, sysctl, libc, target in cases:
             with self.subTest(target=target):
                 ctx = self.build(os_name=os_name, machine=machine,
-                                 sysctl_arm=sysctl)
+                                 sysctl_arm=sysctl, libc=libc)
                 p = self.install(ctx)
                 self.assertEqual(p.returncode, 0, p.stderr)
                 urls = self.curl_urls(ctx)
                 self.assertEqual(len(urls), 3)
-                self.assertIn("/download/%s/tor-socks5-%s-%s.tar.gz"
-                              % (fx.MOCK_TAG, fx.MOCK_TAG, target), urls[1])
+                self.assertEqual(urls[1], "https://github.com/%s/%s/releases/download/%s/tor-socks5-%s-%s.tar.gz" %
+                                 (fx.OWNER, fx.REPO, fx.MOCK_TAG, fx.MOCK_TAG, target))
+                self.assertEqual(urls[2], urls[1] + ".sha256")
                 # tar-архив под каждый target собирается с именем члена
                 # 'tor-socks5', поэтому установка успешна
                 self.assert_installed(
                     os.path.join(ctx["home"], ".local", "bin", "tor-socks5"))
+
+        cases = [
+            ("Linux", "x86_64", "gnu", "x86_64-unknown-linux-musl"),
+            ("Linux", "x86_64", "musl", "x86_64-unknown-linux-musl"),
+            ("Linux", "amd64", "musl", "x86_64-unknown-linux-musl"),
+            ("Linux", "aarch64", "gnu", "aarch64-unknown-linux-musl"),
+            ("Linux", "aarch64", "musl", "aarch64-unknown-linux-musl"),
+            ("Linux", "arm64", "musl", "aarch64-unknown-linux-musl"),
+        ]
+        for os_name, machine, libc, target in cases:
+            with self.subTest(platform=(machine, libc)):
+                ctx = self.build(os_name=os_name, machine=machine, libc=libc)
+                p = self.install(ctx)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertEqual(self.curl_urls(ctx)[1],
+                                 "https://github.com/%s/%s/releases/download/%s/tor-socks5-%s-%s.tar.gz" %
+                                 (fx.OWNER, fx.REPO, fx.MOCK_TAG, fx.MOCK_TAG, target))
+
+        for machine, libc in (("x86_64", "unknown"), ("aarch64", "unknown")):
+            ctx = self.build(machine=machine, libc=libc)
+            p = self.install(ctx)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn("-unknown-linux-musl", self.curl_urls(ctx)[1])
+
+    def test_linux_conflicting_libc_prefers_musl(self):
+        ctx = self.build(machine="aarch64", libc="mixed",
+                         member=[fx.tar_member("tor-socks5", b"aarch64-musl-payload")])
+        p = self.install(ctx)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        expected_name = "tor-socks5-%s-aarch64-unknown-linux-musl.tar.gz" % fx.MOCK_TAG
+        self.assertEqual(ctx["target"], "aarch64-unknown-linux-musl")
+        self.assertEqual(ctx["archive_name"], expected_name)
+        self.assertEqual(self.curl_urls(ctx)[1],
+                         "https://github.com/%s/%s/releases/download/%s/%s" %
+                         (fx.OWNER, fx.REPO, fx.MOCK_TAG, expected_name))
+        dest = os.path.join(ctx["home"], ".local", "bin", "tor-socks5")
+        self.assert_installed(dest, b"aarch64-musl-payload")
+
+    def test_legacy_exact_tag_gnu_asset(self):
+        tag_url = "https://github.com/%s/%s/releases/tag/v0.2.0" % (fx.OWNER, fx.REPO)
+        ctx = self.build(machine="x86_64", libc="gnu",
+                         scenario_kw={"latest_final_url": tag_url})
+        p = self.install(ctx)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        archive = "tor-socks5-v0.2.0-x86_64-unknown-linux-gnu.tar.gz"
+        urls = self.curl_urls(ctx)
+        base = "https://github.com/%s/%s/releases/download/v0.2.0/" % (fx.OWNER, fx.REPO)
+        self.assertEqual(urls[1:], [base + archive, base + archive + ".sha256"])
+        self.assert_installed(os.path.join(ctx["home"], ".local", "bin", "tor-socks5"))
+
+    def test_legacy_rejects_unconfirmed_libc_and_arm_preserving_destination(self):
+        tag_url = "https://github.com/%s/%s/releases/tag/v0.2.0" % (fx.OWNER, fx.REPO)
+        for machine, libc in (("x86_64", "musl"), ("x86_64", "unknown"),
+                              ("aarch64", "gnu"), ("aarch64", "unknown")):
+            with self.subTest(machine=machine, libc=libc):
+                ctx = self.build(machine=machine, libc=libc,
+                                 scenario_kw={"latest_final_url": tag_url})
+                dest_dir = self.area.subdir("legacy-%s-%s" % (machine, libc))
+                old = os.path.join(dest_dir, "tor-socks5")
+                with open(old, "wb") as f:
+                    f.write(fx.MARKER_OLD)
+                p = self.install(ctx, "--install-dir", dest_dir)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertEqual(fx.file_bytes(old), fx.MARKER_OLD)
+                self.assertEqual(len(self.curl_urls(ctx)), 1)
+                self.assertEqual(self.curl_urls(ctx)[0],
+                                 "https://github.com/%s/%s/releases/latest" %
+                                 (fx.OWNER, fx.REPO))
+                self.assertIn("v0.2.0", p.stderr.decode("utf-8", "replace"))
 
     # --- latest tag: негативы -------------------------------------------
 
     def test_latest_url_negatives(self):
         good = "https://github.com/%s/%s/releases/tag/%s" % (fx.OWNER, fx.REPO,
                                                              fx.MOCK_TAG)
+        bad_tag = "https://github.com/%s/%s/releases/tag/v0.2.0%%2Fbad" % (fx.OWNER, fx.REPO)
         for kw in ({"latest_final_url": "https://evil.example/somewhere"},
                    {"latest_final_url": good.replace(fx.MOCK_TAG, "..%2Fx")},
+                   {"latest_final_url": bad_tag},
                    {"latest_exit": 7}):
             with self.subTest(kw=kw):
                 ctx = self.build(scenario_kw=kw)
                 p = self.install(ctx)
                 self.assertNotEqual(p.returncode, 0)
                 self.assertEqual(len(fx.curl_log(ctx["log"])), 1)
+                self.assertEqual(self.curl_urls(ctx), [
+                    "https://github.com/%s/%s/releases/latest" % (fx.OWNER, fx.REPO)])
+
+    def test_legacy_download_failures_do_not_fallback_or_replace(self):
+        tag_url = "https://github.com/%s/%s/releases/tag/v0.2.0" % (fx.OWNER, fx.REPO)
+        archive = "tor-socks5-v0.2.0-x86_64-unknown-linux-gnu.tar.gz"
+        for failure in ({"fail_download": archive},
+                        {"fail_status": {archive: 404}},
+                        {"fail_status": {archive + ".sha256": 404}},
+                        {"fail_exit": {archive + ".sha256": 35}}):
+            with self.subTest(failure=failure):
+                ctx = self.build(machine="x86_64", libc="gnu",
+                                 scenario_kw={"latest_final_url": tag_url, **failure})
+                dest_dir = self.area.subdir("legacy-failure-%d" % self._build_n)
+                old = os.path.join(dest_dir, "tor-socks5")
+                with open(old, "wb") as f:
+                    f.write(fx.MARKER_OLD)
+                p = self.install(ctx, "--install-dir", dest_dir)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertEqual(fx.file_bytes(old), fx.MARKER_OLD)
+                urls = self.curl_urls(ctx)
+                expected_calls = 2 if (failure.get("fail_download") == archive or
+                                        failure.get("fail_status", {}).get(archive) or
+                                        failure.get("fail_exit", {}).get(archive)) else 3
+                self.assertEqual(len(urls), expected_calls)
+                self.assertEqual(urls[1], "https://github.com/%s/%s/releases/download/v0.2.0/%s" %
+                                 (fx.OWNER, fx.REPO, archive))
+                if expected_calls == 3:
+                    self.assertEqual(urls[2], urls[1] + ".sha256")
+                self.assertEqual(urls[0], "https://github.com/%s/%s/releases/latest" %
+                                 (fx.OWNER, fx.REPO))
+                self.assertTrue(all(r["proto_ok"] for r in fx.curl_log(ctx["log"])))
+
+    def test_legacy_checksum_malformed_or_mismatched_preserves_target(self):
+        tag_url = "https://github.com/%s/%s/releases/tag/v0.2.0" % (fx.OWNER, fx.REPO)
+        for checksum in (b"not-a-checksum\n",
+                         b"0" * 64 + b"  wrong-name\n",
+                         b"0" * 64 + b"  " + b"tor-socks5-v0.2.0-x86_64-unknown-linux-gnu.tar.gz\n"):
+            with self.subTest(checksum=checksum):
+                ctx = self.build(machine="x86_64", libc="gnu", checksum=checksum,
+                                 scenario_kw={"latest_final_url": tag_url})
+                dest_dir = self.area.subdir("legacy-bad-sum-%d" % self._build_n)
+                old = os.path.join(dest_dir, "tor-socks5")
+                with open(old, "wb") as f:
+                    f.write(fx.MARKER_OLD)
+                p = self.install(ctx, "--install-dir", dest_dir)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertEqual(fx.file_bytes(old), fx.MARKER_OLD)
+                urls = self.curl_urls(ctx)
+                self.assertEqual(len(urls), 3)
+                self.assertEqual(urls[1], "https://github.com/%s/%s/releases/download/v0.2.0/%s" %
+                                 (fx.OWNER, fx.REPO, ctx["archive_name"]))
+                self.assertEqual(urls[2], urls[1] + ".sha256")
+                self.assertTrue(all(r["proto_ok"] for r in fx.curl_log(ctx["log"])))
+
+    def test_latest_transport_failure_preserves_existing_target(self):
+        for scenario in ({"latest_exit": 35},
+                         {"latest_final_url": "https://github.com/%s/%s/releases/tag/v0.2.0" %
+                          (fx.OWNER, fx.REPO),
+                          "fail_download": "tor-socks5-v0.2.0-x86_64-unknown-linux-gnu.tar.gz"}):
+            ctx = self.build(machine="x86_64", libc="gnu", scenario_kw=scenario)
+            dest_dir = self.area.subdir("transport-failure-%d" % self._build_n)
+            old = os.path.join(dest_dir, "tor-socks5")
+            with open(old, "wb") as f:
+                f.write(fx.MARKER_OLD)
+            p = self.install(ctx, "--install-dir", dest_dir)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertEqual(fx.file_bytes(old), fx.MARKER_OLD)
+            self.assertTrue(all(r["proto_ok"] for r in fx.curl_log(ctx["log"])))
 
     # --- checksum-файл: все допустимые и недопустимые формы -------------
 
@@ -271,7 +424,8 @@ class ShInstallTests(unittest.TestCase):
         bad = [
             b"",                                                  # empty
             fx.checksum_text(wrong, name).encode(),               # wronghash
-            fx.checksum_text(digest, "other.tar.gz").encode(),    # неверное имя
+            (fx.checksum_text(digest, "other.tar.gz").encode()),
+            fx.checksum_text("0" * 64, name).encode(),
             (digest + "  " + name + "\r").encode(),               # bare CR
             (digest + "  " + name + "\n\n").encode(),             # extra blankline
             (digest + "  " + name + "\n" + digest + "  x\n").encode(),  # вторая строка

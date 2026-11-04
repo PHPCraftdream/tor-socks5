@@ -10,6 +10,7 @@ on:
         type: choice
         options: [affected, sprint-full]
         default: affected
+        description: 'affected — по диффу (commit footer CI-Full: sprint-end игнорируется); sprint-full — полный прогон без footer'
       base_ref:
         type: string
         description: 'Базовый коммит обязателен для режима affected'
@@ -50,7 +51,8 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
-          HEAD: ${{ github.sha }}
+          # Для PR — исходный head; push/dispatch — текущий checkout (github.sha), event.before не используется как head
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
           BASE_REF: ${{ inputs.base_ref }}
           MODE: ${{ inputs.mode || 'affected' }}
         shell: bash
@@ -63,7 +65,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          python -I -c 'import json,os,pathlib; f=pathlib.Path("plan.json"); s=pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"]); p=json.loads(f.read_text(encoding="utf-8")) if f.is_file() and f.stat().st_size else None; s.write_text("## План CI\n\n" + ("```json\n" + json.dumps({k:p[k] for k in ("paths","reasons")},ensure_ascii=False,indent=2) + "\n```\n" if p else "План не сформирован.\n"),encoding="utf-8")'
+          python -I -c 'import json,os,pathlib; f=pathlib.Path("plan.json"); s=pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"]); p=json.loads(f.read_text(encoding="utf-8")) if f.is_file() and f.stat().st_size else None; s.write_text("## План CI\n\n" + ("```json\n" + json.dumps({k:p[k] for k in ("paths","reasons","full","full_trigger")},ensure_ascii=False,indent=2) + "\n```\n" if p else "План не сформирован.\n"),encoding="utf-8")'
 
   real-tor-channel:
     needs: plan
