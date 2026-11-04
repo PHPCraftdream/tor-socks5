@@ -49,7 +49,9 @@ pub use tor::TorConfig;
 
 /// Реэкспорт, чтобы обвязке auth/dns-server/CLI/FFI хватало одного пути
 /// импорта (`proxy_config::...`) для типов клиентского ACL.
-pub use client_acl::{AllowedClients, AllowedClientsError, ClientAccessConfig, EndpointOverride};
+pub use client_acl::{
+    resolve_endpoint, AllowedClients, AllowedClientsError, ClientAccessConfig, EndpointOverride,
+};
 const ENV_VAR: &str = "TOR_SOCKS5_CONFIG";
 const DEFAULT_FILE: &str = "tor-socks5.ktav";
 pub(crate) static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);

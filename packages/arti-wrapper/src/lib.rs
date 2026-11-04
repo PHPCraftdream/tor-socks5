@@ -12,9 +12,15 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use arti_client::config::pt::TransportConfigBuilder;
-use arti_client::config::{BridgeConfigBuilder, CfgPath, Reconfigure, TorClientConfigBuilder};
-use arti_client::{DataStream, TorClient, TorClientConfig};
+/// Конструктор цели моста для доступа к менеджеру каналов Arti.
+pub use arti_client::config::BridgeConfigBuilder;
+use arti_client::config::{CfgPath, Reconfigure, TorClientConfigBuilder};
+/// Поток данных, открытый через Tor.
+pub use arti_client::DataStream;
+use arti_client::{TorClient, TorClientConfig};
 use bridge_line::BridgeLine;
+/// Назначение канала при запросе к менеджеру Arti.
+pub use tor_chanmgr::ChannelUsage;
 use tor_linkspec::HasChanMethod;
 use tor_rtcompat::PreferredRuntime;
 
@@ -362,29 +368,11 @@ fn build_bridge_target(
 pub struct TorTunnel {
     inner: Arc<TorClient<PreferredRuntime>>,
     obfs4_iat_mode: Arc<RwLock<Option<u8>>>,
+    pre_endpoint: Option<Option<Socks5PreEndpoint>>,
 }
 
-/// Map one `BootstrapStatus` to callback event(s). Returns `true` when
-/// the status is ready for traffic (the subscriber's terminal success —
-/// the forwarding task exits after emitting `Ready`).
-fn emit_bootstrap_event(
-    status: &arti_client::status::BootstrapStatus,
-    on_event: &BootstrapEventCallback,
-) -> bool {
-    if status.ready_for_traffic() {
-        on_event(BootstrapEvent::Ready);
-        true
-    } else {
-        on_event(BootstrapEvent::Progress(
-            status.as_frac(),
-            status.to_string(),
-        ));
-        if let Some(blockage) = status.blocked() {
-            on_event(BootstrapEvent::Blocked(blockage.to_string()));
-        }
-        false
-    }
-}
+mod bootstrap_event;
+use bootstrap_event::emit_bootstrap_event;
 
 /// Render an error plus its whole `source()` chain into one line
 /// ("msg: cause: cause") — thiserror's `Display` stops at the top layer,
@@ -408,9 +396,12 @@ impl TorTunnel {
 
     /// Bootstrap a Tor client applying the given [`Settings`].
     pub async fn bootstrap_with(settings: Settings) -> Result<Self> {
+        let pre = settings.pre_endpoint.clone();
         let iat_mode = settings.obfs4_iat_mode;
         let config = build_config(&settings)?;
-        Self::bootstrap_raw_with_mode(config, iat_mode).await
+        let mut tunnel = Self::bootstrap_raw_with_mode(config, iat_mode).await?;
+        tunnel.pre_endpoint = Some(pre);
+        Ok(tunnel)
     }
 
     /// Bootstrap using a pre-built `arti-client` config (escape hatch).
@@ -431,6 +422,7 @@ impl TorTunnel {
         Ok(Self {
             inner: client,
             obfs4_iat_mode: Arc::new(RwLock::new(obfs4_iat_mode)),
+            pre_endpoint: None,
         })
     }
 
@@ -479,7 +471,8 @@ impl TorTunnel {
     ) -> Result<Self> {
         let iat_mode = settings.obfs4_iat_mode;
         let config = build_config(&settings)?;
-        let tunnel = Self::create_unbootstrapped_with_mode(config, iat_mode)?;
+        let mut tunnel = Self::create_unbootstrapped_with_mode(config, iat_mode)?;
+        tunnel.pre_endpoint = Some(settings.pre_endpoint.clone());
         if let Some(on_event) = &on_event {
             tunnel.forward_bootstrap_events(on_event.clone());
         }
@@ -534,6 +527,7 @@ impl TorTunnel {
     pub fn terminate_all_channels(&self) -> Result<()> {
         let chanmgr = self.inner.chanmgr().map_err(TorError::ChanMgrUnavailable)?;
         chanmgr.terminate_all_channels();
+        tracing::debug!(target: "arti_wrapper::channel_reset", "вызвано завершение каналов");
         Ok(())
     }
 
@@ -669,6 +663,7 @@ impl TorTunnel {
         Ok(Self {
             inner: client,
             obfs4_iat_mode: Arc::new(RwLock::new(obfs4_iat_mode)),
+            pre_endpoint: None,
         })
     }
 
@@ -679,7 +674,9 @@ impl TorTunnel {
     pub fn create_unbootstrapped_with(settings: Settings) -> Result<Self> {
         let iat_mode = settings.obfs4_iat_mode;
         let config = build_config(&settings)?;
-        Self::create_unbootstrapped_with_mode(config, iat_mode)
+        let mut tunnel = Self::create_unbootstrapped_with_mode(config, iat_mode)?;
+        tunnel.pre_endpoint = Some(settings.pre_endpoint);
+        Ok(tunnel)
     }
 
     /// Wait for the client to reach a usable directory.
@@ -692,12 +689,27 @@ impl TorTunnel {
         self.inner.bootstrap().await.map_err(TorError::Bootstrap)
     }
 
+    /// Маршрут, закреплённый за клиентом при создании из настроек; внешний `None` означает raw-конфигурацию.
+    pub fn configured_pre_endpoint(&self) -> Option<Option<&Socks5PreEndpoint>> {
+        self.pre_endpoint.as_ref().map(Option::as_ref)
+    }
+
     /// Apply updated settings before bootstrap starts. The channel manager may already have
     /// warmed channels for this same client; reconfiguring the guard set makes the measured
     /// fastest candidates the first choices instead of leaving the initial bootstrap to the
     /// original config-file order. Stream timeout settings also take effect for subsequent
     /// stream requests, while requests already in progress retain their snapshot.
+    /// Для Settings маршрут pre неизменен; для raw сохраняется прежнее поведение Arti.
     pub fn reconfigure_bridges(&self, settings: &Settings) -> Result<()> {
+        if self
+            .pre_endpoint
+            .as_ref()
+            .is_some_and(|original| original != &settings.pre_endpoint)
+        {
+            return Err(TorError::BuildConfig(
+                "cannot change the pre endpoint on a shared client".to_owned(),
+            ));
+        }
         let config = build_config(settings)?;
         self.inner
             .reconfigure(&config, Reconfigure::AllOrNothing)
@@ -859,7 +871,6 @@ fn build_config(settings: &Settings) -> Result<TorClientConfig> {
     let mut builder: TorClientConfigBuilder = TorClientConfig::builder();
 
     pre_endpoint::configure_pre_endpoint(&mut builder, settings)?;
-
     builder
         .stream_timeouts()
         .initial_connect_timeout(settings.initial_connect_timeout);

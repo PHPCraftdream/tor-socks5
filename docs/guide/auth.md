@@ -6,12 +6,12 @@ SOCKS5 or Proxy-Authorization Basic for HTTP CONNECT. The CLI enables
 authentication when at least one user exists; Android requires a nonempty registry
 when `auth.enabled` is true and permits anonymous access only when explicitly disabled.
 
-`resocks5-net` owns inbound framing and authentication responses. The shared
-`socks5_proto::accept` adapter takes a host-owned `PasswordVerifier` and returns
-SDK `IncomingRequest` / `ServerError`, preserving the authenticated username.
-`Some(verifier)` requires credentials and disables anonymous access; `None`
-enables anonymous access only. Credentials travel in plaintext unless transport
-protection is provided; do not log credentials or whole requests/errors containing identity.
+`resocks5-net` обрабатывает входящий протокол и ответы аутентификации. Android
+использует `socks5_proto::accept` с `PasswordVerifier`; CLI применяет политику
+только после допуска подтверждения через `accept_verified`. `Some(verifier)`
+требует учётные данные, `None` разрешает только анонимный доступ. Без защиты
+транспорта учётные данные передаются открытым текстом; не записывайте их или
+целые запросы и ошибки с идентификационными данными в журнал.
 
 ## Storage
 
@@ -43,6 +43,20 @@ Passwords are hashed with **Argon2id** (per-user random salt). The file is writt
 (temp file + rename), and concurrent writers serialise on a per-file lock (see *Cross-process
 serialisation of the registry* below).
 
+## Маршруты аккаунтов CLI
+
+`pre_socks5` и `post_socks5` разрешаются независимо: отсутствие поля наследует
+глобальное значение, `none` отменяет его, endpoint заменяет. CLI поддерживает
+post через Tor; ошибка post не переключает соединение на прямой маршрут.
+Все эффективные pre endpoint пока запрещены: глобальный endpoint отклоняется
+при запуске, endpoint аккаунта — при запуске или после TOFU. Разные pre owner
+и pre-транспорт не реализованы. Эффективный post несовместим с DNS listener и
+upstream вместо Tor; проверка выполняется при запуске и для каждого запроса.
+Глобальный post также запрещён с DNS listener или upstream при запуске,
+даже если все аккаунты отменяют его через `none`.
+TOFU может обновить снимок политики: маршрут и ACL берутся из допущенного
+подтверждения, а не из имени в запросе. Android здесь не меняется.
+
 ## Managing users
 
 ```bash
@@ -68,8 +82,8 @@ to `true`, so new and legacy configurations refuse `.onion` destinations unless 
 explicitly sets `security.block_onion: false`. With the global switch off, the per-account
 `allowed_onion` rules below apply.
 
-The CLI checks each account's `allowed_onion` flag (**default `false`**) using
-the SDK request's **authenticated username**, for either inbound protocol:
+CLI проверяет флаг `allowed_onion` аккаунта (**по умолчанию `false`**)
+по допущенному подтверждению учётных данных для обоих входящих протоколов:
 
 - account with `allowed_onion: true` (and enabled) → the onion connection proceeds;
 - any other account → SDK `Reply::Forbidden` (SOCKS5 `0x02` / HTTP 403);
@@ -121,12 +135,20 @@ security.client_access.allowed_clients: 127.*, ::1
 только глобальная политика. Политика DNS отдельна, например
 `dns_server.client_access.allowed_clients: loopback`.
 
-Применение изменений: обычные правки users-файла через CLI сами по себе
-НЕ включают live-reload уже загруженного auth state. Существующий
-TOFU-путь (`resolve_init`) при первом входе init-аккаунта авторитетно
-перечитывает users registry и переносит ACL и credentials одним
-snapshot. Полный live/hot reload политик не предусмотрен: перезапуск
-сервера применяет изменения конфига и users-файла.
+Подтверждение CLI не содержит пароль или хеш и связано с успешно завершённым
+handshake, идентичностью `AuthState` и опубликованным снимком. Шлюз публикации /
+допуска чтения удерживается до завершения исходящего dial: уже допущенный dial
+может завершиться до публикации, а новое устаревшее или чужое подтверждение
+отклоняется. Шлюз освобождается до ответа `Established` и relay, поэтому
+публикация может произойти после успешного dial, но до ответа клиенту. Уже
+установленные туннели не отзываются. При отмене lease допуска освобождается;
+блокирующая проверка или TOFU могут завершиться и сохранить данные после отмены
+сокета.
+
+Правки users-файла видны загруженному auth state только после reload или
+публикации TOFU. API reload — блокирующий backend; автоматического watcher и
+CLI hot reload нет. Перезапуск сервера также применяет изменения конфига и
+users-файла.
 
 Когда аутентификация выключена (нет пользователей или
 `auth.enabled: false`), действует только глобальный шлюз. Неизвестные и
@@ -230,10 +252,8 @@ At `nativeStart`, the engine:
    account provisioned from an Android client gets its real hash written back to the same file)
    and requires RFC 1929 or HTTP Basic credentials for every accepted connection.
 
-The host implements `PasswordVerifier` over this state and passes it to
-`socks5_proto::accept` per connection with the absolute deadline. CLI and JNI
-share SDK framing and the same adapter verification path; only host configuration
-and destination policy differ.
+Android использует `PasswordVerifier` и `socks5_proto::accept`; CLI использует
+`socks5_proto::accept_verified` и допуск подтверждения перед выбором маршрута.
 
 The exact Ktav key names for the users-registry file itself (`users:` array schema — see
 *Storage* above) are unchanged; only the **Android-side pointer to that file** is new. Aligning

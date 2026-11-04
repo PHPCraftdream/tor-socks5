@@ -48,6 +48,36 @@ egress through an upstream SOCKS5 proxy instead of Tor, and install itself as an
 - **Install as a service** — systemd, OpenRC, launchd, Windows SCM, BSD `rc.d`.
 - **Non-blocking logging** to stderr / stdout / file, configurable level and per-target filters.
 
+## Global `pre_socks5` routing
+
+Global `pre_socks5` uses only explicitly configured plain bridges. Periodic
+maintenance checks channels through the same SOCKS5 endpoint and credentials.
+Arti may reuse an existing channel, so this is not always a fresh reachability
+check. A failed or incompatible configuration reload preserves the active route;
+changing the endpoint or credentials requires a restart.
+
+When its conditions are met, the watchdog requests closure of the existing
+client's open channels without cancelling pending connections. Later requests
+may create channels again through the same pre proxy. This does not replace the
+client or guarantee network recovery. Model tests establish operation ordering,
+not a real client's route. The separate CI contract includes local real-Tor
+channel checks and negative mutations of channel termination and
+reconfiguration; channel checks alone do not establish a complete
+client → pre → Tor → post → target application exchange. The fixture uses the
+Tor 0.4.9.15 source archive with a pinned SHA-256. Its archive signature was not
+verified, so provenance is limited to the source and the recorded checksum.
+
+Direct TCP probes, bridge discovery/downloads, seed bridges, PT, the warm pool
+and the separate circuit verifier are unsupported in this mode. Each maintenance
+pass considers the first 30 bridges, at most eight concurrently, with up to
+15 seconds per channel; the watchdog considers the first eight active bridges.
+Pre-route observations do not update the bridge-health store.
+
+The DNS listener and onion services are incompatible with global pre routing.
+Soft failover is disabled because aggregate statistics do not prove route
+ownership. Alternative account owners are not maintained by the global loop;
+automatic recovery for those owners is not implemented here.
+
 ## Build
 
 Requires a recent stable Rust toolchain (edition 2021).

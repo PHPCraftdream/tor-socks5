@@ -143,11 +143,14 @@ class External(unittest.TestCase):
         pr = self.planner("--event", "pull_request", "--base", side, "--head", main_head)
         self.assertEqual(pr["paths"], sorted(["docs/side.md", "packages/proxy-config/src/lib.rs"]))
         self.git("checkout", "-q", "-")
-        self.assertEqual(self.push(base=first)["paths"], ["packages/proxy-config/src/lib.rs"])
+        pushed = self.push(base=first)
+        self.assertEqual(pushed["paths"], ["packages/proxy-config/src/lib.rs"])
         manual = self.planner("--event", "workflow_dispatch", "--mode", "affected",
                               "--base-ref", first, "--head", self.head())
         self.assertFalse(manual["full"])
         self.assertEqual(manual["paths"], ["packages/proxy-config/src/lib.rs"])
+        self.assertEqual(manual["packages"], pushed["packages"])
+        self.assertEqual(manual["segments"], pushed["segments"])
         for base in ("", "missing-ref"):
             self.planner("--event", "workflow_dispatch", "--base-ref", base, "--head", self.head(), ok=False)
         self.planner("--event", "push", "--base", self.base, "--head", first, ok=False)

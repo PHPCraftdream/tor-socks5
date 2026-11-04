@@ -69,6 +69,9 @@ channels after sleep/resume or a network change without a cold `TorClient`
 rebuild. Also: the non-direct (PT) channel-build total timeout is raised
 10 s → 45 s — a full pluggable-transport handshake budget.
 
+Предупреждение о нелокальном прокси записывает схему и адрес без учётных
+данных; формат `Display` и сериализация `ProxyProtocol` не изменены.
+
 ### `tor-guardmgr` (0.47.0)
 
 A guard-readiness signal pair (`any_guard_usable_for_traffic()` +
@@ -129,6 +132,7 @@ One row per patch group. Marker names are the identifiers in the
 | sqlite lock classification | tor-dirmgr | src/err.rs | `SQLITE_BUSY`/`SQLITE_LOCKED` → `CacheAccessFailed`, not fatal `Internal` | carried |
 | `terminate_all_channels` | tor-chanmgr | src/lib.rs, src/mgr.rs, src/mgr/state.rs, src/builder.rs | force-close half-open channels after sleep/resume / network change | carried |
 | `connect_build_timeout` | tor-chanmgr | src/builder.rs | non-direct channel-build total 10 s → 45 s (PT handshake budget) | carried |
+| `proxy_warning_redaction` | tor-chanmgr | src/lib.rs | предупреждение о нелокальном прокси без учётных данных | локальный |
 | guard-readiness signal | tor-guardmgr | src/sample.rs, src/events.rs, src/lib.rs | `any_guard_usable_for_traffic()` + `usable_guard_events()` watch stream | carried (0.47 `BootstrapSetting` ignores guards) |
 | bridge-recovery corrections | tor-guardmgr | src/sample.rs, src/lib.rs | eligibility, reintroduction, retry and adaptive-widening semantics | carried |
 | `reset_disabled_guards` / `guard_is_disabled` | tor-guardmgr | src/guard.rs, src/sample.rs, src/lib.rs | manual recovery hook for persisted `disabled` state | carried (role changed: manual migration handle; !4426 made new automatic disables practically impossible) |

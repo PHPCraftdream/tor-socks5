@@ -25,16 +25,134 @@ pub(crate) fn reject_unsupported_endpoint(
     Ok(())
 }
 
-pub(crate) fn reject_unsupported_account_endpoints(users: &UsersConfig) -> anyhow::Result<()> {
+/// Проверить все включённые маршруты до запуска сети.
+pub(crate) fn validate_account_routes(
+    users: &UsersConfig,
+    global_pre: Option<&EndpointOverride>,
+    global_post: Option<&EndpointOverride>,
+    dns: bool,
+    upstream: bool,
+) -> anyhow::Result<()> {
     for user in users.users.iter().filter(|user| user.is_enabled) {
-        for (scope, setting) in [
-            ("enabled account pre_socks5", &user.pre_socks5),
-            ("enabled account post_socks5", &user.post_socks5),
-        ] {
-            reject_unsupported_endpoint(setting, scope)?;
-        }
+        resolve_account_route(
+            global_pre,
+            global_post,
+            user.pre_socks5.as_ref(),
+            user.post_socks5.as_ref(),
+            dns,
+            upstream,
+        )?;
     }
     Ok(())
+}
+
+/// Собственный снимок разрешённых маршрутов.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AdmittedRoute {
+    pub(crate) pre: Option<EndpointOverride>,
+    pub(crate) post: Option<EndpointOverride>,
+}
+
+/// Разрешить pre и post независимо.
+pub(crate) fn resolve_account_route(
+    global_pre: Option<&EndpointOverride>,
+    global_post: Option<&EndpointOverride>,
+    account_pre: Option<&EndpointOverride>,
+    account_post: Option<&EndpointOverride>,
+    dns: bool,
+    upstream: bool,
+) -> anyhow::Result<AdmittedRoute> {
+    let global_pre_resolved = proxy_config::resolve_endpoint(global_pre, None);
+    let pre = proxy_config::resolve_endpoint(global_pre, account_pre);
+    let post = proxy_config::resolve_endpoint(global_post, account_post);
+    if upstream && global_pre_resolved.is_some() {
+        anyhow::bail!("global pre_socks5 cannot be combined with upstream egress");
+    }
+    if pre.is_some() && (dns || upstream) {
+        anyhow::bail!("pre_socks5 cannot be combined with DNS listener or upstream egress");
+    }
+    validate_post_compatibility(post.is_some(), dns, upstream)?;
+    Ok(AdmittedRoute {
+        pre: pre.map(EndpointOverride::Endpoint),
+        post: post.map(EndpointOverride::Endpoint),
+    })
+}
+
+/// Маршрут определяется только из допущенного снимка.
+pub(crate) fn resolve_admitted_route(
+    global_pre: Option<&EndpointOverride>,
+    global_post: Option<&EndpointOverride>,
+    lease: Option<&auth::AdmissionLease>,
+    dns: bool,
+    upstream: bool,
+) -> anyhow::Result<AdmittedRoute> {
+    resolve_account_route(
+        global_pre,
+        global_post,
+        lease.and_then(|lease| lease.pre_socks5()),
+        lease.and_then(|lease| lease.post_socks5()),
+        dns,
+        upstream,
+    )
+}
+
+/// Не допустить обход post через независимый DNS или upstream вместо Tor.
+pub(crate) fn validate_post_compatibility(
+    post: bool,
+    dns: bool,
+    upstream: bool,
+) -> anyhow::Result<()> {
+    if post && (dns || upstream) {
+        anyhow::bail!("post_socks5 cannot be combined with DNS listener or upstream egress");
+    }
+    Ok(())
+}
+
+/// Выбрать один маршрут; ошибка post не запускает прямой путь.
+pub(crate) async fn select_post_route<T, D, P>(use_post: bool, direct: D, post: P) -> T
+where
+    D: std::future::Future<Output = T>,
+    P: std::future::Future<Output = T>,
+{
+    if use_post {
+        post.await
+    } else {
+        direct.await
+    }
+}
+
+/// Установить соединение через Tor и необязательный post SOCKS5.
+///
+/// cancel-safe: NO — при отмене частично открытый поток отбрасывается.
+pub(crate) async fn connect_tor_route(
+    tor: &arti_wrapper::TorTunnel,
+    post: Option<&EndpointOverride>,
+    host: &str,
+    port: u16,
+) -> Result<arti_wrapper::DataStream, arti_wrapper::TorError> {
+    let post_connect = async {
+        let Some(EndpointOverride::Endpoint(endpoint)) = post else {
+            return Err(arti_wrapper::TorError::PostSocks(
+                socks5_proto::client::Error::InvalidInput,
+            ));
+        };
+        let credentials = endpoint
+            .credentials()
+            .map(|(username, password)| arti_wrapper::PostSocksCredentials::new(username, password))
+            .transpose()
+            .map_err(arti_wrapper::TorError::PostSocks)?;
+        arti_wrapper::connect_post_socks(
+            tor,
+            &endpoint.address().ip().to_string(),
+            endpoint.address().port(),
+            host,
+            port,
+            credentials.as_ref(),
+            std::time::Instant::now() + crate::upstream::UPSTREAM_SETUP_DEADLINE,
+        )
+        .await
+    };
+    select_post_route(post.is_some(), tor.connect(host, port), post_connect).await
 }
 
 /// `rustls` 0.23 requires picking a process-wide crypto provider explicitly.
@@ -107,7 +225,10 @@ pub(crate) fn init_tracing(cfg: &Config) -> (WorkerGuard, ObservationSink) {
 
 #[cfg(test)]
 mod endpoint_guard_tests {
-    use super::{reject_unsupported_account_endpoints, reject_unsupported_endpoint};
+    use super::{
+        reject_unsupported_endpoint, resolve_account_route, resolve_admitted_route,
+        select_post_route, validate_account_routes, validate_post_compatibility, AdmittedRoute,
+    };
     use auth::{User, UsersConfig};
     use proxy_config::EndpointOverride;
 
@@ -132,6 +253,197 @@ mod endpoint_guard_tests {
     }
 
     #[test]
+    fn account_validation_does_not_replace_global_startup_guard() {
+        let global = endpoint();
+        let mut init = user(true, None, Some(EndpointOverride::Disabled));
+        init.hash = auth::INIT_SENTINEL.to_owned();
+        let users = UsersConfig { users: vec![init] };
+        // Проверка аккаунтов отдельно; глобальный guard всё равно запрещает запуск.
+        assert!(validate_account_routes(&users, None, Some(&global), true, false).is_ok());
+        assert!(validate_account_routes(&users, None, Some(&global), false, true).is_ok());
+        assert!(validate_post_compatibility(true, true, false).is_err());
+        assert!(validate_post_compatibility(true, false, true).is_err());
+        let users = UsersConfig {
+            users: vec![user(true, None, Some(endpoint()))],
+        };
+        assert!(validate_account_routes(&users, None, None, true, false).is_err());
+        assert!(validate_account_routes(&users, None, None, false, true).is_err());
+        let users = UsersConfig {
+            users: vec![user(false, Some(endpoint()), Some(endpoint()))],
+        };
+        assert!(validate_account_routes(&users, None, None, true, true).is_ok());
+    }
+
+    #[test]
+    fn account_routes_resolve_independently_and_fail_closed() {
+        let global = endpoint();
+        let replacement =
+            EndpointOverride::Endpoint("127.0.0.1:1081|alice:secret".parse().unwrap());
+        let disabled = EndpointOverride::Disabled;
+        let cases = [
+            (None, Some(global.clone())),
+            (Some(&disabled), None),
+            (Some(&replacement), Some(replacement.clone())),
+        ];
+        for (account, expected) in cases {
+            let route =
+                resolve_account_route(Some(&global), Some(&global), account, None, false, false)
+                    .unwrap();
+            assert_eq!(route.pre, expected);
+            assert_eq!(route.post, Some(global.clone()));
+            let route =
+                resolve_account_route(Some(&global), Some(&global), None, account, false, false)
+                    .unwrap();
+            assert_eq!(route.pre, Some(global.clone()));
+            assert_eq!(route.post, expected);
+        }
+        let route =
+            resolve_account_route(None, None, Some(&replacement), Some(&global), false, false)
+                .unwrap();
+        assert_eq!(
+            route,
+            AdmittedRoute {
+                pre: Some(replacement.clone()),
+                post: Some(global.clone())
+            }
+        );
+        for (dns, upstream) in [(true, false), (false, true)] {
+            assert!(
+                resolve_account_route(None, None, Some(&replacement), None, dns, upstream).is_err()
+            );
+            assert!(
+                resolve_account_route(None, None, None, Some(&replacement), dns, upstream).is_err()
+            );
+            assert!(resolve_account_route(
+                None,
+                None,
+                Some(&disabled),
+                Some(&disabled),
+                dns,
+                upstream
+            )
+            .is_ok());
+        }
+        assert!(
+            resolve_account_route(Some(&global), None, Some(&disabled), None, false, true).is_err()
+        );
+        assert!(
+            resolve_account_route(Some(&global), None, Some(&disabled), None, true, false).is_ok()
+        );
+    }
+
+    #[test]
+    fn route_snapshot_preserves_replaced_credentials() {
+        let global = EndpointOverride::Endpoint("127.0.0.1:1080|alice:secret".parse().unwrap());
+        for account in [
+            EndpointOverride::Endpoint("127.0.0.1:1081|alice:secret".parse().unwrap()),
+            EndpointOverride::Endpoint("127.0.0.1:1080|bob:secret".parse().unwrap()),
+            EndpointOverride::Endpoint("127.0.0.1:1080|alice:other".parse().unwrap()),
+            endpoint(),
+        ] {
+            let route = resolve_account_route(
+                Some(&global),
+                Some(&global),
+                Some(&account),
+                Some(&account),
+                false,
+                false,
+            )
+            .unwrap();
+            assert_eq!(route.pre, Some(account.clone()));
+            assert_eq!(route.post, Some(account));
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_route_uses_lease_snapshot_across_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.ktav");
+        let global = endpoint();
+        let pre = EndpointOverride::Endpoint("127.0.0.1:1082|alice:secret".parse().unwrap());
+        let post = EndpointOverride::Endpoint("127.0.0.1:1081|bob:secret".parse().unwrap());
+        let mut account = user(true, Some(pre.clone()), Some(post.clone()));
+        account.hash = auth::compute_hash("pw").unwrap();
+        let mut users = UsersConfig {
+            users: vec![account],
+        };
+        users.save(&path).unwrap();
+        let state =
+            std::sync::Arc::new(auth::AuthState::build_persistent(&users, path.clone()).unwrap());
+        let proof = state.verify_proof("test", "pw").unwrap();
+        let lease = state.admit(&proof).await.unwrap();
+        let snapshot =
+            resolve_admitted_route(Some(&global), None, Some(&lease), false, false).unwrap();
+        assert_eq!(
+            snapshot,
+            AdmittedRoute {
+                pre: Some(pre),
+                post: Some(post)
+            }
+        );
+        assert!(resolve_admitted_route(Some(&global), None, Some(&lease), false, true).is_err());
+        users.users[0].pre_socks5 = Some(EndpointOverride::Disabled);
+        users.users[0].post_socks5 = Some(EndpointOverride::Disabled);
+        users.save(&path).unwrap();
+        let reload_state = state.clone();
+        let reload = tokio::task::spawn_blocking(move || reload_state.reload());
+        assert_eq!(
+            resolve_admitted_route(Some(&global), None, Some(&lease), false, false).unwrap(),
+            snapshot
+        );
+        drop(lease);
+        reload.await.unwrap().unwrap();
+        assert!(state.admit(&proof).await.is_none());
+        let fresh = state.verify_proof("test", "pw").unwrap();
+        let lease = state.admit(&fresh).await.unwrap();
+        assert_eq!(lease.pre_socks5(), Some(&EndpointOverride::Disabled));
+        assert_eq!(
+            resolve_admitted_route(Some(&global), Some(&global), Some(&lease), false, false)
+                .unwrap(),
+            AdmittedRoute {
+                pre: None,
+                post: None
+            }
+        );
+        assert!(resolve_admitted_route(Some(&global), None, Some(&lease), false, true).is_err());
+    }
+
+    #[test]
+    fn post_rejects_bypassing_egress_and_dns() {
+        assert!(validate_post_compatibility(true, true, false).is_err());
+        assert!(validate_post_compatibility(true, false, true).is_err());
+        assert!(validate_post_compatibility(true, false, false).is_ok());
+        assert!(validate_post_compatibility(false, true, true).is_ok());
+    }
+
+    #[tokio::test]
+    async fn post_failure_never_polls_direct_route() {
+        let direct_polled = std::cell::Cell::new(false);
+        let direct = async {
+            direct_polled.set(true);
+            Ok::<_, &str>(())
+        };
+        let post = async { Err::<(), _>("post failed") };
+        assert_eq!(
+            select_post_route(true, direct, post).await,
+            Err("post failed")
+        );
+        assert!(!direct_polled.get());
+    }
+
+    #[tokio::test]
+    async fn no_post_never_polls_post_route() {
+        let post_polled = std::cell::Cell::new(false);
+        let direct = async { Ok::<_, &str>(()) };
+        let post = async {
+            post_polled.set(true);
+            Err::<(), _>("unexpected post")
+        };
+        assert_eq!(select_post_route(false, direct, post).await, Ok(()));
+        assert!(!post_polled.get());
+    }
+
+    #[test]
     fn rejects_global_pre_and_post_endpoints() {
         for scope in ["global pre_socks5", "global post_socks5"] {
             let error = reject_unsupported_endpoint(&Some(endpoint()), scope).unwrap_err();
@@ -141,29 +453,75 @@ mod endpoint_guard_tests {
     }
 
     #[test]
-    fn rejects_account_endpoint_without_global_setting() {
+    fn account_pre_is_independent_of_global_pre() {
         let users = UsersConfig {
-            users: vec![
-                user(true, Some(endpoint()), None),
-                user(true, None, Some(endpoint())),
-            ],
+            users: vec![user(true, Some(endpoint()), None)],
         };
-        let error = reject_unsupported_account_endpoints(&users).unwrap_err();
-        assert!(error.to_string().contains("enabled account pre_socks5"));
-        assert!(error.to_string().contains("not supported yet"));
-        let post_only = UsersConfig {
+        assert!(validate_account_routes(&users, None, None, false, false).is_ok());
+        assert!(validate_account_routes(
+            &users,
+            Some(&EndpointOverride::Disabled),
+            None,
+            false,
+            false
+        )
+        .is_ok());
+        assert!(validate_account_routes(&users, Some(&endpoint()), None, false, false).is_ok());
+        let replacement = EndpointOverride::Endpoint("127.0.0.1:1081".parse().unwrap());
+        assert!(validate_account_routes(&users, Some(&replacement), None, false, false).is_ok());
+        let users = UsersConfig {
             users: vec![user(true, None, Some(endpoint()))],
         };
-        let error = reject_unsupported_account_endpoints(&post_only).unwrap_err();
-        assert!(error.to_string().contains("enabled account post_socks5"));
+        assert!(validate_account_routes(&users, None, None, false, false).is_ok());
     }
 
     #[test]
-    fn disabled_account_does_not_run_endpoint_guard() {
+    fn restricted_owner_template_and_alternate_validation() {
+        let mut cfg = crate::config::Config::default();
+        cfg.bridges.use_seeds = false;
+        cfg.bridges.auto_fetch = false;
+        cfg.warm_pool.enabled = false;
+        cfg.bridges.lines = vec!["8.8.8.8:443 1111111111111111111111111111111111111111".into()];
         let users = UsersConfig {
-            users: vec![user(false, Some(endpoint()), Some(endpoint()))],
+            users: vec![user(true, Some(endpoint()), None)],
         };
-        assert!(reject_unsupported_account_endpoints(&users).is_ok());
+        let settings = crate::tor_setup::validate_owner_routes(&cfg, &users, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(settings.bridges.len(), 1);
+        assert!(settings.pre_endpoint.is_none());
+        assert!(settings.pt_binary.is_none());
+        assert!(settings.extra_pt_protocols.is_empty());
+        cfg.bridges.use_seeds = true;
+        assert!(crate::tor_setup::validate_owner_routes(&cfg, &users, None).is_err());
+        cfg.bridges.use_seeds = false;
+        cfg.bridges.auto_fetch = true;
+        assert!(crate::tor_setup::restricted_owner_settings(&cfg, None).is_err());
+        cfg.bridges.auto_fetch = false;
+        cfg.warm_pool.enabled = true;
+        assert!(crate::tor_setup::restricted_owner_settings(&cfg, None).is_err());
+        cfg.warm_pool.enabled = false;
+        cfg.dns_server.enabled = true;
+        assert!(crate::tor_setup::restricted_owner_settings(&cfg, None).is_err());
+        cfg.dns_server.enabled = false;
+        cfg.upstream.enabled = true;
+        assert!(crate::tor_setup::restricted_owner_settings(&cfg, None).is_ok());
+        assert!(validate_account_routes(&users, None, None, false, true).is_err());
+        assert!(validate_account_routes(&users, None, None, false, false).is_ok());
+        cfg.upstream.enabled = false;
+        cfg.bridges.lines.push(
+            "obfs4 1.2.3.4:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA iat-mode=0".into(),
+        );
+        assert!(crate::tor_setup::restricted_owner_settings(&cfg, None).is_err());
+        cfg.bridges.lines.clear();
+        assert!(crate::tor_setup::restricted_owner_settings(&cfg, None).is_err());
+        cfg.pre_socks5 = Some(endpoint());
+        let direct = UsersConfig {
+            users: vec![user(true, Some(EndpointOverride::Disabled), None)],
+        };
+        assert!(crate::tor_setup::validate_owner_routes(&cfg, &direct, None)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -432,4 +790,170 @@ mod tests {
     fn no_color_set_when_configured_off_and_redirected() {
         assert!(should_set_no_color(false, false));
     }
+}
+
+// Подтверждение выдаётся только после проверки учётных данных.
+pub(crate) struct AuthStateVerifier(pub(crate) std::sync::Arc<auth::AuthState>);
+
+impl socks5_proto::ProofVerifier for AuthStateVerifier {
+    type Proof = auth::CredentialProof;
+
+    fn verify_proof(&self, username: &str, password: &str) -> Option<Self::Proof> {
+        self.0.verify_proof(username, password)
+    }
+
+    fn username<'a>(&self, proof: &'a Self::Proof) -> &'a str {
+        proof.username()
+    }
+}
+
+/// Decide whether a `.onion` connection is allowed for this request.
+///
+/// * No authenticator (anonymous proxy) → allowed: there is no account
+///   to gate on.
+/// * Authenticated → allowed iff the named account carries
+///   `allowed_onion` (and is still enabled).
+/// * Auth required but no account on the request (should not happen for
+///   a completed handshake) → denied, fail-closed.
+#[cfg(test)]
+pub(crate) fn onion_permitted(auth: Option<&auth::AuthState>, authed_user: Option<&str>) -> bool {
+    match (auth, authed_user) {
+        (None, _) => true,
+        (Some(state), Some(name)) => state.allowed_onion(name),
+        (Some(_), None) => false,
+    }
+}
+
+/// Coarse classification of a [`handle_client`] failure, so operators can
+/// tell "the client misbehaved" from "Tor is having a bad time" from
+/// "something else" without grepping the error text — see [`ConnErrorKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnErrorKind {
+    /// The client side of the SOCKS5 session misbehaved or disconnected —
+    /// e.g. it dropped the TCP connection mid-handshake. Not a proxy or Tor
+    /// problem; normal for clients that churn through many parallel
+    /// connections (Telegram and similar).
+    Client,
+    /// A Tor-side failure building a circuit/stream — an
+    /// `arti_wrapper::TorError::Connect` anywhere in the error's cause
+    /// chain. Finer-grained classification (which `tor_error::ErrorKind`)
+    /// already happens in [`crate::tor_watchdog::classify_and_record`]; this
+    /// variant only answers "is this Tor's problem at all".
+    Tor,
+    /// relay-stage I/O failure. Deliberately NOT Client:
+    /// `tokio::io::copy_bidirectional` does not expose WHICH end errored, so the
+    /// client-vs-Tor direction of a mid-relay reset is indeterminate; what is
+    /// determinate is the stage, and a relay-stage reset must not inflate the
+    /// client-misbehavior count. Per-direction byte counts exist only on
+    /// success.
+    Relay,
+    /// Anything else: I/O errors unrelated to the SOCKS5 handshake, bugs,
+    /// or failures that don't fit any bucket above.
+    Other,
+}
+
+/// Which protocol stage a connection failed at. Discriminating on stage (an
+/// internal, stable anyhow context tag — see the `STAGE_*` constants) rather
+/// than on error text lets the same I/O condition be attributed differently:
+/// a ConnectionReset during the handshake is the client's doing, while the
+/// identical reset mid-relay is reported as [`ConnStage::Relay`] so it does
+/// not inflate the client-misbehavior count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnStage {
+    /// SOCKS5 method negotiation / auth / CONNECT request.
+    Handshake,
+    /// Establishing the egress (Tor circuit or upstream proxy) connection.
+    Connect,
+    /// Bidirectional data transfer between client and egress.
+    Relay,
+    /// No stage context tag found in the error chain.
+    Other,
+}
+
+/// Internal, stable context tags `handle_client` attaches to each stage.
+/// Classification string-matches ONLY these — never arbitrary error message
+/// text (message text is not a stable classification key).
+pub(crate) const STAGE_HANDSHAKE: &str = "SOCKS5 handshake";
+pub(crate) const STAGE_CONNECT_TOR: &str = "tor connect";
+pub(crate) const STAGE_CONNECT_UPSTREAM: &str = "upstream connect";
+pub(crate) const STAGE_RELAY: &str = "relay";
+
+/// Classify a [`handle_client`] failure into a stage and an error kind, by
+/// the *type* of its root cause and the stage context tag in the chain,
+/// never by string-matching arbitrary rendered error message text (only the
+/// internal `STAGE_*` context tags above are matched — message text is not a
+/// stable classification key).
+///
+/// Order of checks:
+/// 1. Stage: the first chain cause matching a `STAGE_*` tag wins (relay →
+///    handshake → connect → other).
+/// 2. Kind: any `arti_wrapper::TorError::Connect` in the chain →
+///    [`ConnErrorKind::Tor`], regardless of stage (a Tor connect failure is
+///    unambiguous and takes priority over any incidental I/O wrapping).
+/// 3. Otherwise by stage: handshake → Client (everything escaping the
+///    handshake phase is client-side, including the deadline); relay →
+///    Relay when a chain cause is a client-drop-ish `io::Error`
+///    (ConnectionReset/Aborted/BrokenPipe/UnexpectedEof), else Other;
+///    connect → Other (a non-Tor connect failure is not attributable to the
+///    SOCKS client — the `connect_failed` counter carries the stage signal);
+///    other stage → Client when a chain cause is a drop-ish `io::Error`
+///    (after the stage tags the only untagged I/O escape path is the SOCKS
+///    reply writes, which are client-side), else Other.
+pub(crate) fn classify_conn_failure(err: &anyhow::Error) -> (ConnStage, ConnErrorKind) {
+    let stage = if err.chain().any(|cause| cause.to_string() == STAGE_RELAY) {
+        ConnStage::Relay
+    } else if err
+        .chain()
+        .any(|cause| cause.to_string() == STAGE_HANDSHAKE)
+    {
+        ConnStage::Handshake
+    } else if err.chain().any(|cause| {
+        cause.to_string() == STAGE_CONNECT_TOR || cause.to_string() == STAGE_CONNECT_UPSTREAM
+    }) {
+        ConnStage::Connect
+    } else {
+        ConnStage::Other
+    };
+
+    let is_dropish_io = err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_err| {
+                matches!(
+                    io_err.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                )
+            })
+    });
+
+    for cause in err.chain() {
+        if let Some(tor_err) = cause.downcast_ref::<arti_wrapper::TorError>() {
+            if matches!(tor_err, arti_wrapper::TorError::Connect { .. }) {
+                return (stage, ConnErrorKind::Tor);
+            }
+        }
+    }
+
+    let kind = match stage {
+        ConnStage::Handshake => ConnErrorKind::Client,
+        ConnStage::Relay => {
+            if is_dropish_io {
+                ConnErrorKind::Relay
+            } else {
+                ConnErrorKind::Other
+            }
+        }
+        ConnStage::Connect => ConnErrorKind::Other,
+        ConnStage::Other => {
+            if is_dropish_io {
+                ConnErrorKind::Client
+            } else {
+                ConnErrorKind::Other
+            }
+        }
+    };
+    (stage, kind)
 }

@@ -5,6 +5,172 @@ use super::{
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use time::OffsetDateTime;
+
+#[derive(Debug)]
+struct PublisherSentinel(u32);
+
+#[derive(Debug)]
+struct FlushCause;
+impl std::fmt::Display for FlushCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("typed flush cause")
+    }
+}
+impl std::error::Error for FlushCause {}
+
+// Отмена после ответа не должна уничтожать исходную типизированную ошибку актора.
+#[tokio::test]
+async fn cancelled_close_retains_actor_outcome() {
+    use crate::test_seams::{ParkedGate, Site, HANG_GUARD};
+    use std::future::{pending, poll_fn, Future};
+    use std::task::Poll;
+
+    tokio::time::timeout(HANG_GUARD, async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = BridgeStore::resolve_path(Some(&config_path(dir.path())));
+        let gate = ParkedGate::arm(Site::WriterCloseReplySent, &path);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let publisher_calls = calls.clone();
+        let writer = StoreWriter::spawn(
+            path,
+            Arc::new(move |_| {
+                publisher_calls.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::Error::new(FlushCause).context("final flush context"))
+            }),
+            Duration::from_secs(60),
+        );
+        writer.apply(|_| {}).await.unwrap();
+
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+        let (second_tx, second_rx) = tokio::sync::oneshot::channel();
+        let closing_writer = writer.clone();
+        let close_task = tokio::spawn(async move {
+            let mut close = Box::pin(closing_writer.close());
+            let first = poll_fn(|cx| Poll::Ready(close.as_mut().poll(cx))).await;
+            first_tx.send(first.is_pending()).unwrap();
+            continue_rx.await.unwrap();
+            let second = poll_fn(|cx| Poll::Ready(close.as_mut().poll(cx))).await;
+            second_tx.send(second.is_pending()).unwrap();
+            pending::<()>().await;
+        });
+        assert!(first_rx.await.unwrap());
+        let waiting_gate = gate.clone();
+        tokio::task::spawn_blocking(move || waiting_gate.wait_parked(HANG_GUARD))
+            .await
+            .unwrap();
+        continue_tx.send(()).unwrap();
+        assert!(second_rx.await.unwrap());
+        assert!(writer.actor.try_lock().is_err());
+        close_task.abort();
+        assert!(close_task.await.unwrap_err().is_cancelled());
+        let capacity = writer.tx.capacity();
+        let mut retry = Box::pin(writer.close());
+        let retry_poll = poll_fn(|cx| Poll::Ready(retry.as_mut().poll(cx))).await;
+        assert!(retry_poll.is_pending());
+        assert!(writer.actor.try_lock().is_err());
+        assert_eq!(writer.tx.capacity(), capacity);
+        gate.release();
+        let error = retry.await.unwrap_err();
+        assert_eq!(error.to_string(), "final flush context");
+        assert!(error.chain().any(|cause| cause.is::<FlushCause>()));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    })
+    .await
+    .expect("cancelled close timed out");
+}
+
+// Проверяем реальную передачу паники после close, а не строковое представление.
+#[tokio::test]
+async fn close_final_flush_panic_remains_in_registry() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let registry = Arc::new(crate::bridge_verifier::TestWorkers::default());
+        registry
+            .scope(async {
+                let dir = tempfile::tempdir().unwrap();
+                let path = config_path(dir.path());
+                let calls = Arc::new(AtomicUsize::new(0));
+                let publisher_calls = calls.clone();
+                let writer = StoreWriter::spawn(
+                    BridgeStore::resolve_path(Some(&path)),
+                    Arc::new(move |_| {
+                        if publisher_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            Err(anyhow!("first failure"))
+                        } else {
+                            std::panic::panic_any(PublisherSentinel(42))
+                        }
+                    }),
+                    Duration::from_secs(60),
+                );
+                writer.apply(|_| {}).await.unwrap();
+                assert!(writer.close().await.is_err());
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+                let errors = registry
+                    .join()
+                    .await
+                    .unwrap_err()
+                    .downcast::<crate::bridge_verifier::WorkerFailures>()
+                    .unwrap()
+                    .into_errors();
+                let panic = errors
+                    .into_iter()
+                    .find_map(|e| e.downcast::<tokio::task::JoinError>().ok())
+                    .expect("final flush panic retained");
+                assert_eq!(
+                    panic
+                        .into_panic()
+                        .downcast::<PublisherSentinel>()
+                        .unwrap()
+                        .0,
+                    42
+                );
+            })
+            .await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn publisher_panic_payload_survives_actor_retry_and_registry_join() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let registry = Arc::new(crate::bridge_verifier::TestWorkers::default());
+        registry
+            .scope(async {
+                let dir = tempfile::tempdir().unwrap();
+                let path = config_path(dir.path());
+                let calls = Arc::new(AtomicUsize::new(0));
+                let publisher_calls = calls.clone();
+                let writer = StoreWriter::spawn(
+                    BridgeStore::resolve_path(Some(&path)),
+                    Arc::new(move |_| {
+                        if publisher_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            std::panic::panic_any(PublisherSentinel(73));
+                        }
+                        Ok(())
+                    }),
+                    Duration::from_secs(60),
+                );
+                writer.apply(|_| {}).await.unwrap();
+                writer.close().await.unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+                let error = registry.join().await.unwrap_err();
+                let failures = error
+                    .downcast_ref::<crate::bridge_verifier::WorkerFailures>()
+                    .unwrap();
+                let panic = failures
+                    .errors()
+                    .iter()
+                    .flat_map(|e| e.chain())
+                    .find_map(|cause| cause.downcast_ref::<PublisherPanic>())
+                    .unwrap();
+                assert!(panic.payload_is::<PublisherSentinel>(|payload| payload.0 == 73));
+            })
+            .await;
+    })
+    .await
+    .unwrap();
+}
 /// TS4-09 panic branch (updated by TS5-06): a mutation closure that
 /// panics must not kill the actor. The panicked op's ack resolves `Err`
 /// (the caller must assume THAT mutation did not land), nothing is
