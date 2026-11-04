@@ -66,7 +66,16 @@ its global setting; `none` explicitly disables that field. Protocol, endpoint
 and credentials participate in pre-owner identity. Errors never negotiate a
 different proxy protocol or fall back to a direct route. HTTPS-to-proxy is not
 part of this interface. All inbound proxy listeners use dual SOCKS5/HTTP CONNECT
-framing; ordinary HTTP forwarding is not supported.
+framing; ordinary HTTP forwarding is not supported. See the
+[CLI account-routing guide](docs/guide/auth.md#cli-prepost-routing) for examples
+and the distinction between proxy credentials and listener account passwords.
+
+The local Windows candidate has completed real HTTPS request/response checks for
+all four pre/post protocol combinations, four configured-proxy failure controls,
+and two overlapping authenticated account routes with distinct PT owners.
+Normal Ctrl+Break shutdown of the CLI and its active PT children was also checked.
+This is not an all-platform runtime claim or packet-capture evidence. Main/release
+delivery and fresh CI for publicly reproducible dependencies remain separate.
 
 ## Global `pre_socks5` routing
 
@@ -79,7 +88,7 @@ separate from compilation and the PT contract tests.
 Periodic maintenance checks channels through the same proxy protocol, endpoint and credentials.
 Arti may reuse an existing channel, so this is not always a fresh reachability
 check. A failed or incompatible configuration reload preserves the active route;
-changing the endpoint or credentials requires a restart.
+changing the proxy protocol, endpoint or credentials requires a restart.
 
 When its conditions are met, the watchdog requests closure of the existing
 client's open channels without cancelling pending connections. Later requests
@@ -105,22 +114,37 @@ automatic recovery for those owners is not implemented here.
 
 ## Build
 
-Requires a recent stable Rust toolchain (edition 2021).
+Requires Rust 1.92 or newer (edition 2021 for first-party crates).
 
-The workspace uses `resocks5-net` 0.4.1 and takes it from
-the local SDK at `../resocks5/crates/resocks5-net`. Keep a sibling `resocks5`
-checkout at tag `v0.4.1` beside `tor-socks5`. To build without the
-checkout, remove the `path` from the `resocks5-net` dependency in the root
-`Cargo.toml` so that Cargo takes the crates.io release.
+The workspace uses the sibling `resocks5` checkout at tag `v0.4.1`, exposing
+`../resocks5/crates/resocks5-net`. CI provisions that SDK with
+`.github/actions/setup-local-sdk/action.yml`; it does not provision the unpublished
+ptrs-gesher carrier changes described below.
 
-CI and release builds provision the sibling SDK with
-`.github/actions/setup-local-sdk/action.yml`, pinned to the `v0.4.1` tag rather
-than a moving branch.
+**Temporary local candidate dependency:** the pre/WebTunnel carrier requires
+ptrs-gesher source commit `9a59ae672944c77afe968cea9679ab36e31324e4`.
+Its package versions remain 0.7.0, but the registry's existing 0.7.0 artifacts do
+not contain these changes. Keep that source in a sibling `ptrs-gesher` checkout;
+do not vendor it or assume that an unpatched registry build tests the same code.
+The candidate lockfile reflects these local overrides. A fresh public CI/main
+candidate must resolve the published replacement before dropping the overrides;
+publication and the replacement version are not selected by this example.
+
+For this temporary checkout layout, run from the `tor-socks5` repository root:
 
 ```bash
-cargo build --release
+cargo build --locked --release \
+  --config 'patch.crates-io.ptrs-gesher-core.path="../ptrs-gesher/crates/core"' \
+  --config 'patch.crates-io.ptrs-gesher-obfs4.path="../ptrs-gesher/crates/obfs4"' \
+  --config 'patch.crates-io.ptrs-gesher-webtunnel.path="../ptrs-gesher/crates/webtunnel"' \
+  --config 'patch.crates-io.ptrs-gesher-lyrebird.path="../ptrs-gesher/crates/lyrebird"' \
+  --config 'patch.crates-io.resocks5-net.path="../resocks5/crates/resocks5-net"'
 # binary: target/release/socks5-proxy   (invoked as `tor-socks5`)
 ```
+
+These are per-command source bindings, not permanent local paths in Cargo config.
+The runtime acceptance above used a debug CLI; it does not claim a separately
+executed release-profile acceptance run.
 
 ### Code structure rules (checked in CI)
 

@@ -16,7 +16,12 @@ when `auth.enabled` is true and permits anonymous access only when explicitly di
 ## Storage
 
 Accounts live in `tor-socks5.users.ktav`, next to the main config (same directory, same stem,
-`.users.ktav` suffix). Each record:
+`.users.ktav` suffix). The CLI derives this path from `--config`; it does not
+use `auth.users_file` to select a different registry. The `auth` fields described
+in the Android section below do not replace this CLI convention. A missing or
+empty CLI registry means anonymous access, so confirm the startup message
+`SOCKS5 will require USER/PASS authentication` before testing account routes.
+Each record:
 
 ```ktav
 users: [
@@ -43,19 +48,99 @@ Passwords are hashed with **Argon2id** (per-user random salt). The file is writt
 (temp file + rename), and concurrent writers serialise on a per-file lock (see *Cross-process
 serialisation of the registry* below).
 
-## Маршруты аккаунтов CLI
+## CLI pre/post routing
 
-`pre_socks5` и `post_socks5` разрешаются независимо: отсутствие поля наследует
-глобальное значение, `none` отменяет его, endpoint заменяет. CLI поддерживает
-post через Tor; ошибка post не переключает соединение на прямой маршрут.
-Все эффективные pre endpoint пока запрещены: глобальный endpoint отклоняется
-при запуске, endpoint аккаунта — при запуске или после TOFU. Разные pre owner
-и pre-транспорт не реализованы. Эффективный post несовместим с DNS listener и
-upstream вместо Tor; проверка выполняется при запуске и для каждого запроса.
-Глобальный post также запрещён с DNS listener или upstream при запуске,
-даже если все аккаунты отменяют его через `none`.
-TOFU может обновить снимок политики: маршрут и ACL берутся из допущенного
-подтверждения, а не из имени в запросе. Android здесь не меняется.
+The CLI route is:
+
+```text
+client → pre proxy → existing WebTunnel/Tor → post proxy → target
+```
+
+`pre_socks5` and `post_socks5` are legacy field names, not protocol restrictions.
+Each independently selects SOCKS5 or plain HTTP CONNECT, globally or per account:
+
+| Account field | Effective value for that hop |
+| --- | --- |
+| Omitted | Inherit the corresponding global value |
+| `none` | Explicitly disable that hop, even if globally configured |
+| Endpoint | Replace that hop with the account endpoint |
+
+The scalar grammar is `[socks5://|http://]IP:port[|username:password]`.
+No scheme means SOCKS5. Endpoints must be IP literals with a nonzero port;
+credentials are optional, paired, nonempty and at most 255 bytes each, with the
+existing delimiter restrictions. HTTP Basic usernames cannot contain a colon,
+and HTTP credentials cannot contain control characters. HTTPS-to-proxy and
+ordinary HTTP forwarding are not supported. Listener account passwords and
+outbound proxy credentials are separate identities; neither SOCKS5 nor plain
+HTTP CONNECT encrypts its credential-bearing hop.
+
+For example, the main config can select:
+
+```ktav
+pre_socks5: socks5://192.0.2.10:1080|pre_user:pre_password
+post_socks5: http://192.0.2.11:8080|post_user:post_password
+```
+
+A sibling users registry can then inherit or override the hops independently:
+
+```ktav
+users: [
+    { name: alice, hash: init, is_enabled: true }
+    {
+        name: bob
+        hash: init
+        is_enabled: true
+        pre_socks5: http://192.0.2.12:8080|other_user:other_password
+        post_socks5: none
+    }
+]
+```
+
+These TEST-NET addresses and credentials are illustrative, not usable proxy
+inputs. `init` is real trust-on-first-use provisioning, not an existing password;
+use it only when the first login can be controlled, or create an account with
+`users add` and its password prompt. Preserve existing hashes when editing real
+accounts. Keep credential-bearing config files private and out of Git and public
+logs; prefer editing the protected registry over putting proxy credentials in CLI
+arguments or shell history.
+
+The CLI also accepts `users set-socks5 <name> <pre|post> <inherit|none|endpoint>`.
+`inherit` removes the account override; `none` disables just the selected hop.
+The endpoint format above also applies to `users add --pre-socks5` /
+`--post-socks5`. Apply running CLI configuration changes by restarting; there is
+no automatic users-file watcher.
+
+The pre proxy supplies the carrier before the existing bundled WebTunnel TLS/PT
+handshake; it does not replace that transport. Post negotiation runs inside a
+Tor-opened stream and forwards the target hostname to the post proxy, not a local
+resolver. A configured proxy failure never selects a direct route or another
+proxy protocol. Explicit `none` is a requested route change, not error fallback.
+
+Different effective pre identities (protocol, address and credentials) select
+different retained Tor/PT owners; identical pre identities may share an owner.
+Post selection is independent and is applied per admitted connection. TOFU can
+publish a new policy snapshot: routes and ACLs come from the admitted credential
+proof, never an unverified request username. A failed or incompatible reload
+preserves the active route; pre protocol/endpoint/credential changes require a
+restart. This CLI support does not enable new Android routing behavior.
+
+Pre routes require explicitly configured usable bridges and support only the
+trusted bundled obfs4/WebTunnel PT. Discovery, seed bridges, direct probes, the
+warm pool and alternative-owner automatic recovery are restricted; see the
+[global pre routing limitations](../../README.md#global-pre_socks5-routing).
+Effective post routes cannot be combined with a DNS listener or upstream egress
+instead of Tor; startup and request checks fail closed. A global post endpoint
+also fails startup with those modes even if every account disables it.
+
+Local Windows acceptance exercised all four pre/post protocol combinations,
+wrong-auth and closed-endpoint failures, overlapping inherited SOCKS5/SOCKS5 and
+explicit HTTP/HTTP authenticated account routes with two active PT owners, and
+normal CLI/PT shutdown without forced termination. The account run provisioned
+its two hashes through TOFU. It was not a password-rejection matrix, exhaustive
+account-isolation test, or packet capture. Hostname-preserving handshake tests and
+route construction support the no-local-target-DNS property; no DNS packet-capture
+result is claimed. See the [temporary build bindings](../../README.md#build)
+before treating this local candidate as reproducible from registry dependencies.
 
 ## Managing users
 
@@ -150,10 +235,11 @@ handshake, идентичностью `AuthState` и опубликованны�
 CLI hot reload нет. Перезапуск сервера также применяет изменения конфига и
 users-файла.
 
-Когда аутентификация выключена (нет пользователей или
-`auth.enabled: false`), действует только глобальный шлюз. Неизвестные и
-выключенные аккаунты отклоняются как прежде. Обе политики применяются к
-SOCKS5 и HTTP CONNECT на общем слушателе в CLI и Android FFI.
+When CLI authentication is disabled because its registry has no users, only the
+global client gate applies. The Android `auth.enabled` switch is described below;
+it is not a CLI override for the sibling users registry. With authentication
+active, unknown and disabled accounts are rejected. The shared listener policies
+apply to SOCKS5 and HTTP CONNECT; this does not extend CLI pre/post routing to JNI.
 
 ## Trust on first use (`--init`)
 
