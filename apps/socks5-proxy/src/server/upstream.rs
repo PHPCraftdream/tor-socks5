@@ -1,4 +1,4 @@
-//! Upstream SOCKS5 egress: a thin adapter over `resocks5-net`'s client.
+//! Upstream SOCKS5 setup and shared relay I/O diagnostics.
 //!
 //! When an upstream proxy is configured (and enabled), the angel
 //! forwards each accepted CONNECT through it instead of dialing out via
@@ -204,6 +204,157 @@ pub(crate) fn pick_upstream(
         );
     }
     Ok(Some(up))
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RelayRemote {
+    Tor,
+    Upstream,
+}
+
+/// Relay bytes, adapting Arti's local full-close to Tokio's EOF contract.
+/// cancel-safe: NO — Tokio may buffer unforwarded bytes; cancellation must end the connection.
+pub(crate) async fn relay<A, B>(
+    client: &mut A,
+    remote: &mut B,
+    conn_id: u64,
+    remote_kind: RelayRemote,
+) -> std::io::Result<(u64, u64)>
+where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized,
+{
+    let mut client = RelayIo::new(client, conn_id, "client");
+    let side = match remote_kind {
+        RelayRemote::Tor => "tor",
+        RelayRemote::Upstream => "upstream",
+    };
+    let mut remote = RelayIo::new(remote, conn_id, side);
+    remote.tor_stream = matches!(remote_kind, RelayRemote::Tor);
+    tokio::io::copy_bidirectional(&mut client, &mut remote).await
+}
+
+// Borrows only; only a locally closed Tor read maps NotConnected to EOF.
+struct RelayIo<'a, S: ?Sized> {
+    inner: &'a mut S,
+    tor_stream: bool,
+    conn_id: u64,
+    side: &'static str,
+    read_eof: bool,
+    write_shutdown: bool,
+}
+
+impl<'a, S: ?Sized> RelayIo<'a, S> {
+    fn new(inner: &'a mut S, conn_id: u64, side: &'static str) -> Self {
+        Self {
+            inner,
+            tor_stream: false,
+            conn_id,
+            side,
+            read_eof: false,
+            write_shutdown: false,
+        }
+    }
+
+    fn observe<T>(
+        &self,
+        operation: &'static str,
+        result: std::task::Poll<std::io::Result<T>>,
+    ) -> std::task::Poll<std::io::Result<T>> {
+        if let std::task::Poll::Ready(Err(error)) = &result {
+            tracing::warn!(
+                conn_id = self.conn_id,
+                relay_side = self.side,
+                relay_operation = operation,
+                io_kind = ?error.kind(),
+                os_error = error.raw_os_error(),
+                read_eof = self.read_eof,
+                write_shutdown = self.write_shutdown,
+                "relay I/O failed"
+            );
+        }
+        result
+    }
+}
+
+impl<S: tokio::io::AsyncRead + Unpin + ?Sized> tokio::io::AsyncRead for RelayIo<'_, S> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buffer.filled().len();
+        let had_capacity = buffer.remaining() != 0;
+        let result = std::pin::Pin::new(&mut *this.inner).poll_read(cx, buffer);
+        // Arti closes the whole stream on write shutdown, unlike TCP half-close.
+        // Drain queued payload first; only its terminal local-close error is EOF.
+        let result = match result {
+            std::task::Poll::Ready(Err(error))
+                if this.tor_stream
+                    && this.write_shutdown
+                    && buffer.filled().len() == before
+                    && error.kind() == std::io::ErrorKind::NotConnected =>
+            {
+                std::task::Poll::Ready(Ok(()))
+            }
+            result => result,
+        };
+        if matches!(&result, std::task::Poll::Ready(Ok(())))
+            && had_capacity
+            && buffer.filled().len() == before
+        {
+            this.read_eof = true;
+        }
+        this.observe("read", result)
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin + ?Sized> tokio::io::AsyncWrite for RelayIo<'_, S> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut *this.inner).poll_write(cx, buffer);
+        this.observe("write", result)
+    }
+
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffers: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut *this.inner).poll_write_vectored(cx, buffers);
+        this.observe("write_vectored", result)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut *this.inner).poll_flush(cx);
+        this.observe("flush", result)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut *this.inner).poll_shutdown(cx);
+        if matches!(&result, std::task::Poll::Ready(Ok(()))) {
+            this.write_shutdown = true;
+        }
+        this.observe("shutdown", result)
+    }
 }
 
 #[cfg(test)]

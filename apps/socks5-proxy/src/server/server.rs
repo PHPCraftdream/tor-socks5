@@ -24,6 +24,8 @@ use crate::startup::{
     validate_post_compatibility, AuthStateVerifier,
 };
 use crate::tor_watchdog::{spawn_bridge_failover_watchdog, spawn_tor_watchdog, TorHandle};
+use crate::upstream::relay;
+use crate::upstream::RelayRemote::{Tor, Upstream};
 use crate::{shutdown, upstream};
 
 /// Maximum concurrent SOCKS5 connections. Each may run an Argon2id verify
@@ -881,7 +883,7 @@ async fn handle_client_with_connector<C: TorConnector + Send>(
             // (not merely a successful connect) is the real transfer
             // outcome; `relay_errors` is bumped in `accept_loop` via
             // classification of the STAGE_RELAY-tagged error below.
-            match tokio::io::copy_bidirectional(&mut client, &mut tor_compat).await {
+            match relay(&mut client, &mut tor_compat, conn_id, Tor).await {
                 Ok((sent, recv)) => {
                     conn_health.record_relay_closed();
                     info!(
@@ -921,7 +923,7 @@ async fn handle_client_with_connector<C: TorConnector + Send>(
                 .write_all(&pipeline)
                 .await
                 .context(STAGE_RELAY)?;
-            match tokio::io::copy_bidirectional(&mut client, &mut upstream_stream).await {
+            match relay(&mut client, &mut upstream_stream, conn_id, Upstream).await {
                 Ok((sent, recv)) => {
                     conn_health.record_relay_closed();
                     info!(
