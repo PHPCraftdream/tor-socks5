@@ -245,10 +245,16 @@ pub(super) async fn stop_startup() -> Result<()> {
 }
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(300);
 
+struct Constructed {
+    tunnel: TorTunnel,
+    outcome: Result<()>,
+}
+
 pub(super) struct GlobalInit {
     cancel: CancellationToken,
-    handle: Mutex<Option<JoinHandle<Result<TorTunnel>>>>,
+    handle: Mutex<Option<JoinHandle<Result<Constructed>>>>,
     cleanup: Mutex<Option<JoinHandle<()>>>,
+    tunnel: Mutex<Option<TorTunnel>>,
 }
 
 pub(super) struct InitGuard(pub(super) Arc<GlobalInit>);
@@ -284,8 +290,10 @@ impl GlobalInit {
                     let (entered, release) = hook.gate.lock().unwrap().take().unwrap();
                     let _ = entered.send(());
                     let _ = release.recv();
-                    drop(tunnel);
-                    Err(anyhow::Error::new(ConstructorCancelled))
+                    Ok(Constructed {
+                        tunnel,
+                        outcome: Err(anyhow::Error::new(ConstructorCancelled)),
+                    })
                 });
             }
         }
@@ -294,7 +302,10 @@ impl GlobalInit {
             let runtime = tokio::runtime::Handle::current();
             return Self::start_job(move |_| {
                 let _entered = runtime.enter();
-                Ok(TorTunnel::create_unbootstrapped_with(settings)?)
+                Ok(Constructed {
+                    tunnel: TorTunnel::create_unbootstrapped_with(settings)?,
+                    outcome: Ok(()),
+                })
             });
         }
         let runtime = tokio::runtime::Handle::current();
@@ -303,20 +314,20 @@ impl GlobalInit {
             let deadline = Instant::now() + BOOTSTRAP_TIMEOUT;
             let tunnel = TorTunnel::create_unbootstrapped_with(settings)?;
             runtime.block_on(async {
-                tokio::select! {
+                let outcome = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => Err(anyhow::Error::new(ConstructorCancelled)),
                     result = tokio::time::timeout_at(deadline, tunnel.wait_bootstrapped()) => {
-                        result.context("истёк срок запуска глобального Tor")??;
-                        Ok(tunnel)
+                        result.context("истёк срок запуска глобального Tor").and_then(|result| result.map_err(anyhow::Error::from))
                     }
-                }
+                };
+                Ok(Constructed { tunnel, outcome })
             })
         })
     }
 
     fn start_job(
-        job: impl FnOnce(CancellationToken) -> Result<TorTunnel> + Send + 'static,
+        job: impl FnOnce(CancellationToken) -> Result<Constructed> + Send + 'static,
     ) -> Result<Arc<Self>> {
         let mut root = RETAINED
             .lock()
@@ -328,6 +339,7 @@ impl GlobalInit {
             cancel: CancellationToken::new(),
             handle: Mutex::new(None),
             cleanup: Mutex::new(None),
+            tunnel: Mutex::new(None),
         });
         // Корень устанавливается до запуска; между установкой и сохранением дескриптора нет await.
         let mut handle = init.handle.try_lock().expect("новый слот свободен");
@@ -347,8 +359,31 @@ impl GlobalInit {
         // При отмене ожидания дескриптор остаётся в корневом слоте.
         let result = handle.await;
         slot.take();
+        let constructed = match result.context("задача запуска Tor завершилась аварийно")?
+        {
+            Ok(value) => value,
+            Err(error) => {
+                self.release()?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = constructed.outcome {
+            *self.tunnel.try_lock().expect("слот запуска свободен") = Some(constructed.tunnel);
+            drop(slot);
+            Self::recover(Instant::now() + cleanup_budget()).await?;
+            return Err(error);
+        }
+        *self.tunnel.try_lock().expect("слот запуска свободен") = Some(constructed.tunnel.clone());
+        Ok(constructed.tunnel)
+    }
+
+    pub(super) fn complete_handoff(self: &Arc<Self>) -> Result<()> {
         self.release()?;
-        result.context("задача запуска Tor завершилась аварийно")?
+        self.tunnel
+            .try_lock()
+            .expect("слот запуска свободен")
+            .take();
+        Ok(())
     }
 
     fn release(self: &Arc<Self>) -> Result<()> {
@@ -386,14 +421,28 @@ impl GlobalInit {
             slot.take();
             match result.context("задача запуска Tor завершилась аварийно")?
             {
-                Ok(tunnel) => {
-                    *cleanup = Some(tokio::task::spawn_blocking(move || drop(tunnel)));
+                Ok(constructed) => {
+                    *init.tunnel.try_lock().expect("слот запуска свободен") =
+                        Some(constructed.tunnel);
                 }
                 Err(error) if error.is::<ConstructorCancelled>() => {}
                 Err(error) => {
                     init.release()?;
                     return Err(error);
                 }
+            }
+        }
+        {
+            let mut tunnel = tokio::time::timeout_at(deadline, init.tunnel.lock())
+                .await
+                .context("истёк срок ожидания очистки глобального Tor")?;
+            if let Some(current) = tunnel.as_ref() {
+                tokio::time::timeout_at(deadline, current.shutdown())
+                    .await
+                    .context("истёк срок завершения глобального PT")??;
+            }
+            if let Some(current) = tunnel.take() {
+                *cleanup = Some(tokio::task::spawn_blocking(move || drop(current)));
             }
         }
         if let Some(handle) = cleanup.as_mut() {
@@ -503,6 +552,32 @@ mod tests {
             .unwrap();
         assert!(result.expect("shutdown was ignored").is_err());
         assert!(cancelled && retained);
+        assert!(RETAINED.lock().unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handoff_keeps_tunnel_rooted_until_recovery() {
+        let _lifecycle = super::super::owners::TEST_LIFECYCLE.lock().await;
+        let runtime = tokio::runtime::Handle::current();
+        let init = GlobalInit::start_job(move |_| {
+            let _entered = runtime.enter();
+            Ok(Constructed {
+                tunnel: TorTunnel::create_unbootstrapped_with(Settings::default())?,
+                outcome: Ok(()),
+            })
+        })
+        .unwrap();
+        let tunnel = init.wait().await.unwrap();
+        assert!(RETAINED
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|root| Arc::ptr_eq(root, &init)));
+        assert!(init.tunnel.lock().await.is_some());
+        drop(tunnel);
+        GlobalInit::recover(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
         assert!(RETAINED.lock().unwrap().is_none());
     }
 

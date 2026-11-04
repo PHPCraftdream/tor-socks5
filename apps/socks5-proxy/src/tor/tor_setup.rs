@@ -68,12 +68,15 @@ pub(crate) async fn build_tor_settings_preserving_live(
 ) -> Result<Settings> {
     if let Some(endpoint) = proxy_config::resolve_endpoint(cfg.pre_socks5.as_ref(), None) {
         let mut settings = restricted_owner_settings(cfg, config_path)?;
-        settings.pre_endpoint = Some(arti_wrapper::Socks5PreEndpoint::new(
-            endpoint.address(),
-            endpoint
-                .credentials()
-                .map(|(user, pass)| (user.to_owned(), pass.to_owned())),
-        ));
+        settings.pre_endpoint = Some(
+            arti_wrapper::Socks5PreEndpoint::new(
+                endpoint.address(),
+                endpoint
+                    .credentials()
+                    .map(|(user, pass)| (user.to_owned(), pass.to_owned())),
+            )
+            .with_protocol(endpoint.protocol()),
+        );
         return Ok(settings);
     }
     let parsed = cfg

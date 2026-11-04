@@ -48,10 +48,35 @@ egress through an upstream SOCKS5 proxy instead of Tor, and install itself as an
 - **Install as a service** — systemd, OpenRC, launchd, Windows SCM, BSD `rc.d`.
 - **Non-blocking logging** to stderr / stdout / file, configurable level and per-target filters.
 
+## Pre/post proxy protocols
+
+Pre and post independently accept SOCKS5 or plain HTTP CONNECT. The legacy
+`pre_socks5` / `post_socks5` field names remain valid globally and per account.
+No scheme means SOCKS5; `socks5://` makes it explicit and `http://` selects
+HTTP CONNECT. The scalar format remains `IP:port|username:password`, with the
+credentials suffix optional. Existing credential length/delimiter rules apply.
+
+```text
+pre_socks5: http://192.0.2.10:8080|username:password
+post_socks5: socks5://192.0.2.11:1080
+```
+
+The addresses above are documentation-only. An absent account field inherits
+its global setting; `none` explicitly disables that field. Protocol, endpoint
+and credentials participate in pre-owner identity. Errors never negotiate a
+different proxy protocol or fall back to a direct route. HTTPS-to-proxy is not
+part of this interface. All inbound proxy listeners use dual SOCKS5/HTTP CONNECT
+framing; ordinary HTTP forwarding is not supported.
+
 ## Global `pre_socks5` routing
 
-Global `pre_socks5` uses only explicitly configured plain bridges. Periodic
-maintenance checks channels through the same SOCKS5 endpoint and credentials.
+Global `pre_socks5` uses explicitly configured plain bridges or the bundled
+obfs4/WebTunnel transport. For PT bridges, the pre proxy supplies the carrier
+before the existing transport handshake and TLS. External `TOR_PT_BINARY`
+overrides are rejected in this mode. Whole-route application acceptance remains
+separate from compilation and the PT contract tests.
+
+Periodic maintenance checks channels through the same proxy protocol, endpoint and credentials.
 Arti may reuse an existing channel, so this is not always a fresh reachability
 check. A failed or incompatible configuration reload preserves the active route;
 changing the endpoint or credentials requires a restart.
@@ -67,8 +92,8 @@ client → pre → Tor → post → target application exchange. The fixture use
 Tor 0.4.9.15 source archive with a pinned SHA-256. Its archive signature was not
 verified, so provenance is limited to the source and the recorded checksum.
 
-Direct TCP probes, bridge discovery/downloads, seed bridges, PT, the warm pool
-and the separate circuit verifier are unsupported in this mode. Each maintenance
+Direct TCP probes, bridge discovery/downloads, seed bridges, untrusted PT binaries,
+the warm pool and the separate circuit verifier are unsupported in this mode. Each maintenance
 pass considers the first 30 bridges, at most eight concurrently, with up to
 15 seconds per channel; the watchdog considers the first eight active bridges.
 Pre-route observations do not update the bridge-health store.
@@ -82,14 +107,14 @@ automatic recovery for those owners is not implemented here.
 
 Requires a recent stable Rust toolchain (edition 2021).
 
-The workspace needs `resocks5-net` 0.3 (the inbound server API) and takes it from
+The workspace uses `resocks5-net` 0.4.1 and takes it from
 the local SDK at `../resocks5/crates/resocks5-net`. Keep a sibling `resocks5`
-checkout at tag `v0.3.0` or newer beside `tor-socks5`. To build without the
+checkout at tag `v0.4.1` beside `tor-socks5`. To build without the
 checkout, remove the `path` from the `resocks5-net` dependency in the root
 `Cargo.toml` so that Cargo takes the crates.io release.
 
 CI and release builds provision the sibling SDK with
-`.github/actions/setup-local-sdk/action.yml`, pinned to the `v0.3.0` tag rather
+`.github/actions/setup-local-sdk/action.yml`, pinned to the `v0.4.1` tag rather
 than a moving branch.
 
 ```bash

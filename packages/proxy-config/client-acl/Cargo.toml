@@ -24,6 +24,7 @@ name = "client_acl"
 
 [dependencies]
 serde.workspace = true
+resocks5-net.workspace = true
 
 [dev-dependencies]
 ktav.workspace = true

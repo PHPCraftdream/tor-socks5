@@ -32,6 +32,138 @@ pub async fn connect_post_socks(
     .await
 }
 
+/// Connect through one configured SOCKS5 or HTTP CONNECT post endpoint.
+/// cancel-safe: NO — cancellation discards the owned, partially negotiated stream.
+pub async fn connect_post_proxy(
+    tunnel: &TorTunnel,
+    proxy: &resocks5_net::types::ProxyConfig,
+    target_host: &str,
+    target_port: u16,
+    deadline: Instant,
+) -> Result<DataStream, TorError> {
+    use resocks5_net::types::ProxyProtocol;
+    if proxy.gate.is_some() || proxy.host.is_empty() || proxy.port == 0 {
+        return Err(TorError::BuildConfig(
+            "post endpoint must be one valid proxy".to_owned(),
+        ));
+    }
+    let credentials = match (&proxy.user, &proxy.password) {
+        (None, None) => None,
+        (Some(user), Some(password))
+            if !user.is_empty()
+                && !password.is_empty()
+                && user.len() <= 255
+                && password.len() <= 255
+                && (proxy.protocol != ProxyProtocol::Http
+                    || (!user.contains(':')
+                        && !user.bytes().any(|byte| byte.is_ascii_control())
+                        && !password.bytes().any(|byte| byte.is_ascii_control()))) =>
+        {
+            Some((user.as_str(), password.as_str()))
+        }
+        _ => return Err(TorError::BuildConfig("invalid post credentials".to_owned())),
+    };
+    if tokio::time::Instant::now() >= deadline.into() {
+        return Err(match proxy.protocol {
+            ProxyProtocol::Socks5 => TorError::PostSocksTimeout,
+            ProxyProtocol::Http => TorError::PostHttpTimeout,
+            ProxyProtocol::Https => TorError::BuildConfig("unsupported post protocol".to_owned()),
+        });
+    }
+    match proxy.protocol {
+        ProxyProtocol::Socks5 => {
+            let credentials = credentials
+                .map(|(user, password)| Credentials::new(user, password))
+                .transpose()
+                .map_err(TorError::PostSocks)?;
+            connect_post_socks(
+                tunnel,
+                &proxy.host,
+                proxy.port,
+                target_host,
+                target_port,
+                credentials.as_ref(),
+                deadline,
+            )
+            .await
+        }
+        ProxyProtocol::Http => {
+            connect_post_http(
+                tunnel,
+                &proxy.host,
+                proxy.port,
+                target_host,
+                target_port,
+                credentials,
+                deadline,
+            )
+            .await
+        }
+        ProxyProtocol::Https => Err(TorError::BuildConfig(
+            "post protocol must be SOCKS5 or HTTP CONNECT".to_owned(),
+        )),
+    }
+}
+
+/// Open an HTTP CONNECT proxy through Tor without local target DNS or fallback.
+/// cancel-safe: NO — cancellation discards the owned, partially negotiated stream.
+async fn connect_post_http(
+    tunnel: &TorTunnel,
+    proxy_host: &str,
+    proxy_port: u16,
+    target_host: &str,
+    target_port: u16,
+    credentials: Option<(&str, &str)>,
+    deadline: Instant,
+) -> Result<DataStream, TorError> {
+    use resocks5_net::types::{ProxyConfig, ProxyProtocol};
+    let mut proxy = ProxyConfig::new(ProxyProtocol::Http, proxy_host, proxy_port);
+    if let Some((username, password)) = credentials {
+        proxy.user = Some(username.to_owned());
+        proxy.password = Some(password.to_owned());
+    }
+    connect_http_over_dial(
+        tunnel.connect(proxy_host, proxy_port),
+        &proxy,
+        target_host,
+        target_port,
+        deadline,
+    )
+    .await
+}
+
+async fn connect_http_over_dial<S, F>(
+    dial: F,
+    proxy: &resocks5_net::types::ProxyConfig,
+    target_host: &str,
+    target_port: u16,
+    deadline: Instant,
+) -> Result<S, TorError>
+where
+    S: futures::AsyncRead + futures::AsyncWrite + Unpin,
+    F: std::future::Future<Output = Result<S, TorError>>,
+{
+    if tokio::time::Instant::now() >= deadline.into() {
+        return Err(TorError::PostHttpTimeout);
+    }
+    let stream = tokio::time::timeout_at(deadline.into(), dial)
+        .await
+        .map_err(|_| TorError::PostHttpTimeout)??;
+    let mut stream = stream.compat();
+    let target = resocks5_net::connect::HostPort::format(target_host, target_port);
+    if tokio::time::Instant::now() >= deadline.into() {
+        return Err(TorError::PostHttpTimeout);
+    }
+    tokio::time::timeout_at(
+        deadline.into(),
+        resocks5_net::connect::http_connect_handshake(&mut stream, &target, proxy),
+    )
+    .await
+    .map_err(|_| TorError::PostHttpTimeout)?
+    .map_err(TorError::PostHttp)?;
+    Ok(stream.into_inner())
+}
+
 async fn connect_post_over_dial<S, F>(
     dial: F,
     target_host: &str,
@@ -43,9 +175,19 @@ where
     S: futures::AsyncRead + futures::AsyncWrite + Unpin,
     F: std::future::Future<Output = Result<S, TorError>>,
 {
+    tracing::info!(
+        post_protocol = "socks5",
+        post_stage = "dial",
+        "post proxy setup"
+    );
     let stream = tokio::time::timeout_at(deadline.into(), dial)
         .await
         .map_err(|_| TorError::PostSocksTimeout)??;
+    tracing::info!(
+        post_protocol = "socks5",
+        post_stage = "handshake",
+        "post proxy setup"
+    );
     connect_stream(stream, target_host, target_port, credentials, deadline).await
 }
 
@@ -72,6 +214,11 @@ where
         client::Error::Timeout => TorError::PostSocksTimeout,
         error => TorError::PostSocks(error),
     })?;
+    tracing::info!(
+        post_protocol = "socks5",
+        post_stage = "established",
+        "post proxy setup"
+    );
     Ok(compat.into_inner())
 }
 
@@ -82,6 +229,152 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_util::compat::TokioAsyncReadCompatExt;
+
+    #[tokio::test]
+    async fn http_post_uses_unresolved_authority_and_preserves_payload() {
+        use resocks5_net::server::{accept, Protocol, Reply, ServerOptions};
+        use resocks5_net::types::{ProxyConfig, ProxyProtocol};
+        let (client, mut peer) = tokio::io::duplex(4096);
+        let mut proxy = ProxyConfig::new(ProxyProtocol::Http, "192.0.2.1", 8080);
+        proxy.user = Some("user".to_owned());
+        proxy.password = Some("password".to_owned());
+        let server = async {
+            let options = ServerOptions::new(
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                false,
+                true,
+            );
+            let request = accept(&mut peer, &options, |credentials| {
+                std::future::ready(
+                    credentials.username() == "user" && credentials.password() == "password",
+                )
+            })
+            .await
+            .unwrap();
+            assert_eq!(request.protocol(), Protocol::Http);
+            assert_eq!(request.target(), "target.invalid:443");
+            request.reply(&mut peer, Reply::Established).await.unwrap();
+            peer.write_all(b"payload").await.unwrap();
+        };
+        let client = async {
+            let mut stream = connect_http_over_dial(
+                async { Ok(client.compat()) },
+                &proxy,
+                "target.invalid",
+                443,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            let mut payload = [0; 7];
+            FuturesAsyncReadExt::read_exact(&mut stream, &mut payload)
+                .await
+                .unwrap();
+            assert_eq!(&payload, b"payload");
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(server, client)
+        })
+        .await
+        .expect("HTTP post exchange must finish");
+    }
+
+    #[tokio::test]
+    async fn http_post_rejection_is_not_success() {
+        use resocks5_net::types::{ProxyConfig, ProxyProtocol};
+        let (client, mut peer) = tokio::io::duplex(4096);
+        let proxy = ProxyConfig::new(ProxyProtocol::Http, "192.0.2.1", 8080);
+        let server = async {
+            let options = resocks5_net::server::ServerOptions::new(
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                true,
+                false,
+            );
+            let request =
+                resocks5_net::server::accept(&mut peer, &options, |_| std::future::ready(false))
+                    .await
+                    .unwrap();
+            request
+                .reply(&mut peer, resocks5_net::server::Reply::Forbidden)
+                .await
+                .unwrap();
+        };
+        let client = connect_http_over_dial(
+            async { Ok(client.compat()) },
+            &proxy,
+            "target.invalid",
+            443,
+            Instant::now() + Duration::from_secs(5),
+        );
+        let ((), result) = tokio::join!(server, client);
+        assert!(matches!(
+            result,
+            Err(TorError::PostHttp(
+                resocks5_net::ConnectError::ProxyRejected {
+                    protocol: ProxyProtocol::Http,
+                    code: Some(403),
+                    ..
+                }
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn expired_http_post_deadline_never_polls_dial() {
+        use resocks5_net::types::{ProxyConfig, ProxyProtocol};
+        let proxy = ProxyConfig::new(ProxyProtocol::Http, "192.0.2.1", 8080);
+        let polls = std::sync::atomic::AtomicUsize::new(0);
+        let dial = std::future::poll_fn(|_| {
+            polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::task::Poll::Ready(
+                Err::<tokio_util::compat::Compat<tokio::io::DuplexStream>, _>(
+                    TorError::PostHttpTimeout,
+                ),
+            )
+        });
+        let result =
+            connect_http_over_dial(dial, &proxy, "target.invalid", 443, Instant::now()).await;
+        assert!(matches!(result, Err(TorError::PostHttpTimeout)));
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn buffered_socks_stream_flushes_each_handshake_phase() {
+        use resocks5_net::server::{accept, Reply, ServerError, ServerOptions};
+        let (client, mut peer) = tokio::io::duplex(4096);
+        let deadline = (tokio::time::Instant::now() + Duration::from_secs(5)).into_std();
+        let credentials = Credentials::new("user", "password").unwrap();
+        let server = async {
+            let options = ServerOptions::new(deadline.into(), false, true);
+            let request = accept(&mut peer, &options, |credentials| {
+                std::future::ready(
+                    credentials.username() == "user" && credentials.password() == "password",
+                )
+            })
+            .await?;
+            assert_eq!(request.target(), "target.invalid:443");
+            request.reply(&mut peer, Reply::Established).await?;
+            peer.write_all(b"ready").await.map_err(ServerError::Io)?;
+            Ok::<(), ServerError>(())
+        };
+        let buffered = tokio::io::BufStream::new(client).compat();
+        let client = connect_stream(
+            buffered,
+            "target.invalid",
+            443,
+            Some(&credentials),
+            deadline,
+        );
+        let (server_result, client_result) = tokio::join!(server, client);
+        let mut stream = client_result
+            .expect("SOCKS handshake must flush buffered writes before reading replies");
+        server_result.unwrap();
+        let mut payload = [0; 5];
+        FuturesAsyncReadExt::read_exact(&mut stream, &mut payload)
+            .await
+            .unwrap();
+        assert_eq!(&payload, b"ready");
+    }
 
     #[tokio::test]
     async fn connect_stream_uses_socks_domain_request_and_preserves_payload() {

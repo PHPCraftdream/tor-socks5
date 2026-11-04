@@ -1,6 +1,6 @@
-use std::net::IpAddr;
-
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(test)]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::Instant;
 
 /// Необязательные учётные данные RFC 1929.
@@ -72,90 +72,23 @@ where
     if host.is_empty() || host.len() > u8::MAX as usize || host.as_bytes().contains(&0) {
         return Err(Error::InvalidInput);
     }
-    let mut request = Vec::with_capacity(host.len() + 7);
-    request.extend_from_slice(&[5, 1, 0]);
-    match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(ip)) => {
-            request.push(1);
-            request.extend_from_slice(&ip.octets());
-        }
-        Ok(IpAddr::V6(ip)) => {
-            request.push(4);
-            request.extend_from_slice(&ip.octets());
-        }
-        Err(_) => {
-            request.push(3);
-            request.push(u8::try_from(host.len()).map_err(|_| Error::InvalidInput)?);
-            request.extend_from_slice(host.as_bytes());
-        }
+    if Instant::now() >= deadline {
+        return Err(Error::Timeout);
     }
-    request.extend_from_slice(&port.to_be_bytes());
-
-    let exchange = async {
-        let methods: &[u8] = if credentials.is_some() { &[2] } else { &[0] };
-        stream
-            .write_all(&[5, methods.len() as u8])
-            .await
-            .map_err(|_| Error::Io)?;
-        stream.write_all(methods).await.map_err(|_| Error::Io)?;
-        let mut choice = [0; 2];
-        stream
-            .read_exact(&mut choice)
-            .await
-            .map_err(|_| Error::Io)?;
-        if choice[0] != 5 || choice[1] != methods[0] {
-            return Err(Error::Protocol);
-        }
-        if choice[1] == 2 {
-            let credentials = credentials.ok_or(Error::Protocol)?;
-            let mut auth =
-                Vec::with_capacity(credentials.username.len() + credentials.password.len() + 3);
-            auth.extend_from_slice(&[1, credentials.username.len() as u8]);
-            auth.extend_from_slice(credentials.username.as_bytes());
-            auth.push(credentials.password.len() as u8);
-            auth.extend_from_slice(credentials.password.as_bytes());
-            stream.write_all(&auth).await.map_err(|_| Error::Io)?;
-            let mut result = [0; 2];
-            stream
-                .read_exact(&mut result)
-                .await
-                .map_err(|_| Error::Io)?;
-            if result != [1, 0] {
-                return Err(Error::Protocol);
-            }
-        }
-        stream.write_all(&request).await.map_err(|_| Error::Io)?;
-        let mut header = [0; 4];
-        stream
-            .read_exact(&mut header)
-            .await
-            .map_err(|_| Error::Io)?;
-        if header[0] != 5 || header[2] != 0 {
-            return Err(Error::Protocol);
-        }
-        let tail_len = match header[3] {
-            1 => 4,
-            4 => 16,
-            3 => {
-                let mut n = [0];
-                stream.read_exact(&mut n).await.map_err(|_| Error::Io)?;
-                if n[0] == 0 {
-                    return Err(Error::Protocol);
-                }
-                n[0] as usize
-            }
-            _ => return Err(Error::Protocol),
-        };
-        let mut tail = vec![0; tail_len + 2];
-        stream.read_exact(&mut tail).await.map_err(|_| Error::Io)?;
-        if header[1] != 0 {
-            return Err(Error::Protocol);
-        }
-        Ok(())
-    };
+    let auth = credentials
+        .map(|credentials| (credentials.username.as_str(), credentials.password.as_str()));
+    // The SDK flushes greeting, authentication, and CONNECT before reading replies.
+    // This is required for buffered streams, including Arti's DataStream.
+    let exchange = resocks5_net::connect::socks5_handshake(&mut *stream, host, port, auth);
     match tokio::time::timeout_at(deadline, exchange).await {
-        Ok(result) => result,
+        Ok(Ok(_)) => Ok(()),
         Err(_) => Err(Error::Timeout),
+        Ok(Err(error)) => Err(match error {
+            resocks5_net::ConnectError::Io { .. } => Error::Io,
+            resocks5_net::ConnectError::Timeout { .. } => Error::Timeout,
+            resocks5_net::ConnectError::InvalidTarget(_) => Error::InvalidInput,
+            _ => Error::Protocol,
+        }),
     }
 }
 

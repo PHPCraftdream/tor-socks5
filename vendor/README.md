@@ -2,14 +2,14 @@
 
 This directory holds **full source copies** of upstream crates from the
 [arti](https://gitlab.torproject.org/tpo/core/arti) workspace. The root
-`Cargo.toml` applies `[patch.crates-io]` overrides to the seven crates under
+`Cargo.toml` applies `[patch.crates-io]` overrides to the eight crates under
 `vendor/`; the build does not depend on these fixes being accepted upstream.
 
 **Base line: Arti 0.47.0 (arti 2.7.0), synced 2026-10-13.**
 Workspace MSRV is 1.92 (up from 1.89 on the 0.43 line).
 
-Vendored crates (7): `arti-client`, `tor-chanmgr`, `tor-circmgr`,
-`tor-dirclient`, `tor-dirmgr`, `tor-guardmgr` — all at **0.47.0** — and
+Vendored crates (8): `arti-client`, `tor-chanmgr`, `tor-circmgr`,
+`tor-dirclient`, `tor-dirmgr`, `tor-guardmgr`, `tor-ptmgr` — all at **0.47.0** — and
 `saturating-time` at **0.5.0**.
 
 `ptrs-gesher` (the obfs4/webtunnel PT client and `bridge-line` parser) is
@@ -29,6 +29,20 @@ application dependency. A new fork, if needed, must be added under `vendor/`
 and patched in the root `Cargo.toml`.
 
 ## Why each crate is vendored
+
+### `tor-ptmgr` (0.47.0)
+
+The local manager exposes an awaited PT shutdown receipt, retains unfinished
+child cleanup across cancellation, and rejects new launches after shutdown.
+The paired `arti-client` shutdown method closes channels and awaits that receipt;
+application owners retain their tunnels until shutdown succeeds.
+
+The source baseline is the crates.io `tor-ptmgr` 0.47.0 archive, SHA-256
+`0068103033ae2dcedf88691c4758b1e483dd31d325e4891f5e0d3bb41f24ecbc`.
+The same-version patch is derived from the existing PT owner implementation;
+it does not add another Tor topology or transport. Remove the override only
+when upstream provides the equivalent shutdown contract. PT process tests are
+not proof of a complete pre/Tor/post application exchange.
 
 ### `saturating-time` (0.5.0)
 

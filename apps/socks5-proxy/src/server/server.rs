@@ -309,6 +309,7 @@ pub(crate) async fn run_server(
             )?);
             owners.retain_for_shutdown()?;
             registry_guard = Some(RegistryRunGuard(owners.clone()));
+            init.complete_handoff()?;
             if global_init::launch_background() {
                 let mut launch = producers::LaunchGuard::new(producer_owner.clone());
                 bridge_producers::launch(
@@ -500,30 +501,12 @@ pub(crate) async fn run_server(
     if let Err(error) = handlers.shutdown().await {
         shutdown_errors.push(error);
     }
-    if let Some(guard) = &registry_guard {
-        if let Err(error) = guard
-            .0
-            .close_with_deadline(tokio::time::Instant::now() + Duration::from_secs(5))
-            .await
-        {
-            shutdown_errors.push(error);
-        }
-    }
-
-    // For the Tor egress, draining the handle takes the tunnel out of the
-    // shared slot; dropping it triggers `tor-ptmgr` to terminate PT
-    // subprocesses and releases arti's exclusive lock on its state
-    // directory. The Job Object installed at startup kills anything that
-    // leaks past this point. The upstream egress holds no such resources.
+    // Keep each tunnel rooted until its PT shutdown receipt is observed.
+    // A failed receipt leaves the registry available for recovery.
     if let Egress::Tor(handle, _, _, _, _) = egress {
         info!("stopping Tor client and pluggable transports");
-        // Order matters: cancel first (no producer starts a new work
-        // iteration), then drain the slot (in-flight tunnel reads see
-        // `None`), then wait — bounded — for the producers to finish their
-        // current operations, so their final store writes land before the
-        // writer closes below.
+        // Join producers before shutting down their shared PT owner.
         producer_owner.cancel();
-        drop(handle.drain().await);
         if let Err(error) = producer_owner.join(PRODUCER_JOIN_TIMEOUT).await {
             warn!(%error, "producer graceful shutdown failed; aborting");
             shutdown_errors.push(error);
@@ -531,6 +514,20 @@ pub(crate) async fn run_server(
             if let Err(error) = producer_owner.join(Duration::from_secs(5)).await {
                 shutdown_errors.push(error);
             }
+        }
+        let mut registry_closed = true;
+        if let Some(guard) = &registry_guard {
+            if let Err(error) = guard
+                .0
+                .close_with_deadline(tokio::time::Instant::now() + Duration::from_secs(5))
+                .await
+            {
+                registry_closed = false;
+                shutdown_errors.push(error);
+            }
+        }
+        if registry_closed {
+            drop(handle.drain().await);
         }
         // Give arti's reactor a brief moment to flush the shutdown.
         // Empirically this is enough for the state-dir lock to be released

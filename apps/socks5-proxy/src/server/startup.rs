@@ -136,18 +136,20 @@ pub(crate) async fn connect_tor_route(
                 socks5_proto::client::Error::InvalidInput,
             ));
         };
-        let credentials = endpoint
-            .credentials()
-            .map(|(username, password)| arti_wrapper::PostSocksCredentials::new(username, password))
-            .transpose()
-            .map_err(arti_wrapper::TorError::PostSocks)?;
-        arti_wrapper::connect_post_socks(
-            tor,
-            &endpoint.address().ip().to_string(),
+        let mut proxy = resocks5_net::types::ProxyConfig::new(
+            endpoint.protocol(),
+            endpoint.address().ip().to_string(),
             endpoint.address().port(),
+        );
+        if let Some((username, password)) = endpoint.credentials() {
+            proxy.user = Some(username.to_owned());
+            proxy.password = Some(password.to_owned());
+        }
+        arti_wrapper::connect_post_proxy(
+            tor,
+            &proxy,
             host,
             port,
-            credentials.as_ref(),
             std::time::Instant::now() + crate::upstream::UPSTREAM_SETUP_DEADLINE,
         )
         .await
@@ -510,7 +512,8 @@ mod endpoint_guard_tests {
         assert!(validate_account_routes(&users, None, None, false, false).is_ok());
         cfg.upstream.enabled = false;
         cfg.bridges.lines.push(
-            "obfs4 1.2.3.4:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA iat-mode=0".into(),
+            "unknownpt 1.2.3.4:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA iat-mode=0"
+                .into(),
         );
         assert!(crate::tor_setup::restricted_owner_settings(&cfg, None).is_err());
         cfg.bridges.lines.clear();
@@ -522,6 +525,30 @@ mod endpoint_guard_tests {
         assert!(crate::tor_setup::validate_owner_routes(&cfg, &direct, None)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn account_pre_stock_pt_template_uses_current_executable() {
+        let mut cfg = crate::config::Config::default();
+        cfg.bridges.use_seeds = false;
+        cfg.bridges.auto_fetch = false;
+        cfg.warm_pool.enabled = false;
+        cfg.bridges.lines = vec![
+            "1.1.1.1:443 1111111111111111111111111111111111111111".into(),
+            "obfs4 8.8.4.4:443 2222222222222222222222222222222222222222 cert=AAA iat-mode=0".into(),
+            "webtunnel 8.8.8.8:443 3333333333333333333333333333333333333333 url=https://example.com/x ver=0.0.3".into(),
+        ];
+        let users = UsersConfig {
+            users: vec![user(true, Some(endpoint()), None)],
+        };
+        let settings = crate::tor_setup::validate_owner_routes(&cfg, &users, None)
+            .unwrap()
+            .unwrap();
+        assert!(settings.pre_endpoint.is_none());
+        assert!(settings.stock_pt_proxy);
+        assert_eq!(settings.pt_binary, Some(std::env::current_exe().unwrap()));
+        assert_eq!(settings.bridges, cfg.bridges.parsed().unwrap().bridges);
+        settings.validate_stock_pt_proxy().unwrap();
     }
 
     #[test]

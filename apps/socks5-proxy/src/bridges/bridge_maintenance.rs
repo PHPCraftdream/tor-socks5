@@ -323,6 +323,7 @@ async fn refresh_pre(
                 .credentials()
                 .map(|(user, pass)| (user.to_owned(), pass.to_owned())),
         )
+        .with_protocol(value.protocol())
     });
     if configured.as_ref() != Some(endpoint) || active.pre_endpoint.as_ref() != Some(endpoint) {
         anyhow::bail!("изменение pre требует перезапуска");
