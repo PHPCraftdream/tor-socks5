@@ -276,7 +276,7 @@ impl TorConnector for Observe {
         _post: Option<&'a proxy_config::EndpointOverride>,
         _host: &'a str,
         _port: u16,
-    ) -> arti_wrapper::Result<arti_wrapper::DataStream> {
+    ) -> arti_wrapper::Result<arti_wrapper::RoutedStream> {
         let mut wrong = self.expected.clone();
         wrong.pre_endpoint = Some(Socks5PreEndpoint::new(
             "127.0.0.1:1080".parse().unwrap(),
@@ -582,7 +582,7 @@ impl TorConnector for Park {
         post: Option<&'a proxy_config::EndpointOverride>,
         host: &'a str,
         port: u16,
-    ) -> arti_wrapper::Result<arti_wrapper::DataStream> {
+    ) -> arti_wrapper::Result<arti_wrapper::RoutedStream> {
         let result = self.observe.connect(tor, post, host, port).await;
         let _ = self.release.take().unwrap().await;
         result

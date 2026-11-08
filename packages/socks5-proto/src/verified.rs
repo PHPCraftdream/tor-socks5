@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use resocks5_net::server::{self, Credentials, IncomingRequest, ServerError, ServerOptions};
+use resocks5_net::server::{IncomingRequest, ServerError};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Instant;
 
@@ -79,45 +79,45 @@ where
     V: ProofVerifier + ?Sized + 'static,
 {
     let configured = auth.is_some();
-    let options = ServerOptions::new(deadline, !configured, configured);
     let capture = Arc::new(Mutex::new(None));
     let callback_capture = Arc::clone(&capture);
     let slots = super::verification_slots();
-    let request = server::accept(
-        stream,
-        &options,
-        move |credentials: Credentials| async move {
-            let Some(verifier) = auth else { return false };
-            let Ok(permit) = slots.try_acquire_owned() else {
-                return false;
-            };
-            // fire-and-forget: detached by design только при отмене ожидания;
-            // блокирующая проверка сохраняет слот до выхода, результат отбрасывается.
-            let result = tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                let proof =
-                    verifier.verify_proof(credentials.username(), credentials.password())?;
-                if verifier.username(&proof) != credentials.username() {
-                    return None;
+    let request =
+        super::backend::accept_checked(stream, deadline, configured, move |username, password| {
+            let auth = auth.clone();
+            let slots = Arc::clone(&slots);
+            let callback_capture = Arc::clone(&callback_capture);
+            async move {
+                let Some(verifier) = auth else { return false };
+                let Ok(permit) = slots.try_acquire_owned() else {
+                    return false;
+                };
+                // fire-and-forget: detached by design only on cancellation;
+                // the blocking verifier retains its permit until it finishes.
+                let result = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    let proof = verifier.verify_proof(&username, &password)?;
+                    if verifier.username(&proof) != username {
+                        return None;
+                    }
+                    Some((username, proof))
+                })
+                .await;
+                let Ok(Some(value)) = result else {
+                    return false;
+                };
+                let Ok(mut slot) = callback_capture.lock() else {
+                    return false;
+                };
+                if slot.is_some() {
+                    return false;
                 }
-                Some((credentials.username().to_owned(), proof))
-            })
-            .await;
-            let Ok(Some(value)) = result else {
-                return false;
-            };
-            let Ok(mut slot) = callback_capture.lock() else {
-                return false;
-            };
-            if slot.is_some() {
-                return false;
+                *slot = Some(value);
+                true
             }
-            *slot = Some(value);
-            true
-        },
-    )
-    .await
-    .map_err(VerifiedError::Handshake)?;
+        })
+        .await
+        .map_err(VerifiedError::Handshake)?;
     let captured = capture
         .lock()
         .map_err(|_| VerifiedError::IdentityMismatch)?

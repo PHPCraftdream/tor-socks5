@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use arti_wrapper::TorTunnel;
+use arti_wrapper::{RoutedStream, TorTunnel};
 use auth::{AuthState, UsersConfig};
 use resocks5_net::connect::HostPort;
 use resocks5_net::server::Reply;
@@ -613,7 +613,7 @@ trait TorConnector {
         post: Option<&'a proxy_config::EndpointOverride>,
         host: &'a str,
         port: u16,
-    ) -> impl std::future::Future<Output = arti_wrapper::Result<arti_wrapper::DataStream>> + Send + 'a;
+    ) -> impl std::future::Future<Output = arti_wrapper::Result<RoutedStream>> + Send + 'a;
 }
 
 struct RealTorConnector;
@@ -625,8 +625,7 @@ impl TorConnector for RealTorConnector {
         post: Option<&'a proxy_config::EndpointOverride>,
         host: &'a str,
         port: u16,
-    ) -> impl std::future::Future<Output = arti_wrapper::Result<arti_wrapper::DataStream>> + Send + 'a
-    {
+    ) -> impl std::future::Future<Output = arti_wrapper::Result<RoutedStream>> + Send + 'a {
         connect_tor_route(tor, post, host, port)
     }
 }

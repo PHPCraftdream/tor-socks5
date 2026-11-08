@@ -718,9 +718,12 @@ fn fatal_protocol_error_hook(error: &arti_client::Error) {
 
 mod post_endpoint;
 mod pre_endpoint;
+#[path = "proxy/stream.rs"]
+mod routed_stream;
 mod validate;
 pub use post_endpoint::{connect_post_proxy, connect_post_socks};
 pub use pre_endpoint::Socks5PreEndpoint;
+pub use routed_stream::RoutedStream;
 pub use socks5_proto::client::Credentials as PostSocksCredentials;
 use validate::{
     validate_circuit_hops, validate_min_bandwidth_percentile, validate_service_circuit_hops,

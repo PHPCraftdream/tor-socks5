@@ -280,3 +280,66 @@ async fn incomplete_and_expired_never_return_proof() {
     .await
     .is_err());
 }
+
+#[tokio::test]
+async fn cleartext_only_preserves_host_proofs_without_advertising_secure_auth() {
+    for http in [false, true] {
+        let (mut server, mut client) = duplex(4096);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let verifier = Arc::new(DropTrackingVerifier {
+            calls: Arc::clone(&calls),
+            drops: Arc::clone(&drops),
+        });
+        let accepting = accept_verified(
+            &mut server,
+            Instant::now() + Duration::from_secs(5),
+            Some(verifier),
+        );
+        let peer = async {
+            if http {
+                client
+                    .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut challenge = Vec::new();
+                while !challenge.ends_with(b"\r\n\r\n") {
+                    assert!(challenge.len() < 1024, "bounded authentication challenge");
+                    challenge.push(client.read_u8().await.unwrap());
+                }
+                let challenge = String::from_utf8(challenge).unwrap();
+                assert!(challenge.starts_with("HTTP/1.1 407"));
+                assert!(challenge.contains("Proxy-Authenticate: Basic"));
+                assert!(!challenge.contains("Resocks5-Secure"));
+                client.write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Basic YWxpY2U6cHVibGlj\r\n\r\n").await.unwrap();
+            } else {
+                client.write_all(&[5, 2, 0x80, 2]).await.unwrap();
+                let mut reply = [0; 2];
+                client.read_exact(&mut reply).await.unwrap();
+                assert_eq!(reply, [5, 2], "use the actual host verifier, not a decoy");
+                client
+                    .write_all(b"\x01\x05alice\x06public\x05\x01\x00\x01\x01\x02\x03\x04\x00\x50")
+                    .await
+                    .unwrap();
+                client.read_exact(&mut reply).await.unwrap();
+                assert_eq!(reply, [1, 0]);
+            }
+        };
+        let (accepted, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(accepting, peer)
+        })
+        .await
+        .expect("host verification must finish within its deadline");
+        let (request, proof) = accepted.unwrap().into_parts();
+        assert_eq!(request.username(), Some("alice"));
+        assert_eq!(
+            request.auth_method(),
+            resocks5_net::server::AuthMethod::Cleartext
+        );
+        let proof = proof.expect("authenticated request retains the actual host proof");
+        assert_eq!(proof.identity, "alice");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(proof);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+}

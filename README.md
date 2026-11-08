@@ -116,19 +116,18 @@ automatic recovery for those owners is not implemented here.
 
 Requires Rust 1.92 or newer (edition 2021 for first-party crates).
 
-The workspace uses the sibling `resocks5` checkout at tag `v0.4.1`, exposing
-`../resocks5/crates/resocks5-net`. CI provisions that SDK with
-`.github/actions/setup-local-sdk/action.yml`; it does not provision the unpublished
-ptrs-gesher carrier changes described below.
+The workspace resolves `ktav` 0.8.1 and `resocks5-net` 0.5.1 from the registry.
+The SDK's `AuthMethods::cleartext_only` policy delegates inbound password checks
+to the existing host verifier without advertising unsupported secure authentication.
+No sibling SDK checkout or SDK path override is required.
 
-**Temporary local candidate dependency:** the pre/WebTunnel carrier requires
-ptrs-gesher source commit `9a59ae672944c77afe968cea9679ab36e31324e4`.
-Its package versions remain 0.7.0, but the registry's existing 0.7.0 artifacts do
-not contain these changes. Keep that source in a sibling `ptrs-gesher` checkout;
-do not vendor it or assume that an unpatched registry build tests the same code.
-The candidate lockfile reflects these local overrides. A fresh public CI/main
-candidate must resolve the published replacement before dropping the overrides;
-publication and the replacement version are not selected by this example.
+**Temporary local candidate dependency:** preparation uses the original
+ptrs-gesher 0.8 source checkout, reviewed at commit
+`b0c68330ace29acfcdbaad23dd734c45e94a293c`. Keep that source in a sibling
+`ptrs-gesher` checkout; do not vendor it or assume an unpatched registry build
+tests the same code. The candidate lockfile reflects these local overrides.
+A fresh public CI/main candidate must resolve the published replacement before
+dropping the overrides; this preparation does not establish crate publication.
 
 For this temporary checkout layout, run from the `tor-socks5` repository root:
 
@@ -138,13 +137,15 @@ cargo build --locked --release \
   --config 'patch.crates-io.ptrs-gesher-obfs4.path="../ptrs-gesher/crates/obfs4"' \
   --config 'patch.crates-io.ptrs-gesher-webtunnel.path="../ptrs-gesher/crates/webtunnel"' \
   --config 'patch.crates-io.ptrs-gesher-lyrebird.path="../ptrs-gesher/crates/lyrebird"' \
-  --config 'patch.crates-io.resocks5-net.path="../resocks5/crates/resocks5-net"'
+  --config 'patch.crates-io.ptrs-gesher-bridge-line.path="../ptrs-gesher/crates/bridge-line"'
 # binary: target/release/socks5-proxy   (invoked as `tor-socks5`)
 ```
 
 These are per-command source bindings, not permanent local paths in Cargo config.
-The runtime acceptance above used a debug CLI; it does not claim a separately
-executed release-profile acceptance run.
+The earlier runtime acceptance used a debug CLI with SDK 0.4.1 and the older
+ptrs source. It does not validate this dependency migration or establish a
+release-profile acceptance run. The new consumer tests have compiled, but have
+not yet executed; no fresh CLI runtime acceptance is claimed.
 
 ### Code structure rules (checked in CI)
 

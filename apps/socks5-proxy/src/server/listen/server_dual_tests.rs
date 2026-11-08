@@ -666,7 +666,7 @@ impl TorConnector for ParkedTorConnector {
         post: Option<&'a proxy_config::EndpointOverride>,
         host: &'a str,
         port: u16,
-    ) -> arti_wrapper::Result<arti_wrapper::DataStream> {
+    ) -> arti_wrapper::Result<arti_wrapper::RoutedStream> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.observed
             .take()

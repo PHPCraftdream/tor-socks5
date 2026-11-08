@@ -31,8 +31,21 @@ returns `Result<IncomingRequest, ServerError>` directly using SDK types.
 **disables anonymous access**; `None` enables anonymous access and disables
 passwords. `PasswordVerifier::verify(&self, username: &str, password: &str) -> bool`
 is an open, object-safe host port; keep concrete auth-store implementations in the
-hosts. The adapter moves SDK-owned credentials into an awaited `spawn_blocking`.
-Panic/join failure rejects authentication (with unwinding, not panic=abort).
+hosts. With SDK 0.5.1, a private per-handshake `SecretStore::check_password`
+adapter uses `AuthMethods::cleartext_only`: SOCKS5 selects RFC 1929 rather than
+method 0x80, and HTTP advertises Basic only. This preserves the existing host
+store without inventing secure lookup/claim support. Owned username/password
+values move into an awaited `spawn_blocking`; panic/join failure rejects
+authentication (with unwinding, not panic=abort).
+
+`accept_verified` retains the host's opaque admission proof in per-handshake
+state and checks that its identity matches the SDK's authenticated username.
+Cancellation cannot publish a late proof into another handshake.
+
+The outbound `client::connect` takes an owning `Send + Unpin + 'static` stream
+and returns SDK `AnyUpstream`. It delegates to `dial_chain_over`, with no TCP
+or DNS dial and no renewal of the caller's absolute deadline. Callers must use
+the returned tunnel, which retains any SDK-buffered bytes.
 
 ## Deadline and admission contract
 

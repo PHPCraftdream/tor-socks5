@@ -3,6 +3,7 @@
 //! exclusively owned by the SDK. This crate never resolves or dials a target.
 #![warn(missing_docs)]
 
+mod backend;
 /// SOCKS5 CONNECT-клиент для исходящих соединений.
 pub mod client;
 mod verified;
@@ -12,7 +13,7 @@ mod verified_tests;
 
 use std::sync::{Arc, OnceLock};
 
-use resocks5_net::server::{self, Credentials, IncomingRequest, ServerError, ServerOptions};
+use resocks5_net::server::{IncomingRequest, ServerError};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
@@ -77,11 +78,10 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let password = auth.is_some();
-    let options = ServerOptions::new(deadline, !password, password);
-    server::accept(
-        stream,
-        &options,
-        move |credentials: Credentials| async move {
+    backend::accept_checked(stream, deadline, password, move |username, password| {
+        let auth = auth.clone();
+        let slots = Arc::clone(&slots);
+        async move {
             let Some(verifier) = auth else {
                 return false;
             };
@@ -94,12 +94,12 @@ where
             // be aborted; its owned permit remains captured even while queued.
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                verifier.verify(credentials.username(), credentials.password())
+                verifier.verify(&username, &password)
             })
             .await
             .unwrap_or(false)
-        },
-    )
+        }
+    })
     .await
 }
 
@@ -465,19 +465,58 @@ mod tests {
         for configured in [true, false] {
             let verifier = recorder(true, false);
             let auth = configured.then(|| verifier.clone() as Arc<dyn PasswordVerifier>);
-            let (mut server, mut client) = duplex(1024);
+            let (server, mut client) = duplex(1024);
             let input: &[u8] = if configured {
                 b"CONNECT example.com:443 HTTP/1.1\r\n\r\n"
             } else {
                 b"CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic YWxpY2U6cHVibGlj\r\n\r\n"
             };
-            client.write_all(input).await.unwrap();
-            let result = accept(&mut server, Instant::now() + Duration::from_secs(30), auth).await;
-            drop(server);
-            let mut replies = Vec::new();
-            client.read_to_end(&mut replies).await.unwrap();
+            // Drive SDK challenge/retry rounds to refusal, never to a deadline.
+            let accepting = async move {
+                let mut server = server;
+                let result =
+                    accept(&mut server, Instant::now() + Duration::from_secs(30), auth).await;
+                drop(server);
+                result
+            };
+            let peer = async move {
+                let mut challenges = 0;
+                loop {
+                    challenges += 1;
+                    assert!(challenges <= 8, "bounded 407 challenge rounds");
+                    client.write_all(input).await.unwrap();
+                    let mut head = Vec::new();
+                    while !head.ends_with(b"\r\n\r\n") {
+                        assert!(head.len() < 1024, "bounded authentication challenge");
+                        head.push(client.read_u8().await.unwrap());
+                    }
+                    let head = String::from_utf8(head).unwrap();
+                    assert!(head.starts_with("HTTP/1.1 407 "));
+                    if !configured {
+                        assert_eq!(challenges, 1);
+                        assert!(head.contains("Connection: close"));
+                        assert!(!head.contains("Proxy-Authenticate"));
+                    }
+                    if head.contains("Connection: close") {
+                        break;
+                    }
+                    assert!(head.contains("Proxy-Authenticate: Basic"));
+                    assert!(!head.contains("Resocks5-Secure"));
+                }
+                assert!(!configured || challenges > 1);
+                let mut trailing = [0; 1];
+                assert_eq!(
+                    client.read(&mut trailing).await.unwrap(),
+                    0,
+                    "refusal must close the connection"
+                );
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(accepting, peer)
+            })
+            .await
+            .expect("terminal credential refusal must not hinge on any deadline");
             assert!(matches!(result, Err(ServerError::Authentication(_))));
-            assert!(replies.starts_with(b"HTTP/1.1 407 "));
             assert!(verifier.calls.lock().unwrap().is_empty());
         }
     }

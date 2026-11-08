@@ -129,7 +129,7 @@ pub(crate) async fn connect_tor_route(
     post: Option<&EndpointOverride>,
     host: &str,
     port: u16,
-) -> Result<arti_wrapper::DataStream, arti_wrapper::TorError> {
+) -> Result<arti_wrapper::RoutedStream, arti_wrapper::TorError> {
     let post_connect = async {
         let Some(EndpointOverride::Endpoint(endpoint)) = post else {
             return Err(arti_wrapper::TorError::PostSocks(
@@ -142,8 +142,9 @@ pub(crate) async fn connect_tor_route(
             endpoint.address().port(),
         );
         if let Some((username, password)) = endpoint.credentials() {
-            proxy.user = Some(username.to_owned());
-            proxy.password = Some(password.to_owned());
+            proxy = proxy.try_with_auth(username, password).map_err(|_| {
+                arti_wrapper::TorError::BuildConfig("invalid post credentials".to_owned())
+            })?;
         }
         arti_wrapper::connect_post_proxy(
             tor,
@@ -154,7 +155,12 @@ pub(crate) async fn connect_tor_route(
         )
         .await
     };
-    select_post_route(post.is_some(), tor.connect(host, port), post_connect).await
+    let direct_connect = async {
+        tor.connect(host, port)
+            .await
+            .map(arti_wrapper::RoutedStream::from)
+    };
+    select_post_route(post.is_some(), direct_connect, post_connect).await
 }
 
 /// `rustls` 0.23 requires picking a process-wide crypto provider explicitly.
