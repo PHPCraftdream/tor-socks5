@@ -955,7 +955,7 @@ class ReleaseWorkflowWiring(unittest.TestCase):
                 ("VENDOR_ROOT: ${{ runner.temp }}/cargo-vendor-${{ matrix.target }}",
                  "VENDOR_ROOT: wrong")):
             with self.subTest(env=old), self.assertRaises(AssertionError):
-                assert_source_wiring(build.replace(old, new, 1))
+                assert_source_wiring(build.replace(old, new))
         package_marker = "      - name: Package and verify source companion\n"
         with self.assertRaises(AssertionError):
             assert_source_wiring(build.replace(package_marker,
