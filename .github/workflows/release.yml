@@ -73,6 +73,9 @@ jobs:
       GH_REF_NAME: ${{ needs.validate.outputs.tag }}
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
       - uses: ./.github/actions/setup-local-sdk
 
       - uses: dtolnay/rust-toolchain@stable
@@ -125,6 +128,24 @@ jobs:
           $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
           "$hash *$archive" | Out-File -NoNewline -Encoding ascii "$archive.sha256"
 
+      - name: Vendor locked dependencies
+        shell: bash
+        env:
+          VENDOR_ROOT: ${{ runner.temp }}/cargo-vendor-${{ matrix.target }}
+        run: cargo vendor --locked --versioned-dirs "$VENDOR_ROOT"
+
+      - name: Package and verify source companion
+        shell: bash
+        env:
+          GH_REF_NAME: ${{ needs.validate.outputs.tag }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_TARGET: ${{ matrix.target }}
+          VENDOR_ROOT: ${{ runner.temp }}/cargo-vendor-${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          python .github/release/source_companion.py package --repo-root . --vendor-root "$VENDOR_ROOT" --artifacts-dir . --tag "$GH_REF_NAME" --commit "$SOURCE_COMMIT" --target "$SOURCE_TARGET"
+          python .github/release/source_companion.py verify --repo-root . --artifacts-dir . --tag "$GH_REF_NAME" --commit "$SOURCE_COMMIT" --target "$SOURCE_TARGET"
+
       - uses: actions/upload-artifact@v7
         with:
           name: tor-socks5-${{ matrix.target }}
@@ -133,6 +154,8 @@ jobs:
             tor-socks5-${{ needs.validate.outputs.tag }}-${{ matrix.target }}.tar.gz.sha256
             tor-socks5-${{ needs.validate.outputs.tag }}-${{ matrix.target }}.zip
             tor-socks5-${{ needs.validate.outputs.tag }}-${{ matrix.target }}.zip.sha256
+            tor-socks5-${{ needs.validate.outputs.tag }}-${{ matrix.target }}-source.tar.gz
+            tor-socks5-${{ needs.validate.outputs.tag }}-${{ matrix.target }}-source.tar.gz.sha256
           if-no-files-found: error
 
   release:
@@ -145,13 +168,19 @@ jobs:
       TAG: ${{ needs.validate.outputs.tag }}
       PRERELEASE: ${{ needs.validate.outputs.prerelease }}
       REMOTE_REPO: ${{ github.repository }}
+      SOURCE_COMMIT: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
 
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
+
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Publish (draft -> release)
         env:

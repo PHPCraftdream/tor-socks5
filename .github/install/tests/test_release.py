@@ -10,6 +10,7 @@ publish.sh) как дочерних процессов + узкая провер
 
 import json
 import os
+import shlex
 import shutil
 import stat
 import sys
@@ -18,6 +19,9 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import fixtures as fx
+sys.path.insert(0, os.path.join(fx.REPO_ROOT, ".github", "release"))
+import test_source_companion as source_tests
+import source_companion as companion
 
 REMOTE_REPO = "octo-cat/tor-socks5"
 TAG = "v1.2.3"
@@ -36,6 +40,9 @@ def expected_names(tag):
     for t in WIN_TARGETS:
         names += ["tor-socks5-%s-%s.zip" % (tag, t),
                   "tor-socks5-%s-%s.zip.sha256" % (tag, t)]
+    for t in UNIX_TARGETS + WIN_TARGETS:
+        names += ["tor-socks5-%s-%s-source.tar.gz" % (tag, t),
+                  "tor-socks5-%s-%s-source.tar.gz.sha256" % (tag, t)]
     return names
 
 
@@ -138,6 +145,8 @@ class PublisherTests(unittest.TestCase):
         bin_dir = self.area.subdir("bin")
         fx.write_executable(bin_dir, "gh", "\n" + fx._stub_source("gh_mock.py"))
         self.bin_dir = bin_dir
+        self.source_fixture = source_tests.SourceFixture(self)
+        self.source_fixture.install_cargo_stub(self.bin_dir)
 
     # --- helpers -------------------------------------------------------
 
@@ -154,9 +163,10 @@ class PublisherTests(unittest.TestCase):
         return path
 
     def make_artifacts(self, tag, content_prefix=b"archive-marker"):
-        """Ровно 14 файлов (7 архивов + 7 checksums); точный комплект без двойных checksum."""
+        """Build seven marker archives, checksums, and complete source companions."""
         d = self.area.subdir("artifacts")
-        archives = [n for n in expected_names(tag) if not n.endswith(".sha256")]
+        archives = [n for n in expected_names(tag) if not n.endswith(".sha256")
+                    and "-source.tar.gz" not in n]
         self.assertEqual(len(archives), 7)
         for name in archives:
             data = content_prefix + b":" + name.encode("ascii") + b"\n"
@@ -167,7 +177,10 @@ class PublisherTests(unittest.TestCase):
             sep, eol = (" *", "") if name.endswith(".zip") else ("  ", "\n")
             with open(p + ".sha256", "wb") as f:
                 f.write(fx.checksum_text(h, name, sep=sep, eol=eol).encode("ascii"))
-        # точный комплект: никакие .sha256.sha256 / лишние имена не плодятся
+        for target in UNIX_TARGETS + WIN_TARGETS:
+            companion.create_companion(d, tag, self.source_fixture.commit, target,
+                                       self.source_fixture.project,
+                                       self.source_fixture.vendor_root)
         self.assertEqual(sorted(os.listdir(d)), sorted(expected_names(tag)))
         return d
 
@@ -183,10 +196,12 @@ class PublisherTests(unittest.TestCase):
                                                              "artifacts")
         env["REMOTE_REPO"] = REMOTE_REPO
         env["GH_TOKEN"] = "dummy-token-for-offline-tests"
+        env["SOURCE_COMMIT"] = self.source_fixture.commit
         log_path = os.path.join(self.area.path, "gh-log.jsonl")
         if os.path.exists(log_path):
             os.remove(log_path)  # каждый запуск пишет свежий журнал
-        return fx.run_cmd(["bash", fx.PUBLISH_SH], env=env, cwd=fx.REPO_ROOT)
+        return fx.run_cmd(["bash", fx.PUBLISH_SH], env=env,
+                          cwd=self.source_fixture.repo_root)
 
     def assets_of(self, state, tag=TAG):
         for r in state["releases"]:
@@ -208,10 +223,14 @@ class PublisherTests(unittest.TestCase):
         self.assertFalse(rel["draft"])
         names = sorted(a["name"] for a in rel["assets"])
         self.assertEqual(names, sorted(expected_names(TAG)))
-        for a in rel["assets"]:
-            self.assertEqual(a["state"], "uploaded")
-            self.assertEqual(a["size"],
-                             os.path.getsize(os.path.join(d, a["name"])))
+        for target in UNIX_TARGETS + WIN_TARGETS:
+            _, source_name = companion.names(TAG, target)
+            members = source_tests._bundle_members(os.path.join(d, source_name))
+            self.assertEqual(members["project.tar"], self.source_fixture.project)
+        for asset in rel["assets"]:
+            self.assertEqual(asset["state"], "uploaded")
+            self.assertEqual(asset["size"],
+                             os.path.getsize(os.path.join(d, asset["name"])))
         # PATCH: типизированные поля, make_latest — STRING 'legacy'
         self.assertEqual(state["patch_body"],
                          {"draft": False, "prerelease": False,
@@ -225,18 +244,18 @@ class PublisherTests(unittest.TestCase):
         self.assertFalse(any("-target-" in n for n in names))
         muts = mutations(read_log(
             os.path.join(self.area.path, "gh-log.jsonl")))
-        # 1 create + 14 uploads + 1 PATCH; GET/readback — read-only
-        self.assertEqual(len(muts), 16)
+        # 1 create + 28 uploads + 1 PATCH; GET/readback — read-only
+        self.assertEqual(len(muts), 30)
         create = muts[0]["argv"]
         self.assertIn("--draft", create)
         self.assertIn("--verify-tag", create)
         # ФАКТИЧЕСКАЯ последовательность вызовов: read-list → create →
-        # GET by tag → fresh GET → 14 uploads → GET verify → PATCH →
+        # GET by tag → fresh GET → 28 uploads → GET verify → PATCH →
         # GET readback
         self.assertEqual(call_kinds(read_log(
             os.path.join(self.area.path, "gh-log.jsonl"))),
             ["list", "create", "get-by-tag", "get-by-id"]
-            + ["upload"] * 14 + ["get-by-id", "patch", "get-by-id"])
+            + ["upload"] * 28 + ["get-by-id", "patch", "get-by-id"])
 
     def test_draft_resume(self):
         d = self.make_artifacts(TAG)
@@ -250,16 +269,42 @@ class PublisherTests(unittest.TestCase):
         state = read_state(sp)
         rel = self.assets_of(state)
         self.assertFalse(rel["draft"])
-        self.assertEqual(len(rel["assets"]), 14)
+        self.assertEqual(len(rel["assets"]), 28)
         log = read_log(os.path.join(self.area.path, "gh-log.jsonl"))
         muts = mutations(log)
         self.assertNotIn("create", muts[0]["argv"])
         # resume: без create, остальные фазы в том же порядке
         self.assertEqual(call_kinds(log),
                          ["list", "get-by-tag", "get-by-id"]
-                         + ["upload"] * 14 + ["get-by-id", "patch", "get-by-id"])
+                         + ["upload"] * 28 + ["get-by-id", "patch", "get-by-id"])
         # успешный stable PATCH сдвинул legacy latest на наш тег
         self.assertEqual(read_state(sp)["latest_tag"], TAG)
+
+    def test_missing_source_companion_zero_gh_calls(self):
+        artifacts = self.make_artifacts(TAG)
+        source_name = companion.names(TAG, companion.TARGETS[0])[1]
+        os.remove(os.path.join(artifacts, source_name))
+        state_path = self.gh_state()
+        result = self.run_publish(state_path, artifacts_dir=artifacts)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(read_log(os.path.join(self.area.path, "gh-log.jsonl")), [])
+
+    def test_remote_missing_companion_fails_without_patch(self):
+        artifacts = self.make_artifacts(TAG)
+        assets = [{"name": name,
+                   "size": os.path.getsize(os.path.join(artifacts, name)),
+                   "state": "uploaded"}
+                  for name in expected_names(TAG)
+                  if name != companion.names(TAG, companion.TARGETS[0])[1]]
+        state_path = self.gh_state(releases=[{"id": 7, "tag_name": TAG,
+                                              "draft": False, "prerelease": False,
+                                              "assets": assets}])
+        result = self.run_publish(state_path, artifacts_dir=artifacts)
+        self.assertNotEqual(result.returncode, 0)
+        log = read_log(os.path.join(self.area.path, "gh-log.jsonl"))
+        self.assertFalse(any("upload" in record["argv"] for record in log))
+        self.assertFalse(any("--method" in record["argv"] for record in log))
+        self.assertEqual(mutations(log), [])
 
     def test_published_noop_zero_mutations(self):
         d = self.make_artifacts(TAG)
@@ -576,11 +621,10 @@ class PublisherTests(unittest.TestCase):
                 self.assertNotEqual(p.returncode, 0)
                 self.assertNotIn("Готово", p.stdout.decode())
                 log = read_log(os.path.join(self.area.path, "gh-log.jsonl"))
-                # resume-путь draft-релиза: точная последовательность с 14
-                # uploads, PATCH и финальным readback GET
+                # The exact call sequence includes 28 uploads, PATCH, and final readback.
                 self.assertEqual(call_kinds(log),
                                  ["list", "get-by-tag", "get-by-id"]
-                                 + ["upload"] * 14
+                                 + ["upload"] * 28
                                  + ["get-by-id", "patch", "get-by-id"])
                 state = read_state(sp)
                 self.assertTrue(state["patched"])
@@ -618,7 +662,7 @@ class PublisherTests(unittest.TestCase):
         log = read_log(os.path.join(self.area.path, "gh-log.jsonl"))
         self.assertEqual(call_kinds(log),
                          ["list", "get-by-tag", "get-by-id"]
-                         + ["upload"] * 14 + ["get-by-id", "patch", "get-by-id"])
+                         + ["upload"] * 28 + ["get-by-id", "patch", "get-by-id"])
         self.assertNotIn("Готово", p.stdout.decode())
         state = read_state(sp)
         self.assertTrue(state["patched"])
@@ -819,6 +863,118 @@ class ReleaseWorkflowWiring(unittest.TestCase):
                 ("aarch64-unknown-linux-gnu", ("ubuntu-24.04-arm", False))):
             self.assertEqual(rows[target], expected)
 
+    def test_source_companion_build_and_upload_bindings(self):
+        build = self.jobs["build"]
+
+        def assert_source_wiring(text):
+            steps = text.split("      - ")
+            vendor = [s for s in steps if "name: Vendor locked dependencies" in s]
+            package = [s for s in steps
+                       if "name: Package and verify source companion" in s]
+            upload = [s for s in steps if "actions/upload-artifact@v7" in s]
+            if not (len(vendor) == len(package) == len(upload) == 1):
+                raise AssertionError("expected one vendor, package, and upload step")
+            vendor, package, upload = vendor[0], package[0], upload[0]
+            if not (text.index("name: Vendor locked dependencies") <
+                    text.index("name: Package and verify source companion") <
+                    text.index("actions/upload-artifact@v7")):
+                raise AssertionError("source vendor/package/upload steps are out of order")
+            def code(step):
+                return [line.split("#", 1)[0].strip()
+                        for line in step.splitlines()]
+            def run_commands(step):
+                block = step.split("run:", 1)[1].strip().splitlines()
+                if block[0] == "|":
+                    block = block[1:]
+                return [shlex.split(line.split("#", 1)[0].strip())
+                        for line in block if line.split("#", 1)[0].strip()]
+            if "if: false" in code(package):
+                raise AssertionError("source packaging step is disabled")
+            for binding in ("SOURCE_COMMIT: ${{ github.sha }}",
+                            "SOURCE_TARGET: ${{ matrix.target }}",
+                            "GH_REF_NAME: ${{ needs.validate.outputs.tag }}",
+                            "VENDOR_ROOT: ${{ runner.temp }}/cargo-vendor-${{ matrix.target }}"):
+                if binding not in code(package):
+                    raise AssertionError("missing package-step binding: " + binding)
+            if "VENDOR_ROOT: ${{ runner.temp }}/cargo-vendor-${{ matrix.target }}" not in code(vendor):
+                raise AssertionError("vendor directory must be target-scoped under runner.temp")
+            if run_commands(vendor) != [["cargo", "vendor", "--locked", "--versioned-dirs", "$VENDOR_ROOT"]]:
+                raise AssertionError("vendor step must use locked versioned directories")
+            commands = [a for a in run_commands(package) if a != ["set", "-euo", "pipefail"]]
+            expected = {
+                "package": ["--repo-root", ".", "--vendor-root", "$VENDOR_ROOT",
+                            "--artifacts-dir", ".", "--tag", "$GH_REF_NAME",
+                            "--commit", "$SOURCE_COMMIT", "--target", "$SOURCE_TARGET"],
+                "verify": ["--repo-root", ".", "--artifacts-dir", ".",
+                           "--tag", "$GH_REF_NAME", "--commit", "$SOURCE_COMMIT",
+                           "--target", "$SOURCE_TARGET"],
+            }
+            if (len(commands) != 2 or [a[:3] for a in commands] !=
+                    [["python", ".github/release/source_companion.py", "package"],
+                     ["python", ".github/release/source_companion.py", "verify"]]):
+                raise AssertionError("package and verify commands must both run in order")
+            for args, operation in zip(commands, ("package", "verify")):
+                if args[3:] != expected[operation]:
+                    raise AssertionError(operation + " CLI argument bindings differ")
+            source_entries = [line.strip() for line in upload.splitlines()
+                              if "-source.tar.gz" in line]
+            wanted = ["tor-socks5-${{ needs.validate.outputs.tag }}-${{ matrix.target }}-source.tar.gz",
+                      "tor-socks5-${{ needs.validate.outputs.tag }}-${{ matrix.target }}-source.tar.gz.sha256"]
+            if source_entries != wanted:
+                raise AssertionError("upload must include exactly archive and checksum")
+
+        assert_source_wiring(build)
+        for operation, options in (
+                ("package", ("--repo-root", "--vendor-root", "--artifacts-dir",
+                             "--tag", "--commit", "--target")),
+                ("verify", ("--repo-root", "--artifacts-dir", "--tag",
+                            "--commit", "--target"))):
+            for option in options:
+                with self.subTest(operation=operation, missing=option):
+                    line = next(x for x in build.splitlines()
+                                if "source_companion.py " + operation in x)
+                    args = shlex.split(line)
+                    index = args.index(option)
+                    del args[index:index + 2]
+                    broken = build.replace(line, "          " + shlex.join(args), 1)
+                    with self.assertRaises(AssertionError):
+                        assert_source_wiring(broken)
+        for old, new in (
+                ("--repo-root .", "--repo-root wrong"),
+                ("--artifacts-dir .", "--artifacts-dir wrong"),
+                ('--vendor-root "$VENDOR_ROOT"', '--vendor-root wrong'),
+                ('--tag "$GH_REF_NAME"', '--tag wrong'),
+                ('--commit "$SOURCE_COMMIT"', '--commit wrong'),
+                ('--target "$SOURCE_TARGET"', '--target wrong')):
+            with self.subTest(binding=old), self.assertRaises(AssertionError):
+                assert_source_wiring(build.replace(old, new, 1))
+        for old, new in (
+                ("SOURCE_COMMIT: ${{ github.sha }}", "SOURCE_COMMIT: wrong"),
+                ("SOURCE_TARGET: ${{ matrix.target }}", "SOURCE_TARGET: wrong"),
+                ("GH_REF_NAME: ${{ needs.validate.outputs.tag }}", "GH_REF_NAME: wrong"),
+                ("VENDOR_ROOT: ${{ runner.temp }}/cargo-vendor-${{ matrix.target }}",
+                 "VENDOR_ROOT: wrong")):
+            with self.subTest(env=old), self.assertRaises(AssertionError):
+                assert_source_wiring(build.replace(old, new))
+        package_marker = "      - name: Package and verify source companion\n"
+        with self.assertRaises(AssertionError):
+            assert_source_wiring(build.replace(package_marker,
+                                               package_marker + "        if: false\n", 1))
+        command_line = next(x for x in build.splitlines()
+                           if "source_companion.py package" in x)
+        with self.assertRaises(AssertionError):
+            assert_source_wiring(build.replace(command_line, "          # " +
+                                               command_line.lstrip(), 1))
+        checksum_line = ("            tor-socks5-${{ needs.validate.outputs.tag }}-"
+                         "${{ matrix.target }}-source.tar.gz.sha256\n")
+        with self.assertRaises(AssertionError):
+            assert_source_wiring(build.replace(checksum_line, "", 1))
+
+        release = self.jobs["release"]
+        self.assertIn("SOURCE_COMMIT: ${{ github.sha }}", release)
+        self.assertLess(release.index("dtolnay/rust-toolchain@stable"),
+                        release.index("name: Publish (draft -> release)"))
+
     def test_tag_only_trigger_and_targets_present(self):
         on_block = self._top_block("on")
         self.assertIn("tags:", on_block)
@@ -833,6 +989,9 @@ class ReleaseWorkflowWiring(unittest.TestCase):
                  if c.startswith("target:")}
         self.assertEqual(found, set(UNIX_TARGETS) | set(WIN_TARGETS))
 
+
+class SourceCompanionTests(source_tests.SourceCompanionTests):
+    """Include source-material coverage in the release test suite."""
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -8,35 +8,30 @@
 #   TAG           — имя тега (vX.Y.Z или vX.Y.Z-prerelease); повторно валидируется
 #                   через .github/release/validate-tag.sh, класс сверяется с PRERELEASE;
 #   PRERELEASE    — true|false (из validate-tag.sh);
-#   ARTIFACTS_DIR — каталог РОВНО с 8 файлами (4 архива + 4 .sha256); каждая запись
-#                   каталога (включая hidden/dangling symlinks/подкаталоги) обязана
-#                   быть одним из 8 ожидаемых имён: regular, non-empty, НЕ symlink;
-#   GH_TOKEN      — токен GitHub (задаёт workflow; никогда не печатается);
-#   REMOTE_REPO   — "owner/name" (в workflow = github.repository); не печатается.
+#   ARTIFACTS_DIR — directory containing exactly 28 files: 7 archives, 7 source companions,
+#                   and 14 checksum files; all entries are non-empty regular files, not symlinks;
+#   GH_TOKEN      — GitHub token (set by workflow; never printed);
+#   SOURCE_COMMIT — full checkout object ID bound to the source companions;
+#   REMOTE_REPO   — "owner/name" (github.repository in workflow); never printed.
 # Выход: exit 0 — успех; exit 1 — ошибка любого шага. Прогресс — в stdout/stderr.
-# Шаг 0 (без сети): TAG через validate-tag.sh; prerelease= из вывода должен
-#   совпасть с PRERELEASE, иначе fail.
-# Шаг 1 (без сети): строгий local entry check + побайтная сверка .sha256:
-#   пересчёт sha256 архивов (статус sha256sum проверяется отдельно, не в pipeline),
-#   затем cmp <(printf '<hash>  <имя>\n') для tar.gz и <(printf '<hash> *<имя>')
-#   без LF для zip. Bad hex/CRLF/вторая строка/hash mismatch — fail БЕЗ gh-вызовов.
-# Шаг 2 (read-only gh): `gh api --paginate --slurp "repos/$REMOTE_REPO/releases"`
-#   + jq поиск exact tag => absent | draft | published. Сбой API/сети — явная
-#   ошибка (НЕ 'absent'). Пустой список — честный 'absent'.
-# Шаг 3 (мутации): published c полным комплектом (ровно один asset на имя,
-#   size>0, state=uploaded) и совпадающим классом — no-op, exit 0 БЕЗ строки
-#   «Готово: ... опубликован»; published с несоответствием — fail без мутаций;
-#   draft/absent — ПЕРЕД upload отдельный GET releases/$id с typed-проверками
-#   (id/tag/draft==true/prerelease — boolean) => fail без загрузки при любом
-#   несоответствии; затем upload --clobber своих 8 файлов + повторная
-#   state-проверка + check_assets + сверка размеров ВСЕХ 8 файлов (числа
-#   байтов, manifest локальных размеров считается до первого gh-вызова)
-#   + PATCH {"draft":false,...,"make_latest":...} + readback с typed-
-#   предикатами (id/tag/draft==false/prerelease==JSON boolean) + ассеты и
-#   размеры. Extra user-ассеты на remote no-op не мешают. Размеры при
-#   published НЕ сравниваются с локальными (недетерминизм rebuild'а).
-#   ID релиза валидируется как число ДО URL-мутаций; несколько релизов с тем
-#   же тегом (length>1) — fail.
+# Step 0 (offline): validate TAG with validate-tag.sh; prerelease= from its output
+# must match PRERELEASE or fail.
+# Step 1 (local): strict artifact entry checks and byte-for-byte .sha256 comparison:
+# recalculate archive sha256 (check sha256sum status separately, not in a pipeline),
+# then cmp <(printf '<hash>  <name>\n') for tar.gz and <(printf '<hash> *<name>')
+# without LF for zip. Bad hex/CRLF/second line/hash mismatch fails WITHOUT gh calls.
+# Source verification regenerates Cargo vendor data and may access the registry.
+# Step 2 (read-only gh): query "repos/$REMOTE_REPO/releases" with gh api and
+# jq for the exact tag => absent | draft | published. API/network failure is
+# explicit, never 'absent'. An empty list is honestly 'absent'.
+# Step 3 (mutations): a complete published release (one asset per name, size>0,
+# state=uploaded) of the matching class is a no-op, exit 0 without a success
+# message; any mismatch fails without mutations. Draft/absent requires a fresh
+# typed GET before upload, then uploads all 28 files, validates state/assets/sizes,
+# PATCHes publication, and validates typed readback/assets/sizes. The local size
+# manifest is calculated before the first gh call; published sizes are not
+# compared with local rebuilds. Validate release ID before URL mutations and fail
+# on duplicate matching releases.
 
 set -euo pipefail
 
@@ -55,11 +50,11 @@ vt_out="$(bash "$script_dir/validate-tag.sh" "$TAG")" || fail "тег '$TAG' н�
 vt_pre="$(printf '%s\n' "$vt_out" | sed -n 's/^prerelease=//p')"
 [ "$vt_pre" = "$PRERELEASE" ] || fail "класс тега (validate-tag.sh: prerelease=$vt_pre) не совпадает с PRERELEASE=$PRERELEASE"
 
-# === Ожидаемые assets: 6 Linux targets + 2 Apple targets + 1 Windows target ===
+# === Expected assets: 4 Linux targets + 2 Apple targets + 1 Windows target ===
 UNIX_TARGETS="x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-gnu aarch64-unknown-linux-musl x86_64-apple-darwin aarch64-apple-darwin"
 WIN_TARGETS="x86_64-pc-windows-msvc"
 
-# === Шаг 1: строгая локальная проверка комплекта (без сети) ===
+# === Step 1: strict local artifact validation (before release operations) ===
 
 shopt -s dotglob nullglob
 
@@ -69,6 +64,9 @@ for t in $UNIX_TARGETS; do
 done
 for t in $WIN_TARGETS; do
   expected_files="$expected_files tor-socks5-$TAG-$t.zip tor-socks5-$TAG-$t.zip.sha256"
+done
+for t in $UNIX_TARGETS $WIN_TARGETS; do
+  expected_files="$expected_files tor-socks5-$TAG-$t-source.tar.gz tor-socks5-$TAG-$t-source.tar.gz.sha256"
 done
 
 in_expected() { # имя файла входит в список ожидаемых
@@ -89,8 +87,8 @@ for f in $expected_files; do
   [ -s "$p" ] || fail "файл пуст: $f"
 done
 
-# Каждая запись каталога (dotglob: включая hidden, dangling symlinks, подкаталоги)
-# обязана быть одним из 14 ожидаемых имён. Лишнее не удаляем — только fail.
+# Every directory entry (dotglob: including hidden files, dangling symlinks, directories)
+# must be one of the 28 expected names. Do not remove extras — fail instead.
 actual_count=0
 for p in "$ARTIFACTS_DIR"/*; do
   actual_count=$((actual_count + 1))
@@ -133,9 +131,16 @@ for f in $expected_files; do
   esac
 done
 echo "Шаг 1: комплект из $expected_count файлов и контрольные суммы в порядке."
+# === Local file checks and Cargo source verification (before gh release operations) ===
+# Source companion verification independently regenerates Cargo vendor data;
+# Cargo may access the registry before any gh release operation.
+python3 "$script_dir/source_companion.py" verify \
+  --repo-root "$PWD" --artifacts-dir "$ARTIFACTS_DIR" --tag "$TAG" \
+  --commit "${SOURCE_COMMIT:-}" \
+  || fail "source companions are missing, incomplete, or not bound to this release checkout"
 
-# Заранее (до ПЕРВОГО gh-вызова) строим manifest размеров ВСЕХ 14 локальных
-# файлов, включая .sha256 — чтобы сетевые шаги не зависели от локального stat.
+# Before the FIRST gh call, build a size manifest for ALL 28 local files,
+# including .sha256, so network steps do not depend on local stat.
 sizes_json='{}'
 for f in $expected_files; do
   p="$ARTIFACTS_DIR/$f"
@@ -145,11 +150,11 @@ done
 
 shopt -u dotglob nullglob
 
-# Имена ассетов для jq — построчно; для 7-target manifest legacy-комплект
-# намеренно не принимается по cardinality: его нельзя отличить от partial upload.
+# Asset names for jq, one per line; the complete set includes binaries,
+# source companions, and all checksum files.
 names_json="$(printf '%s\n' $expected_files | jq -Rn '[inputs]')"
 
-# === Шаг 2: read-only — состояние релиза на remote (только через gh) ===
+# === Step 2: read-only — remote release state (through gh only) ===
 
 releases_json="$(gh api --paginate --slurp "repos/$REMOTE_REPO/releases?per_page=100")" \
   || fail "не удалось получить список релизов (gh api); сеть/API недоступна — повторите запуск"
@@ -184,9 +189,9 @@ case "$state" in
 esac
 
 # === Общая проверка ассетов по ответу API ===
-# Для КАЖДОГО из 14 ожидаемых имён: ровно один asset, .size — число > 0,
-# .state == "uploaded". Аргумент: JSON объекта release (stdin).
-# Вывод: список «плохих» имён (пустая строка = всё в порядке).
+# For EACH of the 28 expected names: exactly one asset, .size is a number > 0,
+# and .state == "uploaded". Argument: report (JSON release, stdin).
+# Output: list of "bad" names (empty string means everything is valid).
 check_assets() {
   local report="$1"
   printf '%s' "$report" | jq -r --argjson names "$names_json" '
@@ -203,11 +208,11 @@ check_assets() {
   ' || fail "не удалось проверить ассеты (jq)"
 }
 
-# Для DRAFT после upload: размеры каждого asset из API должны совпасть с
-# размерами локальных файлов (сравнение чисел байтов/размеров; для published
-# не используется — rebuild недетерминирован).
-# Аргументы: report (JSON release, stdin) и sizes_json (готовый manifest
-# размеров всех 14 файлов, включая .sha256).
+# For a DRAFT after upload, each asset's API size must match the local file
+# size in bytes (not used for published releases because rebuilds are
+# nondeterministic).
+# Arguments: report (JSON release, stdin) and sizes_json (manifest of all 28
+# files, including .sha256).
 check_asset_sizes() {
   local report="$1" sizes_json="$2"
   printf '%s' "$report" | jq -r --argjson sizes "$sizes_json" '
@@ -219,7 +224,7 @@ check_asset_sizes() {
   ' || fail "не удалось сверить размеры ассетов (jq)"
 }
 
-# === Шаг 3: draft-ветка — загрузка своих 14 ассетов и публикация ===
+# === Step 3: draft branch — upload the 28 assets and publish ===
 
 # Узкая проверка state релиза перед мутацией/после неё (НЕ атомарная защита
 # от любых внешних гонок). Аргументы: report (stdin) и ожидаемый числовой id.
@@ -277,7 +282,7 @@ upload_and_publish() {
   printf '%s' "$body" | gh api --method PATCH "repos/$REMOTE_REPO/releases/$release_id" --input - \
     || fail "PATCH публикации не удался; НЕ утверждаем, что релиз остался draft — сервер мог применить изменение до сбоя сети; безопасный повторный запуск распознает published и сделает no-op"
 
-  # Readback: сервер обязан подтвердить draft=false, класс и все 14 ассетов.
+  # Readback: the server must confirm draft=false, class, and all 28 assets.
   report="$(gh api "repos/$REMOTE_REPO/releases/$release_id")" \
     || fail "не удалось перечитать релиз после PATCH"
   # Typed-сравнение через jq (не shell-текст): id/tag/draft=false/prerelease.
@@ -293,7 +298,8 @@ case "$state" in
     info="$(printf '%s' "$releases_json" | jq -c --arg tag "$TAG" '
       (if (type == "array") and ((.[0]? // null | type) == "array") then flatten else . end)
       | map(select(.tag_name == $tag))[0]')"
-    # Для совпадающих 7-target manifest требуется полный новый комплект.
+    # For a 7-target manifest, require the complete set of binaries,
+    # source companions, and checksums.
     # Старые 4-target релизы неотличимы от частичной загрузки нового комплекта;
     # безопаснее отказать, чем принимать их по числу или составу ассетов.
     bad="$(check_assets "$info")"
@@ -310,7 +316,7 @@ case "$state" in
     # создавать релиз по несуществующему тегу. Тег сами НЕ создаём.
     gh release create "$TAG" --draft --verify-tag --repo "$REMOTE_REPO" \
       --title "tor-socks5 $TAG" \
-      --notes "Сборка tor-socks5 $TAG" \
+      --notes "tor-socks5 $TAG. Source and license/notice material: matching <target>-source.tar.gz companion; see .github/release/README.md in project.tar." \
       || fail "не удалось создать draft release (существует ли тег $TAG на remote?)"
     release_id="$(gh api "repos/$REMOTE_REPO/releases/tags/$TAG" | jq -r '.id')" \
       || fail "не удалось получить ID созданного релиза"
