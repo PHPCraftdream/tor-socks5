@@ -367,6 +367,28 @@ jobs:
       - name: validate-tag.sh + publish.sh offline suite (gh stub, real jq/sha256sum/stat)
         run: python3 -I .github/install/tests/test_release.py
         shell: bash
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Source companion with real locked Cargo vendor
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo="$PWD"
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          export CARGO_HOME="$tmp/cargo-home"
+          mkdir -p "$CARGO_HOME" "$tmp/artifacts"
+          cargo vendor --locked --versioned-dirs "$tmp/package-vendor"
+          commit="$(git rev-parse HEAD)"
+          target="x86_64-unknown-linux-gnu"
+          printf 'non-executable verification marker\n' > \
+            "$tmp/artifacts/tor-socks5-v1.2.3-$target.tar.gz"
+          python3 -I .github/release/source_companion.py package \
+            --repo-root "$repo" --artifacts-dir "$tmp/artifacts" \
+            --tag v1.2.3 --commit "$commit" --target "$target" \
+            --vendor-root "$tmp/package-vendor"
+          python3 -I .github/release/source_companion.py verify \
+            --repo-root "$repo" --artifacts-dir "$tmp/artifacts" \
+            --tag v1.2.3 --commit "$commit" --target "$target"
 
   native-portability:
     needs: plan
