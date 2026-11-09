@@ -36,8 +36,8 @@ otherwise                                ->  run the SOCKS5 proxy
 ```
 
 `arti` is pointed at `current_exe()` as the PT binary, so the child is
-always our own executable. The bundled Rust `lyrebird` (from the
-published `ptrs-gesher-lyrebird` crate) provides **both** the `obfs4`
+always our own executable. The bundled Rust `lyrebird`
+(`ptrs-gesher-lyrebird`) provides **both** the `obfs4`
 and `webtunnel` client transports behind one entrypoint — no separate
 webtunnel binary, no extra build step.
 
@@ -82,15 +82,42 @@ lines: [
 ]
 ```
 
+## Pre/post proxy wrapping
+
+For a configured CLI pre route, SOCKS5 or plain HTTP CONNECT supplies the carrier
+stream to the bridge URL's host and port. The existing WebTunnel TLS verification
+and HTTP upgrade run over that stream unchanged; the proxy does not replace
+WebTunnel or turn it into a plain relay. Bridge URL hostnames are handed to the
+pre proxy without a local lookup. A configured pre proxy failure does not trigger
+a direct dial or a different proxy protocol.
+
+The bundled PT's loopback parent listener accepts both SOCKS5 and HTTP CONNECT,
+but PT control announcements remain `socks5` for Tor/Arti compatibility. Credential
+fields on that local PT protocol carry bridge transport arguments, not application
+user accounts. Replies report success only after the transport handshake, and
+pipelined payload is forwarded before unread parent bytes.
+
+Post proxy negotiation happens inside a Tor-opened application stream, after
+WebTunnel and Tor are established. Pre/post may use different proxy protocols.
+See [CLI account routing](auth.md#cli-prepost-routing) for inheritance and explicit
+`none`, and [build prerequisites](../../README.md#build) for dependency details.
+The ptrs-gesher registry transition does not enable pre/post routing in Android.
+
 ## Startup and bootstrap
 
-At startup every configured bridge — obfs4 and webtunnel together — is
+Without an effective pre route, every configured bridge — obfs4 and webtunnel together — is
 **probed for reachability** in parallel (for webtunnel, the probe
 resolves and dials the `url=` host). Dead ones are skipped; the
 reachable ones are ordered (stability first, ping second) and handed
 to arti. arti launches the managed PT and builds a circuit through the
 first usable guard. See `docs/guide/bridges.md` for the full probe/order/
 health lifecycle — it is identical for both transports.
+
+With pre routing, direct startup probes are not used: usable bridges must be
+explicitly configured. Seed bridges, bridge discovery/downloads and the warm pool
+are unsupported in this restricted mode. Global pre maintenance uses the same
+proxy identity; alternative account owners have no automatic maintenance/recovery
+loop. See the [global pre restrictions](../../README.md#global-pre_socks5-routing).
 
 > arti's own state/cache is pinned to an app-local directory
 > (`<config-dir>/arti-data/{state,cache}`) via `arti-wrapper`'s

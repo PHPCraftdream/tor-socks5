@@ -48,24 +48,96 @@ egress through an upstream SOCKS5 proxy instead of Tor, and install itself as an
 - **Install as a service** — systemd, OpenRC, launchd, Windows SCM, BSD `rc.d`.
 - **Non-blocking logging** to stderr / stdout / file, configurable level and per-target filters.
 
+## Pre/post proxy protocols
+
+Pre and post independently accept SOCKS5 or plain HTTP CONNECT. The legacy
+`pre_socks5` / `post_socks5` field names remain valid globally and per account.
+No scheme means SOCKS5; `socks5://` makes it explicit and `http://` selects
+HTTP CONNECT. The scalar format remains `IP:port|username:password`, with the
+credentials suffix optional. Existing credential length/delimiter rules apply.
+
+```text
+pre_socks5: http://192.0.2.10:8080|username:password
+post_socks5: socks5://192.0.2.11:1080
+```
+
+The addresses above are documentation-only. An absent account field inherits
+its global setting; `none` explicitly disables that field. Protocol, endpoint
+and credentials participate in pre-owner identity. Errors never negotiate a
+different proxy protocol or fall back to a direct route. HTTPS-to-proxy is not
+part of this interface. All inbound proxy listeners use dual SOCKS5/HTTP CONNECT
+framing; ordinary HTTP forwarding is not supported. See the
+[CLI account-routing guide](docs/guide/auth.md#cli-prepost-routing) for examples
+and the distinction between proxy credentials and listener account passwords.
+
+The local Windows candidate has completed real HTTPS request/response checks for
+all four pre/post protocol combinations, four configured-proxy failure controls,
+and two overlapping authenticated account routes with distinct PT owners.
+Normal Ctrl+Break shutdown of the CLI and its active PT children was also checked.
+This is not an all-platform runtime claim or packet-capture evidence. Main/release
+delivery and fresh CI for publicly reproducible dependencies remain separate.
+
+## Global `pre_socks5` routing
+
+Global `pre_socks5` uses explicitly configured plain bridges or the bundled
+obfs4/WebTunnel transport. For PT bridges, the pre proxy supplies the carrier
+before the existing transport handshake and TLS. External `TOR_PT_BINARY`
+overrides are rejected in this mode. Whole-route application acceptance remains
+separate from compilation and the PT contract tests.
+
+Periodic maintenance checks channels through the same proxy protocol, endpoint and credentials.
+Arti may reuse an existing channel, so this is not always a fresh reachability
+check. A failed or incompatible configuration reload preserves the active route;
+changing the proxy protocol, endpoint or credentials requires a restart.
+
+When its conditions are met, the watchdog requests closure of the existing
+client's open channels without cancelling pending connections. Later requests
+may create channels again through the same pre proxy. This does not replace the
+client or guarantee network recovery. Model tests establish operation ordering,
+not a real client's route. The separate CI contract includes local real-Tor
+channel checks and negative mutations of channel termination and
+reconfiguration; channel checks alone do not establish a complete
+client → pre → Tor → post → target application exchange. The fixture uses the
+Tor 0.4.9.15 source archive with a pinned SHA-256. Its archive signature was not
+verified, so provenance is limited to the source and the recorded checksum.
+
+Direct TCP probes, bridge discovery/downloads, seed bridges, untrusted PT binaries,
+the warm pool and the separate circuit verifier are unsupported in this mode. Each maintenance
+pass considers the first 30 bridges, at most eight concurrently, with up to
+15 seconds per channel; the watchdog considers the first eight active bridges.
+Pre-route observations do not update the bridge-health store.
+
+The DNS listener and onion services are incompatible with global pre routing.
+Soft failover is disabled because aggregate statistics do not prove route
+ownership. Alternative account owners are not maintained by the global loop;
+automatic recovery for those owners is not implemented here.
+
 ## Build
 
-Requires a recent stable Rust toolchain (edition 2021).
+Requires Rust 1.92 or newer (edition 2021 for first-party crates).
 
-The workspace needs `resocks5-net` 0.3 (the inbound server API) and takes it from
-the local SDK at `../resocks5/crates/resocks5-net`. Keep a sibling `resocks5`
-checkout at tag `v0.3.0` or newer beside `tor-socks5`. To build without the
-checkout, remove the `path` from the `resocks5-net` dependency in the root
-`Cargo.toml` so that Cargo takes the crates.io release.
+The workspace resolves `ktav` 0.8.1, `resocks5-net` 0.5.1 and the five
+`ptrs-gesher-*` 0.8.0 crates from the registry (crates.io). The SDK's
+`AuthMethods::cleartext_only` policy delegates inbound password checks to
+the existing host verifier without advertising unsupported secure
+authentication. No sibling SDK or ptrs checkout, path override, Git pin or
+per-command Cargo patch is required.
 
-CI and release builds provision the sibling SDK with
-`.github/actions/setup-local-sdk/action.yml`, pinned to the `v0.3.0` tag rather
-than a moving branch.
+From the repository root:
 
 ```bash
-cargo build --release
+cargo build --locked --release
 # binary: target/release/socks5-proxy   (invoked as `tor-socks5`)
 ```
+
+The ptrs-gesher 0.8.0 registry artifacts were published from the reviewed
+source commit `b0c68330ace29acfcdbaad23dd734c45e94a293c`; crates.io trusted
+publishing records that SHA for all five crates, and released bytes remain a
+separate provenance boundary from the reviewed tree. The earlier runtime
+acceptance used a debug CLI with SDK 0.4.1 and the older ptrs source. It
+does not validate this dependency migration or establish a release-profile
+acceptance run. The new consumer tests have compiled, but have not yet
+executed; no fresh CLI runtime acceptance is claimed.
 
 ### Code structure rules (checked in CI)
 

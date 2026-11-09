@@ -1,6 +1,6 @@
-use std::net::IpAddr;
-
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(test)]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::Instant;
 
 /// Необязательные учётные данные RFC 1929.
@@ -53,109 +53,54 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Выполнить CONNECT handshake поверх уже предоставленного stream.
-///
-/// Функция не открывает сокет и не разрешает `host`. Абсолютный `deadline`
-/// ограничивает весь handshake. При ошибке или timeout stream следует отбросить.
-///
-/// cancel-safe: NO — ввод-вывод мог быть частичным; при отмене отбросьте stream.
+impl From<resocks5_net::ConnectError> for Error {
+    fn from(error: resocks5_net::ConnectError) -> Self {
+        match error {
+            resocks5_net::ConnectError::Io { .. } => Self::Io,
+            resocks5_net::ConnectError::Timeout { .. } => Self::Timeout,
+            resocks5_net::ConnectError::InvalidTarget(_) => Self::InvalidInput,
+            _ => Self::Protocol,
+        }
+    }
+}
+
+/// Negotiate SOCKS5 over an owning, already-connected stream using the SDK.
+/// No TCP or DNS dial occurs. The returned stream owns the original transport.
+/// cancel-safe: NO — cancellation discards the partially negotiated transport.
 pub async fn connect<S>(
-    stream: &mut S,
+    stream: S,
     host: &str,
     port: u16,
     credentials: Option<&Credentials>,
     deadline: Instant,
-) -> Result<(), Error>
+) -> Result<resocks5_net::connect::AnyUpstream, Error>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    if host.is_empty() || host.len() > u8::MAX as usize || host.as_bytes().contains(&0) {
+    if host.is_empty() || host.len() > u8::MAX as usize || host.as_bytes().contains(&0) || port == 0
+    {
         return Err(Error::InvalidInput);
     }
-    let mut request = Vec::with_capacity(host.len() + 7);
-    request.extend_from_slice(&[5, 1, 0]);
-    match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(ip)) => {
-            request.push(1);
-            request.extend_from_slice(&ip.octets());
-        }
-        Ok(IpAddr::V6(ip)) => {
-            request.push(4);
-            request.extend_from_slice(&ip.octets());
-        }
-        Err(_) => {
-            request.push(3);
-            request.push(u8::try_from(host.len()).map_err(|_| Error::InvalidInput)?);
-            request.extend_from_slice(host.as_bytes());
-        }
+    if Instant::now() >= deadline {
+        return Err(Error::Timeout);
     }
-    request.extend_from_slice(&port.to_be_bytes());
-
-    let exchange = async {
-        let methods: &[u8] = if credentials.is_some() { &[2] } else { &[0] };
-        stream
-            .write_all(&[5, methods.len() as u8])
-            .await
-            .map_err(|_| Error::Io)?;
-        stream.write_all(methods).await.map_err(|_| Error::Io)?;
-        let mut choice = [0; 2];
-        stream
-            .read_exact(&mut choice)
-            .await
-            .map_err(|_| Error::Io)?;
-        if choice[0] != 5 || choice[1] != methods[0] {
-            return Err(Error::Protocol);
-        }
-        if choice[1] == 2 {
-            let credentials = credentials.ok_or(Error::Protocol)?;
-            let mut auth =
-                Vec::with_capacity(credentials.username.len() + credentials.password.len() + 3);
-            auth.extend_from_slice(&[1, credentials.username.len() as u8]);
-            auth.extend_from_slice(credentials.username.as_bytes());
-            auth.push(credentials.password.len() as u8);
-            auth.extend_from_slice(credentials.password.as_bytes());
-            stream.write_all(&auth).await.map_err(|_| Error::Io)?;
-            let mut result = [0; 2];
-            stream
-                .read_exact(&mut result)
-                .await
-                .map_err(|_| Error::Io)?;
-            if result != [1, 0] {
-                return Err(Error::Protocol);
-            }
-        }
-        stream.write_all(&request).await.map_err(|_| Error::Io)?;
-        let mut header = [0; 4];
-        stream
-            .read_exact(&mut header)
-            .await
-            .map_err(|_| Error::Io)?;
-        if header[0] != 5 || header[2] != 0 {
-            return Err(Error::Protocol);
-        }
-        let tail_len = match header[3] {
-            1 => 4,
-            4 => 16,
-            3 => {
-                let mut n = [0];
-                stream.read_exact(&mut n).await.map_err(|_| Error::Io)?;
-                if n[0] == 0 {
-                    return Err(Error::Protocol);
-                }
-                n[0] as usize
-            }
-            _ => return Err(Error::Protocol),
-        };
-        let mut tail = vec![0; tail_len + 2];
-        stream.read_exact(&mut tail).await.map_err(|_| Error::Io)?;
-        if header[1] != 0 {
-            return Err(Error::Protocol);
-        }
-        Ok(())
-    };
+    // The SDK uses this endpoint only as metadata: the stream is already open.
+    let mut proxy = resocks5_net::types::ProxyConfig::socks5("connected-stream.invalid", 1);
+    if let Some(credentials) = credentials {
+        proxy = proxy
+            .try_with_auth(&credentials.username, &credentials.password)
+            .map_err(|_| Error::InvalidInput)?;
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let options = resocks5_net::connect::DialOptions::new()
+        .with_handshake_timeout(remaining)
+        .with_total_timeout(remaining);
+    let exchange =
+        resocks5_net::connect::dial_chain_over(stream, &proxy, host, port, &options, None);
     match tokio::time::timeout_at(deadline, exchange).await {
-        Ok(result) => result,
+        Ok(Ok(stream)) => Ok(stream),
         Err(_) => Err(Error::Timeout),
+        Ok(Err(error)) => Err(error.into_error().into()),
     }
 }
 
@@ -172,22 +117,22 @@ mod tests {
         reply: &[u8],
     ) {
         tokio::time::timeout(Duration::from_secs(2), async {
-            let (mut client, mut peer) = duplex(512);
+            let (client, mut peer) = duplex(512);
             let peer_task = async {
                 let mut greeting = [0; 2];
                 peer.read_exact(&mut greeting).await.unwrap();
                 let mut methods = vec![0; greeting[1] as usize];
                 peer.read_exact(&mut methods).await.unwrap();
-                assert_eq!(greeting, [5, 1]);
-                assert_eq!(
-                    methods,
-                    if credentials.is_some() {
-                        vec![2]
-                    } else {
-                        vec![0]
-                    }
-                );
-                peer.write_all(&[5, methods[0]]).await.unwrap();
+                let chosen = if credentials.is_some() {
+                    assert_eq!(greeting, [5, 2]);
+                    assert_eq!(methods, [0x80, 2]);
+                    2
+                } else {
+                    assert_eq!(greeting, [5, 1]);
+                    assert_eq!(methods, [0]);
+                    0
+                };
+                peer.write_all(&[5, chosen]).await.unwrap();
                 if let Some(credentials) = credentials {
                     let mut head = [0; 2];
                     peer.read_exact(&mut head).await.unwrap();
@@ -214,17 +159,21 @@ mod tests {
                 for byte in reply {
                     peer.write_all(&[*byte]).await.unwrap();
                 }
+                peer.write_all(b"payload").await.unwrap();
                 peer.shutdown().await.unwrap();
             };
             let result = connect(
-                &mut client,
+                client,
                 host,
                 80,
                 credentials,
                 Instant::now() + Duration::from_secs(1),
             );
             let (result, ()) = tokio::join!(result, peer_task);
-            assert_eq!(result, Ok(()));
+            let mut client = result.expect("SDK returns the owning tunnel");
+            let mut payload = [0; 7];
+            client.read_exact(&mut payload).await.unwrap();
+            assert_eq!(&payload, b"payload");
         })
         .await
         .expect("case deadline");
@@ -232,7 +181,7 @@ mod tests {
 
     async fn failing_reply(reply: &[u8], expected_error: Error) {
         tokio::time::timeout(Duration::from_secs(2), async {
-            let (mut client, mut peer) = duplex(64);
+            let (client, mut peer) = duplex(64);
             let server = async {
                 let mut greeting = [0; 2];
                 peer.read_exact(&mut greeting).await.unwrap();
@@ -249,7 +198,7 @@ mod tests {
             };
             let (result, ()) = tokio::join!(
                 connect(
-                    &mut client,
+                    client,
                     "1.2.3.4",
                     80,
                     None,
@@ -257,7 +206,7 @@ mod tests {
                 ),
                 server
             );
-            assert_eq!(result, Err(expected_error));
+            assert_eq!(result.err(), Some(expected_error));
         })
         .await
         .expect("failure case deadline");
@@ -311,16 +260,16 @@ mod tests {
     async fn credential_mode_rejects_no_auth_downgrade() {
         tokio::time::timeout(Duration::from_secs(2), async {
             let credentials = Credentials::new("user", "pass").unwrap();
-            let (mut client, mut peer) = duplex(16);
+            let (client, mut peer) = duplex(16);
             let server = async {
-                let mut greeting = [0; 3];
+                let mut greeting = [0; 4];
                 peer.read_exact(&mut greeting).await.unwrap();
-                assert_eq!(greeting, [5, 1, 2]);
+                assert_eq!(greeting, [5, 2, 0x80, 2]);
                 peer.write_all(&[5, 0]).await.unwrap();
             };
             let (result, ()) = tokio::join!(
                 connect(
-                    &mut client,
+                    client,
                     "target",
                     80,
                     Some(&credentials),
@@ -328,7 +277,7 @@ mod tests {
                 ),
                 server
             );
-            assert_eq!(result, Err(Error::Protocol));
+            assert_eq!(result.err(), Some(Error::Protocol));
         })
         .await
         .expect("downgrade case deadline");
@@ -361,17 +310,18 @@ mod tests {
             Some(Error::InvalidInput)
         );
         tokio::time::timeout(Duration::from_secs(2), async {
-            let (mut client, _peer) = duplex(16);
+            let (client, _peer) = duplex(16);
             assert_eq!(
                 connect(
-                    &mut client,
+                    client,
                     &"x".repeat(256),
                     80,
                     None,
                     Instant::now() + Duration::from_secs(1)
                 )
-                .await,
-                Err(Error::InvalidInput)
+                .await
+                .err(),
+                Some(Error::InvalidInput)
             );
         })
         .await
@@ -381,7 +331,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_method_and_auth_responses_are_rejected() {
         tokio::time::timeout(Duration::from_secs(2), async {
-            let (mut client, mut peer) = duplex(16);
+            let (client, mut peer) = duplex(16);
             let server = async {
                 let mut greeting = [0; 3];
                 peer.read_exact(&mut greeting).await.unwrap();
@@ -389,7 +339,7 @@ mod tests {
             };
             let (result, ()) = tokio::join!(
                 connect(
-                    &mut client,
+                    client,
                     "x",
                     1,
                     None,
@@ -397,13 +347,14 @@ mod tests {
                 ),
                 server
             );
-            assert_eq!(result, Err(Error::Protocol));
+            assert_eq!(result.err(), Some(Error::Protocol));
 
             let credentials = Credentials::new("user", "pass").unwrap();
-            let (mut client, mut peer) = duplex(32);
+            let (client, mut peer) = duplex(32);
             let server = async {
-                let mut greeting = [0; 3];
+                let mut greeting = [0; 4];
                 peer.read_exact(&mut greeting).await.unwrap();
+                assert_eq!(greeting, [5, 2, 0x80, 2]);
                 peer.write_all(&[5, 2]).await.unwrap();
                 let mut auth = [0; 11];
                 peer.read_exact(&mut auth).await.unwrap();
@@ -411,7 +362,7 @@ mod tests {
             };
             let (result, ()) = tokio::join!(
                 connect(
-                    &mut client,
+                    client,
                     "x",
                     1,
                     Some(&credentials),
@@ -419,7 +370,7 @@ mod tests {
                 ),
                 server
             );
-            assert_eq!(result, Err(Error::Protocol));
+            assert_eq!(result.err(), Some(Error::Protocol));
         })
         .await
         .expect("malformed method deadline");
@@ -428,14 +379,14 @@ mod tests {
     #[tokio::test]
     async fn absolute_deadline_is_terminal() {
         tokio::time::timeout(Duration::from_secs(2), async {
-            let (mut client, mut peer) = duplex(16);
+            let (client, mut peer) = duplex(16);
             let server = async {
                 let mut greeting = [0; 3];
                 peer.read_exact(&mut greeting).await.unwrap();
             };
             let (result, ()) = tokio::join!(
                 connect(
-                    &mut client,
+                    client,
                     "x",
                     1,
                     None,
@@ -443,7 +394,7 @@ mod tests {
                 ),
                 server
             );
-            assert_eq!(result, Err(Error::Timeout));
+            assert_eq!(result.err(), Some(Error::Timeout));
         })
         .await
         .expect("timeout case deadline");

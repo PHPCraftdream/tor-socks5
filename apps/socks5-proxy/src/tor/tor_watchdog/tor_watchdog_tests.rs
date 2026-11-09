@@ -18,6 +18,115 @@ fn ensure_crypto_provider() {
     });
 }
 
+struct ResetObserver(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ResetObserver {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if event.metadata().target() == "arti_wrapper::channel_reset" {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+#[tokio::test]
+async fn heal_calls_real_channel_manager_termination() {
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::prelude::*;
+    ensure_crypto_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bridge = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let settings = arti_wrapper::Settings {
+        state_dir: Some(dir.path().into()),
+        bridges: vec![format!(
+            "{} 1111111111111111111111111111111111111111",
+            bridge.local_addr().unwrap()
+        )
+        .parse()
+        .unwrap()],
+        pre_endpoint: Some(arti_wrapper::Socks5PreEndpoint::new(
+            proxy.local_addr().unwrap(),
+            None,
+        )),
+        ..Default::default()
+    };
+    let tor = TorTunnel::create_unbootstrapped_with(settings).unwrap();
+    let mut bootstrap = Box::pin(tor.wait_bootstrapped());
+    assert!(futures::poll!(bootstrap.as_mut()).is_pending());
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let subscriber = tracing_subscriber::registry().with(ResetObserver(count.clone()));
+    async {
+        // Событие отмечает вызов границы, а не состояние каналов менеджера.
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        tor.terminate_all_channels().unwrap();
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let result = heal(&tor, None).await;
+        assert!(matches!(result, HealResult::Healed));
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+        tor.terminate_all_channels().unwrap();
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+    .with_subscriber(subscriber)
+    .await;
+}
+
+#[tokio::test]
+async fn heal_orchestration_orders_fake_termination_and_relaunch() {
+    use std::cell::RefCell;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Route {
+        bridge: &'static str,
+        endpoint: &'static str,
+        credentials: Option<(&'static str, &'static str)>,
+    }
+    #[derive(Debug, PartialEq, Eq)]
+    enum Channel {
+        Open(Route),
+        Terminated(Route),
+        Relaunched(Route),
+    }
+    for credentials in [None, Some(("alice", "secret"))] {
+        let route = Route {
+            bridge: "bridge",
+            endpoint: "pre",
+            credentials,
+        };
+        let channel = RefCell::new(Channel::Open(route.clone()));
+        let events = RefCell::new(Vec::new());
+        // Модель проверяет порядок вызовов, но не состояние настоящего Tor.
+        let result = heal_with(
+            || {
+                events.borrow_mut().push("terminate");
+                assert_eq!(*channel.borrow(), Channel::Open(route.clone()));
+                *channel.borrow_mut() = Channel::Terminated(route.clone());
+                Ok(())
+            },
+            || async {
+                events.borrow_mut().push("verify");
+                assert_eq!(*channel.borrow(), Channel::Terminated(route.clone()));
+                *channel.borrow_mut() = Channel::Relaunched(route.clone());
+                true
+            },
+        )
+        .await;
+        assert!(matches!(result, HealResult::Healed));
+        assert_eq!(*channel.borrow(), Channel::Relaunched(route));
+        assert_eq!(*events.borrow(), vec!["terminate", "verify"]);
+    }
+    let called = std::cell::Cell::new(false);
+    let result = heal_with(
+        || Err(anyhow::anyhow!("termination failed")),
+        || async {
+            called.set(true);
+            true
+        },
+    )
+    .await;
+    assert!(matches!(result, HealResult::TerminateFailed(_)));
+    assert!(!called.get());
+}
+
 #[test]
 fn health_starts_unstamped_and_counts_attempts() {
     let h = TorHealth::default();

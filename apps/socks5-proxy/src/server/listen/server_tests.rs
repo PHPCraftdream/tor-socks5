@@ -1,4 +1,19 @@
 use super::*;
+
+#[tokio::test]
+async fn shutdown_is_polled_before_loading_config() {
+    let _serial = owners::TEST_LIFECYCLE.lock().await;
+    let args = ServerArgs {
+        config_override: Some(std::path::PathBuf::from(
+            "несуществующий-каталог/конфигурация.ktav",
+        )),
+        upstream_addr: None,
+        upstream_user: None,
+        upstream_pass: None,
+        no_upstream: false,
+    };
+    assert!(run_server(args, std::future::ready(())).await.is_ok());
+}
 use crate::config::UpstreamConfig;
 use crate::config::{AllowedClients, ClientAccessConfig, SecurityConfig};
 use resocks5_net::server::ServerError;
@@ -825,14 +840,18 @@ async fn shutdown_producers_no_new_iteration_after_cancel() {
     while iterations.load(Ordering::SeqCst) < 3 {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    token.cancel();
+    let owner = producers::ProducerTasks::for_test(token.clone());
+    let mut launch = producers::LaunchGuard::new(owner.clone());
+    launch.handles.push(producer);
+    launch.commit();
+    owner.cancel();
     let before = iterations.load(Ordering::SeqCst);
     // The loop must break at its next cancellation check — immediately,
     // since the token is already cancelled — instead of ticking on.
-    tokio::time::timeout(Duration::from_secs(5), producer)
+    owner
+        .join(Duration::from_secs(5))
         .await
-        .expect("producer must stop after cancellation")
-        .expect("producer joins cleanly");
+        .expect("producer must stop after cancellation and join cleanly");
     // No further iteration, even with the ticker long overdue.
     tokio::time::sleep(Duration::from_secs(3600)).await;
     assert_eq!(

@@ -124,7 +124,10 @@ impl std::str::FromStr for ProxyProtocol {
             return Err(ProxyProtocolParseError::InvalidFormat(s.to_string()));
         }
 
-        let port = url.port().ok_or(ProxyProtocolParseError::InvalidPort)?;
+        let port = url
+            .port()
+            .or_else(|| (scheme_lower == "http").then_some(80))
+            .ok_or(ProxyProtocolParseError::InvalidPort)?;
         let host = url
             .host()
             .ok_or_else(|| ProxyProtocolParseError::InvalidAddress(s.to_string()))?;

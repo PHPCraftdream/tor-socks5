@@ -30,7 +30,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 name = "socks5_proto"
 
 [dependencies]
-resocks5-net.workspace = true
+resocks5-net = { workspace = true, features = ["secure-auth"] }
 tokio.workspace = true
 
 [dev-dependencies]

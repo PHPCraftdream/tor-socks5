@@ -286,6 +286,7 @@ dependencies = [
  "arti-client",
  "futures",
  "ptrs-gesher-bridge-line",
+ "resocks5-net",
  "rustls",
  "tempfile",
  "thiserror 2.0.18",
@@ -904,6 +905,17 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "chacha20"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3613f74bd2eac03dad61bd53dbe620703d4371614fe0bc3b9f04dd36fe4e818"
+dependencies = [
+ "cfg-if",
+ "cipher 0.4.4",
+ "cpufeatures 0.2.17",
+]
+
+[[package]]
+name = "chacha20"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
@@ -911,6 +923,19 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "chacha20poly1305"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10cd79432192d1c0f4e1a0fef9527696cc039165d729fb41b3f4f4f354c2dc35"
+dependencies = [
+ "aead",
+ "chacha20 0.9.1",
+ "cipher 0.4.4",
+ "poly1305",
+ "zeroize",
 ]
 
 [[package]]
@@ -2047,20 +2072,6 @@ name = "fallible-streaming-iterator"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
-
-[[package]]
-name = "fast-socks5"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d09fe4a491909a716088083eeb5bcc25427330fdbcd4ecd3dfa5469b3da795df"
-dependencies = [
- "anyhow",
- "async-trait",
- "log",
- "thiserror 1.0.69",
- "tokio",
- "tokio-stream",
-]
 
 [[package]]
 name = "fastrand"
@@ -3206,9 +3217,9 @@ dependencies = [
 
 [[package]]
 name = "ktav"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "961a8932a06e7f2c02a301b70978c190b746925d615f20035a3e07c584282655"
+checksum = "7140dfe2fa6c320e74768cd6a637828c2d26f81746254f4fcd805f3993bd3fd5"
 dependencies = [
  "bumpalo",
  "compact_str",
@@ -4224,18 +4235,18 @@ dependencies = [
 
 [[package]]
 name = "ptrs-gesher-bridge-line"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52f832956364a32d88ff91cf4c771fadf397c4c1c0dd90ae821c7a11fb989455"
+checksum = "9d16592fc5d98e85271bac84215e36f83f6314f1953d76bfef485cf149179902"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "ptrs-gesher-core"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da21cb4d7da8cd9833909753ed29bafd6ca40878bb47a779c059be32f870f1ad"
+checksum = "cca48844beba4a1edcf06c5cd2bc55728b3c560a753d2548654d693d93164b7f"
 dependencies = [
  "futures",
  "itertools 0.14.0",
@@ -4248,20 +4259,22 @@ dependencies = [
 
 [[package]]
 name = "ptrs-gesher-lyrebird"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27e7fe5a6a292b960c5a467e25cf7146ba07b50f5d14ae7696d1c8142ebd5d1b"
+checksum = "dc9b93e84379ced245840874b3fe6a4bf024d7e16d79ccaa3d0305e6bf34359a"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "clap",
- "fast-socks5",
  "futures",
  "libc",
  "log",
+ "percent-encoding",
  "ptrs-gesher-core",
  "ptrs-gesher-obfs4",
  "ptrs-gesher-webtunnel",
+ "resocks5-net",
  "safelog 0.4.8",
  "socket2",
  "thiserror 2.0.18",
@@ -4271,14 +4284,16 @@ dependencies = [
  "tracing-core",
  "tracing-log",
  "tracing-subscriber",
+ "url",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
 name = "ptrs-gesher-obfs4"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6202859c152dd81316f348948f6f666753689307d2aad937a128a36db8182c2c"
+checksum = "d904ab9ff8e4a12c0dde9e3b0dfae455e826d861ca6d87904ed8c73bcbf140e0"
 dependencies = [
  "base64",
  "bytes",
@@ -4316,9 +4331,9 @@ dependencies = [
 
 [[package]]
 name = "ptrs-gesher-webtunnel"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90a11756859f576c003a1df2e9784398053c625a3ee44c71052c4fea5c6f9b63"
+checksum = "f3a309026fccf6f865de79193278fea226ba83f0da0deed0681644d92014a0c6"
 dependencies = [
  "base64",
  "getrandom 0.2.17",
@@ -4415,7 +4430,7 @@ version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2e8e8bcc7961af1fdac401278c6a831614941f6164ee3bf4ce61b7edb162207"
 dependencies = [
- "chacha20",
+ "chacha20 0.10.2",
  "getrandom 0.4.2",
  "rand_core 0.10.1",
 ]
@@ -4640,11 +4655,22 @@ dependencies = [
 
 [[package]]
 name = "resocks5-net"
-version = "0.3.0"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "21758cd56cea0a3e7c9a115b814da54a6248bb060d3b729075905faab8ee3af3"
 dependencies = [
+ "argon2",
  "base64",
+ "chacha20poly1305",
+ "getrandom 0.2.17",
+ "hkdf",
+ "hmac",
+ "sha2",
  "socket2",
+ "subtle",
  "tokio",
+ "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
@@ -5787,9 +5813,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.52.3"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",
@@ -5820,17 +5846,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
  "rustls",
- "tokio",
-]
-
-[[package]]
-name = "tokio-stream"
-version = "0.1.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32da49809aab5c3bc678af03902d4ccddea2a87d028d86392a4b1560c6906c70"
-dependencies = [
- "futures-core",
- "pin-project-lite",
  "tokio",
 ]
 
@@ -7015,9 +7030,8 @@ dependencies = [
 [[package]]
 name = "tor-ptmgr"
 version = "0.47.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0068103033ae2dcedf88691c4758b1e483dd31d325e4891f5e0d3bb41f24ecbc"
 dependencies = [
+ "anyhow",
  "async-trait",
  "cfg-if",
  "derive-deftly",
@@ -7028,6 +7042,7 @@ dependencies = [
  "oneshot-fused-workaround",
  "serde",
  "thiserror 2.0.18",
+ "tokio",
  "tor-async-utils",
  "tor-basic-utils",
  "tor-chanmgr",
@@ -7039,6 +7054,8 @@ dependencies = [
  "tor-rtcompat",
  "tor-socksproto",
  "tracing",
+ "tracing-subscriber",
+ "visibility",
  "web-time-compat",
 ]
 
@@ -7189,9 +7206,9 @@ dependencies = [
  "serde",
  "sha2",
  "subtle",
- "tor-socks5-client-acl",
  "thiserror 2.0.18",
  "tokio",
+ "tor-socks5-client-acl",
  "tracing",
 ]
 
@@ -7200,6 +7217,7 @@ name = "tor-socks5-client-acl"
 version = "0.2.0"
 dependencies = [
  "ktav",
+ "resocks5-net",
  "serde",
 ]
 
@@ -7234,10 +7252,10 @@ dependencies = [
  "socket2",
  "thiserror 2.0.18",
  "time",
- "tor-socks5-client-acl",
  "tokio",
  "tokio-rustls",
  "tokio-util",
+ "tor-socks5-client-acl",
  "tracing",
  "webpki-roots 0.26.11",
  "windows-sys 0.61.2",

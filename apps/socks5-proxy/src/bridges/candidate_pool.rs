@@ -65,7 +65,7 @@ impl CandidatePool {
     /// lock wait must never block an async worker.
     pub(crate) async fn acquire_transaction_lock(path: &Path) -> Result<PathLock> {
         let path = path.to_path_buf();
-        tokio::task::spawn_blocking(move || {
+        crate::bridge_verifier::run_fallible_blocking(move || {
             PathLock::acquire_bounded(&path, POOL_LOCK_WAIT)
                 .with_context(|| format!("candidate pool transaction lock for {}", path.display()))
         })

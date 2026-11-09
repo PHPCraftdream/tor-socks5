@@ -38,8 +38,10 @@ tor-socks5/
 The torrc `Bridge` line grammar is parsed by the external
 `ptrs-gesher-bridge-line` crate — there is no local `bridge-line`
 package, and `ptrs-gesher` is **not** vendored. The workspace consumes
-`ptrs-gesher-bridge-line` and `ptrs-gesher-lyrebird` 0.7 through the root
-`Cargo.toml` workspace dependencies; no sibling checkout is patched in.
+`ptrs-gesher-bridge-line` and `ptrs-gesher-lyrebird` 0.8 through the root
+`Cargo.toml` workspace dependencies. The five `ptrs-gesher-*` 0.8.0 crates,
+`ktav` 0.8.1 and `resocks5-net` 0.5.1 all resolve from the registry
+(crates.io); see the root README's build instructions.
 
 ## Crates and their responsibilities
 
@@ -52,6 +54,12 @@ A thin facade over `arti-client`. Three responsibilities:
 * `TorTunnel::bootstrap_with(settings)` returns a cheap-to-clone client.
 * `TorTunnel::connect(host, port)` returning an
   `arti_client::DataStream` for use in the SOCKS5 hand-off.
+
+Post-proxy helpers return an owning `RoutedStream`, which keeps direct Tor
+streams and SDK `AnyUpstream` tunnels behind the same futures I/O interface.
+The SDK's `dial_chain_over` negotiates over the already-open Tor stream without
+another TCP connection or local final-target DNS lookup. Flush and close forward
+to the owned transport, and one absolute setup deadline spans dial and negotiation.
 
 Workspace-pinned `arti-client` features: `bridge-client`, `pt-client`,
 `onion-service-client`, `static-sqlite`, `rustls`, `tokio`. The caller
@@ -269,7 +277,7 @@ procedure live in `vendor/README.md`. In short:
   bandwidth floor, and more — see `vendor/README.md`).
 
 The obfs4 + webtunnel PT client is **not** vendored. It comes from the
-`ptrs-gesher-lyrebird` 0.7 workspace dependency declared in the root
+`ptrs-gesher-lyrebird` 0.8 workspace dependency declared in the root
 `Cargo.toml`.
 
 ## Pluggable-transport dispatch (busybox)

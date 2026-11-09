@@ -12,154 +12,21 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use arti_client::config::pt::TransportConfigBuilder;
-use arti_client::config::{BridgeConfigBuilder, CfgPath, Reconfigure, TorClientConfigBuilder};
-use arti_client::{DataStream, TorClient, TorClientConfig};
+/// Конструктор цели моста для доступа к менеджеру каналов Arti.
+pub use arti_client::config::BridgeConfigBuilder;
+use arti_client::config::{CfgPath, Reconfigure, TorClientConfigBuilder};
+/// Поток данных, открытый через Tor.
+pub use arti_client::DataStream;
+use arti_client::{TorClient, TorClientConfig};
 use bridge_line::BridgeLine;
+/// Назначение канала при запросе к менеджеру Arti.
+pub use tor_chanmgr::ChannelUsage;
 use tor_linkspec::HasChanMethod;
 use tor_rtcompat::PreferredRuntime;
 
-/// Error type of every fallible operation in this crate, named for the
-/// phase that failed: assembling the client config
-/// ([`TorError::BuildConfig`]), parsing bridge or pluggable-transport
-/// settings ([`TorError::InvalidBridge`], [`TorError::InvalidPt`]),
-/// bootstrapping ([`TorError::Bootstrap`]), reconfiguring a live client
-/// ([`TorError::Reconfigure`]), opening streams ([`TorError::Connect`]),
-/// channel/guard management ([`TorError::ChanMgrUnavailable`],
-/// [`TorError::Warm`], [`TorError::SignalFailure`]), and the two
-/// reachability-check budgets ([`TorError::BridgeCheckBootstrapTimeout`],
-/// [`TorError::BridgeCheckProbeTimeout`]).
-#[derive(Debug, thiserror::Error)]
-pub enum TorError {
-    /// Creating the `TorClient` or waiting for it to reach a usable
-    /// directory failed. Raised by every bootstrap path: `create_bootstrapped`,
-    /// [`TorTunnel::create_unbootstrapped`]'s client construction, and
-    /// [`TorTunnel::wait_bootstrapped`]'s directory wait. `source` is
-    /// arti's own error (directory-fetch, PT-launch, or runtime
-    /// failure); a caller's `timeout` around `wait_bootstrapped` cancels
-    /// the future instead of producing this variant.
-    #[error("failed to bootstrap Tor client: {0}")]
-    Bootstrap(#[source] arti_client::Error),
-
-    /// Applying new [`Settings`] to the already-running client failed
-    /// ([`TorTunnel::reconfigure_bridges`]'s `TorClient::reconfigure`
-    /// call). arti applies the change atomically (`Reconfigure::AllOrNothing`),
-    /// so on this error the client keeps running with its previous
-    /// configuration; `source` is arti's error.
-    #[error("failed to reconfigure bridge order: {0}")]
-    Reconfigure(#[source] arti_client::Error),
-
-    /// Opening a stream through Tor to the requested destination failed
-    /// (circuit build, exit refusal, timeout, unreachable `.onion`, ...).
-    #[error("failed to connect through Tor to {host}:{port}: {source}")]
-    Connect {
-        /// Destination as passed to [`TorTunnel::connect`] — a domain,
-        /// `.onion`, or IP string, echoed verbatim (never resolved or
-        /// normalised).
-        host: String,
-        /// Destination port as passed to [`TorTunnel::connect`].
-        port: u16,
-        /// The underlying `arti_client::Error` for the failed stream
-        /// open.
-        #[source]
-        source: arti_client::Error,
-    },
-
-    /// SOCKS5 CONNECT negotiation over a Tor-opened stream failed.
-    #[error("post-SOCKS5 CONNECT failed: {0}")]
-    PostSocks(#[source] socks5_proto::client::Error),
-
-    /// The absolute post-SOCKS stream deadline elapsed.
-    #[error("post-SOCKS5 connection deadline elapsed")]
-    PostSocksTimeout,
-
-    /// A bridge line could not be turned into arti's `BridgeConfig`:
-    /// either its serialised form (after any obfs4 `iat-mode` override)
-    /// failed to parse as a bridge line, or the parsed builder failed
-    /// validation. The payload carries the offending serialised line plus
-    /// the underlying parse/build message. Raised wherever a
-    /// `BridgeLine` is converted — config build, [`TorTunnel::warm_bridge`],
-    /// [`TorTunnel::signal_bridge_failure`].
-    #[error("invalid bridge configuration: {0}")]
-    InvalidBridge(String),
-
-    /// The pluggable-transport configuration is incomplete or invalid:
-    /// the bridges (or [`Settings::extra_pt_protocols`]) name transports
-    /// but [`Settings::pt_binary`] is not set, the configured binary path
-    /// does not exist, or a transport name is not a parseable protocol.
-    /// The payload says which of the three.
-    #[error("invalid pluggable-transport configuration: {0}")]
-    InvalidPt(String),
-
-    /// The assembled `TorClientConfig` failed final validation
-    /// (`TorClientConfigBuilder::build`); the payload is the builder's
-    /// error message. Raised from the single config-building helper that
-    /// every bootstrap and reconfigure path goes through.
-    #[error("failed to build Tor client config: {0}")]
-    BuildConfig(String),
-
-    /// The client's channel manager (or, for
-    /// [`TorTunnel::bridge_is_disabled`], the equivalent guard-state
-    /// query) could not be reached. Raised by
-    /// [`TorTunnel::terminate_all_channels`], [`TorTunnel::warm_bridge`],
-    /// and [`TorTunnel::bridge_is_disabled`], so watchdog callers can
-    /// tell "could not even reach the manager" from "action performed";
-    /// `source` is arti's error (arti raises it when the client is not in
-    /// a running state, e.g. fully dormant).
-    #[error("could not access Tor client's channel manager: {0}")]
-    ChanMgrUnavailable(#[source] arti_client::Error),
-
-    /// Opening (or reusing) a channel to `bridge` failed in
-    /// `ChanMgr::get_or_launch` during [`TorTunnel::warm_bridge`] — the
-    /// transport connection could not be established or the target failed
-    /// channel-level validation. `bridge` carries the exact serialised
-    /// line (after any obfs4 `iat-mode` override) that was attempted;
-    /// `source` is the underlying `tor_chanmgr::Error`.
-    #[error("failed to warm a channel to bridge {bridge}: {source}")]
-    Warm {
-        /// The serialised bridge line (iat-mode applied) whose warm-up
-        /// failed.
-        bridge: String,
-        /// The underlying `tor_chanmgr::Error`.
-        #[source]
-        source: Box<tor_chanmgr::Error>,
-    },
-
-    /// Reporting an externally-observed guard failure for `bridge` to
-    /// arti's guard manager failed (see
-    /// [`TorTunnel::signal_bridge_failure`]; raised under the same
-    /// "client not in a running state" condition as
-    /// [`TorError::ChanMgrUnavailable`]). `bridge` carries the exact
-    /// serialised line (after any obfs4 `iat-mode` override) that was
-    /// reported; `source` is arti's error.
-    #[error("failed to signal guard failure for bridge {bridge}: {source}")]
-    SignalFailure {
-        /// The serialised bridge line (iat-mode applied) whose failure
-        /// report failed.
-        bridge: String,
-        /// The underlying `arti_client::Error`.
-        #[source]
-        source: arti_client::Error,
-    },
-
-    /// [`TorTunnel::verify_bridge_reachable`]'s throwaway client did not
-    /// reach a usable directory within `bootstrap_timeout`; the payload
-    /// is that budget, for the caller's log messages. The client is torn
-    /// down either way — this is "not proven in time", not evidence the
-    /// bridge is dead.
-    #[error("bridge reachability check: bootstrap timed out after {0:?}")]
-    BridgeCheckBootstrapTimeout(Duration),
-
-    /// The live-traffic probe inside
-    /// [`TorTunnel::verify_bridge_reachable`] — a `connect` to the probe
-    /// target, retried within the same budget — did not open a stream
-    /// within `probe_timeout`; the payload is that budget. Same caveat as
-    /// [`TorError::BridgeCheckBootstrapTimeout`]: DPI can kill a PT
-    /// stream after the handshake, and the candidate's own
-    /// microdescriptors may still be landing, so treat this as "not
-    /// proven reachable" rather than a measured death.
-    #[error("bridge reachability check: live probe timed out after {0:?}")]
-    BridgeCheckProbeTimeout(Duration),
-}
+#[path = "proxy/error.rs"]
+mod error;
+pub use error::TorError;
 
 /// Re-exported so callers (e.g. `apps/socks5-proxy/src/tor_watchdog.rs`) do
 /// not need a direct dependency on `tor-guardmgr` just to call
@@ -203,13 +70,14 @@ pub type BootstrapEventCallback = Arc<dyn Fn(BootstrapEvent) + Send + Sync>;
 pub struct Settings {
     /// Optional SOCKS5 pre-transport endpoint for owner-level routing. Credentials are redacted in Debug output.
     pub pre_endpoint: Option<Socks5PreEndpoint>,
+    /// Allow the bundled PT to use the owner's SOCKS5 pre route.
+    pub stock_pt_proxy: bool,
     /// Bridges to use. When non-empty, the client will go through these
     /// instead of public guards.
     pub bridges: Vec<BridgeLine>,
     /// Path to a pluggable-transport binary (e.g. `lyrebird`/`obfs4proxy`).
     /// Required if any bridge specifies a transport other than `none`.
     pub pt_binary: Option<PathBuf>,
-
     /// Additional protocols supported by `pt_binary`, for probing inactive transports.
     pub extra_pt_protocols: Vec<String>,
     /// Base directory for arti's on-disk **state** and **cache**. When set,
@@ -278,6 +146,7 @@ impl Default for Settings {
         Self {
             bridges: Vec::new(),
             pre_endpoint: None,
+            stock_pt_proxy: false,
             pt_binary: None,
             extra_pt_protocols: Vec::new(),
             state_dir: None,
@@ -300,6 +169,7 @@ impl Settings {
     /// a client with only those set still behaves like the default one.
     pub fn is_default(&self) -> bool {
         self.pre_endpoint.is_none()
+            && !self.stock_pt_proxy
             && self.bridges.is_empty()
             && self.pt_binary.is_none()
             && self.extra_pt_protocols.is_empty()
@@ -362,29 +232,11 @@ fn build_bridge_target(
 pub struct TorTunnel {
     inner: Arc<TorClient<PreferredRuntime>>,
     obfs4_iat_mode: Arc<RwLock<Option<u8>>>,
+    pre_endpoint: Option<Option<Socks5PreEndpoint>>,
 }
 
-/// Map one `BootstrapStatus` to callback event(s). Returns `true` when
-/// the status is ready for traffic (the subscriber's terminal success —
-/// the forwarding task exits after emitting `Ready`).
-fn emit_bootstrap_event(
-    status: &arti_client::status::BootstrapStatus,
-    on_event: &BootstrapEventCallback,
-) -> bool {
-    if status.ready_for_traffic() {
-        on_event(BootstrapEvent::Ready);
-        true
-    } else {
-        on_event(BootstrapEvent::Progress(
-            status.as_frac(),
-            status.to_string(),
-        ));
-        if let Some(blockage) = status.blocked() {
-            on_event(BootstrapEvent::Blocked(blockage.to_string()));
-        }
-        false
-    }
-}
+mod bootstrap_event;
+use bootstrap_event::emit_bootstrap_event;
 
 /// Render an error plus its whole `source()` chain into one line
 /// ("msg: cause: cause") — thiserror's `Display` stops at the top layer,
@@ -408,14 +260,17 @@ impl TorTunnel {
 
     /// Bootstrap a Tor client applying the given [`Settings`].
     pub async fn bootstrap_with(settings: Settings) -> Result<Self> {
+        pre_endpoint::reject_one_shot_pre_pt(&settings)?;
+        let pre = settings.pre_endpoint.clone();
         let iat_mode = settings.obfs4_iat_mode;
         let config = build_config(&settings)?;
-        Self::bootstrap_raw_with_mode(config, iat_mode).await
+        let mut tunnel = Self::bootstrap_raw_with_mode(config, iat_mode).await?;
+        tunnel.pre_endpoint = Some(pre);
+        Ok(tunnel)
     }
-
     /// Bootstrap using a pre-built `arti-client` config (escape hatch).
     pub async fn bootstrap_raw(config: TorClientConfig) -> Result<Self> {
-        Self::bootstrap_raw_with_mode(config, None).await
+        Self::bootstrap_raw_with_mode(pre_endpoint::checked_raw(config)?, None).await
     }
 
     async fn bootstrap_raw_with_mode(
@@ -431,9 +286,9 @@ impl TorTunnel {
         Ok(Self {
             inner: client,
             obfs4_iat_mode: Arc::new(RwLock::new(obfs4_iat_mode)),
+            pre_endpoint: None,
         })
     }
-
     /// Forward this client's bootstrap events to `on_event` from a background
     /// Tokio task: the current status is emitted synchronously first (a
     /// subscriber always sees at least one `Progress` immediately), then one
@@ -477,9 +332,11 @@ impl TorTunnel {
         settings: Settings,
         on_event: Option<BootstrapEventCallback>,
     ) -> Result<Self> {
+        pre_endpoint::reject_one_shot_pre_pt(&settings)?;
         let iat_mode = settings.obfs4_iat_mode;
         let config = build_config(&settings)?;
-        let tunnel = Self::create_unbootstrapped_with_mode(config, iat_mode)?;
+        let mut tunnel = Self::create_unbootstrapped_with_mode(config, iat_mode)?;
+        tunnel.pre_endpoint = Some(settings.pre_endpoint.clone());
         if let Some(on_event) = &on_event {
             tunnel.forward_bootstrap_events(on_event.clone());
         }
@@ -534,6 +391,7 @@ impl TorTunnel {
     pub fn terminate_all_channels(&self) -> Result<()> {
         let chanmgr = self.inner.chanmgr().map_err(TorError::ChanMgrUnavailable)?;
         chanmgr.terminate_all_channels();
+        tracing::debug!(target: "arti_wrapper::channel_reset", "вызвано завершение каналов");
         Ok(())
     }
 
@@ -669,6 +527,7 @@ impl TorTunnel {
         Ok(Self {
             inner: client,
             obfs4_iat_mode: Arc::new(RwLock::new(obfs4_iat_mode)),
+            pre_endpoint: None,
         })
     }
 
@@ -679,7 +538,9 @@ impl TorTunnel {
     pub fn create_unbootstrapped_with(settings: Settings) -> Result<Self> {
         let iat_mode = settings.obfs4_iat_mode;
         let config = build_config(&settings)?;
-        Self::create_unbootstrapped_with_mode(config, iat_mode)
+        let mut tunnel = Self::create_unbootstrapped_with_mode(config, iat_mode)?;
+        tunnel.pre_endpoint = Some(settings.pre_endpoint);
+        Ok(tunnel)
     }
 
     /// Wait for the client to reach a usable directory.
@@ -692,12 +553,27 @@ impl TorTunnel {
         self.inner.bootstrap().await.map_err(TorError::Bootstrap)
     }
 
+    /// Маршрут, закреплённый за клиентом при создании из настроек; внешний `None` означает raw-конфигурацию.
+    pub fn configured_pre_endpoint(&self) -> Option<Option<&Socks5PreEndpoint>> {
+        self.pre_endpoint.as_ref().map(Option::as_ref)
+    }
+
     /// Apply updated settings before bootstrap starts. The channel manager may already have
     /// warmed channels for this same client; reconfiguring the guard set makes the measured
     /// fastest candidates the first choices instead of leaving the initial bootstrap to the
     /// original config-file order. Stream timeout settings also take effect for subsequent
     /// stream requests, while requests already in progress retain their snapshot.
+    /// Для Settings маршрут pre неизменен; для raw сохраняется прежнее поведение Arti.
     pub fn reconfigure_bridges(&self, settings: &Settings) -> Result<()> {
+        if self
+            .pre_endpoint
+            .as_ref()
+            .is_some_and(|original| original != &settings.pre_endpoint)
+        {
+            return Err(TorError::BuildConfig(
+                "cannot change the pre endpoint on a shared client".to_owned(),
+            ));
+        }
         let config = build_config(settings)?;
         self.inner
             .reconfigure(&config, Reconfigure::AllOrNothing)
@@ -842,9 +718,12 @@ fn fatal_protocol_error_hook(error: &arti_client::Error) {
 
 mod post_endpoint;
 mod pre_endpoint;
+#[path = "proxy/stream.rs"]
+mod routed_stream;
 mod validate;
-pub use post_endpoint::connect_post_socks;
+pub use post_endpoint::{connect_post_proxy, connect_post_socks};
 pub use pre_endpoint::Socks5PreEndpoint;
+pub use routed_stream::RoutedStream;
 pub use socks5_proto::client::Credentials as PostSocksCredentials;
 use validate::{
     validate_circuit_hops, validate_min_bandwidth_percentile, validate_service_circuit_hops,
@@ -859,7 +738,6 @@ fn build_config(settings: &Settings) -> Result<TorClientConfig> {
     let mut builder: TorClientConfigBuilder = TorClientConfig::builder();
 
     pre_endpoint::configure_pre_endpoint(&mut builder, settings)?;
-
     builder
         .stream_timeouts()
         .initial_connect_timeout(settings.initial_connect_timeout);

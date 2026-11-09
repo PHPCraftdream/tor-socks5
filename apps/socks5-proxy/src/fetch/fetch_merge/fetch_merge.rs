@@ -150,9 +150,8 @@ async fn fetch_sources(
 /// already in the working config or already pooled, and persist the rest.
 /// Returns how many new candidates were added.
 ///
-/// The pool update is one cross-process transaction, run off the async
-/// worker so the lock wait cannot block it; on caller cancellation the job
-/// finishes detached — a complete, lock-protected whole-file write.
+/// Обновление пула выполняется целиком под межпроцессной блокировкой
+/// вне асинхронного потока и остаётся в реестре после отмены вызывающего кода.
 ///
 /// cancel-safe: NO — performs network I/O over Tor and writes the pool.
 pub(crate) async fn refresh_candidate_pool(
@@ -179,7 +178,7 @@ pub(crate) async fn refresh_candidate_pool(
             .iter()
             .any(|source| retired_source(&source.url));
     let preferred_transport = cfg.bridges.preferred_transport().map(str::to_owned);
-    let (added, pool_len) = tokio::task::spawn_blocking(move || {
+    let (added, pool_len) = crate::bridge_verifier::run_fallible_blocking(move || {
         CandidatePool::transaction(&pool_path, |pool| {
             let added = pool.merge(fetched.iter().cloned(), &exclude);
             if migration {
@@ -194,7 +193,7 @@ pub(crate) async fn refresh_candidate_pool(
     if config_stale {
         if let Some(path) = config_path {
             let path = path.to_path_buf();
-            tokio::task::spawn_blocking(move || migrate_legacy_source(&path))
+            crate::bridge_verifier::run_fallible_blocking(move || migrate_legacy_source(&path))
                 .await
                 .map_err(|e| anyhow::anyhow!("config migration task failed: {e}"))??;
             info!("updated legacy bridge sources in the config (moved or retired)");
@@ -395,7 +394,7 @@ async fn drain_pool_with(
     #[cfg(test)]
     {
         let seam_path = pool_path.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::bridge_verifier::run_tracked_blocking(move || {
             crate::test_seams::park_if_armed(crate::test_seams::Site::PreAcquire, &seam_path)
         })
         .await
@@ -550,10 +549,12 @@ async fn drain_pool_with(
     } else {
         let path = path.to_path_buf();
         let for_config = promoted.clone();
-        tokio::task::spawn_blocking(move || promote_bridges_in_config(&path, &for_config))
-            .await
-            .map_err(|e| anyhow::anyhow!("config promotion task failed: {e}"))
-            .and_then(|added| added.context("promoting bridges in config"))
+        crate::bridge_verifier::run_fallible_blocking(move || {
+            promote_bridges_in_config(&path, &for_config)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("config promotion task failed: {e}"))
+        .and_then(|added| added.context("promoting bridges in config"))
     };
 
     // The confirm: shed exactly the candidates whose outcome is now durable
@@ -567,7 +568,7 @@ async fn drain_pool_with(
     #[cfg(test)]
     {
         let seam_path = pool_path.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::bridge_verifier::run_tracked_blocking(move || {
             crate::test_seams::park_if_armed(crate::test_seams::Site::PreRestore, &seam_path)
         })
         .await
@@ -580,7 +581,7 @@ async fn drain_pool_with(
     let confirmed = if discard.is_empty() && deferred.is_empty() {
         Ok(())
     } else {
-        tokio::task::spawn_blocking({
+        crate::bridge_verifier::run_fallible_blocking({
             let pool_path = pool_path.clone();
             move || {
                 CandidatePool::transaction(&pool_path, |fresh| {
@@ -638,6 +639,10 @@ fn migrate_legacy_source(path: &Path) -> Result<()> {
 /// this is what makes the drain's retry after a failed promotion safe.
 fn promote_bridges_in_config(path: &Path, promoted: &[BridgeLine]) -> Result<usize> {
     #[cfg(test)]
+    crate::test_seams::note_promotion_slot(path, crate::bridge_verifier::current_slot());
+    #[cfg(test)]
+    crate::test_seams::park_if_armed(crate::test_seams::Site::ConfigPromotion, path);
+    #[cfg(test)]
     if crate::test_seams::take_failure(crate::test_seams::Site::ConfigPromotion, path) {
         anyhow::bail!("injected config promotion failure");
     }
@@ -690,6 +695,9 @@ pub(crate) async fn top_up_working(
     Ok(promoted)
 }
 
+#[cfg(test)]
+#[path = "fetch_merge_lifecycle_tests.rs"]
+mod lifecycle_tests;
 #[cfg(test)]
 #[path = "fetch_merge_source_tests.rs"]
 mod source_tests;

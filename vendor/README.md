@@ -2,14 +2,14 @@
 
 This directory holds **full source copies** of upstream crates from the
 [arti](https://gitlab.torproject.org/tpo/core/arti) workspace. The root
-`Cargo.toml` applies `[patch.crates-io]` overrides to the seven crates under
+`Cargo.toml` applies `[patch.crates-io]` overrides to the eight crates under
 `vendor/`; the build does not depend on these fixes being accepted upstream.
 
 **Base line: Arti 0.47.0 (arti 2.7.0), synced 2026-10-13.**
 Workspace MSRV is 1.92 (up from 1.89 on the 0.43 line).
 
-Vendored crates (7): `arti-client`, `tor-chanmgr`, `tor-circmgr`,
-`tor-dirclient`, `tor-dirmgr`, `tor-guardmgr` — all at **0.47.0** — and
+Vendored crates (8): `arti-client`, `tor-chanmgr`, `tor-circmgr`,
+`tor-dirclient`, `tor-dirmgr`, `tor-guardmgr`, `tor-ptmgr` — all at **0.47.0** — and
 `saturating-time` at **0.5.0**.
 
 `ptrs-gesher` (the obfs4/webtunnel PT client and `bridge-line` parser) is
@@ -29,6 +29,20 @@ application dependency. A new fork, if needed, must be added under `vendor/`
 and patched in the root `Cargo.toml`.
 
 ## Why each crate is vendored
+
+### `tor-ptmgr` (0.47.0)
+
+The local manager exposes an awaited PT shutdown receipt, retains unfinished
+child cleanup across cancellation, and rejects new launches after shutdown.
+The paired `arti-client` shutdown method closes channels and awaits that receipt;
+application owners retain their tunnels until shutdown succeeds.
+
+The source baseline is the crates.io `tor-ptmgr` 0.47.0 archive, SHA-256
+`0068103033ae2dcedf88691c4758b1e483dd31d325e4891f5e0d3bb41f24ecbc`.
+The same-version patch is derived from the existing PT owner implementation;
+it does not add another Tor topology or transport. Remove the override only
+when upstream provides the equivalent shutdown contract. PT process tests are
+not proof of a complete pre/Tor/post application exchange.
 
 ### `saturating-time` (0.5.0)
 
@@ -68,6 +82,9 @@ file locks on Windows.
 channels after sleep/resume or a network change without a cold `TorClient`
 rebuild. Also: the non-direct (PT) channel-build total timeout is raised
 10 s → 45 s — a full pluggable-transport handshake budget.
+
+Предупреждение о нелокальном прокси записывает схему и адрес без учётных
+данных; формат `Display` и сериализация `ProxyProtocol` не изменены.
 
 ### `tor-guardmgr` (0.47.0)
 
@@ -129,6 +146,7 @@ One row per patch group. Marker names are the identifiers in the
 | sqlite lock classification | tor-dirmgr | src/err.rs | `SQLITE_BUSY`/`SQLITE_LOCKED` → `CacheAccessFailed`, not fatal `Internal` | carried |
 | `terminate_all_channels` | tor-chanmgr | src/lib.rs, src/mgr.rs, src/mgr/state.rs, src/builder.rs | force-close half-open channels after sleep/resume / network change | carried |
 | `connect_build_timeout` | tor-chanmgr | src/builder.rs | non-direct channel-build total 10 s → 45 s (PT handshake budget) | carried |
+| `proxy_warning_redaction` | tor-chanmgr | src/lib.rs | предупреждение о нелокальном прокси без учётных данных | локальный |
 | guard-readiness signal | tor-guardmgr | src/sample.rs, src/events.rs, src/lib.rs | `any_guard_usable_for_traffic()` + `usable_guard_events()` watch stream | carried (0.47 `BootstrapSetting` ignores guards) |
 | bridge-recovery corrections | tor-guardmgr | src/sample.rs, src/lib.rs | eligibility, reintroduction, retry and adaptive-widening semantics | carried |
 | `reset_disabled_guards` / `guard_is_disabled` | tor-guardmgr | src/guard.rs, src/sample.rs, src/lib.rs | manual recovery hook for persisted `disabled` state | carried (role changed: manual migration handle; !4426 made new automatic disables practically impossible) |

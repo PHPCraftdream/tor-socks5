@@ -34,9 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   persisted state: 0.47 (!4426) made new automatic guard disables
   practically impossible.
 - **MSRV 1.89 → 1.92** (workspace and vendored crates).
-- `ptrs-gesher` (obfs4/webtunnel PT client, `bridge-line` parser) is
-  temporarily wired from a sibling ptrs-gesher checkout via
-  `[patch.crates-io]`, until its crates.io release targets `tor-*` 0.47.
+- `ptrs-gesher` (obfs4/webtunnel PT client, `bridge-line` parser) 0.8.0
+  resolves from crates.io; the release targets `tor-*` 0.47, replacing the
+  temporary sibling-checkout binding. Executed consumer acceptance of the
+  registry build remains outstanding.
 
 ## [0.2.0] - 2026-10-12
 

@@ -33,6 +33,8 @@ enum Bnd {
     V4,
     V6,
     Domain,
+    EmptyDomain,
+    TruncatedDomain,
 }
 
 impl Bnd {
@@ -45,7 +47,9 @@ impl Bnd {
                 v.extend_from_slice(&[0, 0]);
                 v
             }
-            Bnd::Domain => vec![ATYP_DOMAIN, 0, 0, 0],
+            Bnd::Domain => vec![ATYP_DOMAIN, 3, b'b', b'n', b'd', 0x12, 0x34],
+            Bnd::EmptyDomain => vec![ATYP_DOMAIN, 0, 0, 0],
+            Bnd::TruncatedDomain => vec![ATYP_DOMAIN, 3, b'b', b'n', b'd', 0x12],
         }
     }
 }
@@ -211,13 +215,90 @@ async fn bnd_addr_v6_is_drained() {
 
 #[tokio::test]
 async fn bnd_addr_domain_is_drained() {
-    let (addr, handle) = fake_upstream(false, false, REP_SUCCESS, Bnd::Domain, b"tail").await;
-    let up = Upstream::new(addr, None);
-    let mut s = up.connect("example.com", 443).await.expect("connect ok");
-    handle.await.unwrap().expect("stub reached CONNECT");
-    let mut payload = [0u8; 4];
-    s.read_exact(&mut payload).await.unwrap();
-    assert_eq!(&payload, b"tail");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut head = [0u8; 2];
+            s.read_exact(&mut head).await.unwrap();
+            let mut methods = vec![0u8; head[1] as usize];
+            s.read_exact(&mut methods).await.unwrap();
+            s.write_all(&[VER, M_NO_AUTH]).await.unwrap();
+            let mut req = [0u8; 4];
+            s.read_exact(&mut req).await.unwrap();
+            let mut len = [0u8; 1];
+            s.read_exact(&mut len).await.unwrap();
+            let mut target = vec![0u8; len[0] as usize + 2];
+            s.read_exact(&mut target).await.unwrap();
+            for byte in [
+                VER,
+                REP_SUCCESS,
+                0,
+                ATYP_DOMAIN,
+                3,
+                b'b',
+                b'n',
+                b'd',
+                0x12,
+                0x34,
+            ] {
+                s.write_all(std::slice::from_ref(&byte)).await.unwrap();
+            }
+            s.write_all(b"tail").await.unwrap();
+        };
+        let client = async {
+            let up = Upstream::new(addr, None);
+            let mut s = up.connect("example.com", 443).await.expect("connect ok");
+            let mut payload = Vec::new();
+            s.read_to_end(&mut payload).await.unwrap();
+            assert_eq!(payload, b"tail");
+        };
+        tokio::join!(server, client);
+    })
+    .await
+    .expect("fragmented bound-domain exchange must finish");
+}
+
+#[tokio::test]
+async fn bnd_addr_domain_truncated_port_is_rejected() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (addr, handle) =
+            fake_upstream(false, false, REP_SUCCESS, Bnd::TruncatedDomain, b"").await;
+        let up = Upstream::new(addr, None);
+        let err = failure(up.connect("example.com", 443).await);
+        assert!(matches!(
+            typed(&err),
+            ConnectError::Io {
+                stage: Stage::Handshake,
+                ..
+            }
+        ));
+        assert!(err.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|source| source.kind() == std::io::ErrorKind::UnexpectedEof)
+        }));
+        handle.await.unwrap().expect("stub reached CONNECT");
+    })
+    .await
+    .expect("truncated bound-domain reply must terminate");
+}
+
+#[tokio::test]
+async fn bnd_addr_empty_domain_is_rejected() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (addr, handle) = fake_upstream(false, false, REP_SUCCESS, Bnd::EmptyDomain, b"").await;
+        let up = Upstream::new(addr, None);
+        let err = failure(up.connect("example.com", 443).await);
+        assert!(matches!(
+            typed(&err),
+            ConnectError::Protocol(ProtocolViolation::Socks5EmptyBoundDomain)
+        ));
+        handle.await.unwrap().expect("stub reached CONNECT");
+    })
+    .await
+    .expect("empty bound-domain reply must terminate");
 }
 
 #[tokio::test]
@@ -640,4 +721,272 @@ async fn established_relay_survives_setup_deadline() {
     s.read_exact(&mut echo).await.unwrap();
     assert_eq!(&echo, b"ping");
     server.abort();
+}
+
+mod relay_diagnostics {
+    use std::io::{self, IoSlice, Write};
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    use super::super::{relay, RelayIo, RelayRemote};
+    use super::*;
+
+    struct FailingIo;
+
+    fn failure() -> io::Error {
+        io::Error::new(io::ErrorKind::NotConnected, "private-error-marker")
+    }
+
+    impl AsyncRead for FailingIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(failure()))
+        }
+    }
+
+    impl AsyncWrite for FailingIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(failure()))
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(failure()))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(failure()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(failure()))
+        }
+    }
+
+    struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn relay_diagnostics_attribute_each_operation_without_changing_errors() {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let output = Arc::clone(&logs);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || LogBuffer(Arc::clone(&output)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            for side in ["client", "tor", "upstream"] {
+                let mut inner = FailingIo;
+                let mut stream = RelayIo::new(&mut inner, 42, side);
+                assert!(stream.is_write_vectored());
+                for operation in ["read", "write", "write_vectored", "flush", "shutdown"] {
+                    let mut byte = [0];
+                    let mut stream = Pin::new(&mut stream);
+                    let result = match operation {
+                        "read" => stream
+                            .as_mut()
+                            .poll_read(&mut cx, &mut ReadBuf::new(&mut byte)),
+                        "write" => stream.as_mut().poll_write(&mut cx, b"x").map_ok(|_| ()),
+                        "write_vectored" => stream
+                            .as_mut()
+                            .poll_write_vectored(&mut cx, &[IoSlice::new(b"x")])
+                            .map_ok(|_| ()),
+                        "flush" => stream.as_mut().poll_flush(&mut cx),
+                        "shutdown" => stream.as_mut().poll_shutdown(&mut cx),
+                        _ => unreachable!("closed test operation set"),
+                    };
+                    let Poll::Ready(Err(error)) = result else {
+                        panic!("the original I/O error must be returned");
+                    };
+                    assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+                    assert_eq!(error.to_string(), "private-error-marker");
+                }
+            }
+        });
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        let lines: Vec<_> = logs.lines().collect();
+        assert_eq!(lines.len(), 15);
+        for side in ["client", "tor", "upstream"] {
+            for operation in ["read", "write", "write_vectored", "flush", "shutdown"] {
+                assert!(
+                    lines.iter().any(|line| {
+                        line.contains(&format!("relay_side=\"{side}\""))
+                            && line.contains(&format!("relay_operation=\"{operation}\""))
+                            && line.contains("conn_id=42")
+                            && line.contains("NotConnected")
+                    }),
+                    "missing diagnostic for {side}/{operation}: {logs}"
+                );
+            }
+        }
+        assert!(!logs.contains("private-error-marker"));
+    }
+
+    #[tokio::test]
+    async fn relay_diagnostics_preserve_payload_counts_and_half_close() {
+        let (mut client_peer, mut client) = tokio::io::duplex(16);
+        let (mut remote, mut remote_peer) = tokio::io::duplex(16);
+        let client_exchange = async {
+            client_peer.write_all(b"request").await.unwrap();
+            client_peer.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            client_peer.read_to_end(&mut response).await.unwrap();
+            assert_eq!(response, b"response");
+        };
+        let remote_exchange = async {
+            let mut request = Vec::new();
+            remote_peer.read_to_end(&mut request).await.unwrap();
+            assert_eq!(request, b"request");
+            remote_peer.write_all(b"response").await.unwrap();
+            remote_peer.shutdown().await.unwrap();
+        };
+        let ((), (), result) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                client_exchange,
+                remote_exchange,
+                relay(&mut client, &mut remote, 7, RelayRemote::Tor)
+            )
+        })
+        .await
+        .expect("half-closed relay must finish");
+        assert_eq!(result.unwrap(), (7, 8));
+    }
+
+    // Arti drains queued data, then reports NotConnected after local write close.
+    struct FullCloseIo {
+        response: &'static [u8],
+        request: Vec<u8>,
+        closed: bool,
+        error: io::ErrorKind,
+        reader: Option<std::task::Waker>,
+    }
+
+    impl AsyncRead for FullCloseIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            let count = buffer.remaining().min(this.response.len()).min(3);
+            if count != 0 {
+                buffer.put_slice(&this.response[..count]);
+                this.response = &this.response[count..];
+                return Poll::Ready(Ok(()));
+            }
+            if this.closed {
+                return Poll::Ready(Err(io::Error::new(this.error, "stream closed")));
+            }
+            this.reader = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for FullCloseIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            let count = bytes.len().min(2);
+            this.request.extend_from_slice(&bytes[..count]);
+            Poll::Ready(Ok(count))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            this.closed = true;
+            if let Some(reader) = this.reader.take() {
+                reader.wake();
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_diagnostics_tor_local_close_is_eof_without_hiding_other_failures() {
+        let mut failing = FailingIo;
+        let mut unclosed_tor = RelayIo::new(&mut failing, 8, "tor");
+        unclosed_tor.tor_stream = true;
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut byte = [0];
+        let result = Pin::new(&mut unclosed_tor).poll_read(&mut cx, &mut ReadBuf::new(&mut byte));
+        assert!(
+            matches!(result, Poll::Ready(Err(error))
+            if error.kind() == io::ErrorKind::NotConnected),
+            "Tor read failure before local shutdown must not become EOF"
+        );
+        for (side, error, expect_eof) in [
+            (RelayRemote::Tor, io::ErrorKind::NotConnected, true),
+            (RelayRemote::Upstream, io::ErrorKind::NotConnected, false),
+            (RelayRemote::Tor, io::ErrorKind::ConnectionReset, false),
+        ] {
+            let (mut client_peer, mut client) = tokio::io::duplex(64);
+            client_peer.write_all(b"request").await.unwrap();
+            client_peer.shutdown().await.unwrap();
+            let mut remote = FullCloseIo {
+                response: b"response",
+                request: Vec::new(),
+                closed: false,
+                error,
+                reader: None,
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                relay(&mut client, &mut remote, 8, side),
+            )
+            .await
+            .expect("full-close relay must terminate");
+            assert!(remote.closed);
+            assert_eq!(remote.request, b"request");
+            if expect_eof {
+                assert_eq!(result.expect("local Tor close must be EOF"), (7, 8));
+                let mut response = Vec::new();
+                client_peer.read_to_end(&mut response).await.unwrap();
+                assert_eq!(response, b"response");
+            } else {
+                assert_eq!(
+                    result
+                        .expect_err("unrelated failure must remain an error")
+                        .kind(),
+                    error
+                );
+            }
+        }
+    }
 }

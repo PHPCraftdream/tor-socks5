@@ -241,20 +241,57 @@ def manifest_seeds(old, new, graph):
         if key == "workspace":
             wa, wb = a.get(key, {}), b.get(key, {})
             for sub in changed_keys(wa, wb):
-                if sub != "dependencies":
+                if sub == "members":
+                    before, after = wa.get(sub, []), wb.get(sub, [])
+                    if not isinstance(before, list) or not isinstance(after, list) or not all(
+                            isinstance(member, str) for member in before + after):
+                        raise MappingError("missing mapping: workspace.members")
+                    if len(before) != len(set(before)) or len(after) != len(set(after)):
+                        raise MappingError("missing mapping: повторный член workspace")
+                    for member in before + after:
+                        if not member or any(char in member for char in "*?[]{}"):
+                            continue
+                        path = Path(member)
+                        if (path.is_absolute() or re.match(r"^[A-Za-z]:", member) or ".." in path.parts or
+                                "\\" in member):
+                            raise MappingError("missing mapping: недопустимый путь члена workspace: " + member)
+                    remaining = set(before)
+                    additions = []
+                    for member in after:
+                        if member in remaining:
+                            remaining.remove(member)
+                        else:
+                            additions.append(member)
+                    if remaining:
+                        raise MappingError("missing mapping: удалён член workspace")
+                    for member in additions:
+                        if not isinstance(member, str) or not member or any(char in member for char in "*?[]{}"):
+                            raise MappingError("missing mapping: неоднозначный член workspace: " + str(member))
+                        path = Path(member)
+                        if (path.is_absolute() or re.match(r"^[A-Za-z]:", member) or ".." in path.parts or
+                                "\\" in member):
+                            raise MappingError("missing mapping: недопустимый путь члена workspace: " + member)
+                        normalized = path.as_posix().rstrip("/")
+                        matches = {ident for ident in graph.members
+                                   if graph.paths.get(ident) == normalized}
+                        if len(matches) != 1:
+                            raise MappingError("missing mapping: член workspace отсутствует или неоднозначен: " + member)
+                        seeds |= matches
+                elif sub == "dependencies":
+                    da, db = wa.get(sub, {}), wb.get(sub, {})
+                    for name in changed_keys(da, db):
+                        if name in da and name not in db:
+                            raise MappingError("missing mapping: удалена зависимость workspace: " + name)
+                        names = {name}
+                        for value in (da.get(name), db.get(name)):
+                            if isinstance(value, dict):
+                                names.add(value.get("package", name))
+                        found = graph.named(names)
+                        if not found:
+                            raise MappingError("missing mapping: зависимость отсутствует в текущем графе (возможно удалена): " + name)
+                        seeds |= found
+                else:
                     raise MappingError("missing mapping: workspace." + sub)
-                da, db = wa.get(sub, {}), wb.get(sub, {})
-                for name in changed_keys(da, db):
-                    if name in da and name not in db:
-                        raise MappingError("missing mapping: удалена зависимость workspace: " + name)
-                    names = {name}
-                    for value in (da.get(name), db.get(name)):
-                        if isinstance(value, dict):
-                            names.add(value.get("package", name))
-                    found = graph.named(names)
-                    if not found:
-                        raise MappingError("missing mapping: зависимость отсутствует в текущем графе (возможно удалена): " + name)
-                    seeds |= found
         elif key == "patch":
             for registry in changed_keys(a.get(key, {}), b.get(key, {})):
                 names = changed_keys(a.get(key, {}).get(registry, {}), b.get(key, {}).get(registry, {}))
@@ -272,14 +309,106 @@ def lock_seeds(old, new, graph):
     if changed_keys({k: v for k, v in a.items() if k != "package"},
                     {k: v for k, v in b.items() if k != "package"}):
         raise MappingError("missing mapping: Cargo.lock")
+
     def index(data):
-        return {json.dumps(p, sort_keys=True): p for p in data.get("package", [])}
+        packages = data.get("package", [])
+        if not isinstance(packages, list):
+            raise MappingError("missing mapping: Cargo.lock packages")
+        result = {}
+        for package in packages:
+            if not isinstance(package, dict):
+                raise MappingError("missing mapping: Cargo.lock package")
+            name, version = package.get("name"), package.get("version")
+            source = package.get("source")
+            if (not isinstance(name, str) or not isinstance(version, str) or
+                    (source is not None and not isinstance(source, str))):
+                raise MappingError("missing mapping: Cargo.lock package identity")
+            identity = (name, version, source)
+            if identity in result:
+                raise MappingError("missing mapping: повторная идентичность Cargo.lock")
+            result[identity] = package
+        return result
+
     ia, ib = index(a), index(b)
-    names = {p["name"] for k, p in (ia | ib).items() if k in ia.keys() ^ ib.keys()}
-    found = graph.named(names)
-    if {graph.packages[i]["name"] for i in found} != names:
-        raise MappingError("missing mapping: пакет lock отсутствует в текущем графе (возможно удалён)")
-    return found
+    changed_old = {identity for identity in ia.keys() - ib.keys()}
+    changed_new = {identity for identity in ib.keys() - ia.keys()}
+    changed_old |= {identity for identity in ia.keys() & ib.keys() if ia[identity] != ib[identity]}
+    changed_new |= {identity for identity in ia.keys() & ib.keys() if ia[identity] != ib[identity]}
+
+    def graph_node(identity):
+        matches = {package_id for package_id, package in graph.packages.items()
+                   if (package.get("name"), package.get("version"), package.get("source")) == identity}
+        if len(matches) != 1:
+            raise MappingError("missing mapping: пакет lock отсутствует в текущем графе (возможно удалён или неоднозначен)")
+        return next(iter(matches))
+
+    seeds = {graph_node(identity) for identity in changed_new}
+    if changed_old:
+        def identity_key(identity):
+            return identity[0], identity[1], identity[2] or ""
+
+        def dependency_identity(text):
+            match = re.fullmatch(r"([^\s()]+)(?: ([^\s()]+))?(?: \(([^()]*)\))?", text)
+            if not match:
+                raise MappingError("missing mapping: неразрешённая зависимость Cargo.lock: " + str(text))
+            name, version, source = match.groups()
+            if source is not None and version is None:
+                raise MappingError("missing mapping: неоднозначная зависимость Cargo.lock: " + text)
+            matches = {identity for identity in ia
+                       if identity[0] == name and (version is None or identity[1] == version) and
+                       (source is None or identity[2] == source)}
+            if len(matches) != 1:
+                raise MappingError("missing mapping: неразрешённая или неоднозначная зависимость Cargo.lock: " + text)
+            return next(iter(matches))
+
+        def base_consumers(identity):
+            result = set()
+            for parent, package in ia.items():
+                dependencies = package.get("dependencies", [])
+                if not isinstance(dependencies, list):
+                    raise MappingError("missing mapping: зависимости Cargo.lock")
+                for dependency in dependencies:
+                    if not isinstance(dependency, str):
+                        raise MappingError("missing mapping: зависимость Cargo.lock")
+                    if dependency.split(" ", 1)[0] == identity[0] and dependency_identity(dependency) == identity:
+                        result.add(parent)
+            return result
+
+        def replacement(identity):
+            if identity in ib:
+                return identity
+            matches = {candidate for candidate in ib
+                       if candidate[0] == identity[0] and candidate[2] == identity[2]}
+            if len(matches) > 1:
+                raise MappingError("missing mapping: неоднозначная замена пакета Cargo.lock: " + identity[0])
+            return next(iter(matches)) if matches else None
+
+        def lift(identity, active):
+            if identity in active:
+                raise MappingError("missing mapping: цикл зависимостей Cargo.lock")
+            successor = replacement(identity)
+            if successor is not None:
+                return {graph_node(successor)}
+            parents = base_consumers(identity)
+            if not parents:
+                raise MappingError("missing mapping: пакет lock отсутствует в текущем графе (возможно удалён)")
+            result = set()
+            active.add(identity)
+            for parent in sorted(parents, key=identity_key):
+                parent_to_current = replacement(parent)
+                if parent_to_current is not None:
+                    result.add(graph_node(parent_to_current))
+                else:
+                    result.update(lift(parent, active))
+            active.remove(identity)
+            if not result:
+                raise MappingError("missing mapping: пакет lock отсутствует в текущем графе (возможно удалён)")
+            return result
+
+        for identity in sorted(changed_old, key=identity_key):
+            if identity not in ib:
+                seeds.update(lift(identity, set()))
+    return seeds
 
 
 def check_removed_dependencies(old, new):
