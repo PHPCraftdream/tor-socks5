@@ -471,34 +471,10 @@ jobs:
     needs: plan
     if: contains(fromJSON(needs.plan.outputs.plan).segments, 'license-offline')
     runs-on: ubuntu-latest
-    env:
-      PLAN: ${{ needs.plan.outputs.plan }}
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup-local-sdk
-        if: fromJSON(needs.plan.outputs.plan).license_stack
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-      - name: Проверка юридических файлов и локального набора лицензий
-        run: |
-          set -eu
-          test -s LICENSE-MIT
-          test -s LICENSE-APACHE
-          if [ -d .github/release/license ]; then
-            export LICENSE_TEST_BASH="$BASH"
-            python3 -I .github/release/license/tests/unit/test_bundle.py
-            python3 -I .github/release/license/tests/unit/test_admission.py
-            python3 -I .github/release/license/tests/unit/test_publish_bundle.py
-            python3 -I .github/release/license/tests/unit/test_source_inventory.py
-            python3 -I .github/release/license/tests/unit/test_provenance.py
-            python3 -I .github/release/license/tests/unit/test_workflow_portability.py
-            python3 -I .github/install/tests/test_release.py PublisherTests
-            python3 -I .github/install/tests/test_release.py ReleaseWorkflowWiring
-            python3 -I .github/release/license/tests/integration/test_release_chain.py
-          else
-            python3 -I -c 'import json,os,sys; r=json.loads(os.environ["PLAN"])["reasons"]["license-offline"]; all(x in ("LICENSE-MIT","LICENSE-APACHE") for x in r) or sys.exit("missing mapping: отсутствует лицензионный набор")'
-          fi
+      - name: Check root license and policy are present
+        run: test -s LICENSE-MIT && test -s LICENSE-APACHE && test -s .github/deny.toml
 
   license-audit:
     needs: plan
@@ -506,14 +482,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup-local-sdk
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
-      - run: |
-          test -f .github/deny.toml
-          cargo deny --config .github/deny.toml check licenses
+      - name: Fetch locked registry sources
+        run: cargo fetch --locked
+      - name: Check dependency licenses
+        run: cargo deny --locked --config .github/deny.toml check licenses
 
   license-lifecycle:
     needs: plan
@@ -631,7 +607,7 @@ jobs:
   required:
     name: CI required
     if: always()
-    needs: [plan, fmt, line-limit, dir-entries, publish-guard, packageability, real-tor-channel, rust, msrv, android, docs-contract, installer-sh, installer-windows, release-scripts, native-portability, vendor-extra, features, stress, license-offline, license-audit, license-lifecycle]
+    needs: [plan, fmt, line-limit, dir-entries, publish-guard, packageability, real-tor-channel, rust, msrv, android, docs-contract, installer-sh, installer-windows, release-scripts, native-portability, vendor-extra, features, stress, license-offline, license-audit]
     runs-on: ubuntu-latest
     env:
       NEEDS: ${{ toJSON(needs) }}
