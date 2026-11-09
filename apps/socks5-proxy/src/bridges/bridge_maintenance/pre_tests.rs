@@ -413,7 +413,10 @@ async fn invalid_reload_fails_before_readiness() {
             1,
             "pre_socks5 requires bridges.use_seeds and bridges.auto_fetch to be disabled",
         ),
-        (2, "pre_socks5 does not support pluggable transport bridges"),
+        (
+            2,
+            "pre_socks5 does not support pluggable transport bridges with unknown protocols",
+        ),
         (3, "pre_socks5 is incompatible with warm_pool.enabled"),
         (4, "pre несовместим с upstream"),
         (
@@ -429,7 +432,7 @@ async fn invalid_reload_fails_before_readiness() {
             2 => changed
                 .bridges
                 .lines
-                .push("obfs4 8.8.4.4:443 2222222222222222222222222222222222222222 cert=AAA".into()),
+                .push("unknownpt 8.8.4.4:443 2222222222222222222222222222222222222222".into()),
             3 => changed.warm_pool.enabled = true,
             4 => changed.upstream.enabled = true,
             5 => changed.bridges.auto_fetch = true,

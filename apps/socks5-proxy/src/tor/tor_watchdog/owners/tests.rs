@@ -215,6 +215,40 @@ async fn cancelled_wait_retains_blocking_constructor_until_close() {
     registry.close().await.unwrap();
     assert!(entry.state.lock().await.constructing.is_none());
 }
+#[tokio::test]
+async fn close_reports_constructed_outcome_failure_after_teardown() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry(dir.path());
+    let entry = registry
+        .reserve(Some(endpoint("failed-outcome")))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut settings = registry.settings.as_ref().unwrap().clone();
+    settings.state_dir = Some(dir.path().join("constructed-outcome"));
+    let tunnel = TorTunnel::create_unbootstrapped_with(settings).unwrap();
+    {
+        let mut state = entry.state.lock().await;
+        state.attempted = true;
+        state.constructing = Some(tokio::task::spawn_blocking(move || {
+            Ok(Constructed {
+                tunnel,
+                slot: 1,
+                outcome: Err(anyhow!("bootstrap failed")),
+            })
+        }));
+    }
+
+    assert!(registry.close().await.is_err());
+    let state = entry.state.lock().await;
+    assert!(state.constructing.is_none());
+    assert_eq!(state.slot, Some(1));
+    assert!(state.tunnel.is_none());
+    assert!(state.teardown.is_none());
+    drop(state);
+    registry.close().await.unwrap();
+}
+
 #[cfg(test)]
 mod pre_policy_tests {
     use super::super::super::validate_pre_compatibility;

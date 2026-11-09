@@ -47,10 +47,26 @@ fn restricted_owner_settings_are_network_free_and_reject_incompatible_options() 
     cfg.dns_server.enabled = true;
     assert!(crate::tor_setup::restricted_owner_settings(&cfg, None).is_err());
     cfg.dns_server.enabled = false;
-    cfg.bridges.lines.push(
+    cfg.bridges
+        .lines
+        .push("unknownpt 8.8.4.4:443 2222222222222222222222222222222222222222 cert=AAA".into());
+    assert!(crate::tor_setup::restricted_owner_settings(&cfg, None)
+        .unwrap_err()
+        .to_string()
+        .contains("unknown protocols"));
+
+    cfg = pre_config();
+    cfg.bridges.lines.extend([
         "obfs4 8.8.4.4:443 2222222222222222222222222222222222222222 cert=AAA iat-mode=0".into(),
-    );
-    assert!(crate::tor_setup::restricted_owner_settings(&cfg, None).is_err());
+        "webtunnel 8.8.8.8:443 3333333333333333333333333333333333333333 url=https://example.com/x ver=0.0.3".into(),
+    ]);
+    let expected = cfg.bridges.parsed().unwrap().bridges;
+    let settings = crate::tor_setup::restricted_owner_settings(&cfg, None).unwrap();
+    assert_eq!(settings.bridges, expected);
+    assert!(settings.pre_endpoint.is_none());
+    assert!(settings.stock_pt_proxy);
+    assert_eq!(settings.pt_binary, Some(std::env::current_exe().unwrap()));
+    settings.validate_stock_pt_proxy().unwrap();
 }
 
 #[tokio::test]
@@ -84,26 +100,56 @@ async fn pre_settings_use_configured_plain_bridges_without_probing() {
 }
 
 #[tokio::test]
+async fn pre_settings_accept_stock_pt_bridges_without_probing() {
+    FORBID_STARTUP_PROBE
+        .scope((), async {
+            for line in [
+                "obfs4 8.8.4.4:443 2222222222222222222222222222222222222222 cert=AAA iat-mode=0",
+                "webtunnel 8.8.8.8:443 3333333333333333333333333333333333333333 url=https://example.com/x ver=0.0.3",
+            ] {
+                let mut cfg = pre_config();
+                cfg.bridges.lines.push(line.into());
+                let parsed = cfg.bridges.parsed().unwrap();
+                let settings = build_tor_settings(&cfg, None).await.unwrap();
+
+                assert_eq!(settings.bridges, parsed.bridges);
+                assert_eq!(settings.bridges.len(), 2);
+                assert!(settings.stock_pt_proxy);
+                assert_eq!(settings.pt_binary, Some(std::env::current_exe().unwrap()));
+                assert_eq!(
+                    settings.pre_endpoint,
+                    Some(arti_wrapper::Socks5PreEndpoint::new(
+                        "127.0.0.1:1080".parse().unwrap(),
+                        Some(("alice".into(), "secret".into()))
+                    ))
+                );
+                assert!(settings.extra_pt_protocols.is_empty());
+                settings.validate_stock_pt_proxy().unwrap();
+            }
+        })
+        .await;
+}
+
+#[tokio::test]
 async fn pre_rejects_pt_and_incompatible_configuration() {
     FORBID_STARTUP_PROBE
         .scope((), async {
             let mut cfg = pre_config();
             cfg.bridges.lines.push(
-                "obfs4 8.8.4.4:443 2222222222222222222222222222222222222222 cert=AAA iat-mode=0"
-                    .into(),
+                "unknownpt 8.8.4.4:443 2222222222222222222222222222222222222222 cert=AAA".into(),
             );
             assert!(build_tor_settings(&cfg, None)
                 .await
                 .unwrap_err()
                 .to_string()
-                .contains("pluggable transport"));
+                .contains("unknown protocols"));
             cfg = pre_config();
             cfg.bridges.lines.clear();
             assert!(build_tor_settings(&cfg, None)
                 .await
                 .unwrap_err()
                 .to_string()
-                .contains("plain bridge"));
+                .contains("usable bridge"));
             cfg = pre_config();
             cfg.bridges.use_seeds = true;
             assert!(build_tor_settings(&cfg, None)
@@ -152,8 +198,7 @@ async fn pre_hint_and_rejected_pt_cannot_bypass_validation() {
             assert_eq!(settings.bridges.len(), 1);
             assert!(settings.bridges.iter().all(|b| b.transport.is_none()));
 
-            // Парсер отбрасывает obfs4 с документационным IPv6-адресом,
-            // но режим pre должен отклонить PT до этой фильтрации.
+            // A documentation-only stock PT address is filtered without activating PT.
             cfg.bridges.lines.push(
                 "obfs4 [2001:db8::1]:443 2222222222222222222222222222222222222222 cert=AAA iat-mode=0"
                     .into(),
@@ -162,16 +207,27 @@ async fn pre_hint_and_rejected_pt_cannot_bypass_validation() {
             assert_eq!(parsed.rejected, 1);
             assert_eq!(parsed.duplicates, 0);
             assert_eq!(parsed.bridges, settings.bridges);
+            let filtered_settings = build_tor_settings(&cfg, None).await.unwrap();
+            assert_eq!(filtered_settings.bridges, parsed.bridges);
+            assert!(!filtered_settings.stock_pt_proxy);
+            assert!(filtered_settings.pt_binary.is_none());
+
+            // Unknown transports remain rejected even when their address is filtered.
+            *cfg.bridges.lines.last_mut().expect("PT line exists") =
+                "unknownpt [2001:db8::1]:443 2222222222222222222222222222222222222222".into();
+            let parsed = cfg.bridges.parsed().unwrap();
+            assert_eq!(parsed.rejected, 1);
+            assert_eq!(parsed.duplicates, 0);
+            assert_eq!(parsed.bridges, settings.bridges);
             assert!(build_tor_settings(&cfg, None)
                 .await
                 .unwrap_err()
                 .to_string()
-                .contains("pluggable transport"));
+                .contains("unknown protocols"));
 
-            // IPv4 loopback проходит фильтр, но сырой PT всё равно запрещён в pre.
-            *cfg.bridges.lines.last_mut().expect("PT-строка существует") =
-                "obfs4 127.0.0.1:443 2222222222222222222222222222222222222222 cert=AAA iat-mode=0"
-                    .into();
+            // An accepted address does not make an unknown protocol supported.
+            *cfg.bridges.lines.last_mut().expect("PT line exists") =
+                "unknownpt 127.0.0.1:443 2222222222222222222222222222222222222222".into();
             let parsed = cfg.bridges.parsed().unwrap();
             assert_eq!(parsed.rejected, 0);
             assert_eq!(parsed.duplicates, 0);
@@ -182,7 +238,7 @@ async fn pre_hint_and_rejected_pt_cannot_bypass_validation() {
                 .await
                 .unwrap_err()
                 .to_string()
-                .contains("pluggable transport"));
+                .contains("unknown protocols"));
 
             cfg = pre_config();
             cfg.bridges

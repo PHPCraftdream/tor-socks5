@@ -331,14 +331,34 @@ impl OwnerRegistry {
         use futures::stream::{FuturesUnordered, StreamExt};
         let mut pending = FuturesUnordered::new();
         for entry in entries {
+            let close_failed = &self.close_failed;
             pending.push(async move {
                 let mut state = entry.state.lock().await;
                 if let Some(handle) = state.constructing.as_mut() {
                     let result = handle.await;
                     state.constructing.take();
-                    if let Ok(Ok(constructed)) = result {
-                        state.slot = Some(constructed.slot);
-                        state.tunnel = Some(constructed.tunnel);
+                    match result {
+                        Ok(Ok(Constructed {
+                            tunnel,
+                            slot,
+                            outcome,
+                        })) => {
+                            state.slot = Some(slot);
+                            state.tunnel = Some(tunnel);
+                            if let Err(error) = &outcome {
+                                if error.downcast_ref::<ConstructorCancelled>().is_none() {
+                                    close_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        Ok(Err(error)) => {
+                            if error.downcast_ref::<ConstructorCancelled>().is_none() {
+                                close_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                        Err(_) => {
+                            close_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 }
                 if let Some(tunnel) = state.tunnel.as_ref() {
@@ -353,7 +373,9 @@ impl OwnerRegistry {
                 if let Some(handle) = state.teardown.as_mut() {
                     let result = handle.await;
                     state.teardown.take();
-                    result.map_err(|_| anyhow!("ошибка освобождения Tor"))?;
+                    if result.is_err() {
+                        close_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 Ok::<(), anyhow::Error>(())
             });
