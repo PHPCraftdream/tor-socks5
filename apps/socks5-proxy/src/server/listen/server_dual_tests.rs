@@ -24,18 +24,25 @@ fn test_egress(listener: &TcpListener) -> Egress {
 /// creates a queued upstream connection and makes the final poll fail.
 #[tokio::test]
 async fn http_auth_and_onion_refusals_never_dial_upstream() {
+    const BASIC_CHALLENGE: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"resocks5\"\r\nContent-Length: 0\r\n\r\n";
+    const BASIC_CLOSE: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"resocks5\"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+    const BARE_CLOSE: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+    const FORBIDDEN: &[u8] =
+        b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let enabled = Arc::new(onion_state("alice", true, false));
     let disabled = Arc::new(onion_state("alice", false, true));
     // alice:pw and alice:wrong are public test credentials.
-    for (auth, block, target, header, status, authentication) in [
+    for (auth, block, target, header, retry_after_challenge, response, authentication) in [
         (
             Some(enabled.clone()),
             false,
             "example.com:443",
             "",
-            407,
+            true,
+            BASIC_CLOSE,
             true,
         ),
         (
@@ -43,7 +50,8 @@ async fn http_auth_and_onion_refusals_never_dial_upstream() {
             false,
             "example.com:443",
             "Proxy-Authorization: Basic YWxpY2U6d3Jvbmc=\r\n",
-            407,
+            false,
+            BASIC_CLOSE,
             true,
         ),
         (
@@ -51,7 +59,8 @@ async fn http_auth_and_onion_refusals_never_dial_upstream() {
             false,
             "example.com:443",
             "Proxy-Authorization: Basic YWxpY2U6cHc=\r\n",
-            407,
+            false,
+            BASIC_CLOSE,
             true,
         ),
         (
@@ -59,42 +68,68 @@ async fn http_auth_and_onion_refusals_never_dial_upstream() {
             false,
             "example.com:443",
             "Proxy-Authorization: Basic YWxpY2U6cHc=\r\n",
-            407,
+            false,
+            BARE_CLOSE,
             true,
         ),
-        (None, true, "example.ONION.:443", "", 403, false),
+        (
+            None,
+            true,
+            "example.ONION.:443",
+            "",
+            false,
+            FORBIDDEN,
+            false,
+        ),
         (
             Some(enabled),
             false,
             "example.ONION.:443",
             "Proxy-Authorization: Basic YWxpY2U6cHc=\r\n",
-            403,
+            false,
+            FORBIDDEN,
             false,
         ),
     ] {
-        let mut client = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (server, _) = listener.accept().await.unwrap();
-        client
-            .write_all(format!("CONNECT {target} HTTP/1.1\r\n{header}\r\n").as_bytes())
-            .await
-            .unwrap();
-        // Complete before inspecting the still-open upstream listener. A bypass
-        // would stall in setup and hit this safety bound instead of passing.
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            handle_client(
-                server,
-                test_egress(&upstream),
-                auth,
-                ConnHealthCounters::default(),
-                block,
-                1,
-            ),
-        )
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            let (result, ()) = tokio::join!(
+                handle_client(
+                    server,
+                    test_egress(&upstream),
+                    auth,
+                    ConnHealthCounters::default(),
+                    block,
+                    1,
+                ),
+                async {
+                    client
+                        .write_all(format!("CONNECT {target} HTTP/1.1\r\n{header}\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                    if retry_after_challenge {
+                        let mut challenge = vec![0; BASIC_CHALLENGE.len()];
+                        client.read_exact(&mut challenge).await.unwrap();
+                        assert_eq!(challenge, BASIC_CHALLENGE);
+                        assert_no_upstream_connection(&upstream).await;
+                        client
+                            .write_all(format!("CONNECT {target} HTTP/1.1\r\nProxy-Authorization: Basic YWxpY2U6d3Jvbmc=\r\n\r\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    let mut final_response = Vec::new();
+                    client.read_to_end(&mut final_response).await.unwrap();
+                    assert_eq!(final_response, response);
+                }
+            );
+            result
+        })
         .await
-        .expect("refusal must complete without egress");
+        .expect("HTTP refusal must complete within the per-case bound");
+
         if authentication {
             let error = result.unwrap_err();
             assert!(
@@ -107,12 +142,6 @@ async fn http_auth_and_onion_refusals_never_dial_upstream() {
         } else {
             result.unwrap();
         }
-        let mut response = Vec::new();
-        client.read_to_end(&mut response).await.unwrap();
-        assert!(
-            response.starts_with(format!("HTTP/1.1 {status} ").as_bytes()),
-            "{response:?}"
-        );
         assert_no_upstream_connection(&upstream).await;
     }
 }
