@@ -33,6 +33,8 @@ enum Bnd {
     V4,
     V6,
     Domain,
+    EmptyDomain,
+    TruncatedDomain,
 }
 
 impl Bnd {
@@ -45,7 +47,9 @@ impl Bnd {
                 v.extend_from_slice(&[0, 0]);
                 v
             }
-            Bnd::Domain => vec![ATYP_DOMAIN, 0, 0, 0],
+            Bnd::Domain => vec![ATYP_DOMAIN, 3, b'b', b'n', b'd', 0x12, 0x34],
+            Bnd::EmptyDomain => vec![ATYP_DOMAIN, 0, 0, 0],
+            Bnd::TruncatedDomain => vec![ATYP_DOMAIN, 3, b'b', b'n', b'd', 0x12],
         }
     }
 }
@@ -211,13 +215,90 @@ async fn bnd_addr_v6_is_drained() {
 
 #[tokio::test]
 async fn bnd_addr_domain_is_drained() {
-    let (addr, handle) = fake_upstream(false, false, REP_SUCCESS, Bnd::Domain, b"tail").await;
-    let up = Upstream::new(addr, None);
-    let mut s = up.connect("example.com", 443).await.expect("connect ok");
-    handle.await.unwrap().expect("stub reached CONNECT");
-    let mut payload = [0u8; 4];
-    s.read_exact(&mut payload).await.unwrap();
-    assert_eq!(&payload, b"tail");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut head = [0u8; 2];
+            s.read_exact(&mut head).await.unwrap();
+            let mut methods = vec![0u8; head[1] as usize];
+            s.read_exact(&mut methods).await.unwrap();
+            s.write_all(&[VER, M_NO_AUTH]).await.unwrap();
+            let mut req = [0u8; 4];
+            s.read_exact(&mut req).await.unwrap();
+            let mut len = [0u8; 1];
+            s.read_exact(&mut len).await.unwrap();
+            let mut target = vec![0u8; len[0] as usize + 2];
+            s.read_exact(&mut target).await.unwrap();
+            for byte in [
+                VER,
+                REP_SUCCESS,
+                0,
+                ATYP_DOMAIN,
+                3,
+                b'b',
+                b'n',
+                b'd',
+                0x12,
+                0x34,
+            ] {
+                s.write_all(std::slice::from_ref(&byte)).await.unwrap();
+            }
+            s.write_all(b"tail").await.unwrap();
+        };
+        let client = async {
+            let up = Upstream::new(addr, None);
+            let mut s = up.connect("example.com", 443).await.expect("connect ok");
+            let mut payload = Vec::new();
+            s.read_to_end(&mut payload).await.unwrap();
+            assert_eq!(payload, b"tail");
+        };
+        tokio::join!(server, client);
+    })
+    .await
+    .expect("fragmented bound-domain exchange must finish");
+}
+
+#[tokio::test]
+async fn bnd_addr_domain_truncated_port_is_rejected() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (addr, handle) =
+            fake_upstream(false, false, REP_SUCCESS, Bnd::TruncatedDomain, b"").await;
+        let up = Upstream::new(addr, None);
+        let err = failure(up.connect("example.com", 443).await);
+        assert!(matches!(
+            typed(&err),
+            ConnectError::Io {
+                stage: Stage::Handshake,
+                ..
+            }
+        ));
+        assert!(err.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|source| source.kind() == std::io::ErrorKind::UnexpectedEof)
+        }));
+        handle.await.unwrap().expect("stub reached CONNECT");
+    })
+    .await
+    .expect("truncated bound-domain reply must terminate");
+}
+
+#[tokio::test]
+async fn bnd_addr_empty_domain_is_rejected() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (addr, handle) = fake_upstream(false, false, REP_SUCCESS, Bnd::EmptyDomain, b"").await;
+        let up = Upstream::new(addr, None);
+        let err = failure(up.connect("example.com", 443).await);
+        assert!(matches!(
+            typed(&err),
+            ConnectError::Protocol(ProtocolViolation::Socks5EmptyBoundDomain)
+        ));
+        handle.await.unwrap().expect("stub reached CONNECT");
+    })
+    .await
+    .expect("empty bound-domain reply must terminate");
 }
 
 #[tokio::test]
