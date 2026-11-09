@@ -1,3 +1,4 @@
+// Modified locally for tor-socks5; see vendor/PROVENANCE.md.
 //! Infrastructure required to support managed PTs.
 
 use crate::config::{ManagedTransportOptions, TransportOptions};

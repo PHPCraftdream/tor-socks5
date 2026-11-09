@@ -17,6 +17,12 @@ not vendored here. The root `Cargo.toml` declares its crates.io packages
 (`ptrs-gesher-bridge-line` and `ptrs-gesher-lyrebird`) as workspace
 dependencies; there is no sibling-checkout `[patch.crates-io]` override.
 
+See [PROVENANCE.md](PROVENANCE.md) for the eight published README license
+offers, byte-identical standard Apache-2.0 license copies, the bounded source
+basis, the unresolved upstream GitLab 403 and §4(c) applicability, and the
+record of nine files now carrying prominent §4(b) change-notice comments. This
+does not claim legal approval or global clearance.
+
 ### Onion-service server (not vendored)
 
 The app's `onion-service` feature enables `arti-wrapper/onion-service`
