@@ -111,10 +111,14 @@ class Routing(unittest.TestCase):
         self.assertEqual(self.route("apps/socks5-proxy/src/main.rs")["command_packages"]["android"], ["socks5-proxy"])
         self.assertIn("tor", self.route("packages/arti-wrapper/src/lib.rs")["segments"])
         self.assertEqual(self.route("docs/plans/note.md")["segments"], ["fast"])
+        self.assertEqual(self.route("docs/project/licensing.md")["segments"], ["fast"])
+        self.assertEqual(self.route("docs/project/license-policy.md")["segments"], ["fast"])
         self.assertEqual(self.route("vendor/README.md")["segments"], ["fast"])
         with self.assertRaises(p.MappingError):
             self.route("vendor/unknown-control.txt")
-        caps = {"license_stack": True, "real_tor_channel": False}
+        with self.assertRaisesRegex(p.MappingError, "missing mapping: путь: deny.toml"):
+            self.route("deny.toml")
+        caps = {"license_policy": True, "real_tor_channel": False}
         for path in (".github/release/license/README.md", "docs/project/licensing.md", "packages/auth/README.md", "vendor/README.md"):
             result = self.route(path, capabilities=caps)
             self.assertEqual(result["segments"], ["fast"])
@@ -122,15 +126,17 @@ class Routing(unittest.TestCase):
             self.assertEqual(result["native_rows"], [])
         for path in (".github/release/license/bundle.py", ".github/release/license/reviews/evidence.md"):
             result = self.route(path, capabilities=caps)
-            for segment in ("rust", "native-portability", "license-offline", "license-audit", "license-lifecycle"):
-                self.assertIn(segment, result["segments"])
-            self.assertNotIn("tor", result["segments"])
+            self.assertEqual(result["segments"], ["fast", "license-audit", "license-offline"])
+            self.assertEqual(result["packages"], [])
+            self.assertEqual(result["native_rows"], [])
+            self.assertNotIn("license-lifecycle", result["segments"])
 
     def test_install_license_tor_native(self):
         self.assertIn("installer-sh", self.route(".github/install/install.sh")["segments"])
         self.assertIn("installer-windows", self.route(".github/install/install.ps1")["segments"])
         self.assertIn("release", self.route(".github/release/publish.sh")["segments"])
-        self.assertIn("license-offline", self.route("LICENSE-MIT")["segments"])
+        self.assertEqual(self.route("LICENSE-MIT", capabilities={"license_policy": True})["segments"],
+                         ["fast", "license-audit", "license-offline"])
         self.assertIn("tor", self.route("packages/bridge-probe/src/lib.rs")["segments"])
         self.assertIn({"segment": "rust", "target": "windows-latest"}, self.route("packages/auth/src/lib.rs")["target_rows"])
 
@@ -392,7 +398,7 @@ class Routing(unittest.TestCase):
     def test_added_workflow_has_no_base_jobs(self):
         path = ".github/workflows/license-promote.yml"
         new = "name: Promote\njobs:\n  promote:\n    runs-on: ubuntu-latest\n"
-        caps = {"license_stack": True, "real_tor_channel": False}
+        caps = {"license_policy": True, "real_tor_channel": False}
         result = self.route(path, blobs={path: ("", new)}, capabilities=caps)
         self.assertIn("license-offline", result["segments"])
         self.assertFalse(result["full"])
@@ -409,7 +415,7 @@ class Routing(unittest.TestCase):
         new = "name: CI\njobs:\n  native-portability:\n    runs-on: ${{ matrix.runner }}\n"
         result = self.route(".github/workflows/ci.yml",
                             blobs={".github/workflows/ci.yml": (old, new)},
-                            capabilities={"license_stack": True, "real_tor_channel": False})
+                            capabilities={"license_policy": True, "real_tor_channel": False})
         self.assertFalse(result["full"])
         self.assertIn("native-portability", result["segments"])
         self.assertEqual({row["target"] for row in result["native_rows"]},
@@ -422,8 +428,30 @@ class Routing(unittest.TestCase):
         self.assertNotIn("tor", self.route("apps/socks5-proxy/src/commands/auth.rs")["segments"])
         self.assertIn("tor", self.route("apps/socks5-proxy/src/tor/channel.rs")["segments"])
         self.assertIn("license-offline", self.route(".github/release/license/check.py")["segments"])
-        self.assertIn("license-audit", self.route(".github/deny.toml")["segments"])
+        self.assertEqual(self.route("LICENSE-MIT")["segments"], ["fast"])
+        self.assertEqual(self.route("Cargo.toml", blobs={"Cargo.toml": ("[workspace]\nresolver='2'", "[workspace]\nresolver='2'")})["segments"],
+                         ["fast"])
+        result = self.route("Cargo.toml", blobs={"Cargo.toml": ("[workspace]\nresolver='2'", "[workspace]\nresolver='2'")},
+                            capabilities={"license_policy": True})
+        self.assertEqual(result["segments"], ["fast", "license-audit"])
+        self.assertNotIn("license-lifecycle", result["segments"])
+        self.assertEqual(self.route("Cargo.lock", blobs={"Cargo.lock": ("version=4", "version=4")},
+                                    capabilities={"license_policy": True})["segments"], ["fast", "license-audit"])
+        self.assertNotIn("license-audit", self.route("Cargo.lock", blobs={"Cargo.lock": ("version=4", "version=4")})["segments"])
+        self.assertEqual(self.route("vendor/README.md", capabilities={"license_policy": True})["segments"], ["fast"])
+        self.assertEqual(self.route("vendor/PROVENANCE.md", capabilities={"license_policy": True})["segments"], ["fast"])
         with self.assertRaisesRegex(p.MappingError, "missing mapping"):
+            self.route("vendor/NOTICE", capabilities={"license_policy": True})
+        full_without_license = self.route(mode="sprint-full", capabilities={"license_policy": False,
+                                                                                "real_tor_channel": False})
+        self.assertFalse({"license-offline", "license-audit"} & set(full_without_license["segments"]))
+        license_root = self.route("LICENSE-MIT", capabilities={"license_policy": True})
+        self.assertEqual(license_root["segments"], ["fast", "license-audit", "license-offline"])
+        self.assertEqual(self.route(".github/release/license/README.md", capabilities={"license_policy": True})["segments"], ["fast"])
+        self.assertEqual(self.route(".github/license/README.md", capabilities={"license_policy": True})["segments"], ["fast"])
+        with self.assertRaisesRegex(p.MappingError, "missing mapping"):
+            self.route(".github/deny.toml")
+        with self.assertRaisesRegex(p.MappingError, "missing mapping: путь: deny.toml"):
             self.route("deny.toml")
         result = self.route("apps/socks5-proxy/build.rs")
         self.assertNotIn("license-offline", result["segments"])
@@ -473,15 +501,26 @@ class Routing(unittest.TestCase):
     def test_ci_workflow_consumers(self):
         workflow = Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml"
         blocks = p.workflow_blocks(workflow.read_text(encoding="utf-8"))
-        for job in ("rust", "msrv", "android", "docs-contract", "native-portability", "vendor-extra", "features", "stress", "license-offline", "license-audit", "license-lifecycle", "real-tor-channel", "installer-sh", "installer-windows", "release-scripts"):
+        for job in ("rust", "msrv", "android", "docs-contract", "native-portability", "vendor-extra", "features", "stress", "license-offline", "license-audit", "real-tor-channel", "installer-sh", "installer-windows", "release-scripts"):
             self.assertIn(job, blocks)
             self.assertIn("contains(fromJSON(needs.plan.outputs.plan).segments", blocks[job])
             self.assertIn(job, blocks["required"])
-        self.assertIn("github.event_name == 'pull_request' && contains(fromJSON(needs.plan.outputs.plan).segments", blocks["license-lifecycle"])
-        self.assertIn("if: github.event_name == 'pull_request'", blocks["license-lifecycle"])
+        self.assertIn("license-lifecycle", blocks)
+        self.assertNotIn("license-lifecycle", blocks["required"])
         self.assertIn("always()", blocks["required"])
-        self.assertIn("cargo deny", blocks["license-audit"])
-        self.assertNotIn("license-audit", self.route(mode="sprint-full")["segments"])
+        self.assertIn("cargo deny --locked --config .github/deny.toml check licenses", blocks["license-audit"])
+        self.assertIn("cargo fetch --locked", blocks["license-audit"])
+        self.assertNotIn("python", blocks["license-audit"])
+        self.assertNotIn("artifact", blocks["license-audit"])
+        self.assertIn("test -s LICENSE-MIT && test -s LICENSE-APACHE && test -s .github/deny.toml", blocks["license-offline"])
+        self.assertNotIn("python", blocks["license-offline"])
+        policy_change = self.route(".github/deny.toml", capabilities={"license_policy": True})
+        self.assertEqual(policy_change["segments"], ["fast", "license-audit", "license-offline"])
+        self.assertNotIn("license-lifecycle", policy_change["segments"])
+        full = self.route(mode="sprint-full", capabilities={"license_policy": True,
+                                                             "real_tor_channel": False})
+        self.assertTrue({"license-offline", "license-audit"} <= set(full["segments"]))
+        self.assertNotIn("license-lifecycle", full["segments"])
 
     def test_macos_loopback_fixtures(self):
         root = Path(__file__).resolve().parents[2]
@@ -537,26 +576,21 @@ jobs:
         example = self.route("packages/proxy-config/examples/sample.ktav")
         self.assertEqual(example["segments"], ["docs-contract", "fast"])
         self.assertEqual(example["packages"], [])
-        caps = {"license_stack": True}
+        caps = {"license_policy": True}
         readme = self.route("README.md", capabilities=caps)
-        self.assertTrue(readme["license_stack"])
-        self.assertFalse(set(readme["segments"]) & {"license-offline", "license-audit", "license-lifecycle", "native-portability"})
+        self.assertFalse(set(readme["segments"]) & {"license-offline", "license-audit", "native-portability"})
         for event in ("push", "workflow_dispatch"):
             result = self.route("apps/socks5-proxy/build.rs", capabilities=caps, event=event)
             self.assertNotIn("license-lifecycle", result["segments"])
-            for segment in ("license-offline", "license-audit", "rust", "native-portability"):
-                self.assertIn(segment, result["segments"])
         bundle = ".github/workflows/license-bundle.yml"
         before = "name: Bundle\njobs:\n  guard:\n    x: 1\n  build:\n    x: 1\n"
         changed = self.route(bundle, blobs={bundle: (before, before.replace("x: 1", "x: 2"))}, capabilities=caps)
-        self.assertIn("license-offline", changed["segments"])
-        self.assertIn("license-lifecycle", changed["segments"])
-        self.assertIn("license-lifecycle", self.route("apps/socks5-proxy/build.rs", capabilities=caps)["segments"])
+        self.assertEqual(changed["segments"], ["fast", "license-offline"])
+        self.assertNotIn("license-lifecycle", self.route("apps/socks5-proxy/build.rs", capabilities=caps)["segments"])
         interface = self.route(".github/release/license/check.py", capabilities=caps)
-        self.assertIn("license-lifecycle", interface["segments"])
-        self.assertIn("android", interface["segments"])
-        self.assertEqual(interface["command_packages"]["android"], ["socks5-proxy"])
-        full = self.route(mode="sprint-full", capabilities=caps)
+        self.assertEqual(interface["segments"], ["fast", "license-audit", "license-offline"])
+        self.assertEqual(interface["command_packages"]["android"], [])
+        full = self.route(mode="sprint-full", capabilities={"license_policy": True})
         self.assertIn("license-audit", full["segments"])
         self.assertNotIn("license-lifecycle", full["segments"])
         release = ".github/workflows/release.yml"
@@ -571,7 +605,7 @@ jobs:
         native = {"Cargo.toml": ('[workspace.dependencies]\nopenssl-sys="1"', '[workspace.dependencies]\nopenssl-sys="2"')}
         result = self.route("Cargo.toml", blobs=native, capabilities=caps)
         self.assertEqual(result["packages"], ["socks5-proxy"])
-        self.assertIn("license-lifecycle", result["segments"])
+        self.assertNotIn("license-lifecycle", result["segments"])
         self.assertIn("aarch64-unknown-linux-musl", [row["target"] for row in result["native_rows"]])
         self.assertIn("x86_64-pc-windows-msvc", [row["target"] for row in result["native_rows"]])
         with self.assertRaisesRegex(p.MappingError, "missing mapping"):
@@ -602,24 +636,26 @@ jobs:
         for filename in ("test_release.py", "gh_mock.py"):
             path = ".github/install/tests/" + filename
             self.assertEqual(self.route(path)["segments"], ["fast", "release"])
-            self.assertEqual(self.route(path, capabilities={"license_stack": True})["segments"], ["fast", "license-offline", "release"])
+            self.assertEqual(self.route(path, capabilities={"license_policy": True})["segments"], ["fast", "release"])
         path = ".github/install/tests/fixtures.py"
         self.assertEqual(self.route(path)["segments"], ["fast", "installer-sh", "installer-windows", "release"])
-        self.assertEqual(self.route(path, capabilities={"license_stack": True})["segments"], ["fast", "installer-sh", "installer-windows", "license-offline", "release"])
+        self.assertEqual(self.route(path, capabilities={"license_policy": True})["segments"], ["fast", "installer-sh", "installer-windows", "release"])
         self.assertEqual(self.route(".github/install/install.sh")["segments"], ["fast", "installer-sh"])
         for path, old, new in (("Cargo.toml", '[workspace.dependencies]\nold="1"', '[workspace.dependencies]\nnew="1"'),
                                ("Cargo.lock", 'version=3\n[[package]]\nname="old"\nversion="1"', 'version=3\n')):
             with self.assertRaisesRegex(p.MappingError, "missing mapping"):
-                self.route(path, blobs={path: (old, new)}, capabilities={"license_stack": True})
+                self.route(path, blobs={path: (old, new)}, capabilities={"license_policy": True})
         workflow = Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml"
         blocks = p.workflow_blocks(workflow.read_text(encoding="utf-8"))
         self.assertNotIn("'regression'", blocks["stress"])
         self.assertIn("name: CI required", blocks["required"])
 
     def test_required_results(self):
-        plan = {"segments": ["fast", "rust"], "capabilities": {"real_tor_channel": True}}
+        plan = {"segments": ["fast", "rust"], "capabilities": {"real_tor_channel": True, "license_policy": False}, "full": False}
         needs = {job: {"result": "success" if any(s in plan["segments"] for s in selections) else "skipped"} for job, selections in p.RESULT_JOBS.items()}
         needs["plan"] = {"result": "success"}
+        with self.assertRaisesRegex(p.MappingError, "license policy capability"):
+            p.validate_results({"segments": ["fast", "rust"], "capabilities": {"real_tor_channel": True}}, needs)
         p.validate_results(plan, needs)
         for result in ("failure", "cancelled", "skipped"):
             needs["rust"]["result"] = result
@@ -631,14 +667,11 @@ jobs:
             p.validate_results(plan, needs)
         needs["android"]["result"] = "skipped"
         p.validate_results(plan, needs)
-        lifecycle_plan = {"segments": ["fast", "rust", "license-lifecycle"], "capabilities": {"real_tor_channel": True}}
-        with self.assertRaises(p.MappingError):
+        lifecycle_plan = {"segments": ["fast", "rust", "license-lifecycle"], "capabilities": {"real_tor_channel": True, "license_policy": False}, "full": False}
+        with self.assertRaisesRegex(p.MappingError, "legacy license lifecycle is disabled"):
             p.validate_results(lifecycle_plan, needs)
-        needs["license-lifecycle"]["result"] = "success"
-        p.validate_results(lifecycle_plan, needs)
-        needs["license-lifecycle"]["result"] = "skipped"
         with self.assertRaisesRegex(p.MappingError, "нет потребителя"):
-            p.validate_results({"segments": ["fast", "rust", "unknown-segment"], "capabilities": {"real_tor_channel": True}}, needs)
+            p.validate_results({"segments": ["fast", "rust", "unknown-segment"], "capabilities": {"real_tor_channel": True, "license_policy": False}, "full": False}, needs)
         del needs["android"]
         with self.assertRaises(p.MappingError):
             p.validate_results(plan, needs)
@@ -650,15 +683,17 @@ jobs:
         for path in p.TOR_ANCHORS:
             with self.assertRaisesRegex(p.MappingError, 'missing mapping'):
                 p.contract_capability(read({path: 'evidence'}), read(absent))
-        manifest_route = self.route(p.CONTRACT_MANIFEST, capabilities={'real_tor_channel': False})
+        manifest_route = self.route(p.CONTRACT_MANIFEST, capabilities={'real_tor_channel': False,
+                                                                        'license_policy': False})
         self.assertEqual(manifest_route['segments'], ['fast', 'regression'])
         self.assertEqual(manifest_route['capability_reasons']['real_tor_channel'], 'контракт не установлен')
         for path in ('packages/proxy-config/src/lib.rs', 'packages/proxy-config/client-acl/src/lib.rs', 'packages/bridge-probe/src/lib.rs'):
-            result = self.route(path, capabilities={'real_tor_channel': False})
+            result = self.route(path, capabilities={'real_tor_channel': False, 'license_policy': False})
             self.assertNotIn('tor', result['segments'])
             self.assertIn('rust', result['segments'])
             self.assertFalse(result['capabilities']['real_tor_channel'])
-        self.assertNotIn('tor', self.route(mode='sprint-full', capabilities={'real_tor_channel': False})['segments'])
+        self.assertNotIn('tor', self.route(mode='sprint-full', capabilities={'real_tor_channel': False,
+                                                                              'license_policy': False})['segments'])
         installed = {path: '\n'.join(markers) for path, markers in p.TOR_MARKERS.items()}
         installed[p.CONTRACT_MANIFEST] = 'real_tor_channel = true\n'
         self.assertTrue(p.contract_capability(read({}), read(installed)))
@@ -677,7 +712,52 @@ jobs:
         needs = {job: {'result': 'skipped'} for job in p.RESULT_JOBS}
         needs['plan'] = {'result': 'success'}
         with self.assertRaisesRegex(p.MappingError, 'missing mapping'):
-            p.validate_results({'segments': ['tor'], 'capabilities': {'real_tor_channel': False}}, needs)
+            p.validate_results({'segments': ['tor'], 'capabilities': {'real_tor_channel': False,
+                                'license_policy': False}}, needs)
+
+    def test_license_policy_capability_and_routing(self):
+        read = lambda data: lambda path: data.get(path)
+        self.assertFalse(p.license_policy_capability(read({}), read({})))
+        self.assertTrue(p.license_policy_capability(read({}), read({'.github/deny.toml': 'policy bytes'})))
+        with self.assertRaisesRegex(p.MappingError, 'empty license-policy identity file'):
+            p.license_policy_capability(read({}), read({'.github/deny.toml': '  \n'}))
+        with self.assertRaisesRegex(p.MappingError, 'license-policy identity removed'):
+            p.license_policy_capability(read({'.github/deny.toml': 'policy bytes'}), read({}))
+        caps = {'license_policy': True, 'real_tor_channel': False}
+        with self.assertRaisesRegex(p.MappingError, 'missing mapping: путь: deny.toml'):
+            self.route('deny.toml')
+        self.assertEqual(self.route('vendor/README.md', capabilities=caps)['segments'], ['fast'])
+        self.assertEqual(self.route('vendor/PROVENANCE.md', capabilities=caps)['segments'], ['fast'])
+        with self.assertRaisesRegex(p.MappingError, 'missing mapping'):
+            self.route('vendor/NOTICE', capabilities=caps)
+        for path in (".github/deny.toml", ".github/license/README.md"):
+            with self.subTest(path=path):
+                result = self.route(path, capabilities=caps)
+                expected = ['fast', 'license-audit', 'license-offline'] if path == '.github/deny.toml' else ['fast']
+                self.assertEqual(result['segments'], expected)
+                if path == '.github/deny.toml':
+                    self.assertEqual(result['packages'], [])
+                    self.assertEqual(result['native_rows'], [])
+                    needs = {job: {'result': 'success' if any(s in result['segments'] for s in selections) else 'skipped'}
+                             for job, selections in p.RESULT_JOBS.items()}
+                    needs['plan'] = {'result': 'success'}
+                    p.validate_results(result, needs)
+                    for outcome in ('skipped', 'failure', 'cancelled'):
+                        needs['license-audit']['result'] = outcome
+                        with self.assertRaisesRegex(p.MappingError, 'license-audit: expected success'):
+                            p.validate_results(result, needs)
+        full = self.route(mode='sprint-full', capabilities=caps)
+        self.assertTrue({'license-offline', 'license-audit'} <= set(full['segments']))
+        full_needs = {job: {'result': 'success' if any(s in full['segments'] for s in selections) else 'skipped'}
+                      for job, selections in p.RESULT_JOBS.items()}
+        full_needs['plan'] = {'result': 'success'}
+        p.validate_results(full, full_needs)
+        for job in ('license-offline', 'license-audit'):
+            for outcome in ('skipped', 'failure', 'cancelled'):
+                full_needs[job]['result'] = outcome
+                with self.assertRaisesRegex(p.MappingError, job + ': expected success'):
+                    p.validate_results(full, full_needs)
+            full_needs[job]['result'] = 'success'
 
     def test_events(self):
         calls = []

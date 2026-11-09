@@ -18,6 +18,9 @@ REQUIRED_DOCS = ("README.md", "tor-socks5.example.ktav",
 
 CONTRACT_MANIFEST = ".config/ci-contracts.toml"
 LICENSE_DOCS = frozenset({".github/release/license/README.md"})
+LICENSE_POLICY_FILES = (".github/deny.toml",)
+
+
 TOR_ANCHORS = ("scripts/testing/real-tor-channel.sh", "scripts/testing/real-tor-mutations.sh",
                "apps/socks5-proxy/src/bridges/bridge_maintenance/real_channel_tests.rs")
 TOR_MARKERS = {
@@ -52,6 +55,52 @@ def contract_capability(base_read, head_read):
             if not text or any(marker not in text for marker in markers):
                 raise MappingError("missing mapping: real Tor contract: " + path)
     return after
+
+
+def license_policy_capability(base_read, head_read):
+    """Require a present, nonempty deny policy and reject removal."""
+    def installed(read):
+        text = read(".github/deny.toml")
+        if text is not None and not text.strip():
+            raise MappingError("missing mapping: empty license-policy identity file")
+        return text is not None
+
+    before, after = installed(base_read), installed(head_read)
+    if before and not after:
+        raise MappingError("missing mapping: license-policy identity removed")
+    return after
+
+
+def license_policy_checkout_capability(root, head_read, enabled):
+    root = Path(root)
+    for path in LICENSE_POLICY_FILES:
+        expected = head_read(path)
+        target = root
+        for part in path.split("/")[:-1]:
+            target /= part
+            if target.is_symlink():
+                raise MappingError("missing mapping: license policy checkout differs from Git: " + path)
+            if not target.is_dir():
+                target = None
+                break
+        actual = None
+        if target is not None:
+            target /= path.rsplit("/", 1)[-1]
+            if target.is_symlink():
+                raise MappingError("missing mapping: license policy checkout differs from Git: " + path)
+            if target.exists():
+                if not target.is_file():
+                    raise MappingError("missing mapping: license policy checkout differs from Git: " + path)
+                actual = target.read_bytes()
+        if expected is None:
+            if actual is not None:
+                raise MappingError("missing mapping: license policy checkout differs from Git: " + path)
+            continue
+        if actual is None:
+            raise MappingError("missing mapping: license policy checkout input missing: " + path)
+        if not actual or actual != expected.encode("utf-8"):
+            raise MappingError("missing mapping: license policy checkout differs from Git: " + path)
+    return enabled
 
 
 # Полный прогон выбирает ТОЧНЫЙ standalone footer в сообщении коммита:
@@ -191,8 +240,7 @@ JOB_SEGMENTS = {
     "required": "fast", "regression": "fast", "rust": "rust", "docs-contract": "docs-contract",
     "vendor-extra": "vendor-extra", "features": "features", "native-portability": "native-portability",
     "portability-diagnostics": "native-portability",
-    "license-offline": "license-offline", "license-audit": "license-audit",
-    "license-lifecycle": "license-lifecycle", "license-producer": "fast", "stress": "stress",
+    "license-offline": "license-offline", "license-audit": "license-audit", "license-producer": "fast", "stress": "stress",
 }
 
 
@@ -492,8 +540,8 @@ def config_targets(old, new):
 def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_request",
          full_reason="ручной sprint-full", full_trigger=None):
     if capabilities is None:
-        capabilities = {"license_stack": (graph.root / ".github/deny.toml").is_file() and (graph.root / ".github/release/license").is_dir()}
-    license_stack = bool(capabilities.get("license_stack", False))
+        capabilities = {"license_policy": (graph.root / ".github/deny.toml").is_file()}
+    license_policy = bool(capabilities.get("license_policy", False))
     real_tor = capabilities.get("real_tor_channel", True)
     if type(real_tor) is not bool:
         raise MappingError("missing mapping: real Tor capability")
@@ -505,7 +553,7 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
     def add(segment, reason):
         if segment == "tor" and not real_tor:
             return
-        if segment == "license-lifecycle" and (event != "pull_request" or mode == "sprint-full"):
+        if segment == "license-lifecycle":
             return
         segments.add(segment)
         reasons.setdefault(segment, set()).add(reason)
@@ -520,6 +568,8 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
         return ids
     for path in sorted(set(paths)):
         if path in ("Cargo.toml", "Cargo.lock"):
+            if license_policy:
+                add("license-audit", path)
             old, new = blobs(path)
             try:
                 ids = (manifest_seeds if path == "Cargo.toml" else lock_seeds)(old, new, graph)
@@ -533,7 +583,7 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
             b = workflow_blocks(new)
             nightly = {"full": "rust", "flaky-hunt": "stress", "vendor-extra": "vendor-extra", "features": "features", "report": "fast"}
             release = {"validate": "release", "build": "release", "release": "release", "license-audit": "license-audit", "origin": "license-offline"}
-            license_jobs = {"offline-tests": "license-offline", "build": "license-lifecycle", "aggregate": "license-offline", "promote": "license-offline", "plan": "fast", "required": "fast", "guard": "fast", "pr-lifecycle": "license-lifecycle", "license-producer": "license-lifecycle"}
+            license_jobs = {"offline-tests": "license-offline", "aggregate": "license-offline", "promote": "license-offline", "plan": "fast", "required": "fast", "guard": "fast", "build": "fast", "pr-lifecycle": "fast", "license-producer": "fast"}
             mapping = JOB_SEGMENTS if path.endswith("/ci.yml") else nightly if path.endswith("/nightly.yml") else license_jobs if path.endswith(("/license-bundle.yml", "/license-promote.yml")) else release
             for job in sorted(changed_keys(a, b)):
                 if job in ("@name", "@on", "@concurrency", "@env", "@permissions"):
@@ -544,10 +594,9 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
                         header_check(job, a.get(job, ""), b.get(job, ""))
                     if job == "@env" and path.endswith(("/license-bundle.yml", "/license-promote.yml")):
                         add("license-offline", path + ":" + job)
-                        add("license-lifecycle", path + ":" + job)
                     add("fast", path + ":" + job)
                 elif job in mapping:
-                    if job in ("license-audit", "license-offline", "license-lifecycle") and not license_stack and job not in a:
+                    if job in ("license-offline", "license-audit") and not license_policy and job not in a:
                         add("fast", path + ":" + job)
                     elif job == "full" and job not in b:
                         add("rust", path + ":" + job)
@@ -561,7 +610,7 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
                         add("license-offline", path + ":" + job)
                     if path.endswith("/nightly.yml"):
                         add("regression", path + ":" + job)
-                    if path.endswith("/release.yml") and license_stack:
+                    if path.endswith("/release.yml") and license_policy:
                         add("license-offline", path + ":" + job)
                 else:
                     raise MappingError("missing mapping: блок workflow: " + job)
@@ -602,12 +651,10 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
             add("native-portability", path)
         elif path.startswith("packages/proxy-config/examples/") or path == "README.md" or path == "tor-socks5.example.ktav" or path == "docs/architecture.md" or path.startswith("docs/guide/"):
             add("docs-contract", path)
-        elif path.startswith("docs/") or path in ("CHANGELOG.md", ".gitignore", ".gitattributes", "vendor/README.md"):
+        elif path.startswith("docs/") or path in ("CHANGELOG.md", ".gitignore", ".gitattributes", "vendor/README.md", "vendor/PROVENANCE.md"):
             add("fast", path)
         elif path in (".github/install/tests/test_release.py", ".github/install/tests/gh_mock.py", ".github/install/tests/fixtures.py"):
             add("release", path)
-            if license_stack:
-                add("license-offline", path)
             if path.endswith("/fixtures.py"):
                 add("installer-sh", path)
                 add("installer-windows", path)
@@ -621,10 +668,29 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
                 add("installer-windows", path)
         elif path in LICENSE_DOCS:
             add("fast", path)
-        elif path.startswith("scripts/license/") or path.startswith(".github/release/license/") or path.startswith("LICENSE"):
+        elif path.startswith("scripts/license/") or path.startswith(".github/release/license/"):
             add("license-offline", path)
+            if license_policy:
+                add("license-audit", path)
+        elif path.startswith("LICENSE"):
+            if license_policy:
+                add("license-offline", path)
+                add("license-audit", path)
+            else:
+                add("fast", path)
         elif path == ".github/deny.toml":
+            if not license_policy:
+                raise MappingError("missing mapping: license policy selected without installed identity")
+            add("license-offline", path)
             add("license-audit", path)
+        elif path.startswith(".github/license/"):
+            if not license_policy:
+                raise MappingError("missing mapping: license policy selected without installed identity")
+            if path != ".github/license/README.md":
+                add("license-offline", path)
+                add("license-audit", path)
+            else:
+                add("fast", path)
         elif path.startswith(".github/release/") or path in ("scripts/check-publish-guard.sh", "scripts/check-packageability.sh", "scripts/publishable-crates.sh"):
             add("release", path)
         elif path.endswith('/README.md') and graph.owner(path) and path == graph.paths[graph.owner(path)] + '/README.md':
@@ -634,6 +700,8 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
             if not owner:
                 raise MappingError("missing mapping: путь: " + path)
             if path.endswith("/Cargo.toml"):
+                if license_policy:
+                    add("license-audit", path)
                 try:
                     check_removed_dependencies(*blobs(path))
                 except (ValueError, TypeError) as exc:
@@ -653,9 +721,9 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
         selected = set(graph.members)
         for segment in ("rust", "msrv", "android", "tor", "vendor", "vendor-extra", "docs-contract", "installer-sh", "installer-windows", "release", "features", "stress", "regression", "native-portability", "required"):
             add(segment, full_reason)
-        if license_stack:
-            add("license-offline", "лицензионный стек")
-            add("license-audit", "лицензионный стек")
+        if license_policy:
+            add("license-offline", "license policy")
+            add("license-audit", "license policy")
         native.update(NATIVE_TARGETS)
     if selected:
         add("rust", "обратное замыкание графа")
@@ -670,27 +738,8 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
         if native_names & {"windows-sys", "ring", "cc", "cmake", "openssl-sys", "libsqlite3-sys", "zstd-sys"}:
             native.add("x86_64-pc-windows-msvc")
         add("native-portability", "изменена native-зависимость proxy")
-    if license_stack and mode != "sprint-full":
-        interfaces = any((path not in LICENSE_DOCS and path.startswith((".github/release/license/", "scripts/license/"))) or
-                         (path.startswith("apps/socks5-proxy/") and (path.endswith("/build.rs") or "license" in path.lower() or "recipient_information" in path or path in ("apps/socks5-proxy/src/main.rs", "apps/socks5-proxy/src/args.rs", "apps/socks5-proxy/src/cli.rs")))
-                         for path in paths)
-        dependency_change = proxy & selected and any(path == "Cargo.toml" or path == "Cargo.lock" or path.endswith("/Cargo.toml") for path in paths)
-        if any(path in ("Cargo.toml", "Cargo.lock") or path.endswith("/Cargo.toml") for path in paths):
-            add("license-audit", "изменены зависимости")
-        if any(path.endswith("/build.rs") for path in paths):
-            add("license-offline", "изменён build.rs")
-        if interfaces or dependency_change:
-            add("license-offline", "изменён интерфейс или зависимости лицензирования proxy")
-            add("license-audit", "изменён интерфейс или зависимости лицензирования proxy")
-            seed(proxy, "изменён интерфейс лицензирования proxy")
-            native.update(("x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"))
-            add("native-portability", "изменён интерфейс лицензирования proxy")
-            add("license-lifecycle", "изменён интерфейс или зависимости лицензирования proxy")
-    if license_stack and proxy & selected and any(path.startswith((".github/actions/setup-local-sdk/", "vendor/")) for path in paths):
-        add("license-lifecycle", "изменены SDK или vendor зависимости proxy")
-        add("license-audit", "изменены SDK или vendor зависимости")
-        native.update(("x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"))
-        add("native-portability", "изменены SDK или vendor зависимости proxy")
+    if license_policy and any(path == "Cargo.toml" or path == "Cargo.lock" or path.endswith("/Cargo.toml") for path in paths):
+        add("license-audit", "изменены зависимости")
     if proxy & selected and any(path.endswith("/build.rs") for path in paths):
         native.update(("x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"))
         add("native-portability", "build.rs в замыкании proxy")
@@ -732,9 +781,9 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
             "shipping_packages": sorted(graph.packages[i]["name"] for i in required(shipping)),
             "segments": sorted(segments), "target_rows": rows, "native_rows": native_rows,
             "paths": sorted(set(paths)), "reasons": {k: sorted(reasons[k]) for k in sorted(segments)}, "full": mode == "sprint-full", "full_trigger": full_trigger,
-            "capabilities": {"license_stack": license_stack, "real_tor_channel": real_tor},
-            "capability_reasons": {"real_tor_channel": "установлен контракт" if real_tor else "контракт не установлен"},
-            "license_stack": license_stack}
+            "capabilities": {"license_policy": license_policy,
+                             "real_tor_channel": real_tor},
+            "capability_reasons": {"real_tor_channel": "установлен контракт" if real_tor else "контракт не установлен"}}
 
 
 RESULT_JOBS = {
@@ -746,7 +795,7 @@ RESULT_JOBS = {
     "release-scripts": ("release",), "native-portability": ("native-portability",),
     "vendor-extra": ("vendor-extra", "vendor"), "features": ("features",),
     "stress": ("stress",), "license-offline": ("license-offline",),
-    "license-audit": ("license-audit",), "license-lifecycle": ("license-lifecycle",),
+    "license-audit": ("license-audit",),
 }
 
 
@@ -761,6 +810,12 @@ def validate_results(plan, needs):
     capabilities = plan.get("capabilities")
     if not isinstance(capabilities, dict) or type(capabilities.get("real_tor_channel")) is not bool:
         raise MappingError("missing mapping: real Tor capability")
+    if type(capabilities.get("license_policy")) is not bool:
+        raise MappingError("missing mapping: license policy capability")
+    if any(s in segments for s in ("license-offline", "license-audit")) and not capabilities["license_policy"]:
+        raise MappingError("missing mapping: license policy segment without installed capability")
+    if "license-lifecycle" in segments:
+        raise MappingError("missing mapping: legacy license lifecycle is disabled")
     if "tor" in segments and not capabilities["real_tor_channel"]:
         raise MappingError("missing mapping: real Tor selected without capability")
     unsupported = set(segments) - {s for values in RESULT_JOBS.values() for s in values} - {"required"}
@@ -797,7 +852,7 @@ def main():
             entries = git("ls-tree", "-z", "--name-only", checkout, "--", path).decode().split("\0")
             if path not in entries:
                 raise MappingError("missing mapping: отсутствует обязательный документ: " + path)
-        # Для PR checkout может быть synthetic merge: граф/license_stack читаются из него.
+        # Ordinary CI uses the standard cargo-deny dependency policy only.
         metadata = json.loads(run("cargo", "metadata", "--locked", "--all-features", "--format-version", "1"))
         graph = Graph(metadata, root)
         paths = [] if base is None else git("diff", "--name-only", "--no-renames", "-z", base, checkout).decode().split("\0")
@@ -809,17 +864,24 @@ def main():
             return tuple(read(ref) for ref in (base, checkout))
         def tree_read(ref, path):
             if ref is None:
-                return ""
+                return None
             entry = git("ls-tree", "--name-only", ref, "--", path).decode().strip()
-            return git("show", ref + ":" + path).decode() if entry == path else ""
+            return git("show", ref + ":" + path).decode() if entry == path else None
         # Ручной полный запуск также проверяет первого родителя на удаление контракта в HEAD.
         parent = base
         if parent is None:
             parents = git("rev-list", "--parents", "-n", "1", checkout).decode().split()
             parent = parents[1] if len(parents) > 1 else None
         real_tor = contract_capability(lambda p: tree_read(parent, p), lambda p: tree_read(checkout, p))
-        capabilities = {"real_tor_channel": real_tor,
-                        "license_stack": (Path(root) / ".github/deny.toml").is_file() and (Path(root) / ".github/release/license").is_dir()}
+        if args.event in ("pull_request", "push"):
+            license_base = args.base
+        else:
+            license_base = parent
+        license_policy = license_policy_capability(lambda p: tree_read(license_base, p),
+                                                    lambda p: tree_read(checkout, p))
+        license_policy = license_policy_checkout_capability(root, lambda p: tree_read(checkout, p),
+                                                            license_policy)
+        capabilities = {"real_tor_channel": real_tor, "license_policy": license_policy}
         # Ручной affected не сканирует footer: ручной выбор режима главнее.
         # Сообщения — из исходного диапазона: synthetic merge не сканируется.
         footer = base is not None and args.event in ("push", "pull_request") and commit_footer_full(git, base, args.head)

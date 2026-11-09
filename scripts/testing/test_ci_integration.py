@@ -161,6 +161,20 @@ class External(unittest.TestCase):
         self.metadata.write_text('{}', encoding="utf-8")
         self.push(ok=False)
 
+    def test_license_policy_checkout_missing_file_fails_closed(self):
+        previous = self.head()
+        self.put(".github/deny.toml", "[licenses]\nallow = [\"MIT\"]\n")
+        self.commit("install synthetic license policy")
+        installed = self.head()
+        (self.root / ".github/deny.toml").unlink()
+
+        affected = self.push(base=previous, head=installed, ok=False)
+        full = self.planner("--event", "workflow_dispatch", "--mode", "sprint-full",
+                            "--head", installed, ok=False)
+        expected = "missing mapping: license policy checkout input missing: .github/deny.toml"
+        self.assertIn(expected, affected.stderr)
+        self.assertIn(expected, full.stderr)
+
     def test_commit_footer_full_trigger(self):
         members = sorted(["socks5-proxy", "android-ffi", "tor-socks5-auth", "tor-socks5-config",
                           "tor-socks5-client-acl", "bridge-probe", "arti-wrapper"])
@@ -206,11 +220,13 @@ class External(unittest.TestCase):
             "native-portability": ("native-portability",),
             "vendor-extra": ("vendor-extra", "vendor"), "features": ("features",),
             "stress": ("stress",), "license-offline": ("license-offline",),
-            "license-audit": ("license-audit",), "license-lifecycle": ("license-lifecycle",),
+            "license-audit": ("license-audit",),
         }
-        self.assertEqual(expected_consumers, dict(p.RESULT_JOBS))  # Независимый literal-контракт потребителей.
+        self.assertEqual(expected_consumers, dict(p.RESULT_JOBS))
         needs = {job: {"result": "success" if any(s in result["segments"] for s in selections) else "skipped"} for job, selections in expected_consumers.items()}
         needs["plan"] = {"result": "success"}
+        self.assertFalse(result["capabilities"]["license_policy"])
+        self.assertFalse({"license-offline", "license-audit"} & set(result["segments"]))
         p.validate_results(result, needs)
         # Footer в содержимом файла триггером не является.
         self.git("reset", "--hard", self.base)
