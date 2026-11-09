@@ -116,36 +116,28 @@ automatic recovery for those owners is not implemented here.
 
 Requires Rust 1.92 or newer (edition 2021 for first-party crates).
 
-The workspace resolves `ktav` 0.8.1 and `resocks5-net` 0.5.1 from the registry.
-The SDK's `AuthMethods::cleartext_only` policy delegates inbound password checks
-to the existing host verifier without advertising unsupported secure authentication.
-No sibling SDK checkout or SDK path override is required.
+The workspace resolves `ktav` 0.8.1, `resocks5-net` 0.5.1 and the five
+`ptrs-gesher-*` 0.8.0 crates from the registry (crates.io). The SDK's
+`AuthMethods::cleartext_only` policy delegates inbound password checks to
+the existing host verifier without advertising unsupported secure
+authentication. No sibling SDK or ptrs checkout, path override, Git pin or
+per-command Cargo patch is required.
 
-**Temporary local candidate dependency:** preparation uses the original
-ptrs-gesher 0.8 source checkout, reviewed at commit
-`b0c68330ace29acfcdbaad23dd734c45e94a293c`. Keep that source in a sibling
-`ptrs-gesher` checkout; do not vendor it or assume an unpatched registry build
-tests the same code. The candidate lockfile reflects these local overrides.
-A fresh public CI/main candidate must resolve the published replacement before
-dropping the overrides; this preparation does not establish crate publication.
-
-For this temporary checkout layout, run from the `tor-socks5` repository root:
+From the repository root:
 
 ```bash
-cargo build --locked --release \
-  --config 'patch.crates-io.ptrs-gesher-core.path="../ptrs-gesher/crates/core"' \
-  --config 'patch.crates-io.ptrs-gesher-obfs4.path="../ptrs-gesher/crates/obfs4"' \
-  --config 'patch.crates-io.ptrs-gesher-webtunnel.path="../ptrs-gesher/crates/webtunnel"' \
-  --config 'patch.crates-io.ptrs-gesher-lyrebird.path="../ptrs-gesher/crates/lyrebird"' \
-  --config 'patch.crates-io.ptrs-gesher-bridge-line.path="../ptrs-gesher/crates/bridge-line"'
+cargo build --locked --release
 # binary: target/release/socks5-proxy   (invoked as `tor-socks5`)
 ```
 
-These are per-command source bindings, not permanent local paths in Cargo config.
-The earlier runtime acceptance used a debug CLI with SDK 0.4.1 and the older
-ptrs source. It does not validate this dependency migration or establish a
-release-profile acceptance run. The new consumer tests have compiled, but have
-not yet executed; no fresh CLI runtime acceptance is claimed.
+The ptrs-gesher 0.8.0 registry artifacts were published from the reviewed
+source commit `b0c68330ace29acfcdbaad23dd734c45e94a293c`; crates.io trusted
+publishing records that SHA for all five crates, and released bytes remain a
+separate provenance boundary from the reviewed tree. The earlier runtime
+acceptance used a debug CLI with SDK 0.4.1 and the older ptrs source. It
+does not validate this dependency migration or establish a release-profile
+acceptance run. The new consumer tests have compiled, but have not yet
+executed; no fresh CLI runtime acceptance is claimed.
 
 ### Code structure rules (checked in CI)
 
