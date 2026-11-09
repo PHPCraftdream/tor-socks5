@@ -112,6 +112,7 @@ class Routing(unittest.TestCase):
         self.assertIn("tor", self.route("packages/arti-wrapper/src/lib.rs")["segments"])
         self.assertEqual(self.route("docs/plans/note.md")["segments"], ["fast"])
         self.assertEqual(self.route("vendor/README.md")["segments"], ["fast"])
+        self.assertEqual(self.route("vendor/PROVENANCE.md")["segments"], ["fast"])
         with self.assertRaises(p.MappingError):
             self.route("vendor/unknown-control.txt")
         caps = {"license_stack": True, "real_tor_channel": False}

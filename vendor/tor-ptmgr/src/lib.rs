@@ -1,3 +1,4 @@
+// Modified locally for tor-socks5; see vendor/PROVENANCE.md.
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 // @@ begin lint list maintained by maint/add_warning @@

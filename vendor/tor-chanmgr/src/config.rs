@@ -1,3 +1,4 @@
+// Modified locally for tor-socks5; see vendor/PROVENANCE.md.
 //! Configuration for a channel manager (and, therefore, channels)
 //!
 //! # Semver note
