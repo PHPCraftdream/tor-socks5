@@ -25,10 +25,59 @@ def graph():
         "native": ("openssl-sys", "external/openssl-sys"),
     }
     root = Path(__file__).resolve().parent / "fixture-repo"
-    packages = [{"id": i, "name": name, "manifest_path": str(root / path / "Cargo.toml"), "targets": [{"kind": ["lib"]}]} for i, (name, path) in names.items()]
+    packages = [{"id": i, "name": name, "version": "2.0.0" if i == "sdk" else "1.0.0",
+                 **({"source": "registry+https://github.com/rust-lang/crates.io-index"} if i == "sdk" else {}),
+                 "manifest_path": str(root / path / "Cargo.toml"), "targets": [{"kind": ["lib"]}]}
+                for i, (name, path) in names.items()]
     edges = {"proxy": ["auth", "config", "bridge", "arti", "sdk", "native"], "ffi": ["config", "auth"], "bridge": ["middle"], "arti": [], "middle": ["vendor"], "acl": [], "auth": ["acl"], "config": ["acl"], "sdk": [], "vendor": [], "native": []}
     nodes = [{"id": i, "deps": [{"pkg": d, "name": "alias_" + d, "dep_kinds": [{"kind": "build" if d == "middle" else "dev" if d == "auth" else None, "target": "cfg(unix)" if d == "vendor" else None}]} for d in deps]} for i, deps in edges.items()]
     return p.Graph({"packages": packages, "workspace_members": ["proxy", "auth", "config", "acl", "bridge", "arti", "ffi"], "resolve": {"nodes": nodes}}, root)
+
+
+def lock_graph(extra_packages=(), lyrebird_versions=("0.8.0",), extra_members=()):
+    root = Path(__file__).resolve().parent / "fixture-repo"
+    registry = "registry+https://github.com/rust-lang/crates.io-index"
+    definitions = [
+        ("proxy", "socks5-proxy", "0.2.0", None, "apps/socks5-proxy", "bin"),
+        ("pt-helper", "pt-helper", "0.2.0", None, "apps/pt-helper", "bin"),
+        ("android", "android-ffi", "0.2.0", None, "packages/android-ffi", "lib"),
+        ("unrelated", "bridge-probe", "0.2.0", None, "packages/bridge-probe", "lib"),
+    ]
+    definitions.extend(("lyrebird-" + version, "ptrs-gesher-lyrebird", version, registry,
+                        "external/ptrs-gesher-lyrebird", "lib") for version in lyrebird_versions)
+    definitions.append(("sdk", "resocks5-net", "0.5.1", registry, "external/resocks5-net", "lib"))
+    definitions.extend(extra_packages)
+    definitions.extend(extra_members)
+    packages = []
+    for ident, name, version, source, path, kind in definitions:
+        package = {"id": ident, "name": name, "version": version,
+                   "manifest_path": str(root / path / "Cargo.toml"), "targets": [{"kind": [kind]}]}
+        if source is not None:
+            package["source"] = source
+        packages.append(package)
+    edges = {ident: [] for ident, *_ in definitions}
+    edges["proxy"] = ["lyrebird-" + lyrebird_versions[0]]
+    edges["pt-helper"] = ["lyrebird-" + lyrebird_versions[0]]
+    edges["lyrebird-" + lyrebird_versions[0]] = ["sdk"]
+    nodes = [{"id": ident, "deps": [{"pkg": dep, "name": next(p["name"] for p in packages if p["id"] == dep),
+                                        "dep_kinds": [{"kind": None, "target": None}]}
+                                       for dep in deps]} for ident, deps in edges.items()]
+    members = ["proxy", "pt-helper", "android", "unrelated"] + [item[0] for item in extra_members]
+    return p.Graph({"packages": packages, "workspace_members": members,
+                    "resolve": {"nodes": nodes}}, root)
+
+
+def lock_package(name, version, source=None, dependencies=()):
+    lines = ["[[package]]", "name = " + repr(name), "version = " + repr(version)]
+    if source is not None:
+        lines.append("source = " + repr(source))
+    if dependencies:
+        lines.append("dependencies = [" + ", ".join(repr(item) for item in dependencies) + "]")
+    return "\n".join(lines) + "\n"
+
+
+def lock_text(*packages):
+    return "version = 4\n\n" + "\n".join(packages)
 
 
 class Routing(unittest.TestCase):
@@ -94,10 +143,236 @@ class Routing(unittest.TestCase):
     def test_manifest_and_lock(self):
         blobs = {"Cargo.toml": ('[workspace.dependencies]\nresocks5-net = "1"', '[workspace.dependencies]\nresocks5-net = "2"')}
         self.assertIn("socks5-proxy", self.route("Cargo.toml", blobs=blobs)["packages"])
-        blobs = {"Cargo.lock": ('version = 3\n[[package]]\nname = "resocks5-net"\nversion = "1"', 'version = 3\n[[package]]\nname = "resocks5-net"\nversion = "2"')}
+        registry = "registry+https://github.com/rust-lang/crates.io-index"
+        old = lock_text(lock_package("resocks5-net", "1.0.0", registry))
+        new = lock_text(lock_package("resocks5-net", "2.0.0", registry))
+        blobs = {"Cargo.lock": (old, new)}
         self.assertIn("socks5-proxy", self.route("Cargo.lock", blobs=blobs)["packages"])
         with self.assertRaises(p.MappingError):
             self.route("Cargo.toml", blobs={"Cargo.toml": ("[workspace]\nresolver='1'", "[workspace]\nresolver='2'")})
+
+    def test_workspace_member_addition_mapping(self):
+        old = '[workspace]\nresolver = "2"\nmembers = ["packages/*", "apps/*"]\n'
+        new = old.replace('"apps/*"]', '"apps/*", "vendor/tor-ptmgr"]')
+        graph = lock_graph(extra_members=(
+            ("tor-ptmgr", "tor-ptmgr", "0.47.0", None, "vendor/tor-ptmgr", "lib"),))
+        seeds = p.manifest_seeds(old, new, graph)
+        self.assertEqual(seeds, {"tor-ptmgr"})
+        result = p.plan(graph, ["Cargo.toml"], lambda path: (old, new))
+        self.assertEqual(result["packages"], ["tor-ptmgr"])
+        self.assertIn("rust", result["segments"])
+        self.assertIn("msrv", result["segments"])
+        registry = "registry+https://github.com/rust-lang/crates.io-index"
+        lock_before = lock_text(lock_package("resocks5-net", "0.5.0", registry))
+        lock_after = lock_text(lock_package("resocks5-net", "0.5.1", registry))
+        combined_blobs = {"Cargo.toml": (old, new), "Cargo.lock": (lock_before, lock_after)}
+        combined = p.plan(graph, ["Cargo.toml", "Cargo.lock"], lambda path: combined_blobs[path])
+        self.assertFalse(combined["full"])
+        self.assertIsNone(combined["full_trigger"])
+        self.assertEqual(combined["packages"], ["pt-helper", "socks5-proxy", "tor-ptmgr"])
+        self.assertNotIn("bridge-probe", combined["packages"])
+        for invalid_old, invalid_new in (
+                (new, old),
+                (old, old.replace('"apps/*"]', '"apps/*", "vendor/*"]')),
+                (old, old.replace('"apps/*"]', '"apps/*", "../outside"]')),
+                (old, old.replace('"apps/*"]', '"apps/*", "/absolute/member"]')),
+                (old, old.replace('"apps/*"]', '"apps/*", "vendor/missing"]')),
+                (old, old.replace('"apps/*"]', '"apps/*", "vendor\\\\tor-ptmgr"]')),
+                (old, old.replace('"apps/*"]', '"apps/*", "C:/outside/member"]')),
+                (old.replace('"packages/*", ', ''), new)):
+            with self.subTest(member=invalid_new), self.assertRaisesRegex(p.MappingError, "missing mapping"):
+                p.manifest_seeds(invalid_old, invalid_new, graph)
+        duplicate_member = old.replace('"apps/*"]', '"apps/*", "vendor/tor-ptmgr", "vendor/tor-ptmgr"]')
+        with self.assertRaisesRegex(p.MappingError, "missing mapping"):
+            p.manifest_seeds(old, duplicate_member, graph)
+        with self.assertRaisesRegex(p.MappingError, "missing mapping"):
+            p.manifest_seeds(old.replace('"packages/*", ', ''), new, graph)
+        ambiguous_graph = lock_graph(extra_members=(
+            ("tor-ptmgr-a", "tor-ptmgr", "0.47.0", None, "vendor/tor-ptmgr", "lib"),
+            ("tor-ptmgr-b", "tor-ptmgr", "0.47.0", None, "vendor/tor-ptmgr", "lib")))
+        with self.assertRaisesRegex(p.MappingError, "missing mapping"):
+            p.manifest_seeds(old, new, ambiguous_graph)
+
+    def test_removed_lock_transitives_reach_current_consumers(self):
+        registry = "registry+https://github.com/rust-lang/crates.io-index"
+        before = lock_text(
+            lock_package("socks5-proxy", "0.2.0", dependencies=("ptrs-gesher-lyrebird 0.7.0 (" + registry + ")",)),
+            lock_package("pt-helper", "0.2.0", dependencies=("ptrs-gesher-lyrebird 0.7.0 (" + registry + ")",)),
+            lock_package("ptrs-gesher-lyrebird", "0.7.0", registry,
+                         ("fast-socks5",)),
+            lock_package("fast-socks5", "0.10.0", registry,
+                         ("tokio-stream",)),
+            lock_package("tokio-stream", "0.1.18", registry),
+        )
+        after = lock_text(
+            lock_package("socks5-proxy", "0.2.0", dependencies=("ptrs-gesher-lyrebird 0.8.0 (" + registry + ")",)),
+            lock_package("pt-helper", "0.2.0", dependencies=("ptrs-gesher-lyrebird 0.8.0 (" + registry + ")",)),
+            lock_package("ptrs-gesher-lyrebird", "0.8.0", registry,
+                         ("resocks5-net 0.5.1 (" + registry + ")",)),
+            lock_package("resocks5-net", "0.5.1", registry),
+        )
+        graph = lock_graph()
+        blobs = {"Cargo.lock": (before, after)}
+        self.assertEqual(p.lock_seeds(before, after, graph),
+                         {"proxy", "pt-helper", "lyrebird-0.8.0", "sdk"})
+        current_lyrebird_before = lock_text(
+            lock_package("socks5-proxy", "0.2.0", dependencies=("ptrs-gesher-lyrebird 0.8.0 (" + registry + ")",)),
+            lock_package("pt-helper", "0.2.0", dependencies=("ptrs-gesher-lyrebird 0.8.0 (" + registry + ")",)),
+            lock_package("ptrs-gesher-lyrebird", "0.8.0", registry, ("fast-socks5",)),
+            lock_package("fast-socks5", "0.10.0", registry, ("tokio-stream",)),
+            lock_package("tokio-stream", "0.1.18", registry),
+        )
+        current_lyrebird_after = lock_text(
+            lock_package("socks5-proxy", "0.2.0", dependencies=("ptrs-gesher-lyrebird 0.8.0 (" + registry + ")",)),
+            lock_package("pt-helper", "0.2.0", dependencies=("ptrs-gesher-lyrebird 0.8.0 (" + registry + ")",)),
+            lock_package("ptrs-gesher-lyrebird", "0.8.0", registry,
+                         ("resocks5-net 0.5.1 (" + registry + ")",)),
+            lock_package("resocks5-net", "0.5.1", registry),
+        )
+        self.assertEqual(p.lock_seeds(current_lyrebird_before, current_lyrebird_after, graph),
+                         {"lyrebird-0.8.0", "sdk"})
+        first = p.plan(graph, ["Cargo.lock"], lambda path: blobs[path])
+        second = p.plan(graph, ["Cargo.lock"], lambda path: blobs[path])
+        self.assertEqual(first, second)
+        self.assertFalse(first["full"])
+        self.assertIsNone(first["full_trigger"])
+        self.assertEqual(first["packages"], ["pt-helper", "socks5-proxy"])
+        self.assertEqual(first["command_packages"]["rust"], ["pt-helper", "socks5-proxy"])
+        self.assertEqual(first["command_packages"]["msrv"], ["pt-helper", "socks5-proxy"])
+        self.assertIn("rust", first["segments"])
+        self.assertIn("msrv", first["segments"])
+        self.assertNotIn("android-ffi", first["packages"])
+        self.assertNotIn("bridge-probe", first["packages"])
+        needs = {job: {"result": "success" if any(segment in first["segments"] for segment in selections) else "skipped"}
+                 for job, selections in p.RESULT_JOBS.items()}
+        needs["plan"] = {"result": "success"}
+        p.validate_results(first, needs)
+
+    def test_lock_removed_identity_fail_closed(self):
+        graph = lock_graph()
+        with self.assertRaisesRegex(p.MappingError, "missing mapping"):
+            p.lock_seeds(lock_text(lock_package("orphan", "1.0.0")), lock_text(), graph)
+        registry = "registry+https://github.com/rust-lang/crates.io-index"
+        ambiguous = lock_text(
+            lock_package("ptrs-gesher-lyrebird", "0.7.0", registry, ("fast-socks5",)),
+            lock_package("fast-socks5", "0.10.0", registry),
+            lock_package("fast-socks5", "0.11.0", registry),
+        )
+        with self.assertRaisesRegex(p.MappingError, "missing mapping"):
+            p.lock_seeds(ambiguous, lock_text(), graph)
+        mixed = lock_text(
+            lock_package("socks5-proxy", "0.2.0", dependencies=("middle 1.0.0 (" + registry + ")",)),
+            lock_package("middle", "1.0.0", registry, ("leaf 1.0.0 (" + registry + ")",)),
+            lock_package("leaf", "1.0.0", registry),
+            lock_package("orphan", "1.0.0"),
+        )
+        mixed_new = lock_text(
+            lock_package("socks5-proxy", "0.2.0", dependencies=("middle 2.0.0 (" + registry + ")",)),
+            lock_package("middle", "2.0.0", registry),
+        )
+        with self.assertRaisesRegex(p.MappingError, "missing mapping"):
+            p.lock_seeds(mixed, mixed_new, lock_graph(extra_packages=(
+                ("middle-new", "middle", "2.0.0", registry, "external/middle", "lib"),)))
+        orphan_branch = lock_text(
+            lock_package("middle", "1.0.0", registry, ("leaf 1.0.0 (" + registry + ")",)),
+            lock_package("orphan-parent", "1.0.0", registry, ("leaf 1.0.0 (" + registry + ")",)),
+            lock_package("leaf", "1.0.0", registry),
+        )
+        orphan_branch_new = lock_text(lock_package("middle", "2.0.0", registry))
+        with self.assertRaisesRegex(p.MappingError, "missing mapping"):
+            p.lock_seeds(orphan_branch, orphan_branch_new, lock_graph(extra_packages=(
+                ("middle-new", "middle", "2.0.0", registry, "external/middle", "lib"),)))
+        cyclic = lock_text(
+            lock_package("cycle-a", "1.0.0", dependencies=("cycle-b 1.0.0",)),
+            lock_package("cycle-b", "1.0.0", dependencies=("cycle-a 1.0.0",)),
+        )
+        with self.assertRaisesRegex(p.MappingError, "missing mapping"):
+            p.lock_seeds(cyclic, lock_text(), graph)
+
+    def test_lock_source_qualified_reverse_mapping(self):
+        registry_a = "registry+https://example.invalid/a"
+        registry_b = "registry+https://example.invalid/b"
+        old = lock_text(
+            lock_package("middle", "1.0.0", registry_a, ("leaf 1.0.0 (" + registry_a + ")",)),
+            lock_package("other", "1.0.0", registry_a, ("leaf 1.0.0 (" + registry_b + ")",)),
+            lock_package("leaf", "1.0.0", registry_a),
+            lock_package("leaf", "1.0.0", registry_b),
+        )
+        new = lock_text(
+            lock_package("middle", "2.0.0", registry_a),
+            lock_package("other", "1.0.0", registry_a, ("leaf 1.0.0 (" + registry_b + ")",)),
+            lock_package("leaf", "1.0.0", registry_b),
+        )
+        graph = lock_graph(extra_packages=(
+            ("middle-new", "middle", "2.0.0", registry_a, "external/middle", "lib"),
+            ("other-current", "other", "1.0.0", registry_a, "external/other", "lib"),
+            ("leaf-b", "leaf", "1.0.0", registry_b, "external/leaf-b", "lib")))
+        self.assertEqual(p.lock_seeds(old, new, graph), {"middle-new"})
+        registry = "registry+https://github.com/rust-lang/crates.io-index"
+        local_to_registry_old = lock_text(
+            lock_package("socks5-proxy", "0.2.0", dependencies=("resocks5-net 0.3.0",)),
+            lock_package("resocks5-net", "0.3.0"),
+        )
+        local_to_registry_new = lock_text(
+            lock_package("socks5-proxy", "0.2.0", dependencies=("resocks5-net 0.5.1 (" + registry + ")",)),
+            lock_package("resocks5-net", "0.5.1", registry),
+        )
+        self.assertEqual(p.lock_seeds(local_to_registry_old, local_to_registry_new, lock_graph()),
+                         {"proxy", "sdk"})
+        version_only_old = lock_text(
+            lock_package("middle", "1.0.0", registry_a, ("leaf 1.0.0",)),
+            lock_package("leaf", "1.0.0", registry_a),
+        )
+        version_only_new = lock_text(lock_package("middle", "2.0.0", registry_a))
+        version_only_graph = lock_graph(extra_packages=(
+            ("middle-new", "middle", "2.0.0", registry_a, "external/middle", "lib"),))
+        self.assertEqual(p.lock_seeds(version_only_old, version_only_new, version_only_graph),
+                         {"middle-new"})
+        wrong_source_old = lock_text(
+            lock_package("middle", "1.0.0", registry_a, ("leaf 1.0.0 (" + registry_a + ")",)),
+            lock_package("leaf", "1.0.0", registry_a),
+            lock_package("leaf", "1.0.0", registry_b),
+        )
+        wrong_source_new = lock_text(
+            lock_package("middle", "1.0.0", registry_a),
+            lock_package("leaf", "2.0.0", registry_b),
+        )
+        wrong_source_graph = lock_graph(extra_packages=(
+            ("middle-current", "middle", "1.0.0", registry_a, "external/middle", "lib"),
+            ("leaf-current", "leaf", "2.0.0", registry_b, "external/leaf", "lib")))
+        self.assertEqual(p.lock_seeds(wrong_source_old, wrong_source_new, wrong_source_graph),
+                         {"middle-current", "leaf-current"})
+        without_b = lock_text(lock_package("leaf", "1.0.0", registry_b))
+        leaf_graph = lock_graph(extra_packages=(
+            ("leaf-b", "leaf", "1.0.0", registry_b, "external/leaf-b", "lib"),))
+        with self.assertRaisesRegex(p.MappingError, "missing mapping"):
+            p.lock_seeds(lock_text(lock_package("leaf", "1.0.0", registry_a)), without_b, leaf_graph)
+        unresolved = lock_text(
+            lock_package("middle", "1.0.0", registry_a, ("leaf",)),
+            lock_package("leaf", "1.0.0", registry_a),
+            lock_package("leaf", "1.0.0", registry_b),
+        )
+        with self.assertRaisesRegex(p.MappingError, "missing mapping"):
+            p.lock_seeds(unresolved, lock_text(), graph)
+
+    def test_lock_rejects_ambiguous_replacements_and_graph_mismatch(self):
+        registry = "registry+https://github.com/rust-lang/crates.io-index"
+        old = lock_text(lock_package("changed", "1.0.0", registry))
+        replacements = lock_text(lock_package("changed", "2.0.0", registry),
+                                 lock_package("changed", "3.0.0", registry))
+        graph = lock_graph(extra_packages=(
+            ("changed-2", "changed", "2.0.0", registry, "external/changed", "lib"),
+            ("changed-3", "changed", "3.0.0", registry, "external/changed", "lib")))
+        with self.assertRaisesRegex(p.MappingError, "missing mapping"):
+            p.lock_seeds(old, replacements, graph)
+        unknown_new = lock_text(lock_package("not-in-graph", "1.0.0", registry))
+        with self.assertRaisesRegex(p.MappingError, "missing mapping"):
+            p.lock_seeds(lock_text(), unknown_new, graph)
+        wrong_graph_version = lock_graph(extra_packages=(
+            ("changed-current", "changed", "2.1.0", registry, "external/changed", "lib"),))
+        with self.assertRaisesRegex(p.MappingError, "missing mapping"):
+            p.lock_seeds(lock_text(), lock_text(lock_package("changed", "2.0.0", registry)),
+                         wrong_graph_version)
 
     def test_rename_delete_unknown(self):
         result = self.route("packages/auth/src/old.rs", "packages/bridge-probe/src/new.rs")
