@@ -114,6 +114,7 @@ class Routing(unittest.TestCase):
         self.assertEqual(self.route("docs/project/licensing.md")["segments"], ["fast"])
         self.assertEqual(self.route("docs/project/license-policy.md")["segments"], ["fast"])
         self.assertEqual(self.route("vendor/README.md")["segments"], ["fast"])
+        self.assertEqual(self.route("vendor/PROVENANCE.md")["segments"], ["fast"])
         with self.assertRaises(p.MappingError):
             self.route("vendor/unknown-control.txt")
         with self.assertRaisesRegex(p.MappingError, "missing mapping: путь: deny.toml"):

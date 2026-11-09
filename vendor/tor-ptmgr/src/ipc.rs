@@ -1,3 +1,4 @@
+// Modified locally for tor-socks5; see vendor/PROVENANCE.md.
 //! Launching pluggable transport binaries and communicating with them.
 //!
 //! This module contains utilities to launch pluggable transports supporting pt-spec.txt
