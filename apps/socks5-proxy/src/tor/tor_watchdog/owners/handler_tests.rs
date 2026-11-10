@@ -593,8 +593,7 @@ async fn production_handler_selects_cached_owners_by_full_route() {
         assert_ne!(ids[4], global_id);
         assert_ne!(http_ids[0], ids[1], "protocol is part of the owner key");
         assert_eq!(
-            http_ids[0],
-            http_ids[1],
+            http_ids[0], http_ids[1],
             "identical HTTP routes reuse the client"
         );
         assert_ne!(http_ids[0], global_id);
@@ -628,8 +627,7 @@ async fn production_handler_selects_cached_owners_by_full_route() {
             http_state.tunnel.as_ref().unwrap().raw() as *const _ as usize
         );
         assert_ne!(
-            socks_slot,
-            http_slot,
+            socks_slot, http_slot,
             "protocol owners need distinct cache slots"
         );
         drop(http_state);
