@@ -180,7 +180,8 @@ class PublisherTests(unittest.TestCase):
         for target in UNIX_TARGETS + WIN_TARGETS:
             companion.create_companion(d, tag, self.source_fixture.commit, target,
                                        self.source_fixture.project,
-                                       self.source_fixture.vendor_root)
+                                       self.source_fixture.vendor_root,
+                                       self.source_fixture.native_material(target))
         self.assertEqual(sorted(os.listdir(d)), sorted(expected_names(tag)))
         return d
 
@@ -907,7 +908,7 @@ class ReleaseWorkflowWiring(unittest.TestCase):
                             "--commit", "$SOURCE_COMMIT", "--target", "$SOURCE_TARGET"],
                 "verify": ["--repo-root", ".", "--artifacts-dir", ".",
                            "--tag", "$GH_REF_NAME", "--commit", "$SOURCE_COMMIT",
-                           "--target", "$SOURCE_TARGET"],
+                           "--target", "$SOURCE_TARGET", "--installed-native"],
             }
             if (len(commands) != 2 or [a[:3] for a in commands] !=
                     [["python", ".github/release/source_companion.py", "package"],
@@ -928,7 +929,7 @@ class ReleaseWorkflowWiring(unittest.TestCase):
                 ("package", ("--repo-root", "--vendor-root", "--artifacts-dir",
                              "--tag", "--commit", "--target")),
                 ("verify", ("--repo-root", "--artifacts-dir", "--tag",
-                            "--commit", "--target"))):
+                            "--commit", "--target", "--installed-native"))):
             for option in options:
                 with self.subTest(operation=operation, missing=option):
                     line = next(x for x in build.splitlines()

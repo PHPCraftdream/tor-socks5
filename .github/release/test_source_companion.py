@@ -19,6 +19,7 @@ for _path in (_RELEASE_DIR, _TEST_DIR):
         sys.path.insert(0, _path)
 
 import fixtures as fx
+import native_material
 import source_companion as companion
 
 TAG = "v1.2.3"
@@ -42,6 +43,9 @@ class SourceFixture:
         self.repo_root = self.area.subdir("checkout")
         self.vendor_root = self.area.subdir("cargo-vendor")
         self._make_project_and_vendor()
+        self.sysroots = {}
+        for target in companion.TARGETS:
+            self._make_native_sysroot(target)
         self.cargo_reference_root = os.path.join(self.area.path, "cargo-reference")
         shutil.copytree(self.vendor_root, self.cargo_reference_root)
         self.expected_vendor_files = dict(companion.vendor_files(self.cargo_reference_root)[0])
@@ -83,6 +87,63 @@ class SourceFixture:
             wrapper = '"%s" "%%~dp0cargo" %%*\r\n' % sys.executable
             _write(command, wrapper.encode("utf-8"))
         return bin_dir
+
+    def install_rustc_stub(self, bin_dir):
+        os.makedirs(bin_dir, exist_ok=True)
+        roots = repr(self.sysroots)
+        lines = [
+            "#!/usr/bin/env python3", "import os, sys", "args = sys.argv[1:]",
+            "roots = %s" % roots,
+            "target = args[args.index('--target') + 1] if '--target' in args else None",
+            "if args == ['--print', 'sysroot']:",
+            "    print(roots[target] if target else next(iter(roots.values())))",
+            "elif args == ['-vV']:",
+            "    print('release: 1.92.0\\ncommit-hash: %s\\nhost: synthetic-host')" % ('1' * 40),
+            "elif args == ['--print', 'target-libdir', '--target', target]:",
+            "    print(os.path.join(roots[target], 'lib', 'rustlib', target, 'lib'))",
+            "else:", "    raise SystemExit('unexpected rustc invocation: ' + repr(args))",
+        ]
+        script = os.path.join(bin_dir, "rustc")
+        _write(script, ("\n".join(lines) + "\n").encode("utf-8"))
+        os.chmod(script, 0o755)
+        if os.name == "nt":
+            _write(os.path.join(bin_dir, "rustc.cmd"),
+                   ('"%s" "%%~dp0rustc" %%*\r\n' % sys.executable).encode())
+        return bin_dir
+
+    def native_material(self, target):
+        root = self.sysroots[target]
+        return native_material.collect(
+            root, "release: 1.92.0\ncommit-hash: %s\nhost: synthetic-host\n" % ('1' * 40),
+            os.path.join(root, "lib", "rustlib", target, "lib"), target)
+
+    def _make_native_sysroot(self, target):
+        root = self.area.subdir("rust-" + target)
+        self.sysroots[target] = root
+        doc_dir = os.path.join(root, "share", "doc", "rust")
+        for name in native_material.REQUIRED_DOCS:
+            _write(os.path.join(doc_dir, name),
+                   ("SYNTHETIC RUST FIXTURE %s %s\n" % (target, name)).encode())
+        _write(os.path.join(doc_dir, "licenses", "COPYING"),
+               ("SYNTHETIC LICENSE FIXTURE %s\n" % target).encode())
+        libdir = os.path.join(root, "lib", "rustlib", target, "lib")
+        inputs = [
+            ("libstd-0123456789abcdef.rlib", b"SYNTHETIC Rust std fixture " + target.encode()),
+            ("libcompiler_builtins-abcdef0123456789.rlib",
+             b"SYNTHETIC compiler builtins fixture " + target.encode()),
+            ("libfixture_native.a", b"SYNTHETIC native archive fixture " + target.encode()),
+        ]
+        if target.endswith("-musl"):
+            inputs.extend([
+                ("self-contained/libc.a", b"SYNTHETIC Rust-distributed musl fixture " + target.encode()),
+                ("self-contained/crt1.o", b"SYNTHETIC startup fixture " + target.encode()),
+            ])
+        manifest_lines = ["manifest-version: 2"]
+        for name, data in inputs:
+            _write(os.path.join(libdir, *name.split("/")), data)
+            manifest_lines.append("file:lib/rustlib/%s/lib/%s" % (target, name))
+        manifest_path = os.path.join(root, "lib", "rustlib", "manifest-rust-std-" + target)
+        _write(manifest_path, ("\n".join(manifest_lines) + "\n").encode())
 
     def _make_project_and_vendor(self):
         _write(os.path.join(self.repo_root, "LICENSE-APACHE"), b"Apache test license\n")
@@ -146,7 +207,8 @@ class SourceFixture:
             _write(os.path.join(artifacts_dir, binary_name),
                    ("fixture binary: " + target + "\n").encode())
             companion.create_companion(artifacts_dir, tag, self.commit, target,
-                                       self.project, self.vendor_root)
+                                       self.project, self.vendor_root,
+                                       self.native_material(target))
         return artifacts_dir
 
 
@@ -247,6 +309,11 @@ class SourceCompanionTests(unittest.TestCase):
         self.assertEqual(metadata["binary_archive_sha256"],
                          _checksum(fx.file_bytes(os.path.join(self.artifacts,
                                                              self.binary_name))))
+        native = {name: data for name, data in members.items()
+                  if name.startswith(native_material.ROOT)}
+        self.assertEqual(native, self.fixture.native_material(self.target))
+        self.assertEqual(metadata["native_material_provenance_sha256"],
+                         _checksum(native[native_material.PROVENANCE]))
         companion.verify_bundle(self.bundle, TAG, self.target, self.fixture.commit,
                                 self.fixture.project, self.artifacts,
                                 self.expected_vendor_files)
@@ -258,13 +325,18 @@ class SourceCompanionTests(unittest.TestCase):
         binary_bytes = b"CLI fixture binary archive\n"
         _write(os.path.join(artifacts, binary_name), binary_bytes)
         script = os.path.join(_RELEASE_DIR, "source_companion.py")
+        bin_dir = self.fixture.install_cargo_stub(
+            self.fixture.area.subdir("fake-rust-tools"))
+        self.fixture.install_rustc_stub(bin_dir)
         common = ["--repo-root", self.fixture.repo_root,
                   "--artifacts-dir", artifacts, "--tag", TAG,
                   "--commit", self.fixture.commit, "--target", target]
-        packaged = subprocess.run(
-            [sys.executable, "-I", script, "package", *common,
-             "--vendor-root", self.fixture.vendor_root],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"PATH": bin_dir + os.pathsep + os.environ.get("PATH", "")}):
+            packaged = subprocess.run(
+                [sys.executable, "-I", script, "package", *common,
+                 "--vendor-root", self.fixture.vendor_root],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(packaged.returncode, 0, packaged.stderr.decode())
 
         bundle = os.path.join(artifacts, source_name)
@@ -283,13 +355,18 @@ class SourceCompanionTests(unittest.TestCase):
                          _checksum(self.fixture.project))
         self.assertEqual(metadata["binary_archive"], binary_name)
         self.assertEqual(metadata["binary_archive_sha256"], _checksum(binary_bytes))
+        native = {name: data for name, data in members.items()
+                  if name.startswith(native_material.ROOT)}
+        self.assertEqual(native, self.fixture.native_material(target))
+        self.assertEqual(metadata["native_material_provenance_sha256"],
+                         _checksum(native[native_material.PROVENANCE]))
 
-        from unittest.mock import patch
         bin_dir = self.fixture.install_cargo_stub(
             self.fixture.area.subdir("fake-cargo-bin"))
+        self.fixture.install_rustc_stub(bin_dir)
         test_env = {"PATH": bin_dir + os.pathsep + os.environ.get("PATH", "")}
         with patch.dict(os.environ, test_env):
-            self.assertEqual(companion.main(["verify", *common]), 0)
+            self.assertEqual(companion.main(["verify", *common, "--installed-native"]), 0)
         with patch.object(companion, "trusted_vendor", return_value={}):
             with self.assertRaises(SystemExit) as failure:
                 companion.main(["verify", *common])
@@ -368,14 +445,15 @@ class SourceCompanionTests(unittest.TestCase):
         companion.check_vendor(vendor, packages)
         companion.create_companion(self.artifacts, TAG, self.fixture.commit,
                                    self.target, self.fixture.project,
-                                   self.fixture.vendor_root)
+                                   self.fixture.vendor_root,
+                                   self.fixture.native_material(self.target))
         members = _bundle_members(self.bundle)
         self.assertEqual(members["cargo-vendor/" + relative], marker)
         marker_reference = dict(self.expected_vendor_files)
         marker_reference[relative] = marker
         companion.verify_bundle(self.bundle, TAG, self.target, self.fixture.commit,
                                 self.fixture.project, self.artifacts,
-                                marker_reference)
+                                marker_reference, self.fixture.native_material(self.target))
 
     def test_wrong_commit_target_lock_and_binary_binding_are_rejected(self):
         original = _bundle_members(self.bundle)
@@ -419,6 +497,207 @@ class SourceCompanionTests(unittest.TestCase):
             companion.verify_bundle(self.bundle, TAG, self.target, self.fixture.commit,
                                     self.fixture.project, self.artifacts,
                                     self.expected_vendor_files)
+
+    def test_collect_rejects_missing_installed_native_material(self):
+        target = "x86_64-unknown-linux-musl"
+        pristine = self.fixture.sysroots[target]
+        missing = (
+            ("Apache document", "share/doc/rust/licenses/Apache-2.0.txt"),
+            ("MIT document", "share/doc/rust/licenses/MIT.txt"),
+            ("copyright document", "share/doc/rust/COPYRIGHT.html"),
+            ("library copyright document", "share/doc/rust/COPYRIGHT-library.html"),
+            ("component manifest", "lib/rustlib/manifest-rust-std-" + target),
+            ("libstd", "lib/rustlib/%s/lib/libstd-0123456789abcdef.rlib" % target),
+            ("compiler builtins", "lib/rustlib/%s/lib/libcompiler_builtins-abcdef0123456789.rlib" % target),
+            ("musl libc", "lib/rustlib/%s/lib/self-contained/libc.a" % target),
+            ("startup object", "lib/rustlib/%s/lib/self-contained/crt1.o" % target),
+        )
+        for label, relative in missing:
+            with self.subTest(material=label):
+                root = self.fixture.area.subdir("collect-missing-" + label.replace(" ", "-"))
+                shutil.copytree(pristine, root, dirs_exist_ok=True)
+                if relative.startswith("lib/rustlib/%s/lib/" % target):
+                    _write(os.path.join(root, "lib", "rustlib", "manifest-rust-std-" + target),
+                           ("dir:lib/rustlib/%s/lib\n" % target).encode())
+                os.remove(os.path.join(root, *relative.split("/")))
+                libdir = os.path.join(root, "lib", "rustlib", target, "lib")
+                rustc_vv = ("release: 1.92.0\ncommit-hash: %s\nhost: synthetic-host\n"
+                            % ("1" * 40))
+                with self.assertRaises(native_material.Invalid):
+                    native_material.collect(root, rustc_vv, libdir, target)
+
+        root = self.fixture.area.subdir("collect-wrong-libdir")
+        shutil.copytree(pristine, root, dirs_exist_ok=True)
+        wrong_libdir = os.path.join(root, "lib", "rustlib",
+                                    "x86_64-unknown-linux-gnu", "lib")
+        with self.subTest(material="wrong target libdir"):
+            with self.assertRaises(native_material.Invalid):
+                native_material.collect(
+                    root, "release: 1.92.0\ncommit-hash: %s\nhost: synthetic-host\n"
+                    % ("1" * 40), wrong_libdir, target)
+
+    def test_collect_accepts_component_directory_manifest(self):
+        target = "x86_64-unknown-linux-gnu"
+        root = self.fixture.area.subdir("collect-directory-manifest")
+        shutil.copytree(self.fixture.sysroots[target], root, dirs_exist_ok=True)
+        manifest = os.path.join(root, "lib", "rustlib",
+                                "manifest-rust-std-" + target)
+        _write(manifest, ("manifest-version: 2\n"
+                          "dir:lib/rustlib/%s/lib\n" % target).encode())
+        libdir = os.path.join(root, "lib", "rustlib", target, "lib")
+        rustc_vv = ("release: 1.92.0\ncommit-hash: %s\nhost: synthetic-host\n"
+                    % ("1" * 40))
+        payload = native_material.collect(root, rustc_vv, libdir, target)
+        record = json.loads(payload[native_material.PROVENANCE])
+        hashed = {item["path"] for item in record["target_inputs"]}
+        self.assertIn("lib/rustlib/%s/lib/libstd-0123456789abcdef.rlib" % target,
+                      hashed)
+        self.assertIn("lib/rustlib/%s/lib/libcompiler_builtins-abcdef0123456789.rlib" % target,
+                      hashed)
+
+    def _rewrite_native_provenance(self, members, update_metadata=True):
+        path = native_material.PROVENANCE
+        record = json.loads(members[path])
+        record["material_sha256"] = {
+            name: _checksum(data) for name, data in members.items()
+            if name.startswith(native_material.ROOT) and name != path}
+        members[path] = json.dumps(record, sort_keys=True, indent=2).encode() + b"\n"
+        metadata = json.loads(members["SOURCE-MATERIALS.json"])
+        if update_metadata:
+            metadata["native_material_provenance_sha256"] = _checksum(members[path])
+        members["SOURCE-MATERIALS.json"] = json.dumps(metadata).encode()
+
+    def _verify_native_members(self, target, members, installed=None):
+        path = os.path.join(self.artifacts, companion.names(TAG, target)[1])
+        _rewrite_bundle(path, members)
+        companion.verify_bundle(path, TAG, target, self.fixture.commit,
+                                self.fixture.project, self.artifacts,
+                                self.expected_vendor_files, installed)
+
+    def test_native_missing_material_and_malformed_provenance_are_rejected(self):
+        def remove_input(members, marker):
+            record = json.loads(members[native_material.PROVENANCE])
+            record["target_inputs"] = [item for item in record["target_inputs"]
+                                        if marker not in item["path"]]
+            members[native_material.PROVENANCE] = json.dumps(record).encode()
+
+        original = _bundle_members(self.bundle)
+        cases = [
+            ("missing document", lambda m, t: m.pop(
+                native_material.DOC_ROOT + native_material.REQUIRED_DOCS[0])),
+            ("missing manifest", lambda m, t: m.pop(
+                native_material.MANIFEST_ROOT + "manifest-rust-std-" + t)),
+            ("missing std-lib", lambda m, t: remove_input(m, "libstd-")),
+            ("missing per-file-manifest input", lambda m, t: remove_input(m, "libfixture_native.a")),
+            ("malformed provenance", lambda m, t: m.update(
+                {native_material.PROVENANCE: b"{"})),
+            ("missing native payload", lambda m, t: [
+                m.pop(k) for k in list(m) if k.startswith(native_material.ROOT)]),
+        ]
+        for label, mutate in cases:
+            with self.subTest(case=label):
+                target = self.target
+                members = dict(original)
+                mutate(members, target)
+                if label == "missing std-lib":
+                    members[native_material.MANIFEST_ROOT + "manifest-rust-std-" + target] = (
+                        "dir:lib/rustlib/%s/lib\n" % target).encode()
+                if label in ("missing std-lib", "missing per-file-manifest input"):
+                    self._rewrite_native_provenance(members)
+                with self.assertRaises(companion.Invalid):
+                    self._verify_native_members(target, members)
+
+    def test_manifest_requires_compiler_builtins_and_exact_input_paths(self):
+        members = _bundle_members(self.bundle)
+        members[native_material.MANIFEST_ROOT + "manifest-rust-std-" + self.target] = (
+            "dir:lib/rustlib/%s/lib\n" % self.target).encode()
+        record = json.loads(members[native_material.PROVENANCE])
+        record["target_inputs"] = [item for item in record["target_inputs"]
+                                    if "libcompiler_builtins-" not in item["path"]]
+        members[native_material.PROVENANCE] = json.dumps(record).encode()
+        self._rewrite_native_provenance(members)
+        with self.assertRaises(companion.Invalid):
+            self._verify_native_members(self.target, members)
+
+    def test_native_manifest_wrong_target_or_libdir_is_rejected(self):
+        original = _bundle_members(self.bundle)
+        for key, value in (("target", companion.TARGETS[1]),
+                           ("target_libdir", "lib/rustlib/wrong-target/lib")):
+            with self.subTest(field=key):
+                members = dict(original)
+                record = json.loads(members[native_material.PROVENANCE])
+                record[key] = value
+                members[native_material.PROVENANCE] = json.dumps(record).encode()
+                self._rewrite_native_provenance(members)
+                with self.assertRaises(companion.Invalid):
+                    self._verify_native_members(self.target, members)
+
+    def test_native_document_self_hash_and_provenance_digest_are_checked(self):
+        original = _bundle_members(self.bundle)
+        for field in ("self-hash", "companion digest"):
+            with self.subTest(field=field):
+                members = dict(original)
+                if field == "self-hash":
+                    path = native_material.DOC_ROOT + native_material.REQUIRED_DOCS[0]
+                    members[path] += b"changed\n"
+                else:
+                    metadata = json.loads(members["SOURCE-MATERIALS.json"])
+                    metadata["native_material_provenance_sha256"] = "0" * 64
+                    members["SOURCE-MATERIALS.json"] = json.dumps(metadata).encode()
+                with self.assertRaises(companion.Invalid):
+                    self._verify_native_members(self.target, members)
+
+    def test_musl_native_material_requires_distributed_libc_and_startup(self):
+        target = "x86_64-unknown-linux-musl"
+        original = _bundle_members(os.path.join(
+            self.artifacts, companion.names(TAG, target)[1]))
+        for missing in ("libc.a", "crt1.o"):
+            with self.subTest(missing=missing):
+                members = dict(original)
+                members[native_material.MANIFEST_ROOT + "manifest-rust-std-" + target] = (
+                    "dir:lib/rustlib/%s/lib\n" % target).encode()
+                record = json.loads(members[native_material.PROVENANCE])
+                record["target_inputs"] = [item for item in record["target_inputs"]
+                                            if not item["path"].endswith(missing)]
+                members[native_material.PROVENANCE] = json.dumps(record).encode()
+                self._rewrite_native_provenance(members)
+                with self.assertRaises(companion.Invalid):
+                    self._verify_native_members(target, members)
+
+    def test_rewritten_native_material_is_structural_not_authenticity(self):
+        original = _bundle_members(self.bundle)
+        altered = dict(original)
+        doc = native_material.DOC_ROOT + native_material.REQUIRED_DOCS[0]
+        altered[doc] += b"coordinated rewrite\n"
+        self._rewrite_native_provenance(altered)
+        self._verify_native_members(self.target, dict(altered))
+        with self.assertRaises(companion.Invalid):
+            self._verify_native_members(self.target, dict(altered),
+                                        self.fixture.native_material(self.target))
+
+    def test_installed_native_requires_explicit_target(self):
+        with self.assertRaises(SystemExit) as failure:
+            companion.main(["verify", "--repo-root", self.fixture.repo_root,
+                            "--artifacts-dir", self.artifacts, "--tag", TAG,
+                            "--commit", self.fixture.commit, "--installed-native"])
+        self.assertEqual(failure.exception.code, 2)
+
+    def test_release_workflow_native_verification_contract(self):
+        path = os.path.join(_ROOT, ".github", "workflows", "release.yml")
+        with open(path, encoding="utf-8") as stream:
+            workflow = stream.read()
+
+        def assert_contract(text):
+            self.assertIn("- uses: dtolnay/rust-toolchain@stable\n        with:\n          targets: ${{ matrix.target }}", text)
+            verify_line = next(line for line in text.splitlines()
+                               if "source_companion.py verify" in line)
+            self.assertIn("--installed-native", verify_line)
+
+        assert_contract(workflow)
+        with self.assertRaises(AssertionError):
+            assert_contract(workflow.replace("--installed-native", "", 1))
+        with self.assertRaises(AssertionError):
+            assert_contract(workflow.replace("targets: ${{ matrix.target }}", "targets: wrong", 1))
 
 
 if __name__ == "__main__":
