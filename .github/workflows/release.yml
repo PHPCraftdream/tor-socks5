@@ -144,7 +144,7 @@ jobs:
         run: |
           set -euo pipefail
           python .github/release/source_companion.py package --repo-root . --vendor-root "$VENDOR_ROOT" --artifacts-dir . --tag "$GH_REF_NAME" --commit "$SOURCE_COMMIT" --target "$SOURCE_TARGET"
-          python .github/release/source_companion.py verify --repo-root . --artifacts-dir . --tag "$GH_REF_NAME" --commit "$SOURCE_COMMIT" --target "$SOURCE_TARGET"
+          python .github/release/source_companion.py verify --repo-root . --artifacts-dir . --tag "$GH_REF_NAME" --commit "$SOURCE_COMMIT" --target "$SOURCE_TARGET" --installed-native
 
       - uses: actions/upload-artifact@v7
         with:

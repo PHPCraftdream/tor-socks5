@@ -377,18 +377,20 @@ jobs:
           trap 'rm -rf "$tmp"' EXIT
           export CARGO_HOME="$tmp/cargo-home"
           mkdir -p "$CARGO_HOME" "$tmp/artifacts"
+          rustup target add x86_64-unknown-linux-gnu x86_64-unknown-linux-musl
           cargo vendor --locked --versioned-dirs "$tmp/package-vendor"
           commit="$(git rev-parse HEAD)"
-          target="x86_64-unknown-linux-gnu"
-          printf 'non-executable verification marker\n' > \
-            "$tmp/artifacts/tor-socks5-v1.2.3-$target.tar.gz"
-          python3 -I .github/release/source_companion.py package \
-            --repo-root "$repo" --artifacts-dir "$tmp/artifacts" \
-            --tag v1.2.3 --commit "$commit" --target "$target" \
-            --vendor-root "$tmp/package-vendor"
-          python3 -I .github/release/source_companion.py verify \
-            --repo-root "$repo" --artifacts-dir "$tmp/artifacts" \
-            --tag v1.2.3 --commit "$commit" --target "$target"
+          for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl; do
+            printf 'non-executable verification marker\n' > \
+              "$tmp/artifacts/tor-socks5-v1.2.3-$target.tar.gz"
+            python3 -I .github/release/source_companion.py package \
+              --repo-root "$repo" --artifacts-dir "$tmp/artifacts" \
+              --tag v1.2.3 --commit "$commit" --target "$target" \
+              --vendor-root "$tmp/package-vendor"
+            python3 -I .github/release/source_companion.py verify \
+              --repo-root "$repo" --artifacts-dir "$tmp/artifacts" \
+              --tag v1.2.3 --commit "$commit" --target "$target" --installed-native
+          done
 
   native-portability:
     needs: plan

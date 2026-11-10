@@ -8,9 +8,13 @@ import posixpath
 import re
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 import tomllib
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import native_material
 
 TARGETS = (
     "x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl",
@@ -247,26 +251,40 @@ def package(args):
         fail("source commit must be a full hexadecimal object id")
     project = git_project(args.repo_root, args.commit)
     create_companion(args.artifacts_dir, args.tag, args.commit, args.target,
-                     project, args.vendor_root)
+                     project, args.vendor_root, native_payload(args.target))
 
 
-def create_companion(artifacts_dir, tag, commit, target, project, vendor_root):
+def native_payload(target):
+    try:
+        return native_material.installed(target)
+    except native_material.Invalid as exc:
+        fail("invalid native material: %s" % exc)
+
+
+def create_companion(artifacts_dir, tag, commit, target, project, vendor_root,
+                     native_payload):
     if target not in TARGETS or not re.fullmatch(r"[0-9a-f]{40,64}", commit):
         fail("invalid source companion target or commit")
     files, packages = lock_data(project)
     vendor, vendor_modes = vendor_files(vendor_root)
     check_vendor(vendor, packages)
+    try:
+        native_material.validate(native_payload, target)
+    except native_material.Invalid as exc:
+        fail("invalid native material: %s" % exc)
     binary_name, source_name = names(tag, target)
     binary_path = os.path.join(artifacts_dir, binary_name)
     if not os.path.isfile(binary_path) or os.path.getsize(binary_path) == 0:
         fail("missing or empty binary archive: " + binary_name)
     with open(binary_path, "rb") as stream:
         binary_digest = sha(stream.read())
-    metadata = {"schema": 1, "commit": commit, "target": target,
+    metadata = {"schema": 2, "commit": commit, "target": target,
                 "lock_sha256": sha(files["Cargo.lock"]),
                 "project_archive_sha256": sha(project),
                 "binary_archive": binary_name,
-                "binary_archive_sha256": binary_digest}
+                "binary_archive_sha256": binary_digest,
+                "native_material_provenance_sha256": sha(
+                    native_payload[native_material.PROVENANCE])}
     os.makedirs(artifacts_dir, exist_ok=True)
     output = os.path.join(artifacts_dir, source_name)
     with tarfile.open(output, "w:gz") as archive:
@@ -278,6 +296,11 @@ def create_companion(artifacts_dir, tag, commit, target, project, vendor_root):
             info = tarfile.TarInfo("cargo-vendor/" + path)
             info.size = len(data)
             info.mode = vendor_modes[path]
+            archive.addfile(info, io.BytesIO(data))
+        for path, data in sorted(native_payload.items()):
+            info = tarfile.TarInfo(path)
+            info.size = len(data)
+            info.mode = 0o644
             archive.addfile(info, io.BytesIO(data))
         content = (json.dumps(metadata, sort_keys=True, indent=2) + "\n").encode()
         info = tarfile.TarInfo("SOURCE-MATERIALS.json")
@@ -291,7 +314,7 @@ def create_companion(artifacts_dir, tag, commit, target, project, vendor_root):
 
 
 def verify_bundle(path, tag, target, commit, project, artifacts_dir,
-                  trusted_vendor_files):
+                  trusted_vendor_files, installed_native=None):
     binary_name, source_name = names(tag, target)
     with open(path, "rb") as stream:
         digest = sha(stream.read())
@@ -312,9 +335,16 @@ def verify_bundle(path, tag, target, commit, project, artifacts_dir,
         fail("invalid source companion archive: %s" % exc)
     if "project.tar" not in members or "SOURCE-MATERIALS.json" not in members:
         fail("source companion lacks project source or metadata")
+    native = {name: data for name, data in members.items()
+              if name.startswith(native_material.ROOT)}
+    try:
+        native_material.validate(native, target)
+    except native_material.Invalid as exc:
+        fail("invalid native material: %s" % exc)
     for name in members:
         if name not in ("project.tar", "SOURCE-MATERIALS.json"):
-            if not name.startswith("cargo-vendor/") or not safe_path(name[len("cargo-vendor/"):]):
+            if not (name.startswith("cargo-vendor/") and
+                    safe_path(name[len("cargo-vendor/"):])) and name not in native:
                 fail("unexpected source companion entry: " + name)
     try:
         metadata = json.loads(members["SOURCE-MATERIALS.json"].decode("utf-8"))
@@ -322,10 +352,18 @@ def verify_bundle(path, tag, target, commit, project, artifacts_dir,
         fail("invalid source companion metadata: %s" % exc)
     if not isinstance(metadata, dict):
         fail("source companion metadata must be a JSON object")
-    if metadata.get("schema") != 1 or metadata.get("commit") != commit:
+    if metadata.get("schema") != 2 or metadata.get("commit") != commit:
         fail("source companion commit/schema mismatch: " + source_name)
     if metadata.get("target") != target or metadata.get("binary_archive") != binary_name:
         fail("source companion target/binary mismatch: " + source_name)
+    if metadata.get("native_material_provenance_sha256") != sha(
+            members.get(native_material.PROVENANCE, b"")):
+        fail("source companion native-material provenance digest mismatch")
+    if installed_native is not None:
+        try:
+            native_material.compare(native, installed_native, target)
+        except native_material.Invalid as exc:
+            fail("invalid native material: %s" % exc)
     source = members["project.tar"]
     files, packages = lock_data(source)
     if source != project or metadata.get("project_archive_sha256") != sha(project):
@@ -356,6 +394,7 @@ def verify(args):
     if not trusted_files:
         fail("independent Cargo vendor reference is missing or empty")
     check_vendor(trusted_files, packages)
+    installed = native_payload(args.target) if args.installed_native else None
     targets = (args.target,) if args.target else TARGETS
     for target in targets:
         _, source_name = names(args.tag, target)
@@ -363,7 +402,7 @@ def verify(args):
         if not os.path.isfile(path) or os.path.getsize(path) == 0:
             fail("missing or empty source companion: " + source_name)
         verify_bundle(path, args.tag, target, args.commit, project,
-                      args.artifacts_dir, trusted_files)
+                      args.artifacts_dir, trusted_files, installed)
 
 
 def main(argv=None):
@@ -381,7 +420,10 @@ def main(argv=None):
         else:
             item.add_argument("--repo-root", required=True)
             item.add_argument("--target", choices=TARGETS)
+            item.add_argument("--installed-native", action="store_true")
     args = parser.parse_args(argv)
+    if args.command == "verify" and args.installed_native and not args.target:
+        parser.error("--installed-native requires --target")
     try:
         package(args) if args.command == "package" else verify(args)
     except (Invalid, OSError, subprocess.CalledProcessError) as exc:

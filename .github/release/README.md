@@ -9,7 +9,11 @@ contains:
   and notices;
 - `cargo-vendor/`: full Cargo-vendored source for the locked external packages;
 - `SOURCE-MATERIALS.json`: the commit, target, lockfile and project-archive
-  digests, and the corresponding executable-archive name and digest.
+  digests, corresponding executable-archive name and digest, and native-material
+  provenance digest;
+- `native-material/`: selected Rust distribution documentation, the target
+  standard-library component manifest, and a provenance inventory of native
+  target inputs.
 
 The package command uses the supplied vendor directory and does not fetch source.
 Publisher `verify` independently invokes locked `cargo vendor --versioned-dirs`
@@ -29,9 +33,11 @@ in `project.tar`.
 
 ## CI real-Cargo smoke hook
 
-Run this in a clean checkout with Rust/Cargo installed. It packages a single
-target using a non-executable marker archive; the marker is not a build receipt
-and nothing is published. The explicit vendor step and companion `verify` both
+Run this in a clean CI checkout with Rust/Cargo installed. It packages GNU and
+musl targets from the installed Rust distribution using non-executable marker
+archives; no build or publication occurs. Rust standard-library targets are
+added if absent, and `verify --installed-native` compares each bundle with its
+selected installation. The explicit vendor step and companion `verify` both
 use Cargo's real locked vendor generation; the latter regenerates independently
 in the helper's fresh Cargo home. Network failures are expected to fail closed.
 `v1.2.3` is an example valid stable tag.
@@ -43,26 +49,27 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 export CARGO_HOME="$tmp/cargo-home"
 mkdir -p "$CARGO_HOME" "$tmp/artifacts"
+rustup target add x86_64-unknown-linux-gnu x86_64-unknown-linux-musl
 cargo vendor --locked --versioned-dirs "$tmp/package-vendor"
 commit="$(git -C "$repo" rev-parse HEAD)"
-target="x86_64-unknown-linux-gnu"
-printf 'non-executable verification marker\n' > \
-  "$tmp/artifacts/tor-socks5-v1.2.3-$target.tar.gz"
-python3 -I "$repo/.github/release/source_companion.py" package \
-  --repo-root "$repo" --artifacts-dir "$tmp/artifacts" \
-  --tag v1.2.3 --commit "$commit" --target "$target" \
-  --vendor-root "$tmp/package-vendor"
-python3 -I "$repo/.github/release/source_companion.py" verify \
-  --repo-root "$repo" --artifacts-dir "$tmp/artifacts" \
-  --tag v1.2.3 --commit "$commit" --target "$target"
+for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl; do
+  printf 'non-executable verification marker\n' > \
+    "$tmp/artifacts/tor-socks5-v1.2.3-$target.tar.gz"
+  python3 -I "$repo/.github/release/source_companion.py" package \
+    --repo-root "$repo" --artifacts-dir "$tmp/artifacts" \
+    --tag v1.2.3 --commit "$commit" --target "$target" \
+    --vendor-root "$tmp/package-vendor"
+  python3 -I "$repo/.github/release/source_companion.py" verify \
+    --repo-root "$repo" --artifacts-dir "$tmp/artifacts" \
+    --tag v1.2.3 --commit "$commit" --target "$target" --installed-native
+done
 ```
 
-This smoke hook verifies vendor bytes; it does not build or authenticate a
-release binary, certify licensing or legal compliance, or establish native
-toolchain/runtime inputs. Cargo vendor does not capture native Rust standard-
-library/compiler inputs or static musl material. CCADB/external-term review
-also remains outside this check. Preserving package source and notices is not
-a blanket clearance or legal advice.
+The hook verifies vendor and selected native-material references; it does not build
+or authenticate a release binary, certify licensing or legal compliance, or
+establish host build tools or dynamically linked host libraries. CCADB/external-
+term review also remains outside this check. Preserving source and notices is
+not blanket clearance or legal advice.
 
 ## Inspecting and using the source
 
@@ -103,13 +110,25 @@ use its matching source companion: exact source for included packages, including
 MPL-2.0-covered package source, and the corresponding package license and notice
 files are retained under `cargo-vendor/` alongside the package source.
 
-Cargo vendor does not capture the native Rust standard library/compiler
-runtime inputs or static musl material. Their exact contents and applicable
-terms remain unresolved here; this is not global native-input or legal
-clearance. Bundled C and assembly sources that are actually included in the
-project or vendored package trees remain preserved in the source companion.
-The companion is a source-availability aid, not legal advice or a claim that
-all release inputs have been captured.
+The helper preserves `share/doc/rust/LICENSE-APACHE`, `LICENSE-MIT`,
+`COPYRIGHT.html`, and any files under `share/doc/rust/licenses/` from the
+selected sysroot. For the selected target it preserves the installed Rust
+standard-library component manifest and hashes manifest-listed regular `.rlib`,
+archive, shared-library, and object inputs under that target's `lib` directory;
+`libstd` and `libcompiler_builtins` rlibs are required. These are upstream
+Rust-distribution materials collected as distributed, not a finding that any
+particular Rust license grants use of musl or another input.
+
+This inventory excludes host build tools, dynamically linked host libraries,
+and files outside those documented and selected-target scopes. The finite gap
+for musl is that the exact applicable source and terms linkage for Rust-distributed
+self-contained musl `libc.a` and startup objects is not established; host
+`musl-tools`/apt copyright material is not attributed to those Rust inputs.
+Publisher verification checks native structure and self-reported integrity,
+not independent authenticity; the CI installed-reference comparison is still
+not a build receipt. No build receipt, legal certification, or complete-input
+clearance is claimed. Preserving upstream texts does not assert their terms
+apply to every hashed input and is not legal advice.
 
 ## CI verification
 
