@@ -26,13 +26,13 @@ tor-socks5/
 ├── apps/
 │   └── socks5-proxy/           # the binary (SOCKS5 proxy + busybox PT dispatch)
 └── vendor/                     # locally-patched forks of 7 upstream crates
-    ├── arti-client/            # 0.47.0
-    ├── saturating-time/        # 0.5.0
-    ├── tor-chanmgr/            # 0.47.0
-    ├── tor-circmgr/            # 0.47.0
-    ├── tor-dirclient/          # 0.47.0
-    ├── tor-dirmgr/             # 0.47.0
-    └── tor-guardmgr/           # 0.47.0
+    ├── arti-client/            # 0.48.0
+    ├── saturating-time/        # 0.6.0
+    ├── tor-chanmgr/            # 0.48.0
+    ├── tor-circmgr/            # 0.48.0
+    ├── tor-dirclient/          # 0.48.0
+    ├── tor-dirmgr/             # 0.48.0
+    └── tor-guardmgr/           # 0.48.0
 ```
 
 The torrc `Bridge` line grammar is parsed by the external
@@ -258,26 +258,28 @@ The user-facing binary. Source modules under `src/`:
 
 ### `vendor/` — locally-patched forks
 
-Seven upstream crates (the Arti 0.47.0 / arti 2.7.0 line, plus
-`saturating-time` 0.5.0) are vendored as full source copies and wired in
+Seven upstream crates (the Arti 0.48.0 / arti 2.8.0 line, plus
+`saturating-time` 0.6.0) are vendored as full source copies and wired in
 via `[patch.crates-io]` in the workspace `Cargo.toml`, so the build is
 self-contained and does **not** depend on these fixes being accepted
 upstream. The full patch table, per-crate rationale and the next-sync
 procedure live in `vendor/README.md`. In short:
 
-* **`saturating-time` (0.5.0)** — the root-cause fix:
-  lazy `saturating_add`/`saturating_sub` limits instead of the eager
+* **`saturating-time` (0.6.0)** — originally the root-cause fix for the
   non-terminating min/max search on Windows `SystemTime`, which left every
-  bridge "unsuitable to purpose" so no circuit could be built.
+  bridge "unsuitable to purpose" so no circuit could be built. Upstream 0.6.0
+  adopted the lazy `saturating_add`/`saturating_sub` limits and terminates the
+  search itself; the override keeps only comments, ignored tests and a
+  regression test, and is a removal candidate.
 * **`arti-client`, `tor-chanmgr`, `tor-circmgr`, `tor-dirclient`,
-  `tor-dirmgr`, `tor-guardmgr` (all 0.47.0)** — the full seven-fork set,
+  `tor-dirmgr`, `tor-guardmgr` (all 0.48.0)** — the full seven-fork set,
   carrying our local stability/observability patches (idle body timeouts,
   descriptor-fetch and channel-build budgets, poison recovery, channel
   termination, guard readiness signals, exit-stream retry, opt-in
   bandwidth floor, and more — see `vendor/README.md`).
 
 The obfs4 + webtunnel PT client is **not** vendored. It comes from the
-`ptrs-gesher-lyrebird` 0.8 workspace dependency declared in the root
+`ptrs-gesher-lyrebird` 0.9 workspace dependency declared in the root
 `Cargo.toml`.
 
 ## Pluggable-transport dispatch (busybox)

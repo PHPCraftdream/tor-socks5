@@ -47,17 +47,17 @@ lyrebird.workspace = true
 
 # Onion-service identity keystore management (tor-socks5 onion ...),
 # behind the `onion-service` feature.
-tor-hsservice = { version = "0.47", optional = true }
-tor-keymgr = { version = "0.47", optional = true }
-tor-hscrypto = { version = "0.47", optional = true }
-tor-llcrypto = { version = "0.47", optional = true }
+tor-hsservice = { version = "0.48", optional = true }
+tor-keymgr = { version = "0.48", optional = true }
+tor-hscrypto = { version = "0.48", optional = true }
+tor-llcrypto = { version = "0.48", optional = true }
 fs-mistrust = { version = "0.16", optional = true }
 safelog = { version = "0.10", optional = true }
 # Relay cells (`Connected`/`End`) and `IncomingStreamRequest` for the
-# server-side onion-service forwarder. Same arti 0.47 stack as Cargo.lock;
+# server-side onion-service forwarder. Same arti 0.48 stack as Cargo.lock;
 # optional so `--no-default-features` stays light.
-tor-cell = { version = "0.47", optional = true }
-tor-proto = { version = "0.47", optional = true }
+tor-cell = { version = "0.48", optional = true }
+tor-proto = { version = "0.48", optional = true }
 
 ktav.workspace = true
 service-manager.workspace = true
@@ -76,7 +76,8 @@ futures.workspace = true
 
 # Vanity v3 onion address generation (see src/onion/).
 data-encoding = "2.11.0"
-ed25519-dalek = "2.2.0"
+# hazmat exposes ExpandedSecretKey; it used to be enabled only through tor-llcrypto.
+ed25519-dalek = { version = "2.2.0", features = ["hazmat"] }
 sha2 = "0.10.9"
 sha3 = "0.10.9"
 zeroize = "1.9.1"

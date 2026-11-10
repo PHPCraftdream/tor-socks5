@@ -167,7 +167,7 @@ mod tests {
 
     /// Known vector: pubkey = bytes 0..32, checksum computed per
     /// rend-spec-v3 (verified against the same formula used by
-    /// tor-hscrypto 0.47 `HsId`).
+    /// tor-hscrypto 0.48 `HsId`).
     #[test]
     fn address_known_vector() {
         let mut pubkey = [0u8; 32];

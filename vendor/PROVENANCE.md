@@ -12,13 +12,35 @@ The seven Arti crates' published archived `README.md` files and `Cargo.toml.orig
 metadata declare `MIT OR Apache-2.0`; `saturating-time` does too. The README
 offers are the package-level licensing basis recorded here; no holder is
 inferred from package author fields or the repository's root license. The
-reviewed repository baseline is commit
-`16239aae44407237d9fd3987e58082860b6cedcc`; the canonical upstream repository
-is `https://gitlab.torproject.org/tpo/core/arti.git/`. Each
+license review was first performed at repository commit
+`16239aae44407237d9fd3987e58082860b6cedcc` on the 0.47.0 archives and repeated
+on 2026-11-10 for the 0.48.0 re-baseline: the README license-offer lines and
+the `Cargo.toml` / `Cargo.toml.orig` license fields are unchanged, and the
+archives still contain no standalone `NOTICE`, `LICENSE*` or `COPYING*` member.
+The canonical upstream repository is
+`https://gitlab.torproject.org/tpo/core/arti.git/`. Each 0.48.0
 `.cargo_vcs_info.json` identifies commit
-`ce8bc6e0998bd5a4efdf06dd62dce53c98ea1087` and its listed `crates/<name>`
-path. The baseline archives came from the canonical crates.io static archive
-URL pattern `https://static.crates.io/crates/<name>/<name>-<version>.crate`.
+`7c038125baef924a4bf287429c192c5af606f79c` and its listed `crates/<name>`
+path. The archives came from the canonical crates.io static archive URL pattern
+`https://static.crates.io/crates/<name>/<name>-<version>.crate`.
+
+Current baseline (synced 2026-11-10):
+
+| Crate | Version | VCS path | SHA-256 of downloaded `.crate.gz` |
+|---|---:|---|---|
+| `arti-client` | 0.48.0 | `crates/arti-client` | `5bb17a5096e30f2b2bf9f7493ff7577ac66ed7059b8e435658a2884546afe70c` |
+| `tor-chanmgr` | 0.48.0 | `crates/tor-chanmgr` | `6d6086ead3951f0af897d593a33e1c9ed411e8b3d97d82da971ed08838382108` |
+| `tor-circmgr` | 0.48.0 | `crates/tor-circmgr` | `13157eea9e95141a327b947a4cb600525a0db229208c689c7b06b2947ed59ff8` |
+| `tor-dirclient` | 0.48.0 | `crates/tor-dirclient` | `3a0b528c94c6df7ea4084ceedfc370266f5b004c0827258b4cd081bf5fd81852` |
+| `tor-dirmgr` | 0.48.0 | `crates/tor-dirmgr` | `86f7ac56b491b26a6f2b73f0f16fa7a0c66b507163e0f0ed850334b86169b326` |
+| `tor-guardmgr` | 0.48.0 | `crates/tor-guardmgr` | `4a300b7ee657f837bfd7fa71c546fb3a53b291d84a7c0bf2086a53ab5de79b90` |
+| `tor-ptmgr` | 0.48.0 | `crates/tor-ptmgr` | `e5a85e68659fc0627daa90cb7c1993461801ace009fc22aec230a62cdef27747` |
+| `saturating-time` | 0.6.0 | `crates/saturating-time` | `f950f7f265dc6fc082387eccf710b1adbf22d75f17c4ee0db4648c9b6959b50d` |
+
+Previous baseline (synced 2026-10-13, upstream commit
+`ce8bc6e0998bd5a4efdf06dd62dce53c98ea1087`). These archives were the base of the
+three-way merge used for the 0.48.0 sync; they were downloaded again on
+2026-11-10 and every SHA-256 below matched before the merge:
 
 | Crate | Version | VCS path | SHA-256 of downloaded `.crate.gz` |
 |---|---:|---|---|
@@ -31,23 +53,26 @@ URL pattern `https://static.crates.io/crates/<name>/<name>-<version>.crate`.
 | `tor-ptmgr` | 0.47.0 | `crates/tor-ptmgr` | `0068103033ae2dcedf88691c4758b1e483dd31d325e4891f5e0d3bb41f24ecbc` |
 | `saturating-time` | 0.5.0 | `crates/saturating-time` | `a586db154f85f3faf78398c37b6792d71f99d2253d3277571e14f8a8c6e49a65` |
 
-The ignored evidence area is `target/task78-evidence/archives/`: it contains
-those eight named `.crate.gz` files, per-archive `.crate` and `archive.tar`
-files, and extracted native data copies. Extracted trees are under each
-archive's `contents/extracted/<name>-<version>/`; `contents/data/` copies are
-present for some archives. The observed `target/task78-evidence/upstream/`
+For the 0.47.0 baseline, the ignored evidence area
+`target/task78-evidence/archives/` contained those eight named `.crate.gz`
+files, per-archive `.crate` and `archive.tar` files, and extracted native data
+copies. Extracted trees were under each archive's
+`contents/extracted/<name>-<version>/`; `contents/data/` copies were present
+for some archives. The observed `target/task78-evidence/upstream/`
 subdirectories `LICENSE-MIT/`, `LICENSE-APACHE/`, and
-`saturating-time-history/` are empty. These paths are local, ignored evidence,
-not part of this deliverable.
+`saturating-time-history/` were empty. These paths are local, ignored
+evidence, not part of this deliverable.
 
 ## Comparison observations
 
-At that reviewed repository snapshot, native `git diff --no-index --name-status`
-comparisons of each pre-existing `vendor/<crate>` tree against its extracted
-archive reported the following differences; this comparison excludes this new
-provenance document. `M` means the named path differs. `Cargo.toml` changes
-include local vendoring/patch configuration; source diffs identify divergence,
-not its author or license.
+After the 0.48.0 sync, native `git diff --no-index` comparisons of each
+`vendor/<crate>` tree against its extracted 0.48.0 archive report the following
+differences; `LICENSE-APACHE`, delivered separately below, and this provenance
+document are excluded. The sync merged each file three ways (base: the
+0.47.0 archive, ours: the previous `vendor/` tree, theirs: the 0.48.0 archive);
+only the `version` lines of the `Cargo.toml` manifests conflicted and were
+resolved by hand. `Cargo.toml` changes include local vendoring/patch
+configuration; source diffs identify divergence, not its author or license.
 
 | Crate | Vendor-only paths | Differing paths |
 |---|---|---|
@@ -65,7 +90,10 @@ READMEs (SHA-256 comparison). The two vendor-only Rust paths above are local
 additions relative to the archives; source changes and additions alone do not
 establish authorship or licensing for patches. The README's patch table also
 identifies local patches, including `tor-circmgr` service-circuit-hop changes;
-that description is not a rights grant.
+that description is not a rights grant. `saturating-time` 0.6.0 itself adopted
+the lazy `saturating_add`/`saturating_sub` arithmetic and a termination check
+of the limit search, so its remaining differences are marker comments, ignored
+tests and one regression test.
 
 ## Published license offers and delivered text
 
@@ -73,14 +101,14 @@ Each unchanged package README explicitly offers `MIT OR Apache-2.0`:
 
 | Crate | Published README line |
 |---|---:|
-| `arti-client` 0.47.0 | 323 |
-| `tor-chanmgr` 0.47.0 | 39 |
-| `tor-circmgr` 0.47.0 | 43 |
-| `tor-dirclient` 0.47.0 | 29 |
-| `tor-dirmgr` 0.47.0 | 58 |
-| `tor-guardmgr` 0.47.0 | 108 |
-| `tor-ptmgr` 0.47.0 | 58 |
-| `saturating-time` 0.5.0 | 106 |
+| `arti-client` 0.48.0 | 323 |
+| `tor-chanmgr` 0.48.0 | 39 |
+| `tor-circmgr` 0.48.0 | 43 |
+| `tor-dirclient` 0.48.0 | 29 |
+| `tor-dirmgr` 0.48.0 | 58 |
+| `tor-guardmgr` 0.48.0 | 108 |
+| `tor-ptmgr` 0.48.0 | 58 |
+| `saturating-time` 0.6.0 | 106 |
 
 A byte-for-byte copy of the complete standard Apache-2.0 license text is now
 provided as `LICENSE-APACHE` in each of these eight crate directories. The

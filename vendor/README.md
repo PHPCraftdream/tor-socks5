@@ -5,12 +5,12 @@ This directory holds **full source copies** of upstream crates from the
 `Cargo.toml` applies `[patch.crates-io]` overrides to the eight crates under
 `vendor/`; the build does not depend on these fixes being accepted upstream.
 
-**Base line: Arti 0.47.0 (arti 2.7.0), synced 2026-10-13.**
+**Base line: Arti 0.48.0 (arti 2.8.0), synced 2026-11-10.**
 Workspace MSRV is 1.92 (up from 1.89 on the 0.43 line).
 
 Vendored crates (8): `arti-client`, `tor-chanmgr`, `tor-circmgr`,
-`tor-dirclient`, `tor-dirmgr`, `tor-guardmgr`, `tor-ptmgr` — all at **0.47.0** — and
-`saturating-time` at **0.5.0**.
+`tor-dirclient`, `tor-dirmgr`, `tor-guardmgr`, `tor-ptmgr` — all at **0.48.0** — and
+`saturating-time` at **0.6.0**.
 
 `ptrs-gesher` (the obfs4/webtunnel PT client and `bridge-line` parser) is
 not vendored here. The root `Cargo.toml` declares its crates.io packages
@@ -36,32 +36,35 @@ and patched in the root `Cargo.toml`.
 
 ## Why each crate is vendored
 
-### `tor-ptmgr` (0.47.0)
+### `tor-ptmgr` (0.48.0)
 
 The local manager exposes an awaited PT shutdown receipt, retains unfinished
 child cleanup across cancellation, and rejects new launches after shutdown.
 The paired `arti-client` shutdown method closes channels and awaits that receipt;
 application owners retain their tunnels until shutdown succeeds.
 
-The source baseline is the crates.io `tor-ptmgr` 0.47.0 archive, SHA-256
-`0068103033ae2dcedf88691c4758b1e483dd31d325e4891f5e0d3bb41f24ecbc`.
+The source baseline is the crates.io `tor-ptmgr` 0.48.0 archive, SHA-256
+`e5a85e68659fc0627daa90cb7c1993461801ace009fc22aec230a62cdef27747`.
 The same-version patch is derived from the existing PT owner implementation;
 it does not add another Tor topology or transport. Remove the override only
 when upstream provides the equivalent shutdown contract. PT process tests are
 not proof of a complete pre/Tor/post application exchange.
 
-### `saturating-time` (0.5.0)
+### `saturating-time` (0.6.0)
 
-The root-cause fix for the bridge outage: `saturating_add`/`saturating_sub`
-eagerly forced a `LazyLock` min/max binary search that never terminates on
-Windows `SystemTime`, so bridge descriptors were never parsed and no circuit
-could be built. We ship a lazy `unwrap_or_else` limit and regression tests (one with a
-test-only termination watchdog). A direct limit query or genuine overflow still
-runs the unbounded `find_limit` search on Windows. Upstream's !4414 merely imported
-the crate into arti without the lazy fix; crates.io 0.5.0 still has the eager
-`unwrap_or`.
+The original root-cause fix for the bridge outage: `saturating_add`/
+`saturating_sub` eagerly forced a `LazyLock` min/max binary search that never
+terminates on Windows `SystemTime`, so bridge descriptors were never parsed and
+no circuit could be built. **Upstream 0.6.0 adopted both halves of the fix**:
+the lazy `unwrap_or_else` limits, and a termination check of the limit search
+(a step that returns the unchanged value counts as a miss, working around
+rust-lang/rust#149995). What the override still carries is small: marker
+comments, the `#[ignore]` on the three tests that force a `SystemTime` limit
+search, and the `saturating_add_sub_does_not_hang` regression test with its
+termination watchdog. It is a removal candidate once the upstream limit search
+has been verified on Windows CI.
 
-### `tor-dirclient` (0.47.0)
+### `tor-dirclient` (0.48.0)
 
 A 90-second **idle** (inter-read) body timeout instead of the 10-second total
 timeout, so healthy-but-slow obfs4/webtunnel consensus downloads survive.
@@ -71,10 +74,10 @@ it covers headers only. Also carried: a `Content-Length` body bound
 (`RemainingTracker` + `TruncatedBody`), so a truncated directory body is no
 longer trusted.
 
-### `tor-dirmgr` (0.47.0)
+### `tor-dirmgr` (0.48.0)
 
 Four fixes: a hard 30-second total timeout on the whole bridge-descriptor
-fetch (0.47 still has no overall fetch timeout); parallelism 12 / initial
+fetch (0.48 still has no overall fetch timeout); parallelism 12 / initial
 retry 5 s defaults for the bridge pool (small-pool policy, not a security
 fix); `SharedMutArc` poison recovery instead of bricking the netdir on any
 panic inside `mutate()` (recover-with-possible-staleness); and
@@ -82,7 +85,7 @@ panic inside `mutate()` (recover-with-possible-staleness); and
 `CacheAccessFailed` — an honest classification of transient AV/indexer/sync
 file locks on Windows.
 
-### `tor-chanmgr` (0.47.0)
+### `tor-chanmgr` (0.48.0)
 
 `ChanMgr::terminate_all_channels()` lets the app force-close half-open
 channels after sleep/resume or a network change without a cold `TorClient`
@@ -92,7 +95,7 @@ rebuild. Also: the non-direct (PT) channel-build total timeout is raised
 Предупреждение о нелокальном прокси записывает схему и адрес без учётных
 данных; формат `Display` и сериализация `ProxyProtocol` не изменены.
 
-### `tor-guardmgr` (0.47.0)
+### `tor-guardmgr` (0.48.0)
 
 A guard-readiness signal pair (`any_guard_usable_for_traffic()` +
 `usable_guard_events()`) distinguishes "dir bootstrapped" from "dir
@@ -112,20 +115,20 @@ unreachable value, so new automatic disables practically never happen.
 is not auto-cleared). Automatic recovery never calls it; security-disabled
 bridges stay excluded from recovery.
 
-### `arti-client` (0.47.0)
+### `arti-client` (0.48.0)
 
 `ready_for_traffic()` now ANDs in the guards-usable stream (default `false`
-until the first guard-sample refresh) — upstream 0.47's `BootstrapSetting`
+until the first guard-sample refresh) — upstream 0.48's `BootstrapSetting`
 still ignores guards. Plus: a `FatalProtocolErrorHandler` hook for
 observability of arti's intentional fast-zombie `process::exit(1)` (the exit
 itself is not weakened); a `note_external_guard_failure()` passthrough with
 re-exports of `tor_guardmgr::ExternalActivity` and `tor_linkspec::HasRelayIds`;
 `reset_disabled_guards()` / `guard_is_disabled()` passthroughs; a bounded
-exit-stream retry of `begin_stream` (0.47 still does a single attempt); and
+exit-stream retry of `begin_stream` (0.48 still does a single attempt); and
 an optional `initial_connect_timeout` config field (Android sets 4 s for a
 fast-first budget).
 
-### `tor-circmgr` (0.47.0)
+### `tor-circmgr` (0.48.0)
 
 Opt-in bandwidth floor for middle/exit relay selection; client HS stems honor
 `PathConfig::circuit_hops` in Disabled mode; ordinary exit paths ignore it
@@ -140,34 +143,35 @@ HsDirs reject descriptor posts whose previous hop is a client (a bridge).
 One row per patch group. Marker names are the identifiers in the
 `tor-socks5 local patch: <name>` comments.
 
-| Patch | Crate | File(s) | Purpose | Status in 0.47 |
+| Patch | Crate | File(s) | Purpose | Status in 0.48 |
 |---|---|---|---|---|
-| `lazy_add_limit` / `lazy_sub_limit` | saturating-time 0.5.0 | src/lib.rs | lazy limits instead of eager `unwrap_or` (Windows `SystemTime` hang) | carried (not upstream; 0.5.0 still eager) |
-| watchdog + test hygiene | saturating-time | src/lib.rs, src/internal.rs | test-only termination watchdog around `find_limit` (the search itself stays unbounded); doctests off; 3 limit-forcing tests ignored | carried |
+| `lazy_add_limit` / `lazy_sub_limit` | saturating-time 0.6.0 | src/lib.rs | lazy limits instead of eager `unwrap_or` (Windows `SystemTime` hang) | upstream in 0.6.0; only the marker comments remain |
+| watchdog + test hygiene | saturating-time | src/lib.rs, src/internal.rs | test-only termination watchdog around `find_limit`; doctests off; 3 limit-forcing tests ignored (upstream 0.6.0 now also terminates the search itself) | carried |
 | `body_idle_timeout` / `reset_body_idle` | tor-dirclient | src/lib.rs | 90 s idle body timeout for slow PT consensus downloads | carried (upstream's 10 s header timeout is a different mechanism, kept) |
 | `RemainingTracker` / `TruncatedBody` | tor-dirclient | src/lib.rs, src/err.rs, src/local_test.rs | enforce `Content-Length`; distrust truncated bodies | carried |
-| descriptor-fetch total timeout | tor-dirmgr | src/bridgedesc.rs | hard 30 s total on bridge-descriptor fetch, `RequestFailed(DirTimeout)` | carried (0.47 has no overall fetch timeout) |
-| pool parallelism/retry defaults | tor-dirmgr | src/bridgedesc.rs | parallelism 12, initial retry 5 s | carried (0.47 keeps 4 / 30 s; small-pool policy) |
-| `SharedMutArc` poison recovery | tor-dirmgr | src/shared_ref.rs | `unwrap_or_else(into_inner)` instead of panic on `mutate()` | carried (0.47 still bricks the netdir) |
+| descriptor-fetch total timeout | tor-dirmgr | src/bridgedesc.rs | hard 30 s total on bridge-descriptor fetch, `RequestFailed(DirTimeout)` | carried (0.48 has no overall fetch timeout) |
+| pool parallelism/retry defaults | tor-dirmgr | src/bridgedesc.rs | parallelism 12, initial retry 5 s | carried (0.48 keeps 4 / 30 s; small-pool policy) |
+| `SharedMutArc` poison recovery | tor-dirmgr | src/shared_ref.rs | `unwrap_or_else(into_inner)` instead of panic on `mutate()` | carried (0.48 still bricks the netdir) |
 | sqlite lock classification | tor-dirmgr | src/err.rs | `SQLITE_BUSY`/`SQLITE_LOCKED` → `CacheAccessFailed`, not fatal `Internal` | carried |
 | `terminate_all_channels` | tor-chanmgr | src/lib.rs, src/mgr.rs, src/mgr/state.rs, src/builder.rs | force-close half-open channels after sleep/resume / network change | carried |
 | `connect_build_timeout` | tor-chanmgr | src/builder.rs | non-direct channel-build total 10 s → 45 s (PT handshake budget) | carried |
 | `proxy_warning_redaction` | tor-chanmgr | src/lib.rs | предупреждение о нелокальном прокси без учётных данных | локальный |
-| guard-readiness signal | tor-guardmgr | src/sample.rs, src/events.rs, src/lib.rs | `any_guard_usable_for_traffic()` + `usable_guard_events()` watch stream | carried (0.47 `BootstrapSetting` ignores guards) |
+| guard-readiness signal | tor-guardmgr | src/sample.rs, src/events.rs, src/lib.rs | `any_guard_usable_for_traffic()` + `usable_guard_events()` watch stream | carried (0.48 `BootstrapSetting` ignores guards) |
 | bridge-recovery corrections | tor-guardmgr | src/sample.rs, src/lib.rs | eligibility, reintroduction, retry and adaptive-widening semantics | carried |
 | `reset_disabled_guards` / `guard_is_disabled` | tor-guardmgr | src/guard.rs, src/sample.rs, src/lib.rs | manual recovery hook for persisted `disabled` state | carried (role changed: manual migration handle; !4426 made new automatic disables practically impossible) |
 | descriptorless `Data` retriable | tor-guardmgr | src/lib.rs, src/pending.rs | retry after guardset refresh; `AllGuardsDown` not `Internal` | carried |
 | guards-usable readiness | arti-client | src/status.rs, src/client.rs | `ready_for_traffic()` ANDs the guards-usable stream | carried |
 | `FatalProtocolErrorHandler` | arti-client | src/builder.rs, src/client.rs, src/lib.rs | observability hook for fast-zombie `process::exit(1)`; exit not weakened | carried |
 | external-guard-failure passthrough | arti-client | src/client.rs, src/lib.rs | `note_external_guard_failure()` + re-exports; `reset_disabled_guards`/`guard_is_disabled` passthroughs | carried |
-| exit-stream retry | arti-client | src/client.rs, src/client/stream_retry.rs | one bounded `begin_stream` retry, narrow retryable set, snapshot budgets | carried (0.47 Exit branch is single-attempt) |
+| exit-stream retry | arti-client | src/client.rs, src/client/stream_retry.rs | one bounded `begin_stream` retry, narrow retryable set, snapshot budgets | carried (0.48 Exit branch is single-attempt) |
 | `initial_connect_timeout` | arti-client | src/config.rs; packages/android-ffi | optional fast-first budget; Android sets 4 s; inactive when `None` | carried |
 | `min_bandwidth_percentile` | tor-circmgr | src/config.rs, src/path.rs, src/path/exitpath.rs, src/path/hspath.rs | opt-in bandwidth floor for middle/exit; default 0 = stock | carried |
 | `hs_circuit_hops` | tor-circmgr | src/config.rs, src/hspool.rs, src/hspool/pool.rs, src/path.rs, src/path/exitpath.rs, src/path/hspath.rs | role-aware client lengths, exact-length pool targets, epoch-safe retirement | local |
 | service stem length | tor-circmgr | src/config.rs, src/hspool.rs, src/hspool/pool.rs, src/path.rs, src/path/exitpath.rs, src/path/hspath.rs | `service_circuit_hops` for Svc stems (Disabled mode), guard-only 1-hop path, pool retargeting on change | local |
 | Pareto timeout normalization | tor-circmgr | src/timeouts/pareto.rs | normalize completed short-path observations to canonical three-hop work so timeout estimates remain comparable | local |
 
-**None of the functional patches above were accepted upstream in 0.47.**
+**None of the functional patches above were accepted upstream in 0.48**, except the
+lazy `saturating_add`/`saturating_sub` limits, which `saturating-time` 0.6.0 adopted.
 
 ## Cross-cutting notes
 
@@ -199,7 +203,11 @@ grep -rn "tor-socks5 local patch: body_idle_timeout" vendor/tor-dirclient/
    and whole-file moves silently drop upstream security fixes.
 4. Keep `publish = false` and the `tor-socks5 local patch: <name>` marker
    comments.
-5. Build the workspace and run the test suites.
+5. Build the workspace and run the test suites. The 0.48.0 sync started from
+   per-file three-way merges (`git merge-file`; base: the pristine 0.47.0
+   archive whose SHA-256 matched PROVENANCE.md, ours: `vendor/`, theirs: the new
+   archive) and then reviewed every file that changed on both sides; only the
+   manifests' `version` lines conflicted.
 6. Drop a patch only after verifying the fix landed upstream in the **actual
    sources**, not just the changelog.
 7. Update the patch table above and `CHANGELOG.md`.

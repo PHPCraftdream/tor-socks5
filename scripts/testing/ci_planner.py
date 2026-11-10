@@ -428,7 +428,10 @@ def lock_seeds(old, new, graph):
             matches = {candidate for candidate in ib
                        if candidate[0] == identity[0] and candidate[2] == identity[2]}
             if len(matches) > 1:
-                raise MappingError("missing mapping: неоднозначная замена пакета Cargo.lock: " + identity[0])
+                # Versions that were already in the old lock cannot replace a removed one.
+                matches = {candidate for candidate in matches if candidate not in ia}
+                if len(matches) != 1:
+                    raise MappingError("missing mapping: неоднозначная замена пакета Cargo.lock: " + identity[0])
             return next(iter(matches)) if matches else None
 
         def lift(identity, active):
