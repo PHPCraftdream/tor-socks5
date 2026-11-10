@@ -287,7 +287,22 @@ impl TorConnector for Observe {
                 if message == "cannot change the pre endpoint on a shared client")
         };
         let route_matches = !immutable_guard(tor.reconfigure_bridges(&self.expected));
-        let immutable = immutable_guard(tor.reconfigure_bridges(&wrong));
+        let protocol_immutable = if let Some(pre) = self.expected.pre_endpoint.as_ref() {
+            let http = pre
+                .clone()
+                .with_protocol(resocks5_net::types::ProxyProtocol::Http);
+            let mut wrong_protocol = self.expected.clone();
+            wrong_protocol.pre_endpoint = Some(if pre == &http {
+                pre.clone()
+                    .with_protocol(resocks5_net::types::ProxyProtocol::Socks5)
+            } else {
+                http
+            });
+            immutable_guard(tor.reconfigure_bridges(&wrong_protocol))
+        } else {
+            true
+        };
+        let immutable = immutable_guard(tor.reconfigure_bridges(&wrong)) && protocol_immutable;
         self.tx
             .take()
             .unwrap()
@@ -540,6 +555,32 @@ async fn production_handler_selects_cached_owners_by_full_route() {
             assert!(immutable);
             ids.push(id);
         }
+        users.users[0].pre_socks5 = Some(proxy_config::EndpointOverride::Endpoint(
+            "http://127.0.0.1:1080|alice:first".parse().unwrap(),
+        ));
+        users.save(&path).unwrap();
+        let state = auth.clone();
+        tokio::task::spawn_blocking(move || state.reload())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut expected = settings.clone();
+        expected.pre_endpoint =
+            Some(endpoint("first").with_protocol(resocks5_net::types::ProxyProtocol::Http));
+        let mut http_ids = Vec::new();
+        for _ in 0..2 {
+            let (id, route_matches, immutable) = request(
+                registry.clone(),
+                handle.clone(),
+                auth.clone(),
+                Some(global_pre.clone()),
+                expected.clone(),
+            )
+            .await;
+            assert!(route_matches);
+            assert!(immutable);
+            http_ids.push(id);
+        }
         assert_eq!(ids[0], global_id);
         assert_ne!(
             ids[1], global_id,
@@ -550,10 +591,48 @@ async fn production_handler_selects_cached_owners_by_full_route() {
         assert_ne!(ids[1], ids[4]);
         assert_ne!(ids[3], ids[4]);
         assert_ne!(ids[4], global_id);
+        assert_ne!(http_ids[0], ids[1], "protocol is part of the owner key");
+        assert_eq!(
+            http_ids[0],
+            http_ids[1],
+            "identical HTTP routes reuse the client"
+        );
+        assert_ne!(http_ids[0], global_id);
+        assert_ne!(http_ids[0], ids[3]);
+        assert_ne!(http_ids[0], ids[4]);
         let state = registry.state.lock().await;
-        assert_eq!(state.entries.len(), 3);
+        assert_eq!(state.entries.len(), 4);
         let entries = state.entries.clone();
         drop(state);
+        let socks_pre = endpoint("first");
+        let socks_entry = entries
+            .iter()
+            .find(|entry| entry.pre.as_ref() == Some(&socks_pre))
+            .unwrap();
+        let http_pre = endpoint("first").with_protocol(resocks5_net::types::ProxyProtocol::Http);
+        let http_entry = entries
+            .iter()
+            .find(|entry| entry.pre.as_ref() == Some(&http_pre))
+            .unwrap();
+        let socks_state = socks_entry.state.lock().await;
+        let socks_slot = socks_state.slot.unwrap();
+        assert_eq!(
+            ids[1],
+            socks_state.tunnel.as_ref().unwrap().raw() as *const _ as usize
+        );
+        drop(socks_state);
+        let http_state = http_entry.state.lock().await;
+        let http_slot = http_state.slot.unwrap();
+        assert_eq!(
+            http_ids[0],
+            http_state.tunnel.as_ref().unwrap().raw() as *const _ as usize
+        );
+        assert_ne!(
+            socks_slot,
+            http_slot,
+            "protocol owners need distinct cache slots"
+        );
+        drop(http_state);
         let mut slots = Vec::new();
         for entry in entries {
             let state = entry.state.lock().await;
@@ -562,7 +641,7 @@ async fn production_handler_selects_cached_owners_by_full_route() {
         }
         slots.sort_unstable();
         slots.dedup();
-        assert_eq!(slots.len(), 3);
+        assert_eq!(slots.len(), 4);
         registry.close().await.unwrap();
     })
     .await
