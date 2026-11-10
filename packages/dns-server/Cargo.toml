@@ -32,7 +32,7 @@ name = "dns_server"
 arti-wrapper = { path = "../arti-wrapper", version = "0.2.0" }
 persist-lock = { path = "../persist-lock", version = "0.2.0" }
 hickory-proto = "0.26.1"
-socket2 = "=0.6.3"
+socket2 = "=0.6.5"
 hickory-resolver.workspace = true
 anyhow.workspace = true
 client-acl = { path = "../proxy-config/client-acl", version = "0.2.0", package = "tor-socks5-client-acl" }

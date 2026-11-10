@@ -381,6 +381,24 @@ class Routing(unittest.TestCase):
             p.lock_seeds(lock_text(), lock_text(lock_package("changed", "2.0.0", registry)),
                          wrong_graph_version)
 
+    def test_lock_replacement_ignores_versions_that_were_already_locked(self):
+        registry = "registry+https://github.com/rust-lang/crates.io-index"
+        old = lock_text(lock_package("changed", "1.0.0", registry),
+                        lock_package("changed", "2.0.0", registry))
+        new = lock_text(lock_package("changed", "2.0.0", registry),
+                        lock_package("changed", "3.0.0", registry))
+        graph = lock_graph(extra_packages=(
+            ("changed-2", "changed", "2.0.0", registry, "external/changed-2", "lib"),
+            ("changed-3", "changed", "3.0.0", registry, "external/changed-3", "lib")))
+        self.assertEqual(p.lock_seeds(old, new, graph), {"changed-3"})
+        both_new = lock_text(lock_package("changed", "3.0.0", registry),
+                             lock_package("changed", "4.0.0", registry))
+        both_graph = lock_graph(extra_packages=(
+            ("changed-3", "changed", "3.0.0", registry, "external/changed-3", "lib"),
+            ("changed-4", "changed", "4.0.0", registry, "external/changed-4", "lib")))
+        with self.assertRaisesRegex(p.MappingError, "missing mapping"):
+            p.lock_seeds(lock_text(lock_package("changed", "1.0.0", registry)), both_new, both_graph)
+
     def test_rename_delete_unknown(self):
         result = self.route("packages/auth/src/old.rs", "packages/bridge-probe/src/new.rs")
         self.assertIn("tor-socks5-auth", result["packages"])

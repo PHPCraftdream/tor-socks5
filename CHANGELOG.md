@@ -21,23 +21,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Breaking:** `pre_socks5` / `post_socks5` (config and users registry) are replaced by the array fields `pre_proxies` / `post_proxies`; the old names and single-value form are rejected at load time. `users set-socks5` is now `users set-proxies`
-- **Vendored crates rebased from the Arti 0.43 line to 0.47.0 (arti 2.7.0)**
+- **Vendored crates rebased from the Arti 0.43 line to 0.48.0 (arti 2.8.0)**
   (`vendor/`, see its README for the full patch table); `saturating-time`
-  0.3.0 → 0.5.0. All local vendor patches carried: saturating-time lazy
-  limits; dirclient idle-body timeout and Content-Length bound; dirmgr
+  0.3.0 → 0.6.0, which now has the lazy limits and the termination fix of the
+  Windows limit search upstream. All other local vendor patches carried: dirclient idle-body timeout and Content-Length bound; dirmgr
   descriptor-fetch timeout, pool parallelism/retry, poison recovery and
   sqlite lock classification; chanmgr `terminate_all_channels` and the 45 s
   non-direct channel-build timeout; guardmgr guard-readiness signal, bridge
   recovery corrections and `reset_disabled_guards`; arti-client
   guards-usable readiness, fatal-protocol-error hook, external guard failure
   passthrough, exit-stream retry and `initial_connect_timeout`; circmgr
-  opt-in bandwidth floor. None were accepted upstream in 0.47.
+  opt-in bandwidth floor. None were accepted upstream in 0.48.
   `reset_disabled_guards` is re-scoped as a manual migration handle for old
   persisted state: 0.47 (!4426) made new automatic guard disables
   practically impossible.
 - **MSRV 1.89 → 1.92** (workspace and vendored crates).
-- `ptrs-gesher` (obfs4/webtunnel PT client, `bridge-line` parser) 0.8.0
-  resolves from crates.io; the release targets `tor-*` 0.47, replacing the
+- `socket2` is pinned at 0.6.5 (required by `tor-rtcompat` 0.48), and the CLI enables the `hazmat` feature of `ed25519-dalek` itself instead of relying on `tor-llcrypto` to enable it.
+- `ptrs-gesher` (obfs4/webtunnel PT client, `bridge-line` parser) 0.9.0
+  resolves from crates.io; the release targets `tor-*` 0.48, replacing the
   temporary sibling-checkout binding. Executed consumer acceptance of the
   registry build remains outstanding.
 
