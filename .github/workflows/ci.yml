@@ -367,6 +367,9 @@ jobs:
       - name: validate-tag.sh + publish.sh offline suite (gh stub, real jq/sha256sum/stat)
         run: python3 -I .github/install/tests/test_release.py
         shell: bash
+      - name: Pinned musl source-material regressions
+        run: python3 -I .github/release/test_source_companion.py NativeMuslSourceTests
+        shell: bash
       - uses: dtolnay/rust-toolchain@stable
       - name: Source companion with real locked Cargo vendor
         shell: bash
