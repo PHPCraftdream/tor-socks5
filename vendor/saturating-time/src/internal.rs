@@ -25,7 +25,7 @@ static MAX_INSTANT: LazyLock<Instant> = LazyLock::new(find_max);
 static MIN_INSTANT: LazyLock<Instant> = LazyLock::new(find_min);
 
 /// An internal trait implementing the actual magic behind this.
-pub trait SaturatingTime: Sized + Copy {
+pub trait SaturatingTime: Sized + Copy + PartialEq {
     /// Anchor method to obtain an instance of this type.
     fn anchor() -> Self;
 
@@ -124,6 +124,9 @@ fn find_min<T: SaturatingTime>() -> T {
 /// 1. Set `step` to `INITIAL_STEP` and `res` to [`SaturatingTime::anchor()`].
 /// 2. Call `f(&res, step)`.
 ///     1. If [`Some`], set `res` to the returned value and continue.
+///         * A [`Some`] that is equal to the previous value is considered as a
+///           [`None`] due to a long lived bug in the Rust standard library.
+///         * See Also: <https://github.com/rust-lang/rust/issues/149995>
 ///     2. If [`None`] and `step == 1ns`, return `res`.
 ///     3. Else, set `step` to `MAX{1ns, step / 2}` and continue.
 fn find_limit<T, F>(f: F) -> T
@@ -135,8 +138,8 @@ where
     const ONE_NS: Duration = Duration::new(0, 1);
 
     // tor-socks5 local patch: limit_search_caveat
-    // Windows SystemTime searches can fail to terminate. Lazy arithmetic avoids
-    // this on success, but direct limits and genuine overflow remain affected.
+    // Windows SystemTime searches used to fail to terminate; 0.6.0 stops them
+    // once a step leaves the value unchanged (rust-lang/rust#149995).
     // (1) Set step to INITIAL_STEP and res to T::anchor().
     let mut step = INITIAL_STEP;
     let mut res = T::anchor();
@@ -145,11 +148,12 @@ where
         // (2) Call f().
         let next = f(&res, step);
         match next {
-            Some(st) => {
+            // We only consider a Some as a Some if the value actually changed.
+            Some(st) if st != res => {
                 // (2.1) If Some, set res to the returned value and continue.
                 res = st;
             }
-            None => {
+            None | Some(_) => {
                 if step == ONE_NS {
                     // (2.2) If None and step == 1ns, return res.
                     return res;
