@@ -827,7 +827,7 @@ async fn tor_handler_routes_and_releases_admission_on_error_or_cancel() {
             for mode in 0..3 {
                 for cancel in [false, true] {
                     let global = proxy_config::EndpointOverride::Endpoint("127.0.0.1:1080".parse().unwrap());
-                    let account = proxy_config::EndpointOverride::Endpoint("127.0.0.1:1081".parse().unwrap());
+                    let account = proxy_config::EndpointOverride::Endpoint("http://127.0.0.1:1081|post_user:post_password".parse().unwrap());
                     let override_value = match mode {
                         0 => None,
                         1 => Some(account.clone()),
