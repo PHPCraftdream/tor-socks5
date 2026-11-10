@@ -1,5 +1,6 @@
 use super::super::{handle_client_with_connector, ConnHealthCounters, Egress, TorConnector};
 use super::*;
+use proxy_config::Socks5Endpoint;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -203,9 +204,8 @@ async fn tracked_handler_shutdown_joins_pending_owner_constructor() {
         let (_, handle, mut registry, path, mut users, _) = handler_setup(dir.path());
         let observer = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         observer.set_nonblocking(true).unwrap();
-        users.users[0].pre_socks5 = Some(proxy_config::EndpointOverride::Endpoint(
-            format!("{}|alice:first", observer.local_addr().unwrap()).parse().unwrap(),
-        ));
+        users.users[0].pre_proxies = Some(proxy_config::PoolOverride::Pool(
+            format!("{}|alice:first", observer.local_addr().unwrap()).parse::<Socks5Endpoint>().unwrap().into()));
         users.save(&path).unwrap();
         let auth = Arc::new(auth::AuthState::build_persistent(&users, path).unwrap());
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -228,7 +228,7 @@ async fn tracked_handler_shutdown_joins_pending_owner_constructor() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let mut accept = AbortOnDrop(tokio::spawn(handlers.clone().accept_loop_tracked(
-            listener, Egress::Tor(handle, None, None, false, Some(registry.clone())),
+            listener, Egress::Tor(handle, None, None, false, Some(registry.clone()), Arc::new(crate::post_pool::PostPools::new())),
             Some(auth), permits.clone(), super::super::handlers::ConnectionTracking {
                 conn_health: ConnHealthCounters::default(),
                 next_conn_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
@@ -273,7 +273,7 @@ impl TorConnector for Observe {
     async fn connect<'a>(
         &'a mut self,
         tor: &'a TorTunnel,
-        _post: Option<&'a proxy_config::EndpointOverride>,
+        _post: Option<&'a proxy_config::ProxyPool>,
         _host: &'a str,
         _port: u16,
     ) -> arti_wrapper::Result<arti_wrapper::RoutedStream> {
@@ -333,7 +333,7 @@ async fn request(
     registry: Arc<OwnerRegistry>,
     handle: TorHandle,
     auth: Arc<auth::AuthState>,
-    global_pre: Option<proxy_config::EndpointOverride>,
+    global_pre: Option<proxy_config::ProxyPool>,
     expected: Settings,
 ) -> (usize, bool, bool) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -356,6 +356,7 @@ async fn request(
             None,
             false,
             Some(registry),
+            Arc::new(crate::post_pool::PostPools::new()),
         ),
         Some(auth),
         ConnHealthCounters::default(),
@@ -391,10 +392,17 @@ async fn production_handler_account_endpoint_without_global() {
         registry.bootstrap_hook = Some(Arc::new(|| Box::pin(async {})));
         let registry = Arc::new(registry);
         let path = dir.path().join("users.ktav");
-        let route_a =
-            proxy_config::EndpointOverride::Endpoint("127.0.0.1:1080|alice:first".parse().unwrap());
-        let route_b = proxy_config::EndpointOverride::Endpoint(
-            "127.0.0.1:1080|alice:second".parse().unwrap(),
+        let route_a = proxy_config::PoolOverride::Pool(
+            "127.0.0.1:1080|alice:first"
+                .parse::<Socks5Endpoint>()
+                .unwrap()
+                .into(),
+        );
+        let route_b = proxy_config::PoolOverride::Pool(
+            "127.0.0.1:1080|alice:second"
+                .parse::<Socks5Endpoint>()
+                .unwrap()
+                .into(),
         );
         let mut users = auth::UsersConfig {
             users: vec![auth::User {
@@ -403,8 +411,8 @@ async fn production_handler_account_endpoint_without_global() {
                 is_enabled: true,
                 allowed_onion: false,
                 allowed_clients: None,
-                pre_socks5: Some(route_a.clone()),
-                post_socks5: None,
+                pre_proxies: Some(route_a.clone()),
+                post_proxies: None,
             }],
         };
         users.save(&path).unwrap();
@@ -413,13 +421,13 @@ async fn production_handler_account_endpoint_without_global() {
             (Some(route_a.clone()), Some(endpoint("first"))),
             (Some(route_a), Some(endpoint("first"))),
             (Some(route_b), Some(endpoint("second"))),
-            (Some(proxy_config::EndpointOverride::Disabled), None),
+            (Some(proxy_config::PoolOverride::Disabled), None),
             (None, None),
         ];
         let mut ids = Vec::new();
         for (index, (route, pre)) in routes.into_iter().enumerate() {
             if index != 0 {
-                users.users[0].pre_socks5 = route.clone();
+                users.users[0].pre_proxies = route.clone();
                 users.save(&path).unwrap();
                 let state = auth.clone();
                 tokio::task::spawn_blocking(move || state.reload())
@@ -450,7 +458,7 @@ async fn production_handler_account_endpoint_without_global() {
                 .unwrap();
             {
                 let lease = auth.admit(&proof).await.unwrap();
-                assert!(lease.pre_socks5() == route.as_ref());
+                assert!(lease.pre_proxies() == route.as_ref());
             }
             if let Some(pre) = pre {
                 let entries = registry.state.lock().await.entries.clone();
@@ -499,9 +507,10 @@ async fn production_handler_selects_cached_owners_by_full_route() {
         // Заменяется только ожидание сети, не выбор и не создание владельца.
         registry.bootstrap_hook = Some(Arc::new(|| Box::pin(async {})));
         let registry = Arc::new(registry);
-        let global_pre = proxy_config::EndpointOverride::Endpoint(
-            "127.0.0.1:1080|alice:global".parse().unwrap(),
-        );
+        let global_pre: proxy_config::ProxyPool = "127.0.0.1:1080|alice:global"
+            .parse::<Socks5Endpoint>()
+            .unwrap()
+            .into();
         let path = dir.path().join("users.ktav");
         let mut users = auth::UsersConfig {
             users: vec![auth::User {
@@ -510,8 +519,8 @@ async fn production_handler_selects_cached_owners_by_full_route() {
                 is_enabled: true,
                 allowed_onion: false,
                 allowed_clients: None,
-                pre_socks5: None,
-                post_socks5: None,
+                pre_proxies: None,
+                post_proxies: None,
             }],
         };
         users.save(&path).unwrap();
@@ -524,11 +533,14 @@ async fn production_handler_selects_cached_owners_by_full_route() {
             Some("second"),
             Some("direct"),
         ] {
-            users.users[0].pre_socks5 = match pre {
+            users.users[0].pre_proxies = match pre {
                 None => None,
-                Some("direct") => Some(proxy_config::EndpointOverride::Disabled),
-                Some(password) => Some(proxy_config::EndpointOverride::Endpoint(
-                    format!("127.0.0.1:1080|alice:{password}").parse().unwrap(),
+                Some("direct") => Some(proxy_config::PoolOverride::Disabled),
+                Some(password) => Some(proxy_config::PoolOverride::Pool(
+                    format!("127.0.0.1:1080|alice:{password}")
+                        .parse::<Socks5Endpoint>()
+                        .unwrap()
+                        .into(),
                 )),
             };
             users.save(&path).unwrap();
@@ -555,8 +567,11 @@ async fn production_handler_selects_cached_owners_by_full_route() {
             assert!(immutable);
             ids.push(id);
         }
-        users.users[0].pre_socks5 = Some(proxy_config::EndpointOverride::Endpoint(
-            "http://127.0.0.1:1080|alice:first".parse().unwrap(),
+        users.users[0].pre_proxies = Some(proxy_config::PoolOverride::Pool(
+            "http://127.0.0.1:1080|alice:first"
+                .parse::<Socks5Endpoint>()
+                .unwrap()
+                .into(),
         ));
         users.save(&path).unwrap();
         let state = auth.clone();
@@ -656,7 +671,7 @@ impl TorConnector for Park {
     async fn connect<'a>(
         &'a mut self,
         tor: &'a TorTunnel,
-        post: Option<&'a proxy_config::EndpointOverride>,
+        post: Option<&'a proxy_config::ProxyPool>,
         host: &'a str,
         port: u16,
     ) -> arti_wrapper::Result<arti_wrapper::RoutedStream> {
@@ -685,7 +700,14 @@ async fn start_handler<C: TorConnector + Send + 'static>(
         .unwrap();
     let handler = AbortOnDrop(tokio::spawn(handle_client_with_connector(
         server,
-        Egress::Tor(handle, None, None, false, Some(registry)),
+        Egress::Tor(
+            handle,
+            None,
+            None,
+            false,
+            Some(registry),
+            Arc::new(crate::post_pool::PostPools::new()),
+        ),
         Some(auth),
         ConnHealthCounters::default(),
         false,
@@ -724,10 +746,13 @@ fn handler_setup(
             is_enabled: true,
             allowed_onion: false,
             allowed_clients: None,
-            pre_socks5: Some(proxy_config::EndpointOverride::Endpoint(
-                "127.0.0.1:1080|alice:first".parse().unwrap(),
+            pre_proxies: Some(proxy_config::PoolOverride::Pool(
+                "127.0.0.1:1080|alice:first"
+                    .parse::<Socks5Endpoint>()
+                    .unwrap()
+                    .into(),
             )),
-            post_socks5: None,
+            post_proxies: None,
         }],
     };
     users.save(&path).unwrap();
@@ -838,8 +863,11 @@ async fn production_handler_reload_waits_through_alternate_dial() {
         .await;
         let (id_a, matches, immutable) = rx.await.unwrap();
         assert!(matches && immutable);
-        users.users[0].pre_socks5 = Some(proxy_config::EndpointOverride::Endpoint(
-            "127.0.0.1:1080|alice:second".parse().unwrap(),
+        users.users[0].pre_proxies = Some(proxy_config::PoolOverride::Pool(
+            "127.0.0.1:1080|alice:second"
+                .parse::<Socks5Endpoint>()
+                .unwrap()
+                .into(),
         ));
         users.save(&path).unwrap();
         let state = auth.clone();

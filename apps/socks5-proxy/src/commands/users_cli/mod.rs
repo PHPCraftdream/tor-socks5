@@ -7,7 +7,7 @@ use anyhow::{bail, Result};
 use auth::{compute_hash, verify_hash, User, UsersConfig, INIT_SENTINEL};
 use clap::Subcommand;
 use persist_lock::{PathLock, CLI_LOCK_WAIT};
-use proxy_config::EndpointOverride;
+use proxy_config::{PoolOverride, ProxyPool, Socks5Endpoint};
 
 /// Test-only override (milliseconds) for the CLI lock wait; `0` uses the
 /// production [`CLI_LOCK_WAIT`]. Lets tests exercise the busy path
@@ -42,10 +42,14 @@ pub enum UsersAction {
         /// grant an existing account.
         #[arg(long)]
         allow_onion: bool,
-        #[arg(long)]
-        pre_socks5: Option<String>,
-        #[arg(long)]
-        post_socks5: Option<String>,
+        /// Pre proxy pool for this account: one or more endpoints, or `none`
+        /// to disable the hop; omitted inherits the global pool.
+        #[arg(long, num_args = 1.., value_name = "ENDPOINT")]
+        pre_proxies: Vec<String>,
+        /// Post proxy pool for this account: one or more endpoints, or `none`
+        /// to disable the hop; omitted inherits the global pool.
+        #[arg(long, num_args = 1.., value_name = "ENDPOINT")]
+        post_proxies: Vec<String>,
     },
     /// Remove an existing user.
     Remove {
@@ -67,11 +71,13 @@ pub enum UsersAction {
         /// Username whose password to change.
         name: String,
     },
-    /// Set or inherit a SOCKS5 hop (`pre` or `post`); `none` disables it.
-    SetSocks5 {
+    /// Set or inherit the proxy pool of a hop (`pre` or `post`): endpoints
+    /// replace the pool, `none` disables the hop, `inherit` uses the global pool.
+    SetProxies {
         name: String,
         hop: String,
-        value: String,
+        #[arg(num_args = 1.., value_name = "ENDPOINT")]
+        values: Vec<String>,
     },
     /// List all users.
     List,
@@ -116,32 +122,26 @@ pub fn run(
             name,
             init,
             allow_onion,
-            pre_socks5,
-            post_socks5,
+            pre_proxies,
+            post_proxies,
         } => {
             if init {
-                cmd_add_init(
-                    &users_path,
-                    &name,
-                    allow_onion,
-                    pre_socks5.as_deref(),
-                    post_socks5.as_deref(),
-                )
+                cmd_add_init(&users_path, &name, allow_onion, &pre_proxies, &post_proxies)
             } else {
                 cmd_add(
                     &users_path,
                     &name,
                     prompt,
                     allow_onion,
-                    pre_socks5.as_deref(),
-                    post_socks5.as_deref(),
+                    &pre_proxies,
+                    &post_proxies,
                 )
             }
         }
         UsersAction::Remove { name } => cmd_remove(&users_path, &name),
         UsersAction::SetPassword { name } => cmd_set_password(&users_path, &name, prompt),
-        UsersAction::SetSocks5 { name, hop, value } => {
-            cmd_set_socks5(&users_path, &name, &hop, &value)
+        UsersAction::SetProxies { name, hop, values } => {
+            cmd_set_proxies(&users_path, &name, &hop, &values)
         }
         UsersAction::List => cmd_list(&users_path),
         UsersAction::Enable { name } => cmd_enable(&users_path, &name),
@@ -180,13 +180,13 @@ fn cmd_add(
     name: &str,
     prompt: &mut dyn PasswordPrompt,
     allow_onion: bool,
-    pre_socks5: Option<&str>,
-    post_socks5: Option<&str>,
+    pre_proxies: &[String],
+    post_proxies: &[String],
 ) -> Result<()> {
     // Fail fast before the interactive prompt; the authoritative check
     // re-runs under the transaction lock below.
-    let pre_socks5 = parse_user_endpoint(pre_socks5)?;
-    let post_socks5 = parse_user_endpoint(post_socks5)?;
+    let pre_proxies = parse_user_pool(pre_proxies)?;
+    let post_proxies = parse_user_pool(post_proxies)?;
     if UsersConfig::load(users_path)?.find(name).is_some() {
         bail!("user \"{name}\" already exists — use `set-password` to change the password");
     }
@@ -205,8 +205,8 @@ fn cmd_add(
         allowed_onion: allow_onion,
         // Новые пользователи создаются без per-user ACL.
         allowed_clients: None,
-        pre_socks5,
-        post_socks5,
+        pre_proxies,
+        post_proxies,
     });
     users.save(users_path)?;
     drop(lock);
@@ -225,11 +225,11 @@ fn cmd_add_init(
     users_path: &Path,
     name: &str,
     allow_onion: bool,
-    pre_socks5: Option<&str>,
-    post_socks5: Option<&str>,
+    pre_proxies: &[String],
+    post_proxies: &[String],
 ) -> Result<()> {
-    let pre_socks5 = parse_user_endpoint(pre_socks5)?;
-    let post_socks5 = parse_user_endpoint(post_socks5)?;
+    let pre_proxies = parse_user_pool(pre_proxies)?;
+    let post_proxies = parse_user_pool(post_proxies)?;
     let (lock, mut users) = lock_and_load(users_path)?;
     if users.find(name).is_some() {
         bail!("user \"{name}\" already exists — use `set-password` to change the password");
@@ -241,8 +241,8 @@ fn cmd_add_init(
         allowed_onion: allow_onion,
         // Новые пользователи создаются без per-user ACL.
         allowed_clients: None,
-        pre_socks5,
-        post_socks5,
+        pre_proxies,
+        post_proxies,
     });
     users.save(users_path)?;
     drop(lock);
@@ -255,35 +255,46 @@ fn cmd_add_init(
     Ok(())
 }
 
-fn cmd_set_socks5(path: &Path, name: &str, hop: &str, value: &str) -> Result<()> {
+fn cmd_set_proxies(path: &Path, name: &str, hop: &str, values: &[String]) -> Result<()> {
     if !matches!(hop, "pre" | "post") {
         bail!("hop must be `pre` or `post`");
     }
-    let setting = parse_user_endpoint(Some(value))?;
+    let setting = parse_user_pool(values)?;
     let (lock, mut users) = lock_and_load(path)?;
     let user = users
         .find_mut(name)
         .ok_or_else(|| anyhow::anyhow!("user does not exist"))?;
     match hop {
-        "pre" => user.pre_socks5 = setting,
-        "post" => user.post_socks5 = setting,
+        "pre" => user.pre_proxies = setting,
+        "post" => user.post_proxies = setting,
         _ => bail!("hop must be `pre` or `post`"),
     }
     users.save(path)?;
     drop(lock);
-    println!("user SOCKS5 override updated");
+    println!("user proxy pool updated");
     Ok(())
 }
 
-fn parse_user_endpoint(value: Option<&str>) -> Result<Option<EndpointOverride>> {
-    match value {
-        None | Some("inherit") => Ok(None),
-        Some("none") => Ok(Some(EndpointOverride::Disabled)),
-        Some(value) => value
-            .parse()
-            .map(EndpointOverride::Endpoint)
-            .map(Some)
-            .map_err(|_| anyhow::anyhow!("invalid SOCKS5 endpoint")),
+/// `inherit` (or nothing) keeps the global pool, `none` disables the hop,
+/// anything else is the account's own pool.
+fn parse_user_pool(values: &[String]) -> Result<Option<PoolOverride>> {
+    match values {
+        [] => Ok(None),
+        [only] if only == "inherit" => Ok(None),
+        [only] if only == "none" => Ok(Some(PoolOverride::Disabled)),
+        values => {
+            let members = values
+                .iter()
+                .map(|value| {
+                    value
+                        .parse::<Socks5Endpoint>()
+                        .map_err(|_| anyhow::anyhow!("invalid proxy endpoint"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            ProxyPool::new(members)
+                .map(|pool| Some(PoolOverride::Pool(pool)))
+                .map_err(|error| anyhow::anyhow!(error))
+        }
     }
 }
 

@@ -2,34 +2,37 @@ use super::{
     reject_unimplemented_account_socks5_endpoints, reject_unimplemented_global_socks5_endpoints,
 };
 use auth::{User, UsersConfig};
-use proxy_config::{Config, EndpointOverride};
+use proxy_config::{Config, PoolOverride, ProxyPool, Socks5Endpoint};
 
-fn endpoint() -> EndpointOverride {
-    EndpointOverride::Endpoint("127.0.0.1:9050".parse().unwrap())
+fn pool() -> ProxyPool {
+    "127.0.0.1:9050".parse::<Socks5Endpoint>().unwrap().into()
 }
 
-fn user(enabled: bool, pre: Option<EndpointOverride>) -> User {
+fn endpoint() -> PoolOverride {
+    PoolOverride::Pool(pool())
+}
+
+fn user(enabled: bool, pre: Option<PoolOverride>) -> User {
     User {
         name: "account".to_owned(),
         hash: "unused".to_owned(),
         is_enabled: enabled,
         allowed_onion: false,
         allowed_clients: None,
-        pre_socks5: pre,
-        post_socks5: None,
+        pre_proxies: pre,
+        post_proxies: None,
     }
 }
 
 #[test]
-fn global_endpoint_is_rejected_but_none_or_absence_is_allowed() {
+fn global_pool_is_rejected_but_absence_is_allowed() {
     let mut config = Config::default();
     assert!(reject_unimplemented_global_socks5_endpoints(&config).is_ok());
-    config.pre_socks5 = Some(EndpointOverride::Disabled);
-    config.post_socks5 = Some(endpoint());
+    config.post_proxies = Some(pool());
     assert!(reject_unimplemented_global_socks5_endpoints(&config).is_err());
-    config.post_socks5 = None;
+    config.post_proxies = None;
     assert!(reject_unimplemented_global_socks5_endpoints(&config).is_ok());
-    config.pre_socks5 = Some(endpoint());
+    config.pre_proxies = Some(pool());
     assert!(reject_unimplemented_global_socks5_endpoints(&config).is_err());
 }
 
@@ -40,7 +43,7 @@ fn enabled_account_endpoint_is_rejected_but_disabled_account_is_ignored() {
     };
     assert!(reject_unimplemented_account_socks5_endpoints(&users).is_err());
     let mut post_only = user(true, None);
-    post_only.post_socks5 = Some(endpoint());
+    post_only.post_proxies = Some(endpoint());
     let users = UsersConfig {
         users: vec![post_only],
     };
@@ -50,7 +53,7 @@ fn enabled_account_endpoint_is_rejected_but_disabled_account_is_ignored() {
     };
     assert!(reject_unimplemented_account_socks5_endpoints(&users).is_ok());
     let users = UsersConfig {
-        users: vec![user(true, Some(EndpointOverride::Disabled))],
+        users: vec![user(true, Some(PoolOverride::Disabled))],
     };
     assert!(reject_unimplemented_account_socks5_endpoints(&users).is_ok());
 }

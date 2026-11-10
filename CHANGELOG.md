@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Pre and post proxy pools: `pre_proxies` and `post_proxies` (globally and per account) are arrays of SOCKS5 / HTTP CONNECT endpoints, and one pool may mix both. A post pool keeps each target's registrable domain (eTLD+1) on one member while spreading different sites, tries the other members when one fails, quarantines a member whose proxy keeps failing and re-checks it in the background through Tor; an exhausted pool fails the connection and never goes direct. A pre pool currently holds one member. `users add --pre-proxies/--post-proxies` and `users set-proxies` take one or more endpoints, `none` or `inherit`
 - New documentation: `docs/guide/ops/onion-service.md` (publishing a local site through Tor: quick start, key management, vanity mining, security, diagnostics) is bundled as the `tor-socks5 help onion-service` topic; `docs/guide/logging.md` moved to `docs/guide/ops/logging.md`.
 - Build now supports the server side of onion services behind the `onion-service` cargo feature (on by default in the CLI, off for Android; no user-facing functionality yet).
 - New `tor-socks5 onion` subcommands (`new`, `list`, `show`, `export`, `import`, `remove`) manage onion-service identity keys in the Arti keystore; `new`/`import`/`remove` refuse to destroy an existing address without an explicit confirmation flag.
@@ -19,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `pre_socks5` / `post_socks5` (config and users registry) are replaced by the array fields `pre_proxies` / `post_proxies`; the old names and single-value form are rejected at load time. `users set-socks5` is now `users set-proxies`
 - **Vendored crates rebased from the Arti 0.43 line to 0.47.0 (arti 2.7.0)**
   (`vendor/`, see its README for the full patch table); `saturating-time`
   0.3.0 → 0.5.0. All local vendor patches carried: saturating-time lazy

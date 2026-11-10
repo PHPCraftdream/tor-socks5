@@ -48,23 +48,43 @@ egress through an upstream SOCKS5 proxy instead of Tor, and install itself as an
 - **Install as a service** — systemd, OpenRC, launchd, Windows SCM, BSD `rc.d`.
 - **Non-blocking logging** to stderr / stdout / file, configurable level and per-target filters.
 
-## Pre/post proxy protocols
+## Pre/post proxy pools
 
-Pre and post independently accept SOCKS5 or plain HTTP CONNECT. The legacy
-`pre_socks5` / `post_socks5` field names remain valid globally and per account.
-No scheme means SOCKS5; `socks5://` makes it explicit and `http://` selects
-HTTP CONNECT. The scalar format remains `IP:port|username:password`, with the
-credentials suffix optional. Existing credential length/delimiter rules apply.
+`pre_proxies` and `post_proxies` are arrays of proxy endpoints, globally and per
+account. Every member independently selects SOCKS5 or plain HTTP CONNECT, and a
+pool may mix both. No scheme means SOCKS5; `socks5://` makes it explicit and
+`http://` selects HTTP CONNECT. Each member is `IP:port|username:password`, with
+the credentials suffix optional. Existing credential length/delimiter rules apply.
 
 ```text
-pre_socks5: http://192.0.2.10:8080|username:password
-post_socks5: socks5://192.0.2.11:1080
+pre_proxies: [
+    http://192.0.2.10:8080|username:password
+]
+post_proxies: [
+    socks5://192.0.2.11:1080
+    http://192.0.2.12:8080|username:password
+    :: [2001:db8::2]:1080
+]
 ```
 
-The addresses above are documentation-only. An absent account field inherits
-its global setting; `none` explicitly disables that field. Protocol, endpoint
-and credentials participate in pre-owner identity. Errors never negotiate a
-different proxy protocol or fall back to a direct route. HTTPS-to-proxy is not
+A bracketed IPv6 member starts with `[`, which Ktav would read as a nested array,
+so write it as a literal item with the `:: ` prefix as shown. The addresses above
+are documentation-only. An absent account field inherits its global pool;
+`none` explicitly disables that hop; an array replaces the global pool. The
+old `pre_socks5` / `post_socks5` fields are rejected at load time.
+
+A **post** pool rotates: each target's registrable domain (eTLD+1, so
+`a.example.com` and `b.example.com` share it) is assigned to one member and keeps
+using it, while different sites spread over the members. When a member fails, the
+next ones are tried within the setup deadline and the site moves to the member
+that worked; a member whose proxy keeps failing is quarantined and re-checked in
+the background through Tor, and returns to rotation once it answers again.
+Failures that are not the proxy's fault (the target refuses, Tor itself is
+unavailable) do not rotate and do not demote a member. An exhausted pool fails
+the connection. A **pre** pool currently holds exactly one member.
+
+Protocol, endpoint and credentials participate in pre-owner identity. Errors
+never negotiate a different proxy protocol or fall back to a direct route. HTTPS-to-proxy is not
 part of this interface. All inbound proxy listeners use dual SOCKS5/HTTP CONNECT
 framing; ordinary HTTP forwarding is not supported. See the
 [CLI account-routing guide](docs/guide/auth.md#cli-prepost-routing) for examples
@@ -77,9 +97,9 @@ Normal Ctrl+Break shutdown of the CLI and its active PT children was also checke
 This is not an all-platform runtime claim or packet-capture evidence. Main/release
 delivery and fresh CI for publicly reproducible dependencies remain separate.
 
-## Global `pre_socks5` routing
+## Global `pre_proxies` routing
 
-Global `pre_socks5` uses explicitly configured plain bridges or the bundled
+Global `pre_proxies` uses explicitly configured plain bridges or the bundled
 obfs4/WebTunnel transport. For PT bridges, the pre proxy supplies the carrier
 before the existing transport handshake and TLS. External `TOR_PT_BINARY`
 overrides are rejected in this mode. Whole-route application acceptance remains

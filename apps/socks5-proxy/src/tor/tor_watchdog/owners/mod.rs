@@ -18,7 +18,14 @@ static RETAINED: std::sync::Mutex<Option<Arc<OwnerRegistry>>> = std::sync::Mutex
 pub(super) static TEST_LIFECYCLE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const CAPACITY: usize = 16;
+
 pub(super) const SETUP_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Pre pools are limited to one member until pool rotation reaches the pre hop.
+fn single_pre_member(pool: &proxy_config::ProxyPool) -> Result<&proxy_config::Socks5Endpoint> {
+    pool.sole_member()
+        .ok_or_else(|| anyhow!("pre proxy pools with several members are not supported yet"))
+}
 
 struct Entry {
     pre: Option<Socks5PreEndpoint>,
@@ -109,18 +116,21 @@ impl OwnerRegistry {
 
     /// cancel-safe: YES — отмена сохраняет запущенный конструктор в записи реестра.
     pub(super) async fn select_admitted(&self, lease: &auth::AdmissionLease) -> Result<Owner> {
-        let pre = match lease.pre_socks5() {
+        let pre = match lease.pre_proxies() {
             None => self.global_pre.clone(),
-            Some(proxy_config::EndpointOverride::Disabled) => None,
-            Some(proxy_config::EndpointOverride::Endpoint(endpoint)) => Some(
-                Socks5PreEndpoint::new(
-                    endpoint.address(),
-                    endpoint
-                        .credentials()
-                        .map(|(user, pass)| (user.to_owned(), pass.to_owned())),
+            Some(proxy_config::PoolOverride::Disabled) => None,
+            Some(proxy_config::PoolOverride::Pool(pool)) => {
+                let endpoint = single_pre_member(pool)?;
+                Some(
+                    Socks5PreEndpoint::new(
+                        endpoint.address(),
+                        endpoint
+                            .credentials()
+                            .map(|(user, pass)| (user.to_owned(), pass.to_owned())),
+                    )
+                    .with_protocol(endpoint.protocol()),
                 )
-                .with_protocol(endpoint.protocol()),
-            ),
+            }
         };
         tokio::select! {
             biased;

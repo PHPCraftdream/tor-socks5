@@ -1,4 +1,5 @@
 use super::*;
+use proxy_config::Socks5Endpoint;
 
 use std::future::Future;
 
@@ -28,8 +29,12 @@ async fn route_argument_comes_from_admission_lease() {
     let dir = tempfile::tempdir().unwrap();
     let registry = registry(dir.path());
     let path = dir.path().join("users.ktav");
-    let pre =
-        proxy_config::EndpointOverride::Endpoint("127.0.0.1:1080|alice:global".parse().unwrap());
+    let pre = proxy_config::PoolOverride::Pool(
+        "127.0.0.1:1080|alice:global"
+            .parse::<Socks5Endpoint>()
+            .unwrap()
+            .into(),
+    );
     let users = auth::UsersConfig {
         users: vec![auth::User {
             name: "test".into(),
@@ -37,8 +42,8 @@ async fn route_argument_comes_from_admission_lease() {
             is_enabled: true,
             allowed_onion: false,
             allowed_clients: None,
-            pre_socks5: Some(pre),
-            post_socks5: None,
+            pre_proxies: Some(pre),
+            post_proxies: None,
         }],
     };
     users.save(&path).unwrap();

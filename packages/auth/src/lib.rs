@@ -55,39 +55,32 @@ mod integration_tests {
 
     #[test]
     fn user_pre_and_post_overrides_resolve_independently_of_global_values() {
-        use client_acl::{resolve_endpoint, EndpointOverride};
+        use client_acl::{resolve_pool, PoolOverride, ProxyPool};
 
-        let global_pre = Some(EndpointOverride::Endpoint(
-            "192.0.2.1:1080".parse().unwrap(),
-        ));
-        let global_post = Some(EndpointOverride::Endpoint(
-            "192.0.2.2:1080".parse().unwrap(),
-        ));
-        let user_pre = Some(EndpointOverride::Disabled);
-        let user_post = Some(EndpointOverride::Endpoint(
-            "198.51.100.2:1080".parse().unwrap(),
-        ));
+        fn pool(value: &str) -> ProxyPool {
+            value.parse::<client_acl::Socks5Endpoint>().unwrap().into()
+        }
+        let first = |pool: Option<ProxyPool>| pool.unwrap().members()[0].address().to_string();
 
-        let resolved_pre = resolve_endpoint(global_pre.as_ref(), user_pre.as_ref());
-        let resolved_post = resolve_endpoint(global_post.as_ref(), user_post.as_ref());
-        assert!(resolved_pre.is_none());
+        let global_pre = pool("192.0.2.1:1080");
+        let global_post = pool("192.0.2.2:1080");
+        let user_pre = Some(PoolOverride::Disabled);
+        let user_post = Some(PoolOverride::Pool(pool("198.51.100.2:1080")));
+
+        assert!(resolve_pool(Some(&global_pre), user_pre.as_ref()).is_none());
         assert_eq!(
-            resolved_post.unwrap().address().to_string(),
+            first(resolve_pool(Some(&global_post), user_post.as_ref())),
             "198.51.100.2:1080"
         );
-
-        let inherited_pre = resolve_endpoint(global_pre.as_ref(), None).unwrap();
-        let inherited_post = resolve_endpoint(global_post.as_ref(), None).unwrap();
-        assert_eq!(inherited_pre.address().to_string(), "192.0.2.1:1080");
-        assert_eq!(inherited_post.address().to_string(), "192.0.2.2:1080");
-        assert!(resolve_endpoint(global_post.as_ref(), user_pre.as_ref()).is_none());
         assert_eq!(
-            resolve_endpoint(global_pre.as_ref(), user_post.as_ref())
-                .unwrap()
-                .address()
-                .to_string(),
-            "198.51.100.2:1080"
+            first(resolve_pool(Some(&global_pre), None)),
+            "192.0.2.1:1080"
         );
+        assert_eq!(
+            first(resolve_pool(Some(&global_post), None)),
+            "192.0.2.2:1080"
+        );
+        assert!(resolve_pool(Some(&global_post), user_pre.as_ref()).is_none());
     }
 
     #[test]
@@ -97,23 +90,22 @@ name: alice
 hash: $argon2id$v=19$m=5120,t=2,p=1$salt$hash
 "#;
         let inherited: User = ktav::from_str(old).expect("legacy account");
-        assert!(inherited.pre_socks5.is_none());
+        assert!(inherited.pre_proxies.is_none());
         let explicit = r#"
 name: alice
 hash: $argon2id$v=19$m=5120,t=2,p=1$salt$hash
-pre_socks5: none
-post_socks5: 192.0.2.1:1080|u:p
+pre_proxies: none
+post_proxies: [
+    192.0.2.1:1080|u:p
+]
 "#;
         let user: User = ktav::from_str(explicit).expect("overrides");
-        assert_eq!(
-            user.pre_socks5,
-            Some(client_acl::EndpointOverride::Disabled)
-        );
+        assert_eq!(user.pre_proxies, Some(client_acl::PoolOverride::Disabled));
         let saved = ktav::to_string(&user).expect("serialize");
-        assert!(saved.contains("pre_socks5: none"));
+        assert!(saved.contains("pre_proxies: none"));
         let restored: User = ktav::from_str(&saved).expect("roundtrip");
-        assert_eq!(restored.pre_socks5, user.pre_socks5);
-        assert_eq!(restored.post_socks5, user.post_socks5);
+        assert_eq!(restored.pre_proxies, user.pre_proxies);
+        assert_eq!(restored.post_proxies, user.post_proxies);
         assert!(ktav::from_str::<User>(
             &explicit.replace("192.0.2.1:1080|u:p", "proxy.invalid:1080")
         )
@@ -183,8 +175,8 @@ allowed_onion: true
             is_enabled: true,
             allowed_onion: false,
             allowed_clients: None,
-            pre_socks5: None,
-            post_socks5: None,
+            pre_proxies: None,
+            post_proxies: None,
         };
         let state = AuthState::build(&UsersConfig { users: vec![user] }).unwrap();
         assert!(!state.verify("mallory", "anything"));
@@ -207,8 +199,8 @@ mod user_acl_tests {
             is_enabled: true,
             allowed_onion: false,
             allowed_clients: Some(acl.parse().expect("valid allow-list")),
-            pre_socks5: None,
-            post_socks5: None,
+            pre_proxies: None,
+            post_proxies: None,
         }
     }
 
@@ -266,8 +258,8 @@ mod user_acl_tests {
                 is_enabled: true,
                 allowed_onion: false,
                 allowed_clients: None,
-                pre_socks5: None,
-                post_socks5: None,
+                pre_proxies: None,
+                post_proxies: None,
             }],
         })
         .unwrap();
@@ -285,8 +277,8 @@ mod user_acl_tests {
                 is_enabled: false,
                 allowed_onion: false,
                 allowed_clients: None,
-                pre_socks5: None,
-                post_socks5: None,
+                pre_proxies: None,
+                post_proxies: None,
             }],
         })
         .unwrap();
@@ -345,8 +337,8 @@ mod user_acl_tests {
                     is_enabled: true,
                     allowed_onion: false,
                     allowed_clients: Some("203.0.113.*".parse().expect("valid allow-list")),
-                    pre_socks5: None,
-                    post_socks5: None,
+                    pre_proxies: None,
+                    post_proxies: None,
                 },
                 User {
                     name: "carol".into(),
@@ -354,8 +346,8 @@ mod user_acl_tests {
                     is_enabled: true,
                     allowed_onion: false,
                     allowed_clients: None,
-                    pre_socks5: None,
-                    post_socks5: None,
+                    pre_proxies: None,
+                    post_proxies: None,
                 },
             ],
         };

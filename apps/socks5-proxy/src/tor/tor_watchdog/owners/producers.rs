@@ -284,9 +284,12 @@ mod tests {
         cfg.bridges.use_seeds = false;
         cfg.bridges.auto_fetch = false;
         cfg.bridges.lines = vec!["8.8.8.8:443 1111111111111111111111111111111111111111".into()];
-        cfg.pre_socks5 = Some(proxy_config::EndpointOverride::Endpoint(
-            "127.0.0.1:1080".parse().unwrap(),
-        ));
+        cfg.pre_proxies = Some(
+            "127.0.0.1:1080"
+                .parse::<proxy_config::Socks5Endpoint>()
+                .unwrap()
+                .into(),
+        );
         cfg.write(&path).unwrap();
         let settings = crate::tor_setup::build_tor_settings(&cfg, Some(&path))
             .await

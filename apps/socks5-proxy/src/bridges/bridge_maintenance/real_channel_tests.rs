@@ -1,4 +1,5 @@
 use super::*;
+use proxy_config::Socks5Endpoint;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -125,9 +126,7 @@ async fn real_channel_heal_and_config_selection() {
     let mut tasks = tokio::task::JoinSet::new();
     tasks.spawn(proxy(listener, tx, token.clone()));
     let mut cfg = Config {
-        pre_socks5: Some(proxy_config::EndpointOverride::Endpoint(
-            endpoint.parse().unwrap(),
-        )),
+        pre_proxies: Some(endpoint.parse::<Socks5Endpoint>().unwrap().into()),
         ..Config::default()
     };
     cfg.bridges.use_seeds = false;

@@ -56,16 +56,17 @@ The CLI route is:
 client → pre proxy → existing WebTunnel/Tor → post proxy → target
 ```
 
-`pre_socks5` and `post_socks5` are legacy field names, not protocol restrictions.
-Each independently selects SOCKS5 or plain HTTP CONNECT, globally or per account:
+`pre_proxies` and `post_proxies` are arrays of proxy endpoints. Each member
+independently selects SOCKS5 or plain HTTP CONNECT, globally or per account, and
+one pool may mix both:
 
 | Account field | Effective value for that hop |
 | --- | --- |
-| Omitted | Inherit the corresponding global value |
+| Omitted | Inherit the corresponding global pool |
 | `none` | Explicitly disable that hop, even if globally configured |
-| Endpoint | Replace that hop with the account endpoint |
+| Array | Replace that hop with the account's own pool |
 
-The scalar grammar is `[socks5://|http://]IP:port[|username:password]`.
+The member grammar is `[socks5://|http://]IP:port[|username:password]`.
 No scheme means SOCKS5. Endpoints must be IP literals with a nonzero port;
 credentials are optional, paired, nonempty and at most 255 bytes each, with the
 existing delimiter restrictions. HTTP Basic usernames cannot contain a colon,
@@ -77,9 +78,16 @@ HTTP CONNECT encrypts its credential-bearing hop.
 For example, the main config can select:
 
 ```ktav
-pre_socks5: socks5://192.0.2.10:1080|pre_user:pre_password
-post_socks5: http://192.0.2.11:8080|post_user:post_password
+pre_proxies: [
+    socks5://192.0.2.10:1080|pre_user:pre_password
+]
+post_proxies: [
+    http://192.0.2.11:8080|post_user:post_password
+    socks5://192.0.2.13:1080
+]
 ```
+
+A bracketed IPv6 member must be written as a literal item (`:: [2001:db8::2]:1080`).
 
 A sibling users registry can then inherit or override the hops independently:
 
@@ -90,8 +98,10 @@ users: [
         name: bob
         hash: init
         is_enabled: true
-        pre_socks5: http://192.0.2.12:8080|other_user:other_password
-        post_socks5: none
+        pre_proxies: [
+            http://192.0.2.12:8080|other_user:other_password
+        ]
+        post_proxies: none
     }
 ]
 ```
@@ -104,11 +114,11 @@ accounts. Keep credential-bearing config files private and out of Git and public
 logs; prefer editing the protected registry over putting proxy credentials in CLI
 arguments or shell history.
 
-The CLI also accepts `users set-socks5 <name> <pre|post> <inherit|none|endpoint>`.
-`inherit` removes the account override; `none` disables just the selected hop.
-The endpoint format above also applies to `users add --pre-socks5` /
-`--post-socks5`. Apply running CLI configuration changes by restarting; there is
-no automatic users-file watcher.
+The CLI also accepts `users set-proxies <name> <pre|post> <inherit|none|endpoint...>`.
+`inherit` removes the account override; `none` disables just the selected hop;
+one or more endpoints replace the pool. The endpoint format above also applies to
+`users add --pre-proxies` / `--post-proxies`. Apply running CLI configuration
+changes by restarting; there is no automatic users-file watcher.
 
 The pre proxy supplies the carrier before the existing bundled WebTunnel TLS/PT
 handshake; it does not replace that transport. Post negotiation runs inside a
@@ -118,7 +128,11 @@ proxy protocol. Explicit `none` is a requested route change, not error fallback.
 
 Different effective pre identities (protocol, address and credentials) select
 different retained Tor/PT owners; identical pre identities may share an owner.
-Post selection is independent and is applied per admitted connection. TOFU can
+Post selection is independent and is applied per admitted connection:
+the pool's member is chosen by the target's registrable domain (see
+[post pools](../../README.md#prepost-proxy-pools)). Accounts whose effective post
+pools hold the same members share one rotation state, so they also share which
+member serves a site. TOFU can
 publish a new policy snapshot: routes and ACLs come from the admitted credential
 proof, never an unverified request username. A failed or incompatible reload
 preserves the active route; pre protocol/endpoint/credential changes require a
@@ -127,7 +141,7 @@ restart. This CLI support does not enable new Android routing behavior.
 Pre routes require explicitly configured usable bridges and support only the
 trusted bundled obfs4/WebTunnel PT. Discovery, seed bridges, direct probes, the
 warm pool and alternative-owner automatic recovery are restricted; see the
-[global pre routing limitations](../../README.md#global-pre_socks5-routing).
+[global pre routing limitations](../../README.md#global-pre_proxies-routing).
 Effective post routes cannot be combined with a DNS listener or upstream egress
 instead of Tor; startup and request checks fail closed. A global post endpoint
 also fails startup with those modes even if every account disables it.

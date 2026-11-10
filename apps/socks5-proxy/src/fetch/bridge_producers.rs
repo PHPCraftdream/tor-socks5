@@ -10,7 +10,7 @@ pub(super) fn launch(
     producers: &mut Vec<tokio::task::JoinHandle<()>>,
 ) {
     if settings.pre_endpoint.is_some() {
-        warn!("global pre_socks5: warmer, verifier, discovery and soft failover remain disabled");
+        warn!("global pre_proxies: warmer, verifier, discovery and soft failover remain disabled");
         producers.push(crate::bridge_maintenance::spawn(
             handle.clone(),
             config_path.clone(),

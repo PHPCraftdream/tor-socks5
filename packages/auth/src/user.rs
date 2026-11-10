@@ -27,20 +27,20 @@ pub struct User {
     /// Явная пустая строка — ошибка загрузки, а не None/inherit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_clients: Option<client_acl::AllowedClients>,
-    /// Per-account SOCKS chain selection: omitted inherits global configuration.
+    /// Per-account pre proxy pool: omitted inherits the global pool, `none` disables the hop.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        with = "client_acl::socks5_endpoint_field"
+        with = "client_acl::pool_field"
     )]
-    pub pre_socks5: Option<client_acl::EndpointOverride>,
-    /// SOCKS5 endpoint used after Tor for this account; omitted inherits the global setting.
+    pub pre_proxies: Option<client_acl::PoolOverride>,
+    /// Per-account post proxy pool used after Tor: omitted inherits the global pool, `none` disables the hop.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        with = "client_acl::socks5_endpoint_field"
+        with = "client_acl::pool_field"
     )]
-    pub post_socks5: Option<client_acl::EndpointOverride>,
+    pub post_proxies: Option<client_acl::PoolOverride>,
 }
 
 fn default_true() -> bool {

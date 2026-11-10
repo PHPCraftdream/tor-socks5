@@ -9,8 +9,8 @@ fn mk_user(name: &str, password: &str, enabled: bool) -> User {
         is_enabled: enabled,
         allowed_onion: false,
         allowed_clients: None,
-        pre_socks5: None,
-        post_socks5: None,
+        pre_proxies: None,
+        post_proxies: None,
     }
 }
 
@@ -21,8 +21,8 @@ fn init_user(name: &str) -> User {
         is_enabled: true,
         allowed_onion: false,
         allowed_clients: None,
-        pre_socks5: None,
-        post_socks5: None,
+        pre_proxies: None,
+        post_proxies: None,
     }
 }
 
@@ -354,8 +354,8 @@ fn onion_user(name: &str, enabled: bool, allowed_onion: bool) -> User {
         is_enabled: enabled,
         allowed_onion,
         allowed_clients: None,
-        pre_socks5: None,
-        post_socks5: None,
+        pre_proxies: None,
+        post_proxies: None,
     }
 }
 
@@ -394,8 +394,8 @@ fn init_account_disabled_is_not_provisioned() {
         is_enabled: false,
         allowed_onion: false,
         allowed_clients: None,
-        pre_socks5: None,
-        post_socks5: None,
+        pre_proxies: None,
+        post_proxies: None,
     }]);
     assert!(!s.verify("alice", "chosen-pw"));
     let stored = s.users.read().unwrap().find("alice").unwrap().hash.clone();

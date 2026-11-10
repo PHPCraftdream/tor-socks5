@@ -31,6 +31,10 @@ mod help_cmd;
 #[allow(dead_code)]
 #[path = "commands/onion/mod.rs"]
 mod onion;
+#[path = "server/egress/post_pool.rs"]
+mod post_pool;
+#[path = "server/egress/route.rs"]
+mod route;
 #[path = "fetch/seed.rs"]
 mod seed;
 #[path = "server/server.rs"]
@@ -51,7 +55,7 @@ mod tor_watchdog;
 #[cfg(test)]
 #[path = "tor/ts19_tests.rs"]
 mod ts19_tests;
-#[path = "server/upstream.rs"]
+#[path = "server/egress/upstream.rs"]
 mod upstream;
 #[path = "commands/users_cli/mod.rs"]
 mod users_cli;

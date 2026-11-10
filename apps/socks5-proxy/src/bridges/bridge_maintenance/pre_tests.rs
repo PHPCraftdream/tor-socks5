@@ -1,4 +1,5 @@
 use super::*;
+use proxy_config::Socks5Endpoint;
 
 pub(super) struct LoopControl {
     pub(super) started: std::sync::atomic::AtomicUsize,
@@ -126,9 +127,7 @@ async fn pre_refresh_and_heal_relaunch_through_same_proxy() {
             proxy.local_addr().unwrap().to_string()
         };
         let mut cfg = Config {
-            pre_socks5: Some(proxy_config::EndpointOverride::Endpoint(
-                endpoint.parse().unwrap(),
-            )),
+            pre_proxies: Some(endpoint.parse::<Socks5Endpoint>().unwrap().into()),
             ..Config::default()
         };
         cfg.bridges.use_seeds = false;
@@ -195,9 +194,7 @@ async fn pre_refresh_and_heal_relaunch_through_same_proxy() {
         let isolated = tempfile::tempdir().unwrap();
         let quiet_proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let quiet_endpoint = quiet_proxy.local_addr().unwrap().to_string();
-        cfg.pre_socks5 = Some(proxy_config::EndpointOverride::Endpoint(
-            quiet_endpoint.parse().unwrap(),
-        ));
+        cfg.pre_proxies = Some(quiet_endpoint.parse::<Socks5Endpoint>().unwrap().into());
         let mut active = crate::tor_setup::build_tor_settings(&cfg, Some(isolated.path()))
             .await
             .unwrap();
@@ -216,7 +213,7 @@ async fn pre_refresh_and_heal_relaunch_through_same_proxy() {
         .is_err());
         assert!(quiet_proxy.accept().now_or_never().is_none());
         cfg.bridges.use_seeds = false;
-        cfg.pre_socks5 = Some(proxy_config::EndpointOverride::Disabled);
+        cfg.pre_proxies = None;
         assert!(refresh_pre(
             &handle,
             Some(dir.path()),
@@ -227,9 +224,7 @@ async fn pre_refresh_and_heal_relaunch_through_same_proxy() {
         )
         .await
         .is_err());
-        cfg.pre_socks5 = Some(proxy_config::EndpointOverride::Endpoint(
-            quiet_endpoint.parse().unwrap(),
-        ));
+        cfg.pre_proxies = Some(quiet_endpoint.parse::<Socks5Endpoint>().unwrap().into());
         cfg.bridges.lines.push(format!(
             "obfs4 {address} 2222222222222222222222222222222222222222 cert=AAA"
         ));
@@ -268,11 +263,12 @@ async fn refresh_activates_selected_route_and_preserves_credentials() {
     cfg.bridges.use_seeds = false;
     cfg.bridges.auto_fetch = false;
     cfg.bridges.lines = vec![candidate.to_string()];
-    cfg.pre_socks5 = Some(proxy_config::EndpointOverride::Endpoint(
+    cfg.pre_proxies = Some(
         format!("{}|alice:secret", proxy.local_addr().unwrap())
-            .parse()
-            .unwrap(),
-    ));
+            .parse::<Socks5Endpoint>()
+            .unwrap()
+            .into(),
+    );
     cfg.write(&path).unwrap();
     let mut active = crate::tor_setup::build_tor_settings(&cfg, Some(&path))
         .await
@@ -339,9 +335,7 @@ async fn failed_pre_refresh_delays_recovery_notification() {
     cfg.bridges.use_seeds = false;
     cfg.bridges.auto_fetch = false;
     cfg.bridges.lines = vec!["8.8.8.8:443 1111111111111111111111111111111111111111".into()];
-    cfg.pre_socks5 = Some(proxy_config::EndpointOverride::Endpoint(
-        "127.0.0.1:1080".parse().unwrap(),
-    ));
+    cfg.pre_proxies = Some("127.0.0.1:1080".parse::<Socks5Endpoint>().unwrap().into());
     cfg.write(&path).unwrap();
     let active = crate::tor_setup::build_tor_settings(&cfg, Some(&path))
         .await
@@ -398,9 +392,12 @@ async fn invalid_reload_fails_before_readiness() {
     cfg.bridges.use_seeds = false;
     cfg.bridges.auto_fetch = false;
     cfg.bridges.lines = vec!["8.8.8.8:443 1111111111111111111111111111111111111111".into()];
-    cfg.pre_socks5 = Some(proxy_config::EndpointOverride::Endpoint(
-        "127.0.0.1:1080|alice:secret".parse().unwrap(),
-    ));
+    cfg.pre_proxies = Some(
+        "127.0.0.1:1080|alice:secret"
+            .parse::<Socks5Endpoint>()
+            .unwrap()
+            .into(),
+    );
     let mut active = crate::tor_setup::build_tor_settings(&cfg, Some(&path))
         .await
         .unwrap();
@@ -411,23 +408,23 @@ async fn invalid_reload_fails_before_readiness() {
         (0, "изменение pre требует перезапуска"),
         (
             1,
-            "pre_socks5 requires bridges.use_seeds and bridges.auto_fetch to be disabled",
+            "pre_proxies requires bridges.use_seeds and bridges.auto_fetch to be disabled",
         ),
         (
             2,
-            "pre_socks5 does not support pluggable transport bridges with unknown protocols",
+            "pre_proxies does not support pluggable transport bridges with unknown protocols",
         ),
-        (3, "pre_socks5 is incompatible with warm_pool.enabled"),
+        (3, "pre_proxies is incompatible with warm_pool.enabled"),
         (4, "pre несовместим с upstream"),
         (
             5,
-            "pre_socks5 requires bridges.use_seeds and bridges.auto_fetch to be disabled",
+            "pre_proxies requires bridges.use_seeds and bridges.auto_fetch to be disabled",
         ),
         (6, "изменение pre требует перезапуска"),
     ] {
         let mut changed = cfg.clone();
         match case {
-            0 => changed.pre_socks5 = Some(proxy_config::EndpointOverride::Disabled),
+            0 => changed.pre_proxies = None,
             1 => changed.bridges.use_seeds = true,
             2 => changed
                 .bridges
@@ -437,9 +434,12 @@ async fn invalid_reload_fails_before_readiness() {
             4 => changed.upstream.enabled = true,
             5 => changed.bridges.auto_fetch = true,
             _ => {
-                changed.pre_socks5 = Some(proxy_config::EndpointOverride::Endpoint(
-                    "127.0.0.1:1080|alice:changed".parse().unwrap(),
-                ))
+                changed.pre_proxies = Some(
+                    "127.0.0.1:1080|alice:changed"
+                        .parse::<Socks5Endpoint>()
+                        .unwrap()
+                        .into(),
+                )
             }
         }
         changed.write(&path).unwrap();

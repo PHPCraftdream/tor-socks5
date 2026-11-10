@@ -12,7 +12,8 @@ use tracing::info;
 
 use crate::cli::BridgesAction;
 use crate::config::{Config, Loaded};
-use crate::startup::{init_tracing, install_crypto_provider, reject_unsupported_endpoint};
+use crate::route::reject_unsupported_pool;
+use crate::startup::{init_tracing, install_crypto_provider};
 use crate::tor_setup::build_tor_settings;
 
 #[cfg(test)]
@@ -40,7 +41,7 @@ pub(crate) async fn cmd_bridges(
         }
     };
     let cfg = loaded.into_config();
-    reject_unsupported_endpoint(&cfg.pre_socks5, "bridges fetch global pre_socks5")?;
+    reject_unsupported_pool(&cfg.pre_proxies, "bridges fetch global pre_proxies")?;
 
     #[cfg(test)]
     if FETCH_BOUNDARY.try_with(|hit| hit.set(true)).is_ok() {
