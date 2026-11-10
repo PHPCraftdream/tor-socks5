@@ -502,9 +502,10 @@ class SourceCompanionTests(unittest.TestCase):
         target = "x86_64-unknown-linux-musl"
         pristine = self.fixture.sysroots[target]
         missing = (
-            ("Apache document", "share/doc/rust/LICENSE-APACHE"),
-            ("MIT document", "share/doc/rust/LICENSE-MIT"),
+            ("Apache document", "share/doc/rust/licenses/Apache-2.0.txt"),
+            ("MIT document", "share/doc/rust/licenses/MIT.txt"),
             ("copyright document", "share/doc/rust/COPYRIGHT.html"),
+            ("library copyright document", "share/doc/rust/COPYRIGHT-library.html"),
             ("component manifest", "lib/rustlib/manifest-rust-std-" + target),
             ("libstd", "lib/rustlib/%s/lib/libstd-0123456789abcdef.rlib" % target),
             ("compiler builtins", "lib/rustlib/%s/lib/libcompiler_builtins-abcdef0123456789.rlib" % target),

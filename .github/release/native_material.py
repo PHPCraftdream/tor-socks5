@@ -16,7 +16,8 @@ import subprocess
 ROOT = "native-material/"
 DOC_ROOT = ROOT + "share/doc/rust/"
 MANIFEST_ROOT = ROOT + "lib/rustlib/"
-REQUIRED_DOCS = ("LICENSE-APACHE", "LICENSE-MIT", "COPYRIGHT.html")
+REQUIRED_DOCS = ("licenses/Apache-2.0.txt", "licenses/MIT.txt",
+                 "COPYRIGHT.html", "COPYRIGHT-library.html")
 INPUT_SUFFIXES = (".rlib", ".a", ".o", ".lib", ".obj", ".so",
                   ".dylib", ".dll")
 REQUIRED_RLIBS = ("libstd", "libcompiler_builtins")

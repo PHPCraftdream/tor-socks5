@@ -110,9 +110,10 @@ use its matching source companion: exact source for included packages, including
 MPL-2.0-covered package source, and the corresponding package license and notice
 files are retained under `cargo-vendor/` alongside the package source.
 
-The helper preserves `share/doc/rust/LICENSE-APACHE`, `LICENSE-MIT`,
-`COPYRIGHT.html`, and any files under `share/doc/rust/licenses/` from the
-selected sysroot. For the selected target it preserves the installed Rust
+The helper preserves `share/doc/rust/licenses/Apache-2.0.txt`,
+`share/doc/rust/licenses/MIT.txt`, `share/doc/rust/COPYRIGHT.html`,
+`share/doc/rust/COPYRIGHT-library.html`, and all other installed files under
+`share/doc/rust/licenses/` from the selected sysroot. For the selected target it preserves the installed Rust
 standard-library component manifest and hashes manifest-listed regular `.rlib`,
 archive, shared-library, and object inputs under that target's `lib` directory;
 `libstd` and `libcompiler_builtins` rlibs are required. These are upstream
