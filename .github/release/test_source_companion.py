@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tarfile
 import unittest
+from unittest.mock import Mock, patch
 
 _RELEASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(os.path.dirname(_RELEASE_DIR))
@@ -698,6 +699,251 @@ class SourceCompanionTests(unittest.TestCase):
             assert_contract(workflow.replace("--installed-native", "", 1))
         with self.assertRaises(AssertionError):
             assert_contract(workflow.replace("targets: ${{ matrix.target }}", "targets: wrong", 1))
+
+
+class NativeMuslSourceTests(unittest.TestCase):
+    """Focused offline coverage for the reviewed musl source pins."""
+
+    TARGET = "x86_64-unknown-linux-musl"
+    GNU_TARGET = "x86_64-unknown-linux-gnu"
+    SOURCES = {
+        name: ("SYNTHETIC MUSL SOURCE TEST BYTES: " + name).encode("ascii")
+        for name in native_material.MUSL_SOURCE_PINS
+    }
+
+    def setUp(self):
+        self.area = fx.TempArea(self)
+        self.root = self._make_sysroot(self.TARGET)
+        self.pins = {
+            name: ("https://synthetic.invalid/" + name, _checksum(data))
+            for name, data in self.SOURCES.items()
+        }
+
+    def _make_sysroot(self, target):
+        root = self.area.subdir("sysroot-" + target)
+        docdir = os.path.join(root, "share", "doc", "rust")
+        for name in native_material.REQUIRED_DOCS:
+            _write(os.path.join(docdir, name), b"SYNTHETIC native material doc\n")
+        libdir = os.path.join(root, "lib", "rustlib", target, "lib")
+        files = [("libstd-0123456789abcdef.rlib", b"SYNTHETIC libstd"),
+                 ("libcompiler_builtins-abcdef0123456789.rlib", b"SYNTHETIC builtins")]
+        if target.endswith("-musl"):
+            files += [("self-contained/libc.a", b"SYNTHETIC musl libc"),
+                      ("self-contained/crt1.o", b"SYNTHETIC musl startup")]
+        lines = ["manifest-version: 2"]
+        for name, data in files:
+            _write(os.path.join(libdir, *name.split("/")), data)
+            lines.append("file:lib/rustlib/%s/lib/%s" % (target, name))
+        _write(os.path.join(root, "lib", "rustlib", "manifest-rust-std-" + target),
+               ("\n".join(lines) + "\n").encode())
+        return root
+
+    def _collect_reviewed(self):
+        rustc = "release: %s\ncommit-hash: %s\nhost: synthetic-host\n" % (
+            native_material.RUST_MUSL_RELEASE, native_material.RUST_MUSL_COMMIT)
+        with patch.object(native_material, "_fetch_musl_sources",
+                          return_value={native_material.MUSL_ROOT + name: data
+                                        for name, data in self.SOURCES.items()}) as fetch:
+            payload = native_material.collect(
+                self.root, rustc,
+                os.path.join(self.root, "lib", "rustlib", self.TARGET, "lib"),
+                self.TARGET)
+        fetch.assert_called_once_with()
+        return payload
+
+    @staticmethod
+    def _rewrite_material_hashes(payload):
+        record = json.loads(payload[native_material.PROVENANCE])
+        record["material_sha256"] = {
+            path: _checksum(data) for path, data in payload.items()
+            if path != native_material.PROVENANCE}
+        payload[native_material.PROVENANCE] = (
+            json.dumps(record, sort_keys=True, indent=2) + "\n").encode()
+
+    def test_production_critical_source_pins_and_immutable_urls(self):
+        expected = {
+            "musl-1.2.5.tar.gz": "a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4",
+            "0001-cve-2025-26519-p1.diff": "89ec5af152afb9c0ba8e37ecdca63a7a7fd13b60247f1a2d8024a59baa18e7dc",
+            "0002-cve-2025-26519-p2.diff": "d5b88fe87f9554238bdd69235694b0d50bb909f38149a7be417a0240a490e813",
+            "musl-cve-2026-6042.diff": "444fa70e52ca158fb7d4bad560637790bbf8f72e80b82fff840dd66fa83091e3",
+            "musl-cve-2026-40200.diff": "1ee29f64f9ca8e8ad7c349779d661ff6b52126a27575d3586981357a52c406fb",
+            "mcm-musl-1.2.5.tar.gz.sha1": "5c5d074634ed2dedef96c21d52040bfdf056e17d8ec0ccae96e7bf0eb86c3026",
+        }
+        pins = native_material.MUSL_SOURCE_PINS
+        self.assertTrue(all(pins[name][1] == digest
+                            for name, digest in expected.items()))
+        for url, _ in pins.values():
+            self.assertTrue(url.startswith("https://"), url)
+            if "github" in url:
+                self.assertRegex(
+                    url, r"(?:github\.com|githubusercontent\.com)/.+/[0-9a-f]{40}/")
+
+    def test_collect_rejects_missing_required_pinned_source(self):
+        missing = next(iter(self.SOURCES))
+        fetched = {native_material.MUSL_ROOT + name: data
+                   for name, data in self.SOURCES.items() if name != missing}
+        with patch.dict(native_material.MUSL_SOURCE_PINS, self.pins, clear=True), \
+                patch.object(native_material, "_fetch_musl_sources", return_value=fetched):
+            rustc = "release: %s\ncommit-hash: %s\nhost: synthetic-host\n" % (
+                native_material.RUST_MUSL_RELEASE, native_material.RUST_MUSL_COMMIT)
+            with self.assertRaisesRegex(native_material.Invalid, "exact pinned source set"):
+                native_material.collect(
+                    self.root, rustc,
+                    os.path.join(self.root, "lib", "rustlib", self.TARGET, "lib"),
+                    self.TARGET)
+
+    def test_unreviewed_musl_collect_keeps_original_scope_offline(self):
+        rustc = "release: 1.92.0\ncommit-hash: %s\nhost: synthetic-host\n" % ("1" * 40)
+        with patch.object(native_material, "_fetch_musl_sources") as fetch:
+            payload = native_material.collect(
+                self.root, rustc,
+                os.path.join(self.root, "lib", "rustlib", self.TARGET, "lib"),
+                self.TARGET)
+        fetch.assert_not_called()
+        self.assertFalse(any(path.startswith(native_material.MUSL_ROOT) for path in payload))
+        record = native_material.validate(payload, self.TARGET)
+        self.assertIn(native_material.MUSL_UNESTABLISHED_SCOPE,
+                      record["unestablished_scope"])
+        self.assertNotIn(native_material.MUSL_SOURCE_LINKAGE_SCOPE,
+                         record["unestablished_scope"])
+
+    def test_reviewed_collect_preserves_exact_pinned_bytes(self):
+        with patch.dict(native_material.MUSL_SOURCE_PINS, self.pins, clear=True):
+            payload = self._collect_reviewed()
+            provenance = native_material.validate(payload, self.TARGET)
+        self.assertEqual(provenance["rustc"]["release"], native_material.RUST_MUSL_RELEASE)
+        self.assertEqual({path: payload[path] for path in payload
+                          if path.startswith(native_material.MUSL_ROOT)},
+                         {native_material.MUSL_ROOT + name: data
+                          for name, data in self.SOURCES.items()})
+
+    def test_each_pinned_file_rejects_removal_or_corruption_after_rehash(self):
+        with patch.dict(native_material.MUSL_SOURCE_PINS, self.pins, clear=True):
+            original = self._collect_reviewed()
+            for name, data in self.SOURCES.items():
+                path = native_material.MUSL_ROOT + name
+                for action in ("missing", "corrupt"):
+                    with self.subTest(source=name, action=action):
+                        changed = dict(original)
+                        if action == "missing":
+                            changed.pop(path)
+                        else:
+                            changed[path] = data + b"tampered"
+                        self._rewrite_material_hashes(changed)
+                        with self.assertRaises(native_material.Invalid):
+                            native_material.validate(changed, self.TARGET)
+
+    def test_extra_or_unreviewed_identity_cannot_claim_pinned_sources(self):
+        with patch.dict(native_material.MUSL_SOURCE_PINS, self.pins, clear=True):
+            original = self._collect_reviewed()
+            for field, value in (("release", "1.99.2"),
+                                 ("commit-hash", "f" * 40)):
+                changed = dict(original)
+                record = json.loads(changed[native_material.PROVENANCE])
+                record["rustc"][field] = value
+                record["unestablished_scope"] = native_material.unestablished_scope(
+                    self.TARGET, record["rustc"])
+                changed[native_material.PROVENANCE] = json.dumps(record).encode()
+                self._rewrite_material_hashes(changed)
+                with self.subTest(identity=field), self.assertRaises(native_material.Invalid):
+                    native_material.validate(changed, self.TARGET)
+
+            extra = dict(original)
+            extra[native_material.MUSL_ROOT + "extra.diff"] = b"SYNTHETIC extra"
+            self._rewrite_material_hashes(extra)
+            with self.assertRaises(native_material.Invalid):
+                native_material.validate(extra, self.TARGET)
+
+            gnu_root = self._make_sysroot(self.GNU_TARGET)
+            gnu_payload = native_material.collect(
+                gnu_root,
+                "release: %s\ncommit-hash: %s\nhost: synthetic-host\n" % (
+                    native_material.RUST_MUSL_RELEASE, native_material.RUST_MUSL_COMMIT),
+                os.path.join(gnu_root, "lib", "rustlib", self.GNU_TARGET, "lib"),
+                self.GNU_TARGET)
+            gnu_payload[native_material.MUSL_ROOT + next(iter(self.SOURCES))] = next(
+                iter(self.SOURCES.values()))
+            self._rewrite_material_hashes(gnu_payload)
+            with self.assertRaises(native_material.Invalid):
+                native_material.validate(gnu_payload, self.GNU_TARGET)
+
+    def test_installed_rejects_unsupported_target_and_new_rustc_before_fetch(self):
+        with patch.object(native_material.subprocess, "run") as run, \
+                patch.object(native_material, "_fetch_musl_sources") as fetch:
+            with self.assertRaises(native_material.Invalid):
+                native_material.installed("riscv64-unknown-linux-musl")
+            run.assert_not_called()
+            fetch.assert_not_called()
+
+        outputs = [Mock(stdout="/synthetic/sysroot"), Mock(stdout=(
+            "release: 1.99.2\ncommit-hash: %s\nhost: synthetic-host\n" % ("f" * 40))),
+            Mock(stdout="/synthetic/sysroot/lib/rustlib/%s/lib" % self.TARGET)]
+        with patch.object(native_material.subprocess, "run", side_effect=outputs) as run, \
+                patch.object(native_material, "_fetch_musl_sources") as fetch:
+            with self.assertRaises(native_material.Invalid):
+                native_material.installed(self.TARGET)
+            self.assertEqual(run.call_count, 3)
+            fetch.assert_not_called()
+
+    def test_fetch_checks_bytes_limits_redirects_and_network_errors(self):
+        class Response:
+            def __init__(self, body, length=None, url="https://synthetic.invalid/source"):
+                self.body, self.offset, self.url = body, 0, url
+                self.read_sizes = []
+                self.headers = {} if length is None else {"Content-Length": str(length)}
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def geturl(self):
+                return self.url
+            def read(self, size):
+                self.read_sizes.append(size)
+                chunk = self.body[self.offset:self.offset + size]
+                self.offset += len(chunk)
+                return chunk
+
+        cases = (("good", b"abc", None, "https://synthetic.invalid/source", None, True),
+                 ("empty", b"", None, "https://synthetic.invalid/source", None, False),
+                 ("wrong hash", b"abc", None, "https://synthetic.invalid/source", "0" * 64, False),
+                 ("header too large", b"abc", 4, "https://synthetic.invalid/source", None, False),
+                 ("read too large", b"abcd", None, "https://synthetic.invalid/source", None, False),
+                 ("redirect", b"abc", None, "https://other.invalid/source", None, False),
+                 ("network error", None, None, None, None, False))
+        for label, body, length, url, digest, succeeds in cases:
+            with self.subTest(case=label):
+                response = Response(body or b"", length, url or "https://synthetic.invalid/source")
+                opener = Mock()
+                if label == "network error":
+                    opener.open.side_effect = OSError("synthetic offline failure")
+                else:
+                    opener.open.return_value = response
+                expected = digest or _checksum(b"abc")
+                with patch.dict(native_material.MUSL_SOURCE_PINS,
+                                {"source.bin": ("https://synthetic.invalid/source", expected)},
+                                clear=True), \
+                        patch.object(native_material, "MUSL_SOURCE_MAX_BYTES", 3), \
+                        patch.object(native_material.urllib.request, "build_opener",
+                                     return_value=opener) as build_opener:
+                    if succeeds:
+                        self.assertEqual(native_material._fetch_musl_sources(),
+                                         {native_material.MUSL_ROOT + "source.bin": b"abc"})
+                    else:
+                        with self.assertRaises(native_material.Invalid):
+                            native_material._fetch_musl_sources()
+                    opener.open.assert_called_once_with(
+                        "https://synthetic.invalid/source", timeout=30)
+                    build_opener.assert_called_once()
+                    handler = build_opener.call_args.args[0]
+                    self.assertIsInstance(handler, native_material._NoRedirect)
+                    self.assertIsNone(handler.redirect_request(
+                        Mock(), Mock(), 302, "Found", {}, "https://other.invalid/source"))
+                if label == "header too large":
+                    self.assertEqual(response.read_sizes, [])
+                if label == "read too large":
+                    self.assertEqual(response.read_sizes, [4])
 
 
 if __name__ == "__main__":

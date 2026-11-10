@@ -3,15 +3,20 @@
 Callers run rustc --print sysroot, rustc -vV, and
 rustc --print target-libdir --target <target>, then pass their stdout to
 collect(). The returned payload maps archive paths to exact bytes. validate()
-checks bundle structure and self-reported hashes only; compare() additionally
+checks bundle structure and self-reported installed document/input hashes; reviewed
+musl source artifacts are additionally checked against fixed SHA-256 pins. collect()
+retrieves those artifacts for reviewed musl identities; compare() additionally
 compares the payload byte-for-byte with a separately collected installation.
 """
 import hashlib
+import http.client
 import json
 import os
 import re
 import stat
 import subprocess
+import urllib.error
+import urllib.request
 
 ROOT = "native-material/"
 DOC_ROOT = ROOT + "share/doc/rust/"
@@ -33,14 +38,134 @@ MUSL_UNESTABLISHED_SCOPE = (
     "Applicable terms for the Rust-distributed self-contained musl libc.a "
     "and startup objects are not established here; host musl-tools/apt "
     "copyright material is not evidence for those inputs.")
+RUST_MUSL_RELEASE = "1.99.1"
+RUST_MUSL_COMMIT = "58cf8f9c35b355199727627d07ae34a4e2846d67"
+MUSL_TARGETS = (
+    "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl")
+MUSL_SOURCE_LINKAGE_SCOPE = (
+    "For Rust 1.99.1 at the pinned commit, this payload preserves the "
+    "SHA-256-pinned musl 1.2.5 archive, exact patch set, and selected Rust "
+    "and musl-cross-make source recipes linked to the distributed musl "
+    "inputs. This does not establish legal clearance, a reproducible build, "
+    "or a linker/build receipt.")
+MUSL_ROOT = ROOT + "musl/"
+MUSL_SOURCE_PINS = {
+    "musl-1.2.5.tar.gz": (
+        "https://musl.libc.org/releases/musl-1.2.5.tar.gz",
+        "a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4"),
+    "0001-cve-2025-26519-p1.diff": (
+        "https://raw.githubusercontent.com/richfelker/musl-cross-make/"
+        "3635262e4524c991552789af6f36211a335a77b3/patches/musl-1.2.5/"
+        "0001-cve-2025-26519-p1.diff",
+        "89ec5af152afb9c0ba8e37ecdca63a7a7fd13b60247f1a2d8024a59baa18e7dc"),
+    "0002-cve-2025-26519-p2.diff": (
+        "https://raw.githubusercontent.com/richfelker/musl-cross-make/"
+        "3635262e4524c991552789af6f36211a335a77b3/patches/musl-1.2.5/"
+        "0002-cve-2025-26519-p2.diff",
+        "d5b88fe87f9554238bdd69235694b0d50bb909f38149a7be417a0240a490e813"),
+    "musl-cve-2026-6042.diff": (
+        "https://raw.githubusercontent.com/rust-lang/rust/"
+        "58cf8f9c35b355199727627d07ae34a4e2846d67/src/ci/docker/scripts/"
+        "musl-cve-2026-6042.diff",
+        "444fa70e52ca158fb7d4bad560637790bbf8f72e80b82fff840dd66fa83091e3"),
+    "musl-cve-2026-40200.diff": (
+        "https://raw.githubusercontent.com/rust-lang/rust/"
+        "58cf8f9c35b355199727627d07ae34a4e2846d67/src/ci/docker/scripts/"
+        "musl-cve-2026-40200.diff",
+        "1ee29f64f9ca8e8ad7c349779d661ff6b52126a27575d3586981357a52c406fb"),
+    "musl-toolchain.sh": (
+        "https://raw.githubusercontent.com/rust-lang/rust/"
+        "58cf8f9c35b355199727627d07ae34a4e2846d67/src/ci/docker/scripts/"
+        "musl-toolchain.sh",
+        "6089a487dc49ad220d4a928de288fee8b78038acfbe163d025e3bfed9d590a82"),
+    "dist-x86_64-musl.Dockerfile": (
+        "https://raw.githubusercontent.com/rust-lang/rust/"
+        "58cf8f9c35b355199727627d07ae34a4e2846d67/src/ci/docker/host-x86_64/"
+        "dist-x86_64-musl/Dockerfile",
+        "b671f149b73e3bc1a7c0e6b2b9c8bbca1c6983d0879c65659441309ad433ed50"),
+    "dist-arm-linux-musl.Dockerfile": (
+        "https://raw.githubusercontent.com/rust-lang/rust/"
+        "58cf8f9c35b355199727627d07ae34a4e2846d67/src/ci/docker/host-x86_64/"
+        "dist-arm-linux-musl/Dockerfile",
+        "1cbf994d6ccfe7a72bb5501e888e8fcbb30e0639f4600e85ff548edca6214050"),
+    "mcm-Makefile": (
+        "https://raw.githubusercontent.com/richfelker/musl-cross-make/"
+        "3635262e4524c991552789af6f36211a335a77b3/Makefile",
+        "6ba8e8f0d7d46a32e4644d5de2e537c33c854c8956990b8bd475c1c310ff9a6d"),
+    "mcm-litecross-Makefile": (
+        "https://raw.githubusercontent.com/richfelker/musl-cross-make/"
+        "3635262e4524c991552789af6f36211a335a77b3/litecross/Makefile",
+        "0d610337a23086e552989888d0e30926387c4e79e52c584a4f0e65e78e6265e1"),
+    "mcm-musl-1.2.5.tar.gz.sha1": (
+        "https://raw.githubusercontent.com/richfelker/musl-cross-make/"
+        "3635262e4524c991552789af6f36211a335a77b3/hashes/musl-1.2.5.tar.gz.sha1",
+        "5c5d074634ed2dedef96c21d52040bfdf056e17d8ec0ccae96e7bf0eb86c3026"),
+    "mcm-LICENSE": (
+        "https://raw.githubusercontent.com/richfelker/musl-cross-make/"
+        "3635262e4524c991552789af6f36211a335a77b3/LICENSE",
+        "6512d6cdd05bb1e71491518b8b2ffe14927bdc13c21dd205c653ba65f7b7c72c"),
+    "mcm-COPYRIGHT": (
+        "https://raw.githubusercontent.com/richfelker/musl-cross-make/"
+        "3635262e4524c991552789af6f36211a335a77b3/COPYRIGHT",
+        "1e7cf04e318d8dcf00b2cfa3035c7e4e445da7f8851d1dcfebd7d4b5ac257f5a"),
+}
+MUSL_SOURCE_MAX_BYTES = 16 * 1024 * 1024
 PROVENANCE = ROOT + "provenance.json"
 
 
-def unestablished_scope(target):
+def _reviewed_musl_identity(rustc, target):
+    return (target in MUSL_TARGETS and isinstance(rustc, dict) and
+            rustc.get("release") == RUST_MUSL_RELEASE and
+            rustc.get("commit-hash") == RUST_MUSL_COMMIT)
+
+
+def unestablished_scope(target, rustc=None):
     scope = [UNESTABLISHED_SCOPE]
     if target.endswith("-musl"):
-        scope.append(MUSL_UNESTABLISHED_SCOPE)
+        if _reviewed_musl_identity(rustc, target):
+            scope.append(MUSL_SOURCE_LINKAGE_SCOPE)
+        else:
+            scope.append(MUSL_UNESTABLISHED_SCOPE)
     return scope
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, new_url):
+        return None
+
+
+def _fetch_musl_sources():
+    opener = urllib.request.build_opener(_NoRedirect())
+    payload = {}
+    for name, (url, expected) in MUSL_SOURCE_PINS.items():
+        if not url.startswith("https://"):
+            _fail("pinned musl source URL is not HTTPS: " + name)
+        limit = MUSL_SOURCE_MAX_BYTES
+        try:
+            with opener.open(url, timeout=30) as response:
+                if response.geturl() != url:
+                    _fail("pinned musl source redirected unexpectedly: " + name)
+                length = response.headers.get("Content-Length")
+                if length is not None and int(length) > limit:
+                    _fail("pinned musl source exceeds size limit: " + name)
+                data = bytearray()
+                while len(data) <= limit:
+                    chunk = response.read(min(65536, limit + 1 - len(data)))
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+        except Invalid:
+            raise
+        except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException) as exc:
+            _fail("cannot retrieve pinned musl source %s: %s" % (name, exc))
+        if not data:
+            _fail("pinned musl source is empty: " + name)
+        if len(data) > limit:
+            _fail("pinned musl source exceeds size limit: " + name)
+        if _sha(data) != expected:
+            _fail("pinned musl source SHA-256 mismatch: " + name)
+        payload[MUSL_ROOT + name] = bytes(data)
+    return payload
 
 
 class Invalid(ValueError):
@@ -255,10 +380,12 @@ def collect(sysroot, rustc_vv, target_libdir, target):
 
     payload = _collect_docs(sysroot)
     payload[manifest_rel] = manifest
+    if _reviewed_musl_identity(rustc, target):
+        payload.update(_fetch_musl_sources())
     material_hashes = {path: _sha(data) for path, data in sorted(payload.items())}
     inputs = [{"path": libdir_rel + "/" + path, "sha256": digest}
               for path, digest in sorted(input_hashes.items())]
-    unresolved = unestablished_scope(target)
+    unresolved = unestablished_scope(target, rustc)
     provenance = {
         "schema": 1,
         "rustc": rustc,
@@ -276,6 +403,9 @@ def collect(sysroot, rustc_vv, target_libdir, target):
 
 def installed(target):
     """Collect native material from the rustc selected by the current PATH."""
+    if target.endswith("-musl") and target not in MUSL_TARGETS:
+        _fail("Rust musl source linkage is pinned only for supported targets: " +
+              ", ".join(MUSL_TARGETS))
     commands = (
         ["rustc", "--print", "sysroot"],
         ["rustc", "-vV"],
@@ -287,11 +417,18 @@ def installed(target):
                    for command in commands]
     except (OSError, subprocess.CalledProcessError) as exc:
         _fail("selected rustc query failed: %s" % exc)
+    if target.endswith("-musl"):
+        rustc = _rustc_fields(outputs[1])
+        if not _reviewed_musl_identity(rustc, target):
+            _fail("installed musl material is supported only for rustc %s at commit %s "
+                  "and targets %s; selected rustc is release %s commit %s" % (
+                      RUST_MUSL_RELEASE, RUST_MUSL_COMMIT, ", ".join(MUSL_TARGETS),
+                      rustc["release"], rustc["commit-hash"]))
     return collect(outputs[0], outputs[1], outputs[2], target)
 
 
 def validate(payload, target):
-    """Validate payload structure and self-reported hashes, not authenticity."""
+    """Validate payload structure and self-reported hashes, plus musl source pins."""
     if not isinstance(payload, dict) or not isinstance(target, str):
         _fail("native-material payload must be a path-to-bytes mapping")
     if ("-" not in target or
@@ -321,7 +458,8 @@ def validate(payload, target):
                 not path.startswith(DOC_ROOT + "licenses/")):
             _fail("unexpected native-material Rust document: " + path)
         if (path != PROVENANCE and path != manifest_path and
-                not path.startswith(DOC_ROOT)):
+                not path.startswith(DOC_ROOT) and
+                not path.startswith(MUSL_ROOT)):
             _fail("unexpected native-material payload path: " + path)
 
     try:
@@ -342,6 +480,18 @@ def validate(payload, target):
         _fail("native-material rustc identity is incomplete")
     if provenance.get("target_input_scope") != TARGET_INPUT_SCOPE:
         _fail("native-material target input scope is missing or invalid")
+    musl_source_paths = {path for path in payload if path.startswith(MUSL_ROOT)}
+    expected_musl_sources = {
+        MUSL_ROOT + name: digest for name, (_, digest) in MUSL_SOURCE_PINS.items()}
+    reviewed_musl = _reviewed_musl_identity(rustc, target)
+    if reviewed_musl:
+        if musl_source_paths != set(expected_musl_sources):
+            _fail("reviewed Rust musl material lacks the exact pinned source set")
+        for path, expected in expected_musl_sources.items():
+            if _sha(payload[path]) != expected:
+                _fail("pinned Rust musl source SHA-256 mismatch: " + path)
+    elif musl_source_paths:
+        _fail("unreviewed Rust musl identity cannot claim pinned source linkage")
 
     expected_materials = {path: _sha(data) for path, data in payload.items()
                           if path != PROVENANCE}
@@ -378,7 +528,7 @@ def validate(payload, target):
                                 path.rsplit("/", 1)[-1]) for path in seen):
             _fail("native-material required " + library + " rlib record is missing")
     scope = provenance.get("unestablished_scope")
-    if scope != unestablished_scope(target):
+    if scope != unestablished_scope(target, rustc):
         _fail("native-material limits are missing or invalid")
     if target.endswith("-musl"):
         if "lib/rustlib/%s/lib/self-contained/libc.a" % target not in seen:
