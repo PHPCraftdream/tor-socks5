@@ -1,6 +1,6 @@
 use super::{
     reject_unsupported_pool, resolve_account_route, resolve_admitted_route, select_post_route,
-    validate_account_routes, validate_post_compatibility, AdmittedRoute,
+    validate_account_routes, validate_post_compatibility, validate_pre_capacity, AdmittedRoute,
 };
 use auth::{User, UsersConfig};
 use proxy_config::{PoolOverride, ProxyPool, Socks5Endpoint};
@@ -141,14 +141,66 @@ fn route_snapshot_preserves_replaced_credentials() {
 }
 
 #[test]
-fn post_pools_may_hold_several_members_but_pre_pools_not_yet() {
+fn pre_and_post_pools_may_hold_several_members() {
     let several = pool_of(&["127.0.0.1:1081", "http://127.0.0.1:1082"]);
-    let route = resolve_account_route(None, Some(&several), None, None, false, false).unwrap();
+    let route =
+        resolve_account_route(Some(&several), Some(&several), None, None, false, false).unwrap();
+    assert_eq!(route.pre, Some(several.clone()));
     assert_eq!(route.post, Some(several.clone()));
-    assert!(resolve_account_route(Some(&several), None, None, None, false, false).is_err());
     let account = PoolOverride::Pool(several);
-    assert!(resolve_account_route(None, None, Some(&account), None, false, false).is_err());
-    assert!(resolve_account_route(None, None, None, Some(&account), false, false).is_ok());
+    assert!(
+        resolve_account_route(None, None, Some(&account), Some(&account), false, false).is_ok()
+    );
+    assert!(resolve_account_route(None, None, Some(&account), None, true, false).is_err());
+}
+
+fn many(first_port: u16, count: u16) -> ProxyPool {
+    ProxyPool::new(
+        (first_port..first_port + count)
+            .map(|port| format!("127.0.0.1:{port}").parse().unwrap())
+            .collect(),
+    )
+    .unwrap()
+}
+
+fn users_with_pre(pools: Vec<Option<PoolOverride>>) -> UsersConfig {
+    UsersConfig {
+        users: pools.into_iter().map(|pre| user(true, pre, None)).collect(),
+    }
+}
+
+#[test]
+fn pre_capacity_counts_one_client_per_extra_endpoint() {
+    let none = users_with_pre(Vec::new());
+    assert!(validate_pre_capacity(&none, Some(&many(2000, 16))).is_ok());
+    assert!(validate_pre_capacity(&none, Some(&many(2000, 17))).is_err());
+
+    let own = |count| Some(PoolOverride::Pool(many(3000, count)));
+    assert!(validate_pre_capacity(&users_with_pre(vec![own(15)]), None).is_ok());
+    assert!(validate_pre_capacity(&users_with_pre(vec![own(16)]), None).is_err());
+
+    let global = many(2000, 2);
+    assert!(validate_pre_capacity(&users_with_pre(vec![own(14)]), Some(&global)).is_ok());
+    assert!(validate_pre_capacity(&users_with_pre(vec![own(15)]), Some(&global)).is_err());
+
+    let direct = Some(PoolOverride::Disabled);
+    assert!(validate_pre_capacity(
+        &users_with_pre(vec![direct.clone(), own(13)]),
+        Some(&global)
+    )
+    .is_ok());
+    assert!(validate_pre_capacity(&users_with_pre(vec![direct, own(14)]), Some(&global)).is_err());
+}
+
+#[test]
+fn pre_capacity_shares_endpoints_and_skips_disabled_accounts() {
+    let global = many(2000, 4);
+    let shared = Some(PoolOverride::Pool(many(2002, 4)));
+    let users = users_with_pre(vec![shared.clone(), shared]);
+    assert!(validate_pre_capacity(&users, Some(&global)).is_ok());
+    let mut off = users_with_pre(vec![Some(PoolOverride::Pool(many(5000, 20)))]);
+    off.users[0].is_enabled = false;
+    assert!(validate_pre_capacity(&off, None).is_ok());
 }
 
 #[tokio::test]

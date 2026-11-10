@@ -67,19 +67,9 @@ pub(crate) async fn build_tor_settings_preserving_live(
     live: &[BridgeLine],
 ) -> Result<Settings> {
     if let Some(pool) = cfg.pre_proxies.as_ref() {
-        let endpoint = pool.sole_member().ok_or_else(|| {
-            anyhow::anyhow!("pre proxy pools with several members are not supported yet")
-        })?;
+        let endpoint = owner_settings::select_anchor(pool).await?;
         let mut settings = restricted_owner_settings(cfg, config_path)?;
-        settings.pre_endpoint = Some(
-            arti_wrapper::Socks5PreEndpoint::new(
-                endpoint.address(),
-                endpoint
-                    .credentials()
-                    .map(|(user, pass)| (user.to_owned(), pass.to_owned())),
-            )
-            .with_protocol(endpoint.protocol()),
-        );
+        settings.pre_endpoint = Some(crate::route::pre_endpoint(endpoint));
         return Ok(settings);
     }
     let parsed = cfg

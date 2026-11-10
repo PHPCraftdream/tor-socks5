@@ -52,6 +52,26 @@ pub(crate) fn blame_dial(error: &TorError) -> PostBlame {
     }
 }
 
+/// Whether a failed Tor stream points at the path through the client's pre
+/// proxy: the client cannot reach the Tor network or build circuits, as
+/// opposed to the exit, the target or a post proxy refusing the stream.
+pub fn is_pre_path_failure(error: &TorError) -> bool {
+    let TorError::Connect { source, .. } = error else {
+        return false;
+    };
+    kind_is_pre_path(source.kind())
+}
+
+fn kind_is_pre_path(kind: ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::TorAccessFailed
+            | ErrorKind::TorNetworkTimeout
+            | ErrorKind::BootstrapRequired
+            | ErrorKind::TorDirectoryUnusable
+    )
+}
+
 /// Blame for a failure of the SOCKS5 / HTTP CONNECT handshake with the proxy.
 pub(crate) fn blame_handshake(error: &ConnectError) -> PostBlame {
     match error {
@@ -83,6 +103,33 @@ mod tests {
             code: Some(code),
             response: String::new(),
         }
+    }
+
+    #[test]
+    fn only_tor_reachability_kinds_point_at_the_pre_path() {
+        for kind in [
+            ErrorKind::TorAccessFailed,
+            ErrorKind::TorNetworkTimeout,
+            ErrorKind::BootstrapRequired,
+            ErrorKind::TorDirectoryUnusable,
+        ] {
+            assert!(kind_is_pre_path(kind), "{kind:?}");
+        }
+        for kind in [
+            ErrorKind::RemoteNetworkTimeout,
+            ErrorKind::RemoteConnectionRefused,
+            ErrorKind::RemoteHostNotFound,
+            ErrorKind::ExitPolicyRejected,
+            ErrorKind::ForbiddenStreamTarget,
+        ] {
+            assert!(!kind_is_pre_path(kind), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn errors_that_are_not_tor_stream_failures_never_point_at_the_pre_path() {
+        assert!(!is_pre_path_failure(&TorError::PostSocksTimeout));
+        assert!(!is_pre_path_failure(&TorError::InvalidBridge("x".into())));
     }
 
     #[test]

@@ -6,15 +6,37 @@ use resocks5_net::types::{ProxyConfig, ProxyProtocol};
 use crate::blame::{blame_dial, PostBlame};
 use crate::TorTunnel;
 
-/// Result of a handshake-only check of a post proxy.
+/// Result of a handshake-only check of a pre or post proxy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PostProbe {
+pub enum ProxyProbe {
     /// The proxy answered like a SOCKS5 or HTTP proxy.
     Alive,
-    /// The proxy is unreachable through Tor or does not speak its protocol.
+    /// The proxy is unreachable or does not speak its protocol.
     Dead,
     /// The check could not tell: Tor itself failed or ran out of time.
     Inconclusive,
+}
+
+/// Checks that a pre proxy is alive over a direct TCP connection.
+///
+/// A pre proxy is reached without Tor, so this is the path real traffic takes.
+/// The exchange is the handshake-only one of [`probe_post_proxy`]; it never
+/// carries a target, user data or credentials, and never answers
+/// [`ProxyProbe::Inconclusive`].
+///
+/// cancel-safe: NO — cancellation drops the probe connection.
+pub async fn probe_proxy_direct(proxy: &ProxyConfig, deadline: Instant) -> ProxyProbe {
+    use tokio_util::compat::TokioAsyncReadCompatExt;
+    let deadline = tokio::time::Instant::from_std(deadline);
+    let connect = tokio::net::TcpStream::connect((proxy.host.as_str(), proxy.port));
+    let stream = match tokio::time::timeout_at(deadline, connect).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(_)) | Err(_) => return ProxyProbe::Dead,
+    };
+    match tokio::time::timeout_at(deadline, greet(stream.compat(), proxy)).await {
+        Ok(true) => ProxyProbe::Alive,
+        Ok(false) | Err(_) => ProxyProbe::Dead,
+    }
 }
 
 /// Checks that a post proxy is alive without sending any target.
@@ -30,22 +52,22 @@ pub async fn probe_post_proxy(
     tunnel: &TorTunnel,
     proxy: &ProxyConfig,
     deadline: Instant,
-) -> PostProbe {
+) -> ProxyProbe {
     let deadline = tokio::time::Instant::from_std(deadline);
     let stream =
         match tokio::time::timeout_at(deadline, tunnel.connect(&proxy.host, proxy.port)).await {
-            Err(_) => return PostProbe::Inconclusive,
+            Err(_) => return ProxyProbe::Inconclusive,
             Ok(Err(error)) => {
                 return match blame_dial(&error) {
-                    PostBlame::NotProxy => PostProbe::Inconclusive,
-                    PostBlame::ProxyHard | PostBlame::ProxySoft => PostProbe::Dead,
+                    PostBlame::NotProxy => ProxyProbe::Inconclusive,
+                    PostBlame::ProxyHard | PostBlame::ProxySoft => ProxyProbe::Dead,
                 }
             }
             Ok(Ok(stream)) => stream,
         };
     match tokio::time::timeout_at(deadline, greet(stream, proxy)).await {
-        Ok(true) => PostProbe::Alive,
-        Ok(false) | Err(_) => PostProbe::Dead,
+        Ok(true) => ProxyProbe::Alive,
+        Ok(false) | Err(_) => ProxyProbe::Dead,
     }
 }
 
@@ -124,6 +146,35 @@ mod tests {
         );
         assert!(answer(&proxy, b"HTTP/1.0 502 Bad Gateway\r\n\r\n").await);
         assert!(!answer(&proxy, b"\x05\x00garbage garbage").await);
+    }
+
+    async fn direct_probe_against(reply: &'static [u8]) -> ProxyProbe {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 64];
+            let _ = peer.read(&mut buffer).await;
+            let _ = peer.write_all(reply).await;
+            let _ = peer.shutdown().await;
+        });
+        let proxy = ProxyConfig::new(ProxyProtocol::Socks5, "127.0.0.1", port);
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        let probe = probe_proxy_direct(&proxy, deadline).await;
+        server.await.unwrap();
+        probe
+    }
+
+    #[tokio::test]
+    async fn direct_probe_reports_a_live_socks5_server() {
+        assert_eq!(direct_probe_against(&[5, 0]).await, ProxyProbe::Alive);
+    }
+
+    #[tokio::test]
+    async fn direct_probe_rejects_a_server_that_is_not_a_proxy() {
+        assert_eq!(direct_probe_against(b"HT").await, ProxyProbe::Dead);
+        assert_eq!(direct_probe_against(&[]).await, ProxyProbe::Dead);
     }
 
     #[tokio::test]

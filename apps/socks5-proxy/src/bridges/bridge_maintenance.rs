@@ -316,20 +316,12 @@ async fn refresh_pre(
     tor: &arti_wrapper::TorTunnel,
     endpoint: &arti_wrapper::Socks5PreEndpoint,
 ) -> Result<()> {
-    let configured = cfg
-        .pre_proxies
-        .as_ref()
-        .and_then(|pool| pool.sole_member())
-        .map(|value| {
-            arti_wrapper::Socks5PreEndpoint::new(
-                value.address(),
-                value
-                    .credentials()
-                    .map(|(user, pass)| (user.to_owned(), pass.to_owned())),
-            )
-            .with_protocol(value.protocol())
-        });
-    if configured.as_ref() != Some(endpoint) || active.pre_endpoint.as_ref() != Some(endpoint) {
+    let configured = cfg.pre_proxies.as_ref().is_some_and(|pool| {
+        pool.members()
+            .iter()
+            .any(|member| &crate::route::pre_endpoint(member) == endpoint)
+    });
+    if !configured || active.pre_endpoint.as_ref() != Some(endpoint) {
         anyhow::bail!("изменение pre требует перезапуска");
     }
     if cfg.upstream.enabled {

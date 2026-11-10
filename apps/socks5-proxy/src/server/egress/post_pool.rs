@@ -4,7 +4,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arti_wrapper::{PostBlame, PostFailure, PostProbe, RoutedStream, TorError, TorTunnel};
+use arti_wrapper::{PostBlame, PostFailure, ProxyProbe, RoutedStream, TorError, TorTunnel};
 use proxy_config::ProxyPool;
 use resocks5_net::types::ProxyConfig;
 use route_pool::{PoolError, ProbeOutcome, ScopeMap, Verdict};
@@ -118,9 +118,9 @@ async fn probe_once(handle: TorHandle, proxy: Arc<ProxyConfig>, deadline: Instan
         return ProbeOutcome::Inconclusive;
     };
     match arti_wrapper::probe_post_proxy(&tunnel, &proxy, deadline).await {
-        PostProbe::Alive => ProbeOutcome::Alive,
-        PostProbe::Dead => ProbeOutcome::Dead,
-        PostProbe::Inconclusive => ProbeOutcome::Inconclusive,
+        ProxyProbe::Alive => ProbeOutcome::Alive,
+        ProxyProbe::Dead => ProbeOutcome::Dead,
+        ProxyProbe::Inconclusive => ProbeOutcome::Inconclusive,
     }
 }
 

@@ -95,6 +95,43 @@ pub(crate) fn validate_owner_routes(
     Ok(None)
 }
 
+/// How long each pre pool member gets to answer the startup handshake check.
+const ANCHOR_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Picks the pre pool member the main Tor client bootstraps through: the first
+/// one in configuration order that answers a direct handshake check.
+///
+/// A pool of one member is taken as it is, so a dead proxy still shows up as a
+/// bootstrap failure. Only the member's position is logged, never its address.
+pub(super) async fn select_anchor(
+    pool: &proxy_config::ProxyPool,
+) -> Result<&proxy_config::Socks5Endpoint> {
+    if let Some(only) = pool.sole_member() {
+        return Ok(only);
+    }
+    let deadline = std::time::Instant::now() + ANCHOR_PROBE_TIMEOUT;
+    let answers = futures::future::join_all(pool.members().iter().map(|member| async move {
+        match route_pool::proxy_config(member) {
+            Ok(proxy) => {
+                arti_wrapper::probe_proxy_direct(&proxy, deadline).await
+                    == arti_wrapper::ProxyProbe::Alive
+            }
+            Err(_) => false,
+        }
+    }))
+    .await;
+    match answers.iter().position(|alive| *alive) {
+        Some(index) => {
+            info!(
+                member = index,
+                "main Tor client uses this pre proxy pool member"
+            );
+            Ok(&pool.members()[index])
+        }
+        None => bail!("no pre_proxies member answered the startup handshake check"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

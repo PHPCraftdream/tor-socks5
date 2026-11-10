@@ -725,9 +725,9 @@ mod pre_endpoint;
 #[path = "proxy/stream.rs"]
 mod routed_stream;
 mod validate;
-pub use blame::{PostBlame, PostFailure};
+pub use blame::{is_pre_path_failure, PostBlame, PostFailure};
 pub use post_endpoint::{connect_post_proxy, connect_post_proxy_blamed, connect_post_socks};
-pub use post_probe::{probe_post_proxy, PostProbe};
+pub use post_probe::{probe_post_proxy, probe_proxy_direct, ProxyProbe};
 pub use pre_endpoint::Socks5PreEndpoint;
 pub use routed_stream::RoutedStream;
 pub use socks5_proto::client::Credentials as PostSocksCredentials;

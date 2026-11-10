@@ -110,6 +110,11 @@ impl PoolScope {
         self.rotator.link_proxy(key, Arc::clone(proxy));
     }
 
+    /// Records that the member served a connection without pinning the site.
+    pub fn record_served(&self, proxy: &Arc<ProxyConfig>) {
+        self.rotator.record_success(proxy);
+    }
+
     /// Records a failure of the proxy itself; `hard` counts toward quarantine.
     pub fn record_failure(&self, proxy: &ProxyConfig, hard: bool) {
         if hard {
@@ -172,6 +177,15 @@ impl PoolScope {
             .restore_health(&[UpstreamHealth::new(Arc::clone(proxy), health)]);
         assert_eq!(restored, 1);
     }
+}
+
+/// The configured member of `pool` that `proxy` was built from.
+pub fn find_member<'a>(pool: &'a ProxyPool, proxy: &ProxyConfig) -> Option<&'a Socks5Endpoint> {
+    pool.members().iter().find(|member| {
+        proxy_config(member)
+            .map(|candidate| same_member(&candidate, proxy))
+            .unwrap_or(false)
+    })
 }
 
 /// Address, port, protocol tag and credentials of one member.
@@ -439,5 +453,28 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second));
         assert!(!Arc::ptr_eq(&first, &other));
         assert_eq!(map.scopes().len(), 2);
+    }
+
+    #[test]
+    fn find_member_matches_the_exact_identity() {
+        let members = pool(&[
+            "192.0.2.1:1080",
+            "http://192.0.2.1:1080",
+            "192.0.2.1:1080|alice:secret",
+        ]);
+        let found = find_member(&members, &config("http://192.0.2.1:1080")).unwrap();
+        assert_eq!(found.protocol(), ProxyProtocol::Http);
+        let with_login = find_member(&members, &config("192.0.2.1:1080|alice:secret")).unwrap();
+        assert!(with_login.credentials().is_some());
+        assert!(find_member(&members, &config("192.0.2.9:1080")).is_none());
+    }
+
+    #[test]
+    fn serving_without_pinning_leaves_the_assignment_alone() {
+        let scope = PoolScope::new(&pool(&["192.0.2.1:1080", "192.0.2.2:1080"])).unwrap();
+        let before = scope.candidates("example.com");
+        let other = before.last().unwrap().clone();
+        scope.record_served(&other);
+        assert!(same_member(&scope.candidates("example.com")[0], &before[0]));
     }
 }

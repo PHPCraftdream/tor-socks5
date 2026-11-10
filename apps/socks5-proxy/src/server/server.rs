@@ -358,12 +358,27 @@ pub(crate) async fn run_server(
 
     // Quarantined post proxies are re-checked in the background so a revived
     // one returns to rotation; stopped by the same token as the other producers.
-    if let Egress::Tor(handle, _, _, _, _, pools) = &egress {
+    if let Egress::Tor(handle, pre, _, _, registry, pools) = &egress {
         producer_owner.add(crate::post_pool::spawn_prober(
             pools.clone(),
             handle.clone(),
             producer_token.clone(),
         ));
+        // Pre pool members are Tor clients of their own. Those of the global
+        // pool start in the background, and quarantined ones are probed
+        // directly; both stop with the other producers.
+        if let Some(registry) = registry {
+            producer_owner.add(pre_pool::spawn_prober(
+                registry.clone(),
+                producer_token.clone(),
+            ));
+            if let Some(pool) = pre.as_deref().filter(|pool| pool.len() > 1) {
+                let members = pool.members().iter().map(crate::route::pre_endpoint);
+                if let Some(start) = registry.start_background(members.collect()).await {
+                    producer_owner.add(start);
+                }
+            }
+        }
     }
 
     // Optional local DNS listener (opt-in, default OFF). Every DoH exchange
@@ -723,137 +738,46 @@ async fn handle_client_with_connector<C: TorConnector + Send>(
         }
     };
 
-    let differs = route.pre.as_ref() != global_pre;
-    let setup_deadline = tokio::time::Instant::now() + owners::SETUP_DEADLINE;
-    match egress {
+    match &egress {
         Egress::Tor(handle, _, _, _, registry, _) => {
-            if differs && (registry.is_none() || lease.is_none()) {
-                drop(lease);
-                req.reply(&mut client, Reply::Forbidden).await.ok();
-                return Ok(());
-            }
-            let owner = if differs {
-                match tokio::time::timeout_at(
-                    setup_deadline,
-                    registry
-                        .as_ref()
-                        .expect("реестр проверен")
-                        .select_admitted(lease.as_ref().expect("допуск проверен")),
-                )
-                .await
-                {
-                    Ok(Ok(owner)) => Some(owner),
-                    _ => {
-                        drop(lease);
-                        warn!("account owner rejected");
-                        req.reply(&mut client, Reply::Forbidden).await.ok();
-                        return Ok(());
-                    }
-                }
-            } else {
-                None
+            let leg = tor_branch::TorLeg {
+                handle,
+                registry: registry.as_ref(),
+                global_pre,
+                pre: route.pre.as_ref(),
+                post: route.post.as_ref(),
+                admitted: lease.is_some(),
             };
-            let global = owner
-                .as_ref()
-                .is_none_or(|owner| owner.global_handle().is_some());
-            if global {
-                handle.bridge_refresh().request();
-            }
-            info!(host = ?host, port = port, "tunneling through Tor");
-            // Read the *current* tunnel through the handle: a watchdog
-            // rebuild swaps the slot, and new connections must pick up the
-            // replacement. Returns None only while the server is draining
-            // the slot at shutdown.
-            let selected = tokio::time::timeout_at(setup_deadline, async {
-                match &owner {
-                    Some(owner) => owner.tunnel().await,
-                    None => handle.tunnel().await,
+            let connected = tor_branch::connect(&leg, &mut connector, host, port).await;
+            drop(lease);
+            let tor_stream = match connected {
+                Ok(stream) => {
+                    conn_health.record_connect_ok();
+                    info!(host = ?host, port = port, "tor connection established");
+                    stream
                 }
-            })
-            .await
-            .unwrap_or(None);
-            let tor = match selected {
-                Some(t) => t,
-                None => {
-                    drop(lease);
+                Err(tor_branch::Failure::Forbidden) => {
+                    warn!("account route rejected");
+                    req.reply(&mut client, Reply::Forbidden).await.ok();
+                    return Ok(());
+                }
+                Err(tor_branch::Failure::Unavailable) => {
                     req.reply(&mut client, Reply::GeneralFailure).await.ok();
                     conn_health.record_connect_failed();
                     return Err(anyhow!("tor tunnel unavailable (shutting down?)")
                         .context(STAGE_CONNECT_TOR));
                 }
-            };
-            // Feed the watchdog: every attempt bumps the counter (so it can
-            // tell "no traffic" from "circuits failing"), a success stamps
-            // the last-good time it compares against.
-            if global {
-                handle.health().record_attempt();
-            }
-            let tor_result = if global {
-                match tokio::time::timeout_at(
-                    setup_deadline,
-                    handle.bridge_refresh().track_connection(connector.connect(
-                        &tor,
-                        route.post.as_ref(),
-                        host,
-                        port,
-                    )),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => {
-                        drop(lease);
-                        req.reply(&mut client, Reply::GeneralFailure).await.ok();
-                        return Err(
-                            anyhow!("истекло время подключения Tor").context(STAGE_CONNECT_TOR)
-                        );
-                    }
+                Err(tor_branch::Failure::TimedOut(message)) => {
+                    req.reply(&mut client, Reply::GeneralFailure).await.ok();
+                    return Err(anyhow!(message).context(STAGE_CONNECT_TOR));
                 }
-            } else {
-                tokio::select! {
-                    biased;
-                    _ = registry.as_ref().expect("реестр проверен").cancelled() => {
-                        drop(lease);
-                        return Err(anyhow!("реестр закрыт").context(STAGE_CONNECT_TOR));
-                    }
-                    result = tokio::time::timeout_at(setup_deadline, connector.connect(&tor, route.post.as_ref(), host, port)) => {
-                        match result {
-                            Ok(result) => result,
-                            Err(_) => {
-                                drop(lease);
-                                req.reply(&mut client, Reply::GeneralFailure).await.ok();
-                                return Err(anyhow!("истекло время подключения владельца").context(STAGE_CONNECT_TOR));
-                            }
-                        }
-                    }
+                Err(tor_branch::Failure::Closed) => {
+                    return Err(anyhow!("реестр закрыт").context(STAGE_CONNECT_TOR));
                 }
-            };
-            drop(lease);
-            let tor_stream = match tor_result {
-                Ok(s) => {
-                    if global {
-                        handle.health().record_success();
-                        handle.health().record_success_target(host, port);
-                    }
-                    conn_health.record_connect_ok();
-                    info!(host = ?host, port = port, "tor connection established");
-                    s
-                }
-                Err(e) => {
-                    // Classify the failure into the three `ErrorKind`s the
-                    // watchdog cares about (see `classify_and_record`'s doc
-                    // comment) — data collection only, no gating here.
-                    if global {
-                        crate::tor_watchdog::classify_and_record(&e, handle.health());
-                    }
-                    // The watchdog needs the RAW `TorError` type — pass the
-                    // un-wrapped error, not a context-wrapped one.
-                    if global {
-                        handle.bridge_refresh().request_after_failure(&e);
-                    }
+                Err(tor_branch::Failure::Connect(error)) => {
                     req.reply(&mut client, Reply::GeneralFailure).await.ok();
                     conn_health.record_connect_failed();
-                    return Err(anyhow::Error::new(e).context(STAGE_CONNECT_TOR));
+                    return Err(anyhow::Error::new(error).context(STAGE_CONNECT_TOR));
                 }
             };
             req.reply(&mut client, Reply::Established).await?;
@@ -961,6 +885,12 @@ mod global_init;
 
 #[path = "../tor/tor_watchdog/owners/mod.rs"]
 mod owners;
+
+#[path = "egress/pre_pool.rs"]
+mod pre_pool;
+
+#[path = "egress/tor_branch.rs"]
+mod tor_branch;
 
 #[path = "listen/server_binding.rs"]
 mod binding;
