@@ -12,6 +12,7 @@ use crate::bridge_maintenance::load_config_off_worker;
 use crate::bridge_verifier::run_circuit_verify_tick;
 use crate::config::Config;
 use crate::test_seams::{ran_on_thread, Site};
+use proxy_config::Socks5Endpoint;
 
 use crate::tor_setup::{
     build_tor_settings, build_tor_settings_preserving_live, FORBID_STARTUP_PROBE,
@@ -19,9 +20,12 @@ use crate::tor_setup::{
 
 fn pre_config() -> Config {
     let mut cfg = Config {
-        pre_socks5: Some(proxy_config::EndpointOverride::Endpoint(
-            "127.0.0.1:1080|alice:secret".parse().unwrap(),
-        )),
+        pre_proxies: Some(
+            "127.0.0.1:1080|alice:secret"
+                .parse::<Socks5Endpoint>()
+                .unwrap()
+                .into(),
+        ),
         ..Config::default()
     };
     cfg.bridges.use_seeds = false;
@@ -251,10 +255,10 @@ async fn pre_hint_and_rejected_pt_cannot_bypass_validation() {
 }
 
 #[tokio::test]
-async fn absent_and_disabled_pre_keep_existing_empty_pool_policy() {
-    for pre in [None, Some(proxy_config::EndpointOverride::Disabled)] {
+async fn absent_pre_keeps_existing_empty_pool_policy() {
+    for pre in [None::<proxy_config::ProxyPool>] {
         let mut cfg = pre_config();
-        cfg.pre_socks5 = pre;
+        cfg.pre_proxies = pre;
         cfg.bridges.lines.clear();
         let error = build_tor_settings(&cfg, None)
             .await

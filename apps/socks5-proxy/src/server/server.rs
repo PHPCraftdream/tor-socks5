@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use arti_wrapper::{RoutedStream, TorTunnel};
+#[cfg(test)]
+use arti_wrapper::TorTunnel;
 use auth::{AuthState, UsersConfig};
 use resocks5_net::connect::HostPort;
 use resocks5_net::server::Reply;
@@ -19,10 +20,10 @@ use tracing::{debug, error, info, warn};
 use crate::config::{Config, Loaded, SecurityConfig};
 use crate::conn_health::{spawn_conn_health_logger, ConnHealthCounters};
 use crate::dns_wiring::{convert_custom_doh_providers, convert_dns_overrides, dns_cache_path};
-use crate::startup::{
-    connect_tor_route, resolve_admitted_route, validate_account_routes,
-    validate_post_compatibility, AuthStateVerifier,
-};
+use crate::post_pool::PostPools;
+use crate::route::{resolve_admitted_route, validate_account_routes, validate_post_compatibility};
+pub(crate) use crate::route::{RealTorConnector, TorConnector};
+use crate::startup::AuthStateVerifier;
 use crate::tor_watchdog::{spawn_bridge_failover_watchdog, spawn_tor_watchdog, TorHandle};
 use crate::upstream::relay;
 use crate::upstream::RelayRemote::{Tor, Upstream};
@@ -57,10 +58,11 @@ const PRODUCER_JOIN_TIMEOUT: Duration = Duration::from_secs(120);
 enum Egress {
     Tor(
         TorHandle,
-        Option<Arc<proxy_config::EndpointOverride>>,
-        Option<Arc<proxy_config::EndpointOverride>>,
+        Option<Arc<proxy_config::ProxyPool>>,
+        Option<Arc<proxy_config::ProxyPool>>,
         bool,
         Option<Arc<owners::OwnerRegistry>>,
+        Arc<PostPools>,
     ),
     Upstream(Arc<upstream::Upstream>),
 }
@@ -110,22 +112,14 @@ pub(crate) async fn run_server(
         Loaded::Defaults(_) => (None, "built-in defaults".to_string()),
     };
     let cfg = loaded.into_config();
-    let pre_socks = cfg
-        .pre_socks5
-        .clone()
-        .filter(|setting| matches!(setting, proxy_config::EndpointOverride::Endpoint(_)))
-        .map(Arc::new);
+    let pre_socks = cfg.pre_proxies.clone().map(Arc::new);
     validate_pre_compatibility(
         pre_socks.is_some(),
         cfg.dns_server.enabled,
         cfg.onion_services.iter().any(|service| service.enabled),
         false,
     )?;
-    let post_socks = cfg
-        .post_socks5
-        .clone()
-        .filter(|setting| matches!(setting, proxy_config::EndpointOverride::Endpoint(_)))
-        .map(Arc::new);
+    let post_socks = cfg.post_proxies.clone().map(Arc::new);
     validate_post_compatibility(post_socks.is_some(), cfg.dns_server.enabled, false)?;
 
     // Held until the server shuts down so the non-blocking log writer
@@ -158,8 +152,8 @@ pub(crate) async fn run_server(
     let owner_template = crate::tor_setup::restricted_owner_settings(&cfg, config_path.as_deref());
     validate_account_routes(
         &users,
-        cfg.pre_socks5.as_ref(),
-        cfg.post_socks5.as_ref(),
+        cfg.pre_proxies.as_ref(),
+        cfg.post_proxies.as_ref(),
         cfg.dns_server.enabled,
         false,
     )?;
@@ -208,8 +202,8 @@ pub(crate) async fn run_server(
             validate_post_compatibility(post_socks.is_some(), false, true)?;
             validate_account_routes(
                 &users,
-                cfg.pre_socks5.as_ref(),
-                cfg.post_socks5.as_ref(),
+                cfg.pre_proxies.as_ref(),
+                cfg.post_proxies.as_ref(),
                 false,
                 true,
             )?;
@@ -357,9 +351,20 @@ pub(crate) async fn run_server(
                 post_socks,
                 cfg.dns_server.enabled,
                 Some(owners),
+                Arc::new(PostPools::new()),
             )
         }
     };
+
+    // Quarantined post proxies are re-checked in the background so a revived
+    // one returns to rotation; stopped by the same token as the other producers.
+    if let Egress::Tor(handle, _, _, _, _, pools) = &egress {
+        producer_owner.add(crate::post_pool::spawn_prober(
+            pools.clone(),
+            handle.clone(),
+            producer_token.clone(),
+        ));
+    }
 
     // Optional local DNS listener (opt-in, default OFF). Every DoH exchange
     // it performs is tunnelled through the live Tor tunnel, so the feature
@@ -367,7 +372,7 @@ pub(crate) async fn run_server(
     // ("client DNS leaves the machine only inside Tor") cannot be honoured,
     // and refusing to start beats silently leaking plaintext queries.
     if cfg.dns_server.enabled {
-        let Egress::Tor(handle, _, _, _, _) = &egress else {
+        let Egress::Tor(handle, _, _, _, _, _) = &egress else {
             bail!(
                 "dns_server.enabled requires Tor egress, not an upstream SOCKS5 proxy — \
                  disable dns_server or remove the upstream"
@@ -505,7 +510,7 @@ pub(crate) async fn run_server(
     }
     // Keep each tunnel rooted until its PT shutdown receipt is observed.
     // A failed receipt leaves the registry available for recovery.
-    if let Egress::Tor(handle, _, _, _, _) = egress {
+    if let Egress::Tor(handle, _, _, _, _, _) = egress {
         info!("stopping Tor client and pluggable transports");
         // Join producers before shutting down their shared PT owner.
         producer_owner.cancel();
@@ -560,7 +565,7 @@ pub(crate) async fn run_server(
 
 fn validate_pre_compatibility(pre: bool, dns: bool, onion: bool, upstream: bool) -> Result<()> {
     if pre && (dns || onion || upstream) {
-        bail!("global pre_socks5 cannot be combined with DNS listener, enabled onion services, or upstream egress");
+        bail!("global pre_proxies cannot be combined with DNS listener, enabled onion services, or upstream egress");
     }
     Ok(())
 }
@@ -605,31 +610,6 @@ use crate::startup::{
 };
 pub(crate) use crate::startup::{ConnErrorKind, ConnStage};
 
-// RPITIT + Send: внутренний интерфейс без динамической диспетчеризации.
-trait TorConnector {
-    fn connect<'a>(
-        &'a mut self,
-        tor: &'a TorTunnel,
-        post: Option<&'a proxy_config::EndpointOverride>,
-        host: &'a str,
-        port: u16,
-    ) -> impl std::future::Future<Output = arti_wrapper::Result<RoutedStream>> + Send + 'a;
-}
-
-struct RealTorConnector;
-
-impl TorConnector for RealTorConnector {
-    fn connect<'a>(
-        &'a mut self,
-        tor: &'a TorTunnel,
-        post: Option<&'a proxy_config::EndpointOverride>,
-        host: &'a str,
-        port: u16,
-    ) -> impl std::future::Future<Output = arti_wrapper::Result<RoutedStream>> + Send + 'a {
-        connect_tor_route(tor, post, host, port)
-    }
-}
-
 /// cancel-safe: NO — partial protocol replies/prefix writes/relay are terminal;
 /// dropping this handler closes its owned client and egress, with no replay.
 async fn handle_client(
@@ -640,6 +620,10 @@ async fn handle_client(
     block_onion: bool,
     conn_id: u64,
 ) -> Result<()> {
+    let pools = match &egress {
+        Egress::Tor(_, _, _, _, _, pools) => Arc::clone(pools),
+        Egress::Upstream(_) => Arc::new(PostPools::new()),
+    };
     handle_client_with_connector(
         client,
         egress,
@@ -647,7 +631,7 @@ async fn handle_client(
         conn_health,
         block_onion,
         conn_id,
-        RealTorConnector,
+        RealTorConnector::new(pools),
     )
     .await
 }
@@ -725,7 +709,7 @@ async fn handle_client_with_connector<C: TorConnector + Send>(
         return Ok(());
     }
     let (global_pre, global_post, dns, upstream) = match &egress {
-        Egress::Tor(_, pre, post, dns, _) => (pre.as_deref(), post.as_deref(), *dns, false),
+        Egress::Tor(_, pre, post, dns, _, _) => (pre.as_deref(), post.as_deref(), *dns, false),
         Egress::Upstream(_) => (None, None, false, true),
     };
     let route = match resolve_admitted_route(global_pre, global_post, lease.as_ref(), dns, upstream)
@@ -739,11 +723,10 @@ async fn handle_client_with_connector<C: TorConnector + Send>(
         }
     };
 
-    let differs = proxy_config::resolve_endpoint(route.pre.as_ref(), None)
-        != proxy_config::resolve_endpoint(global_pre, None);
+    let differs = route.pre.as_ref() != global_pre;
     let setup_deadline = tokio::time::Instant::now() + owners::SETUP_DEADLINE;
     match egress {
-        Egress::Tor(handle, _, _, _, registry) => {
+        Egress::Tor(handle, _, _, _, registry, _) => {
             if differs && (registry.is_none() || lease.is_none()) {
                 drop(lease);
                 req.reply(&mut client, Reply::Forbidden).await.ok();

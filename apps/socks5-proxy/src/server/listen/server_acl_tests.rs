@@ -284,8 +284,8 @@ fn acl_user(name: &str, policy: Option<&str>) -> auth::User {
         is_enabled: true,
         allowed_onion: false,
         allowed_clients: policy.map(|p| p.parse().unwrap()),
-        pre_socks5: None,
-        post_socks5: None,
+        pre_proxies: None,
+        post_proxies: None,
     }
 }
 

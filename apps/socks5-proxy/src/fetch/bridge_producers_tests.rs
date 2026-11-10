@@ -1,4 +1,5 @@
 use super::*;
+use proxy_config::Socks5Endpoint;
 
 fn ensure_crypto_provider() {
     static INIT: std::sync::Once = std::sync::Once::new();
@@ -14,9 +15,7 @@ async fn pre_launch_keeps_only_maintenance_and_watchdog() {
     cfg.bridges.use_seeds = false;
     cfg.bridges.auto_fetch = false;
     cfg.bridges.lines = vec!["8.8.8.8:443 1111111111111111111111111111111111111111".into()];
-    cfg.pre_socks5 = Some(proxy_config::EndpointOverride::Endpoint(
-        "127.0.0.1:1080".parse().unwrap(),
-    ));
+    cfg.pre_proxies = Some("127.0.0.1:1080".parse::<Socks5Endpoint>().unwrap().into());
     cfg.watchdog.enabled = true;
     cfg.watchdog.check_interval_secs = 45;
     cfg.warm_pool.enabled = true;
@@ -49,9 +48,7 @@ async fn pre_launch_keeps_only_maintenance_and_watchdog() {
 async fn producer_boundaries_remain_guarded() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = Config {
-        pre_socks5: Some(proxy_config::EndpointOverride::Endpoint(
-            "127.0.0.1:1080".parse().unwrap(),
-        )),
+        pre_proxies: Some("127.0.0.1:1080".parse::<Socks5Endpoint>().unwrap().into()),
         ..Config::default()
     };
     cfg.bridges.use_seeds = false;
@@ -84,7 +81,7 @@ async fn producer_boundaries_remain_guarded() {
             assert_eq!(panic.downcast_ref::<&'static str>(), Some(&"maintenance"));
             assert!(producers.is_empty());
 
-            cfg.pre_socks5 = None;
+            cfg.pre_proxies = None;
             // Туннель остаётся с pre; проверка доходит только до границы запуска.
             let mut default_settings = settings;
             default_settings.pre_endpoint = None;

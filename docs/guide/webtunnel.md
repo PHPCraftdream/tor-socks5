@@ -117,7 +117,7 @@ With pre routing, direct startup probes are not used: usable bridges must be
 explicitly configured. Seed bridges, bridge discovery/downloads and the warm pool
 are unsupported in this restricted mode. Global pre maintenance uses the same
 proxy identity; alternative account owners have no automatic maintenance/recovery
-loop. See the [global pre restrictions](../../README.md#global-pre_socks5-routing).
+loop. See the [global pre restrictions](../../README.md#global-pre_proxies-routing).
 
 > arti's own state/cache is pinned to an app-local directory
 > (`<config-dir>/arti-data/{state,cache}`) via `arti-wrapper`'s

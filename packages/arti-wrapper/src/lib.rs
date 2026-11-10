@@ -716,12 +716,18 @@ fn fatal_protocol_error_hook(error: &arti_client::Error) {
     );
 }
 
+#[path = "proxy/blame.rs"]
+mod blame;
 mod post_endpoint;
+#[path = "proxy/probe.rs"]
+mod post_probe;
 mod pre_endpoint;
 #[path = "proxy/stream.rs"]
 mod routed_stream;
 mod validate;
-pub use post_endpoint::{connect_post_proxy, connect_post_socks};
+pub use blame::{PostBlame, PostFailure};
+pub use post_endpoint::{connect_post_proxy, connect_post_proxy_blamed, connect_post_socks};
+pub use post_probe::{probe_post_proxy, PostProbe};
 pub use pre_endpoint::Socks5PreEndpoint;
 pub use routed_stream::RoutedStream;
 pub use socks5_proto::client::Credentials as PostSocksCredentials;

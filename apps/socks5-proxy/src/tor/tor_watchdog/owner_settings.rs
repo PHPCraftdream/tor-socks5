@@ -19,13 +19,13 @@ fn restricted_owner_settings_with_override(
     pt_override: Option<&std::ffi::OsStr>,
 ) -> Result<Settings> {
     if cfg.dns_server.enabled || cfg.onion_services.iter().any(|service| service.enabled) {
-        bail!("pre_socks5 is incompatible with DNS listener, onion services, or upstream egress");
+        bail!("pre_proxies is incompatible with DNS listener, onion services, or upstream egress");
     }
     if cfg.bridges.use_seeds || cfg.bridges.auto_fetch {
-        bail!("pre_socks5 requires bridges.use_seeds and bridges.auto_fetch to be disabled");
+        bail!("pre_proxies requires bridges.use_seeds and bridges.auto_fetch to be disabled");
     }
     if cfg.warm_pool.enabled {
-        bail!("pre_socks5 is incompatible with warm_pool.enabled");
+        bail!("pre_proxies is incompatible with warm_pool.enabled");
     }
     for line in &cfg.bridges.lines {
         if !line.starts_with(bridge_probe::DNS_HINT_PREFIX) {
@@ -35,7 +35,7 @@ fn restricted_owner_settings_with_override(
                 .as_deref()
                 .is_some_and(|p| !matches!(p, "obfs4" | "webtunnel"))
             {
-                bail!("pre_socks5 does not support pluggable transport bridges with unknown protocols");
+                bail!("pre_proxies does not support pluggable transport bridges with unknown protocols");
             }
         }
     }
@@ -45,7 +45,7 @@ fn restricted_owner_settings_with_override(
         .context("parsing bridges from config")?
         .bridges;
     if bridges.is_empty() {
-        bail!("pre_socks5 requires at least one explicitly configured usable bridge");
+        bail!("pre_proxies requires at least one explicitly configured usable bridge");
     }
     let needs_pt = bridges.iter().any(|b| b.transport.is_some());
     let override_path = pt_binary_override_from(pt_override);
@@ -79,14 +79,14 @@ pub(crate) fn validate_owner_routes(
     users: &auth::UsersConfig,
     config_path: Option<&Path>,
 ) -> Result<Option<Settings>> {
-    let global = proxy_config::resolve_endpoint(cfg.pre_socks5.as_ref(), None);
+    let global = cfg.pre_proxies.clone();
     if users
         .users
         .iter()
         .filter(|user| user.is_enabled)
         .any(|user| {
             let effective =
-                proxy_config::resolve_endpoint(cfg.pre_socks5.as_ref(), user.pre_socks5.as_ref());
+                proxy_config::resolve_pool(cfg.pre_proxies.as_ref(), user.pre_proxies.as_ref());
             effective.is_some() && effective != global
         })
     {

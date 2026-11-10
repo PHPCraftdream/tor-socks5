@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "packages/*",
     "packages/proxy-config/client-acl",
+    "packages/proxy-config/route-pool",
     "apps/*",
     "vendor/saturating-time",
     "vendor/arti-client",

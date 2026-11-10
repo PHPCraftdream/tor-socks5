@@ -1,4 +1,5 @@
 use super::*;
+use proxy_config::Socks5Endpoint;
 
 // -- same-port consumer migration ------------------------------------------
 
@@ -437,7 +438,7 @@ async fn handle_client_partial_http_deadline_is_typed_and_terminal() {
 
 // Реальный registry нужен для проверки публикации между стадиями handshake.
 fn persistent_state(
-    post: Option<proxy_config::EndpointOverride>,
+    post: Option<proxy_config::PoolOverride>,
 ) -> (
     tempfile::TempDir,
     std::path::PathBuf,
@@ -453,8 +454,8 @@ fn persistent_state(
             is_enabled: true,
             allowed_onion: false,
             allowed_clients: None,
-            pre_socks5: None,
-            post_socks5: post,
+            pre_proxies: None,
+            post_proxies: post,
         }],
     };
     users.save(&path).unwrap();
@@ -622,9 +623,10 @@ async fn verified_handshakes_resolve_admitted_post_independently() {
     tokio::time::timeout(Duration::from_secs(10), async {
         for http in [true, false] {
             for mode in 0..3 {
-                let global = proxy_config::EndpointOverride::Endpoint("127.0.0.1:1080".parse().unwrap());
-                let account = proxy_config::EndpointOverride::Endpoint("127.0.0.1:1081".parse().unwrap());
-                let override_value = match mode { 0 => None, 1 => Some(account.clone()), _ => Some(proxy_config::EndpointOverride::Disabled) };
+                let global: proxy_config::ProxyPool = "127.0.0.1:1080".parse::<Socks5Endpoint>().unwrap().into();
+                let account_pool: proxy_config::ProxyPool = "127.0.0.1:1081".parse::<Socks5Endpoint>().unwrap().into();
+                let account = proxy_config::PoolOverride::Pool(account_pool.clone());
+                let override_value = match mode { 0 => None, 1 => Some(account.clone()), _ => Some(proxy_config::PoolOverride::Disabled) };
                 let (_dir, _path, state, _users) = persistent_state(override_value);
                 let incoming = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let mut client = TcpStream::connect(incoming.local_addr().unwrap()).await.unwrap();
@@ -642,7 +644,7 @@ async fn verified_handshakes_resolve_admitted_post_independently() {
                 let (_request, proof) = handshake.await.unwrap();
                 let lease = state.admit(&proof.unwrap()).await.unwrap();
                 let selected = resolve_admitted_route(None, Some(&global), Some(&lease), false, false).unwrap();
-                assert_eq!(selected.post, match mode { 0 => Some(global), 1 => Some(account), _ => None });
+                assert_eq!(selected.post, match mode { 0 => Some(global), 1 => Some(account_pool), _ => None });
             }
         }
     }).await.expect("route admission test timed out");
@@ -681,8 +683,7 @@ async fn wrong_socks_password_never_dials() {
 }
 
 struct ParkedTorConnector {
-    observed:
-        Option<tokio::sync::oneshot::Sender<(Option<proxy_config::EndpointOverride>, String, u16)>>,
+    observed: Option<tokio::sync::oneshot::Sender<(Option<proxy_config::ProxyPool>, String, u16)>>,
     release: Option<tokio::sync::oneshot::Receiver<()>>,
     calls: Arc<AtomicUsize>,
 }
@@ -692,7 +693,7 @@ impl TorConnector for ParkedTorConnector {
     async fn connect<'a>(
         &'a mut self,
         _tor: &'a TorTunnel,
-        post: Option<&'a proxy_config::EndpointOverride>,
+        post: Option<&'a proxy_config::ProxyPool>,
         host: &'a str,
         port: u16,
     ) -> arti_wrapper::Result<arti_wrapper::RoutedStream> {
@@ -749,10 +750,13 @@ async fn tor_handler_enforces_global_pre_before_connector_after_reload() {
             state_dir: Some(tor_dir.path().to_path_buf()),
             ..Default::default()
         }).unwrap());
-        let pre = proxy_config::EndpointOverride::Endpoint("127.0.0.1:1080|alice:secret".parse().unwrap());
-        let other = proxy_config::EndpointOverride::Endpoint("127.0.0.1:1080|alice:other".parse().unwrap());
-        let global_post = proxy_config::EndpointOverride::Endpoint("127.0.0.1:1082".parse().unwrap());
-        let account_post = proxy_config::EndpointOverride::Endpoint("127.0.0.1:1083".parse().unwrap());
+        let pre_pool: proxy_config::ProxyPool = "127.0.0.1:1080|alice:secret".parse::<Socks5Endpoint>().unwrap().into();
+        let other_pool: proxy_config::ProxyPool = "127.0.0.1:1080|alice:other".parse::<Socks5Endpoint>().unwrap().into();
+        let global_post_pool: proxy_config::ProxyPool = "127.0.0.1:1082".parse::<Socks5Endpoint>().unwrap().into();
+        let account_post_pool: proxy_config::ProxyPool = "127.0.0.1:1083".parse::<Socks5Endpoint>().unwrap().into();
+        let pre = proxy_config::PoolOverride::Pool(pre_pool.clone());
+        let other = proxy_config::PoolOverride::Pool(other_pool);
+        let account_post = proxy_config::PoolOverride::Pool(account_post_pool.clone());
         for http in [false, true] {
             for mode in 0..4 {
                 for after_reload in [false, true] {
@@ -760,11 +764,11 @@ async fn tor_handler_enforces_global_pre_before_connector_after_reload() {
                         0 => None,
                         1 => Some(pre.clone()),
                         2 => Some(other.clone()),
-                        _ => Some(proxy_config::EndpointOverride::Disabled),
+                        _ => Some(proxy_config::PoolOverride::Disabled),
                     };
                     let post = if mode == 1 { Some(account_post.clone()) } else { None };
                     let (_dir, path, state, mut users) = persistent_state(post);
-                    users.users[0].pre_socks5 = account_pre;
+                    users.users[0].pre_proxies = account_pre;
                     users.save(&path).unwrap();
                     let state = if after_reload {
                         reload(state.clone()).await;
@@ -780,7 +784,7 @@ async fn tor_handler_enforces_global_pre_before_connector_after_reload() {
                     let calls = Arc::new(AtomicUsize::new(0));
                     let connector = ParkedTorConnector { observed: Some(observed_tx), release: Some(release_rx), calls: calls.clone() };
                     let mut handler = AbortHandler(tokio::spawn(handle_client_with_connector(
-                        server, Egress::Tor(tor.clone(), Some(Arc::new(pre.clone())), Some(Arc::new(global_post.clone())), false, None),
+                        server, Egress::Tor(tor.clone(), Some(Arc::new(pre_pool.clone())), Some(Arc::new(global_post_pool.clone())), false, None, Arc::new(crate::post_pool::PostPools::new())),
                         Some(state), ConnHealthCounters::default(), false, 1, connector,
                     )));
                     if http {
@@ -791,7 +795,7 @@ async fn tor_handler_enforces_global_pre_before_connector_after_reload() {
                     }
                     if mode < 2 {
                         let (post, host, port) = observed_rx.await.unwrap();
-                        assert_eq!(post, Some(if mode == 0 { global_post.clone() } else { account_post.clone() }));
+                        assert_eq!(post, Some(if mode == 0 { global_post_pool.clone() } else { account_post_pool.clone() }));
                         assert_eq!((host.as_str(), port), if http { ("example.com", 443) } else { ("1.2.3.4", 80) });
                         release_tx.send(()).unwrap();
                         let error = (&mut handler.0).await.unwrap().unwrap_err();
@@ -826,14 +830,15 @@ async fn tor_handler_routes_and_releases_admission_on_error_or_cancel() {
         for http in [false, true] {
             for mode in 0..3 {
                 for cancel in [false, true] {
-                    let global = proxy_config::EndpointOverride::Endpoint("127.0.0.1:1080".parse().unwrap());
-                    let account = proxy_config::EndpointOverride::Endpoint("http://127.0.0.1:1081|post_user:post_password".parse().unwrap());
+                    let global: proxy_config::ProxyPool = "127.0.0.1:1080".parse::<Socks5Endpoint>().unwrap().into();
+                    let account_pool: proxy_config::ProxyPool = "http://127.0.0.1:1081|post_user:post_password".parse::<Socks5Endpoint>().unwrap().into();
+                    let account = proxy_config::PoolOverride::Pool(account_pool.clone());
                     let override_value = match mode {
                         0 => None,
                         1 => Some(account.clone()),
-                        _ => Some(proxy_config::EndpointOverride::Disabled),
+                        _ => Some(proxy_config::PoolOverride::Disabled),
                     };
-                    let expected = match mode { 0 => Some(global.clone()), 1 => Some(account), _ => None };
+                    let expected = match mode { 0 => Some(global.clone()), 1 => Some(account_pool), _ => None };
                     let (_dir, path, state, mut users) = persistent_state(override_value);
                     let proof = state.verify_proof("alice", "pw").unwrap();
                     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -844,7 +849,7 @@ async fn tor_handler_routes_and_releases_admission_on_error_or_cancel() {
                     let calls = Arc::new(AtomicUsize::new(0));
                     let connector = ParkedTorConnector { observed: Some(observed_tx), release: Some(release_rx), calls: calls.clone() };
                     let mut handler = AbortHandler(tokio::spawn(handle_client_with_connector(
-                        server, Egress::Tor(tor.clone(), None, Some(Arc::new(global)), false, None),
+                        server, Egress::Tor(tor.clone(), None, Some(Arc::new(global)), false, None, Arc::new(crate::post_pool::PostPools::new())),
                         Some(state.clone()), ConnHealthCounters::default(), false, 1, connector,
                     )));
                     if http {

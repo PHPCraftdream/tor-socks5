@@ -14,8 +14,8 @@ fn run_uses_effective_config_path() {
                 name: "alice".into(),
                 init: true,
                 allow_onion: false,
-                pre_socks5: None,
-                post_socks5: Some("none".into()),
+                pre_proxies: Vec::new(),
+                post_proxies: vec!["none".into()],
             },
             config_path,
             &mut fixed_prompt(""),
@@ -54,7 +54,7 @@ fn run_uses_effective_config_path() {
         let alice = users.find("alice").unwrap();
         assert!(alice.is_enabled);
         assert_eq!(alice.hash, INIT_SENTINEL);
-        assert_eq!(alice.post_socks5, Some(EndpointOverride::Disabled));
+        assert_eq!(alice.post_proxies, Some(PoolOverride::Disabled));
         for name in [
             "tor-socks5.users.ktav",
             "env.users.ktav",
@@ -104,6 +104,10 @@ fn mismatch_prompt(pw: &str, confirm: &str) -> FixedPrompt {
     }
 }
 
+fn args(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_owned()).collect()
+}
+
 fn tmp_users_path(dir: &std::path::Path) -> std::path::PathBuf {
     dir.join("test.users.ktav")
 }
@@ -119,8 +123,8 @@ fn add_happy_path() {
         "alice",
         &mut prompt,
         false,
-        Some("127.0.0.1:1080"),
-        Some("none"),
+        &args(&["127.0.0.1:1080"]),
+        &args(&["none"]),
     )
     .unwrap();
 
@@ -131,15 +135,12 @@ fn add_happy_path() {
     assert!(!loaded.users[0].hash.is_empty());
     assert!(verify_hash(&loaded.users[0].hash, "secret123").unwrap());
     assert_eq!(
-        loaded.users[0].pre_socks5,
-        Some(EndpointOverride::Endpoint(
-            "127.0.0.1:1080".parse().unwrap()
+        loaded.users[0].pre_proxies,
+        Some(PoolOverride::Pool(
+            "127.0.0.1:1080".parse::<Socks5Endpoint>().unwrap().into()
         ))
     );
-    assert_eq!(
-        loaded.users[0].post_socks5,
-        Some(EndpointOverride::Disabled)
-    );
+    assert_eq!(loaded.users[0].post_proxies, Some(PoolOverride::Disabled));
 }
 
 #[test]
@@ -153,12 +154,12 @@ fn add_rejects_invalid_socks5_without_saving() {
         "alice",
         &mut prompt,
         false,
-        Some("127.0.0.1:1080"),
-        Some("not-an-endpoint"),
+        &args(&["127.0.0.1:1080"]),
+        &args(&["not-an-endpoint"]),
     )
     .unwrap_err();
 
-    assert!(format!("{err}").contains("invalid SOCKS5 endpoint"));
+    assert!(format!("{err}").contains("invalid proxy endpoint"));
     assert!(!path.exists(), "invalid endpoint must not create registry");
 }
 
@@ -167,17 +168,24 @@ fn add_init_preserves_socks5_overrides() {
     let dir = tempfile::tempdir().unwrap();
     let path = tmp_users_path(dir.path());
 
-    cmd_add_init(&path, "alice", false, Some("127.0.0.1:1080"), Some("none")).unwrap();
+    cmd_add_init(
+        &path,
+        "alice",
+        false,
+        &args(&["127.0.0.1:1080"]),
+        &args(&["none"]),
+    )
+    .unwrap();
 
     let loaded = UsersConfig::load(&path).unwrap();
     let alice = loaded.find("alice").unwrap();
     assert_eq!(
-        alice.pre_socks5,
-        Some(EndpointOverride::Endpoint(
-            "127.0.0.1:1080".parse().unwrap()
+        alice.pre_proxies,
+        Some(PoolOverride::Pool(
+            "127.0.0.1:1080".parse::<Socks5Endpoint>().unwrap().into()
         ))
     );
-    assert_eq!(alice.post_socks5, Some(EndpointOverride::Disabled));
+    assert_eq!(alice.post_proxies, Some(PoolOverride::Disabled));
 }
 
 #[test]
@@ -189,12 +197,12 @@ fn add_init_rejects_invalid_socks5_without_saving() {
         &path,
         "alice",
         false,
-        Some("127.0.0.1:1080"),
-        Some("not-an-endpoint"),
+        &args(&["127.0.0.1:1080"]),
+        &args(&["not-an-endpoint"]),
     )
     .unwrap_err();
 
-    assert!(format!("{err}").contains("invalid SOCKS5 endpoint"));
+    assert!(format!("{err}").contains("invalid proxy endpoint"));
     assert!(!path.exists(), "invalid endpoint must not create registry");
 }
 
@@ -203,7 +211,7 @@ fn add_defaults_to_onion_denied() {
     let dir = tempfile::tempdir().unwrap();
     let path = tmp_users_path(dir.path());
     let mut prompt = fixed_prompt("secret123");
-    cmd_add(&path, "alice", &mut prompt, false, None, None).unwrap();
+    cmd_add(&path, "alice", &mut prompt, false, &[], &[]).unwrap();
     let loaded = UsersConfig::load(&path).unwrap();
     assert!(
         !loaded.find("alice").unwrap().allowed_onion,
@@ -216,7 +224,7 @@ fn add_with_allow_onion_grants_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = tmp_users_path(dir.path());
     let mut prompt = fixed_prompt("secret123");
-    cmd_add(&path, "alice", &mut prompt, true, None, None).unwrap();
+    cmd_add(&path, "alice", &mut prompt, true, &[], &[]).unwrap();
     assert!(
         UsersConfig::load(&path)
             .unwrap()
@@ -230,7 +238,7 @@ fn add_with_allow_onion_grants_it() {
 fn add_init_with_allow_onion_grants_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = tmp_users_path(dir.path());
-    cmd_add_init(&path, "alice", true, None, None).unwrap();
+    cmd_add_init(&path, "alice", true, &[], &[]).unwrap();
     let u = UsersConfig::load(&path).unwrap();
     let u = u.find("alice").unwrap();
     assert_eq!(u.hash, INIT_SENTINEL);
@@ -245,7 +253,7 @@ fn set_onion_toggles_flag() {
     let dir = tempfile::tempdir().unwrap();
     let path = tmp_users_path(dir.path());
     let mut prompt = fixed_prompt("pw");
-    cmd_add(&path, "alice", &mut prompt, false, None, None).unwrap();
+    cmd_add(&path, "alice", &mut prompt, false, &[], &[]).unwrap();
 
     cmd_set_onion(&path, "alice", true).unwrap();
     assert!(
@@ -279,7 +287,7 @@ fn add_init_stores_sentinel_hash() {
     let dir = tempfile::tempdir().unwrap();
     let path = tmp_users_path(dir.path());
 
-    cmd_add_init(&path, "alice", false, None, None).unwrap();
+    cmd_add_init(&path, "alice", false, &[], &[]).unwrap();
 
     let loaded = UsersConfig::load(&path).unwrap();
     assert_eq!(loaded.users.len(), 1);
@@ -292,8 +300,8 @@ fn add_init_stores_sentinel_hash() {
 fn add_init_rejects_duplicate() {
     let dir = tempfile::tempdir().unwrap();
     let path = tmp_users_path(dir.path());
-    cmd_add_init(&path, "alice", false, None, None).unwrap();
-    let err = cmd_add_init(&path, "alice", false, None, None).unwrap_err();
+    cmd_add_init(&path, "alice", false, &[], &[]).unwrap();
+    let err = cmd_add_init(&path, "alice", false, &[], &[]).unwrap_err();
     assert!(format!("{err}").contains("already exists"));
 }
 
@@ -303,7 +311,7 @@ fn set_password_on_init_account_succeeds() {
     // trip the "old password still verifies" sanity check.
     let dir = tempfile::tempdir().unwrap();
     let path = tmp_users_path(dir.path());
-    cmd_add_init(&path, "alice", false, None, None).unwrap();
+    cmd_add_init(&path, "alice", false, &[], &[]).unwrap();
 
     let mut prompt = fixed_prompt("real-pass");
     cmd_set_password(&path, "alice", &mut prompt).unwrap();
@@ -320,8 +328,8 @@ fn add_rejects_duplicate() {
     let path = tmp_users_path(dir.path());
     let mut prompt = fixed_prompt("secret");
 
-    cmd_add(&path, "alice", &mut prompt, false, None, None).unwrap();
-    let err = cmd_add(&path, "alice", &mut prompt, false, None, None).unwrap_err();
+    cmd_add(&path, "alice", &mut prompt, false, &[], &[]).unwrap();
+    let err = cmd_add(&path, "alice", &mut prompt, false, &[], &[]).unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("set-password"),
@@ -335,7 +343,7 @@ fn add_rejects_mismatched_confirm() {
     let path = tmp_users_path(dir.path());
     let mut prompt = mismatch_prompt("secret123", "different");
 
-    let err = cmd_add(&path, "alice", &mut prompt, false, None, None).unwrap_err();
+    let err = cmd_add(&path, "alice", &mut prompt, false, &[], &[]).unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("do not match"),
@@ -349,7 +357,7 @@ fn add_rejects_empty_password() {
     let path = tmp_users_path(dir.path());
     let mut prompt = fixed_prompt("");
 
-    let err = cmd_add(&path, "alice", &mut prompt, false, None, None).unwrap_err();
+    let err = cmd_add(&path, "alice", &mut prompt, false, &[], &[]).unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("empty"), "error should mention empty: {msg}");
 }
@@ -360,7 +368,7 @@ fn remove_deletes_existing() {
     let path = tmp_users_path(dir.path());
     let mut prompt = fixed_prompt("pw");
 
-    cmd_add(&path, "alice", &mut prompt, false, None, None).unwrap();
+    cmd_add(&path, "alice", &mut prompt, false, &[], &[]).unwrap();
     cmd_remove(&path, "alice").unwrap();
 
     let loaded = UsersConfig::load(&path).unwrap();
@@ -385,7 +393,7 @@ fn enable_disable_toggles_flag() {
     let path = tmp_users_path(dir.path());
     let mut prompt = fixed_prompt("pw");
 
-    cmd_add(&path, "alice", &mut prompt, false, None, None).unwrap();
+    cmd_add(&path, "alice", &mut prompt, false, &[], &[]).unwrap();
     cmd_disable(&path, "alice").unwrap();
     let loaded = UsersConfig::load(&path).unwrap();
     assert!(!loaded.find("alice").unwrap().is_enabled);
@@ -401,7 +409,7 @@ fn set_password_changes_hash_and_old_no_longer_verifies() {
     let path = tmp_users_path(dir.path());
     let mut prompt = fixed_prompt("old-pass");
 
-    cmd_add(&path, "alice", &mut prompt, false, None, None).unwrap();
+    cmd_add(&path, "alice", &mut prompt, false, &[], &[]).unwrap();
     let old_hash = UsersConfig::load(&path)
         .unwrap()
         .find("alice")
@@ -435,8 +443,8 @@ fn list_returns_rows_in_insertion_order() {
                     is_enabled: true,
                     allowed_onion: false,
                     allowed_clients: None,
-                    pre_socks5: None,
-                    post_socks5: None,
+                    pre_proxies: None,
+                    post_proxies: None,
                 },
                 User {
                     name: "alice".into(),
@@ -444,8 +452,8 @@ fn list_returns_rows_in_insertion_order() {
                     is_enabled: false,
                     allowed_onion: true,
                     allowed_clients: None,
-                    pre_socks5: None,
-                    post_socks5: None,
+                    pre_proxies: None,
+                    post_proxies: None,
                 },
             ],
         };
@@ -499,8 +507,8 @@ fn render_list_long_username() {
             is_enabled: true,
             allowed_onion: false,
             allowed_clients: None,
-            pre_socks5: None,
-            post_socks5: None,
+            pre_proxies: None,
+            post_proxies: None,
         }],
     };
     let table = render_list(&users);
@@ -516,8 +524,8 @@ fn render_list_short_hash_no_truncation() {
             is_enabled: true,
             allowed_onion: false,
             allowed_clients: None,
-            pre_socks5: None,
-            post_socks5: None,
+            pre_proxies: None,
+            post_proxies: None,
         }],
     };
     let table = render_list(&users);
@@ -534,8 +542,8 @@ fn render_list_disabled_user_shows_no() {
             is_enabled: false,
             allowed_onion: false,
             allowed_clients: None,
-            pre_socks5: None,
-            post_socks5: None,
+            pre_proxies: None,
+            post_proxies: None,
         }],
     };
     let table = render_list(&users);
@@ -557,7 +565,7 @@ fn add_mismatch_error_does_not_leak_password() {
     let path = tmp_users_path(dir.path());
     let mut prompt = mismatch_prompt("s3cret", "0ther");
 
-    let err = cmd_add(&path, "alice", &mut prompt, false, None, None).unwrap_err();
+    let err = cmd_add(&path, "alice", &mut prompt, false, &[], &[]).unwrap_err();
     let msg = format!("{err}");
     assert!(!msg.contains("s3cret"), "error must not contain password");
     assert!(!msg.contains("0ther"), "error must not contain confirm");
@@ -579,8 +587,8 @@ fn set_password_fails_with_busy_error_when_lock_is_held_too_long() {
             is_enabled: true,
             allowed_onion: false,
             allowed_clients: None,
-            pre_socks5: None,
-            post_socks5: None,
+            pre_proxies: None,
+            post_proxies: None,
         }],
     }
     .save(&path)
@@ -629,57 +637,69 @@ fn set_password_fails_with_busy_error_when_lock_is_held_too_long() {
 }
 
 #[test]
-fn set_socks5_updates_only_selected_hop_and_round_trips_inherit_and_none() {
+fn set_proxies_updates_only_selected_hop_and_round_trips_inherit_and_none() {
     let dir = tempfile::tempdir().unwrap();
     let path = tmp_users_path(dir.path());
-    cmd_add_init(&path, "alice", false, None, None).unwrap();
-    cmd_set_socks5(&path, "alice", "pre", "127.0.0.1:1080").unwrap();
-    cmd_set_socks5(&path, "alice", "post", "none").unwrap();
+    cmd_add_init(&path, "alice", false, &[], &[]).unwrap();
+    cmd_set_proxies(&path, "alice", "pre", &args(&["127.0.0.1:1080"])).unwrap();
+    cmd_set_proxies(&path, "alice", "post", &args(&["none"])).unwrap();
 
     let loaded = UsersConfig::load(&path).unwrap();
     let alice = loaded.find("alice").unwrap();
     assert_eq!(
-        alice.pre_socks5,
-        Some(EndpointOverride::Endpoint(
-            "127.0.0.1:1080".parse().unwrap()
+        alice.pre_proxies,
+        Some(PoolOverride::Pool(
+            "127.0.0.1:1080".parse::<Socks5Endpoint>().unwrap().into()
         ))
     );
-    assert_eq!(alice.post_socks5, Some(EndpointOverride::Disabled));
+    assert_eq!(alice.post_proxies, Some(PoolOverride::Disabled));
 
-    cmd_set_socks5(&path, "alice", "pre", "inherit").unwrap();
-    cmd_set_socks5(&path, "alice", "post", "inherit").unwrap();
+    cmd_set_proxies(&path, "alice", "pre", &args(&["inherit"])).unwrap();
+    cmd_set_proxies(&path, "alice", "post", &args(&["inherit"])).unwrap();
     let loaded = UsersConfig::load(&path).unwrap();
     let alice = loaded.find("alice").unwrap();
-    assert_eq!(alice.pre_socks5, None);
-    assert_eq!(alice.post_socks5, None);
+    assert_eq!(alice.pre_proxies, None);
+    assert_eq!(alice.post_proxies, None);
 }
 
 #[test]
-fn set_socks5_cli_round_trips_ipv6_credentials_and_hides_them_from_debug_and_errors() {
+fn set_proxies_cli_round_trips_ipv6_credentials_and_hides_them_from_debug_and_errors() {
     let dir = tempfile::tempdir().unwrap();
     let path = tmp_users_path(dir.path());
-    cmd_add_init(&path, "alice", false, None, None).unwrap();
-    cmd_set_socks5(&path, "alice", "pre", "192.0.2.4:1080|pre-user:pre-secret").unwrap();
-    cmd_set_socks5(
+    cmd_add_init(&path, "alice", false, &[], &[]).unwrap();
+    cmd_set_proxies(
+        &path,
+        "alice",
+        "pre",
+        &args(&["192.0.2.4:1080|pre-user:pre-secret"]),
+    )
+    .unwrap();
+    cmd_set_proxies(
         &path,
         "alice",
         "post",
-        "[2001:db8::2]:1082|post-user:post-secret",
+        &args(&["[2001:db8::2]:1082|post-user:post-secret"]),
     )
     .unwrap();
 
     let loaded = UsersConfig::load(&path).unwrap();
     let alice = loaded.find("alice").unwrap();
     assert_eq!(
-        alice.pre_socks5,
-        Some(EndpointOverride::Endpoint(
-            "192.0.2.4:1080|pre-user:pre-secret".parse().unwrap()
+        alice.pre_proxies,
+        Some(PoolOverride::Pool(
+            "192.0.2.4:1080|pre-user:pre-secret"
+                .parse::<Socks5Endpoint>()
+                .unwrap()
+                .into()
         ))
     );
     assert_eq!(
-        alice.post_socks5,
-        Some(EndpointOverride::Endpoint(
-            "[2001:db8::2]:1082|post-user:post-secret".parse().unwrap()
+        alice.post_proxies,
+        Some(PoolOverride::Pool(
+            "[2001:db8::2]:1082|post-user:post-secret"
+                .parse::<Socks5Endpoint>()
+                .unwrap()
+                .into()
         ))
     );
     let saved = std::fs::read_to_string(&path).unwrap();
@@ -687,51 +707,59 @@ fn set_socks5_cli_round_trips_ipv6_credentials_and_hides_them_from_debug_and_err
     std::fs::write(&roundtrip_path, saved).unwrap();
     let roundtripped = UsersConfig::load(&roundtrip_path).unwrap();
     let alice = roundtripped.find("alice").unwrap();
-    assert_eq!(alice.pre_socks5, loaded.find("alice").unwrap().pre_socks5);
-    assert_eq!(alice.post_socks5, loaded.find("alice").unwrap().post_socks5);
+    assert_eq!(alice.pre_proxies, loaded.find("alice").unwrap().pre_proxies);
+    assert_eq!(
+        alice.post_proxies,
+        loaded.find("alice").unwrap().post_proxies
+    );
 
     let debug = format!("{alice:?}");
     for secret in ["pre-user", "pre-secret", "post-user", "post-secret"] {
         assert!(!debug.contains(secret), "Debug leaked {secret}");
     }
-    let error =
-        cmd_set_socks5(&path, "alice", "post", "192.0.2.4:0|post-user:post-secret").unwrap_err();
+    let error = cmd_set_proxies(
+        &path,
+        "alice",
+        "post",
+        &args(&["192.0.2.4:0|post-user:post-secret"]),
+    )
+    .unwrap_err();
     let error = format!("{error}");
     assert!(!error.contains("post-user"));
     assert!(!error.contains("post-secret"));
 }
 
 #[test]
-fn set_socks5_invalid_endpoint_preserves_saved_data() {
+fn set_proxies_invalid_endpoint_preserves_saved_data() {
     let dir = tempfile::tempdir().unwrap();
     let path = tmp_users_path(dir.path());
-    cmd_add_init(&path, "alice", false, None, None).unwrap();
-    cmd_set_socks5(&path, "alice", "pre", "127.0.0.1:1080").unwrap();
-    cmd_set_socks5(&path, "alice", "post", "none").unwrap();
+    cmd_add_init(&path, "alice", false, &[], &[]).unwrap();
+    cmd_set_proxies(&path, "alice", "pre", &args(&["127.0.0.1:1080"])).unwrap();
+    cmd_set_proxies(&path, "alice", "post", &args(&["none"])).unwrap();
     let before = std::fs::read(&path).unwrap();
 
-    let err = cmd_set_socks5(&path, "alice", "pre", "not-an-endpoint").unwrap_err();
+    let err = cmd_set_proxies(&path, "alice", "pre", &args(&["not-an-endpoint"])).unwrap_err();
 
-    assert!(format!("{err}").contains("invalid SOCKS5 endpoint"));
+    assert!(format!("{err}").contains("invalid proxy endpoint"));
     assert_eq!(std::fs::read(&path).unwrap(), before);
     let loaded = UsersConfig::load(&path).unwrap();
     let alice = loaded.find("alice").unwrap();
     assert_eq!(
-        alice.pre_socks5,
-        Some(EndpointOverride::Endpoint(
-            "127.0.0.1:1080".parse().unwrap()
+        alice.pre_proxies,
+        Some(PoolOverride::Pool(
+            "127.0.0.1:1080".parse::<Socks5Endpoint>().unwrap().into()
         ))
     );
-    assert_eq!(alice.post_socks5, Some(EndpointOverride::Disabled));
+    assert_eq!(alice.post_proxies, Some(PoolOverride::Disabled));
 }
 
 #[test]
-fn set_socks5_rejects_unknown_hop_without_changing_saved_data() {
+fn set_proxies_rejects_unknown_hop_without_changing_saved_data() {
     let dir = tempfile::tempdir().unwrap();
     let path = tmp_users_path(dir.path());
-    cmd_add_init(&path, "alice", false, None, None).unwrap();
+    cmd_add_init(&path, "alice", false, &[], &[]).unwrap();
     let before = std::fs::read(&path).unwrap();
-    assert!(cmd_set_socks5(&path, "alice", "middle", "none").is_err());
+    assert!(cmd_set_proxies(&path, "alice", "middle", &args(&["none"])).is_err());
     assert_eq!(std::fs::read(&path).unwrap(), before);
 }
 
@@ -740,7 +768,7 @@ fn real_cli_writers_preserve_allowed_clients() {
     let dir = tempfile::tempdir().unwrap();
     let path = tmp_users_path(dir.path());
     let mut prompt = fixed_prompt("secret123");
-    cmd_add(&path, "alice", &mut prompt, false, None, None).unwrap();
+    cmd_add(&path, "alice", &mut prompt, false, &[], &[]).unwrap();
     // Ручная правка users.ktav: оператор задаёт per-user ACL.
     let mut cfg = UsersConfig::load(&path).unwrap();
     cfg.find_mut("alice").unwrap().allowed_clients =

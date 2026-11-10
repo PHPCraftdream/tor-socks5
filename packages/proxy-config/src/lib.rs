@@ -50,7 +50,8 @@ pub use tor::TorConfig;
 /// Реэкспорт, чтобы обвязке auth/dns-server/CLI/FFI хватало одного пути
 /// импорта (`proxy_config::...`) для типов клиентского ACL.
 pub use client_acl::{
-    resolve_endpoint, AllowedClients, AllowedClientsError, ClientAccessConfig, EndpointOverride,
+    resolve_pool, AllowedClients, AllowedClientsError, ClientAccessConfig, PoolOverride, ProxyPool,
+    Socks5Endpoint,
 };
 const ENV_VAR: &str = "TOR_SOCKS5_CONFIG";
 const DEFAULT_FILE: &str = "tor-socks5.ktav";
@@ -102,20 +103,12 @@ pub struct Config {
     pub conn_health: ConnHealthConfig,
     /// Optional upstream SOCKS5 proxy used as the egress instead of Tor.
     pub upstream: UpstreamConfig,
-    /// Необязательный SOCKS5-прокси для соединений к сети Tor.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "client_acl::socks5_endpoint_field"
-    )]
-    pub pre_socks5: Option<client_acl::EndpointOverride>,
-    /// Необязательный SOCKS5-прокси для соединений через Tor к целевому адресу.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "client_acl::socks5_endpoint_field"
-    )]
-    pub post_socks5: Option<client_acl::EndpointOverride>,
+    /// Необязательный пул прокси (SOCKS5 или HTTP CONNECT) для соединений к сети Tor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_proxies: Option<client_acl::ProxyPool>,
+    /// Необязательный пул прокси для соединений через Tor к целевому адресу.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_proxies: Option<client_acl::ProxyPool>,
     /// Local SOCKS5 (RFC 1929) authentication for the listener. Used by
     /// both the CLI and the Android JNI FFI crate — see [`AuthConfig`].
     pub auth: AuthConfig,
@@ -841,8 +834,8 @@ impl Default for Config {
             warm_pool: WarmPoolConfig::default(),
             conn_health: ConnHealthConfig::default(),
             upstream: UpstreamConfig::default(),
-            pre_socks5: None,
-            post_socks5: None,
+            pre_proxies: None,
+            post_proxies: None,
             auth: AuthConfig::default(),
             security: SecurityConfig::default(),
             dns: DnsConfig::default(),

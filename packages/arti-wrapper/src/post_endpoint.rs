@@ -5,6 +5,7 @@ use resocks5_net::types::{ProxyConfig, ProxyProtocol};
 use socks5_proto::client::{self, Credentials};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
+use crate::blame::{blame_dial, blame_handshake, PostBlame, PostFailure};
 use crate::{RoutedStream, TorError, TorTunnel};
 
 /// Открыть поток к SOCKS5 через Tor и запросить конечный адрес.
@@ -43,10 +44,26 @@ pub async fn connect_post_proxy(
     target_port: u16,
     deadline: Instant,
 ) -> Result<RoutedStream, TorError> {
+    connect_post_proxy_blamed(tunnel, proxy, target_host, target_port, deadline)
+        .await
+        .map_err(|failure| failure.error)
+}
+
+/// [`connect_post_proxy`] that also reports whom a failure points at, so a
+/// pool can rotate past a broken proxy without demoting it for a target or
+/// Tor fault.
+/// cancel-safe: NO — cancellation discards the owned, partially negotiated stream.
+pub async fn connect_post_proxy_blamed(
+    tunnel: &TorTunnel,
+    proxy: &ProxyConfig,
+    target_host: &str,
+    target_port: u16,
+    deadline: Instant,
+) -> Result<RoutedStream, PostFailure> {
     if proxy.gate.is_some() || proxy.host.is_empty() || proxy.port == 0 {
-        return Err(TorError::BuildConfig(
+        return Err(PostFailure::local(TorError::BuildConfig(
             "post endpoint must be one valid proxy".to_owned(),
-        ));
+        )));
     }
     match (&proxy.user, &proxy.password) {
         (None, None) => {}
@@ -59,12 +76,16 @@ pub async fn connect_post_proxy(
                     || (!user.contains(':')
                         && !user.bytes().any(|byte| byte.is_ascii_control())
                         && !password.bytes().any(|byte| byte.is_ascii_control()))) => {}
-        _ => return Err(TorError::BuildConfig("invalid post credentials".to_owned())),
+        _ => {
+            return Err(PostFailure::local(TorError::BuildConfig(
+                "invalid post credentials".to_owned(),
+            )))
+        }
     }
     if proxy.protocol == ProxyProtocol::Https {
-        return Err(TorError::BuildConfig(
+        return Err(PostFailure::local(TorError::BuildConfig(
             "post protocol must be SOCKS5 or HTTP CONNECT".to_owned(),
-        ));
+        )));
     }
     connect_proxy_over_dial(
         tunnel.connect(&proxy.host, proxy.port),
@@ -85,7 +106,7 @@ async fn connect_proxy_over_dial<S, F>(
     target_host: &str,
     target_port: u16,
     deadline: Instant,
-) -> Result<AnyUpstream, TorError>
+) -> Result<AnyUpstream, PostFailure>
 where
     S: futures::AsyncRead + futures::AsyncWrite + Send + Unpin + 'static,
     F: std::future::Future<Output = Result<S, TorError>>,
@@ -94,7 +115,9 @@ where
         ProxyProtocol::Socks5 => "socks5",
         ProxyProtocol::Http => "http",
         ProxyProtocol::Https => {
-            return Err(TorError::BuildConfig("unsupported post protocol".into()))
+            return Err(PostFailure::local(TorError::BuildConfig(
+                "unsupported post protocol".into(),
+            )))
         }
     };
     if proxy.protocol == ProxyProtocol::Socks5
@@ -102,11 +125,13 @@ where
             || target_host.len() > 255
             || target_host.as_bytes().contains(&0))
     {
-        return Err(TorError::PostSocks(client::Error::InvalidInput));
+        return Err(PostFailure::local(TorError::PostSocks(
+            client::Error::InvalidInput,
+        )));
     }
     let deadline = tokio::time::Instant::from_std(deadline);
     if tokio::time::Instant::now() >= deadline {
-        return Err(post_timeout(proxy.protocol));
+        return Err(timed_out(proxy.protocol));
     }
     tracing::info!(
         post_protocol = protocol,
@@ -115,10 +140,14 @@ where
     );
     let stream = tokio::time::timeout_at(deadline, dial)
         .await
-        .map_err(|_| post_timeout(proxy.protocol))??;
+        .map_err(|_| timed_out(proxy.protocol))?
+        .map_err(|error| {
+            let blame = blame_dial(&error);
+            PostFailure::new(error, blame)
+        })?;
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero() {
-        return Err(post_timeout(proxy.protocol));
+        return Err(timed_out(proxy.protocol));
     }
     let options = DialOptions::new()
         .with_handshake_timeout(remaining)
@@ -140,21 +169,25 @@ where
         ),
     )
     .await
-    .map_err(|_| post_timeout(proxy.protocol))?
-    .map_err(|error| match proxy.protocol {
-        ProxyProtocol::Socks5 => match client::Error::from(error.into_error()) {
-            client::Error::Timeout => TorError::PostSocksTimeout,
-            error => TorError::PostSocks(error),
-        },
-        ProxyProtocol::Http => {
-            let error = error.into_error();
-            if matches!(&error, resocks5_net::ConnectError::Timeout { .. }) {
-                TorError::PostHttpTimeout
-            } else {
-                TorError::PostHttp(error)
+    .map_err(|_| timed_out(proxy.protocol))?
+    .map_err(|error| {
+        let error = error.into_error();
+        let blame = blame_handshake(&error);
+        let error = match proxy.protocol {
+            ProxyProtocol::Socks5 => match client::Error::from(error) {
+                client::Error::Timeout => TorError::PostSocksTimeout,
+                error => TorError::PostSocks(error),
+            },
+            ProxyProtocol::Http => {
+                if matches!(&error, resocks5_net::ConnectError::Timeout { .. }) {
+                    TorError::PostHttpTimeout
+                } else {
+                    TorError::PostHttp(error)
+                }
             }
-        }
-        ProxyProtocol::Https => TorError::BuildConfig("unsupported post protocol".into()),
+            ProxyProtocol::Https => TorError::BuildConfig("unsupported post protocol".into()),
+        };
+        PostFailure::new(error, blame)
     })?;
     tracing::info!(
         post_protocol = protocol,
@@ -162,6 +195,12 @@ where
         "post proxy setup"
     );
     Ok(stream)
+}
+
+/// A deadline that elapsed while talking to the proxy: ambiguous between a
+/// slow proxy and a slow Tor, so it never counts toward quarantine.
+fn timed_out(protocol: ProxyProtocol) -> PostFailure {
+    PostFailure::new(post_timeout(protocol), PostBlame::ProxySoft)
 }
 
 fn post_timeout(protocol: ProxyProtocol) -> TorError {
@@ -187,6 +226,7 @@ where
     connect_proxy_over_dial(dial, proxy, target_host, target_port, deadline)
         .await
         .map(TokioAsyncReadCompatExt::compat)
+        .map_err(|failure| failure.error)
 }
 
 async fn connect_post_over_dial<S, F>(
@@ -623,9 +663,13 @@ mod tests {
         })
         .await
         .expect("secure-only rejection must finish");
+        let Err(failure) = result else {
+            panic!("secure-only rejection must fail");
+        };
         assert!(matches!(
-            result,
-            Err(TorError::PostSocks(client::Error::Protocol))
+            failure.error,
+            TorError::PostSocks(client::Error::Protocol)
         ));
+        assert_eq!(failure.blame, PostBlame::ProxyHard);
     }
 }

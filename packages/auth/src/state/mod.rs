@@ -91,8 +91,8 @@ pub struct AdmissionLease {
     name: String,
     allowed_onion: bool,
     allowed_clients: Option<client_acl::AllowedClients>,
-    pre_socks5: Option<client_acl::EndpointOverride>,
-    post_socks5: Option<client_acl::EndpointOverride>,
+    pre_proxies: Option<client_acl::PoolOverride>,
+    post_proxies: Option<client_acl::PoolOverride>,
 }
 
 impl AdmissionLease {
@@ -109,12 +109,12 @@ impl AdmissionLease {
         self.allowed_clients.as_ref()
     }
     /// Маршрут до Tor.
-    pub fn pre_socks5(&self) -> Option<&client_acl::EndpointOverride> {
-        self.pre_socks5.as_ref()
+    pub fn pre_proxies(&self) -> Option<&client_acl::PoolOverride> {
+        self.pre_proxies.as_ref()
     }
     /// Маршрут после Tor.
-    pub fn post_socks5(&self) -> Option<&client_acl::EndpointOverride> {
-        self.post_socks5.as_ref()
+    pub fn post_proxies(&self) -> Option<&client_acl::PoolOverride> {
+        self.post_proxies.as_ref()
     }
 }
 
@@ -362,8 +362,8 @@ impl AuthState {
             name: proof.name.clone(),
             allowed_onion: user.allowed_onion,
             allowed_clients: user.allowed_clients.clone(),
-            pre_socks5: user.pre_socks5.clone(),
-            post_socks5: user.post_socks5.clone(),
+            pre_proxies: user.pre_proxies.clone(),
+            post_proxies: user.post_proxies.clone(),
         })
     }
 

@@ -2,27 +2,22 @@ use super::*;
 
 #[cfg(any(target_os = "android", test))]
 fn reject_unimplemented_global_socks5_endpoints(config: &Config) -> Result<(), String> {
-    use proxy_config::EndpointOverride;
-
-    if [&config.pre_socks5, &config.post_socks5]
-        .iter()
-        .any(|setting| matches!(setting, Some(EndpointOverride::Endpoint(_))))
-    {
-        return Err("Android SOCKS5 global pre_socks5/post_socks5 endpoints are not supported yet; refusing startup to prevent direct connections".to_owned());
+    if config.pre_proxies.is_some() || config.post_proxies.is_some() {
+        return Err("Android global pre_proxies/post_proxies pools are not supported yet; refusing startup to prevent direct connections".to_owned());
     }
     Ok(())
 }
 
 #[cfg(any(target_os = "android", test))]
 fn reject_unimplemented_account_socks5_endpoints(users: &UsersConfig) -> Result<(), String> {
-    use proxy_config::EndpointOverride;
+    use proxy_config::PoolOverride;
 
     for user in users.users.iter().filter(|user| user.is_enabled) {
-        if [&user.pre_socks5, &user.post_socks5]
+        if [&user.pre_proxies, &user.post_proxies]
             .iter()
-            .any(|setting| matches!(setting, Some(EndpointOverride::Endpoint(_))))
+            .any(|setting| matches!(setting, Some(PoolOverride::Pool(_))))
         {
-            return Err("Android SOCKS5 account pre_socks5/post_socks5 endpoints are not supported yet; refusing startup to prevent direct connections".to_owned());
+            return Err("Android account pre_proxies/post_proxies pools are not supported yet; refusing startup to prevent direct connections".to_owned());
         }
     }
     Ok(())

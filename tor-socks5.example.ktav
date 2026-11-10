@@ -51,6 +51,18 @@ auth.users_file:
 ## Destination policy. Onion blocking is enabled by default.
 security.block_onion: true
 
+## Proxy pools for the pre hop (client -> pre proxy -> WebTunnel/Tor) and the
+## post hop (Tor -> post proxy -> target). Each field is an array of endpoints
+## [socks5://|http://]IP:port[|username:password]. A post pool rotates: one site
+## (registrable domain) keeps one member, failures move on to the next member,
+## and a quarantined member is re-checked in the background. A pre pool holds
+## exactly one member for now. A bracketed IPv6 member needs the literal prefix
+## ":: ". See README.md (Pre/post proxy pools).
+## post_proxies: [
+##     socks5://192.0.2.11:1080
+##     http://192.0.2.12:8080|username:password
+## ]
+
 ## Контроль доступа клиентов. security.client_access.allowed_clients защищает
 ## слушатели SOCKS5/HTTP CONNECT, dns_server.client_access.allowed_clients —
 ## слушатели DNS (оба по умолчанию * при отсутствии ключа):

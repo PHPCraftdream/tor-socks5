@@ -316,15 +316,19 @@ async fn refresh_pre(
     tor: &arti_wrapper::TorTunnel,
     endpoint: &arti_wrapper::Socks5PreEndpoint,
 ) -> Result<()> {
-    let configured = proxy_config::resolve_endpoint(cfg.pre_socks5.as_ref(), None).map(|value| {
-        arti_wrapper::Socks5PreEndpoint::new(
-            value.address(),
-            value
-                .credentials()
-                .map(|(user, pass)| (user.to_owned(), pass.to_owned())),
-        )
-        .with_protocol(value.protocol())
-    });
+    let configured = cfg
+        .pre_proxies
+        .as_ref()
+        .and_then(|pool| pool.sole_member())
+        .map(|value| {
+            arti_wrapper::Socks5PreEndpoint::new(
+                value.address(),
+                value
+                    .credentials()
+                    .map(|(user, pass)| (user.to_owned(), pass.to_owned())),
+            )
+            .with_protocol(value.protocol())
+        });
     if configured.as_ref() != Some(endpoint) || active.pre_endpoint.as_ref() != Some(endpoint) {
         anyhow::bail!("изменение pre требует перезапуска");
     }

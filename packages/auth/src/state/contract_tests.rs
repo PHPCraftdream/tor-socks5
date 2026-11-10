@@ -13,8 +13,8 @@ fn user(name: &str, hash: &str) -> User {
         is_enabled: true,
         allowed_onion: false,
         allowed_clients: None,
-        pre_socks5: None,
-        post_socks5: None,
+        pre_proxies: None,
+        post_proxies: None,
     }
 }
 
@@ -213,7 +213,7 @@ fn tofu_invalidates_other_account_proof_and_updates_policy() {
     let mut changed = cfg.clone();
     changed.users[0].allowed_onion = true;
     changed.users[0].allowed_clients = Some("192.0.2.1".parse().unwrap());
-    changed.users[0].pre_socks5 = Some(client_acl::EndpointOverride::Disabled);
+    changed.users[0].pre_proxies = Some(client_acl::PoolOverride::Disabled);
     changed.save(&path).unwrap();
     assert!(state.verify_proof("bob", "pw").is_some());
     let rt = runtime();
@@ -226,8 +226,8 @@ fn tofu_invalidates_other_account_proof_and_updates_policy() {
         .unwrap()
         .allows("192.0.2.1".parse().unwrap()));
     assert_eq!(
-        lease.pre_socks5(),
-        Some(&client_acl::EndpointOverride::Disabled)
+        lease.pre_proxies(),
+        Some(&client_acl::PoolOverride::Disabled)
     );
     drop(lease);
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
