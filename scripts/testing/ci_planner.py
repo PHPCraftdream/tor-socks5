@@ -352,17 +352,30 @@ def manifest_seeds(old, new, graph):
     return seeds
 
 
+DEPENDENCY_RE = re.compile(r"([^\s()]+)(?: ([^\s()]+))?(?: \(([^()]*)\))?")
+
+
 def lock_seeds(old, new, graph):
+    """Packages whose resolved lock entry is new or changed.
+
+    An entry is a package with its dependencies resolved to the packages they
+    name, so a dependency that merely gains or loses a version qualifier is no
+    change. A package leaves the lock only when every consumer stops using it,
+    and then each consumer's entry changes or a successor entry appears. So a
+    package whose resolved environment changed always has a new or changed
+    entry (its own or a consumer's on the way to it), and removals need no
+    mapping: a member is affected exactly when its dependency closure differs.
+    """
     a, b = tomllib.loads(old), tomllib.loads(new)
     if changed_keys({k: v for k, v in a.items() if k != "package"},
                     {k: v for k, v in b.items() if k != "package"}):
         raise MappingError("missing mapping: Cargo.lock")
 
-    def index(data):
+    def resolved(data):
         packages = data.get("package", [])
         if not isinstance(packages, list):
             raise MappingError("missing mapping: Cargo.lock packages")
-        result = {}
+        index = {}
         for package in packages:
             if not isinstance(package, dict):
                 raise MappingError("missing mapping: Cargo.lock package")
@@ -372,16 +385,32 @@ def lock_seeds(old, new, graph):
                     (source is not None and not isinstance(source, str))):
                 raise MappingError("missing mapping: Cargo.lock package identity")
             identity = (name, version, source)
-            if identity in result:
+            if identity in index:
                 raise MappingError("missing mapping: повторная идентичность Cargo.lock")
-            result[identity] = package
-        return result
+            index[identity] = package
+        by_name = {}
+        for identity in index:
+            by_name.setdefault(identity[0], []).append(identity)
+        entries = {}
+        for identity, package in index.items():
+            dependencies = package.get("dependencies", [])
+            if not isinstance(dependencies, list):
+                raise MappingError("missing mapping: зависимости Cargo.lock")
+            targets = []
+            for text in dependencies:
+                match = DEPENDENCY_RE.fullmatch(text) if isinstance(text, str) else None
+                if not match:
+                    raise MappingError("missing mapping: неразрешённая зависимость Cargo.lock: " + str(text))
+                name, version, source = match.groups()
+                found = [target for target in by_name.get(name, ())
+                         if (version is None or target[1] == version) and (source is None or target[2] == source)]
+                if (source is not None and version is None) or len(found) != 1:
+                    raise MappingError("missing mapping: неразрешённая или неоднозначная зависимость Cargo.lock: " + text)
+                targets.append(found[0])
+            entries[identity] = {**package, "dependencies": sorted(targets, key=lambda t: (t[0], t[1], t[2] or ""))}
+        return entries
 
-    ia, ib = index(a), index(b)
-    changed_old = {identity for identity in ia.keys() - ib.keys()}
-    changed_new = {identity for identity in ib.keys() - ia.keys()}
-    changed_old |= {identity for identity in ia.keys() & ib.keys() if ia[identity] != ib[identity]}
-    changed_new |= {identity for identity in ia.keys() & ib.keys() if ia[identity] != ib[identity]}
+    ia, ib = resolved(a), resolved(b)
 
     def graph_node(identity):
         matches = {package_id for package_id, package in graph.packages.items()
@@ -390,77 +419,7 @@ def lock_seeds(old, new, graph):
             raise MappingError("missing mapping: пакет lock отсутствует в текущем графе (возможно удалён или неоднозначен)")
         return next(iter(matches))
 
-    seeds = {graph_node(identity) for identity in changed_new}
-    if changed_old:
-        def identity_key(identity):
-            return identity[0], identity[1], identity[2] or ""
-
-        def dependency_identity(text):
-            match = re.fullmatch(r"([^\s()]+)(?: ([^\s()]+))?(?: \(([^()]*)\))?", text)
-            if not match:
-                raise MappingError("missing mapping: неразрешённая зависимость Cargo.lock: " + str(text))
-            name, version, source = match.groups()
-            if source is not None and version is None:
-                raise MappingError("missing mapping: неоднозначная зависимость Cargo.lock: " + text)
-            matches = {identity for identity in ia
-                       if identity[0] == name and (version is None or identity[1] == version) and
-                       (source is None or identity[2] == source)}
-            if len(matches) != 1:
-                raise MappingError("missing mapping: неразрешённая или неоднозначная зависимость Cargo.lock: " + text)
-            return next(iter(matches))
-
-        def base_consumers(identity):
-            result = set()
-            for parent, package in ia.items():
-                dependencies = package.get("dependencies", [])
-                if not isinstance(dependencies, list):
-                    raise MappingError("missing mapping: зависимости Cargo.lock")
-                for dependency in dependencies:
-                    if not isinstance(dependency, str):
-                        raise MappingError("missing mapping: зависимость Cargo.lock")
-                    if dependency.split(" ", 1)[0] == identity[0] and dependency_identity(dependency) == identity:
-                        result.add(parent)
-            return result
-
-        def replacement(identity):
-            if identity in ib:
-                return identity
-            matches = {candidate for candidate in ib
-                       if candidate[0] == identity[0] and candidate[2] == identity[2]}
-            if len(matches) > 1:
-                # Versions that were already in the old lock cannot replace a removed one.
-                matches = {candidate for candidate in matches if candidate not in ia}
-                # Nothing new left: the version was only removed, its consumers carry the change.
-                if len(matches) > 1:
-                    raise MappingError("missing mapping: неоднозначная замена пакета Cargo.lock: " + identity[0])
-            return next(iter(matches)) if matches else None
-
-        def lift(identity, active):
-            if identity in active:
-                raise MappingError("missing mapping: цикл зависимостей Cargo.lock")
-            successor = replacement(identity)
-            if successor is not None:
-                return {graph_node(successor)}
-            parents = base_consumers(identity)
-            if not parents:
-                raise MappingError("missing mapping: пакет lock отсутствует в текущем графе (возможно удалён)")
-            result = set()
-            active.add(identity)
-            for parent in sorted(parents, key=identity_key):
-                parent_to_current = replacement(parent)
-                if parent_to_current is not None:
-                    result.add(graph_node(parent_to_current))
-                else:
-                    result.update(lift(parent, active))
-            active.remove(identity)
-            if not result:
-                raise MappingError("missing mapping: пакет lock отсутствует в текущем графе (возможно удалён)")
-            return result
-
-        for identity in sorted(changed_old, key=identity_key):
-            if identity not in ib:
-                seeds.update(lift(identity, set()))
-    return seeds
+    return {graph_node(identity) for identity, entry in ib.items() if ia.get(identity) != entry}
 
 
 def check_removed_dependencies(old, new):
