@@ -517,6 +517,8 @@ jobs:
         run: cargo fetch --locked
       - name: Check dependency licenses
         run: cargo deny --locked --config .github/deny.toml check licenses
+      - name: Check dependency advisories
+        run: cargo deny --locked --config .github/deny.toml check advisories
 
   license-lifecycle:
     needs: plan

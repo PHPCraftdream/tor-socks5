@@ -13,6 +13,17 @@ and CDLA-Permissive-2.0, at a confidence threshold of 0.93. The exact
 `priority-queue` 2.7.0 MPL-2.0 exception is also configured. These are
 metadata-policy atoms, not blanket package or GPL/LGPL permissions.
 
+The same job checks the RustSec advisory database against `Cargo.lock`:
+
+```sh
+cargo deny --locked --config .github/deny.toml check advisories
+```
+
+It runs when the lockfile, a manifest or the policy changes, so a new advisory
+fails the next dependency change rather than unrelated pull requests. Each
+`[advisories].ignore` entry in `deny.toml` carries its reason; remove an entry
+as soon as the cause it names is gone.
+
 This routine CI check is not legal review or release clearance. For distribution,
 preserve applicable license and copyright notices, and meet applicable source-
 access obligations, including for MPL-covered material. Review the CDLA
