@@ -38,8 +38,8 @@ tor-socks5/
 The torrc `Bridge` line grammar is parsed by the external
 `ptrs-gesher-bridge-line` crate — there is no local `bridge-line`
 package, and `ptrs-gesher` is **not** vendored. The workspace consumes
-`ptrs-gesher-bridge-line` and `ptrs-gesher-lyrebird` 0.9 through the root
-`Cargo.toml` workspace dependencies. The five `ptrs-gesher-*` 0.9.0 crates,
+`ptrs-gesher-bridge-line` and `ptrs-gesher-lyrebird` 0.10 through the root
+`Cargo.toml` workspace dependencies. The five `ptrs-gesher-*` 0.10.0 crates,
 `ktav` 0.8.1 and `resocks5-net` 0.5.2 all resolve from the registry
 (crates.io); see the root README's build instructions.
 
@@ -279,7 +279,7 @@ procedure live in `vendor/README.md`. In short:
   bandwidth floor, and more — see `vendor/README.md`).
 
 The obfs4 + webtunnel PT client is **not** vendored. It comes from the
-`ptrs-gesher-lyrebird` 0.9 workspace dependency declared in the root
+`ptrs-gesher-lyrebird` 0.10 workspace dependency declared in the root
 `Cargo.toml`.
 
 ## Pluggable-transport dispatch (busybox)
