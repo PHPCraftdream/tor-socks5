@@ -116,7 +116,7 @@ class Routing(unittest.TestCase):
         self.assertEqual(self.route("docs/project/licensing.md")["segments"], ["fast"])
         self.assertEqual(self.route("docs/project/license-policy.md")["segments"], ["fast"])
         self.assertEqual(self.route("vendor/README.md")["segments"], ["fast"])
-        self.assertEqual(self.route("vendor/PROVENANCE.md")["segments"], ["fast"])
+        self.assertEqual(self.route("vendor/PROVENANCE.md")["segments"], ["fast", "vendor-notices"])
         with self.assertRaises(p.MappingError):
             self.route("vendor/unknown-control.txt")
         with self.assertRaisesRegex(p.MappingError, "missing mapping: путь: deny.toml"):
@@ -146,6 +146,10 @@ class Routing(unittest.TestCase):
     def test_graph_vendor_sdk(self):
         result = self.route("vendor/tor-dirclient/src/lib.rs")
         self.assertIn("vendor", result["segments"])
+        self.assertIn("vendor-notices", result["segments"])
+        self.assertNotIn("license-audit", result["segments"])
+        for path in (".github/license/check_vendor_notices.py", ".github/license/test_check_vendor_notices.py"):
+            self.assertEqual(self.route(path)["segments"], ["fast", "vendor-notices"])
         self.assertIn("bridge-probe", result["packages"])
         self.assertEqual(self.route(".github/actions/setup-local-sdk/action.yml")["packages"], ["socks5-proxy"])
 
@@ -454,7 +458,7 @@ class Routing(unittest.TestCase):
                                     capabilities={"license_policy": True})["segments"], ["fast", "license-audit"])
         self.assertNotIn("license-audit", self.route("Cargo.lock", blobs={"Cargo.lock": ("version=4", "version=4")})["segments"])
         self.assertEqual(self.route("vendor/README.md", capabilities={"license_policy": True})["segments"], ["fast"])
-        self.assertEqual(self.route("vendor/PROVENANCE.md", capabilities={"license_policy": True})["segments"], ["fast"])
+        self.assertEqual(self.route("vendor/PROVENANCE.md", capabilities={"license_policy": True})["segments"], ["fast", "vendor-notices"])
         with self.assertRaisesRegex(p.MappingError, "missing mapping"):
             self.route("vendor/NOTICE", capabilities={"license_policy": True})
         full_without_license = self.route(mode="sprint-full", capabilities={"license_policy": False,
@@ -516,7 +520,7 @@ class Routing(unittest.TestCase):
     def test_ci_workflow_consumers(self):
         workflow = Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml"
         blocks = p.workflow_blocks(workflow.read_text(encoding="utf-8"))
-        for job in ("rust", "msrv", "android", "docs-contract", "native-portability", "vendor-extra", "features", "stress", "license-offline", "license-audit", "real-tor-channel", "installer-sh", "installer-windows", "release-scripts"):
+        for job in ("rust", "msrv", "android", "docs-contract", "native-portability", "vendor-extra", "features", "stress", "license-offline", "license-audit", "vendor-notices", "real-tor-channel", "installer-sh", "installer-windows", "release-scripts"):
             self.assertIn(job, blocks)
             self.assertIn("contains(fromJSON(needs.plan.outputs.plan).segments", blocks[job])
             self.assertIn(job, blocks["required"])
@@ -746,7 +750,7 @@ jobs:
         with self.assertRaisesRegex(p.MappingError, 'missing mapping: путь: deny.toml'):
             self.route('deny.toml')
         self.assertEqual(self.route('vendor/README.md', capabilities=caps)['segments'], ['fast'])
-        self.assertEqual(self.route('vendor/PROVENANCE.md', capabilities=caps)['segments'], ['fast'])
+        self.assertEqual(self.route('vendor/PROVENANCE.md', capabilities=caps)['segments'], ['fast', 'vendor-notices'])
         with self.assertRaisesRegex(p.MappingError, 'missing mapping'):
             self.route('vendor/NOTICE', capabilities=caps)
         for path in (".github/deny.toml", ".github/license/README.md"):

@@ -184,6 +184,19 @@ manifests; no runtime tokens or manifest values were changed. These additions
 document notices but do not establish that every relevant change or file has
 been noticed or otherwise determine §4(b) compliance.
 
+Since 2026-11-11 CI checks part of this mechanically for the baseline in the
+table above (`.github/license/check_vendor_notices.py`, in the
+`vendor-notices` job): each archive's SHA-256 must match its row; every copyright, license,
+holder and author line of the pristine package (they sit in the manifests and
+READMEs; the sources carry no per-file headers) must still be present,
+unchanged, in the vendored file; every vendored file that differs from the
+archive or is new must carry a change notice (`tor-socks5 local patch` or a
+pointer to this record), except `LICENSE-MIT`, `LICENSE-APACHE` and Cargo's
+`.cargo-ok`; and the two license files must have the blob ids recorded above.
+The check does not decide which notices apply or whether a notice is
+complete, it covers only the archive files, and a rebase to a new Arti line
+must update the baseline table first.
+
 The retrieval worker reported HTTP 403 for the pinned upstream GitLab raw paths
 `/-/raw/ce8bc6e0998bd5a4efdf06dd62dce53c98ea1087/LICENSE-MIT` and
 `/-/raw/ce8bc6e0998bd5a4efdf06dd62dce53c98ea1087/LICENSE-APACHE`; that official
