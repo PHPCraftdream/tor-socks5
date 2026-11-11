@@ -3,3 +3,7 @@
 *.sh text eol=lf
 .githooks/* text eol=lf
 *.yml text eol=lf
+
+# Vendored Arti license texts are delivered byte for byte (blob ids are in vendor/PROVENANCE.md).
+vendor/*/LICENSE-MIT -text
+vendor/*/LICENSE-APACHE -text
