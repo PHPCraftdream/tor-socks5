@@ -40,7 +40,7 @@ The torrc `Bridge` line grammar is parsed by the external
 package, and `ptrs-gesher` is **not** vendored. The workspace consumes
 `ptrs-gesher-bridge-line` and `ptrs-gesher-lyrebird` 0.9 through the root
 `Cargo.toml` workspace dependencies. The five `ptrs-gesher-*` 0.9.0 crates,
-`ktav` 0.8.1 and `resocks5-net` 0.5.1 all resolve from the registry
+`ktav` 0.8.1 and `resocks5-net` 0.5.2 all resolve from the registry
 (crates.io); see the root README's build instructions.
 
 ## Crates and their responsibilities
