@@ -82,7 +82,7 @@ criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 proptest = "1"
 rusqlite = { version = "0.39", features = ["backup"] }
 # Host-owned verification uses the cleartext-only policy added in SDK 0.5.1.
-resocks5-net = { version = "0.5.1", default-features = false }
+resocks5-net = { version = "0.5.2", default-features = false }
 
 [profile.release]
 lto = "thin"
