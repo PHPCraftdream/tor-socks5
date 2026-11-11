@@ -3,11 +3,9 @@
 
 use std::sync::Arc;
 
-use arti_wrapper::{RoutedStream, Socks5PreEndpoint, TorTunnel};
+use arti_wrapper::{PostPools, RoutedStream, Socks5PreEndpoint, TorTunnel};
 use auth::UsersConfig;
 use proxy_config::{PoolOverride, ProxyPool, Socks5Endpoint};
-
-use crate::post_pool::PostPools;
 
 /// Отклонить пул прокси там, где он не поддерживается, до запуска сети.
 pub(crate) fn reject_unsupported_pool(

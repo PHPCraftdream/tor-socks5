@@ -12,6 +12,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use super::bridges::{accept_with_deadline, handle_connection_with_egress, EgressConnector};
 use auth::{AuthState, User, UsersConfig};
+use proxy_config::{PoolOverride, ProxyPool, Socks5Endpoint};
 use resocks5_net::connect::HostPort;
 
 /// Синтетический peer для duplex-тестов (реальный адрес приходит из accept_loop).
@@ -29,6 +30,7 @@ impl EgressConnector for GatedLoopbackConnector {
     async fn open_egress(
         self,
         target: HostPort<'_>,
+        _account_post: Option<&PoolOverride>,
     ) -> anyhow::Result<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>
     {
         assert_eq!(target.host, "127.0.0.1");
@@ -48,6 +50,7 @@ impl EgressConnector for FailingConnector {
     async fn open_egress(
         self,
         target: HostPort<'_>,
+        _account_post: Option<&PoolOverride>,
     ) -> anyhow::Result<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>
     {
         self.dialed.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -70,6 +73,7 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> E
     async fn open_egress(
         self,
         target: HostPort<'_>,
+        _account_post: Option<&PoolOverride>,
     ) -> anyhow::Result<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>
     {
         assert_eq!((target.host, target.port), ("example.com", 443));
@@ -635,4 +639,82 @@ async fn jni_partial_reply_and_pipeline_errors_are_terminal() {
             }
         );
     }
+}
+
+/// Records the account's post setting the handler passes to egress, then fails the dial.
+struct PostRecordingConnector {
+    seen: Arc<std::sync::Mutex<Option<Option<PoolOverride>>>>,
+}
+
+impl EgressConnector for PostRecordingConnector {
+    async fn open_egress(
+        self,
+        _target: HostPort<'_>,
+        account_post: Option<&PoolOverride>,
+    ) -> anyhow::Result<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>
+    {
+        *self.seen.lock().unwrap() = Some(account_post.cloned());
+        Err::<TcpStream, _>(anyhow::anyhow!("recorded"))
+    }
+}
+
+fn post_pool() -> ProxyPool {
+    "192.0.2.1:1080".parse::<Socks5Endpoint>().unwrap().into()
+}
+
+fn state_with_post(post: Option<PoolOverride>) -> Arc<AuthState> {
+    let user = User {
+        name: "alice".into(),
+        hash: auth::compute_hash("hunter2").unwrap(),
+        is_enabled: true,
+        allowed_onion: false,
+        allowed_clients: None,
+        pre_proxies: None,
+        post_proxies: post,
+    };
+    Arc::new(AuthState::build(&UsersConfig { users: vec![user] }).unwrap())
+}
+
+#[tokio::test]
+async fn the_admitted_accounts_post_setting_reaches_egress() {
+    let request = "CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic YWxpY2U6aHVudGVyMg==\r\n\r\n";
+    for account in [
+        None,
+        Some(PoolOverride::Disabled),
+        Some(PoolOverride::Pool(post_pool())),
+    ] {
+        let (server, mut client) = tokio::io::duplex(2048);
+        client.write_all(request.as_bytes()).await.unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let result = handle_connection_with_egress(
+            server,
+            loopback_peer(),
+            Some(state_with_post(account.clone())),
+            false,
+            PostRecordingConnector { seen: seen.clone() },
+        )
+        .await;
+        assert!(result.is_err(), "the recording connector fails the dial");
+        assert_eq!(*seen.lock().unwrap(), Some(account));
+    }
+}
+
+#[tokio::test]
+async fn without_auth_no_account_setting_reaches_egress() {
+    let (server, mut client) = tokio::io::duplex(2048);
+    client
+        .write_all(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n")
+        .await
+        .unwrap();
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let result = handle_connection_with_egress(
+        server,
+        loopback_peer(),
+        None,
+        false,
+        PostRecordingConnector { seen: seen.clone() },
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(*seen.lock().unwrap(), Some(None));
 }

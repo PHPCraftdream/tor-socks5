@@ -101,6 +101,7 @@ dependencies = [
  "resocks5-net",
  "rusqlite",
  "rustls",
+ "tempfile",
  "time",
  "tokio",
  "tokio-util",
@@ -307,7 +308,9 @@ dependencies = [
  "tor-guardmgr",
  "tor-linkspec",
  "tor-rtcompat",
+ "tor-socks5-client-acl",
  "tor-socks5-proto",
+ "tor-socks5-route-pool",
  "tracing",
  "url",
 ]

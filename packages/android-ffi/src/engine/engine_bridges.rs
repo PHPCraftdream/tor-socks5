@@ -667,24 +667,14 @@ pub(super) async fn handle_connection<C: EgressConnector + Clone>(
 
 /// Private static-dispatch seam: RPITIT + Send, without a boxed connection future.
 pub(super) trait EgressConnector: Send {
+    /// `account_post` is the admitted account's post pool setting; `None` means it inherits.
     fn open_egress(
         self,
         target: HostPort<'_>,
+        account_post: Option<&PoolOverride>,
     ) -> impl std::future::Future<
         Output = Result<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>,
     > + Send;
-}
-
-impl EgressConnector for TorTunnel {
-    async fn open_egress(
-        self,
-        target: HostPort<'_>,
-    ) -> Result<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> {
-        TorTunnel::connect(&self, target.host, target.port)
-            .await
-            .map(|stream| stream.compat())
-            .context("Tor connect failed")
-    }
 }
 
 /// cancel-safe: NO — framing, replies, pipeline write_all and relay may be partial.
@@ -702,14 +692,39 @@ where
 {
     use tokio::io::AsyncWriteExt;
 
-    // Типизированный auth остаётся для ACL-гейта; в handshake уходит отдельная
-    // trait-object копия (PasswordVerifier), чтобы не перемещать Arc<AuthState>.
-    let proto_auth = auth
-        .clone()
-        .map(|state| Arc::new(AuthStateVerifier(state)) as Arc<dyn socks5_proto::PasswordVerifier>);
-    let mut req = accept_with_deadline(&mut client, proto_auth)
+    // Handshake, then admission: the account's ACL and route come from one
+    // admitted snapshot that is held until the connection is established.
+    let proto_auth = auth.clone().map(|state| Arc::new(AuthStateVerifier(state)));
+    let deadline = tokio::time::Instant::now() + HANDSHAKE_DEADLINE;
+    let (mut req, proof) = socks5_proto::accept_verified(&mut client, deadline, proto_auth)
         .await
-        .context("client handshake")?;
+        .map_err(|error| match error {
+            socks5_proto::VerifiedError::Handshake(error) => anyhow::Error::new(error),
+            other => anyhow::Error::new(other),
+        })
+        .context("client handshake")?
+        .into_parts();
+    let lease = match (auth.as_deref(), proof.as_ref()) {
+        (Some(state), Some(proof)) => {
+            match tokio::time::timeout_at(deadline, state.admit(proof))
+                .await
+                .map_err(|_| anyhow::Error::new(ServerError::Deadline))
+                .context("client handshake")?
+            {
+                Some(lease) => Some(lease),
+                None => {
+                    req.reply(&mut client, Reply::Forbidden).await.ok();
+                    return Ok(());
+                }
+            }
+        }
+        (None, None) => None,
+        // Auth without a proof or a proof without auth: fail closed.
+        _ => {
+            req.reply(&mut client, Reply::Forbidden).await.ok();
+            return Ok(());
+        }
+    };
     let target = HostPort::parse(req.target()).context("invalid SDK target authority")?;
     if !onion_destination_allowed(target.host, block_onion) {
         info!(host = ?target.host, port = target.port, "rejecting onion destination by local policy");
@@ -719,14 +734,11 @@ where
         return Ok(());
     }
 
-    // Per-user client ACL: после успешного handshake личность уже проверена —
-    // имя только из верифицированного запроса, peer — реальный адрес сокета.
-    // Auth выключен — не применяется; активирован, но имени/peer нет —
-    // fail-closed. Отказ до любого egress, без relay-задач.
-    let user_allowed = match (auth.as_deref(), req.username()) {
-        (Some(state), Some(name)) => state.client_allowed(name, peer),
-        (Some(_), None) => false,
-        (None, _) => true,
+    // Per-user client ACL from the admitted snapshot; peer is the real socket
+    // address. Auth off: no lease, no restriction. Denied before any egress.
+    let user_allowed = match lease.as_ref().and_then(|lease| lease.allowed_clients()) {
+        Some(acl) => acl.allows(peer),
+        None => true,
     };
     if !user_allowed {
         info!(%peer, "rejecting connection by user allowed_clients policy");
@@ -736,7 +748,10 @@ where
         return Ok(());
     }
 
-    let mut upstream = match connect.open_egress(target).await {
+    let account_post = lease.as_ref().and_then(|lease| lease.post_proxies());
+    let opened = connect.open_egress(target, account_post).await;
+    drop(lease);
+    let mut upstream = match opened {
         Ok(stream) => stream,
         Err(error) => {
             req.reply(&mut client, Reply::GeneralFailure)
@@ -761,6 +776,7 @@ where
 
 /// One absolute deadline covers detection, authentication and request framing.
 /// cancel-safe: NO — SDK partial I/O is terminal; caller must discard the stream.
+#[cfg(test)]
 pub(super) async fn accept_with_deadline<S>(
     stream: &mut S,
     auth: Option<Arc<dyn socks5_proto::PasswordVerifier>>,
@@ -929,9 +945,9 @@ pub(crate) fn take_auto_fetched_bridges() -> Vec<BridgeLine> {
 }
 
 #[cfg(test)]
-#[path = "engine_deadline_tests.rs"]
+#[path = "tests/engine_deadline_tests.rs"]
 mod tests;
 
 #[cfg(test)]
-#[path = "engine_acl_tests.rs"]
+#[path = "tests/engine_acl_tests.rs"]
 mod acl_tests;

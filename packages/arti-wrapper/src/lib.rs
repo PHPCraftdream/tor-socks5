@@ -739,6 +739,8 @@ fn fatal_protocol_error_hook(error: &arti_client::Error) {
 #[path = "proxy/blame.rs"]
 mod blame;
 mod post_endpoint;
+#[path = "proxy/post_pool.rs"]
+mod post_pool;
 #[path = "proxy/probe.rs"]
 mod post_probe;
 mod pre_endpoint;
@@ -747,6 +749,7 @@ mod routed_stream;
 mod validate;
 pub use blame::{is_pre_path_failure, PostBlame, PostFailure};
 pub use post_endpoint::{connect_post_proxy, connect_post_proxy_blamed, connect_post_socks};
+pub use post_pool::{spawn_post_prober, PostPools};
 pub use post_probe::{probe_post_proxy, probe_proxy_direct, ProxyProbe};
 pub use pre_endpoint::Socks5PreEndpoint;
 pub use routed_stream::RoutedStream;

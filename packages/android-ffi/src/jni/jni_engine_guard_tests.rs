@@ -25,11 +25,11 @@ fn user(enabled: bool, pre: Option<PoolOverride>) -> User {
 }
 
 #[test]
-fn global_pool_is_rejected_but_absence_is_allowed() {
+fn global_pre_is_rejected_but_post_and_absence_are_allowed() {
     let mut config = Config::default();
     assert!(reject_unimplemented_global_socks5_endpoints(&config).is_ok());
     config.post_proxies = Some(pool());
-    assert!(reject_unimplemented_global_socks5_endpoints(&config).is_err());
+    assert!(reject_unimplemented_global_socks5_endpoints(&config).is_ok());
     config.post_proxies = None;
     assert!(reject_unimplemented_global_socks5_endpoints(&config).is_ok());
     config.pre_proxies = Some(pool());
@@ -37,7 +37,7 @@ fn global_pool_is_rejected_but_absence_is_allowed() {
 }
 
 #[test]
-fn enabled_account_endpoint_is_rejected_but_disabled_account_is_ignored() {
+fn enabled_account_pre_is_rejected_but_post_and_disabled_accounts_are_allowed() {
     let users = UsersConfig {
         users: vec![user(true, Some(endpoint()))],
     };
@@ -47,7 +47,7 @@ fn enabled_account_endpoint_is_rejected_but_disabled_account_is_ignored() {
     let users = UsersConfig {
         users: vec![post_only],
     };
-    assert!(reject_unimplemented_account_socks5_endpoints(&users).is_err());
+    assert!(reject_unimplemented_account_socks5_endpoints(&users).is_ok());
     let users = UsersConfig {
         users: vec![user(false, Some(endpoint()))],
     };

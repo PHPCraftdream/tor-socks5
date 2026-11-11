@@ -2,8 +2,8 @@ use super::*;
 
 #[cfg(any(target_os = "android", test))]
 fn reject_unimplemented_global_socks5_endpoints(config: &Config) -> Result<(), String> {
-    if config.pre_proxies.is_some() || config.post_proxies.is_some() {
-        return Err("Android global pre_proxies/post_proxies pools are not supported yet; refusing startup to prevent direct connections".to_owned());
+    if config.pre_proxies.is_some() {
+        return Err("Android global pre_proxies are not supported yet; refusing startup to prevent direct connections".to_owned());
     }
     Ok(())
 }
@@ -13,11 +13,8 @@ fn reject_unimplemented_account_socks5_endpoints(users: &UsersConfig) -> Result<
     use proxy_config::PoolOverride;
 
     for user in users.users.iter().filter(|user| user.is_enabled) {
-        if [&user.pre_proxies, &user.post_proxies]
-            .iter()
-            .any(|setting| matches!(setting, Some(PoolOverride::Pool(_))))
-        {
-            return Err("Android account pre_proxies/post_proxies pools are not supported yet; refusing startup to prevent direct connections".to_owned());
+        if matches!(user.pre_proxies, Some(PoolOverride::Pool(_))) {
+            return Err("Android account pre_proxies are not supported yet; refusing startup to prevent direct connections".to_owned());
         }
     }
     Ok(())
@@ -326,6 +323,9 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
         // overridden via `cfg.auth.users_file`. Either way the decision
         // is logged — this proxy must never silently fall back to
         // anonymous access.
+        // Whether any enabled account brings its own post pool: decides if the
+        // pools' rotation state and its background prober are needed at all.
+        let mut accounts_use_post = false;
         let auth_state: Option<Arc<AuthState>> = if !cfg.auth.enabled {
             info!("auth: disabled via config (auth.enabled: false) — SOCKS5 will accept anonymous clients");
             None
@@ -347,6 +347,11 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
                 let _ = env.throw_new("java/lang/IllegalStateException", &message);
                 return Err(anyhow::anyhow!(message));
             }
+            accounts_use_post = users
+                .users
+                .iter()
+                .filter(|user| user.is_enabled)
+                .any(|user| matches!(user.post_proxies, Some(proxy_config::PoolOverride::Pool(_))));
             if users.users.is_empty() {
                 let msg = format!(
                     "auth is enabled but the users registry is empty: {}",
@@ -370,6 +375,14 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
                 );
                 Some(Arc::new(state))
             }
+        };
+
+        // 7b. Post proxy pools: the global one (accounts may override it) and the
+        // rotation state, created only when some connection can use a pool.
+        let post = engine::PostRouting {
+            global: cfg.post_proxies.clone().map(Arc::new),
+            pools: (cfg.post_proxies.is_some() || accounts_use_post)
+                .then(|| Arc::new(arti_wrapper::PostPools::new())),
         };
 
         // 8. Build Settings
@@ -429,6 +442,7 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
                         auth_state,
                         block_onion,
                         allowed_clients,
+                        post,
                     },
                     stop_rx,
                     done_tx,
