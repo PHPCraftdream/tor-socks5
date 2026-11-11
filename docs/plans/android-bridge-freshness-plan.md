@@ -1,8 +1,28 @@
 # Plan: keep the Android engine's bridge list — and arti's guard sample — fresh automatically
 
-Status: **planned, not implemented**. Companion to `docs/guide/bridges.md` (the CLI angel's already-shipping
+Status: **implemented on the Rust/JNI side** (Phase 1 and Phase 2); the Kotlin side is not in this
+repository and is not verified here. Companion to `docs/guide/bridges.md` (the CLI angel's already-shipping
 bridge lifecycle) and `docs/checkpoints/obfs4-connect-investigation.md` (orbot-rs repo — the livelock
-investigation that surfaced this gap).
+investigation that surfaced this gap). The sections below are the design record, written before the
+implementation; the "Problem" section describes the gap as it was.
+
+## Implementation status (checked against the code, 2026-11-11)
+
+- **Phase 1, pruning.** `persist_and_rank_probe` (`packages/android-ffi/src/engine/engine_bridges.rs`) keeps the
+  result of `BridgeStore::note_probe_round` and hands the pruned bridges to `record_pruned_bridges`; the JNI call
+  `nativeTakePrunedBridges` (`src/jni/jni_engine.rs`) drains them through `take_pruned_bridges`. The handoff
+  channel is the process-wide `PRUNED_BRIDGES`, option (a) of the plan.
+- **Phase 2, auto-fetch.** `stall_watchdog` (`src/engine/engine_bootstrap.rs`) re-probes the configured bridges
+  periodically; when the alive count is below `min_alive` and `auto_fetch` is on with sources configured, it fetches
+  over the already-live tunnel, skipping sources judged barren by the bridge store, deduplicates, and hands the new
+  bridges to `record_auto_fetched_bridges`; the JNI call `nativeTakeAutoFetchedBridges` drains them.
+- **Not in this repository.** Draining both queues, updating `Prefs.bridgesList`, the prune floor (the doc comment
+  of `nativeTakePrunedBridges` assigns it to Kotlin) and the connect-screen journal live in the Kotlin app
+  (orbot-rs). Whether they consume the queues is not checked from here.
+- **Still the plan's stated limit.** Auto-fetch needs a live circuit, so it does not help a first cold bootstrap
+  with a pool that is already too thin.
+- **Verification.** The pruning logic is covered by `bridge-store` tests; the live-device checks of the
+  "Verification plan" below have not been run from this repository.
 
 ## Problem
 
