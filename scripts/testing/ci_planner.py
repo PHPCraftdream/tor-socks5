@@ -242,6 +242,8 @@ JOB_SEGMENTS = {
     "portability-diagnostics": "native-portability",
     "license-offline": "license-offline", "license-audit": "license-audit", "license-producer": "fast", "stress": "stress",
     "vendor-notices": "vendor-notices",
+    # Удалённое задание: пока оно есть в базе PR, его удаление должно иметь отображение.
+    "license-lifecycle": "fast",
 }
 
 
@@ -517,8 +519,6 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
     def add(segment, reason):
         if segment == "tor" and not real_tor:
             return
-        if segment == "license-lifecycle":
-            return
         segments.add(segment)
         reasons.setdefault(segment, set()).add(reason)
     def seed(ids, path):
@@ -785,8 +785,6 @@ def validate_results(plan, needs):
         raise MappingError("missing mapping: license policy capability")
     if any(s in segments for s in ("license-offline", "license-audit")) and not capabilities["license_policy"]:
         raise MappingError("missing mapping: license policy segment without installed capability")
-    if "license-lifecycle" in segments:
-        raise MappingError("missing mapping: legacy license lifecycle is disabled")
     if "tor" in segments and not capabilities["real_tor_channel"]:
         raise MappingError("missing mapping: real Tor selected without capability")
     unsupported = set(segments) - {s for values in RESULT_JOBS.values() for s in values} - {"required"}
