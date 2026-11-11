@@ -1,0 +1,51 @@
+[package]
+name = "tor-socks5"
+# Not published to crates.io: the vendored Arti forks cannot travel with a
+# crates.io package, so consumers take this crate by git tag and pull the
+# forks with the patch-kit (README.md).
+publish = false
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+description = "One dependency for the tor-socks5 libraries: a thin facade over the workspace crates, picked by feature."
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[features]
+# Tor-free by default: `tor` links Arti, which needs the patch-kit.
+default = ["socks5", "auth", "config", "bridges"]
+socks5 = ["dep:tor-socks5-proto"]
+acl = ["dep:tor-socks5-client-acl"]
+route = ["acl", "dep:tor-socks5-route-pool"]
+auth = ["acl", "dep:tor-socks5-auth"]
+config = ["acl", "bridges", "dep:tor-socks5-config"]
+bridges = ["dep:bridge-probe", "dep:bridge-store", "dep:bridge-verify-core"]
+tor = ["socks5", "acl", "dep:arti-wrapper"]
+fetch = ["tor", "bridges", "dep:bridge-fetcher"]
+dns = ["tor", "acl", "dep:tor-socks5-dns"]
+# Server-side onion services (the CLI enables the same feature).
+onion-service = ["tor", "arti-wrapper/onion-service"]
+full = ["socks5", "auth", "config", "bridges", "route", "tor", "fetch", "dns", "onion-service"]
+
+[dependencies]
+persist-lock = { path = "../../packages/persist-lock", version = "0.2.0" }
+tor-socks5-proto = { path = "../../packages/socks5-proto", version = "0.2.0", optional = true }
+tor-socks5-client-acl = { path = "../../packages/proxy-config/client-acl", version = "0.2.0", optional = true }
+tor-socks5-route-pool = { path = "../../packages/proxy-config/route-pool", version = "0.2.0", optional = true }
+tor-socks5-auth = { path = "../../packages/auth", version = "0.2.0", optional = true }
+tor-socks5-config = { path = "../../packages/proxy-config", version = "0.2.0", optional = true }
+bridge-probe = { path = "../../packages/bridge-probe", version = "0.2.0", optional = true }
+bridge-store = { path = "../../packages/bridge-store", version = "0.2.0", optional = true }
+bridge-verify-core = { path = "../../packages/bridge-verify-core", version = "0.2.0", optional = true }
+arti-wrapper = { path = "../../packages/arti-wrapper", version = "0.2.0", optional = true }
+bridge-fetcher = { path = "../../packages/bridge-fetcher", version = "0.2.0", optional = true }
+tor-socks5-dns = { path = "../../packages/dns-server", version = "0.2.0", optional = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
