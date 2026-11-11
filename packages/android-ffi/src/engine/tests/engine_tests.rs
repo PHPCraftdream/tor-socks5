@@ -677,10 +677,7 @@ fn state_with_post(post: Option<PoolOverride>) -> Arc<AuthState> {
 
 #[tokio::test]
 async fn the_admitted_accounts_post_setting_reaches_egress() {
-    let request = "CONNECT example.com:443 HTTP/1.1
-Proxy-Authorization: Basic YWxpY2U6aHVudGVyMg==
-
-";
+    let request = "CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic YWxpY2U6aHVudGVyMg==\r\n\r\n";
     for account in [
         None,
         Some(PoolOverride::Disabled),
@@ -706,11 +703,7 @@ Proxy-Authorization: Basic YWxpY2U6aHVudGVyMg==
 async fn without_auth_no_account_setting_reaches_egress() {
     let (server, mut client) = tokio::io::duplex(2048);
     client
-        .write_all(
-            b"CONNECT example.com:443 HTTP/1.1
-
-",
-        )
+        .write_all(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n")
         .await
         .unwrap();
     let seen = Arc::new(std::sync::Mutex::new(None));
