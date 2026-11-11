@@ -13,7 +13,24 @@ and CDLA-Permissive-2.0, at a confidence threshold of 0.93. The exact
 `priority-queue` 2.7.0 MPL-2.0 exception is also configured. These are
 metadata-policy atoms, not blanket package or GPL/LGPL permissions.
 
-The same job checks the RustSec advisory database against `Cargo.lock`:
+A separate `vendor-notices` job (selected by changes under `vendor/`, to
+`vendor/PROVENANCE.md` and to the script itself) checks the vendored Arti crates
+against their pristine crates.io archives with `check_vendor_notices.py` (the
+baseline and the license-file blob ids come from the tables in
+[`vendor/PROVENANCE.md`](../../vendor/PROVENANCE.md)):
+
+```sh
+python3 .github/license/check_vendor_notices.py --repo-root .
+```
+
+It verifies each archive checksum, that no copyright, license, holder or author
+line of the pristine packages was removed or changed, that every modified or
+added vendored file carries a change notice, and that `LICENSE-MIT` and
+`LICENSE-APACHE` are Arti's files. It downloads the archives, so it needs
+network access; its unit tests (`test_check_vendor_notices.py`) run offline in
+the same job. It does not decide which notices apply and is not legal review.
+
+The `license-audit` job checks the RustSec advisory database against `Cargo.lock`:
 
 ```sh
 cargo deny --locked --config .github/deny.toml check advisories
