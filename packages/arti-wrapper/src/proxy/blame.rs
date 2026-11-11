@@ -199,4 +199,28 @@ mod tests {
             PostBlame::NotProxy
         );
     }
+
+    #[tokio::test]
+    async fn a_client_that_bootstraps_only_on_request_refuses_streams_at_once() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let settings = crate::Settings {
+            state_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let tunnel = crate::TorTunnel::create_manual_with(settings).unwrap();
+        let attempt = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tunnel.connect("example.com", 443),
+        );
+        let error = attempt
+            .await
+            .expect("fails at once")
+            .expect_err("not bootstrapped");
+        assert!(matches!(
+            &error,
+            TorError::Connect { source, .. } if source.kind() == ErrorKind::BootstrapRequired
+        ));
+        assert!(is_pre_path_failure(&error));
+    }
 }

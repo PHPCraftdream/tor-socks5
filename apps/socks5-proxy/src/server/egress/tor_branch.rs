@@ -338,6 +338,7 @@ mod tests {
     use std::future::Future;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use arti_wrapper::{Settings, Socks5PreEndpoint, TorTunnel};
 
@@ -384,14 +385,21 @@ mod tests {
         (registry, handle)
     }
 
-    /// Real Tor stream errors without any network: an unbootstrapped client
-    /// refuses a valid target with `BootstrapRequired` (the pre path) and an
-    /// invalid one with an address error (not the pre path).
+    /// Real Tor stream errors without any network: a client that bootstraps
+    /// only on request refuses a valid target with `BootstrapRequired` (the
+    /// pre path) and an invalid one with an address error (not the pre path).
+    /// A default client would start a real bootstrap here and never return.
     async fn errors(dir: &Path, host: &str, count: usize) -> Vec<TorError> {
-        let tunnel = tunnel(dir, "errors", None);
+        ensure_crypto_provider();
+        let tunnel = TorTunnel::create_manual_with(settings(dir, "errors", None)).unwrap();
         let mut errors = Vec::new();
         for _ in 0..count {
-            errors.push(tunnel.connect(host, 443).await.expect_err("no network"));
+            let attempt = tokio::time::timeout(Duration::from_secs(10), tunnel.connect(host, 443));
+            let error = attempt
+                .await
+                .expect("fails at once")
+                .expect_err("no network");
+            errors.push(error);
         }
         errors
     }
