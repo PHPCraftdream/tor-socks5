@@ -167,6 +167,10 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
     }
 }
 
+/// Why a check that connects to bridges itself, outside the Tor client, does not run: with
+/// `pre_proxies` set every connection must go through the proxy.
+pub(crate) const DIRECT_CHECKS_REFUSED: &str = "bridge checks connect to bridges directly; refused because pre_proxies is set or the config cannot be read";
+
 /// JNI entry point: `nativeProbeBridgeTransport(String configPath, String transport)`
 ///
 /// An on-demand reachability probe over raw sockets -- unlike `nativeRefreshBridges`, this needs
@@ -182,7 +186,9 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
 ///   few seconds times however many candidates match `transport`) -- call off the Android main
 ///   thread, same convention as `nativeRefreshBridges`.
 /// - **Error Signaling:** Throws `java.lang.IllegalArgumentException` if `configPath` is invalid,
-///   `java.lang.RuntimeException` if the config or its bridge lines can't be parsed.
+///   `java.lang.RuntimeException` if the config or its bridge lines can't be parsed, and
+///   `java.lang.IllegalStateException` when the config sets `pre_proxies` (the probe would
+///   reach the bridges outside the proxy).
 #[no_mangle]
 pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativeProbeBridgeTransport(
     mut env: JNIEnv,
@@ -217,6 +223,10 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
             Loaded::FromFile { config, .. } => config,
             Loaded::Defaults(config) => config,
         };
+        if cfg.pre_proxies.is_some() {
+            let _ = env.throw_new("java/lang/IllegalStateException", DIRECT_CHECKS_REFUSED);
+            return Err(anyhow::anyhow!(DIRECT_CHECKS_REFUSED));
+        }
 
         let parsed = cfg.bridges.parsed().map_err(|e| {
             let msg = format!("{:#}", e);

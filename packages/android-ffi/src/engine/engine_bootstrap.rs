@@ -362,6 +362,11 @@ pub(super) async fn bootstrap_stall_watchdog(tunnel: TorTunnel, callback: Bootst
     }
 }
 
+/// Whether the tunnel's channels are carried by a configured pre proxy.
+pub(super) fn reaches_through_pre_proxy(tunnel: &TorTunnel) -> bool {
+    matches!(tunnel.configured_pre_endpoint(), Some(Some(_)))
+}
+
 /// Background task, spawned once the tunnel reaches `On`, with three independent jobs on
 /// their own cadences:
 ///
@@ -436,6 +441,11 @@ pub(super) async fn stall_watchdog(
         .checked_sub(CIRCUIT_VERIFY_INTERVAL)
         .unwrap_or_else(Instant::now);
 
+    // The engine's own bridge checks (warm top-up, re-probe, circuit-verify) either connect
+    // to bridges outside a pre proxy or feed the health store with what a pre route observed,
+    // so none of them runs with one.
+    let own_checks = !reaches_through_pre_proxy(&tunnel);
+
     loop {
         tokio::select! {
             biased;
@@ -466,7 +476,7 @@ pub(super) async fn stall_watchdog(
         // connection's very first top-up round by however long that sweep takes, defeating the
         // point of "proactively". The health store already has plenty of history from earlier
         // rounds and earlier sessions for `select_active_probe_bridges` to draw on immediately.
-        if last_topup.elapsed() >= WARM_TOPUP_INTERVAL {
+        if own_checks && last_topup.elapsed() >= WARM_TOPUP_INTERVAL {
             last_topup = Instant::now();
             let active = rotation_bridges.len();
             let batch_size = if active < TARGET_WARM_POOL_SIZE {
@@ -561,7 +571,7 @@ pub(super) async fn stall_watchdog(
         // QR-scan flow's user-initiated checks. See `docs/design/real-connectivity-bridge-
         // verification.md` for why this can't simply replace the TCP reprobe above: a full
         // check costs a real Tor circuit per bridge, not a local socket.
-        if last_circuit_verify.elapsed() >= CIRCUIT_VERIFY_INTERVAL {
+        if own_checks && last_circuit_verify.elapsed() >= CIRCUIT_VERIFY_INTERVAL {
             last_circuit_verify = Instant::now();
             let due = needing_circuit_verification_async(&bridge_health).await;
 
@@ -630,7 +640,8 @@ pub(super) async fn stall_watchdog(
             }
         }
 
-        let should_reprobe = !reprobe_interval.is_zero()
+        let should_reprobe = own_checks
+            && !reprobe_interval.is_zero()
             && (first_bridge_reprobe || last_bridge_reprobe.elapsed() >= reprobe_interval);
         if !bridges.is_empty() && should_reprobe {
             // Bumped synchronously, before the spawn: this guards against starting a second

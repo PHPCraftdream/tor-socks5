@@ -144,8 +144,10 @@ publish a new policy snapshot: routes and ACLs come from the admitted credential
 proof, never an unverified request username. A failed or incompatible reload
 preserves the active route; pre protocol/endpoint/credential changes require a
 restart. Android serves the post side the same way (global and per-account post
-pools, from the admitted account); it has no pre routes yet and refuses to start
-with `pre_proxies` instead of going direct.
+pools, from the admitted account). For pre it serves one global endpoint only
+(see [the Android note](../../README.md#prepost-proxy-pools)); per-account pre
+routes, pools of several endpoints and pre with transport bridges are refused at
+start instead of going direct.
 
 Pre routes require explicitly configured usable bridges and support only the
 trusted bundled obfs4/WebTunnel PT. Discovery, seed bridges, direct probes, the

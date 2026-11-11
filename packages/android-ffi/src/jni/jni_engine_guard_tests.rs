@@ -1,15 +1,42 @@
-use super::{
-    reject_unimplemented_account_socks5_endpoints, reject_unimplemented_global_socks5_endpoints,
-};
+use super::{global_pre_endpoint, reject_unserved_account_pre_routes};
 use auth::{User, UsersConfig};
-use proxy_config::{Config, PoolOverride, ProxyPool, Socks5Endpoint};
+use bridge_line::BridgeLine;
+use proxy_config::{BridgesConfig, Config, PoolOverride, ProxyPool, Socks5Endpoint};
 
-fn pool() -> ProxyPool {
-    "127.0.0.1:9050".parse::<Socks5Endpoint>().unwrap().into()
+fn endpoint(address: &str) -> Socks5Endpoint {
+    address.parse().unwrap()
 }
 
-fn endpoint() -> PoolOverride {
-    PoolOverride::Pool(pool())
+fn pool() -> ProxyPool {
+    endpoint("127.0.0.1:9050").into()
+}
+
+fn other_pool() -> ProxyPool {
+    endpoint("127.0.0.1:9051").into()
+}
+
+fn plain_bridge() -> BridgeLine {
+    "192.0.2.1:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01"
+        .parse()
+        .unwrap()
+}
+
+fn transport_bridge() -> BridgeLine {
+    "obfs4 192.0.2.2:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=ZZZ iat-mode=0"
+        .parse()
+        .unwrap()
+}
+
+/// A config that asks for the global pre proxy with everything else in order.
+fn pre_config() -> Config {
+    Config {
+        pre_proxies: Some(pool()),
+        bridges: BridgesConfig {
+            auto_fetch: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
 }
 
 fn user(enabled: bool, pre: Option<PoolOverride>) -> User {
@@ -24,36 +51,94 @@ fn user(enabled: bool, pre: Option<PoolOverride>) -> User {
     }
 }
 
-#[test]
-fn global_pre_is_rejected_but_post_and_absence_are_allowed() {
-    let mut config = Config::default();
-    assert!(reject_unimplemented_global_socks5_endpoints(&config).is_ok());
-    config.post_proxies = Some(pool());
-    assert!(reject_unimplemented_global_socks5_endpoints(&config).is_ok());
-    config.post_proxies = None;
-    assert!(reject_unimplemented_global_socks5_endpoints(&config).is_ok());
-    config.pre_proxies = Some(pool());
-    assert!(reject_unimplemented_global_socks5_endpoints(&config).is_err());
+fn users(user: User) -> UsersConfig {
+    UsersConfig { users: vec![user] }
 }
 
 #[test]
-fn enabled_account_pre_is_rejected_but_post_and_disabled_accounts_are_allowed() {
-    let users = UsersConfig {
-        users: vec![user(true, Some(endpoint()))],
-    };
-    assert!(reject_unimplemented_account_socks5_endpoints(&users).is_err());
+fn without_a_global_pre_nothing_is_required_of_the_bridges() {
+    let config = Config::default();
+    assert_eq!(global_pre_endpoint(&config, &[]), Ok(None));
+    assert_eq!(
+        global_pre_endpoint(&config, &[transport_bridge()]),
+        Ok(None)
+    );
+}
+
+#[test]
+fn a_single_endpoint_with_plain_bridges_is_served() {
+    let served = global_pre_endpoint(&pre_config(), &[plain_bridge()]);
+    assert_eq!(served, Ok(Some(endpoint("127.0.0.1:9050"))));
+}
+
+#[test]
+fn a_pool_of_several_endpoints_is_refused() {
+    let mut config = pre_config();
+    config.pre_proxies =
+        Some(ProxyPool::new(vec![endpoint("127.0.0.1:9050"), endpoint("127.0.0.1:9051")]).unwrap());
+    let error = global_pre_endpoint(&config, &[plain_bridge()]).unwrap_err();
+    assert!(error.contains("single endpoint"), "{error}");
+}
+
+#[test]
+fn a_global_pre_without_explicit_bridges_is_refused() {
+    let error = global_pre_endpoint(&pre_config(), &[]).unwrap_err();
+    assert!(error.contains("at least one"), "{error}");
+}
+
+#[test]
+fn a_pluggable_transport_bridge_behind_a_pre_proxy_is_refused() {
+    let error =
+        global_pre_endpoint(&pre_config(), &[plain_bridge(), transport_bridge()]).unwrap_err();
+    assert!(error.contains("pluggable-transport"), "{error}");
+}
+
+#[test]
+fn auto_fetch_is_refused_with_a_pre_proxy() {
+    let mut config = pre_config();
+    config.bridges.auto_fetch = true;
+    let error = global_pre_endpoint(&config, &[plain_bridge()]).unwrap_err();
+    assert!(error.contains("auto_fetch"), "{error}");
+}
+
+#[test]
+fn an_account_may_restate_the_global_pre_route_or_leave_it() {
+    let global = pool();
+    for setting in [None, Some(PoolOverride::Pool(global.clone()))] {
+        let accounts = users(user(true, setting));
+        assert!(reject_unserved_account_pre_routes(Some(&global), &accounts).is_ok());
+    }
+}
+
+#[test]
+fn an_account_with_another_route_than_the_global_one_is_refused() {
+    let global = pool();
+    for setting in [
+        Some(PoolOverride::Pool(other_pool())),
+        Some(PoolOverride::Disabled),
+    ] {
+        let accounts = users(user(true, setting));
+        assert!(
+            reject_unserved_account_pre_routes(Some(&global), &accounts).is_err(),
+            "a second Tor client would be needed"
+        );
+    }
+}
+
+#[test]
+fn without_a_global_pre_only_an_account_pool_is_refused() {
+    let own = users(user(true, Some(PoolOverride::Pool(pool()))));
+    assert!(reject_unserved_account_pre_routes(None, &own).is_err());
+    let none = users(user(true, Some(PoolOverride::Disabled)));
+    assert!(reject_unserved_account_pre_routes(None, &none).is_ok());
     let mut post_only = user(true, None);
-    post_only.post_proxies = Some(endpoint());
-    let users = UsersConfig {
-        users: vec![post_only],
-    };
-    assert!(reject_unimplemented_account_socks5_endpoints(&users).is_ok());
-    let users = UsersConfig {
-        users: vec![user(false, Some(endpoint()))],
-    };
-    assert!(reject_unimplemented_account_socks5_endpoints(&users).is_ok());
-    let users = UsersConfig {
-        users: vec![user(true, Some(PoolOverride::Disabled))],
-    };
-    assert!(reject_unimplemented_account_socks5_endpoints(&users).is_ok());
+    post_only.post_proxies = Some(PoolOverride::Pool(pool()));
+    assert!(reject_unserved_account_pre_routes(None, &users(post_only)).is_ok());
+}
+
+#[test]
+fn disabled_accounts_are_not_checked() {
+    let off = users(user(false, Some(PoolOverride::Pool(other_pool()))));
+    assert!(reject_unserved_account_pre_routes(Some(&pool()), &off).is_ok());
+    assert!(reject_unserved_account_pre_routes(None, &off).is_ok());
 }

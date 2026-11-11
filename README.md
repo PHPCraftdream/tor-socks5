@@ -100,8 +100,14 @@ startup. Every extra client downloads its own directory data on each start and
 adds bridge load, so keep pre pools small.
 
 **Android.** The Android engine serves post pools, globally and per account, with
-the same rotation. Pre routes are not available there yet: a config with
-`pre_proxies` (global or per account) is refused at start rather than going direct.
+the same rotation. For pre it serves one global endpoint: `pre_proxies` with a
+single member, explicit bridges without a pluggable transport,
+`bridges.auto_fetch: false`, and no account that sets another pre route or `none`
+(each would need a second Tor client). In this mode the engine opens no connection
+of its own to a bridge (no reachability probes, warm-up or circuit verifier), and
+the app's bridge probe and check refuse to run. Anything else (a pool of several
+endpoints, a pre route per account, pre with obfs4 or WebTunnel) is refused at
+start rather than going direct.
 
 Protocol, endpoint and credentials participate in pre-owner identity. Errors
 never negotiate a different proxy protocol or fall back to a direct route. HTTPS-to-proxy is not

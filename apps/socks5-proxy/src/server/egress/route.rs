@@ -23,13 +23,7 @@ pub(crate) const MAX_PRE_OWNERS: usize = 15;
 
 /// Client-side description of a pre pool member for the Tor client.
 pub(crate) fn pre_endpoint(endpoint: &Socks5Endpoint) -> Socks5PreEndpoint {
-    Socks5PreEndpoint::new(
-        endpoint.address(),
-        endpoint
-            .credentials()
-            .map(|(user, pass)| (user.to_owned(), pass.to_owned())),
-    )
-    .with_protocol(endpoint.protocol())
+    Socks5PreEndpoint::from_pool_member(endpoint)
 }
 
 /// Rejects pre routes that would need more Tor clients than the process hosts.
