@@ -474,6 +474,13 @@ pub(super) fn check_one_bridge(
 /// not just a socket, so unbounded concurrency would trade wall-clock for phone memory/CPU.
 pub(super) const QR_VERIFY_CONCURRENCY: usize = 4;
 
+/// Whether the config at `config_path` forbids checks that connect to bridges directly.
+fn direct_checks_refused(config_path: &std::path::Path) -> bool {
+    Config::load_with_override(Some(config_path))
+        .map(|loaded| loaded.into_config().pre_proxies.is_some())
+        .unwrap_or(true)
+}
+
 /// Worker behind [`nativeVerifyBridges`]. Called from a dedicated OS thread, never from the main
 /// engine's own runtime, so the two never contend. Its scratch base is guaranteed-fresh via
 /// exclusive creation (see [`batch_scratch_dir`]), so overlapping invocations (two manual QR
@@ -498,6 +505,16 @@ pub(super) fn verify_bridges_blocking(
             Err(e) => callback.emit_checked(&bridge_text, false, 0, Some(&e)),
         }
     };
+
+    // Each check starts a throwaway Tor client that connects to the bridge itself, outside a
+    // pre proxy. Unreadable config is treated like a pre proxy: the check cannot tell.
+    if direct_checks_refused(config_path) {
+        for bridge in &bridges {
+            emit(bridge, Err(DIRECT_CHECKS_REFUSED.to_owned()));
+        }
+        callback.emit_done();
+        return;
+    }
 
     // A bridge whose most recent probe today already failed is skipped outright rather than
     // re-run through a live check: the store already answered this exact question a few hours

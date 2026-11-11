@@ -488,7 +488,11 @@ async fn engine_async(
     // zero bridges trivially returns zero alive ones, and the "alive.is_empty()" check below
     // would then reject a direct connection outright, even though "no bridges configured" was
     // the user's intent, not a reachability failure.
-    if !settings.bridges.is_empty() {
+    //
+    // Never with a pre proxy: these probes (and the rescue fetch below) are the engine's own
+    // connections to bridges, outside the Tor client and so outside the proxy. The bridges go
+    // to Tor as configured, and only Tor, through the proxy, tells whether they work.
+    if !settings.bridges.is_empty() && settings.pre_endpoint.is_none() {
         // Cancellable: without this select!, a stop signal received while probing (which can
         // itself take up to 5s per bridge) is not observed until the accept-loop select!
         // further down, which is never reached if bridges never come up -- nativeStop would
@@ -646,60 +650,64 @@ async fn engine_async(
     // A TorClient created with `create_unbootstrapped` is not in Arti's `running` state yet;
     // `TorTunnel::warm_bridge` consequently must run after bootstrap. Start it only after the
     // real circuit and listener are ready, and persist successful channels for the next start.
-    let warm_bridges = settings.bridges.clone();
-    let warm_health = bridge_health.clone();
-    let warm_tunnel = tunnel.clone();
-    let configured_count = all_configured_bridges.len();
-    let mut warm_stop_rx = stop_rx.clone();
-    info!(
-        active = warm_bridges.len().min(MAX_WARM_BRIDGES),
-        completed = 0,
-        successful = 0,
-        failed = 0,
-        "parallel bridge warm-up started in background"
-    );
-    tokio::spawn(async move {
-        let pool = tokio::select! {
-            biased;
-            _ = warm_stop_rx.changed() => {
-                info!("received stop signal while warming bridges");
-                return;
-            }
-            pool = warm_bridge_pool(warm_tunnel, warm_bridges) => pool,
-        };
-        persist_warm_results_async(&pool, &warm_health).await;
-        if let Some((fastest, latency)) = pool.warmed.first() {
-            info!(
-                bridge = %fastest.addr,
-                latency_ms = latency.as_millis() as u64,
-                "selected fastest warmed bridge for rotation"
-            );
-        }
-        for (rank, (bridge, latency)) in pool.warmed.iter().enumerate().skip(1) {
-            debug!(
-                rank = rank + 1,
-                bridge = %bridge.addr,
-                latency_ms = latency.as_millis() as u64,
-                "kept warmed bridge as rotation fallback"
-            );
-        }
-        if !pool.warmed.is_empty() {
-            // Narrow the published set once channels have actually been opened:
-            // now we know which bridges carry, not merely which bootstrapped.
-            let warmed: Vec<BridgeLine> = pool
-                .warmed
-                .iter()
-                .map(|(bridge, _)| bridge.clone())
-                .collect();
-            crate::set_active_bridges(warm_health.config_path.as_deref(), &warmed);
-        }
+    // Not with a pre proxy: the warm-up's outcome feeds the bridge-health store, which holds
+    // what was measured without a proxy, and a pre route's observations stay out of it.
+    if settings.pre_endpoint.is_none() {
+        let warm_bridges = settings.bridges.clone();
+        let warm_health = bridge_health.clone();
+        let warm_tunnel = tunnel.clone();
+        let configured_count = all_configured_bridges.len();
+        let mut warm_stop_rx = stop_rx.clone();
         info!(
-            warmed = pool.warmed.len(),
-            retired = pool.retired.len(),
-            configured = configured_count,
-            "parallel bridge warm pool ready for rotation"
+            active = warm_bridges.len().min(MAX_WARM_BRIDGES),
+            completed = 0,
+            successful = 0,
+            failed = 0,
+            "parallel bridge warm-up started in background"
         );
-    });
+        tokio::spawn(async move {
+            let pool = tokio::select! {
+                biased;
+                _ = warm_stop_rx.changed() => {
+                    info!("received stop signal while warming bridges");
+                    return;
+                }
+                pool = warm_bridge_pool(warm_tunnel, warm_bridges) => pool,
+            };
+            persist_warm_results_async(&pool, &warm_health).await;
+            if let Some((fastest, latency)) = pool.warmed.first() {
+                info!(
+                    bridge = %fastest.addr,
+                    latency_ms = latency.as_millis() as u64,
+                    "selected fastest warmed bridge for rotation"
+                );
+            }
+            for (rank, (bridge, latency)) in pool.warmed.iter().enumerate().skip(1) {
+                debug!(
+                    rank = rank + 1,
+                    bridge = %bridge.addr,
+                    latency_ms = latency.as_millis() as u64,
+                    "kept warmed bridge as rotation fallback"
+                );
+            }
+            if !pool.warmed.is_empty() {
+                // Narrow the published set once channels have actually been opened:
+                // now we know which bridges carry, not merely which bootstrapped.
+                let warmed: Vec<BridgeLine> = pool
+                    .warmed
+                    .iter()
+                    .map(|(bridge, _)| bridge.clone())
+                    .collect();
+                crate::set_active_bridges(warm_health.config_path.as_deref(), &warmed);
+            }
+            info!(
+                warmed = pool.warmed.len(),
+                retired = pool.retired.len(),
+                configured = configured_count,
+                "parallel bridge warm pool ready for rotation"
+            );
+        });
+    }
 
     // Stall watchdog: a real network interruption (Wi-Fi handoff, carrier
     // switch, a guard going stale) can leave arti's guard/circuit managers

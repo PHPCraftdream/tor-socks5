@@ -101,7 +101,8 @@ Post proxy negotiation happens inside a Tor-opened application stream, after
 WebTunnel and Tor are established. Pre/post may use different proxy protocols.
 See [CLI account routing](auth.md#cli-prepost-routing) for inheritance and explicit
 `none`, and [build prerequisites](../../README.md#build) for dependency details.
-On Android only post pools are supported; `pre_proxies` is refused at start.
+On Android post pools are supported, and pre only as one global endpoint with plain
+bridges; a pre route together with WebTunnel (or any transport) is refused at start.
 
 ## Startup and bootstrap
 

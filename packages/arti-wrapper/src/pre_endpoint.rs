@@ -143,6 +143,17 @@ impl Socks5PreEndpoint {
         }
     }
 
+    /// The endpoint of a configured proxy pool member, protocol and credentials included.
+    pub fn from_pool_member(endpoint: &client_acl::Socks5Endpoint) -> Self {
+        Self::new(
+            endpoint.address(),
+            endpoint
+                .credentials()
+                .map(|(user, pass)| (user.to_owned(), pass.to_owned())),
+        )
+        .with_protocol(endpoint.protocol())
+    }
+
     /// Select SOCKS5 or HTTP CONNECT; unsupported protocols fail config validation.
     pub fn with_protocol(mut self, protocol: EndpointProtocol) -> Self {
         self.protocol = protocol;

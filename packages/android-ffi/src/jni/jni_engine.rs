@@ -1,20 +1,47 @@
 use super::*;
 
-#[cfg(any(target_os = "android", test))]
-fn reject_unimplemented_global_socks5_endpoints(config: &Config) -> Result<(), String> {
-    if config.pre_proxies.is_some() {
-        return Err("Android global pre_proxies are not supported yet; refusing startup to prevent direct connections".to_owned());
+/// The one global pre proxy the Android engine can serve, if the config has it.
+///
+/// The engine runs a single Tor client, so a pre route is possible only when
+/// every connection uses the same endpoint. Anything else is refused at start,
+/// never carried out as a direct connection: a pool of several endpoints (one
+/// client per member), pluggable-transport bridges (Android runs the transport
+/// as a separate helper that cannot be shown to honour the proxy), no explicit
+/// bridge, and `auto_fetch` (which the pre mode does not run).
+fn global_pre_endpoint(
+    config: &Config,
+    bridges: &[bridge_line::BridgeLine],
+) -> Result<Option<proxy_config::Socks5Endpoint>, String> {
+    let Some(pool) = config.pre_proxies.as_ref() else {
+        return Ok(None);
+    };
+    let member = pool.sole_member().ok_or_else(|| {
+        "Android runs one Tor client, so global pre_proxies must be a single endpoint".to_owned()
+    })?;
+    if bridges.is_empty() {
+        return Err(
+            "global pre_proxies needs at least one explicitly configured bridge".to_owned(),
+        );
     }
-    Ok(())
+    if bridges.iter().any(|bridge| bridge.transport.is_some()) {
+        return Err("Android cannot route pluggable-transport bridges through a pre proxy; use plain bridges or remove pre_proxies".to_owned());
+    }
+    if config.bridges.auto_fetch {
+        return Err("global pre_proxies requires bridges.auto_fetch to be disabled".to_owned());
+    }
+    Ok(Some(member.clone()))
 }
 
-#[cfg(any(target_os = "android", test))]
-fn reject_unimplemented_account_socks5_endpoints(users: &UsersConfig) -> Result<(), String> {
-    use proxy_config::PoolOverride;
-
+/// Accounts may only restate the global pre route: another endpoint, or none
+/// next to a global one, would need a second Tor client.
+fn reject_unserved_account_pre_routes(
+    global: Option<&proxy_config::ProxyPool>,
+    users: &UsersConfig,
+) -> Result<(), String> {
     for user in users.users.iter().filter(|user| user.is_enabled) {
-        if matches!(user.pre_proxies, Some(PoolOverride::Pool(_))) {
-            return Err("Android account pre_proxies are not supported yet; refusing startup to prevent direct connections".to_owned());
+        let effective = proxy_config::resolve_pool(global, user.pre_proxies.as_ref());
+        if effective.as_ref() != global {
+            return Err("an account's pre_proxies differs from the global route; Android runs one Tor client".to_owned());
         }
     }
     Ok(())
@@ -32,6 +59,7 @@ pub(crate) fn main_engine_settings(
     state_dir: std::path::PathBuf,
     obfs4_iat_mode: Option<u8>,
     circuit_hops: u8,
+    pre_endpoint: Option<arti_wrapper::Socks5PreEndpoint>,
 ) -> arti_wrapper::Settings {
     arti_wrapper::Settings {
         bridges,
@@ -39,6 +67,7 @@ pub(crate) fn main_engine_settings(
         state_dir: Some(state_dir),
         obfs4_iat_mode,
         circuit_hops,
+        pre_endpoint,
         initial_connect_timeout: Some(Duration::from_secs(4)),
         ..Default::default()
     }
@@ -55,14 +84,31 @@ mod settings_tests {
     #[test]
     fn main_engine_settings_forwards_circuit_hops_two_and_three() {
         for hops in [2, 3] {
-            let settings = main_engine_settings(Vec::new(), None, "state".into(), None, hops);
+            let settings = main_engine_settings(Vec::new(), None, "state".into(), None, hops, None);
             assert_eq!(settings.circuit_hops, hops);
         }
     }
 
     #[test]
+    fn main_engine_settings_carries_the_pre_endpoint() {
+        let endpoint =
+            arti_wrapper::Socks5PreEndpoint::new("127.0.0.1:9050".parse().unwrap(), None);
+        let settings = main_engine_settings(
+            Vec::new(),
+            None,
+            "state".into(),
+            None,
+            3,
+            Some(endpoint.clone()),
+        );
+        assert_eq!(settings.pre_endpoint, Some(endpoint));
+        let direct = main_engine_settings(Vec::new(), None, "state".into(), None, 3, None);
+        assert_eq!(direct.pre_endpoint, None);
+    }
+
+    #[test]
     fn main_engine_settings_opts_into_fast_first_exit_attempt() {
-        let settings = main_engine_settings(Vec::new(), None, "state".into(), None, 3);
+        let settings = main_engine_settings(Vec::new(), None, "state".into(), None, 3, None);
         assert_eq!(
             settings.initial_connect_timeout,
             Some(std::time::Duration::from_secs(4))
@@ -214,12 +260,6 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
             }
         };
 
-        #[cfg(target_os = "android")]
-        if let Err(message) = reject_unimplemented_global_socks5_endpoints(cfg) {
-            let _ = env.throw_new("java/lang/IllegalStateException", &message);
-            return Err(anyhow::anyhow!(message));
-        }
-
         // 3a. One-time process init. Must run before any `tracing::info!`/
         // `warn!`/`error!` call below (step 7a's auth-decision logging in
         // particular): with no global `tracing` subscriber installed yet,
@@ -251,6 +291,17 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
                 "ignored documentation/local-only bridge addresses"
             );
         }
+        // The global pre proxy, if any, or a refusal: a route that cannot be
+        // served must stop the start, not fall back to a direct connection.
+        let pre_endpoint = match global_pre_endpoint(cfg, &parsed_bridges.bridges) {
+            Ok(member) => {
+                member.map(|member| arti_wrapper::Socks5PreEndpoint::from_pool_member(&member))
+            }
+            Err(message) => {
+                let _ = env.throw_new("java/lang/IllegalStateException", &message);
+                return Err(anyhow::anyhow!(message));
+            }
+        };
         // Seed any DNS hints carried alongside the configured bridges (e.g.
         // from a QR-imported bridge whose exporter already had it resolved)
         // into the DNS fallback store. Safe regardless of call order versus
@@ -342,8 +393,9 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
                     let _ = env.throw_new("java/lang/RuntimeException", &msg);
                     e
                 })?;
-            #[cfg(target_os = "android")]
-            if let Err(message) = reject_unimplemented_account_socks5_endpoints(&users) {
+            if let Err(message) =
+                reject_unserved_account_pre_routes(cfg.pre_proxies.as_ref(), &users)
+            {
                 let _ = env.throw_new("java/lang/IllegalStateException", &message);
                 return Err(anyhow::anyhow!(message));
             }
@@ -392,6 +444,7 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
             state_dir,
             cfg.bridges.iat_mode_override(),
             cfg.tor.circuit_hops,
+            pre_endpoint,
         );
         let block_onion = cfg.security.block_onion;
         // Owned-копия для потока: `cfg` локален и не живёт в 'static.
