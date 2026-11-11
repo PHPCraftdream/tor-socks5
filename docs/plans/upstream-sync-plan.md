@@ -1,8 +1,16 @@
-# Plan: upstream sync — vendor rebase to Arti 0.47 (UPS-06)
+# Plan: upstream sync — vendor rebases (0.47 UPS-06, then 0.48)
 
 Status: **done** — the vendored set was rebased from Arti 0.43.0 (arti 2.4.0)
-to 0.47.0 (arti 2.7.0), synced 2026-10-13. Patch details live in
-`vendor/README.md`.
+to 0.47.0 (arti 2.7.0), synced 2026-10-13, and then to 0.48.0 (arti 2.8.0),
+synced 2026-11-10 (per-file three-way merge against the pristine archives;
+see `vendor/PROVENANCE.md`). Patch details live in `vendor/README.md`. The
+sections below record the 0.47 decision and are kept as history; where a
+statement changed with 0.48 it says so.
+
+**Decision, 2026-11-11: no more upstream submissions.** Upstream does not
+accept agent-written code, so the carried patches stay in `vendor/`. Other
+projects that want them take the patch-kit (`vendor/README.md`, "Using these
+patches in your own project", tag `arti-patches-0.48.0`).
 
 ## Decision: rebase to 0.47 ("path B"), not backport onto 0.43
 
@@ -47,8 +55,9 @@ non-direct build timeout; guardmgr readiness signal, recovery corrections
 and `reset_disabled_guards`; arti-client guards-usable readiness,
 fatal-protocol-error hook, external guard failure passthrough, exit-stream
 retry and `initial_connect_timeout`; circmgr opt-in bandwidth floor.
-**None were accepted upstream in 0.47.** The full table with statuses is in
-`vendor/README.md`.
+**None were accepted upstream in 0.47**, and in 0.48 only the lazy
+`saturating_add`/`saturating_sub` limits were (`saturating-time` 0.6.0). The
+full table with statuses is in `vendor/README.md`.
 
 ## Still open / known risks
 
@@ -63,9 +72,23 @@ retry and `initial_connect_timeout`; circmgr opt-in bandwidth floor.
 * Our 30 s descriptor-fetch total and 45 s channel-build total budgets are
   not mutually reconciled.
 * #2601 / TROVE-2026-027 applicability was never confirmed.
-* RUSTSEC-2026-0285 dependency-advisory check before release.
-* onion-service-host fixes #2681/#2748 become mandatory if service hosting is
-  ever enabled (today only onion-service-client is used).
+* RUSTSEC-2026-0285 and the other dependency advisories: now checked in CI by
+  `cargo deny check advisories` (the `license-audit` job; ignores and their
+  reasons are in `.github/deny.toml`).
+* ~~onion-service-host fixes #2681/#2748 become mandatory if service hosting is
+  ever enabled~~ — **resolved 2026-11-11.** Hosting is built by default now
+  (the `onion-service` feature; services only start when `onion_services` is
+  configured), so this was checked against the sources. Both fixes shipped in
+  Arti 2.7.0 and are in 0.48.0, which we use unpatched for these crates:
+  #2748 (TROVE-2026-063, `tor-proto` `hs_ntor`: the INTRODUCE2 length underflow
+  is gone, `take_all_but(HS_MAC_LEN)` in 0.47.0 and 0.48.0 but not in 0.43.0)
+  and #2681 (TROVE-2026-068, `tor-hsservice` `pow/v1.rs`: the effort-conversion
+  panic). The proof-of-work code only compiles with `hs-pow-full`, which our
+  build does not enable. The 2.8.0 hosting fixes #2779 (TROVE-2026-069) and
+  #2747 are in 0.48.0 as well. The issue pages were not readable (GitLab
+  answers 403 to non-browser clients); the titles come from the Arti CHANGELOG
+  and commit messages on the public cgit mirror, and the code was compared in
+  the crates.io sources.
 * Full semantic equivalence of the carried patches after the mechanical
   rebase was not re-proven beyond the existing regression tests.
 
