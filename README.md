@@ -81,7 +81,23 @@ that worked; a member whose proxy keeps failing is quarantined and re-checked in
 the background through Tor, and returns to rotation once it answers again.
 Failures that are not the proxy's fault (the target refuses, Tor itself is
 unavailable) do not rotate and do not demote a member. An exhausted pool fails
-the connection. A **pre** pool currently holds exactly one member.
+the connection.
+
+A **pre** pool rotates the same way (site assignment, failover, quarantine), but
+every member is a full Tor client of its own, because a Tor client has a single
+pre proxy. The main client bootstraps through the first member, in configuration
+order, that answers a direct handshake check at startup (startup fails if none
+does; a pool of one member is used as it is). The other members' clients start
+in the background, a few at a time; a client that is still starting is passed
+over while another member is ready, and an account's own pool starts on its first
+use. A member is rotated away from only when the path through its pre proxy fails
+(the client cannot reach Tor or build circuits); errors of the exit, the target
+or a post proxy never rotate it. A quarantined member is probed directly with the
+proxy handshake and, once it answers, returns to rotation and its client retries
+starting. The configuration may name at most 16 distinct pre endpoints in total
+(the main client's plus 15 more, one Tor client each); more is rejected at
+startup. Every extra client downloads its own directory data on each start and
+adds bridge load, so keep pre pools small.
 
 Protocol, endpoint and credentials participate in pre-owner identity. Errors
 never negotiate a different proxy protocol or fall back to a direct route. HTTPS-to-proxy is not
@@ -108,7 +124,8 @@ separate from compilation and the PT contract tests.
 Periodic maintenance checks channels through the same proxy protocol, endpoint and credentials.
 Arti may reuse an existing channel, so this is not always a fresh reachability
 check. A failed or incompatible configuration reload preserves the active route;
-changing the proxy protocol, endpoint or credentials requires a restart.
+changing the proxy protocol, endpoint or credentials of the main client's member
+requires a restart; the other members may be changed with the pool.
 
 When its conditions are met, the watchdog requests closure of the existing
 client's open channels without cancelling pending connections. Later requests

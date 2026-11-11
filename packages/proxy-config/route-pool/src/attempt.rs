@@ -18,6 +18,11 @@ pub enum Verdict {
     ProxySoft,
     /// Not the proxy's fault (target, Tor, local): rating untouched, no rotation.
     NotProxy,
+    /// The member cannot serve right now and nothing is wrong with it (for
+    /// example its client is still starting): the next member is tried and
+    /// nothing is recorded. A member that serves after a skip does not pin
+    /// the site, so the skipped one is used again once it is ready.
+    Skip,
 }
 
 /// Why no member of the pool produced a connection.
@@ -50,6 +55,29 @@ pub async fn run_attempts<T, E, F, Fut, C>(
     scope: &PoolScope,
     key: &str,
     deadline: Instant,
+    connect: F,
+    classify: C,
+) -> Result<T, PoolError<E>>
+where
+    F: FnMut(Arc<ProxyConfig>, Instant) -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+    C: Fn(&E) -> Verdict,
+{
+    run_attempts_with_budget(scope, key, deadline, ATTEMPT_BUDGET, connect, classify).await
+}
+
+/// [`run_attempts`] with a caller-chosen share of the deadline per member.
+///
+/// A hop that must start a whole Tor client on first use needs more than the
+/// fifteen seconds a plain proxy dial gets.
+///
+/// cancel-safe: NO — dropping the future abandons the attempt in flight and
+/// records nothing for it.
+pub async fn run_attempts_with_budget<T, E, F, Fut, C>(
+    scope: &PoolScope,
+    key: &str,
+    deadline: Instant,
+    budget: Duration,
     mut connect: F,
     classify: C,
 ) -> Result<T, PoolError<E>>
@@ -59,6 +87,7 @@ where
     C: Fn(&E) -> Verdict,
 {
     let mut last = None;
+    let mut skipped = false;
     let candidates = scope.candidates(key);
     let count = candidates.len();
     for (index, proxy) in candidates.into_iter().enumerate() {
@@ -69,14 +98,19 @@ where
         let attempt_deadline = if index + 1 == count {
             deadline
         } else {
-            deadline.min(now + ATTEMPT_BUDGET)
+            deadline.min(now + budget)
         };
         match connect(Arc::clone(&proxy), attempt_deadline).await {
             Ok(value) => {
-                scope.record_success(&proxy, key);
+                if skipped {
+                    scope.record_served(&proxy);
+                } else {
+                    scope.record_success(&proxy, key);
+                }
                 return Ok(value);
             }
             Err(error) => match classify(&error) {
+                Verdict::Skip => skipped = true,
                 Verdict::ProxyHard => {
                     scope.record_failure(&proxy, true);
                     last = Some(error);
@@ -113,8 +147,64 @@ mod tests {
         match *error {
             "hard" => Verdict::ProxyHard,
             "soft" => Verdict::ProxySoft,
+            "skip" => Verdict::Skip,
             _ => Verdict::NotProxy,
         }
+    }
+
+    #[tokio::test]
+    async fn a_skipped_member_is_not_penalised_and_does_not_pin_the_site() {
+        let scope = scope(&["192.0.2.1:1080", "192.0.2.2:1080"]);
+        let order = scope.candidates("example.com");
+        let skipped = order[0].clone();
+        let served = run_attempts(
+            &scope,
+            "example.com",
+            far(),
+            |proxy, _| {
+                let skip = proxy.host == skipped.host;
+                async move {
+                    if skip {
+                        Err("skip")
+                    } else {
+                        Ok(proxy.host.clone())
+                    }
+                }
+            },
+            classify,
+        )
+        .await
+        .unwrap();
+        assert_ne!(served, skipped.host);
+        assert!(!scope.is_quarantined(&skipped));
+        let next = scope.candidates("example.com");
+        assert_eq!(
+            next[0].host, skipped.host,
+            "the skipped member keeps the site until it can serve"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_attempt_budget_is_chosen_by_the_caller() {
+        let pair = scope(&["192.0.2.1:1080", "192.0.2.2:1080"]);
+        let overall = Instant::now() + Duration::from_secs(3600);
+        let deadlines = Mutex::new(Vec::new());
+        let _: Result<(), PoolError<&'static str>> = run_attempts_with_budget(
+            &pair,
+            "example.com",
+            overall,
+            Duration::from_secs(30),
+            |_, attempt| {
+                deadlines.lock().unwrap().push(attempt);
+                async { Err("soft") }
+            },
+            classify,
+        )
+        .await;
+        let deadlines = deadlines.into_inner().unwrap();
+        let first = deadlines[0] - Instant::now();
+        assert!(first > Duration::from_secs(15) && first <= Duration::from_secs(30));
+        assert_eq!(deadlines[1], overall);
     }
 
     #[tokio::test]

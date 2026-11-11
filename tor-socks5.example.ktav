@@ -55,9 +55,10 @@ security.block_onion: true
 ## post hop (Tor -> post proxy -> target). Each field is an array of endpoints
 ## [socks5://|http://]IP:port[|username:password]. A post pool rotates: one site
 ## (registrable domain) keeps one member, failures move on to the next member,
-## and a quarantined member is re-checked in the background. A pre pool holds
-## exactly one member for now. A bracketed IPv6 member needs the literal prefix
-## ":: ". See README.md (Pre/post proxy pools).
+## and a quarantined member is re-checked in the background. Every pre member
+## runs its own Tor client; at most 16 distinct pre endpoints are allowed in
+## total. A bracketed IPv6 member needs the literal prefix ":: ". See README.md
+## (Pre/post proxy pools).
 ## post_proxies: [
 ##     socks5://192.0.2.11:1080
 ##     http://192.0.2.12:8080|username:password

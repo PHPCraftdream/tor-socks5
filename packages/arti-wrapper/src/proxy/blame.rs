@@ -52,6 +52,26 @@ pub(crate) fn blame_dial(error: &TorError) -> PostBlame {
     }
 }
 
+/// Whether a failed Tor stream points at the path through the client's pre
+/// proxy: the client cannot reach the Tor network or build circuits, as
+/// opposed to the exit, the target or a post proxy refusing the stream.
+pub fn is_pre_path_failure(error: &TorError) -> bool {
+    let TorError::Connect { source, .. } = error else {
+        return false;
+    };
+    kind_is_pre_path(source.kind())
+}
+
+fn kind_is_pre_path(kind: ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::TorAccessFailed
+            | ErrorKind::TorNetworkTimeout
+            | ErrorKind::BootstrapRequired
+            | ErrorKind::TorDirectoryUnusable
+    )
+}
+
 /// Blame for a failure of the SOCKS5 / HTTP CONNECT handshake with the proxy.
 pub(crate) fn blame_handshake(error: &ConnectError) -> PostBlame {
     match error {
@@ -83,6 +103,33 @@ mod tests {
             code: Some(code),
             response: String::new(),
         }
+    }
+
+    #[test]
+    fn only_tor_reachability_kinds_point_at_the_pre_path() {
+        for kind in [
+            ErrorKind::TorAccessFailed,
+            ErrorKind::TorNetworkTimeout,
+            ErrorKind::BootstrapRequired,
+            ErrorKind::TorDirectoryUnusable,
+        ] {
+            assert!(kind_is_pre_path(kind), "{kind:?}");
+        }
+        for kind in [
+            ErrorKind::RemoteNetworkTimeout,
+            ErrorKind::RemoteConnectionRefused,
+            ErrorKind::RemoteHostNotFound,
+            ErrorKind::ExitPolicyRejected,
+            ErrorKind::ForbiddenStreamTarget,
+        ] {
+            assert!(!kind_is_pre_path(kind), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn errors_that_are_not_tor_stream_failures_never_point_at_the_pre_path() {
+        assert!(!is_pre_path_failure(&TorError::PostSocksTimeout));
+        assert!(!is_pre_path_failure(&TorError::InvalidBridge("x".into())));
     }
 
     #[test]
@@ -151,5 +198,29 @@ mod tests {
             blame_dial(&TorError::BuildConfig("x".to_owned())),
             PostBlame::NotProxy
         );
+    }
+
+    #[tokio::test]
+    async fn a_client_that_bootstraps_only_on_request_refuses_streams_at_once() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let settings = crate::Settings {
+            state_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let tunnel = crate::TorTunnel::create_manual_with(settings).unwrap();
+        let attempt = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tunnel.connect("example.com", 443),
+        );
+        let error = attempt
+            .await
+            .expect("fails at once")
+            .expect_err("not bootstrapped");
+        assert!(matches!(
+            &error,
+            TorError::Connect { source, .. } if source.kind() == ErrorKind::BootstrapRequired
+        ));
+        assert!(is_pre_path_failure(&error));
     }
 }

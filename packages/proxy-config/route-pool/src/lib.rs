@@ -13,7 +13,7 @@ mod probe;
 mod scope;
 mod site;
 
-pub use attempt::{run_attempts, PoolError, Verdict};
+pub use attempt::{run_attempts, run_attempts_with_budget, PoolError, Verdict};
 pub use probe::{drive_probes, probe_round, ProbeOutcome};
-pub use scope::{proxy_config, PoolScope, ScopeError, ScopeMap};
+pub use scope::{find_member, proxy_config, PoolScope, ScopeError, ScopeMap};
 pub use site::site_key;

@@ -75,6 +75,13 @@ ordinary HTTP forwarding are not supported. Listener account passwords and
 outbound proxy credentials are separate identities; neither SOCKS5 nor plain
 HTTP CONNECT encrypts its credential-bearing hop.
 
+Every distinct pre endpoint runs its own Tor client, so the whole configuration
+(global pool and all enabled accounts together) may name at most 16 distinct pre
+endpoints: the main client's plus 15 more. A direct route next to a global pre
+pool (`pre_proxies: none` on an account) counts as one of the 15. Startup fails
+when the limit is exceeded. See
+[Pre/post proxy pools](../../README.md#prepost-proxy-pools).
+
 For example, the main config can select:
 
 ```ktav

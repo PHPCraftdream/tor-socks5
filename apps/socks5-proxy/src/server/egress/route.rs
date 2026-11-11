@@ -3,9 +3,9 @@
 
 use std::sync::Arc;
 
-use arti_wrapper::{RoutedStream, TorTunnel};
+use arti_wrapper::{RoutedStream, Socks5PreEndpoint, TorTunnel};
 use auth::UsersConfig;
-use proxy_config::{PoolOverride, ProxyPool};
+use proxy_config::{PoolOverride, ProxyPool, Socks5Endpoint};
 
 use crate::post_pool::PostPools;
 
@@ -20,10 +20,54 @@ pub(crate) fn reject_unsupported_pool(
     Ok(())
 }
 
-/// Pre pools hold exactly one member until pool rotation reaches the pre hop.
-pub(crate) fn validate_pre_pool_size(pool: Option<&ProxyPool>) -> anyhow::Result<()> {
-    if pool.is_some_and(|pool| pool.sole_member().is_none()) {
-        anyhow::bail!("pre_proxies with several members are not supported yet");
+/// Tor clients that can run next to the main one, one per extra pre endpoint.
+pub(crate) const MAX_PRE_OWNERS: usize = 15;
+
+/// Client-side description of a pre pool member for the Tor client.
+pub(crate) fn pre_endpoint(endpoint: &Socks5Endpoint) -> Socks5PreEndpoint {
+    Socks5PreEndpoint::new(
+        endpoint.address(),
+        endpoint
+            .credentials()
+            .map(|(user, pass)| (user.to_owned(), pass.to_owned())),
+    )
+    .with_protocol(endpoint.protocol())
+}
+
+/// Rejects pre routes that would need more Tor clients than the process hosts.
+///
+/// The main client uses one member of the global pool; every other distinct
+/// pre endpoint needs a client of its own, and so does a direct route next to
+/// a global pool.
+pub(crate) fn validate_pre_capacity(
+    users: &UsersConfig,
+    global: Option<&ProxyPool>,
+) -> anyhow::Result<()> {
+    let mut distinct: Vec<Socks5Endpoint> = Vec::new();
+    let mut direct_next_to_pool = false;
+    let mut add = |pool: &ProxyPool| {
+        for member in pool.members() {
+            if !distinct.contains(member) {
+                distinct.push(member.clone());
+            }
+        }
+    };
+    if let Some(pool) = global {
+        add(pool);
+    }
+    for user in users.users.iter().filter(|user| user.is_enabled) {
+        match proxy_config::resolve_pool(global, user.pre_proxies.as_ref()) {
+            Some(pool) => add(&pool),
+            None => direct_next_to_pool |= global.is_some(),
+        }
+    }
+    let clients = distinct.len().saturating_sub(usize::from(global.is_some()))
+        + usize::from(direct_next_to_pool);
+    if clients > MAX_PRE_OWNERS {
+        anyhow::bail!(
+            "pre_proxies need {clients} extra Tor clients but the limit is {MAX_PRE_OWNERS} \
+             (one per distinct pre endpoint besides the main client's)"
+        );
     }
     Ok(())
 }
@@ -46,7 +90,7 @@ pub(crate) fn validate_account_routes(
             upstream,
         )?;
     }
-    Ok(())
+    validate_pre_capacity(users, global_pre)
 }
 
 /// Собственный снимок разрешённых маршрутов.
@@ -73,7 +117,6 @@ pub(crate) fn resolve_account_route(
     if pre.is_some() && (dns || upstream) {
         anyhow::bail!("pre_proxies cannot be combined with DNS listener or upstream egress");
     }
-    validate_pre_pool_size(pre.as_ref())?;
     validate_post_compatibility(post.is_some(), dns, upstream)?;
     Ok(AdmittedRoute { pre, post })
 }

@@ -1,5 +1,4 @@
 use super::*;
-use proxy_config::Socks5Endpoint;
 
 use std::future::Future;
 
@@ -25,34 +24,144 @@ fn registry(dir: &std::path::Path) -> OwnerRegistry {
 }
 
 #[tokio::test]
-async fn route_argument_comes_from_admission_lease() {
+async fn the_main_clients_own_endpoint_selects_the_main_client() {
     let dir = tempfile::tempdir().unwrap();
     let registry = registry(dir.path());
-    let path = dir.path().join("users.ktav");
-    let pre = proxy_config::PoolOverride::Pool(
-        "127.0.0.1:1080|alice:global"
-            .parse::<Socks5Endpoint>()
-            .unwrap()
-            .into(),
-    );
-    let users = auth::UsersConfig {
-        users: vec![auth::User {
-            name: "test".into(),
-            hash: auth::compute_hash("pw").unwrap(),
-            is_enabled: true,
-            allowed_onion: false,
-            allowed_clients: None,
-            pre_proxies: Some(pre),
-            post_proxies: None,
-        }],
-    };
-    users.save(&path).unwrap();
-    let auth = Arc::new(auth::AuthState::build_persistent(&users, path).unwrap());
-    let proof = auth.verify_proof("test", "pw").unwrap();
-    let lease = auth.admit(&proof).await.unwrap();
-    let owner = registry.select_admitted(&lease).await.unwrap();
+    let owner = registry
+        .select_endpoint(Some(endpoint("global")))
+        .await
+        .unwrap();
     assert!(owner.global_handle().is_some());
     assert!(registry.state.lock().await.entries.is_empty());
+}
+
+async fn failed_entry_with_tunnel(
+    registry: &OwnerRegistry,
+    dir: &std::path::Path,
+    name: &str,
+) -> Arc<Entry> {
+    let entry = registry
+        .reserve(Some(endpoint(name)))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut settings = registry.settings.as_ref().unwrap().clone();
+    settings.state_dir = Some(dir.join(name));
+    let tunnel = TorTunnel::create_unbootstrapped_with(settings).unwrap();
+    {
+        let mut state = entry.state.lock().await;
+        state.attempted = true;
+        state.failed = true;
+        state.slot = Some(1);
+        state.tunnel = Some(tunnel);
+    }
+    entry
+}
+
+#[tokio::test]
+async fn readiness_follows_the_state_of_the_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry(dir.path());
+    assert!(registry.is_ready(&Some(endpoint("global"))).await);
+    assert!(!registry.is_ready(&Some(endpoint("unknown"))).await);
+    let entry = failed_entry_with_tunnel(&registry, dir.path(), "owner").await;
+    let pre = Some(endpoint("owner"));
+    assert!(
+        !registry.is_ready(&pre).await,
+        "a failed owner is not ready"
+    );
+    entry.state.lock().await.failed = false;
+    assert!(registry.is_ready(&pre).await);
+    let busy = entry.state.lock().await;
+    assert!(
+        !registry.is_ready(&pre).await,
+        "an owner being worked on is not ready"
+    );
+    drop(busy);
+}
+
+#[tokio::test]
+async fn a_successful_retry_revives_a_failed_owner_without_a_new_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = registry(dir.path());
+    registry.revive_hook = Some(Arc::new(|| Box::pin(async { Ok(()) })));
+    let entry = failed_entry_with_tunnel(&registry, dir.path(), "revive").await;
+    registry.revive_inner(endpoint("revive")).await;
+    let state = entry.state.lock().await;
+    assert!(!state.failed);
+    assert_eq!(state.slot, Some(1), "the storage slot is reused");
+    assert!(state.tunnel.is_some());
+}
+
+#[tokio::test]
+async fn a_failed_retry_keeps_the_owner_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = registry(dir.path());
+    registry.revive_hook = Some(Arc::new(|| {
+        Box::pin(async { Err(anyhow!("still unreachable")) })
+    }));
+    let entry = failed_entry_with_tunnel(&registry, dir.path(), "still-down").await;
+    registry.revive_inner(endpoint("still-down")).await;
+    assert!(entry.state.lock().await.failed);
+}
+
+#[tokio::test]
+async fn retry_ignores_owners_that_never_built_a_tunnel() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = registry(dir.path());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = calls.clone();
+    registry.revive_hook = Some(Arc::new(move || {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
+    }));
+    let entry = registry
+        .reserve(Some(endpoint("no-tunnel")))
+        .await
+        .unwrap()
+        .unwrap();
+    {
+        let mut state = entry.state.lock().await;
+        state.attempted = true;
+        state.failed = true;
+    }
+    registry.revive_inner(endpoint("no-tunnel")).await;
+    registry.revive_inner(endpoint("never-reserved")).await;
+    assert!(entry.state.lock().await.failed);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn background_start_builds_only_clients_that_are_not_started() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = registry(dir.path());
+    registry.bootstrap_hook = Some(Arc::new(|| Box::pin(async {})));
+    let registry = Arc::new(registry);
+    assert!(
+        registry
+            .start_background(vec![endpoint("global")])
+            .await
+            .is_none(),
+        "the main client needs no owner"
+    );
+    let handle = registry
+        .start_background(vec![endpoint("first"), endpoint("second")])
+        .await
+        .expect("two fresh clients");
+    handle.await.unwrap();
+    assert!(registry.is_ready(&Some(endpoint("first"))).await);
+    assert!(registry.is_ready(&Some(endpoint("second"))).await);
+    assert!(
+        registry
+            .start_background(vec![endpoint("first"), endpoint("second")])
+            .await
+            .is_none(),
+        "started clients are not started again"
+    );
+    registry
+        .close_with_deadline(Instant::now() + Duration::from_secs(30))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

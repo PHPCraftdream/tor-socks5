@@ -21,11 +21,8 @@ const CAPACITY: usize = 16;
 
 pub(super) const SETUP_DEADLINE: Duration = Duration::from_secs(120);
 
-/// Pre pools are limited to one member until pool rotation reaches the pre hop.
-fn single_pre_member(pool: &proxy_config::ProxyPool) -> Result<&proxy_config::Socks5Endpoint> {
-    pool.sole_member()
-        .ok_or_else(|| anyhow!("pre proxy pools with several members are not supported yet"))
-}
+/// Clients started at the same time when a pool is brought up in the background.
+const START_CONCURRENCY: usize = 3;
 
 struct Entry {
     pre: Option<Socks5PreEndpoint>,
@@ -66,6 +63,13 @@ struct State {
 type BootstrapHook =
     Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
 
+#[cfg(test)]
+type ReviveHook = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+        + Send
+        + Sync,
+>;
+
 pub(super) struct OwnerRegistry {
     global_pre: Option<Socks5PreEndpoint>,
     global: TorHandle,
@@ -73,10 +77,14 @@ pub(super) struct OwnerRegistry {
     state: Mutex<State>,
     cancel: CancellationToken,
     close_failed: std::sync::atomic::AtomicBool,
+    /// Rotation state of the pre pools in use; owners are its members' clients.
+    pre_scopes: route_pool::ScopeMap,
     #[cfg(test)]
     storage_quarantine: Arc<std::sync::Mutex<Vec<std::fs::File>>>,
     #[cfg(test)]
     bootstrap_hook: Option<BootstrapHook>,
+    #[cfg(test)]
+    revive_hook: Option<ReviveHook>,
 }
 
 pub(super) struct Owner {
@@ -107,35 +115,135 @@ impl OwnerRegistry {
             }),
             cancel: CancellationToken::new(),
             close_failed: std::sync::atomic::AtomicBool::new(false),
+            pre_scopes: route_pool::ScopeMap::new(),
             #[cfg(test)]
             storage_quarantine: Arc::new(std::sync::Mutex::new(Vec::new())),
             #[cfg(test)]
             bootstrap_hook: None,
+            #[cfg(test)]
+            revive_hook: None,
         })
     }
 
+    /// The client for a pre endpoint: the main one when it is the main
+    /// client's own endpoint, otherwise an owner that is built on first use.
+    /// `None` selects a client without a pre proxy.
+    ///
     /// cancel-safe: YES — отмена сохраняет запущенный конструктор в записи реестра.
-    pub(super) async fn select_admitted(&self, lease: &auth::AdmissionLease) -> Result<Owner> {
-        let pre = match lease.pre_proxies() {
-            None => self.global_pre.clone(),
-            Some(proxy_config::PoolOverride::Disabled) => None,
-            Some(proxy_config::PoolOverride::Pool(pool)) => {
-                let endpoint = single_pre_member(pool)?;
-                Some(
-                    Socks5PreEndpoint::new(
-                        endpoint.address(),
-                        endpoint
-                            .credentials()
-                            .map(|(user, pass)| (user.to_owned(), pass.to_owned())),
-                    )
-                    .with_protocol(endpoint.protocol()),
-                )
-            }
-        };
+    pub(super) async fn select_endpoint(&self, pre: Option<Socks5PreEndpoint>) -> Result<Owner> {
         tokio::select! {
             biased;
             _ = self.cancel.cancelled() => bail!("реестр закрыт"),
             result = self.select_inner(pre) => result,
+        }
+    }
+
+    pub(super) fn pre_scopes(&self) -> &route_pool::ScopeMap {
+        &self.pre_scopes
+    }
+
+    pub(super) fn is_closing(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    /// Whether the client for `pre` can carry a connection right now: it is
+    /// the main client, or its owner finished starting and is not failed.
+    pub(super) async fn is_ready(&self, pre: &Option<Socks5PreEndpoint>) -> bool {
+        if *pre == self.global_pre {
+            return true;
+        }
+        let entry = {
+            let state = self.state.lock().await;
+            state
+                .entries
+                .iter()
+                .find(|entry| entry.pre == *pre)
+                .cloned()
+        };
+        entry.is_some_and(|entry| {
+            entry.state.try_lock().is_ok_and(|state| {
+                state.tunnel.is_some() && !state.failed && state.constructing.is_none()
+            })
+        })
+    }
+
+    /// Starts the clients of `pres` in the background, a few at a time, and
+    /// returns the task doing it. Endpoints whose client was already started,
+    /// or that no client is needed for, are skipped; if nothing is left there
+    /// is no task. Endpoints beyond the capacity stay unavailable.
+    pub(super) async fn start_background(
+        self: &Arc<Self>,
+        pres: Vec<Socks5PreEndpoint>,
+    ) -> Option<JoinHandle<()>> {
+        let mut fresh = Vec::new();
+        for pre in pres {
+            if let Ok(Some(entry)) = self.reserve(Some(pre.clone())).await {
+                if entry.state.try_lock().is_ok_and(|state| !state.attempted) {
+                    fresh.push(pre);
+                }
+            }
+        }
+        if fresh.is_empty() {
+            return None;
+        }
+        let registry = Arc::clone(self);
+        Some(tokio::spawn(async move {
+            use futures::StreamExt;
+            futures::stream::iter(fresh)
+                .for_each_concurrent(START_CONCURRENCY, |pre| {
+                    let registry = &registry;
+                    async move {
+                        let _ = registry.select_endpoint(Some(pre)).await;
+                    }
+                })
+                .await;
+        }))
+    }
+
+    /// Retries, in the background, a client that failed to finish starting.
+    /// Does nothing for the main client or a client in any other state.
+    pub(super) fn revive(self: &Arc<Self>, pre: Socks5PreEndpoint) {
+        let registry = Arc::clone(self);
+        tokio::spawn(async move { registry.revive_inner(pre).await });
+    }
+
+    /// cancel-safe: YES — the entry keeps its tunnel; a cancelled retry leaves it failed.
+    async fn revive_inner(&self, pre: Socks5PreEndpoint) {
+        let entry = {
+            let state = self.state.lock().await;
+            state
+                .entries
+                .iter()
+                .find(|entry| entry.pre.as_ref() == Some(&pre))
+                .cloned()
+        };
+        let Some(entry) = entry else { return };
+        let mut state = entry.state.lock().await;
+        if !state.failed || state.constructing.is_some() {
+            return;
+        }
+        let Some(tunnel) = state.tunnel.clone() else {
+            return;
+        };
+        let deadline = Instant::now() + SETUP_DEADLINE;
+        let retry = tokio::time::timeout_at(deadline, async {
+            #[cfg(test)]
+            if let Some(hook) = &self.revive_hook {
+                return hook().await;
+            }
+            tunnel
+                .wait_bootstrapped()
+                .await
+                .map_err(|_| anyhow!("не удалось запустить Tor владельца"))
+        });
+        tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => {}
+            result = retry => {
+                if matches!(result, Ok(Ok(()))) {
+                    state.failed = false;
+                }
+            }
         }
     }
 
@@ -420,6 +528,15 @@ impl OwnerRegistry {
 }
 
 impl Owner {
+    /// The main client, selected without a registry.
+    pub(super) fn global(handle: TorHandle) -> Self {
+        Self {
+            global: Some(handle),
+            alternate: None,
+            selected: None,
+        }
+    }
+
     pub(super) fn global_handle(&self) -> Option<&TorHandle> {
         self.global.as_ref()
     }
@@ -432,6 +549,24 @@ impl Owner {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+impl OwnerRegistry {
+    /// Test seam: an owner whose client has already been started.
+    pub(super) async fn adopt_started(
+        &self,
+        pre: Socks5PreEndpoint,
+        tunnel: TorTunnel,
+        failed: bool,
+    ) {
+        let entry = self.reserve(Some(pre)).await.unwrap().unwrap();
+        let mut state = entry.state.lock().await;
+        state.attempted = true;
+        state.failed = failed;
+        state.slot = Some(1);
+        state.tunnel = Some(tunnel);
     }
 }
 

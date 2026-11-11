@@ -17,7 +17,7 @@ pub use arti_client::config::BridgeConfigBuilder;
 use arti_client::config::{CfgPath, Reconfigure, TorClientConfigBuilder};
 /// Поток данных, открытый через Tor.
 pub use arti_client::DataStream;
-use arti_client::{TorClient, TorClientConfig};
+use arti_client::{BootstrapBehavior, TorClient, TorClientConfig};
 use bridge_line::BridgeLine;
 /// Назначение канала при запросе к менеджеру Arti.
 pub use tor_chanmgr::ChannelUsage;
@@ -543,6 +543,26 @@ impl TorTunnel {
         Ok(tunnel)
     }
 
+    /// [`create_unbootstrapped_with`](Self::create_unbootstrapped_with) for a
+    /// client that never bootstraps on demand: a stream opened before
+    /// [`wait_bootstrapped`](Self::wait_bootstrapped) has finished fails at
+    /// once with `ErrorKind::BootstrapRequired` instead of starting a
+    /// bootstrap of its own, which is what lets tests obtain that error
+    /// without a network.
+    pub fn create_manual_with(settings: Settings) -> Result<Self> {
+        let iat_mode = settings.obfs4_iat_mode;
+        let config = build_config(&settings)?;
+        let client = tor_builder(config)
+            .bootstrap_behavior(BootstrapBehavior::Manual)
+            .create_unbootstrapped()
+            .map_err(TorError::Bootstrap)?;
+        Ok(Self {
+            inner: client,
+            obfs4_iat_mode: Arc::new(RwLock::new(iat_mode)),
+            pre_endpoint: Some(settings.pre_endpoint),
+        })
+    }
+
     /// Wait for the client to reach a usable directory.
     ///
     /// Safe to wrap in an external timeout: cancelling this future only
@@ -725,9 +745,9 @@ mod pre_endpoint;
 #[path = "proxy/stream.rs"]
 mod routed_stream;
 mod validate;
-pub use blame::{PostBlame, PostFailure};
+pub use blame::{is_pre_path_failure, PostBlame, PostFailure};
 pub use post_endpoint::{connect_post_proxy, connect_post_proxy_blamed, connect_post_socks};
-pub use post_probe::{probe_post_proxy, PostProbe};
+pub use post_probe::{probe_post_proxy, probe_proxy_direct, ProxyProbe};
 pub use pre_endpoint::Socks5PreEndpoint;
 pub use routed_stream::RoutedStream;
 pub use socks5_proto::client::Credentials as PostSocksCredentials;
