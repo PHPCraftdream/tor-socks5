@@ -71,12 +71,12 @@ marker/test changes. The other local functional patches were not accepted in
 Arti 0.48.
 
 The crates' original `MIT OR Apache-2.0` offers and source notices are
-preserved, and prominent change notices were added. The standard Apache-2.0
-license text is delivered in each crate; this is not represented as upstream
-license retrieval. The pinned upstream GitLab
-retrievals for `LICENSE-MIT` and `LICENSE-APACHE` returned HTTP 403; no
-standalone MIT text was delivered. Whether any particular §4(c) source notice
-applies is not established, and §4(b) notice completeness is not claimed.
+preserved, and prominent change notices were added. Each crate carries Arti's
+own `LICENSE-MIT` and `LICENSE-APACHE` (from the pinned upstream commit; the
+official GitLab download returns HTTP 403, so the files were read from a public
+mirror and checked against independent copies, see PROVENANCE). Whether any
+particular §4(c) source notice applies is not established, and §4(b) notice
+completeness is not claimed.
 Differences from upstream alone do not establish patch authorship or licensing.
 See [PROVENANCE.md](PROVENANCE.md) for scope and evidence; this is not legal
 approval or global clearance. No compatibility, support, or security guarantees
@@ -93,8 +93,8 @@ not vendored here. The root `Cargo.toml` declares its crates.io packages
 dependencies; there is no sibling-checkout `[patch.crates-io]` override.
 
 See [PROVENANCE.md](PROVENANCE.md) for the eight published README license
-offers, byte-identical standard Apache-2.0 license copies, the bounded source
-basis, the unresolved upstream GitLab 403 and §4(c) applicability, and the
+offers, the `LICENSE-MIT` and `LICENSE-APACHE` copies and how they were obtained
+and checked, the bounded source basis, §4(c) applicability, and the
 record of nine files now carrying prominent §4(b) change-notice comments. This
 does not claim legal approval or global clearance.
 

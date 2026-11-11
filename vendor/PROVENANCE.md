@@ -67,8 +67,8 @@ evidence, not part of this deliverable.
 
 After the 0.48.0 sync, native `git diff --no-index` comparisons of each
 `vendor/<crate>` tree against its extracted 0.48.0 archive report the following
-differences; `LICENSE-APACHE`, delivered separately below, and this provenance
-document are excluded. The sync merged each file three ways (base: the
+differences; `LICENSE-MIT` and `LICENSE-APACHE`, delivered separately below,
+and this provenance document are excluded. The sync merged each file three ways (base: the
 0.47.0 archive, ours: the previous `vendor/` tree, theirs: the 0.48.0 archive);
 only the `version` lines of the `Cargo.toml` manifests conflicted and were
 resolved by hand. `Cargo.toml` changes include local vendoring/patch
@@ -110,21 +110,44 @@ Each unchanged package README explicitly offers `MIT OR Apache-2.0`:
 | `tor-ptmgr` 0.48.0 | 58 |
 | `saturating-time` 0.6.0 | 106 |
 
-A byte-for-byte copy of the complete standard Apache-2.0 license text is now
-provided as `LICENSE-APACHE` in each of these eight crate directories. The
-operator-authorized retained text came from a file named
-`wasm-tools-upstream-capture/LICENSE-APACHE`; its SHA-256 is
-`a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2`, also
-verified for every delivered copy. This is the standard license text, **not an
-Arti upstream LICENSE download**, and does not convey or imply a wasm-tools,
-LLVM, Mozilla, or other copyright grant in Arti source. No holder is inferred
-from the license text, package authors, or the repository's root license.
+Each of these eight crate directories carries `LICENSE-MIT` and `LICENSE-APACHE`
+copied from the Arti repository at the pinned upstream commit
+`7c038125baef924a4bf287429c192c5af606f79c`. The two files are the same blobs at
+the previous baseline commit `ce8bc6e0998bd5a4efdf06dd62dce53c98ea1087`:
+
+| File | Bytes | Git blob id | SHA-256 |
+|---|---:|---|---|
+| `LICENSE-MIT` | 1067 | `46f0bc9287a5da523702aaf1265f16422e7c9d65` | `e40081d18f17b6783fcb554ae42f6fa3548988e4d705a3e4541e2ef240293040` |
+| `LICENSE-APACHE` | 11358 | `d645695673349e3947e8e5ae42332d0ac3164cd7` | `cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30` |
+
+`LICENSE-MIT` opens with the notice `Copyright 2019-2025, The Tor Project, Inc.`
+as delivered; nothing beyond that text is inferred about a holder. The crates.io
+archives contain no `LICENSE*` member, and the official GitLab raw paths
+returned HTTP 403 (for 0.47.0 in the earlier retrieval and again for a plain web
+request on 2026-11-11), so the files were read on 2026-11-11 from the public
+cgit mirror `https://git.jordan.im/arti` (the file view
+`/arti/tree/<path>?id=<commit>` at each pinned commit; the mirror's raw view is
+disabled), reconstructed line by line, and checked three ways: the
+reconstructed byte count equals the size the mirror states for the file; the Git
+blob ids equal the ones the GitHub contents API reports for the same two files
+in two independent repositories that track Arti (`zakura-core/arti` and
+`bunkerlab-net/docker-arti`); and the Apache blob is the widely used canonical
+Apache-2.0 text. The mirror and those repositories are not the official host,
+so the identity of the files at the pinned commit rests on that agreement, not
+on an official download.
+
+Earlier copies of `LICENSE-APACHE` in these directories were a standard-text
+file taken from a local capture named `wasm-tools-upstream-capture/LICENSE-APACHE`
+(SHA-256 `a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2`),
+not an Arti file; Arti's own file replaces them. Neither version conveys or
+implies a wasm-tools, LLVM, Mozilla, or other copyright grant in Arti source.
+No holder is inferred from package authors or the repository's root license.
 
 The source package README files and any source copyright/notice material were
 not edited. Apache-2.0 §4(a) license-copy delivery is in place for the README
 offers. The archived package listings contained no standalone `NOTICE` member;
 §4(d)'s NOTICE preservation is conditional and is not presumed required solely
-because a root-file retrieval was unavailable. The scoped filename/text review of the exact registry archives (archive member
+because a root-file retrieval was unavailable at the time. The scoped filename/text review of the exact registry archives (archive member
 names, package READMEs, and `Cargo.toml.orig`) found no competing file-level
 grant or standalone NOTICE. This is not a claim about arbitrary upstream
 source or files outside that archive scope. Relevant source attribution
@@ -137,7 +160,7 @@ math reference, Codeberg maintenance history, or fixture presence alone is not
 treated as evidence of an additional license requirement; no independent grant
 is inferred for those materials.
 
-## Modification notices and unresolved retrieval
+## Modification notices
 
 The comparison table above identifies the modified paths. Existing
 `tor-socks5 local patch` comments occur in many modified source files. These
@@ -163,10 +186,9 @@ been noticed or otherwise determine §4(b) compliance.
 
 The retrieval worker reported HTTP 403 for the pinned upstream GitLab raw paths
 `/-/raw/ce8bc6e0998bd5a4efdf06dd62dce53c98ea1087/LICENSE-MIT` and
-`/-/raw/ce8bc6e0998bd5a4efdf06dd62dce53c98ea1087/LICENSE-APACHE`. That
-historical retrieval remains unresolved; no retry, alternate URL, provider,
-mirror, or history was used in this task. The copied standard Apache text is
-not represented as that unavailable Arti file. No MIT license text was added.
+`/-/raw/ce8bc6e0998bd5a4efdf06dd62dce53c98ea1087/LICENSE-APACHE`; that official
+download is still unavailable. The license texts are delivered from the mirror
+described above instead, with the stated checks and their limits.
 
 Applicable Apache-2.0 §4(c) source notices remain to be retained; this task did
 not alter source README/copyright/notice bytes or establish individual notice
