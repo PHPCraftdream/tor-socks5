@@ -191,7 +191,7 @@ class External(unittest.TestCase):
         self.assertEqual(result["packages"], members)
         self.assertIn({"segment": "rust", "target": "macos-latest"}, result["target_rows"])
         self.assertIn("footer коммита CI-Full: sprint-end", result["reasons"]["rust"])
-        self.assertEqual(result["segments"], sorted(["fast", "rust", "msrv", "android", "tor", "vendor", "vendor-extra", "docs-contract", "installer-sh", "installer-windows", "release", "features", "stress", "regression", "native-portability", "required"]))
+        self.assertEqual(result["segments"], sorted(["fast", "rust", "msrv", "android", "tor", "vendor", "vendor-extra", "docs-contract", "installer-sh", "installer-windows", "release", "features", "stress", "regression", "native-portability", "vendor-notices", "required"]))
         self.assertEqual(result["command_packages"]["android"], ["android-ffi", "socks5-proxy"])
         self.assertEqual(result["shipping_packages"], ["android-ffi", "socks5-proxy"])
         self.assertEqual(result["library_packages"], sorted(["android-ffi", "arti-wrapper", "bridge-probe", "tor-socks5-auth", "tor-socks5-client-acl", "tor-socks5-config"]))
@@ -220,7 +220,7 @@ class External(unittest.TestCase):
             "native-portability": ("native-portability",),
             "vendor-extra": ("vendor-extra", "vendor"), "features": ("features",),
             "stress": ("stress",), "license-offline": ("license-offline",),
-            "license-audit": ("license-audit",),
+            "license-audit": ("license-audit",), "vendor-notices": ("vendor-notices",),
         }
         self.assertEqual(expected_consumers, dict(p.RESULT_JOBS))
         needs = {job: {"result": "success" if any(s in result["segments"] for s in selections) else "skipped"} for job, selections in expected_consumers.items()}
