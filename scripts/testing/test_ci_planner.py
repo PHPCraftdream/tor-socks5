@@ -3,6 +3,8 @@
 import importlib.util
 import os
 from pathlib import Path
+import random
+import types
 import unittest
 
 spec = importlib.util.spec_from_file_location("ci_planner", Path(__file__).with_name("ci_planner.py"))
@@ -255,46 +257,39 @@ class Routing(unittest.TestCase):
         needs["plan"] = {"result": "success"}
         p.validate_results(first, needs)
 
-    def test_lock_removed_identity_fail_closed(self):
-        graph = lock_graph()
-        with self.assertRaisesRegex(p.MappingError, "missing mapping"):
-            p.lock_seeds(lock_text(lock_package("orphan", "1.0.0")), lock_text(), graph)
+    def test_lock_removals_need_no_mapping(self):
         registry = "registry+https://github.com/rust-lang/crates.io-index"
-        ambiguous = lock_text(
-            lock_package("ptrs-gesher-lyrebird", "0.7.0", registry, ("fast-socks5",)),
-            lock_package("fast-socks5", "0.10.0", registry),
-            lock_package("fast-socks5", "0.11.0", registry),
-        )
-        with self.assertRaisesRegex(p.MappingError, "missing mapping"):
-            p.lock_seeds(ambiguous, lock_text(), graph)
-        mixed = lock_text(
-            lock_package("socks5-proxy", "0.2.0", dependencies=("middle 1.0.0 (" + registry + ")",)),
-            lock_package("middle", "1.0.0", registry, ("leaf 1.0.0 (" + registry + ")",)),
-            lock_package("leaf", "1.0.0", registry),
-            lock_package("orphan", "1.0.0"),
-        )
-        mixed_new = lock_text(
-            lock_package("socks5-proxy", "0.2.0", dependencies=("middle 2.0.0 (" + registry + ")",)),
-            lock_package("middle", "2.0.0", registry),
-        )
-        with self.assertRaisesRegex(p.MappingError, "missing mapping"):
-            p.lock_seeds(mixed, mixed_new, lock_graph(extra_packages=(
-                ("middle-new", "middle", "2.0.0", registry, "external/middle", "lib"),)))
-        orphan_branch = lock_text(
-            lock_package("middle", "1.0.0", registry, ("leaf 1.0.0 (" + registry + ")",)),
-            lock_package("orphan-parent", "1.0.0", registry, ("leaf 1.0.0 (" + registry + ")",)),
-            lock_package("leaf", "1.0.0", registry),
-        )
-        orphan_branch_new = lock_text(lock_package("middle", "2.0.0", registry))
-        with self.assertRaisesRegex(p.MappingError, "missing mapping"):
-            p.lock_seeds(orphan_branch, orphan_branch_new, lock_graph(extra_packages=(
-                ("middle-new", "middle", "2.0.0", registry, "external/middle", "lib"),)))
-        cyclic = lock_text(
-            lock_package("cycle-a", "1.0.0", dependencies=("cycle-b 1.0.0",)),
-            lock_package("cycle-b", "1.0.0", dependencies=("cycle-a 1.0.0",)),
-        )
-        with self.assertRaisesRegex(p.MappingError, "missing mapping"):
-            p.lock_seeds(cyclic, lock_text(), graph)
+        graph = lock_graph()
+        # A package nobody uses any more leaves no seed of its own.
+        self.assertEqual(p.lock_seeds(lock_text(lock_package("orphan", "1.0.0")), lock_text(), graph), set())
+        # One of several locked versions goes away: the consumer that moved is the seed.
+        old = lock_text(lock_package("changed", "0.10.0", registry),
+                        lock_package("changed", "0.14.0", registry),
+                        lock_package("changed", "0.15.0", registry),
+                        lock_package("socks5-proxy", "0.2.0", None, ("changed 0.14.0",)))
+        new = lock_text(lock_package("changed", "0.10.0", registry),
+                        lock_package("changed", "0.15.0", registry),
+                        lock_package("socks5-proxy", "0.2.0", None, ("changed 0.15.0",)))
+        self.assertEqual(p.lock_seeds(old, new, graph), {"proxy"})
+        # A dependency that is only dropped: its consumer is the seed.
+        old = lock_text(lock_package("socks5-proxy", "0.2.0", None, ("leaf 1.0.0",)),
+                        lock_package("leaf", "1.0.0", registry))
+        new = lock_text(lock_package("socks5-proxy", "0.2.0"))
+        self.assertEqual(p.lock_seeds(old, new, graph), {"proxy"})
+
+    def test_lock_that_does_not_resolve_its_own_dependencies_fails_closed(self):
+        registry = "registry+https://github.com/rust-lang/crates.io-index"
+        graph = lock_graph()
+        ghost = lock_text(lock_package("socks5-proxy", "0.2.0", None, ("ghost 1.0.0",)))
+        two_versions = lock_text(lock_package("socks5-proxy", "0.2.0", None, ("leaf",)),
+                                 lock_package("leaf", "1.0.0", registry),
+                                 lock_package("leaf", "2.0.0", registry))
+        source_without_version = lock_text(
+            lock_package("socks5-proxy", "0.2.0", None, ("leaf (" + registry + ")",)),
+            lock_package("leaf", "1.0.0", registry))
+        for bad in (ghost, two_versions, source_without_version):
+            with self.assertRaisesRegex(p.MappingError, "missing mapping"):
+                p.lock_seeds(lock_text(), bad, graph)
 
     def test_lock_source_qualified_reverse_mapping(self):
         registry_a = "registry+https://example.invalid/a"
@@ -349,20 +344,21 @@ class Routing(unittest.TestCase):
             ("leaf-current", "leaf", "2.0.0", registry_b, "external/leaf", "lib")))
         self.assertEqual(p.lock_seeds(wrong_source_old, wrong_source_new, wrong_source_graph),
                          {"middle-current", "leaf-current"})
-        without_b = lock_text(lock_package("leaf", "1.0.0", registry_b))
+        with_b = lock_text(lock_package("leaf", "1.0.0", registry_b))
         leaf_graph = lock_graph(extra_packages=(
             ("leaf-b", "leaf", "1.0.0", registry_b, "external/leaf-b", "lib"),))
-        with self.assertRaisesRegex(p.MappingError, "missing mapping"):
-            p.lock_seeds(lock_text(lock_package("leaf", "1.0.0", registry_a)), without_b, leaf_graph)
+        self.assertEqual(
+            p.lock_seeds(lock_text(lock_package("leaf", "1.0.0", registry_a)), with_b, leaf_graph),
+            {"leaf-b"})
         unresolved = lock_text(
             lock_package("middle", "1.0.0", registry_a, ("leaf",)),
             lock_package("leaf", "1.0.0", registry_a),
             lock_package("leaf", "1.0.0", registry_b),
         )
         with self.assertRaisesRegex(p.MappingError, "missing mapping"):
-            p.lock_seeds(unresolved, lock_text(), graph)
+            p.lock_seeds(lock_text(), unresolved, graph)
 
-    def test_lock_rejects_ambiguous_replacements_and_graph_mismatch(self):
+    def test_lock_seeds_must_map_to_the_graph(self):
         registry = "registry+https://github.com/rust-lang/crates.io-index"
         old = lock_text(lock_package("changed", "1.0.0", registry))
         replacements = lock_text(lock_package("changed", "2.0.0", registry),
@@ -370,8 +366,8 @@ class Routing(unittest.TestCase):
         graph = lock_graph(extra_packages=(
             ("changed-2", "changed", "2.0.0", registry, "external/changed", "lib"),
             ("changed-3", "changed", "3.0.0", registry, "external/changed", "lib")))
-        with self.assertRaisesRegex(p.MappingError, "missing mapping"):
-            p.lock_seeds(old, replacements, graph)
+        # Every new package is a seed; nothing is guessed about the removed one.
+        self.assertEqual(p.lock_seeds(old, replacements, graph), {"changed-2", "changed-3"})
         unknown_new = lock_text(lock_package("not-in-graph", "1.0.0", registry))
         with self.assertRaisesRegex(p.MappingError, "missing mapping"):
             p.lock_seeds(lock_text(), unknown_new, graph)
@@ -381,7 +377,7 @@ class Routing(unittest.TestCase):
             p.lock_seeds(lock_text(), lock_text(lock_package("changed", "2.0.0", registry)),
                          wrong_graph_version)
 
-    def test_lock_replacement_ignores_versions_that_were_already_locked(self):
+    def test_lock_seeds_are_only_the_new_and_changed_entries(self):
         registry = "registry+https://github.com/rust-lang/crates.io-index"
         old = lock_text(lock_package("changed", "1.0.0", registry),
                         lock_package("changed", "2.0.0", registry))
@@ -396,19 +392,8 @@ class Routing(unittest.TestCase):
         both_graph = lock_graph(extra_packages=(
             ("changed-3", "changed", "3.0.0", registry, "external/changed-3", "lib"),
             ("changed-4", "changed", "4.0.0", registry, "external/changed-4", "lib")))
-        with self.assertRaisesRegex(p.MappingError, "missing mapping"):
-            p.lock_seeds(lock_text(lock_package("changed", "1.0.0", registry)), both_new, both_graph)
-
-    def test_lock_removal_with_other_versions_still_locked_is_not_ambiguous(self):
-        registry = "registry+https://github.com/rust-lang/crates.io-index"
-        old = lock_text(lock_package("changed", "0.10.0", registry),
-                        lock_package("changed", "0.14.0", registry),
-                        lock_package("changed", "0.15.0", registry),
-                        lock_package("socks5-proxy", "0.2.0", None, ("changed 0.14.0",)))
-        new = lock_text(lock_package("changed", "0.10.0", registry),
-                        lock_package("changed", "0.15.0", registry),
-                        lock_package("socks5-proxy", "0.2.0", None, ("changed 0.15.0",)))
-        self.assertEqual(p.lock_seeds(old, new, lock_graph()), {"proxy"})
+        self.assertEqual(p.lock_seeds(lock_text(lock_package("changed", "1.0.0", registry)), both_new, both_graph),
+                         {"changed-3", "changed-4"})
 
     def test_rename_delete_unknown(self):
         result = self.route("packages/auth/src/old.rs", "packages/bridge-probe/src/new.rs")
@@ -671,10 +656,14 @@ jobs:
         self.assertEqual(self.route(path)["segments"], ["fast", "installer-sh", "installer-windows", "release"])
         self.assertEqual(self.route(path, capabilities={"license_policy": True})["segments"], ["fast", "installer-sh", "installer-windows", "release"])
         self.assertEqual(self.route(".github/install/install.sh")["segments"], ["fast", "installer-sh"])
-        for path, old, new in (("Cargo.toml", '[workspace.dependencies]\nold="1"', '[workspace.dependencies]\nnew="1"'),
-                               ("Cargo.lock", 'version=3\n[[package]]\nname="old"\nversion="1"', 'version=3\n')):
-            with self.assertRaisesRegex(p.MappingError, "missing mapping"):
-                self.route(path, blobs={path: (old, new)}, capabilities={"license_policy": True})
+        path, old, new = "Cargo.toml", '[workspace.dependencies]\nold="1"', '[workspace.dependencies]\nnew="1"'
+        with self.assertRaisesRegex(p.MappingError, "missing mapping"):
+            self.route(path, blobs={path: (old, new)}, capabilities={"license_policy": True})
+        # A lock package that only disappears touches nothing that is left.
+        before, after = 'version=3\n[[package]]\nname="old"\nversion="1"', 'version=3\n'
+        removed = self.route("Cargo.lock", blobs={"Cargo.lock": (before, after)},
+                             capabilities={"license_policy": True})
+        self.assertEqual(removed["packages"], [])
         workflow = Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml"
         blocks = p.workflow_blocks(workflow.read_text(encoding="utf-8"))
         self.assertNotIn("'regression'", blocks["stress"])
@@ -814,6 +803,105 @@ jobs:
             raise p.MappingError("git")
         with self.assertRaises(p.MappingError):
             p.comparison("push", "affected", "base", "head", "", failed)
+
+
+class LockSpecification(unittest.TestCase):
+    """lock_seeds against the definition: a member is affected iff its dependency closure changed."""
+
+    REGISTRY = "registry+https://example.invalid/index"
+
+    @classmethod
+    def universe(cls, rng):
+        members = [("m%d" % i, "0.1.0", None) for i in range(rng.randint(1, 3))]
+        crates = [("c%d" % n, version, cls.REGISTRY) for n in range(rng.randint(2, 7))
+                  for version in rng.sample(["1.0.0", "2.0.0", "3.0.0"], rng.randint(1, 2))]
+        lock = {}
+        for position, ident in enumerate(members + crates):
+            later = [c for c in crates if crates.index(c) > position - len(members) and c[0] != ident[0]]
+            deps = {}
+            for target in rng.sample(later, min(len(later), rng.randint(0, 3))):
+                deps.setdefault(target[0], target)
+            lock[ident] = {"checksum": "sum-%s-%s" % ident[:2], "deps": list(deps.values())}
+        return cls.reachable(lock)
+
+    @staticmethod
+    def reachable(lock):
+        keep = {ident for ident in lock if ident[2] is None}
+        stack = list(keep)
+        while stack:
+            for dep in lock[stack.pop()]["deps"]:
+                if dep in lock and dep not in keep:
+                    keep.add(dep)
+                    stack.append(dep)
+        return {ident: entry for ident, entry in lock.items() if ident in keep}
+
+    @classmethod
+    def mutate(cls, rng, lock):
+        new = {ident: {"checksum": entry["checksum"], "deps": list(entry["deps"])} for ident, entry in lock.items()}
+        for _ in range(rng.randint(1, 3)):
+            crates = [ident for ident in new if ident[2] is not None]
+            if not crates:
+                break
+            kind, crate = rng.choice(("bump", "drop_dep", "checksum", "drop_crate")), rng.choice(crates)
+            if kind == "bump":
+                bumped = (crate[0], rng.choice(("4.0.0", "5.0.0")), cls.REGISTRY)
+                if bumped not in new:
+                    new[bumped] = {"checksum": "sum-%s-%s" % bumped[:2], "deps": list(new.pop(crate)["deps"])}
+                    for entry in new.values():
+                        entry["deps"] = [bumped if dep == crate else dep for dep in entry["deps"]]
+            elif kind == "drop_dep":
+                holder = rng.choice(list(new))
+                if new[holder]["deps"]:
+                    new[holder]["deps"].pop(rng.randrange(len(new[holder]["deps"])))
+            elif kind == "checksum":
+                new[crate]["checksum"] += "-changed"
+            else:
+                del new[crate]
+                for entry in new.values():
+                    entry["deps"] = [dep for dep in entry["deps"] if dep != crate]
+        return cls.reachable(new)
+
+    @staticmethod
+    def text(lock):
+        versions = {}
+        for ident in lock:
+            versions.setdefault(ident[0], []).append(ident)
+        packages = []
+        for ident, entry in lock.items():
+            deps = tuple(dep[0] if len(versions[dep[0]]) == 1 else "%s %s" % dep[:2] for dep in entry["deps"])
+            packages.append(lock_package(ident[0], ident[1], ident[2], deps) +
+                            ('checksum = "%s"\n' % entry["checksum"] if ident[2] else ""))
+        return lock_text(*packages)
+
+    @staticmethod
+    def closure(lock, root):
+        seen, stack = {}, [root]
+        while stack:
+            ident = stack.pop()
+            if ident not in seen:
+                seen[ident] = (ident, lock[ident]["checksum"], tuple(sorted(lock[ident]["deps"])))
+                stack.extend(lock[ident]["deps"])
+        return set(seen.values())
+
+    def test_planner_matches_the_closure_definition(self):
+        rng = random.Random(20261111)
+        for case in range(300):
+            old = self.universe(rng)
+            new = self.universe(rng) if case % 4 == 0 else self.mutate(rng, old)
+            graph = types.SimpleNamespace(packages={i: {"name": i[0], "version": i[1], "source": i[2]} for i in new})
+            seeds = p.lock_seeds(self.text(old), self.text(new), graph)
+            consumers = {}
+            for ident, entry in new.items():
+                for dep in entry["deps"]:
+                    consumers.setdefault(dep, set()).add(ident)
+            affected, stack = set(), list(seeds)
+            while stack:
+                ident = stack.pop()
+                if ident not in affected:
+                    affected.add(ident)
+                    stack.extend(consumers.get(ident, ()))
+            expected = {m for m in new if m[2] is None and (m not in old or self.closure(old, m) != self.closure(new, m))}
+            self.assertEqual({i for i in affected if i[2] is None}, expected, "case %d" % case)
 
 
 class CommitFooter(unittest.TestCase):
