@@ -42,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   temporary sibling-checkout binding. Executed consumer acceptance of the
   registry build remains outstanding.
 - Dependency advisories are now checked in CI (`cargo deny check advisories`, in the license-audit job). The lockfile moves `crossbeam-epoch` to 0.9.21, `ctutils` to 0.4.8, `webpki-roots` to 1.0.12, `plist` to 1.10.3 (`quick-xml` 0.42.0) and `spin` to 0.9.9; four advisories with no usable fix stay ignored in `.github/deny.toml`, each with its reason.
+- Documented the git/tag patch-kit for external Arti 0.48 bridge/PT/Windows consumers, including consumer-root and publishing restrictions, exact-version/lockfile guidance, stock defaults and feature opt-ins, and provenance limitations; see `vendor/README.md`. The vendored `arti-client` now gates its `transports()` accessor behind `pt-client` like the field it reads, so the fork compiles without that feature (it failed to, which only a consumer building with default features could notice).
 
 ## [0.2.0] - 2026-10-12
 

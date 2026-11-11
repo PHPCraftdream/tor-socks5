@@ -153,6 +153,8 @@ automatic recovery for those owners is not implemented here.
 
 Requires Rust 1.92 or newer (edition 2021 for first-party crates).
 
+For reusing the Arti 0.48 bridge, PT, and Windows patches in a fork, see [Using these patches in your own project](vendor/README.md#using-these-patches-in-your-own-project) for the tagged `[patch.crates-io]` setup.
+
 The workspace resolves `ktav` 0.8.1, `resocks5-net` 0.5.1 and the five
 `ptrs-gesher-*` 0.8.0 crates from the registry (crates.io). The SDK's
 `AuthMethods::cleartext_only` policy delegates inbound password checks to

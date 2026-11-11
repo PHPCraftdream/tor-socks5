@@ -8,6 +8,80 @@ This directory holds **full source copies** of upstream crates from the
 **Base line: Arti 0.48.0 (arti 2.8.0), synced 2026-11-10.**
 Workspace MSRV is 1.92 (up from 1.89 on the 0.43 line).
 
+## Using these patches in your own project
+
+Add this to the **final binary's or workspace's root** `Cargo.toml`:
+
+```toml
+[patch.crates-io]
+arti-client = { git = "https://github.com/PHPCraftdream/tor-socks5", tag = "arti-patches-0.48.0" }
+tor-chanmgr = { git = "https://github.com/PHPCraftdream/tor-socks5", tag = "arti-patches-0.48.0" }
+tor-circmgr = { git = "https://github.com/PHPCraftdream/tor-socks5", tag = "arti-patches-0.48.0" }
+tor-dirclient = { git = "https://github.com/PHPCraftdream/tor-socks5", tag = "arti-patches-0.48.0" }
+tor-dirmgr = { git = "https://github.com/PHPCraftdream/tor-socks5", tag = "arti-patches-0.48.0" }
+tor-guardmgr = { git = "https://github.com/PHPCraftdream/tor-socks5", tag = "arti-patches-0.48.0" }
+tor-ptmgr = { git = "https://github.com/PHPCraftdream/tor-socks5", tag = "arti-patches-0.48.0" }
+saturating-time = { git = "https://github.com/PHPCraftdream/tor-socks5", tag = "arti-patches-0.48.0" }
+```
+
+Tags follow `arti-patches-<Arti version>`, with one tag per Arti line. This is
+Arti 0.48.x: seven crates are 0.48.0 and `saturating-time` is 0.6.0; the MSRV
+is Rust 1.92. These patches are not renamed crates.io releases: the crates must
+be patched together to keep cross-crate types consistent. Exact dependency
+versions must match; future compatible releases are not guaranteed to resolve
+to this patch set.
+
+`[patch]` belongs in the final binary/workspace root, is not inherited by
+libraries, and selects the source only: it does not enable features, so
+`pt-client` and the other `arti-client` features stay as you declare them on
+your own dependency. Keep the consumer's `Cargo.lock` (which records the
+resolved git SHA), inspect the result with `cargo tree -i <crate>`, and do not
+run `cargo update` blindly.
+
+A crate depending on these git sources cannot be published to crates.io as-is.
+Root-only patches are omitted or ignored when publishing a library, so its end
+users must add the patches themselves; a published library cannot promise its
+consumers the patched API.
+
+Default changes, in brief:
+
+* **Correctness/recovery fixes:** reject truncated `Content-Length` bodies;
+  bound bridge descriptor fetches to 30 s total; correct bridge recovery and
+  guard-readiness handling; retry exit-stream creation once within a bound;
+  classify SQLite busy locks as transient; redact proxy warning credentials.
+  Old persisted security-disabled guards still require a manual reset.
+* **Local policy:** directory body timeout is 90 s idle rather than the upstream
+  10 s total, with the 10 s header timeout retained; PT channel build is 45 s
+  rather than 10 s; bridge pool defaults are 12 parallel / 5 s retry rather
+  than 4 / 30 s. Poison recovery may expose stale state.
+* Added APIs must be called to take effect: PT shutdown receipt, channel
+  termination, manual guard reset, and fatal-exit observability. Fatal protocol
+  errors still call `process::exit(1)`; that behavior remains unchanged.
+  Defaults stay stock: `min_bandwidth_percentile = 0`, `initial_connect_timeout = None`
+  (Android's 4 s is not the consumer default), client circuit hops 3 and
+  service circuit hops 4. Hop shortening applies only in Disabled vanguard
+  mode and trades anonymity for shorter paths; ordinary exits remain 3 hops,
+  and SvcHsDir stems have a 2-hop minimum.
+
+See [Why each crate is vendored](#why-each-crate-is-vendored) and the
+[patch table](#patch-table) for details. Upstream `saturating-time` 0.6.0
+accepted the lazy limits and termination check; its remaining differences are
+marker/test changes. The other local functional patches were not accepted in
+Arti 0.48.
+
+The crates' original `MIT OR Apache-2.0` offers and source notices are
+preserved, and prominent change notices were added. The standard Apache-2.0
+license text is delivered in each crate; this is not represented as upstream
+license retrieval. The pinned upstream GitLab
+retrievals for `LICENSE-MIT` and `LICENSE-APACHE` returned HTTP 403; no
+standalone MIT text was delivered. Whether any particular §4(c) source notice
+applies is not established, and §4(b) notice completeness is not claimed.
+Differences from upstream alone do not establish patch authorship or licensing.
+See [PROVENANCE.md](PROVENANCE.md) for scope and evidence; this is not legal
+approval or global clearance. No compatibility, support, or security guarantees
+are made. Report issues at
+[the patch repository](https://github.com/PHPCraftdream/tor-socks5/issues).
+
 Vendored crates (8): `arti-client`, `tor-chanmgr`, `tor-circmgr`,
 `tor-dirclient`, `tor-dirmgr`, `tor-guardmgr`, `tor-ptmgr` — all at **0.48.0** — and
 `saturating-time` at **0.6.0**.
