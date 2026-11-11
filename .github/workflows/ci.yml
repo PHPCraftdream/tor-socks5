@@ -520,6 +520,17 @@ jobs:
       - name: Check dependency advisories
         run: cargo deny --locked --config .github/deny.toml check advisories
 
+  vendor-notices:
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.plan).segments, 'vendor-notices')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test the vendor notice check
+        run: python3 -B .github/license/test_check_vendor_notices.py
+      - name: Check vendored Arti notices against the pristine archives
+        run: python3 -B -I .github/license/check_vendor_notices.py --repo-root .
+
   license-lifecycle:
     needs: plan
     if: github.event_name == 'pull_request' && contains(fromJSON(needs.plan.outputs.plan).segments, 'license-lifecycle')
@@ -636,7 +647,7 @@ jobs:
   required:
     name: CI required
     if: always()
-    needs: [plan, fmt, line-limit, dir-entries, publish-guard, packageability, real-tor-channel, rust, msrv, android, docs-contract, installer-sh, installer-windows, release-scripts, native-portability, vendor-extra, features, stress, license-offline, license-audit]
+    needs: [plan, fmt, line-limit, dir-entries, publish-guard, packageability, real-tor-channel, rust, msrv, android, docs-contract, installer-sh, installer-windows, release-scripts, native-portability, vendor-extra, features, stress, license-offline, license-audit, vendor-notices]
     runs-on: ubuntu-latest
     env:
       NEEDS: ${{ toJSON(needs) }}

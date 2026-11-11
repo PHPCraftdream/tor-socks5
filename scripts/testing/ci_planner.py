@@ -241,6 +241,7 @@ JOB_SEGMENTS = {
     "vendor-extra": "vendor-extra", "features": "features", "native-portability": "native-portability",
     "portability-diagnostics": "native-portability",
     "license-offline": "license-offline", "license-audit": "license-audit", "license-producer": "fast", "stress": "stress",
+    "vendor-notices": "vendor-notices",
 }
 
 
@@ -614,7 +615,10 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
             add("native-portability", path)
         elif path.startswith("packages/proxy-config/examples/") or path == "README.md" or path == "tor-socks5.example.ktav" or path == "docs/architecture.md" or path.startswith("docs/guide/"):
             add("docs-contract", path)
-        elif path.startswith("docs/") or path in ("CHANGELOG.md", ".gitignore", ".gitattributes", "vendor/README.md", "vendor/PROVENANCE.md"):
+        elif path == "vendor/PROVENANCE.md":
+            add("fast", path)
+            add("vendor-notices", path)  # the notice check reads its tables
+        elif path.startswith("docs/") or path in ("CHANGELOG.md", ".gitignore", ".gitattributes", "vendor/README.md"):
             add("fast", path)
         elif path in (".github/install/tests/test_release.py", ".github/install/tests/gh_mock.py", ".github/install/tests/fixtures.py"):
             add("release", path)
@@ -646,6 +650,8 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
                 raise MappingError("missing mapping: license policy selected without installed identity")
             add("license-offline", path)
             add("license-audit", path)
+        elif path in (".github/license/check_vendor_notices.py", ".github/license/test_check_vendor_notices.py"):
+            add("vendor-notices", path)
         elif path.startswith(".github/license/"):
             if not license_policy:
                 raise MappingError("missing mapping: license policy selected without installed identity")
@@ -670,6 +676,8 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
                 except (ValueError, TypeError) as exc:
                     raise MappingError("missing mapping: ошибка TOML: " + path) from exc
             seed({owner}, path)
+            if path.startswith("vendor/"):
+                add("vendor-notices", path)  # checked against the pristine archives
             if path.startswith("vendor/") and owner not in graph.members:
                 add("vendor", path)
     selected = graph.closure(seeds) & graph.members
@@ -682,7 +690,7 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
         add("tor", "изменён код контракта Tor proxy")
     if mode == "sprint-full":
         selected = set(graph.members)
-        for segment in ("rust", "msrv", "android", "tor", "vendor", "vendor-extra", "docs-contract", "installer-sh", "installer-windows", "release", "features", "stress", "regression", "native-portability", "required"):
+        for segment in ("rust", "msrv", "android", "tor", "vendor", "vendor-extra", "docs-contract", "installer-sh", "installer-windows", "release", "features", "stress", "regression", "native-portability", "vendor-notices", "required"):
             add(segment, full_reason)
         if license_policy:
             add("license-offline", "license policy")
@@ -758,7 +766,7 @@ RESULT_JOBS = {
     "release-scripts": ("release",), "native-portability": ("native-portability",),
     "vendor-extra": ("vendor-extra", "vendor"), "features": ("features",),
     "stress": ("stress",), "license-offline": ("license-offline",),
-    "license-audit": ("license-audit",),
+    "license-audit": ("license-audit",), "vendor-notices": ("vendor-notices",),
 }
 
 
