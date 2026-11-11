@@ -99,6 +99,10 @@ starting. The configuration may name at most 16 distinct pre endpoints in total
 startup. Every extra client downloads its own directory data on each start and
 adds bridge load, so keep pre pools small.
 
+**Android.** The Android engine serves post pools, globally and per account, with
+the same rotation. Pre routes are not available there yet: a config with
+`pre_proxies` (global or per account) is refused at start rather than going direct.
+
 Protocol, endpoint and credentials participate in pre-owner identity. Errors
 never negotiate a different proxy protocol or fall back to a direct route. HTTPS-to-proxy is not
 part of this interface. All inbound proxy listeners use dual SOCKS5/HTTP CONNECT

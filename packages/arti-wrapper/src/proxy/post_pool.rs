@@ -4,14 +4,16 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arti_wrapper::{PostBlame, PostFailure, ProxyProbe, RoutedStream, TorError, TorTunnel};
-use proxy_config::ProxyPool;
+use client_acl::ProxyPool;
 use resocks5_net::types::ProxyConfig;
 use route_pool::{PoolError, ProbeOutcome, ScopeMap, Verdict};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::tor_watchdog::TorHandle;
+use crate::blame::{PostBlame, PostFailure};
+use crate::post_endpoint::connect_post_proxy_blamed;
+use crate::post_probe::{probe_post_proxy, ProxyProbe};
+use crate::{RoutedStream, TorError, TorTunnel};
 
 /// How often the background task looks for quarantined members due a probe.
 const PROBE_INTERVAL: Duration = Duration::from_secs(5);
@@ -21,19 +23,23 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(5);
 /// Accounts whose effective pools hold the same members share one scope, so
 /// they share quarantine state and the site-to-member assignment.
 #[derive(Default)]
-pub(crate) struct PostPools {
+pub struct PostPools {
     scopes: ScopeMap,
 }
 
 impl PostPools {
-    pub(crate) fn new() -> Self {
+    /// Pools with no rotation state yet; scopes appear at first use.
+    pub fn new() -> Self {
         Self::default()
     }
 
     /// Opens a stream to `host:port` through a member of `pool`.
     ///
+    /// The members are tried in turn within `deadline`; an exhausted pool is
+    /// an error, never a direct connection.
+    ///
     /// cancel-safe: NO — cancellation drops the attempt in flight.
-    pub(crate) async fn connect(
+    pub async fn connect(
         &self,
         tor: &TorTunnel,
         pool: &ProxyPool,
@@ -46,8 +52,7 @@ impl PostPools {
             host,
             deadline,
             move |proxy, attempt_deadline| async move {
-                arti_wrapper::connect_post_proxy_blamed(tor, &proxy, host, port, attempt_deadline)
-                    .await
+                connect_post_proxy_blamed(tor, &proxy, host, port, attempt_deadline).await
             },
         )
         .await
@@ -95,29 +100,37 @@ fn verdict(blame: PostBlame) -> Verdict {
 
 /// Starts the background task that re-checks quarantined post proxies.
 ///
-/// The probes run through the tunnel the handle currently holds, so a watchdog
-/// rebuild is picked up. The task stops when `cancel` fires.
-pub(crate) fn spawn_prober(
+/// `tunnel` yields the tunnel to probe through each time a probe starts, so a
+/// rebuilt tunnel is picked up; `None` makes that probe inconclusive. The task
+/// stops when `cancel` fires.
+pub fn spawn_post_prober<F, Fut>(
     pools: Arc<PostPools>,
-    handle: TorHandle,
+    tunnel: F,
     cancel: CancellationToken,
-) -> JoinHandle<()> {
+) -> JoinHandle<()>
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Option<TorTunnel>> + Send + 'static,
+{
     tokio::spawn(async move {
         route_pool::drive_probes(
             move || pools.scopes.scopes(),
             PROBE_INTERVAL,
-            move |proxy, deadline| probe_once(handle.clone(), proxy, deadline),
+            move |proxy, deadline| probe_once(tunnel(), proxy, deadline),
             cancel,
         )
         .await;
     })
 }
 
-async fn probe_once(handle: TorHandle, proxy: Arc<ProxyConfig>, deadline: Instant) -> ProbeOutcome {
-    let Some(tunnel) = handle.tunnel().await else {
+async fn probe_once<Fut>(tunnel: Fut, proxy: Arc<ProxyConfig>, deadline: Instant) -> ProbeOutcome
+where
+    Fut: Future<Output = Option<TorTunnel>>,
+{
+    let Some(tunnel) = tunnel.await else {
         return ProbeOutcome::Inconclusive;
     };
-    match arti_wrapper::probe_post_proxy(&tunnel, &proxy, deadline).await {
+    match probe_post_proxy(&tunnel, &proxy, deadline).await {
         ProxyProbe::Alive => ProbeOutcome::Alive,
         ProxyProbe::Dead => ProbeOutcome::Dead,
         ProxyProbe::Inconclusive => ProbeOutcome::Inconclusive,

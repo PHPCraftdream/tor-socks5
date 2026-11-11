@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use arti_wrapper::PostPools;
 #[cfg(test)]
 use arti_wrapper::TorTunnel;
 use auth::{AuthState, UsersConfig};
@@ -20,7 +21,6 @@ use tracing::{debug, error, info, warn};
 use crate::config::{Config, Loaded, SecurityConfig};
 use crate::conn_health::{spawn_conn_health_logger, ConnHealthCounters};
 use crate::dns_wiring::{convert_custom_doh_providers, convert_dns_overrides, dns_cache_path};
-use crate::post_pool::PostPools;
 use crate::route::{resolve_admitted_route, validate_account_routes, validate_post_compatibility};
 pub(crate) use crate::route::{RealTorConnector, TorConnector};
 use crate::startup::AuthStateVerifier;
@@ -359,9 +359,13 @@ pub(crate) async fn run_server(
     // Quarantined post proxies are re-checked in the background so a revived
     // one returns to rotation; stopped by the same token as the other producers.
     if let Egress::Tor(handle, pre, _, _, registry, pools) = &egress {
-        producer_owner.add(crate::post_pool::spawn_prober(
+        let tunnel_source = handle.clone();
+        producer_owner.add(arti_wrapper::spawn_post_prober(
             pools.clone(),
-            handle.clone(),
+            move || {
+                let handle = tunnel_source.clone();
+                async move { handle.tunnel().await }
+            },
             producer_token.clone(),
         ));
         // Pre pool members are Tor clients of their own. Those of the global
