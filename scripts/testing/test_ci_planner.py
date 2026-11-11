@@ -399,6 +399,17 @@ class Routing(unittest.TestCase):
         with self.assertRaisesRegex(p.MappingError, "missing mapping"):
             p.lock_seeds(lock_text(lock_package("changed", "1.0.0", registry)), both_new, both_graph)
 
+    def test_lock_removal_with_other_versions_still_locked_is_not_ambiguous(self):
+        registry = "registry+https://github.com/rust-lang/crates.io-index"
+        old = lock_text(lock_package("changed", "0.10.0", registry),
+                        lock_package("changed", "0.14.0", registry),
+                        lock_package("changed", "0.15.0", registry),
+                        lock_package("socks5-proxy", "0.2.0", None, ("changed 0.14.0",)))
+        new = lock_text(lock_package("changed", "0.10.0", registry),
+                        lock_package("changed", "0.15.0", registry),
+                        lock_package("socks5-proxy", "0.2.0", None, ("changed 0.15.0",)))
+        self.assertEqual(p.lock_seeds(old, new, lock_graph()), {"proxy"})
+
     def test_rename_delete_unknown(self):
         result = self.route("packages/auth/src/old.rs", "packages/bridge-probe/src/new.rs")
         self.assertIn("tor-socks5-auth", result["packages"])
