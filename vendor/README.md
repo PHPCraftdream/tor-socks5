@@ -34,9 +34,10 @@ to this patch set.
 `[patch]` belongs in the final binary/workspace root, is not inherited by
 libraries, and selects the source only: it does not enable features, so
 `pt-client` and the other `arti-client` features stay as you declare them on
-your own dependency. Keep the consumer's `Cargo.lock` (which records the
-resolved git SHA), inspect the result with `cargo tree -i <crate>`, and do not
-run `cargo update` blindly.
+your own dependency. Without `pt-client`, `tor-ptmgr` is not in your graph and
+Cargo warns that its patch "was not used"; that is expected. Keep the
+consumer's `Cargo.lock` (which records the resolved git SHA), inspect the result
+with `cargo tree -i <crate>`, and do not run `cargo update` blindly.
 
 A crate depending on these git sources cannot be published to crates.io as-is.
 Root-only patches are omitted or ignored when publishing a library, so its end
