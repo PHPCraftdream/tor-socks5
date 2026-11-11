@@ -38,6 +38,7 @@ impl EgressConnector for RecordingConnector {
     async fn open_egress(
         self,
         _target: HostPort<'_>,
+        _account_post: Option<&PoolOverride>,
     ) -> Result<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> {
         self.connects.fetch_add(1, Ordering::Relaxed);
         let (server_side, peer) = tokio::io::duplex(64);
@@ -51,6 +52,7 @@ fn loopback_policy() -> ConnectionPolicy {
         auth_state: None,
         block_onion: false,
         allowed_clients: AllowedClients::default(),
+        post: PostRouting::default(),
     }
 }
 
@@ -59,6 +61,7 @@ fn deny_policy() -> ConnectionPolicy {
         auth_state: None,
         block_onion: false,
         allowed_clients: "192.0.2.1".parse::<AllowedClients>().unwrap(),
+        post: PostRouting::default(),
     }
 }
 
@@ -68,6 +71,7 @@ fn strict_loopback_policy() -> ConnectionPolicy {
         auth_state: None,
         block_onion: false,
         allowed_clients: "127.0.0.1".parse::<AllowedClients>().unwrap(),
+        post: PostRouting::default(),
     }
 }
 
@@ -295,6 +299,7 @@ fn policy(auth: Option<Arc<auth::AuthState>>, allowed_clients: &str) -> Connecti
         auth_state: auth,
         block_onion: false,
         allowed_clients: allowed_clients.parse::<AllowedClients>().unwrap(),
+        post: PostRouting::default(),
     }
 }
 

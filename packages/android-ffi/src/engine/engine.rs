@@ -21,13 +21,15 @@ use arti_wrapper::{BootstrapEvent, BootstrapEventCallback, TorTunnel};
 use auth::AuthState;
 use bridge_line::BridgeLine;
 use bridge_store::BridgeStore;
-use proxy_config::{AllowedClients, BridgesConfig};
+use proxy_config::{AllowedClients, BridgesConfig, PoolOverride};
 use resocks5_net::connect::HostPort;
-use resocks5_net::server::{IncomingRequest, Reply, ServerError};
+#[cfg(test)]
+use resocks5_net::server::IncomingRequest;
+use resocks5_net::server::{Reply, ServerError};
 use time::OffsetDateTime;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
-use tokio_util::compat::FuturesAsyncReadCompatExt;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 /// JNI credential-store adapter; verification scheduling belongs to `socks5-proto`.
@@ -36,6 +38,18 @@ struct AuthStateVerifier(Arc<AuthState>);
 impl socks5_proto::PasswordVerifier for AuthStateVerifier {
     fn verify(&self, username: &str, password: &str) -> bool {
         self.0.verify(username, password)
+    }
+}
+
+impl socks5_proto::ProofVerifier for AuthStateVerifier {
+    type Proof = auth::CredentialProof;
+
+    fn verify_proof(&self, username: &str, password: &str) -> Option<Self::Proof> {
+        self.0.verify_proof(username, password)
+    }
+
+    fn username<'a>(&self, proof: &'a Self::Proof) -> &'a str {
+        proof.username()
     }
 }
 
@@ -181,6 +195,8 @@ pub(crate) struct ConnectionPolicy {
     pub block_onion: bool,
     /// Глобальный ingress-ACL для accept loop (клиентские IP).
     pub allowed_clients: AllowedClients,
+    /// Post proxy pools: the global one and the rotation state.
+    pub post: PostRouting,
 }
 
 /// Final status publication at the end of `engine_main`. Skipped when this
@@ -706,6 +722,20 @@ async fn engine_async(
         settings.pt_binary.clone(),
     ));
 
+    // Quarantined post proxies are re-checked in the background so a revived
+    // one returns to rotation. Only when a post pool can apply to a connection:
+    // an idle ticker would wake a phone for nothing.
+    let post_prober = policy.post.pools.clone().map(|pools| {
+        let cancel = CancellationToken::new();
+        let task = arti_wrapper::spawn_post_prober(
+            pools,
+            || async { get_current_tunnel() },
+            cancel.clone(),
+        );
+        (cancel, task)
+    });
+    let egress = RoutedTor::new(tunnel.clone(), policy.post.clone());
+
     // Create semaphore for concurrency limiting
     let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
 
@@ -719,7 +749,7 @@ async fn engine_async(
             info!("received stop signal");
             Ok(())
         }
-        res = accept_loop(&listener, tunnel.clone(), permits, policy) => {
+        res = accept_loop(&listener, egress, permits, policy) => {
             if let Err(e) = res {
                 error!(error = %e, "accept loop exited with error");
                 Err(e.context("accept loop failed"))
@@ -728,6 +758,12 @@ async fn engine_async(
             }
         }
     };
+
+    // The prober holds tunnel clones while it probes: stop it before the teardown.
+    if let Some((cancel, task)) = post_prober {
+        cancel.cancel();
+        let _ = task.await;
+    }
 
     // Teardown: drop tunnel, then sleep 500ms to release state-dir lock.
     // Clearing the shared handle *before* dropping the local one matters: a
@@ -757,6 +793,8 @@ const BOOTSTRAP_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(300);
 mod bootstrap;
 #[path = "engine_bridges.rs"]
 mod bridges;
+#[path = "engine_egress.rs"]
+mod egress;
 
 use bootstrap::*;
 pub(crate) use bootstrap::{LIVE_PROBE_PORT, LIVE_PROBE_TARGET};
@@ -765,11 +803,13 @@ pub(crate) use bridges::{
     bridge_store_write_lock, get_current_tunnel, persist_and_rank_probe, take_auto_fetched_bridges,
     take_pruned_bridges,
 };
+pub(crate) use egress::PostRouting;
+use egress::RoutedTor;
 
 #[cfg(test)]
-#[path = "engine_tests.rs"]
+#[path = "tests/engine_tests.rs"]
 mod engine_tests;
 
 #[cfg(test)]
-#[path = "engine_lifecycle_tests.rs"]
+#[path = "tests/engine_lifecycle_tests.rs"]
 mod lifecycle_tests;

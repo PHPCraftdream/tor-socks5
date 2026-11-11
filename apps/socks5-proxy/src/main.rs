@@ -31,8 +31,6 @@ mod help_cmd;
 #[allow(dead_code)]
 #[path = "commands/onion/mod.rs"]
 mod onion;
-#[path = "server/egress/post_pool.rs"]
-mod post_pool;
 #[path = "server/egress/route.rs"]
 mod route;
 #[path = "fetch/seed.rs"]

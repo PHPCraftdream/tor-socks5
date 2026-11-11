@@ -228,7 +228,7 @@ async fn tracked_handler_shutdown_joins_pending_owner_constructor() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let mut accept = AbortOnDrop(tokio::spawn(handlers.clone().accept_loop_tracked(
-            listener, Egress::Tor(handle, None, None, false, Some(registry.clone()), Arc::new(crate::post_pool::PostPools::new())),
+            listener, Egress::Tor(handle, None, None, false, Some(registry.clone()), Arc::new(arti_wrapper::PostPools::new())),
             Some(auth), permits.clone(), super::super::handlers::ConnectionTracking {
                 conn_health: ConnHealthCounters::default(),
                 next_conn_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
@@ -356,7 +356,7 @@ async fn request(
             None,
             false,
             Some(registry),
-            Arc::new(crate::post_pool::PostPools::new()),
+            Arc::new(arti_wrapper::PostPools::new()),
         ),
         Some(auth),
         ConnHealthCounters::default(),
@@ -706,7 +706,7 @@ async fn start_handler<C: TorConnector + Send + 'static>(
             None,
             false,
             Some(registry),
-            Arc::new(crate::post_pool::PostPools::new()),
+            Arc::new(arti_wrapper::PostPools::new()),
         ),
         Some(auth),
         ConnHealthCounters::default(),
