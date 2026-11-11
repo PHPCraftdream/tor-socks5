@@ -153,8 +153,10 @@ automatic recovery for those owners is not implemented here.
 
 Requires Rust 1.92 or newer (edition 2021 for first-party crates).
 
+For reusing the Arti 0.48 bridge, PT, and Windows patches in a fork, see [Using these patches in your own project](vendor/README.md#using-these-patches-in-your-own-project) for the tagged `[patch.crates-io]` setup.
+
 The workspace resolves `ktav` 0.8.1, `resocks5-net` 0.5.1 and the five
-`ptrs-gesher-*` 0.8.0 crates from the registry (crates.io). The SDK's
+`ptrs-gesher-*` 0.9.0 crates from the registry (crates.io). The SDK's
 `AuthMethods::cleartext_only` policy delegates inbound password checks to
 the existing host verifier without advertising unsupported secure
 authentication. No sibling SDK or ptrs checkout, path override, Git pin or
@@ -167,14 +169,11 @@ cargo build --locked --release
 # binary: target/release/socks5-proxy   (invoked as `tor-socks5`)
 ```
 
-The ptrs-gesher 0.8.0 registry artifacts were published from the reviewed
-source commit `b0c68330ace29acfcdbaad23dd734c45e94a293c`; crates.io trusted
-publishing records that SHA for all five crates, and released bytes remain a
-separate provenance boundary from the reviewed tree. The earlier runtime
+The ptrs-gesher 0.9.0 crates resolve from the registry; released bytes remain
+a separate provenance boundary from the reviewed tree. The earlier runtime
 acceptance used a debug CLI with SDK 0.4.1 and the older ptrs source. It
 does not validate this dependency migration or establish a release-profile
-acceptance run. The new consumer tests have compiled, but have not yet
-executed; no fresh CLI runtime acceptance is claimed.
+acceptance run; no fresh CLI runtime acceptance is claimed.
 
 ### Code structure rules (checked in CI)
 

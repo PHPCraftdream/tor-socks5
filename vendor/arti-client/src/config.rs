@@ -818,6 +818,7 @@ impl TorClientConfig {
     // tor-socks5 local patch: read-only transport list accessor for the
     // wrapper's raw-constructor pre-PT guard.
     /// Возвращает настроенные подключаемые транспорты — только чтение.
+    #[cfg(feature = "pt-client")]
     pub fn transports(&self) -> &[pt::TransportConfig] {
         &self.bridges.transports
     }
