@@ -242,6 +242,8 @@ JOB_SEGMENTS = {
     "portability-diagnostics": "native-portability",
     "license-offline": "license-offline", "license-audit": "license-audit", "license-producer": "fast", "stress": "stress",
     "vendor-notices": "vendor-notices",
+    # Удалённое задание: пока оно есть в базе PR, его удаление должно иметь отображение.
+    "license-lifecycle": "fast",
 }
 
 
