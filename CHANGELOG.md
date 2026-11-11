@@ -41,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolves from crates.io; the release targets `tor-*` 0.48, replacing the
   temporary sibling-checkout binding. Executed consumer acceptance of the
   registry build remains outstanding.
+- Dependency advisories are now checked in CI (`cargo deny check advisories`, in the license-audit job). The lockfile moves `crossbeam-epoch` to 0.9.21, `ctutils` to 0.4.8, `webpki-roots` to 1.0.12, `plist` to 1.10.3 (`quick-xml` 0.42.0) and `spin` to 0.9.9; four advisories with no usable fix stay ignored in `.github/deny.toml`, each with its reason.
 
 ## [0.2.0] - 2026-10-12
 

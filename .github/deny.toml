@@ -19,3 +19,11 @@ confidence-threshold = 0.93
 name = "priority-queue"
 version = "=2.7.0"
 allow = ["MPL-2.0"]
+
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2026-0459", reason = "Bundled SQLite reads stale memory only when a database file is opened next to a crafted -wal file with a different page size; our databases live in the application's own state directory. The fix needs rusqlite 0.41, which the vendored tor-dirmgr excludes (rusqlite <0.41.0). Drop this entry once tor-dirmgr allows 0.41." },
+    { id = "RUSTSEC-2023-0071", reason = "Marvin timing attack on RSA private-key operations; no fixed 0.9 release exists. rsa comes from tor-llcrypto and ssh-key, and a Tor client only verifies RSA signatures; the private-key paths serve relay roles this proxy does not run." },
+    { id = "RUSTSEC-2025-0069", reason = "daemonize is unmaintained but sound for its one job, the double-fork in the angel command on Unix. Replace it if a maintained equivalent appears." },
+    { id = "RUSTSEC-2024-0436", reason = "paste is an unmaintained proc-macro that only runs at compile time; it is pulled in by arti crates, not by this project." },
+]
