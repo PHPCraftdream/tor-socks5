@@ -686,6 +686,9 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
     tor_upstream = graph.closure(tor_roots, graph.forward) if tor_roots else set()
     if seeds & tor_upstream:
         add("tor", "изменена зависимость контракта Tor")
+    # Фича-матрица фасада SDK зависит только от его манифеста и тестов.
+    if seeds & (graph.named({"tor-socks5"}) & graph.members):
+        add("features", "изменён фасад SDK")
     if any(path.startswith("apps/socks5-proxy/") and any(part in {"tor", "arti", "bridge", "bridges"} or part.startswith(("tor_", "arti_", "bridge_", "bridges_")) for part in path.split("/")) for path in paths):
         add("tor", "изменён код контракта Tor proxy")
     if mode == "sprint-full":

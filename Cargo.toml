@@ -80,7 +80,11 @@ bridge-line = { version = "0.10", package = "ptrs-gesher-bridge-line" }
 lyrebird = { version = "0.10", package = "ptrs-gesher-lyrebird" }
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 proptest = "1"
-rusqlite = { version = "0.39", features = ["backup"] }
+# `bundled`: Arti's `static-sqlite` already builds SQLite from source in every
+# graph that links it; the crates that use rusqlite without Arti
+# (`bridge-verify-core`, so the SDK's default features) must not depend on a
+# system `sqlite3.lib`, which a Windows machine does not have.
+rusqlite = { version = "0.39", features = ["backup", "bundled"] }
 # Host-owned verification uses the cleartext-only policy added in SDK 0.5.1.
 resocks5-net = { version = "0.5.2", default-features = false }
 

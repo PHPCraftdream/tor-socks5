@@ -9,11 +9,12 @@
 # members + 7 vendored Arti forks) carry `publish = false`, enforced by
 # scripts/check-publish-guard.sh.
 #
-# The only crate ever expected on this list is the single consolidated
-# `tor-socks5` package created by the SDK-01 merge (docs/project/sdk-package-design.md,
-# §1/§6). vendor/* forks, apps/* and packages/android-ffi never go to crates.io
-# (docs/project/publishing.md, "Что публикуется и что нет"). Publication itself stays
-# blocked until the vendor gate of docs/project/sdk-package-design.md §4 is open.
+# The only crate that could ever be listed is `tor-socks5`. Today it is the SDK
+# facade in apps/sdk (publish = false; consumers take it from git, see
+# docs/project/sdk-package-design.md, status). vendor/* forks, the other apps/*
+# and packages/android-ffi never go to crates.io (docs/project/publishing.md,
+# "Что публикуется и что нет"). A publication would stay blocked until the vendor
+# gate of docs/project/sdk-package-design.md §4 is open.
 #
 # To make a crate publishable, do BOTH in the same change:
 #   1. add its package name to PUBLISHABLE below;

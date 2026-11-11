@@ -20,6 +20,7 @@ def graph():
         "acl": ("tor-socks5-client-acl", "packages/proxy-config/client-acl"),
         "arti": ("arti-wrapper", "packages/arti-wrapper"),
         "bridge": ("bridge-probe", "packages/bridge-probe"),
+        "facade": ("tor-socks5", "apps/sdk"),
         "ffi": ("android-ffi", "packages/android-ffi"),
         "sdk": ("resocks5-net", "external/sdk"),
         "vendor": ("tor-dirclient", "vendor/tor-dirclient"),
@@ -31,9 +32,9 @@ def graph():
                  **({"source": "registry+https://github.com/rust-lang/crates.io-index"} if i == "sdk" else {}),
                  "manifest_path": str(root / path / "Cargo.toml"), "targets": [{"kind": ["lib"]}]}
                 for i, (name, path) in names.items()]
-    edges = {"proxy": ["auth", "config", "bridge", "arti", "sdk", "native"], "ffi": ["config", "auth"], "bridge": ["middle"], "arti": [], "middle": ["vendor"], "acl": [], "auth": ["acl"], "config": ["acl"], "sdk": [], "vendor": [], "native": []}
+    edges = {"proxy": ["auth", "config", "bridge", "arti", "sdk", "native"], "ffi": ["config", "auth"], "bridge": ["middle"], "arti": [], "middle": ["vendor"], "acl": [], "auth": ["acl"], "config": ["acl"], "sdk": [], "vendor": [], "native": [], "facade": []}
     nodes = [{"id": i, "deps": [{"pkg": d, "name": "alias_" + d, "dep_kinds": [{"kind": "build" if d == "middle" else "dev" if d == "auth" else None, "target": "cfg(unix)" if d == "vendor" else None}]} for d in deps]} for i, deps in edges.items()]
-    return p.Graph({"packages": packages, "workspace_members": ["proxy", "auth", "config", "acl", "bridge", "arti", "ffi"], "resolve": {"nodes": nodes}}, root)
+    return p.Graph({"packages": packages, "workspace_members": ["proxy", "auth", "config", "acl", "bridge", "arti", "ffi", "facade"], "resolve": {"nodes": nodes}}, root)
 
 
 def lock_graph(extra_packages=(), lyrebird_versions=("0.8.0",), extra_members=()):
@@ -440,6 +441,12 @@ class Routing(unittest.TestCase):
                          {"x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl",
                           "aarch64-unknown-linux-gnu"})
         self.assertNotIn("tor", result["segments"])
+
+    def test_sdk_facade_selects_the_feature_matrix(self):
+        facade = self.route("apps/sdk/src/lib.rs")
+        self.assertEqual(facade["packages"], ["tor-socks5"])
+        self.assertIn("features", facade["segments"])
+        self.assertNotIn("features", self.route("packages/auth/src/lib.rs")["segments"])
 
     def test_contracts_and_native(self):
         self.assertNotIn("tor", self.route("apps/socks5-proxy/src/commands/auth.rs")["segments"])

@@ -196,6 +196,16 @@ the limit when the rule was introduced are listed in the script's `BASELINE`
 with their current size: they may not grow, new ones may not appear, and an
 entry is lowered or deleted as the directory is split.
 
+## Using the libraries (SDK)
+
+The library crates come as one git dependency, `tor-socks5`
+([`apps/sdk`](apps/sdk/README.md)): a facade that re-exports the workspace
+crates as modules, picked by cargo features (the default set is Tor-free).
+It is not published to crates.io. The Tor features link Arti and need the
+[patch-kit](vendor/README.md#using-these-patches-in-your-own-project) in the
+consumer's root `Cargo.toml`, otherwise Cargo resolves stock Arti and the
+fixes are lost.
+
 ## Installing a prebuilt binary
 
 The installer installs the **latest stable release** (not `main` or a prerelease), verifying SHA256
