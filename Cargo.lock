@@ -7318,6 +7318,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "tor-socks5"
+version = "0.2.0"
+dependencies = [
+ "arti-wrapper",
+ "bridge-fetcher",
+ "bridge-probe",
+ "bridge-store",
+ "bridge-verify-core",
+ "persist-lock",
+ "tor-socks5-auth",
+ "tor-socks5-client-acl",
+ "tor-socks5-config",
+ "tor-socks5-dns",
+ "tor-socks5-proto",
+ "tor-socks5-route-pool",
+]
+
+[[package]]
 name = "tor-socks5-auth"
 version = "0.2.0"
 dependencies = [
