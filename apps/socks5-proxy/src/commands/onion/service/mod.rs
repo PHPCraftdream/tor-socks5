@@ -157,28 +157,12 @@ async fn service_manager(
             return;
         }
     };
-    // The identity comes from the onion services file: its key is put into the
-    // keystore arti reads, or created and recorded there when the file has
-    // none. A service whose identity cannot be settled is not started.
-    let prepared = {
-        let config_path = config_path.clone();
-        let entry = entry.clone();
-        tokio::task::spawn_blocking(move || identity::ensure(config_path.as_deref(), &entry)).await
-    };
-    match prepared {
-        Ok(Ok(address)) => info!(
-            nickname = %nick,
-            %address,
-            "onion service: identity ready (the onion services file holds its key)"
-        ),
-        Ok(Err(error)) => {
-            error!(nickname = %nick, error = %format!("{error:#}"), "onion service identity is not usable; service not started");
-            return;
-        }
-        Err(error) => {
-            error!(nickname = %nick, %error, "onion service identity task failed; service not started");
-            return;
-        }
+    // A service whose identity cannot be settled is not started.
+    if prepare_identity(config_path.clone(), entry.clone())
+        .await
+        .is_none()
+    {
+        return;
     }
 
     let ports = serve::port_map(&entry.ports);
@@ -257,6 +241,38 @@ async fn service_manager(
     }
 }
 
+/// Settle the identity of `entry` before it is launched: the onion services
+/// file's key is put into the keystore arti reads, or created and recorded
+/// there when the file has none. The keystore and file work blocks, so it runs
+/// on the blocking pool. `None` means the service must not start; the reason is
+/// logged (never the key).
+async fn prepare_identity(
+    config_path: Option<PathBuf>,
+    entry: OnionServiceEntry,
+) -> Option<String> {
+    let nick = entry.nickname.clone();
+    let prepared =
+        tokio::task::spawn_blocking(move || identity::ensure(config_path.as_deref(), &entry)).await;
+    match prepared {
+        Ok(Ok(address)) => {
+            info!(
+                nickname = %nick,
+                %address,
+                "onion service: identity ready (the onion services file holds its key)"
+            );
+            Some(address)
+        }
+        Ok(Err(error)) => {
+            error!(nickname = %nick, error = %format!("{error:#}"), "onion service identity is not usable; service not started");
+            None
+        }
+        Err(error) => {
+            error!(nickname = %nick, %error, "onion service identity task failed; service not started");
+            None
+        }
+    }
+}
+
 /// Build arti's config for a (pre-validated) nickname.
 fn build_config(nick: tor_hsservice::HsNickname) -> Result<tor_hsservice::OnionServiceConfig> {
     tor_hsservice::config::OnionServiceConfigBuilder::default()
@@ -319,5 +335,79 @@ mod tests {
         // The manager returns without launching when the nickname is invalid;
         // validate that path directly via the store helper it uses.
         assert!(store::nickname(&entry.nickname).is_err());
+    }
+
+    fn service(nickname: &str) -> OnionServiceEntry {
+        OnionServiceEntry {
+            nickname: nickname.to_owned(),
+            enabled: true,
+            address: None,
+            key: None,
+            circuit_hops: 4,
+            ports: vec![proxy_config::OnionServicePort {
+                onion_port: 80,
+                target: "127.0.0.1:8080".to_owned(),
+            }],
+        }
+    }
+
+    fn temp_config() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = dir.path().join("tor-socks5.ktav");
+        (dir, config)
+    }
+
+    fn keystore_address(config: &Path, nickname: &str) -> Option<String> {
+        let keymgr = store::open(&store::keystore_dir(Some(config))).expect("keystore");
+        store::address(&keymgr, &store::nickname(nickname).expect("nickname")).expect("address")
+    }
+
+    #[tokio::test]
+    async fn a_launchable_identity_is_prepared_and_the_file_completed() {
+        let (_tmp, config) = temp_config();
+        let entry = service("web");
+        proxy_config::Config::write_onion_services(&config, std::slice::from_ref(&entry))
+            .expect("write");
+
+        let address = prepare_identity(Some(config.clone()), entry)
+            .await
+            .expect("the service may start");
+
+        let stored = proxy_config::Config::read_onion_services(&config).expect("read");
+        assert_eq!(stored[0].address.as_deref(), Some(address.as_str()));
+        assert!(stored[0].key.is_some(), "the new key is recorded");
+        assert_eq!(keystore_address(&config, "web"), Some(address));
+    }
+
+    #[tokio::test]
+    async fn an_address_the_key_does_not_give_keeps_the_service_from_starting() {
+        let (_tmp, config) = temp_config();
+        let (key, _address) = identity::fresh_identity("web");
+        let (_other_key, other_address) = identity::fresh_identity("web");
+        let mut entry = service("web");
+        entry.key = Some(proxy_config::IdentityKey::new(key).expect("key text"));
+        entry.address = Some(other_address);
+        proxy_config::Config::write_onion_services(&config, std::slice::from_ref(&entry))
+            .expect("write");
+
+        assert_eq!(prepare_identity(Some(config.clone()), entry).await, None);
+        assert_eq!(
+            keystore_address(&config, "web"),
+            None,
+            "nothing was published"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_that_is_not_an_identity_keeps_the_service_from_starting() {
+        let (_tmp, config) = temp_config();
+        let mut entry = service("web");
+        entry.key = Some(
+            proxy_config::IdentityKey::new(store::encode_key(b"not a key")).expect("key text"),
+        );
+        proxy_config::Config::write_onion_services(&config, std::slice::from_ref(&entry))
+            .expect("write");
+
+        assert_eq!(prepare_identity(Some(config), entry).await, None);
     }
 }
