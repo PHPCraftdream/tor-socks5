@@ -1,23 +1,24 @@
-use crate::{Config, OnionServiceEntry, OnionServicePort};
+use super::OnionFile;
+use crate::{IdentityKey, OnionServiceEntry, OnionServicePort};
 
 fn service(nickname: &str, ports: &str) -> String {
     format!("\t{{\n\t\tnickname: {nickname}\n\t\tenabled: true\n\t\tports: [{ports}]\n\t}}\n")
 }
 
 fn config_with_services(services: &str) -> String {
-    format!("listen: 127.0.0.1:1080\nonion_services: [\n{services}]\n")
+    format!("services: [\n{services}]\n")
 }
 
-fn parse(src: &str) -> Result<Config, String> {
-    ktav::from_str::<Config>(src).map_err(|err| err.to_string())
+fn parse(src: &str) -> Result<OnionFile, String> {
+    ktav::from_str::<OnionFile>(src).map_err(|err| err.to_string())
 }
 
 #[test]
 fn parses_minimal_onion_service() {
     let src = config_with_services(&service("web", "80=127.0.0.1:8080"));
     let cfg = parse(&src).expect("parses");
-    assert_eq!(cfg.onion_services.len(), 1);
-    let svc = &cfg.onion_services[0];
+    assert_eq!(cfg.services.len(), 1);
+    let svc = &cfg.services[0];
     assert_eq!(svc.nickname, "web");
     assert!(svc.enabled);
     assert_eq!(svc.circuit_hops, 4);
@@ -30,7 +31,7 @@ fn parses_minimal_onion_service() {
 fn parses_multiple_port_mappings_in_order() {
     let src = config_with_services(&service("web", "80=127.0.0.1:8080, 443=127.0.0.1:8443"));
     let cfg = parse(&src).expect("parses");
-    let ports: Vec<(u16, &str)> = cfg.onion_services[0]
+    let ports: Vec<(u16, &str)> = cfg.services[0]
         .ports
         .iter()
         .map(|p| (p.onion_port, p.target.as_str()))
@@ -40,27 +41,25 @@ fn parses_multiple_port_mappings_in_order() {
 
 #[test]
 fn absent_section_defaults_to_empty() {
-    let cfg: Config = ktav::from_str("listen: 127.0.0.1:1080\n").expect("parses");
-    assert!(cfg.onion_services.is_empty());
+    let cfg: OnionFile = ktav::from_str("").expect("parses");
+    assert!(cfg.services.is_empty());
 }
 
 #[test]
 fn enabled_defaults_to_true_when_absent() {
-    let src = "listen: 127.0.0.1:1080\n\
-               onion_services: [\n\
+    let src = "services: [\n\
                \t{\n\
                \t\tnickname: web\n\
                \t\tports: [ 80=127.0.0.1:8080 ]\n\
                \t}\n\
                ]\n";
     let cfg = parse(src).expect("parses");
-    assert!(cfg.onion_services[0].enabled);
+    assert!(cfg.services[0].enabled);
 }
 
 #[test]
 fn explicit_enabled_false_is_kept() {
-    let src = "listen: 127.0.0.1:1080\n\
-               onion_services: [\n\
+    let src = "services: [\n\
                \t{\n\
                \t\tnickname: web\n\
                \t\tenabled: false\n\
@@ -68,7 +67,7 @@ fn explicit_enabled_false_is_kept() {
                \t}\n\
                ]\n";
     let cfg = parse(src).expect("parses");
-    assert!(!cfg.onion_services[0].enabled);
+    assert!(!cfg.services[0].enabled);
 }
 
 #[test]
@@ -79,10 +78,7 @@ fn duplicate_nicknames_are_rejected() {
         service("web", "443=127.0.0.1:8443")
     ));
     let err = parse(&src).expect_err("rejected");
-    assert!(
-        err.contains("onion_services: duplicate nickname 'web'"),
-        "{err}"
-    );
+    assert!(err.contains("services: duplicate nickname 'web'"), "{err}");
 }
 
 #[test]
@@ -90,7 +86,7 @@ fn duplicate_onion_port_within_one_service_is_rejected() {
     let src = config_with_services(&service("web", "80=127.0.0.1:8080, 80=127.0.0.1:8081"));
     let err = parse(&src).expect_err("rejected");
     assert!(
-        err.contains("onion_services[0].ports: duplicate onion port 80"),
+        err.contains("services[0].ports: duplicate onion port 80"),
         "{err}"
     );
 }
@@ -103,13 +99,12 @@ fn same_onion_port_in_different_services_is_allowed() {
         service("api", "80=127.0.0.1:9080")
     ));
     let cfg = parse(&src).expect("parses");
-    assert_eq!(cfg.onion_services.len(), 2);
+    assert_eq!(cfg.services.len(), 2);
 }
 
 #[test]
-fn empty_ports_are_rejected() {
-    let src = "listen: 127.0.0.1:1080\n\
-               onion_services: [\n\
+fn empty_ports_are_rejected_for_an_enabled_service() {
+    let src = "services: [\n\
                \t{\n\
                \t\tnickname: web\n\
                \t\tports: []\n\
@@ -117,7 +112,7 @@ fn empty_ports_are_rejected() {
                ]\n";
     let err = parse(src).expect_err("rejected");
     assert!(
-        err.contains("onion_services[0].ports: at least one port mapping is required"),
+        err.contains("services[0].ports: at least one port mapping is required"),
         "{err}"
     );
 }
@@ -127,10 +122,7 @@ fn onion_port_bounds_are_enforced() {
     for port in ["0", "65536", "abc", ""] {
         let src = config_with_services(&service("web", &format!("{port}=127.0.0.1:8080")));
         let err = parse(&src).expect_err("rejected");
-        assert!(
-            err.contains("onion_services[0].ports:"),
-            "port {port:?}: {err}"
-        );
+        assert!(err.contains("services[0].ports:"), "port {port:?}: {err}");
     }
 }
 
@@ -139,10 +131,7 @@ fn target_port_bounds_are_enforced() {
     for port in ["0", "65536"] {
         let src = config_with_services(&service("web", &format!("80=127.0.0.1:{port}")));
         let err = parse(&src).expect_err("rejected");
-        assert!(
-            err.contains("onion_services[0].ports:"),
-            "port {port:?}: {err}"
-        );
+        assert!(err.contains("services[0].ports:"), "port {port:?}: {err}");
     }
 }
 
@@ -150,21 +139,21 @@ fn target_port_bounds_are_enforced() {
 fn target_without_colon_is_rejected() {
     let src = config_with_services(&service("web", "80=127.0.0.1"));
     let err = parse(&src).expect_err("rejected");
-    assert!(err.contains("onion_services[0].ports:"), "{err}");
+    assert!(err.contains("services[0].ports:"), "{err}");
 }
 
 #[test]
 fn target_with_extra_colon_is_rejected() {
     let src = config_with_services(&service("web", "80=127.0.0.1:8080:9"));
     let err = parse(&src).expect_err("rejected");
-    assert!(err.contains("onion_services[0].ports:"), "{err}");
+    assert!(err.contains("services[0].ports:"), "{err}");
 }
 
 #[test]
 fn bare_ipv6_target_without_brackets_is_rejected() {
     let src = config_with_services(&service("web", "80=::1:8443"));
     let err = parse(&src).expect_err("rejected");
-    assert!(err.contains("onion_services[0].ports:"), "{err}");
+    assert!(err.contains("services[0].ports:"), "{err}");
 }
 
 #[test]
@@ -172,8 +161,7 @@ fn bracketed_ipv6_target_is_accepted() {
     // Ktav reads an unquoted `[` as the start of an inline compound, so a
     // `[::1]` target cannot appear inside the comma-separated inline list —
     // it needs the block-list form with the `::` literal marker per item.
-    let src = "listen: 127.0.0.1:1080\n\
-               onion_services: [\n\
+    let src = "services: [\n\
                \t{\n\
                \t\tnickname: web\n\
                \t\tports: [\n\
@@ -183,7 +171,7 @@ fn bracketed_ipv6_target_is_accepted() {
                \t}\n\
                ]\n";
     let cfg = parse(src).expect("parses");
-    let targets: Vec<&str> = cfg.onion_services[0]
+    let targets: Vec<&str> = cfg.services[0]
         .ports
         .iter()
         .map(|p| p.target.as_str())
@@ -196,7 +184,7 @@ fn target_host_with_invalid_characters_is_rejected() {
     for host in ["bad host", "exa$mple.com"] {
         let src = config_with_services(&service("web", &format!("80={host}:8080")));
         let err = parse(&src).expect_err("rejected");
-        assert!(err.contains("onion_services[0].ports:"), "{err}");
+        assert!(err.contains("services[0].ports:"), "{err}");
     }
 }
 
@@ -207,10 +195,7 @@ fn hostname_and_underscore_hosts_are_accepted() {
         "80=my_host.example.com:8080, 443=my-host:443",
     ));
     let cfg = parse(&src).expect("parses");
-    assert_eq!(
-        cfg.onion_services[0].ports[0].target,
-        "my_host.example.com:8080"
-    );
+    assert_eq!(cfg.services[0].ports[0].target, "my_host.example.com:8080");
 }
 
 #[test]
@@ -219,7 +204,7 @@ fn empty_and_invalid_nicknames_are_rejected() {
         let src = config_with_services(&service(nickname, "80=127.0.0.1:8080"));
         let err = parse(&src).expect_err("rejected");
         assert!(
-            err.contains("onion_services[0].nickname: invalid nickname"),
+            err.contains("services[0].nickname: invalid nickname"),
             "{label}: {err}"
         );
     }
@@ -230,19 +215,18 @@ fn nickname_length_limit_is_enforced() {
     let ok = "a".repeat(25);
     let too_long = "a".repeat(26);
     let src = config_with_services(&service(&ok, "80=127.0.0.1:8080"));
-    assert_eq!(parse(&src).expect("parses").onion_services[0].nickname, ok);
+    assert_eq!(parse(&src).expect("parses").services[0].nickname, ok);
     let src = config_with_services(&service(&too_long, "80=127.0.0.1:8080"));
     let err = parse(&src).expect_err("rejected");
     assert!(
-        err.contains("onion_services[0].nickname: invalid nickname"),
+        err.contains("services[0].nickname: invalid nickname"),
         "{err}"
     );
 }
 
 #[test]
 fn unknown_field_inside_entry_is_rejected() {
-    let src = "listen: 127.0.0.1:1080\n\
-               onion_services: [\n\
+    let src = "services: [\n\
                \t{\n\
                \t\tnickname: web\n\
                \t\tports: [ 80=127.0.0.1:8080 ]\n\
@@ -257,10 +241,12 @@ fn unknown_field_inside_entry_is_rejected() {
 
 #[test]
 fn onion_services_roundtrip_through_write() {
-    let cfg = Config {
-        onion_services: vec![OnionServiceEntry {
+    let cfg = OnionFile {
+        services: vec![OnionServiceEntry {
             nickname: "web".into(),
             enabled: false,
+            address: None,
+            key: None,
             circuit_hops: 4,
             ports: vec![
                 OnionServicePort {
@@ -273,12 +259,11 @@ fn onion_services_roundtrip_through_write() {
                 },
             ],
         }],
-        ..Default::default()
     };
     let serialized = ktav::to_string(&cfg).expect("serialize");
-    let deserialized: Config = ktav::from_str(&serialized).expect("deserialize");
-    assert_eq!(deserialized.onion_services, cfg.onion_services);
-    assert!(!deserialized.onion_services[0].enabled);
+    let deserialized: OnionFile = ktav::from_str(&serialized).expect("deserialize");
+    assert_eq!(deserialized.services, cfg.services);
+    assert!(!deserialized.services[0].enabled);
     // Port mappings must keep the compact scalar spelling.
     assert!(serialized.contains("80=127.0.0.1:8080"));
     assert!(serialized.contains("[::1]:8443"));
@@ -286,56 +271,57 @@ fn onion_services_roundtrip_through_write() {
 
 #[test]
 fn circuit_hops_is_skipped_in_serialized_output_when_default() {
-    let cfg = Config {
-        onion_services: vec![OnionServiceEntry {
+    let cfg = OnionFile {
+        services: vec![OnionServiceEntry {
             nickname: "web".into(),
             enabled: true,
+            address: None,
+            key: None,
             circuit_hops: 4,
             ports: vec![OnionServicePort {
                 onion_port: 80,
                 target: "127.0.0.1:8080".into(),
             }],
         }],
-        ..Default::default()
     };
     let serialized = ktav::to_string(&cfg).expect("serialize");
     assert!(
         !serialized.contains("circuit_hops: 4"),
         "default hop count must be omitted:\n{serialized}"
     );
-    let entry = serialized.split("onion_services:").last().expect("section");
+    let entry = serialized.split("services:").last().expect("section");
     assert!(!entry.contains("circuit_hops"), "{entry}");
-    let deserialized: Config = ktav::from_str(&serialized).expect("deserialize");
-    assert_eq!(deserialized.onion_services, cfg.onion_services);
+    let deserialized: OnionFile = ktav::from_str(&serialized).expect("deserialize");
+    assert_eq!(deserialized.services, cfg.services);
 }
 
 #[test]
 fn non_default_circuit_hops_is_serialized_and_roundtrips() {
-    let cfg = Config {
-        onion_services: vec![OnionServiceEntry {
+    let cfg = OnionFile {
+        services: vec![OnionServiceEntry {
             nickname: "web".into(),
             enabled: true,
+            address: None,
+            key: None,
             circuit_hops: 2,
             ports: vec![OnionServicePort {
                 onion_port: 80,
                 target: "127.0.0.1:8080".into(),
             }],
         }],
-        ..Default::default()
     };
     let serialized = ktav::to_string(&cfg).expect("serialize");
     assert!(serialized.contains("circuit_hops: 2"), "{serialized}");
-    let deserialized: Config = ktav::from_str(&serialized).expect("deserialize");
-    assert_eq!(deserialized.onion_services, cfg.onion_services);
-    assert_eq!(deserialized.onion_services[0].circuit_hops, 2);
+    let deserialized: OnionFile = ktav::from_str(&serialized).expect("deserialize");
+    assert_eq!(deserialized.services, cfg.services);
+    assert_eq!(deserialized.services[0].circuit_hops, 2);
 }
 
 #[test]
 fn circuit_hops_defaults_to_four_and_accepts_two_three_four() {
     for (value, expected) in [("2", 2), ("3", 3), ("4", 4)] {
         let src = format!(
-            "listen: 127.0.0.1:1080\n\
-             onion_services: [\n\
+            "services: [\n\
              \t{{\n\
              \t\tnickname: web\n\
              \t\tcircuit_hops: {value}\n\
@@ -344,7 +330,7 @@ fn circuit_hops_defaults_to_four_and_accepts_two_three_four() {
              ]\n"
         );
         let cfg = parse(&src).expect("valid circuit_hops parses");
-        assert_eq!(cfg.onion_services[0].circuit_hops, expected);
+        assert_eq!(cfg.services[0].circuit_hops, expected);
     }
 }
 
@@ -352,8 +338,7 @@ fn circuit_hops_defaults_to_four_and_accepts_two_three_four() {
 fn invalid_circuit_hops_values_are_rejected_with_key_path() {
     for value in ["1", "5", "0", "255"] {
         let src = format!(
-            "listen: 127.0.0.1:1080\n\
-             onion_services: [\n\
+            "services: [\n\
              \t{{\n\
              \t\tnickname: web\n\
              \t\tcircuit_hops: {value}\n\
@@ -363,7 +348,7 @@ fn invalid_circuit_hops_values_are_rejected_with_key_path() {
         );
         let err = parse(&src).expect_err("invalid circuit_hops must fail");
         assert!(
-            err.contains("onion_services[0].circuit_hops"),
+            err.contains("services[0].circuit_hops"),
             "circuit_hops {value:?}: {err}"
         );
         assert!(err.contains("2, 3, or 4"), "circuit_hops {value:?}: {err}");
@@ -373,8 +358,7 @@ fn invalid_circuit_hops_values_are_rejected_with_key_path() {
     // carries the generic path.
     for value in ["256", "-1", "\"3\"", "abc"] {
         let src = format!(
-            "listen: 127.0.0.1:1080\n\
-             onion_services: [\n\
+            "services: [\n\
              \t{{\n\
              \t\tnickname: web\n\
              \t\tcircuit_hops: {value}\n\
@@ -399,7 +383,7 @@ fn enabled_services_with_identical_circuit_hops_are_accepted() {
         service_with_hops("api", 3, "443=127.0.0.1:8443")
     ));
     let cfg = parse(&src).expect("parses");
-    assert!(cfg.onion_services.iter().all(|svc| svc.circuit_hops == 3));
+    assert!(cfg.services.iter().all(|svc| svc.circuit_hops == 3));
 }
 
 #[test]
@@ -414,8 +398,8 @@ fn enabled_services_with_conflicting_circuit_hops_are_rejected() {
         err.contains("all enabled services must use the same circuit_hops"),
         "{err}"
     );
-    assert!(err.contains("onion_services[0].circuit_hops: 3"), "{err}");
-    assert!(err.contains("onion_services[1].circuit_hops: 2"), "{err}");
+    assert!(err.contains("services[0].circuit_hops: 3"), "{err}");
+    assert!(err.contains("services[1].circuit_hops: 2"), "{err}");
 }
 
 #[test]
@@ -426,7 +410,7 @@ fn disabled_service_may_differ_from_enabled_ones() {
         "\t{\n\t\tnickname: off\n\t\tenabled: false\n\t\tcircuit_hops: 2\n\t\tports: [ 443=127.0.0.1:8443 ]\n\t}\n"
     ));
     let cfg = parse(&src).expect("parses");
-    assert_eq!(cfg.onion_services[1].circuit_hops, 2);
+    assert_eq!(cfg.services[1].circuit_hops, 2);
 }
 
 fn service_with_hops(nickname: &str, circuit_hops: u8, ports: &str) -> String {
@@ -437,10 +421,100 @@ fn service_with_hops(nickname: &str, circuit_hops: u8, ports: &str) -> String {
 }
 
 #[test]
-fn generated_default_config_contains_empty_section() {
-    let serialized = ktav::to_string(&Config::default()).expect("serialize");
-    assert!(
-        serialized.contains("onion_services: []"),
-        "default config must contain an empty onion_services section:\n{serialized}"
+fn disabled_service_may_have_no_ports_yet() {
+    let src =
+        config_with_services("\t{\n\t\tnickname: web\n\t\tenabled: false\n\t\tports: []\n\t}\n");
+    let cfg = parse(&src).expect("parses");
+    assert!(cfg.services[0].ports.is_empty());
+}
+
+const ADDRESS: &str = "6oglpb2ubuf72tczfd6iwwqvvmlb6s2jlrzxgwtctmzfrnse2qluqaqd.onion";
+
+fn service_with(extra: &str) -> String {
+    config_with_services(&format!(
+        "\t{{\n\t\tnickname: web\n\t\t{extra}\n\t\tports: [ 80=127.0.0.1:8080 ]\n\t}}\n"
+    ))
+}
+
+#[test]
+fn address_and_key_are_read_when_present() {
+    let src = service_with(&format!("address: {ADDRESS}\n\t\tkey: LS0tLS1CRUdJTg=="));
+    let cfg = parse(&src).expect("parses");
+    assert_eq!(cfg.services[0].address.as_deref(), Some(ADDRESS));
+    assert_eq!(
+        cfg.services[0].key,
+        Some(IdentityKey::new("LS0tLS1CRUdJTg==").unwrap())
     );
+}
+
+#[test]
+fn address_and_key_are_optional() {
+    let cfg = parse(&config_with_services(&service("web", "80=127.0.0.1:8080"))).expect("parses");
+    assert_eq!(cfg.services[0].address, None);
+    assert_eq!(cfg.services[0].key, None);
+}
+
+#[test]
+fn malformed_addresses_are_rejected_with_the_entry_path() {
+    for address in [
+        "web.onion",
+        "6oglpb2ubuf72tczfd6iwwqvvmlb6s2jlrzxgwtctmzfrnse2qluqaqd",
+        "6OGLPB2UBUF72TCZFD6IWWQVVMLB6S2JLRZXGWTCTMZFRNSE2QLUQAQD.onion",
+        "6oglpb2ubuf72tczfd6iwwqvvmlb6s2jlrzxgwtctmzfrnse2qluqaq1.onion",
+    ] {
+        let err = parse(&service_with(&format!("address: {address}"))).expect_err("rejected");
+        assert!(err.contains("services[0].address"), "{address}: {err}");
+    }
+}
+
+#[test]
+fn a_key_that_is_not_base64_is_rejected_without_echoing_it() {
+    let err = parse(&service_with("key: not base64 !!")).expect_err("rejected");
+    assert!(err.contains("services[0].key"), "{err}");
+    assert!(!err.contains("not base64 !!"), "the secret leaked: {err}");
+}
+
+#[test]
+fn duplicate_addresses_are_rejected() {
+    let both = format!(
+        "\t{{\n\t\tnickname: web\n\t\taddress: {ADDRESS}\n\t\tports: [ 80=127.0.0.1:8080 ]\n\t}}\n\
+         \t{{\n\t\tnickname: api\n\t\taddress: {ADDRESS}\n\t\tports: [ 80=127.0.0.1:9080 ]\n\t}}\n"
+    );
+    let err = parse(&config_with_services(&both)).expect_err("rejected");
+    assert!(err.contains("duplicate address"), "{err}");
+}
+
+#[test]
+fn address_and_key_roundtrip_and_key_is_redacted_in_debug() {
+    let file = OnionFile {
+        services: vec![OnionServiceEntry {
+            nickname: "web".into(),
+            enabled: true,
+            address: Some(ADDRESS.into()),
+            key: Some(IdentityKey::new("LS0tLS1CRUdJTg==").unwrap()),
+            circuit_hops: 4,
+            ports: vec![OnionServicePort {
+                onion_port: 80,
+                target: "127.0.0.1:8080".into(),
+            }],
+        }],
+    };
+    let serialized = ktav::to_string(&file).expect("serialize");
+    assert!(serialized.contains("key: LS0tLS1CRUdJTg=="), "{serialized}");
+    let back: OnionFile = ktav::from_str(&serialized).expect("deserialize");
+    assert_eq!(back, file);
+    assert!(!format!("{file:?}").contains("LS0tLS1CRUdJTg=="));
+}
+
+#[test]
+fn unknown_top_level_key_in_the_file_is_rejected() {
+    assert!(parse("service: []\n").is_err());
+}
+
+#[test]
+fn a_port_mapping_parses_from_its_file_spelling() {
+    let port: OnionServicePort = "443=[::1]:8443".parse().expect("parses");
+    assert_eq!((port.onion_port, port.target.as_str()), (443, "[::1]:8443"));
+    assert!("443".parse::<OnionServicePort>().is_err());
+    assert!("0=127.0.0.1:80".parse::<OnionServicePort>().is_err());
 }

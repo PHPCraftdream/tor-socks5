@@ -14,6 +14,8 @@ use crate::Config;
 pub(crate) enum Problem {
     /// The `bridges` section is still inside the main config.
     InlineBridges,
+    /// The `onion_services` section is still inside the main config.
+    InlineOnionServices,
     /// `dns_server.overrides[index]` still uses the single-mask key `pattern`.
     OverridePattern { index: usize },
 }
@@ -27,6 +29,9 @@ pub(crate) fn problems(src: &str) -> Vec<Problem> {
     let mut found = Vec::new();
     if root.contains_key("bridges") {
         found.push(Problem::InlineBridges);
+    }
+    if root.contains_key("onion_services") {
+        found.push(Problem::InlineOnionServices);
     }
     if let Some(Value::Object(dns_server)) = root.get("dns_server") {
         if let Some(Value::Array(overrides)) = dns_server.get("overrides") {
@@ -56,6 +61,10 @@ pub(crate) fn check(src: &str, path: &Path) -> Result<()> {
             Problem::InlineBridges => message.push_str(&format!(
                 "  - the `bridges` section moved to its own file {}\n",
                 Config::bridges_path(path).display()
+            )),
+            Problem::InlineOnionServices => message.push_str(&format!(
+                "  - the `onion_services` section moved to its own file {}\n",
+                Config::onion_path(path).display()
             )),
             Problem::OverridePattern { index } => message.push_str(&format!(
                 "  - dns_server.overrides[{index}]: `pattern` was replaced by `patterns`, a list of masks\n"

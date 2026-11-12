@@ -246,3 +246,78 @@ fn backups_never_overwrite_each_other() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+const ONION_SECTION: &str = "onion_services: [\n\
+     \t{\n\t\tnickname: web\n\t\tports: [ 80=127.0.0.1:8080 ]\n\t}\n\
+     \t{\n\t\tnickname: off\n\t\tenabled: false\n\t\tports: [ 25=127.0.0.1:2525 ]\n\t}\n\
+     ]\n";
+
+#[test]
+fn moves_the_onion_services_into_their_own_file() {
+    let dir = tmp_dir("onion");
+    let path = dir.join("tor-socks5.ktav");
+    fs::write(&path, format!("listen: 127.0.0.1:1080\n{ONION_SECTION}")).unwrap();
+    assert!(Config::load_with_override(Some(&path)).is_err());
+
+    let report = migrated(migrate_config(&path).unwrap());
+    assert_eq!(report.onion_services, 2);
+    assert_eq!(report.onion_file, Some(Config::onion_path(&path)));
+    assert_eq!(report.bridges_file, None);
+
+    let config = Config::load_with_override(Some(&path))
+        .unwrap()
+        .into_config();
+    let names: Vec<(&str, bool)> = config
+        .onion_services
+        .iter()
+        .map(|service| (service.nickname.as_str(), service.enabled))
+        .collect();
+    assert_eq!(names, [("web", true), ("off", false)]);
+    assert_eq!(config.onion_services[0].ports[0].target, "127.0.0.1:8080");
+    // Keys and addresses are filled in at the first start of the service.
+    assert!(config
+        .onion_services
+        .iter()
+        .all(|s| s.key.is_none() && s.address.is_none()));
+    assert!(!fs::read_to_string(&path)
+        .unwrap()
+        .contains("onion_services"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_existing_onion_file_is_never_overwritten_by_the_migration() {
+    let dir = tmp_dir("onion-exists");
+    let path = dir.join("tor-socks5.ktav");
+    let old = format!("listen: 127.0.0.1:1080\n{ONION_SECTION}");
+    fs::write(&path, &old).unwrap();
+    let existing = "services: []\n";
+    fs::write(Config::onion_path(&path), existing).unwrap();
+
+    let error = migrate_config(&path).unwrap_err().to_string();
+    assert!(error.contains("already exists"), "{error}");
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        old,
+        "main config untouched"
+    );
+    assert_eq!(
+        fs::read_to_string(Config::onion_path(&path)).unwrap(),
+        existing
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_invalid_onion_section_stops_the_migration_before_any_write() {
+    let dir = tmp_dir("onion-invalid");
+    let path = dir.join("tor-socks5.ktav");
+    let old = "listen: 127.0.0.1:1080\nonion_services: [\n\
+               \t{\n\t\tnickname: web\n\t\tports: []\n\t}\n]\n";
+    fs::write(&path, old).unwrap();
+    let error = format!("{:#}", migrate_config(&path).unwrap_err());
+    assert!(error.contains("onion_services"), "{error}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), old);
+    assert!(!Config::onion_path(&path).exists());
+    let _ = fs::remove_dir_all(&dir);
+}

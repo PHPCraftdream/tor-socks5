@@ -21,6 +21,8 @@
 /tor-socks5-webtunnel.ktav
 # Runtime state files written next to the config.
 /tor-socks5.users.ktav
+# Onion services with their secret identity keys.
+/tor-socks5.onion.ktav
 /tor-socks5.alive-bridges.log
 # Unverified bridge candidate pool (scratch staging, never committed).
 *.candidates.log

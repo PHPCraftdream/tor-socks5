@@ -48,6 +48,13 @@ fn migrate(config_override: Option<&Path>) -> Result<()> {
                     report.bridge_sources
                 );
             }
+            if let Some(file) = &report.onion_file {
+                println!(
+                    "  onion services moved to {} ({} services; their keys are added at the first start)",
+                    file.display(),
+                    report.onion_services
+                );
+            }
             if report.masks_converted > 0 {
                 println!(
                     "  dns_server.overrides: {} `pattern` key(s) rewritten as `patterns`",

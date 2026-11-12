@@ -1,20 +1,61 @@
-//! `onion_services`: onion services hosted through this proxy, each a
-//! nickname plus a list of `onion_port=host:port` mappings forwarded to
-//! local targets. Mirrors the `listen`/`dns_server.overrides` pattern:
-//! a hand-written list deserializer doing cross-entry validation with
-//! key-path error messages. proxy-config must not depend on
-//! tor-hsservice, so the nickname check here is a lightweight duplicate
-//! of the real `tor_hsservice::HsNickname` rules (re-checked at service
-//! launch in the app crate).
+//! Onion services hosted through this proxy, kept in their own file next to
+//! the main config (`<stem>.onion.ktav`, see `Config::onion_path`): per
+//! nickname the identity key and address, the `onion_port=host:port`
+//! mappings forwarded to local targets, and whether it is launched. The
+//! entries are a hand-written list deserializer doing cross-entry validation
+//! with key-path error messages (the `listen`/`dns_server.overrides`
+//! pattern). proxy-config must not depend on tor-hsservice, so the nickname
+//! and address checks here are lightweight duplicates of the real rules
+//! (re-checked at service launch in the app crate).
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::fmt;
 
 /// Maximum nickname length in bytes (same cap as `tor_hsservice::HsNickname`).
 const MAX_NICKNAME_LEN: usize = 25;
 
 /// Default server-side onion circuit length.
 const DEFAULT_CIRCUIT_HOPS: u8 = 4;
+
+/// Length of the `<host>` part of a v3 onion address (base32 of the public key).
+const ADDRESS_HOST_LEN: usize = 56;
+
+/// The secret identity key of a service: the bytes of the Arti keystore key
+/// file, as one line of base64. It is the whole identity of the service, so
+/// it is never shown by `Debug` and never part of an error message.
+#[derive(Clone, PartialEq, Eq)]
+pub struct IdentityKey(String);
+
+impl IdentityKey {
+    /// Wrap the base64 text of a key file. Only the alphabet is checked here;
+    /// the keystore code parses the key itself when the service starts.
+    pub fn new(text: impl Into<String>) -> Result<Self, String> {
+        let text = text.into();
+        let base64 = |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=');
+        if text.is_empty() || !text.bytes().all(base64) {
+            return Err("the key must be a single line of base64 text".to_owned());
+        }
+        Ok(Self(text))
+    }
+
+    /// The base64 text, exactly as stored in the file.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for IdentityKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("IdentityKey(<redacted>)")
+    }
+}
+
+impl Serialize for IdentityKey {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
 
 /// One onion service published by this proxy (see [`crate::Config::onion_services`]).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -24,14 +65,32 @@ pub struct OnionServiceEntry {
     pub nickname: String,
     /// Whether the service is launched at startup. Default `true`.
     pub enabled: bool,
+    /// The `.onion` address of the service. Derived from the key, so it can
+    /// only be stated, not chosen: when a key is present the launch refuses a
+    /// different address. Absent until the service has a key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    /// The identity key (secret). When absent, the first launch generates one
+    /// and writes it back here together with the address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<IdentityKey>,
     /// Server-side onion circuit length in hops (relays from the service
     /// to the introduction point, including the bridge). One length per
     /// process: all enabled services must agree. Default `4`, only
     /// `2 | 3 | 4` are permitted. Omitted when `4` on serialization.
     #[serde(skip_serializing_if = "circuit_hops_is_default")]
     pub circuit_hops: u8,
-    /// Port mappings, at least one: `onion_port=host:port`.
+    /// Port mappings `onion_port=host:port`: at least one for an enabled
+    /// service, none yet for a disabled one.
     pub ports: Vec<OnionServicePort>,
+}
+
+/// The document of the onion services file: `services: [ { .. } ]`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OnionFile {
+    #[serde(default, deserialize_with = "onion_services")]
+    pub services: Vec<OnionServiceEntry>,
 }
 
 /// Serde skip predicate: the default hop count is not written back.
@@ -64,6 +123,16 @@ impl<'de> Deserialize<'de> for OnionServicePort {
     }
 }
 
+impl std::str::FromStr for OnionServicePort {
+    type Err = String;
+
+    /// Parse `onion_port=host:port`, the spelling used in the file and by
+    /// `onion new --port`.
+    fn from_str(raw: &str) -> Result<Self, String> {
+        parse_port_mapping(raw)
+    }
+}
+
 /// Serde default for `enabled` (`#[serde(default = "true_fn")]`).
 fn true_fn() -> bool {
     true
@@ -84,7 +153,7 @@ where
 {
     u8::deserialize(deserializer).map_err(|_| {
         serde::de::Error::custom(
-            "onion_services[i].circuit_hops must be an integer; permitted values are 2, 3, or 4",
+            "services[i].circuit_hops must be an integer; permitted values are 2, 3, or 4",
         )
     })
 }
@@ -176,6 +245,10 @@ struct OnionServiceEntryRaw {
     nickname: String,
     #[serde(default = "true_fn")]
     enabled: bool,
+    #[serde(default)]
+    address: Option<String>,
+    #[serde(default)]
+    key: Option<String>,
     #[serde(
         default = "default_circuit_hops",
         deserialize_with = "parse_circuit_hops"
@@ -184,15 +257,30 @@ struct OnionServiceEntryRaw {
     ports: Vec<String>,
 }
 
+/// A v3 onion address: 56 base32 characters and `.onion`, lower case.
+pub(super) fn validate_address(address: &str) -> Result<(), String> {
+    let host = address
+        .strip_suffix(".onion")
+        .ok_or_else(|| "an onion address ends with `.onion`".to_owned())?;
+    let base32 = |byte: u8| matches!(byte, b'a'..=b'z' | b'2'..=b'7');
+    if host.len() != ADDRESS_HOST_LEN || !host.bytes().all(base32) {
+        return Err(format!(
+            "an onion address has {ADDRESS_HOST_LEN} lower-case base32 characters before `.onion`"
+        ));
+    }
+    Ok(())
+}
+
 /// Turn raw entries into validated public entries, reporting the first
-/// problem per entry with its `onion_services[i]` path.
+/// problem per entry with its `services[i]` path.
 fn validate_entries<E: serde::de::Error>(
     raw: Vec<OnionServiceEntryRaw>,
 ) -> Result<Vec<OnionServiceEntry>, E> {
     let mut seen_nicknames = HashSet::new();
+    let mut seen_addresses = HashSet::new();
     let mut entries = Vec::with_capacity(raw.len());
     for (idx, entry) in raw.into_iter().enumerate() {
-        let path = format!("onion_services[{idx}]");
+        let path = format!("services[{idx}]");
         validate_nickname(&entry.nickname).map_err(|reason| {
             E::custom(format!(
                 "{path}.nickname: invalid nickname '{}' ({reason})",
@@ -201,7 +289,7 @@ fn validate_entries<E: serde::de::Error>(
         })?;
         if !seen_nicknames.insert(entry.nickname.clone()) {
             return Err(E::custom(format!(
-                "onion_services: duplicate nickname '{}'",
+                "services: duplicate nickname '{}'",
                 entry.nickname
             )));
         }
@@ -211,11 +299,25 @@ fn validate_entries<E: serde::de::Error>(
                 entry.circuit_hops
             )));
         }
-        if entry.ports.is_empty() {
+        if entry.enabled && entry.ports.is_empty() {
             return Err(E::custom(format!(
                 "{path}.ports: at least one port mapping is required"
             )));
         }
+        if let Some(address) = &entry.address {
+            validate_address(address)
+                .map_err(|reason| E::custom(format!("{path}.address: {reason}")))?;
+            if !seen_addresses.insert(address.clone()) {
+                return Err(E::custom(format!(
+                    "services: duplicate address '{address}'"
+                )));
+            }
+        }
+        let key = entry
+            .key
+            .map(IdentityKey::new)
+            .transpose()
+            .map_err(|reason| E::custom(format!("{path}.key: {reason}")))?;
         let mut seen_ports = HashSet::new();
         let mut ports = Vec::with_capacity(entry.ports.len());
         for raw_port in entry.ports {
@@ -232,6 +334,8 @@ fn validate_entries<E: serde::de::Error>(
         entries.push(OnionServiceEntry {
             nickname: entry.nickname,
             enabled: entry.enabled,
+            address: entry.address,
+            key,
             circuit_hops: entry.circuit_hops,
             ports,
         });
@@ -247,10 +351,10 @@ fn validate_entries<E: serde::de::Error>(
             None => reference = Some((idx, entry.circuit_hops)),
             Some((ref_idx, hops)) if hops != entry.circuit_hops => {
                 return Err(E::custom(format!(
-                    "onion_services: all enabled services must use the same circuit_hops \
+                    "services: all enabled services must use the same circuit_hops \
                      (one circuit length per process): \
-                     onion_services[{ref_idx}].circuit_hops: {hops} != \
-                     onion_services[{idx}].circuit_hops: {}",
+                     services[{ref_idx}].circuit_hops: {hops} != \
+                     services[{idx}].circuit_hops: {}",
                     entry.circuit_hops
                 )));
             }

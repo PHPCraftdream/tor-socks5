@@ -9,11 +9,17 @@
 //! the identity keypair lives in `ks_hs_id.ed25519_expanded_private`
 //! (OpenSSH-format file with the custom `ed25519-expanded@spec.torproject.org`
 //! algorithm — that file *is* the portable export format).
+//!
+//! The keystore is a copy: the onion services file (`<stem>.onion.ktav`)
+//! is where the services and their keys are kept, and a launch puts the
+//! key from there into the keystore, which is what arti reads. The key
+//! text in the file is the base64 of that same key file.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use data_encoding::BASE64;
 use fs_mistrust::Mistrust;
 use safelog::DisplayRedacted as _;
 use tor_hscrypto::pk::{HsIdKey, HsIdKeypair};
@@ -86,6 +92,23 @@ pub(crate) fn exists(keymgr: &KeyMgr, nick: &HsNickname) -> Result<bool> {
         .get::<HsIdKeypair>(&spec)
         .context("reading the onion identity key")?
         .is_some())
+}
+
+/// The `.onion` address of an identity keypair.
+pub(crate) fn address_of(key: &HsIdKeypair) -> String {
+    HsIdKey::from(key).id().display_unredacted().to_string()
+}
+
+/// The key text of the onion services file: base64 of a keystore key file.
+pub(crate) fn encode_key(file_bytes: &[u8]) -> String {
+    BASE64.encode(file_bytes)
+}
+
+/// The keystore key file bytes behind a key text of the onion services file.
+pub(crate) fn decode_key(text: &str) -> Result<Vec<u8>> {
+    BASE64
+        .decode(text.as_bytes())
+        .context("the key is not valid base64")
 }
 
 /// Generate a fresh random identity keypair for `nick`.
@@ -170,6 +193,25 @@ pub(crate) fn parse_identity_file(bytes: &[u8], nick: &HsNickname) -> Result<HsI
         .get::<HsIdKeypair>(&spec)
         .context("parsing the identity key file")?
         .ok_or_else(|| anyhow::anyhow!("file does not contain an onion identity key"))
+}
+
+/// The bytes of the key file the keystore stores for `key` under `nick`:
+/// the portable format, produced by the keystore's own writer in a
+/// throwaway keystore (the mirror of [`parse_identity_file`]).
+pub(crate) fn identity_file_bytes(key: HsIdKeypair, nick: &HsNickname) -> Result<Vec<u8>> {
+    let staging = tempfile::tempdir().context("creating a staging keystore")?;
+    let store = ArtiNativeKeystore::from_path_and_mistrust(
+        staging.path(),
+        &Mistrust::new_dangerously_trust_everyone(),
+    )
+    .context("creating a staging keystore")?;
+    let keymgr = KeyMgrBuilder::default()
+        .primary_store(Box::new(store))
+        .build()
+        .context("building the staging key manager")?;
+    insert(&keymgr, key, nick, true)?;
+    let file = identity_file(staging.path(), nick).context("the staged identity file")?;
+    std::fs::read(&file).with_context(|| format!("reading {}", file.display()))
 }
 
 /// `hss/<nickname>` inside the keystore, if the keystore root is readable.

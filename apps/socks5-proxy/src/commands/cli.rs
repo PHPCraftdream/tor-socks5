@@ -101,8 +101,9 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: BridgesAction,
     },
-    /// Manage onion service identities (`onion new`, `onion list`,
-    /// `onion show`, `onion export`, `onion import`, `onion remove`).
+    /// Manage the onion services of the onion services file, with their keys
+    /// and addresses (`onion new`, `onion list`, `onion show`, `onion export`,
+    /// `onion import`, `onion remove`).
     #[cfg(feature = "onion-service")]
     Onion {
         #[command(subcommand)]

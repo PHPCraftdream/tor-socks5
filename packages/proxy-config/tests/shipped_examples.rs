@@ -73,3 +73,23 @@ fn readme_reference_blocks_parse() {
     assert_eq!(bridges.min_alive, BridgesConfig::default().min_alive);
     assert_eq!(bridges.transport, BridgesConfig::default().transport);
 }
+
+#[test]
+fn readme_onion_reference_parses_as_the_services_file() {
+    let Some(readme) = repo_file("README.md") else {
+        return;
+    };
+    let block = ktav_blocks(&readme)
+        .into_iter()
+        .find(|block| block.starts_with("## Onion services of tor-socks5"))
+        .expect("README has the onion services file reference");
+    let dir = std::env::temp_dir().join(format!("tor-socks5-readme-onion-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let config = dir.join("tor-socks5.ktav");
+    std::fs::write(Config::onion_path(&config), &block).expect("write the reference");
+    let services = Config::read_onion_services(&config).expect("README onion reference parses");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(services[0].nickname, "web");
+    assert!(services[0].address.is_some() && services[0].key.is_some());
+    assert_eq!(services[0].ports.len(), 2);
+}
