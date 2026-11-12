@@ -6,7 +6,9 @@
 //! 3. Built-in defaults (if no file is found).
 //!
 //! The bridge pool (`lines`, `sources`, thresholds) lives in its own file
-//! next to the main config, `<stem>.bridges.ktav` ([`Config::bridges_path`]).
+//! next to the main config, `<stem>.bridges.ktav` ([`Config::bridges_path`]),
+//! and the onion services (nickname, key, address, ports) in
+//! `<stem>.onion.ktav` ([`Config::onion_path`]).
 //! A config in the old layout is rejected at load with the command that
 //! converts it ([`migrate_config`]).
 //!
@@ -34,10 +36,11 @@ pub use log::{LogConfig, LogOutput};
 mod listen_addresses;
 #[path = "sections/onion_services.rs"]
 mod onion_services;
-use onion_services::onion_services;
-pub use onion_services::{OnionServiceEntry, OnionServicePort};
+pub use onion_services::{IdentityKey, OnionServiceEntry, OnionServicePort};
 #[path = "layout/migrate.rs"]
 mod migrate;
+#[path = "onion/file.rs"]
+mod onion_file;
 #[path = "sections/override_patterns.rs"]
 mod override_patterns;
 use listen_addresses::listen_addresses;
@@ -122,8 +125,11 @@ pub struct Config {
     /// client queries through public DoH providers reached over the live
     /// Tor tunnel. See [`DnsServerConfig`].
     pub dns_server: DnsServerConfig,
-    /// Onion services published by this proxy (see [`OnionServiceEntry`]). Default empty.
-    #[serde(default, deserialize_with = "onion_services")]
+    /// Onion services published by this proxy (see [`OnionServiceEntry`]).
+    /// Not part of the main config file: they are read from and written to
+    /// the onion services file ([`Config::onion_path`]); an `onion_services`
+    /// key in the main file is the old layout and is rejected. Default empty.
+    #[serde(skip)]
     pub onion_services: Vec<OnionServiceEntry>,
 }
 
@@ -937,6 +943,7 @@ impl Config {
         legacy::check(&src, path)?;
         let mut cfg: Config = ktav::from_str(&src).context("parse Ktav config")?;
         cfg.bridges = bridges_file::load(path)?;
+        cfg.onion_services = onion_file::load(path)?;
         Ok(cfg)
     }
 
@@ -952,6 +959,9 @@ impl Config {
     /// bridge pool); see [`Config::write_bridges`] to touch only the pool.
     pub fn write(&self, path: &Path) -> Result<()> {
         self.write_bridges(path)?;
+        if !self.onion_services.is_empty() {
+            Self::write_onion_services(path, &self.onion_services)?;
+        }
         self.write_main(path)
     }
 

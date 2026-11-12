@@ -95,3 +95,21 @@ fn loading_an_old_config_fails_before_anything_else() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn inline_onion_services_are_reported_with_the_new_file() {
+    let src = "listen: 127.0.0.1:1080\nonion_services: [\n\
+               \t{\n\t\tnickname: web\n\t\tports: [ 80=127.0.0.1:8080 ]\n\t}\n]\n";
+    assert_eq!(problems(src), vec![Problem::InlineOnionServices]);
+
+    let dir = tmp_dir("onion");
+    let path = dir.join("tor-socks5.ktav");
+    let message = check(src, &path).unwrap_err().to_string();
+    assert!(
+        message.contains("the `onion_services` section moved to its own file"),
+        "{message}"
+    );
+    assert!(message.contains("tor-socks5.onion.ktav"), "{message}");
+    assert!(message.contains("config migrate"), "{message}");
+    let _ = fs::remove_dir_all(&dir);
+}
