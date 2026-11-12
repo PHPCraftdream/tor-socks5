@@ -510,3 +510,11 @@ fn address_and_key_roundtrip_and_key_is_redacted_in_debug() {
 fn unknown_top_level_key_in_the_file_is_rejected() {
     assert!(parse("service: []\n").is_err());
 }
+
+#[test]
+fn a_port_mapping_parses_from_its_file_spelling() {
+    let port: OnionServicePort = "443=[::1]:8443".parse().expect("parses");
+    assert_eq!((port.onion_port, port.target.as_str()), (443, "[::1]:8443"));
+    assert!("443".parse::<OnionServicePort>().is_err());
+    assert!("0=127.0.0.1:80".parse::<OnionServicePort>().is_err());
+}

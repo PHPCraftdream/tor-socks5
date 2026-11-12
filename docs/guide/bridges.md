@@ -14,7 +14,7 @@ introduction and rendezvous stems) when vanguards are disabled. With `2` these
 stems have no middle relay; with `3` they are unchanged. For intro/dir circuits
 the selected target is added after the stem is built, so the complete circuit
 has one additional hop. Service-side circuits are set per service with
-`onion_services[].circuit_hops` (see [onion services](ops/onion-service.md));
+`circuit_hops` of a service in the onion services file (see [onion services](ops/onion-service.md));
 Lite/Full vanguard lengths are unchanged. Fewer hops reduce anonymity; this is intended for censorship
 circumvention, not anonymity.
 

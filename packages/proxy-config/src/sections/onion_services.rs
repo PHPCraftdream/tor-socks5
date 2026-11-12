@@ -123,6 +123,16 @@ impl<'de> Deserialize<'de> for OnionServicePort {
     }
 }
 
+impl std::str::FromStr for OnionServicePort {
+    type Err = String;
+
+    /// Parse `onion_port=host:port`, the spelling used in the file and by
+    /// `onion new --port`.
+    fn from_str(raw: &str) -> Result<Self, String> {
+        parse_port_mapping(raw)
+    }
+}
+
 /// Serde default for `enabled` (`#[serde(default = "true_fn")]`).
 fn true_fn() -> bool {
     true

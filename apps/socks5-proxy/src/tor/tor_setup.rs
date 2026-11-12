@@ -626,37 +626,34 @@ mod tests {
         assert_eq!(settings_for_config(&cfg).circuit_hops, 2);
     }
 
+    fn config_with_service(enabled: bool, circuit_hops: u8) -> Config {
+        Config {
+            onion_services: vec![crate::config::OnionServiceEntry {
+                nickname: "web".to_owned(),
+                enabled,
+                address: None,
+                key: None,
+                circuit_hops,
+                ports: vec![crate::config::OnionServicePort {
+                    onion_port: 80,
+                    target: "127.0.0.1:8080".to_owned(),
+                }],
+            }],
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn settings_for_config_forwards_service_circuit_hops() {
-        let cfg: Config = ktav::from_str(
-            "onion_services: [\n\
-             \t{\n\
-             \t\tnickname: web\n\
-             \t\tenabled: true\n\
-             \t\tports: [ 80=127.0.0.1:8080 ]\n\
-             \t\tcircuit_hops: 2\n\
-             \t}\n\
-             ]\n",
-        )
-        .expect("config parses");
+        let cfg = config_with_service(true, 2);
         assert_eq!(settings_for_config(&cfg).service_circuit_hops, 2);
     }
 
     #[test]
     fn settings_for_config_defaults_service_circuit_hops_without_enabled_services() {
-        let disabled: Config = ktav::from_str(
-            "onion_services: [\n\
-             \t{\n\
-             \t\tnickname: web\n\
-             \t\tenabled: false\n\
-             \t\tports: [ 80=127.0.0.1:8080 ]\n\
-             \t\tcircuit_hops: 2\n\
-             \t}\n\
-             ]\n",
-        )
-        .expect("config parses");
+        let disabled = config_with_service(false, 2);
         assert_eq!(settings_for_config(&disabled).service_circuit_hops, 4);
-        let empty: Config = ktav::from_str("onion_services: []\n").expect("config parses");
+        let empty = Config::default();
         assert_eq!(settings_for_config(&empty).service_circuit_hops, 4);
     }
 

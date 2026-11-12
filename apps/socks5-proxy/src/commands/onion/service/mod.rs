@@ -38,7 +38,7 @@ use safelog::DisplayRedacted as _;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::onion::store;
+use crate::onion::{identity, store};
 use crate::tor_watchdog::TorHandle;
 
 /// Delay before the first relaunch attempt after a failed launch; doubles
@@ -157,17 +157,27 @@ async fn service_manager(
             return;
         }
     };
-    // Observable enough to tell the user which identity is published: if the
-    // keystore already holds the identity key (from `onion new`/`import`),
-    // arti uses it; otherwise arti generates a fresh one on first launch.
-    match identity_exists(config_path.as_deref(), &nick) {
-        Ok(true) => info!(nickname = %nick, "onion service: using existing identity key"),
-        Ok(false) => info!(
+    // The identity comes from the onion services file: its key is put into the
+    // keystore arti reads, or created and recorded there when the file has
+    // none. A service whose identity cannot be settled is not started.
+    let prepared = {
+        let config_path = config_path.clone();
+        let entry = entry.clone();
+        tokio::task::spawn_blocking(move || identity::ensure(config_path.as_deref(), &entry)).await
+    };
+    match prepared {
+        Ok(Ok(address)) => info!(
             nickname = %nick,
-            "onion service: no identity key in keystore; one will be generated on first launch"
+            %address,
+            "onion service: identity ready (the onion services file holds its key)"
         ),
+        Ok(Err(error)) => {
+            error!(nickname = %nick, error = %format!("{error:#}"), "onion service identity is not usable; service not started");
+            return;
+        }
         Err(error) => {
-            warn!(nickname = %nick, %error, "could not inspect the onion keystore before launch")
+            error!(nickname = %nick, %error, "onion service identity task failed; service not started");
+            return;
         }
     }
 
@@ -255,14 +265,6 @@ fn build_config(nick: tor_hsservice::HsNickname) -> Result<tor_hsservice::OnionS
         .context("building the onion service configuration")
 }
 
-/// Whether the keystore already holds an identity key for `nick`.
-fn identity_exists(config_path: Option<&Path>, nick: &str) -> Result<bool> {
-    let dir = store::keystore_dir(config_path);
-    let keymgr = store::open(&dir)?;
-    let nick = store::nickname(nick)?;
-    store::exists(&keymgr, &nick)
-}
-
 /// Poll for the service's `.onion` address, bounded by
 /// [`ADDRESS_WAIT_LIMIT`]. Returns `None` on shutdown.
 async fn wait_for_address(
@@ -309,6 +311,8 @@ mod tests {
         let entry = OnionServiceEntry {
             nickname: "not a nickname".to_owned(),
             enabled: true,
+            address: None,
+            key: None,
             circuit_hops: 4,
             ports: Vec::new(),
         };

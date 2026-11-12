@@ -529,32 +529,6 @@ dns_server.overrides: [
         server: 192.168.1.1:53
     }
 ]
-
-## Onion services published by this proxy (default empty). Each entry
-## launches one onion service at startup: `nickname` names it (only
-## A-Z a-z 0-9 _ -, max 25 chars) and every `ports` entry maps an onion
-## port to a local target as `onion_port=host:port` (an IPv6 target must
-## be bracketed; because Ktav reads `[` as an inline compound, an IPv6
-## target needs the block-list form with the `::` literal marker:
-## ports: [
-##     80=127.0.0.1:8080
-##     :: 443=[::1]:8443
-## ]). At least one port per entry; an
-## onion port may not repeat within one entry and nicknames must be
-## unique. `enabled` defaults to true. The service's v3 key lives in
-## the keystore, which is locked against CLI mutations while the server
-## runs. `circuit_hops` (2..=4, default 4) sets the length of the
-## server-side onion circuits (HsDir uploads never go below 3); all
-## enabled services must use the same value. Example (not part of the default):
-## onion_services: [
-##     {
-##         nickname: web
-##         enabled: true
-##         ports: [ 80=127.0.0.1:8080, 443=127.0.0.1:8443 ]
-##         circuit_hops: 4
-##     }
-## ]
-onion_services: []
 ```
 
 > **Ktav comments are `##` at the start of a line** (a single `#` is content, and there are no
@@ -563,16 +537,45 @@ onion_services: []
 
 ### Onion services
 
-The optional `onion_services` section publishes onion services through the running proxy. Each
-entry launches one service at startup and forwards its onion ports to local `host:port`
-targets — for example `ports: [ 80=127.0.0.1:8080 ]` publishes an onion address whose port 80
+Onion services live in their own file next to the main config, `tor-socks5.onion.ktav`
+(`<stem>.onion.ktav`, like `tor-socks5.bridges.ktav`), and that file is the only source of the
+services. Each entry launches one service at startup and forwards its onion ports to local
+`host:port` targets: `ports: [ 80=127.0.0.1:8080 ]` publishes an onion address whose port 80
 reaches a local web server. `nickname` must match `A-Za-z0-9_-` (max 25 chars); `enabled`
-defaults to `true`, so a service can be paused by setting it to `false`. An IPv6 target must be
-bracketed (`443=[::1]:8443`), and because Ktav reads an unquoted `[` as the start of an inline
-compound, such a mapping needs the block-list form with the `::` literal marker:
+defaults to `true`, so a service can be paused by setting it to `false`; an enabled service needs
+at least one port. The file also holds the service's identity:
 
 ```ktav
-onion_services: [
+## Onion services of tor-socks5. `key` is the secret identity of a service: keep this file private.
+services: [
+    {
+        nickname: web
+        enabled: true
+        address: 6oglpb2ubuf72tczfd6iwwqvvmlb6s2jlrzxgwtctmzfrnse2qluqaqd.onion
+        key: LS0tLS1CRUdJTiBPUEVOU1NIIFBSSVZBVEUgS0VZLS0tLS0K
+        ports: [ 80=127.0.0.1:8080, 443=127.0.0.1:8443 ]
+    }
+]
+```
+
+- `key` is the secret key of the service (the base64 of the Arti key file, one long line; the
+  one above is a placeholder) and `address` the address that key gives. The address cannot be chosen, only stated: a start refuses an address
+  that its key does not give.
+- Both are optional. A service without a key gets one at its first start, and the program
+  writes `key` and `address` back into the file, so afterwards everything about the service is
+  in this one file. The Arti keystore is only a copy that each start refreshes from the file.
+- The file holds secret keys, so treat it like a private key: it is written with owner-only
+  permissions where the OS has them, and `/tor-socks5.onion.ktav` is in `.gitignore`.
+- A config from an older version has the `onion_services` section in the main file; loading it
+  fails with the command that converts it, `tor-socks5 config migrate`, which moves the section
+  into this file (the keys follow at the first start).
+
+An IPv6 target must be bracketed (`443=[::1]:8443`), and because Ktav reads an unquoted `[` as
+the start of an inline compound, such a mapping needs the block-list form with the `::` literal
+marker:
+
+```ktav
+services: [
     {
         nickname: web6
         ports: [
@@ -581,36 +584,27 @@ onion_services: [
         ]
     }
 ]
-``` The services' v3 keys
-are kept in the keystore, which is locked against CLI mutations while the server runs.
+```
 
-Keys are managed from the CLI (stop the server first — it holds the keystore lock while
-services run):
+The services are managed from the CLI (stop the server first: it writes the same file and holds
+the keystore lock while services run):
 
 ```bash
-tor-socks5 onion new <NICK> [--vanity PREFIX] [--threads N] [--timeout DURATION]
+tor-socks5 onion new <NICK> [--port 80=127.0.0.1:8080]... [--vanity PREFIX] [--threads N] [--timeout DURATION]
 tor-socks5 onion list
 tor-socks5 onion show <NICK>
 tor-socks5 onion export <NICK> --out <FILE>
-tor-socks5 onion import <NICK> <FILE>
+tor-socks5 onion import <NICK> <FILE> [--port 80=127.0.0.1:8080]...
 tor-socks5 onion remove <NICK> --yes
 ```
 
-`--vanity` mines an address starting with the given base32 prefix (a-z, 2-7, up to 8 chars);
-the full guide — quick start, vanity tables, security and diagnostics — is in
+`new` and `import` record the service with its key and address in the file; with at least one
+`--port` the service is enabled, without one it is created disabled. `--vanity` mines an address
+starting with the given base32 prefix (a-z, 2-7, up to 8 chars); the full guide — quick start,
+vanity tables, security and diagnostics — is in
 [docs/guide/ops/onion-service.md](docs/guide/ops/onion-service.md).
 
-```ktav
-onion_services: [
-    {
-        nickname: web
-        enabled: true
-        ports: [ 80=127.0.0.1:8080, 443=127.0.0.1:8443 ]
-    }
-]
-```
-
-Setting `circuit_hops` (2..=4, default `4`) shortens the server-side
+Setting `circuit_hops` (2..=4, default `4`) on a service shortens the server-side
 onion circuits — a latency-for-anonymity trade intended for censorship
 circumvention; all enabled services must use the same value. With `2`,
 introduction and rendezvous circuits are `[bridge, target]`; descriptor
@@ -618,7 +612,7 @@ uploads keep three hops, because HsDirs reject posts from a bridge-adjacent
 circuit.
 
 ```ktav
-onion_services: [
+services: [
     {
         nickname: web
         enabled: true

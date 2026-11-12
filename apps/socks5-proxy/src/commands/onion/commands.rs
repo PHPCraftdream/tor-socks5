@@ -1,31 +1,43 @@
 //! `tor-socks5 onion new|list|show|export|import|remove` implementations.
 //!
-//! Pure keystore management: nothing here starts Tor or opens the network.
+//! The services live in the onion services file next to the main config
+//! (`<stem>.onion.ktav`): this is where `new` and `import` record a service
+//! with its key and address and where `list`, `show`, `export` and `remove`
+//! read and change it. Nothing here starts Tor or opens the network. The
+//! Arti keystore is only a copy that a launch refreshes from the file; the
+//! commands that change a service still take its lock, so they refuse while
+//! the server runs (the server writes the same file).
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
-use safelog::DisplayRedacted as _;
-use tor_hscrypto::pk::{HsIdKey, HsIdKeypair};
+use proxy_config::{Config, IdentityKey, OnionServiceEntry, OnionServicePort};
+use tor_hscrypto::pk::HsIdKeypair;
+use tor_hsservice::HsNickname;
 use tor_llcrypto::pk::ed25519::ExpandedKeypair;
 
-use super::vanity;
+use super::{address, vanity};
 use crate::onion::store;
+
+/// Circuit length a new entry starts with (the config default).
+const DEFAULT_CIRCUIT_HOPS: u8 = 4;
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum OnionAction {
-    /// Create a new onion service identity (random key) and print its address.
+    /// Create a new onion service in the onion services file: a random key,
+    /// its address and the given ports.
     ///
     /// With `--vanity PREFIX`, mine a key whose address starts with PREFIX
     /// (base32: a-z, 2-7; up to 8 chars) instead of using a random one.
     New {
-        /// Service nickname (used as the keystore directory name).
+        /// Service nickname.
         nick: String,
+        /// Port mapping `ONION_PORT=HOST:PORT`, repeatable. With one or more
+        /// the service is enabled; without, it is created disabled and the
+        /// ports are added to the file by hand.
+        #[arg(long = "port", value_name = "ONION_PORT=HOST:PORT")]
+        ports: Vec<String>,
         /// Replace an existing identity. WARNING: the old .onion address
         /// will be lost permanently.
         #[arg(long)]
@@ -40,9 +52,9 @@ pub(crate) enum OnionAction {
         #[arg(long)]
         timeout: Option<String>,
     },
-    /// List all onion services in the keystore (nickname and address).
+    /// List the onion services of the file: nickname, address, ports.
     List,
-    /// Show a service's onion address and keystore path (never the secret key).
+    /// Show a service's address, ports and where its key is (never the secret key).
     Show {
         /// Service nickname.
         nick: String,
@@ -59,19 +71,23 @@ pub(crate) enum OnionAction {
         #[arg(long)]
         force: bool,
     },
-    /// Import an identity key from an exported file.
+    /// Import an identity key from an exported file into the onion services file.
     Import {
         /// Service nickname to register the key under.
         nick: String,
         /// File previously produced by `onion export`.
         file: PathBuf,
+        /// Port mapping `ONION_PORT=HOST:PORT`, repeatable; replaces the
+        /// ports of an existing service.
+        #[arg(long = "port", value_name = "ONION_PORT=HOST:PORT")]
+        ports: Vec<String>,
         /// Replace an existing identity for this nickname. WARNING: the old
         /// .onion address will be lost permanently.
         #[arg(long)]
         force: bool,
     },
-    /// Delete a service's keys from the keystore (irreversible without a
-    /// prior `onion export`: the .onion address is lost).
+    /// Delete a service with its key from the onion services file
+    /// (irreversible without a prior `onion export`: the .onion address is lost).
     Remove {
         /// Service nickname.
         nick: String,
@@ -81,336 +97,268 @@ pub(crate) enum OnionAction {
     },
 }
 
+/// Where a command works: the onion services file of the resolved main
+/// config, and the keystore copy beside it.
+struct Target {
+    config: PathBuf,
+    keystore: PathBuf,
+}
+
+impl Target {
+    fn new(config_path: Option<&Path>) -> Self {
+        let config = Config::resolve_path(config_path);
+        let keystore = store::keystore_dir(Some(&config));
+        Self { config, keystore }
+    }
+
+    fn file(&self) -> PathBuf {
+        Config::onion_path(&self.config)
+    }
+
+    fn services(&self) -> Result<Vec<OnionServiceEntry>> {
+        Config::read_onion_services(&self.config)
+    }
+
+    /// The entry of `nick`, or the "no such service" error.
+    fn entry(&self, nick: &HsNickname) -> Result<OnionServiceEntry> {
+        self.services()?
+            .into_iter()
+            .find(|entry| entry.nickname == nick.to_string())
+            .with_context(|| format!("no onion service named {:?}", nick.to_string()))
+    }
+}
+
 pub(crate) fn run(action: OnionAction, config_path: Option<&Path>) -> Result<()> {
+    let at = Target::new(config_path);
     match action {
         OnionAction::New {
             nick,
+            ports,
             force,
             vanity,
             threads,
             timeout,
-        } => cmd_new(config_path, &nick, force, vanity, threads, timeout),
-        OnionAction::List => cmd_list(config_path),
-        OnionAction::Show { nick } => cmd_show(config_path, &nick),
-        OnionAction::Export { nick, out, force } => cmd_export(config_path, &nick, &out, force),
-        OnionAction::Import { nick, file, force } => cmd_import(config_path, &nick, &file, force),
-        OnionAction::Remove { nick, yes } => cmd_remove(config_path, &nick, yes),
+        } => cmd_new(&at, &nick, &ports, force, vanity, threads, timeout),
+        OnionAction::List => cmd_list(&at),
+        OnionAction::Show { nick } => cmd_show(&at, &nick),
+        OnionAction::Export { nick, out, force } => cmd_export(&at, &nick, &out, force),
+        OnionAction::Import {
+            nick,
+            file,
+            ports,
+            force,
+        } => cmd_import(&at, &nick, &file, &ports, force),
+        OnionAction::Remove { nick, yes } => cmd_remove(&at, &nick, yes),
+    }
+}
+
+fn parse_ports(raw: &[String]) -> Result<Option<Vec<OnionServicePort>>> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let mut ports: Vec<OnionServicePort> = Vec::with_capacity(raw.len());
+    for text in raw {
+        let port: OnionServicePort = text.parse().map_err(anyhow::Error::msg)?;
+        if ports.iter().any(|seen| seen.onion_port == port.onion_port) {
+            bail!("onion port {} is given twice", port.onion_port);
+        }
+        ports.push(port);
+    }
+    Ok(Some(ports))
+}
+
+/// Refuse to replace an identity that exists (in the file, or left in the
+/// keystore by an older version) unless `force`; warn when forced.
+fn check_replace(at: &Target, nick: &HsNickname, force: bool) -> Result<()> {
+    let in_file = at
+        .services()?
+        .iter()
+        .any(|entry| entry.nickname == nick.to_string() && entry.key.is_some());
+    let in_keystore = at.keystore.is_dir() && {
+        let keymgr = store::open(&at.keystore)?;
+        store::exists(&keymgr, nick)?
+    };
+    if !(in_file || in_keystore) {
+        return Ok(());
+    }
+    if !force {
+        bail!(
+            "nickname {:?} already has an identity; pass --force to replace it \
+             (the old .onion address will be lost)",
+            nick.to_string()
+        );
+    }
+    eprintln!(
+        "warning: replacing the identity of {:?}: the old .onion address \
+         will be lost permanently",
+        nick.to_string()
+    );
+    Ok(())
+}
+
+/// The keystore keypair of a generated or searched key, checked against the
+/// address the generator computed.
+fn hs_keypair(generated: &address::Keypair) -> Result<HsIdKeypair> {
+    let expanded = ExpandedKeypair::from_secret_key_bytes(generated.to_expanded_bytes())
+        .context("invalid expanded secret key")?;
+    let key = HsIdKeypair::from(expanded);
+    if store::address_of(&key) != generated.address() {
+        bail!("address mismatch; key not saved");
+    }
+    Ok(key)
+}
+
+/// Record `key_bytes` (a keystore key file) as the identity of `nick`.
+///
+/// `ports`, when given, replace the service's ports and enable it; without
+/// them an existing service keeps its ports and a new one is created
+/// disabled. Returns the service's address.
+fn record_identity(
+    at: &Target,
+    nick: &HsNickname,
+    key_bytes: &[u8],
+    address: String,
+    ports: Option<Vec<OnionServicePort>>,
+) -> Result<String> {
+    let key = IdentityKey::new(store::encode_key(key_bytes)).map_err(anyhow::Error::msg)?;
+    let name = nick.to_string();
+    Config::update_onion_services(&at.config, |services| {
+        let service = services.iter_mut().find(|entry| entry.nickname == name);
+        match service {
+            Some(entry) => {
+                entry.address = Some(address.clone());
+                entry.key = Some(key);
+                if let Some(ports) = ports {
+                    entry.ports = ports;
+                    entry.enabled = true;
+                }
+            }
+            None => services.push(OnionServiceEntry {
+                nickname: name,
+                enabled: ports.is_some(),
+                address: Some(address.clone()),
+                key: Some(key),
+                circuit_hops: DEFAULT_CIRCUIT_HOPS,
+                ports: ports.unwrap_or_default(),
+            }),
+        }
+        Ok(())
+    })?;
+    forget_keystore_copy(at, nick)?;
+    Ok(address)
+}
+
+/// Drop the keystore's copy of `nick`: the file is the source, and the next
+/// launch writes the key it holds back into the keystore.
+fn forget_keystore_copy(at: &Target, nick: &HsNickname) -> Result<()> {
+    if store::identity_file(&at.keystore, nick).is_some() {
+        store::remove_all(&at.keystore, nick)?;
+    }
+    Ok(())
+}
+
+fn print_recorded(at: &Target, nick: &HsNickname, address: &str, enabled_ports: bool) {
+    println!("nickname: {nick}");
+    println!("address:  {address}");
+    println!("file:     {}", at.file().display());
+    if !enabled_ports {
+        println!(
+            "no ports yet: the service is disabled; add `ports: [ 80=127.0.0.1:8080 ]` \
+             and `enabled: true` to its entry (or run `onion new --force --port ...`)"
+        );
     }
 }
 
 fn cmd_new(
-    config_path: Option<&Path>,
+    at: &Target,
     nick: &str,
+    ports: &[String],
     force: bool,
     vanity: Option<String>,
     threads: Option<usize>,
     timeout: Option<String>,
 ) -> Result<()> {
-    if vanity.is_none() {
-        if threads.is_some() || timeout.is_some() {
-            bail!("--threads/--timeout require --vanity");
-        }
-        return cmd_new_random(config_path, nick, force);
+    if vanity.is_none() && (threads.is_some() || timeout.is_some()) {
+        bail!("--threads/--timeout require --vanity");
     }
-    cmd_new_vanity(
-        config_path,
-        nick,
-        force,
-        vanity.as_deref().expect("checked above"),
-        threads,
-        timeout.as_deref(),
-    )
-}
-
-/// Parse a duration: a non-negative number plus unit s|m|h; a bare number
-/// means seconds. Zero and overflow are rejected.
-fn parse_duration(s: &str) -> Result<Duration> {
-    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
-    let (digits, unit) = s.split_at(split);
-    if digits.is_empty() {
-        bail!("invalid duration {s:?}: bad number");
-    }
-    let value: u64 = digits
-        .parse()
-        .map_err(|_| anyhow::anyhow!("invalid duration {s:?}: bad number"))?;
-    let mult: u64 = match unit {
-        "" | "s" => 1,
-        "m" => 60,
-        "h" => 3600,
-        _ => bail!("invalid duration {s:?}: unknown unit (use s, m or h)"),
-    };
-    let secs = value
-        .checked_mul(mult)
-        .ok_or_else(|| anyhow::anyhow!("invalid duration {s:?}: overflow"))?;
-    if secs == 0 {
-        bail!("invalid duration {s:?}: must be positive");
-    }
-    Ok(Duration::from_secs(secs))
-}
-
-fn cmd_new_random(config_path: Option<&Path>, nick: &str, force: bool) -> Result<()> {
     let nick = store::nickname(nick)?;
-    let dir = store::keystore_dir(config_path);
-    let _lock = store::lock(&dir)?;
-    let keymgr = store::open(&dir)?;
-    if store::exists(&keymgr, &nick)? {
-        if !force {
-            bail!(
-                "nickname {:?} already exists; pass --force to replace it \
-                 (the old .onion address will be lost)",
-                nick.to_string()
-            );
-        }
-        eprintln!(
-            "warning: replacing the identity of {:?}: the old .onion address \
-             will be lost permanently",
-            nick.to_string()
-        );
-    }
-    store::generate(&keymgr, &nick, force)?;
-    let address = store::address(&keymgr, &nick)?.context("address after generation")?;
-    let file = store::identity_file(&dir, &nick).context("identity file after generation")?;
-    println!("nickname: {}", nick);
-    println!("address:  {address}");
-    println!("keystore: {}", file.display());
+    let ports = parse_ports(ports)?;
+    let _lock = store::lock(&at.keystore)?;
+    check_replace(at, &nick, force)?;
+
+    let generated = match vanity.as_deref() {
+        Some(prefix) => vanity::search_for_cli(prefix, threads, timeout.as_deref())?,
+        None => address::generate(),
+    };
+    let key = hs_keypair(&generated)?;
+    let address = store::address_of(&key);
+    let bytes = store::identity_file_bytes(key, &nick)?;
+    let has_ports = ports.is_some();
+    let address = record_identity(at, &nick, &bytes, address, ports)?;
+    print_recorded(at, &nick, &address, has_ports);
     Ok(())
 }
 
-/// Measure attempts/s over ~1s with `threads` worker threads.
-fn warmup_rate(threads: usize) -> Option<f64> {
-    let attempts = Arc::new(AtomicU64::new(0));
-    let stop = Arc::new(AtomicBool::new(false));
-    let mut handles = Vec::new();
-    for _ in 0..threads {
-        let attempts = Arc::clone(&attempts);
-        let stop = Arc::clone(&stop);
-        handles.push(thread::spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
-                let _ = super::address::generate();
-                attempts.fetch_add(1, Ordering::Relaxed);
-            }
-        }));
-    }
-    let start = Instant::now();
-    thread::sleep(Duration::from_secs(1));
-    stop.store(true, Ordering::Relaxed);
-    for handle in handles {
-        let _ = handle.join();
-    }
-    let elapsed = start.elapsed().as_secs_f64();
-    (elapsed > 0.0).then(|| attempts.load(Ordering::Relaxed) as f64 / elapsed)
-}
-
-/// Spawn a detached thread that sets `cancel` on Ctrl-C.
-fn spawn_ctrl_c(cancel: Arc<AtomicBool>) {
-    thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build();
-        let Ok(runtime) = runtime else {
-            return;
-        };
-        runtime.block_on(async {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                cancel.store(true, Ordering::Relaxed);
-            }
-        });
-    });
-}
-
-fn cmd_new_vanity(
-    config_path: Option<&Path>,
-    nick: &str,
-    force: bool,
-    vanity_str: &str,
-    threads: Option<usize>,
-    timeout_str: Option<&str>,
-) -> Result<()> {
-    let nick = store::nickname(nick)?;
-    let dir = store::keystore_dir(config_path);
-    let _lock = store::lock(&dir)?;
-    let keymgr = store::open(&dir)?;
-    if store::exists(&keymgr, &nick)? {
-        if !force {
-            bail!(
-                "nickname {:?} already exists; pass --force to replace it \
-                 (the old .onion address will be lost)",
-                nick.to_string()
-            );
-        }
-        eprintln!(
-            "warning: replacing the identity of {:?}: the old .onion address \
-             will be lost permanently",
-            nick.to_string()
-        );
-    }
-
-    let target = vanity::VanityTarget::new(vanity_str)?;
-
-    // Warm-up: measure the generation rate for a rough ETA.
-    let rate = warmup_rate(vanity::worker_count(threads.unwrap_or(0)));
-    let expected = vanity::expected_attempts(target.prefix().len());
-    let estimate = rate.map(|rate| vanity::estimate(target.prefix().len(), rate));
-    match estimate {
-        Some(eta) => eprintln!(
-            "vanity search: prefix {:?} needs ~{expected} attempts; \
-             measured {:.0} keys/s; mean time ~{:?} (~95% within 3x)",
-            target.prefix(),
-            rate.expect("estimate implies rate"),
-            eta,
-        ),
-        None => eprintln!(
-            "vanity search: prefix {:?} needs ~{expected} attempts; \
-             speed could not be measured, no ETA available",
-            target.prefix()
-        ),
-    }
-    let time_limit = match timeout_str {
-        Some(s) => Some(parse_duration(s)?),
-        None => {
-            if estimate.is_some_and(|eta| eta > Duration::from_secs(3600)) {
-                bail!(
-                    "expected vanity search time exceeds 1 hour; pass \
-                     --timeout (e.g. --timeout 2h) to confirm"
-                );
-            }
-            None
-        }
-    };
-
-    let cancel = Arc::new(AtomicBool::new(false));
-    spawn_ctrl_c(Arc::clone(&cancel));
-    let progress = Arc::new(AtomicU64::new(0));
-    let done = Arc::new(AtomicBool::new(false));
-    {
-        let progress = Arc::clone(&progress);
-        let done = Arc::clone(&done);
-        let start = Instant::now();
-        thread::spawn(move || {
-            while !done.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_secs(10));
-                if done.load(Ordering::Relaxed) {
-                    break;
-                }
-                let attempts = progress.load(Ordering::Relaxed);
-                let secs = start.elapsed().as_secs_f64().max(1e-9);
-                eprintln!(
-                    "vanity search: {attempts} attempts, {:.0} keys/s, elapsed {:?}",
-                    attempts as f64 / secs,
-                    Duration::from_secs_f64(secs),
-                );
-            }
-        });
-    }
-    let outcome = vanity::search(
-        &target,
-        &vanity::SearchOptions {
-            threads: threads.unwrap_or(0),
-            time_limit,
-            cancel: Arc::clone(&cancel),
-            progress: Some(Arc::clone(&progress)),
-        },
-    );
-    done.store(true, Ordering::Relaxed);
-
-    let kp = match outcome {
-        vanity::SearchOutcome::Found(kp) => kp,
-        vanity::SearchOutcome::TimedOut { attempts } => {
-            eprintln!("vanity search: {attempts} attempts in total");
-            bail!(
-                "vanity search timed out; no key was saved \
-                 (retry with a longer --timeout or a shorter prefix)"
-            );
-        }
-        vanity::SearchOutcome::Cancelled { attempts } => {
-            eprintln!("vanity search: interrupted by Ctrl-C after {attempts} attempts");
-            bail!("vanity search interrupted; no key was saved");
-        }
-    };
-
-    let bytes = kp.to_expanded_bytes();
-    let ekp = ExpandedKeypair::from_secret_key_bytes(bytes)
-        .context("invalid expanded secret key from vanity search")?;
-    let key = HsIdKeypair::from(ekp);
-    let address = HsIdKey::from(&key).id().display_unredacted().to_string();
-    if address != kp.address() {
-        bail!("address mismatch; key not saved");
-    }
-
-    store::insert(&keymgr, key, &nick, force)?;
-    let address = store::address(&keymgr, &nick)?.context("address after generation")?;
-    let file = store::identity_file(&dir, &nick).context("identity file after generation")?;
-    println!("nickname: {}", nick);
-    println!("address:  {address}");
-    println!("keystore: {}", file.display());
-    Ok(())
-}
-
-fn cmd_list(config_path: Option<&Path>) -> Result<()> {
-    let dir = store::keystore_dir(config_path);
-    let mut rows: Vec<(String, String)> = Vec::new();
-    if dir.is_dir() {
-        let keymgr = store::open(&dir)?;
-        let hss_root = dir.join("hss");
-        let mut entries: Vec<_> = std::fs::read_dir(&hss_root)
-            .with_context(|| format!("reading {}", hss_root.display()))?
-            .flatten()
-            .filter(|entry| entry.path().is_dir())
-            .collect();
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
-            let Some(name) = entry.file_name().into_string().ok() else {
-                continue;
-            };
-            let Ok(nick) = store::nickname(&name) else {
-                continue;
-            };
-            if let Ok(Some(address)) = store::address(&keymgr, &nick) {
-                rows.push((name, address));
-            }
-        }
-    }
-    if rows.is_empty() {
+fn cmd_list(at: &Target) -> Result<()> {
+    let services = at.services()?;
+    if services.is_empty() {
         println!("no onion services");
         return Ok(());
     }
-    println!("{:<24} ADDRESS", "NICKNAME");
-    for (name, address) in rows {
-        println!("{:<24} {}", name, address);
+    println!(
+        "{:<24} {:<63} {:<8} PORTS",
+        "NICKNAME", "ADDRESS", "ENABLED"
+    );
+    for service in services {
+        let ports = service
+            .ports
+            .iter()
+            .map(|port| format!("{}={}", port.onion_port, port.target))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "{:<24} {:<63} {:<8} {}",
+            service.nickname,
+            service.address.as_deref().unwrap_or("-"),
+            if service.enabled { "yes" } else { "no" },
+            if ports.is_empty() { "-" } else { &ports },
+        );
     }
     Ok(())
 }
 
-fn cmd_show(config_path: Option<&Path>, nick: &str) -> Result<()> {
+fn cmd_show(at: &Target, nick: &str) -> Result<()> {
     let nick = store::nickname(nick)?;
-    let dir = store::keystore_dir(config_path);
-    if !dir.is_dir() {
-        bail!("no onion keystore at {}", dir.display());
+    let service = at.entry(&nick)?;
+    println!("nickname: {nick}");
+    println!(
+        "address:  {}",
+        service
+            .address
+            .as_deref()
+            .unwrap_or("none yet (created at the first start)")
+    );
+    println!("enabled:  {}", if service.enabled { "yes" } else { "no" });
+    for port in &service.ports {
+        println!("port:     {}={}", port.onion_port, port.target);
     }
-    let keymgr = store::open(&dir)?;
-    let Some(address) = store::address(&keymgr, &nick)? else {
-        bail!("no onion service named {:?}", nick.to_string());
+    match service.key {
+        Some(_) => println!("key:      stored in {}", at.file().display()),
+        None => println!("key:      none yet (created at the first start)"),
+    }
+    Ok(())
+}
+
+fn cmd_export(at: &Target, nick: &str, out: &Path, force: bool) -> Result<()> {
+    let nick = store::nickname(nick)?;
+    let service = at.entry(&nick)?;
+    let Some(key) = service.key else {
+        bail!(
+            "service {:?} has no key yet: it is created at the first start \
+             (or by `onion new --force`)",
+            nick.to_string()
+        );
     };
-    println!("nickname: {}", nick);
-    println!("address:  {address}");
-    if let Some(file) = store::identity_file(&dir, &nick) {
-        println!("keystore: {}", file.display());
-    }
-    Ok(())
-}
-
-fn cmd_export(config_path: Option<&Path>, nick: &str, out: &Path, force: bool) -> Result<()> {
-    let nick = store::nickname(nick)?;
-    let dir = store::keystore_dir(config_path);
-    if !dir.is_dir() {
-        bail!("no onion keystore at {}", dir.display());
-    }
-    let keymgr = store::open(&dir)?;
-    if !store::exists(&keymgr, &nick)? {
-        bail!("no onion service named {:?}", nick.to_string());
-    }
-    let src =
-        store::identity_file(&dir, &nick).context("identity key file not found in keystore")?;
     if out.exists() && !force {
         bail!(
             "{} already exists; pass --force to overwrite it",
@@ -421,41 +369,29 @@ fn cmd_export(config_path: Option<&Path>, nick: &str, out: &Path, force: bool) -
     // keystore stores the identity as an OpenSSH-format file with the custom
     // ed25519-expanded algorithm, which `onion import` (and arti itself)
     // parse back through the same keystore code.
-    let bytes = std::fs::read(&src).with_context(|| format!("reading {}", src.display()))?;
+    let bytes = store::decode_key(key.as_str())?;
     write_secret_file(out, &bytes)?;
     println!("exported {} to {}", nick, out.display());
     Ok(())
 }
 
-fn cmd_import(config_path: Option<&Path>, nick: &str, file: &Path, force: bool) -> Result<()> {
+fn cmd_import(at: &Target, nick: &str, file: &Path, ports: &[String], force: bool) -> Result<()> {
     let nick = store::nickname(nick)?;
-    let dir = store::keystore_dir(config_path);
-    let _lock = store::lock(&dir)?;
+    let ports = parse_ports(ports)?;
     let bytes = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
     let key = store::parse_identity_file(&bytes, &nick)?;
-    let keymgr = store::open(&dir)?;
-    if store::exists(&keymgr, &nick)? {
-        if !force {
-            bail!(
-                "nickname {:?} already exists; pass --force to replace it \
-                 (the old .onion address will be lost)",
-                nick.to_string()
-            );
-        }
-        eprintln!(
-            "warning: replacing the identity of {:?}: the old .onion address \
-             will be lost permanently",
-            nick.to_string()
-        );
-    }
-    store::insert(&keymgr, key, &nick, force)?;
-    let address = store::address(&keymgr, &nick)?.context("address after import")?;
+    let _lock = store::lock(&at.keystore)?;
+    check_replace(at, &nick, force)?;
+    let address = store::address_of(&key);
+    let enabled_ports =
+        ports.is_some() || at.entry(&nick).is_ok_and(|entry| !entry.ports.is_empty());
+    let address = record_identity(at, &nick, &bytes, address, ports)?;
     println!("imported {} from {}", nick, file.display());
-    println!("address:  {address}");
+    print_recorded(at, &nick, &address, enabled_ports);
     Ok(())
 }
 
-fn cmd_remove(config_path: Option<&Path>, nick: &str, yes: bool) -> Result<()> {
+fn cmd_remove(at: &Target, nick: &str, yes: bool) -> Result<()> {
     let nick = store::nickname(nick)?;
     if !yes {
         bail!(
@@ -465,10 +401,18 @@ fn cmd_remove(config_path: Option<&Path>, nick: &str, yes: bool) -> Result<()> {
             nick.to_string()
         );
     }
-    let dir = store::keystore_dir(config_path);
-    let _lock = store::lock(&dir)?;
-    store::remove_all(&dir, &nick)?;
-    println!("removed {} (all keystore keys deleted)", nick);
+    let _lock = store::lock(&at.keystore)?;
+    let name = nick.to_string();
+    Config::update_onion_services(&at.config, |services| {
+        let before = services.len();
+        services.retain(|entry| entry.nickname != name);
+        if services.len() == before {
+            bail!("no onion service named {name:?}");
+        }
+        Ok(())
+    })?;
+    forget_keystore_copy(at, &nick)?;
+    println!("removed {nick} (the service and its key are deleted)");
     Ok(())
 }
 
@@ -493,32 +437,23 @@ fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
-    /// A fresh temp dir + a config path inside it (the file itself never has
-    /// to exist: only its parent directory is used to form `arti-data`).
+    /// A fresh temp dir + a main config path inside it (the config file
+    /// itself never has to exist: only its directory and stem are used).
     fn temp_setup() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("temp dir");
         let config = dir.path().join("tor-socks5.ktav");
         (dir, config)
     }
 
-    fn address_of(config: &Path, nick: &str) -> String {
-        let nick = store::nickname(nick).expect("nickname");
-        let dir = store::keystore_dir(Some(config));
-        let keymgr = store::open(&dir).expect("open keystore");
-        store::address(&keymgr, &nick)
-            .expect("address")
-            .expect("identity present")
-    }
-
     fn run_new(config: &Path, nick: &str, force: bool) -> Result<()> {
-        run_new_full(config, nick, force, None, None, None)
+        run_new_full(config, nick, &[], force, None, None, None)
     }
 
     fn run_new_full(
         config: &Path,
         nick: &str,
+        ports: &[&str],
         force: bool,
         vanity: Option<&str>,
         threads: Option<usize>,
@@ -527,6 +462,7 @@ mod tests {
         run(
             OnionAction::New {
                 nick: nick.to_owned(),
+                ports: ports.iter().map(|port| (*port).to_owned()).collect(),
                 force,
                 vanity: vanity.map(str::to_owned),
                 threads,
@@ -536,36 +472,75 @@ mod tests {
         )
     }
 
+    fn service(config: &Path, nick: &str) -> OnionServiceEntry {
+        Config::read_onion_services(config)
+            .expect("read the file")
+            .into_iter()
+            .find(|entry| entry.nickname == nick)
+            .unwrap_or_else(|| panic!("no service {nick} in the file"))
+    }
+
+    fn address_of(config: &Path, nick: &str) -> String {
+        service(config, nick)
+            .address
+            .expect("the service has an address")
+    }
+
+    fn at(config: &Path) -> Target {
+        Target::new(Some(config))
+    }
+
     #[test]
     fn onion_new_list_show_export_remove_import_roundtrip() {
         let (_tmp, config) = temp_setup();
 
-        // new
         run_new(&config, "svc", false).expect("new");
         let address_before = address_of(&config, "svc");
+        assert!(
+            service(&config, "svc").key.is_some(),
+            "the key is in the file"
+        );
 
-        // list + show see the same address
-        cmd_list(Some(&config)).expect("list");
-        cmd_show(Some(&config), "svc").expect("show");
+        cmd_list(&at(&config)).expect("list");
+        cmd_show(&at(&config), "svc").expect("show");
         assert_eq!(address_of(&config, "svc"), address_before);
 
-        // export
         let export = _tmp.path().join("svc.id");
-        cmd_export(Some(&config), "svc", &export, false).expect("export");
+        cmd_export(&at(&config), "svc", &export, false).expect("export");
         let bytes = std::fs::read(&export).expect("export bytes");
         assert!(!bytes.is_empty());
 
         // remove (guarded), then import restores the same address
-        assert!(cmd_remove(Some(&config), "svc", false).is_err());
-        let dir = store::keystore_dir(Some(&config));
-        let keymgr = store::open(&dir).expect("reopen");
-        let nick = store::nickname("svc").expect("nick");
-        assert!(store::exists(&keymgr, &nick).expect("exists check"));
-        drop(keymgr);
-        cmd_remove(Some(&config), "svc", true).expect("remove");
-        cmd_import(Some(&config), "svc", &export, false).expect("import");
+        assert!(cmd_remove(&at(&config), "svc", false).is_err());
+        cmd_remove(&at(&config), "svc", true).expect("remove");
+        assert!(Config::read_onion_services(&config).unwrap().is_empty());
+        cmd_import(&at(&config), "svc", &export, &[], false).expect("import");
         assert_eq!(address_of(&config, "svc"), address_before);
-        cmd_show(Some(&config), "svc").expect("show after import");
+        cmd_show(&at(&config), "svc").expect("show after import");
+    }
+
+    #[test]
+    fn a_new_service_with_ports_is_enabled_and_without_ports_disabled() {
+        let (_tmp, config) = temp_setup();
+        run_new_full(
+            &config,
+            "web",
+            &["80=127.0.0.1:8080", "443=127.0.0.1:8443"],
+            false,
+            None,
+            None,
+            None,
+        )
+        .expect("new with ports");
+        let web = service(&config, "web");
+        assert!(web.enabled);
+        assert_eq!(web.ports.len(), 2);
+        assert_eq!(web.ports[1].onion_port, 443);
+
+        run_new(&config, "later", false).expect("new without ports");
+        let later = service(&config, "later");
+        assert!(!later.enabled, "nothing to forward yet");
+        assert!(later.ports.is_empty());
     }
 
     #[test]
@@ -574,11 +549,44 @@ mod tests {
         run_new(&config, "dup", false).expect("first new");
         let address = address_of(&config, "dup");
         assert!(run_new(&config, "dup", false).is_err(), "must refuse");
-        // Address unchanged after the refusal.
-        assert_eq!(address_of(&config, "dup"), address);
-        // And --force replaces it.
+        assert_eq!(address_of(&config, "dup"), address, "address unchanged");
         run_new(&config, "dup", true).expect("forced new");
         assert_ne!(address_of(&config, "dup"), address);
+    }
+
+    #[test]
+    fn a_forced_new_keeps_the_ports_of_the_service() {
+        let (_tmp, config) = temp_setup();
+        run_new_full(
+            &config,
+            "keep",
+            &["80=127.0.0.1:8080"],
+            false,
+            None,
+            None,
+            None,
+        )
+        .expect("new");
+        run_new(&config, "keep", true).expect("forced new without ports");
+        let kept = service(&config, "keep");
+        assert!(kept.enabled);
+        assert_eq!(kept.ports.len(), 1);
+    }
+
+    #[test]
+    fn a_key_left_in_the_keystore_counts_as_an_existing_identity() {
+        let (_tmp, config) = temp_setup();
+        let nick = store::nickname("old").expect("nickname");
+        let dir = store::keystore_dir(Some(&config));
+        let keymgr = store::open(&dir).expect("keystore");
+        store::generate(&keymgr, &nick, false).expect("generate");
+        drop(keymgr);
+        assert!(run_new(&config, "old", false).is_err(), "must refuse");
+        run_new(&config, "old", true).expect("forced new");
+        assert!(
+            store::identity_file(&dir, &nick).is_none(),
+            "the stale keystore copy is dropped: the file is the source"
+        );
     }
 
     #[test]
@@ -586,17 +594,38 @@ mod tests {
         let (_tmp, config) = temp_setup();
         run_new(&config, "imp", false).expect("new");
         let export = _tmp.path().join("imp.id");
-        cmd_export(Some(&config), "imp", &export, false).expect("export");
-        assert!(cmd_import(Some(&config), "imp", &export, false).is_err());
-        cmd_import(Some(&config), "imp", &export, true).expect("forced import");
+        cmd_export(&at(&config), "imp", &export, false).expect("export");
+        assert!(cmd_import(&at(&config), "imp", &export, &[], false).is_err());
+        cmd_import(&at(&config), "imp", &export, &[], true).expect("forced import");
+    }
+
+    #[test]
+    fn import_with_ports_replaces_the_ports_and_enables_the_service() {
+        let (_tmp, config) = temp_setup();
+        run_new(&config, "src", false).expect("new");
+        let export = _tmp.path().join("src.id");
+        cmd_export(&at(&config), "src", &export, false).expect("export");
+        cmd_import(
+            &at(&config),
+            "copy",
+            &export,
+            &["8080=127.0.0.1:80".to_owned()],
+            false,
+        )
+        .expect("import as a new service");
+        let copy = service(&config, "copy");
+        assert!(copy.enabled);
+        assert_eq!(copy.ports[0].onion_port, 8080);
+        assert_eq!(copy.address, service(&config, "src").address);
     }
 
     #[test]
     fn onion_remove_requires_yes() {
         let (_tmp, config) = temp_setup();
         run_new(&config, "gone", false).expect("new");
-        let err = cmd_remove(Some(&config), "gone", false).expect_err("must refuse");
+        let err = cmd_remove(&at(&config), "gone", false).expect_err("must refuse");
         assert!(err.to_string().contains("--yes"), "{err}");
+        assert!(cmd_remove(&at(&config), "nosuch", true).is_err());
     }
 
     #[test]
@@ -611,22 +640,28 @@ mod tests {
     }
 
     #[test]
+    fn invalid_or_repeated_ports_are_rejected_before_anything_is_created() {
+        let (_tmp, config) = temp_setup();
+        for ports in [&["80"][..], &["80=127.0.0.1:1", "80=127.0.0.1:2"][..]] {
+            assert!(run_new_full(&config, "p", ports, false, None, None, None).is_err());
+        }
+        assert!(!Config::onion_path(&config).exists());
+    }
+
+    #[test]
     fn onion_import_of_garbage_fails() {
         let (_tmp, config) = temp_setup();
         let garbage = _tmp.path().join("garbage.id");
         std::fs::write(&garbage, b"definitely not an ssh key").expect("write garbage");
-        assert!(cmd_import(Some(&config), "svc", &garbage, false).is_err());
+        assert!(cmd_import(&at(&config), "svc", &garbage, &[], false).is_err());
         // Nothing was created for the failed import.
-        assert!(!store::keystore_dir(Some(&config))
-            .join("hss")
-            .join("svc")
-            .exists());
+        assert!(!Config::onion_path(&config).exists());
     }
 
     #[test]
-    fn onion_list_on_missing_keystore_is_empty_not_error() {
+    fn onion_list_without_a_file_is_empty_not_error() {
         let (_tmp, config) = temp_setup();
-        cmd_list(Some(&config)).expect("list without keystore must succeed");
+        cmd_list(&at(&config)).expect("list without a file must succeed");
     }
 
     #[test]
@@ -635,18 +670,38 @@ mod tests {
         run_new(&config, "exp", false).expect("new");
         let out = _tmp.path().join("existing.id");
         std::fs::write(&out, b"old").expect("seed output file");
-        assert!(cmd_export(Some(&config), "exp", &out, false).is_err());
+        assert!(cmd_export(&at(&config), "exp", &out, false).is_err());
         assert_eq!(std::fs::read(&out).unwrap(), b"old");
-        cmd_export(Some(&config), "exp", &out, true).expect("forced export");
+        cmd_export(&at(&config), "exp", &out, true).expect("forced export");
         assert_ne!(std::fs::read(&out).unwrap(), b"old");
     }
 
     #[test]
-    fn onion_show_errors_on_unknown_or_missing_keystore() {
+    fn export_of_a_service_without_a_key_explains_itself() {
         let (_tmp, config) = temp_setup();
-        assert!(cmd_show(Some(&config), "nosuch").is_err());
+        Config::write_onion_services(
+            &config,
+            &[OnionServiceEntry {
+                nickname: "fresh".to_owned(),
+                enabled: false,
+                address: None,
+                key: None,
+                circuit_hops: DEFAULT_CIRCUIT_HOPS,
+                ports: Vec::new(),
+            }],
+        )
+        .expect("write");
+        let err = cmd_export(&at(&config), "fresh", &_tmp.path().join("x.id"), false)
+            .expect_err("no key yet");
+        assert!(err.to_string().contains("no key yet"), "{err}");
+    }
+
+    #[test]
+    fn onion_show_errors_on_unknown_service() {
+        let (_tmp, config) = temp_setup();
+        assert!(cmd_show(&at(&config), "nosuch").is_err());
         run_new(&config, "known", false).expect("new");
-        assert!(cmd_show(Some(&config), "nosuch").is_err());
+        assert!(cmd_show(&at(&config), "nosuch").is_err());
     }
 
     #[cfg(unix)]
@@ -656,7 +711,7 @@ mod tests {
         let (_tmp, config) = temp_setup();
         run_new(&config, "perm", false).expect("new");
         let out = _tmp.path().join("perm.id");
-        cmd_export(Some(&config), "perm", &out, false).expect("export");
+        cmd_export(&at(&config), "perm", &out, false).expect("export");
         let mode = std::fs::metadata(&out).expect("meta").permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
     }
@@ -664,61 +719,41 @@ mod tests {
     #[test]
     fn onion_new_vanity_flags_require_vanity() {
         let (_tmp, config) = temp_setup();
-        let err = run_new_full(&config, "svc", false, None, Some(2), None)
+        let err = run_new_full(&config, "svc", &[], false, None, Some(2), None)
             .expect_err("threads without vanity");
         assert!(err.to_string().contains("--vanity"), "{err}");
-        let err = run_new_full(&config, "svc", false, None, None, Some("30s"))
+        let err = run_new_full(&config, "svc", &[], false, None, None, Some("30s"))
             .expect_err("timeout without vanity");
         assert!(err.to_string().contains("--vanity"), "{err}");
-        // Nothing was created for the failed runs.
-        assert!(!store::keystore_dir(Some(&config)).join("hss").exists());
-    }
-
-    #[test]
-    fn onion_new_vanity_parse_duration() {
-        for good in [("90", 90), ("90s", 90), ("30m", 1800), ("2h", 7200)] {
-            assert_eq!(
-                parse_duration(good.0).expect(good.0),
-                Duration::from_secs(good.1),
-                "{good:?}"
-            );
-        }
-        for bad in ["", "abc", "0", "1x", "-5s", "99999999999999999999s"] {
-            assert!(parse_duration(bad).is_err(), "{bad:?} must be rejected");
-        }
+        assert!(!Config::onion_path(&config).exists());
     }
 
     #[test]
     fn onion_new_vanity_keypair_roundtrip_to_hs_id() {
-        use safelog::DisplayRedacted as _;
-        use tor_hscrypto::pk::HsIdKey;
         for _ in 0..4 {
-            let kp = super::super::address::generate();
-            let ekp = ExpandedKeypair::from_secret_key_bytes(kp.to_expanded_bytes())
-                .expect("expanded keypair");
-            let key = HsIdKeypair::from(ekp);
-            let address = HsIdKey::from(&key).id().display_unredacted().to_string();
-            assert_eq!(address, kp.address());
+            let generated = address::generate();
+            let key = hs_keypair(&generated).expect("keypair");
+            assert_eq!(store::address_of(&key), generated.address());
         }
     }
 
     #[test]
     fn onion_new_vanity_finds_prefix_end_to_end() {
         let (_tmp, config) = temp_setup();
-        run_new_full(&config, "van", false, Some("a"), Some(2), Some("30s")).expect("vanity new");
+        run_new_full(&config, "van", &[], false, Some("a"), Some(2), Some("30s"))
+            .expect("vanity new");
         let address = address_of(&config, "van");
         assert!(address.starts_with('a'), "{address}");
-        cmd_show(Some(&config), "van").expect("show");
-        assert_eq!(address_of(&config, "van"), address);
+        cmd_show(&at(&config), "van").expect("show");
     }
 
     #[test]
     fn onion_new_vanity_times_out_saves_nothing() {
         let (_tmp, config) = temp_setup();
-        let nick = store::nickname("slow").expect("nick");
         let err = run_new_full(
             &config,
             "slow",
+            &[],
             false,
             Some("abcdefgh"),
             Some(2),
@@ -726,22 +761,15 @@ mod tests {
         )
         .expect_err("8-char prefix must time out");
         assert!(err.to_string().contains("timed out"), "{err}");
-        assert!(!store::keystore_dir(Some(&config))
-            .join("hss")
-            .join(nick.to_string())
-            .exists());
+        assert!(!Config::onion_path(&config).exists());
     }
 
     #[test]
     fn onion_new_vanity_requires_timeout_for_long_estimate() {
         let (_tmp, config) = temp_setup();
-        let nick = store::nickname("slow").expect("nick");
-        let err = run_new_full(&config, "slow", false, Some("abcdefgh"), Some(2), None)
+        let err = run_new_full(&config, "slow", &[], false, Some("abcdefgh"), Some(2), None)
             .expect_err("long estimate without --timeout");
         assert!(err.to_string().contains("--timeout"), "{err}");
-        assert!(!store::keystore_dir(Some(&config))
-            .join("hss")
-            .join(nick.to_string())
-            .exists());
+        assert!(!Config::onion_path(&config).exists());
     }
 }
