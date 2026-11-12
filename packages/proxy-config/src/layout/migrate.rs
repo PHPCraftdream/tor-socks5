@@ -78,6 +78,25 @@ pub fn migrate_config(path: &Path) -> Result<MigrationOutcome> {
     let mut config: Config =
         ktav::de::from_value(root).context("the converted config does not match the schema")?;
     let bridges_path = Config::bridges_path(path);
+    if let Some(bridges) = &bridges {
+        config.bridges = bridges.clone();
+        let wanted = config.bridges_text()?;
+        match fs::read_to_string(&bridges_path) {
+            // A previous run wrote this file and stopped before the main
+            // config: the same content is a safe resume.
+            Ok(existing) if existing == wanted => {}
+            Ok(_) => bail!(
+                "{} already exists and differs from the `bridges` section of {}; remove one of them and run the migration again",
+                bridges_path.display(),
+                path.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading bridges file {}", bridges_path.display()))
+            }
+        }
+    }
     let onion_path = Config::onion_path(path);
     if let Some(services) = &onion {
         config.onion_services = services.clone();

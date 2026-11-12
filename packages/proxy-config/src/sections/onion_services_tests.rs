@@ -449,7 +449,7 @@ fn address_and_key_are_read_when_present() {
 
 #[test]
 fn address_and_key_are_optional() {
-    let cfg = parse(&service("web", "80=127.0.0.1:8080")).expect("parses");
+    let cfg = parse(&config_with_services(&service("web", "80=127.0.0.1:8080"))).expect("parses");
     assert_eq!(cfg.services[0].address, None);
     assert_eq!(cfg.services[0].key, None);
 }

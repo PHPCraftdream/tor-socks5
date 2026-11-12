@@ -605,18 +605,41 @@ mod tests {
         run_new(&config, "src", false).expect("new");
         let export = _tmp.path().join("src.id");
         cmd_export(&at(&config), "src", &export, false).expect("export");
+
+        // Moving the identity to another machine: another config, a new name.
+        let (_other_tmp, other) = temp_setup();
         cmd_import(
-            &at(&config),
+            &at(&other),
             "copy",
             &export,
             &["8080=127.0.0.1:80".to_owned()],
             false,
         )
         .expect("import as a new service");
-        let copy = service(&config, "copy");
+        let copy = service(&other, "copy");
         assert!(copy.enabled);
         assert_eq!(copy.ports[0].onion_port, 8080);
         assert_eq!(copy.address, service(&config, "src").address);
+    }
+
+    #[test]
+    fn one_identity_cannot_serve_under_two_nicknames() {
+        let (_tmp, config) = temp_setup();
+        run_new(&config, "src", false).expect("new");
+        let export = _tmp.path().join("src.id");
+        cmd_export(&at(&config), "src", &export, false).expect("export");
+        let error = cmd_import(&at(&config), "twin", &export, &[], false).expect_err("refused");
+        assert!(
+            format!("{error:#}").contains("duplicate address"),
+            "{error:#}"
+        );
+        assert!(
+            Config::read_onion_services(&config)
+                .unwrap()
+                .iter()
+                .all(|entry| entry.nickname != "twin"),
+            "nothing was recorded"
+        );
     }
 
     #[test]
