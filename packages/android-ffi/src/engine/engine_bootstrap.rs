@@ -362,9 +362,21 @@ pub(super) async fn bootstrap_stall_watchdog(tunnel: TorTunnel, callback: Bootst
     }
 }
 
-/// Whether the tunnel's channels are carried by a configured pre proxy.
-pub(super) fn reaches_through_pre_proxy(tunnel: &TorTunnel) -> bool {
-    matches!(tunnel.configured_pre_endpoint(), Some(Some(_)))
+/// Whether the engine may open its own connections to bridges: the startup
+/// reachability probes, the warm-up, the re-probe and the circuit-verify clients.
+/// Never with a pre proxy, where only the Tor client, through the proxy, reaches
+/// a bridge, and what it observes does not belong in the bridge-health store.
+pub(super) fn engine_connects_to_bridges(pre: Option<&arti_wrapper::Socks5PreEndpoint>) -> bool {
+    pre.is_none()
+}
+
+/// [`engine_connects_to_bridges`] for the route `tunnel` was built with. A tunnel
+/// made from a raw client config records no route and may sit behind a proxy that
+/// is not visible here, so it is treated like one behind a pre proxy.
+pub(super) fn tunnel_allows_own_bridge_checks(tunnel: &TorTunnel) -> bool {
+    tunnel
+        .configured_pre_endpoint()
+        .is_some_and(engine_connects_to_bridges)
 }
 
 /// Background task, spawned once the tunnel reaches `On`, with three independent jobs on
@@ -444,7 +456,7 @@ pub(super) async fn stall_watchdog(
     // The engine's own bridge checks (warm top-up, re-probe, circuit-verify) either connect
     // to bridges outside a pre proxy or feed the health store with what a pre route observed,
     // so none of them runs with one.
-    let own_checks = !reaches_through_pre_proxy(&tunnel);
+    let own_checks = tunnel_allows_own_bridge_checks(&tunnel);
 
     loop {
         tokio::select! {

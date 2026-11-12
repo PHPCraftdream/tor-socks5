@@ -107,13 +107,26 @@ fn record(
     })
 }
 
+/// A fresh identity as the services file stores it: (key text, address).
+#[cfg(test)]
+pub(crate) fn fresh_identity(nickname: &str) -> (String, String) {
+    use tor_hscrypto::pk::HsIdKeypair;
+    use tor_llcrypto::pk::ed25519::ExpandedKeypair;
+
+    let generated = super::address::generate();
+    let expanded = ExpandedKeypair::from_secret_key_bytes(generated.to_expanded_bytes())
+        .expect("expanded keypair");
+    let keypair = HsIdKeypair::from(expanded);
+    let nick = store::nickname(nickname).expect("nickname");
+    let bytes = store::identity_file_bytes(keypair, &nick).expect("key file bytes");
+    (store::encode_key(&bytes), generated.address().to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
     use proxy_config::OnionServicePort;
-    use tor_hscrypto::pk::HsIdKeypair;
-    use tor_llcrypto::pk::ed25519::ExpandedKeypair;
 
     use super::*;
 
@@ -135,17 +148,6 @@ mod tests {
                 target: "127.0.0.1:8080".to_owned(),
             }],
         }
-    }
-
-    /// A fresh identity as the file stores it: (key text, address).
-    fn fresh_identity(nickname: &str) -> (String, String) {
-        let generated = super::super::address::generate();
-        let expanded = ExpandedKeypair::from_secret_key_bytes(generated.to_expanded_bytes())
-            .expect("expanded keypair");
-        let keypair = HsIdKeypair::from(expanded);
-        let nick = store::nickname(nickname).expect("nickname");
-        let bytes = store::identity_file_bytes(keypair, &nick).expect("key file bytes");
-        (store::encode_key(&bytes), generated.address().to_owned())
     }
 
     fn stored(config: &Path) -> Vec<OnionServiceEntry> {

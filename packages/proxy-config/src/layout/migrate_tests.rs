@@ -321,3 +321,29 @@ fn an_invalid_onion_section_stops_the_migration_before_any_write() {
     assert!(!Config::onion_path(&path).exists());
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn an_onion_file_from_an_interrupted_run_is_resumed() {
+    let dir = tmp_dir("onion-resume");
+    let path = dir.join("tor-socks5.ktav");
+    let old = format!("listen: 127.0.0.1:1080\n{ONION_SECTION}");
+    fs::write(&path, &old).unwrap();
+    migrated(migrate_config(&path).unwrap());
+    let onion_file = fs::read_to_string(Config::onion_path(&path)).unwrap();
+
+    // The main config is back in the old layout: the first run is taken to
+    // have died after writing the onion file and before the main config.
+    fs::write(&path, &old).unwrap();
+    let report = migrated(migrate_config(&path).unwrap());
+
+    assert_eq!(report.onion_services, 2);
+    assert_eq!(
+        fs::read_to_string(Config::onion_path(&path)).unwrap(),
+        onion_file,
+        "the same file is kept as it is"
+    );
+    assert!(!fs::read_to_string(&path)
+        .unwrap()
+        .contains("onion_services"));
+    let _ = fs::remove_dir_all(&dir);
+}

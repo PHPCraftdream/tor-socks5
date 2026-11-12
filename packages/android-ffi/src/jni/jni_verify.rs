@@ -889,3 +889,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 }
+
+#[cfg(test)]
+mod direct_checks_tests {
+    use super::direct_checks_refused;
+    use proxy_config::{Config, ProxyPool, Socks5Endpoint};
+
+    fn config_at(dir: &std::path::Path, pre: bool) -> std::path::PathBuf {
+        let path = dir.join("tor-socks5.ktav");
+        let config = Config {
+            pre_proxies: pre
+                .then(|| ProxyPool::from("127.0.0.1:9050".parse::<Socks5Endpoint>().unwrap())),
+            ..Default::default()
+        };
+        config.write(&path).expect("write the config");
+        path
+    }
+
+    #[test]
+    fn a_config_with_pre_proxies_refuses_the_direct_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(direct_checks_refused(&config_at(dir.path(), true)));
+    }
+
+    #[test]
+    fn a_config_without_pre_proxies_allows_them() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!direct_checks_refused(&config_at(dir.path(), false)));
+    }
+
+    #[test]
+    fn a_config_that_cannot_be_read_refuses_them() {
+        let dir = tempfile::tempdir().unwrap();
+        // Missing file.
+        assert!(direct_checks_refused(&dir.path().join("absent.ktav")));
+        // Unparsable file: the check cannot tell whether a pre proxy applies.
+        let broken = dir.path().join("broken.ktav");
+        std::fs::write(&broken, "listen: [\n").unwrap();
+        assert!(direct_checks_refused(&broken));
+    }
+}

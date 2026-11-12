@@ -198,3 +198,36 @@ fn the_file_is_readable_by_its_owner_only() {
     assert_eq!(mode & 0o777, 0o600);
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn concurrent_updates_do_not_lose_each_others_services() {
+    let dir = tmp_dir("concurrent");
+    let path = dir.join("tor-socks5.ktav");
+    Config::write_onion_services(&path, &[]).unwrap();
+
+    let writers: Vec<_> = (0..8)
+        .map(|n| {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                Config::update_onion_services(&path, |services| {
+                    services.push(entry(&format!("svc{n}"), None, None));
+                    Ok(())
+                })
+                .unwrap();
+            })
+        })
+        .collect();
+    for writer in writers {
+        writer.join().unwrap();
+    }
+
+    let mut names: Vec<String> = Config::read_onion_services(&path)
+        .unwrap()
+        .into_iter()
+        .map(|service| service.nickname)
+        .collect();
+    names.sort();
+    let expected: Vec<String> = (0..8).map(|n| format!("svc{n}")).collect();
+    assert_eq!(names, expected, "a writer's service was lost");
+    let _ = fs::remove_dir_all(&dir);
+}
