@@ -253,19 +253,62 @@ The server paces this:
   It is not an error, and nothing is refused.
 
 How far you can go is not settled. Hosting onion services is marked
-experimental by the Arti authors, and we have not measured more than a
-handful of services ourselves. External reports (the OnionPress issues #75
+experimental by the Arti authors. External reports (the OnionPress issues #75
 and #96 on GitHub, against Arti 2.x) saw reliable operation at about
 10 services per process and rendezvous failures from about 13–20. Treat
-that as an external data point, not as a guarantee.
+that as an external data point, not as a guarantee. Our own measurement
+follows.
+
+### What we measured
+
+One setup, one run per row — a Windows release build with 19 reachable
+webtunnel bridges, `tor.circuit_hops: 3`, and every service forwarding to the
+same local HTTP server. After all services had reported a status and a
+further 5 minutes of settling, each address was requested through the proxy
+itself (`curl --socks5-hostname`, 4 at a time, 60 s limit); a miss was
+retried once after a minute. "Up" is the time from the start line to the
+first running or reachable-but-degraded status.
+
+| Services | `guard_spread` | Answered at first try | Answered after one retry | Median up | Slowest up | Descriptor-upload timeouts logged |
+|---------:|:--------------:|----------------------:|-------------------------:|----------:|-----------:|----------------------------------:|
+| 5  | 1 | 4  | 4  | 153 s | 531 s  | 22  |
+| 10 | 1 | 8  | 9  | 361 s | 656 s  | 54  |
+| 20 | 1 | 15 | 18 | 462 s | 840 s  | 185 |
+| 20 | 3 | 16 | 17 | 424 s | 783 s  | 166 |
+| 40 | 1 | 32 | 39 | 773 s | 1115 s | 314 |
+| 40 | 3 | 30 | 37 | 631 s | 1377 s | 506 |
+
+What the runs show:
+
+- **No collapse up to 40.** No service reached the broken status, no launch
+  failed, no `ERROR` line was logged, the bridges stayed reachable (at worst
+  one of the 19 missed a probe), and the working set stayed under 110 MB.
+- **The cost is time and first requests.** The start takes longer as the count
+  grows (the gate launches at most 4 at a time; the last of 40 took about
+  19 minutes to come up at `guard_spread: 1`), and the share of services that answer the very first request falls
+  to about 80 %. Most services settle at "reachable but degraded" rather than
+  "reachable" — the dominant warning is a descriptor upload to an HsDir that
+  timed out — and they still answer. A client should retry a first request.
+- **A few addresses stay silent.** Only three of the 40 addresses did not
+  answer even after the retry (one of them in every run it took part in);
+  every other miss answered on the retry. The failures follow the address
+  more than the count. We did not investigate why.
+- **`guard_spread: 3` gave no gain here.** With every bridge healthy the
+  results are within the noise of a single run, and the warnings roughly
+  doubled at 40 services. What it is for — keeping part of the circuits
+  alive while one bridge fails — was not tested.
+
+This is one network, one machine and one run per row, so it does not
+contradict the external reports: it shows that 40 services can work, not
+that they will. The warning therefore stays at 10 enabled services.
 
 In practice: start with few services, watch the status lines, and raise the
-count gradually. When enough services load a single bridge, set
-`tor.guard_spread: 2` or `3` — provided you have at least that many working
-bridges (see [bridges](../bridges.md)). For much more than ~10 services,
-consider splitting them across separate tor-socks5 processes, each with its
-own config directory and its own bridge set — an option you configure
-yourself, not a shipped feature.
+count gradually. Set `tor.guard_spread: 2` or `3` only for failure isolation
+— provided you have at least that many working bridges (see
+[bridges](../bridges.md)) and accept that more bridges see your traffic. For
+much more than ~10 services, consider splitting them across separate
+tor-socks5 processes, each with its own config directory and its own bridge
+set — an option you configure yourself, not a shipped feature.
 
 ## Limitations
 
