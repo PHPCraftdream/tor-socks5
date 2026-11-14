@@ -2,13 +2,15 @@
 //! and forward each accepted stream to the configured local target; plus a
 //! status-event logger.
 //!
-//! Concurrency: one `Arc<Semaphore>` (256 permits) per service caps the
-//! in-flight forwarded connections. Connection tasks are spawned detached —
-//! this is safe because the semaphore is acquired (owned permit moved into
-//! the task) before spawning, so at most 256 connection tasks exist per
-//! service at any time, and each task self-cleans (permit released on drop).
+//! Concurrency: one `Arc<Semaphore>` (256 permits) per service plus one
+//! process-wide `Arc<Semaphore>` (512 permits) across ALL services together.
+//! Every forwarded stream holds one permit of each for its whole life — the
+//! per-service one acquired first, then the global one, always in that
+//! order, so a stream its own service cannot admit never consumes a global
+//! permit. Connection tasks are spawned detached-but-bounded exactly as
+//! before: both owned permits move into the task, which self-cleans on drop.
 //! The accept loop itself never blocks on a permit; excess streams are
-//! served as soon as a permit frees up.
+//! served as soon as permits free up.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,6 +31,11 @@ use tracing::{debug, info, trace, warn};
 /// plain local TCP forwarding pair, but unbounded spawns would still let a
 /// hostile client exhaust memory/file descriptors.
 pub(crate) const MAX_CONCURRENT_STREAMS: usize = 256;
+
+/// Maximum concurrent forwarded connections across ALL onion services
+/// together. Bounds the process' total file-descriptor/memory footprint
+/// on top of the per-service [`MAX_CONCURRENT_STREAMS`].
+pub(crate) const MAX_TOTAL_CONCURRENT_STREAMS: usize = 512;
 
 /// Deadline for the local `TcpStream::connect` to a service target.
 const TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -74,12 +81,15 @@ fn end_done() -> End {
 /// Top-level serving task for one launched service: runs until the rendezvous
 /// stream ends or the shutdown token fires. Each rendezvous handshake is
 /// accepted and handed its own stream-request loop (client circuits are
-/// independent, so one stuck circuit cannot stall the others).
+/// independent, so one stuck circuit cannot stall the others). `semaphore`
+/// caps this service's forwarded streams; `global` caps them across all
+/// services together.
 pub(crate) async fn serve_service(
     _service: Arc<RunningOnionService>,
     rend_requests: impl Stream<Item = RendRequest> + Unpin,
     ports: PortMap,
     semaphore: Arc<Semaphore>,
+    global: Arc<Semaphore>,
     token: CancellationToken,
 ) {
     let mut rend_requests = rend_requests;
@@ -97,11 +107,12 @@ pub(crate) async fn serve_service(
         };
         let ports = ports.clone();
         let semaphore = semaphore.clone();
+        let global = global.clone();
         let token = token.clone();
         tokio::spawn(async move {
             match rend.accept().await {
                 Ok(stream_requests) => {
-                    serve_stream_requests(stream_requests, ports, semaphore, token).await;
+                    serve_stream_requests(stream_requests, ports, semaphore, global, token).await;
                 }
                 Err(error) => {
                     // The client gets no notification; the rendezvous
@@ -113,13 +124,33 @@ pub(crate) async fn serve_service(
     }
 }
 
+/// The two permits one forwarded stream holds for its whole life: the
+/// per-service cap first, then the process-wide cap — always in that
+/// order, so a stream its own service cannot admit never takes a global
+/// permit. `None` when a semaphore is closed (process teardown only).
+///
+/// Holding the per-service permit across the global wait is fine: if the
+/// caller is cancelled in between, both permits drop with the future.
+async fn acquire_stream_permits(
+    per_service: &Arc<Semaphore>,
+    global: &Arc<Semaphore>,
+) -> Option<(
+    tokio::sync::OwnedSemaphorePermit,
+    tokio::sync::OwnedSemaphorePermit,
+)> {
+    let per_service = per_service.clone().acquire_owned().await.ok()?;
+    let global = global.clone().acquire_owned().await.ok()?;
+    Some((per_service, global))
+}
+
 /// Consume the `StreamRequest`s of one accepted rendezvous (one client
-/// circuit): per request, resolve the virtual port, take a concurrency
-/// permit, and forward to the local target.
+/// circuit): per request, resolve the virtual port, take the per-service
+/// and process-wide concurrency permits, and forward to the local target.
 async fn serve_stream_requests(
     mut stream_requests: impl Stream<Item = StreamRequest> + Unpin,
     ports: PortMap,
     semaphore: Arc<Semaphore>,
+    global: Arc<Semaphore>,
     token: CancellationToken,
 ) {
     loop {
@@ -141,23 +172,32 @@ async fn serve_stream_requests(
             continue;
         };
 
-        // Owned permit, moved into the connection task: the semaphore caps
-        // in-flight forwards and the permit is released when the task ends.
-        let Ok(permit) = semaphore.clone().acquire_owned().await else {
-            // Semaphore closed: only happens at process teardown.
+        // Owned permits, moved into the connection task: they cap in-flight
+        // forwards and are released when the task ends.
+        let Some((permit, global_permit)) = acquire_stream_permits(&semaphore, &global).await
+        else {
+            // Semaphores closed: only happens at process teardown.
             let _ = request.reject(end_done()).await;
             return;
         };
-        tokio::spawn(handle_stream_request(request, target, permit));
+        tokio::spawn(handle_stream_request(
+            request,
+            target,
+            permit,
+            global_permit,
+        ));
     }
 }
 
 /// Serve one accepted stream: accept it (CONNECTED to the client), connect
-/// to the local target, then copy in both directions.
+/// to the local target, then copy in both directions. Holds one per-service
+/// and one process-wide permit for the stream's whole life; both are
+/// released when this task ends.
 async fn handle_stream_request(
     request: StreamRequest,
     target: String,
     _permit: tokio::sync::OwnedSemaphorePermit,
+    _global_permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let data_stream = match request.accept(Connected::new_empty()).await {
         Ok(data_stream) => data_stream,
@@ -189,15 +229,22 @@ async fn handle_stream_request(
 
 /// Log status transitions of one service. INFO for normal lifecycle
 /// (bootstrapping → running → shutdown), WARN when the service degrades.
+/// `started` fires once the service first reports Running,
+/// DegradedReachable or Broken — the launch-phase slot release signal
+/// (see `start_gate`).
 pub(crate) async fn log_status_events(
     mut events: tor_hsservice::status::OnionServiceStatusStream,
     nickname: String,
     address: String,
+    started: tokio::sync::oneshot::Sender<()>,
     token: CancellationToken,
 ) {
     // The stream yields the current status first, then every change; dedupe
     // anyway so only real transitions log.
     let mut last: Option<tor_hsservice::status::State> = None;
+    // The FIRST terminal status fires the launch-phase slot release (see
+    // `start_gate`); later ones find `None` — exactly-once is enough here.
+    let mut started = Some(started);
     loop {
         let status = tokio::select! {
             biased;
@@ -217,12 +264,23 @@ pub(crate) async fn log_status_events(
         last = Some(state);
         match state {
             tor_hsservice::status::State::Running => {
+                // Fails harmlessly once the receiver is gone; subsequent
+                // terminal states find `None` (see `started` above).
+                if let Some(started) = started.take() {
+                    let _ = started.send(());
+                }
                 info!(nickname = %nickname, %address, "onion service reachable");
             }
             tor_hsservice::status::State::Broken => {
+                if let Some(started) = started.take() {
+                    let _ = started.send(()); // see the Running arm
+                }
                 warn!(nickname = %nickname, %address, "onion service is broken");
             }
             tor_hsservice::status::State::DegradedReachable => {
+                if let Some(started) = started.take() {
+                    let _ = started.send(()); // see the Running arm
+                }
                 warn!(nickname = %nickname, %address, "onion service reachable but degraded");
             }
             tor_hsservice::status::State::DegradedUnreachable
@@ -273,5 +331,79 @@ mod tests {
         let map = ports(&[(80, "127.0.0.1:8080")]);
         // Non-BEGIN requests carry no port and must be rejected.
         assert!(target_for_port(&map, None).is_none());
+    }
+
+    // StreamRequest cannot be constructed outside arti, so the permit
+    // ordering is exercised through `acquire_stream_permits` directly.
+    // Deterministic throughout: paused clock, explicit `advance` (the
+    // semaphores use no timers), and sync `try_recv` for "not yet" checks.
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_beyond_the_global_cap_waits_for_a_global_permit() {
+        // Two per-service caps of 1 sum above the global cap of 1: the
+        // process-wide limit is what holds the second stream back.
+        let per_a = Arc::new(Semaphore::new(1));
+        let per_b = Arc::new(Semaphore::new(1));
+        let global = Arc::new(Semaphore::new(1));
+
+        // A's own service has room, so A takes the only global permit.
+        let first = acquire_stream_permits(&per_a, &global)
+            .await
+            .expect("A admitted");
+
+        // B's per-service permit is free, but no global permit is left.
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<bool>();
+        tokio::spawn(async move {
+            let _ = done_tx.send(acquire_stream_permits(&per_b, &global).await.is_some());
+        });
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(
+            done_rx.try_recv().is_err(),
+            "B must still wait: the only global permit is held"
+        );
+
+        drop(first); // frees the global permit
+        assert!(
+            done_rx.await.expect("oneshot"),
+            "B is admitted once a global permit frees up"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_per_service_cap_is_taken_before_the_global_one() {
+        // One per-service cap of 1 and a global cap of 2: A holds one global
+        // permit. While B is parked behind its own service's cap, the other
+        // global permit must still be free — a global-first implementation
+        // would have taken it.
+        let per = Arc::new(Semaphore::new(1));
+        let global = Arc::new(Semaphore::new(2));
+
+        let first = acquire_stream_permits(&per, &global)
+            .await
+            .expect("A admitted");
+
+        // B targets the SAME service.
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<bool>();
+        tokio::spawn({
+            let global = global.clone();
+            async move {
+                let _ = done_tx.send(acquire_stream_permits(&per, &global).await.is_some());
+            }
+        });
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            done_rx.try_recv().is_err(),
+            "B must still wait behind its own service's cap"
+        );
+        assert!(
+            global.try_acquire().is_ok(),
+            "the global permit stays free while B waits on the per-service cap"
+        );
+
+        drop(first); // frees both the per-service and the global permit
+        assert!(
+            done_rx.await.expect("oneshot"),
+            "B is admitted once its service frees a permit"
+        );
     }
 }

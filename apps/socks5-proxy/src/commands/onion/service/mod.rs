@@ -9,11 +9,16 @@
 //! ```text
 //! producer task (one, in `producers`, cancelled via producer_token)
 //!   └─ holds the keystore PathLock guard for its whole life
-//!      └─ one manager task per enabled service
-//!         ├─ launch + retry/backoff loop (30 s doubling to 5 min)
+//!      ├─ settles every service's identity first, in one batch
+//!      │  (one rewrite of the onion services file for the whole launch)
+//!      └─ one manager task per service that may start
+//!         ├─ holds one of at most MAX_STARTING launch slots (`start_gate`)
+//!         │  from just before the launch until a terminal status, the 90 s
+//!         │  slot cap, or shutdown
+//!         ├─ launch + retry/backoff loop (30 s doubling to 5 min, ±20% spread)
 //!         ├─ waits for the .onion address, then spawns:
-//!         │   ├─ request-serving task (rendezvous → stream requests → TCP)
-//!         │   └─ status-event logging task
+//!         │   ├─ request-serving task (rendezvous → stream requests → TCP; ≤512 process-wide)
+//!         │   └─ status-event logging task (fires the slot release signal)
 //!         └─ keeps the Arc<RunningOnionService> alive until shutdown
 //! ```
 //!
@@ -24,6 +29,7 @@
 
 pub(crate) mod forward;
 pub(crate) mod serve;
+pub(crate) mod start_gate;
 
 #[cfg(test)]
 mod lock_tests;
@@ -46,6 +52,30 @@ use crate::tor_watchdog::TorHandle;
 const RETRY_DELAY_INITIAL: Duration = Duration::from_secs(30);
 /// Upper bound on the launch retry backoff.
 const RETRY_DELAY_MAX: Duration = Duration::from_secs(300);
+
+/// Spread a retry delay by ±20%, so many failed services do not retry in
+/// lockstep. Uniform in [0.8×, 1.2×); bytes from the OS RNG (`getrandom`,
+/// already a direct dependency). On RNG failure the delay is unchanged.
+fn backoff_spread(delay: Duration) -> Duration {
+    let mut bytes = [0u8; 8];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        return delay;
+    }
+    Duration::from_millis(spread_millis(
+        // Retry delays are seconds-scale; no truncation at u64.
+        delay.as_millis() as u64,
+        u64::from_le_bytes(bytes),
+    ))
+}
+
+/// The pure ±20% scaling: `unit` (any u64) picks uniformly in 40 steps of
+/// (80 + step) / 100, i.e. [0.8, 1.2). u128 inner math, no overflow.
+fn spread_millis(millis: u64, unit: u64) -> u64 {
+    let step = u128::from(unit % 40); // one of 40 evenly-likely steps
+    let scaled = u128::from(millis) * (80 + step);
+    u64::try_from(scaled / 100).unwrap_or(u64::MAX)
+}
+
 /// Poll interval while waiting for the service's `.onion` address to become
 /// available (arti finds or generates the identity key asynchronously).
 const ADDRESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -73,7 +103,11 @@ pub(crate) fn spawn_services(
     if enabled.is_empty() {
         return;
     }
-    info!(count = enabled.len(), "starting configured onion services");
+    info!(
+        count = enabled.len(),
+        at_once = start_gate::MAX_STARTING,
+        "starting configured onion services; at most 4 launch at a time"
+    );
     let config_path = config_path.map(Path::to_path_buf);
     producers.push(tokio::spawn(run_services(
         handle,
@@ -114,13 +148,45 @@ async fn run_services(
         }
     };
 
-    // One manager per service; a failing service must not affect the others.
-    let mut managers = Vec::with_capacity(entries.len());
-    for entry in entries {
+    // All identities are settled before any manager spawns, in ONE rewrite
+    // of the onion services file (see `identity::prepare_all`); the file and
+    // keystore work blocks, so it runs on the blocking pool. A join error is
+    // NOT fatal: the proxy keeps running without onion services.
+    let prepared = match tokio::task::spawn_blocking(move || {
+        identity::prepare_all(config_path.as_deref(), &entries)
+    })
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            error!(
+                %error,
+                "onion services not started: the identity batch task panicked"
+            );
+            return;
+        }
+    };
+
+    // Gradual start: managers spawn in services-file order and the gate
+    // hands freed slots out FIFO, so services launch in file order.
+    let gate = start_gate::StartGate::new();
+    // One process-wide cap on forwarded streams, across ALL services
+    // together; each service adds its own per-service cap (see `serve`).
+    let global_streams = Arc::new(tokio::sync::Semaphore::new(
+        serve::MAX_TOTAL_CONCURRENT_STREAMS,
+    ));
+    // One manager per service that may start; a failing service must not
+    // affect the others (the ones that may not start are already logged).
+    let mut managers = Vec::with_capacity(prepared.len());
+    for service in prepared {
+        if service.address.is_none() {
+            continue;
+        }
         managers.push(tokio::spawn(service_manager(
             handle.clone(),
-            entry,
-            config_path.clone(),
+            service.entry,
+            gate.clone(),
+            global_streams.clone(),
             token.clone(),
         )));
     }
@@ -135,11 +201,14 @@ async fn run_services(
 
 /// Launch (and if necessary relaunch) one service, then keep it alive until
 /// shutdown. Holding the `Arc<RunningOnionService>` here is what keeps the
-/// service published.
+/// service published. Each launch attempt waits for a `start_gate` slot and
+/// holds it until the service reports a terminal status, the 90 s slot cap,
+/// or shutdown; retries sleep an exponentially growing, ±20%-spread backoff.
 async fn service_manager(
     handle: TorHandle,
     entry: OnionServiceEntry,
-    config_path: Option<PathBuf>,
+    gate: start_gate::StartGate,
+    global_streams: Arc<tokio::sync::Semaphore>,
     token: CancellationToken,
 ) {
     let nick = entry.nickname.clone();
@@ -157,14 +226,6 @@ async fn service_manager(
             return;
         }
     };
-    // A service whose identity cannot be settled is not started.
-    if prepare_identity(config_path.clone(), entry.clone())
-        .await
-        .is_none()
-    {
-        return;
-    }
-
     let ports = serve::port_map(&entry.ports);
     let semaphore = Arc::new(tokio::sync::Semaphore::new(serve::MAX_CONCURRENT_STREAMS));
 
@@ -183,93 +244,80 @@ async fn service_manager(
             return;
         };
 
-        match tunnel.raw().launch_onion_service(config.clone()) {
-            Ok(Some((service, rend_requests))) => {
-                let Some(address) = wait_for_address(&service, &token, &nick).await else {
-                    return; // shutdown while waiting
-                };
-                info!(
-                    nickname = %nick,
-                    address = %address.display_unredacted(),
-                    "onion service address available: onion service starting"
-                );
-                // Serving loop and status logger run as independent tasks;
-                // both exit on cancellation. The manager keeps this first
-                // clone alive; dropping the last clone would unpublish the
-                // service.
-                let serving = tokio::spawn(serve::serve_service(
-                    service.clone(),
-                    rend_requests,
-                    ports,
-                    semaphore,
-                    token.clone(),
-                ));
-                let status = tokio::spawn(serve::log_status_events(
-                    service.status_events(),
-                    nick.clone(),
-                    address.display_unredacted().to_string(),
-                    token.clone(),
-                ));
-                token.cancelled().await;
-                let _ = serving.await;
-                let _ = status.await;
-                info!(nickname = %nick, "onion service stopped");
+        // Gradual start: hold one of at most MAX_STARTING launch slots from
+        // just before the launch until the service reports a terminal
+        // status, the 90 s slot cap elapses, or shutdown. Released before
+        // the retry backoff sleeps.
+        {
+            let Some(slot) = gate.acquire(&token).await else {
+                debug!(nickname = %nick, "onion service launch aborted: shutting down while waiting for a launch slot");
                 return;
-            }
-            // `enabled` defaults to true in our built config; `None` means
-            // arti refused to start the service at all.
-            Ok(None) => {
-                error!(nickname = %nick, "onion service was rejected by the Tor client (disabled configuration); not retried");
-                return;
-            }
-            Err(error) => {
-                error!(
-                    nickname = %nick,
-                    %error,
-                    retry_in = ?delay,
-                    "failed to launch onion service; retrying"
-                );
+            };
+            match tunnel.raw().launch_onion_service(config.clone()) {
+                Ok(Some((service, rend_requests))) => {
+                    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                    // The slot is released by its own task (terminal status,
+                    // the 90 s cap, or shutdown) while this manager continues
+                    // with the address wait and the serving tasks.
+                    let slot_release =
+                        tokio::spawn(slot.hold_until_started(started_rx, token.clone()));
+                    let Some(address) = wait_for_address(&service, &token, &nick).await else {
+                        return; // shutdown (or no address) while waiting; started_tx drops
+                    };
+                    info!(
+                        nickname = %nick,
+                        address = %address.display_unredacted(),
+                        "onion service address available: onion service starting"
+                    );
+                    // Serving loop and status logger run as independent tasks;
+                    // both exit on cancellation. The manager keeps this first
+                    // clone alive; dropping the last clone would unpublish the
+                    // service.
+                    let serving = tokio::spawn(serve::serve_service(
+                        service.clone(),
+                        rend_requests,
+                        ports,
+                        semaphore,
+                        global_streams.clone(),
+                        token.clone(),
+                    ));
+                    let status = tokio::spawn(serve::log_status_events(
+                        service.status_events(),
+                        nick.clone(),
+                        address.display_unredacted().to_string(),
+                        started_tx,
+                        token.clone(),
+                    ));
+                    token.cancelled().await;
+                    let _ = serving.await;
+                    let _ = status.await;
+                    let _ = slot_release.await; // completes on its own; joined for tidiness
+                    info!(nickname = %nick, "onion service stopped");
+                    return;
+                }
+                // `enabled` defaults to true in our built config; `None` means
+                // arti refused to start the service at all.
+                Ok(None) => {
+                    error!(nickname = %nick, "onion service was rejected by the Tor client (disabled configuration); not retried");
+                    return;
+                }
+                Err(error) => {
+                    error!(
+                        nickname = %nick,
+                        %error,
+                        retry_in = ?delay,
+                        "failed to launch onion service; retrying"
+                    );
+                }
             }
         }
 
         tokio::select! {
             biased;
             () = token.cancelled() => return,
-            () = tokio::time::sleep(delay) => {}
+            () = tokio::time::sleep(backoff_spread(delay)) => {}
         }
         delay = (delay * 2).min(RETRY_DELAY_MAX);
-    }
-}
-
-/// Settle the identity of `entry` before it is launched: the onion services
-/// file's key is put into the keystore arti reads, or created and recorded
-/// there when the file has none. The keystore and file work blocks, so it runs
-/// on the blocking pool. `None` means the service must not start; the reason is
-/// logged (never the key).
-async fn prepare_identity(
-    config_path: Option<PathBuf>,
-    entry: OnionServiceEntry,
-) -> Option<String> {
-    let nick = entry.nickname.clone();
-    let prepared =
-        tokio::task::spawn_blocking(move || identity::ensure(config_path.as_deref(), &entry)).await;
-    match prepared {
-        Ok(Ok(address)) => {
-            info!(
-                nickname = %nick,
-                %address,
-                "onion service: identity ready (the onion services file holds its key)"
-            );
-            Some(address)
-        }
-        Ok(Err(error)) => {
-            error!(nickname = %nick, error = %format!("{error:#}"), "onion service identity is not usable; service not started");
-            None
-        }
-        Err(error) => {
-            error!(nickname = %nick, %error, "onion service identity task failed; service not started");
-            None
-        }
     }
 }
 
@@ -312,6 +360,40 @@ async fn wait_for_address(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Retry-spread scaling (pure, no runtime).
+    #[test]
+    fn the_spread_stays_within_twenty_percent() {
+        assert_eq!(spread_millis(30_000, 0), 24_000);
+        // u64::MAX % 40 == 15 → step 15 → factor 0.95.
+        assert_eq!(spread_millis(30_000, u64::MAX), 28_500);
+        assert_eq!(spread_millis(300_000, 0), 240_000);
+
+        // Monotone non-decreasing across the 40-step period.
+        let mut previous = spread_millis(30_000, 0);
+        for unit in 1..40u64 {
+            let current = spread_millis(30_000, unit);
+            assert!(current >= previous, "spread regressed at unit {unit}");
+            previous = current;
+        }
+
+        // Real samples: the unit comes from the OS RNG, so only bounds and
+        // variety are asserted — no wall-clock anywhere.
+        let mut distinct = std::collections::HashSet::new();
+        for _ in 0..50 {
+            let delay = backoff_spread(Duration::from_secs(30));
+            assert!(
+                delay >= Duration::from_secs(24),
+                "below the -20% floor: {delay:?}"
+            );
+            assert!(
+                delay < Duration::from_secs(36),
+                "above the +20% ceiling: {delay:?}"
+            );
+            distinct.insert(delay);
+        }
+        assert!(distinct.len() >= 2, "the spread produces variety");
+    }
 
     #[test]
     fn build_config_accepts_valid_nickname() {
@@ -362,16 +444,15 @@ mod tests {
         store::address(&keymgr, &store::nickname(nickname).expect("nickname")).expect("address")
     }
 
-    #[tokio::test]
-    async fn a_launchable_identity_is_prepared_and_the_file_completed() {
+    #[test]
+    fn a_launchable_identity_is_prepared_and_the_file_completed() {
         let (_tmp, config) = temp_config();
         let entry = service("web");
         proxy_config::Config::write_onion_services(&config, std::slice::from_ref(&entry))
             .expect("write");
 
-        let address = prepare_identity(Some(config.clone()), entry)
-            .await
-            .expect("the service may start");
+        let prepared = identity::prepare_all(Some(&config), &[entry]);
+        let address = prepared[0].address.clone().expect("the service may start");
 
         let stored = proxy_config::Config::read_onion_services(&config).expect("read");
         assert_eq!(stored[0].address.as_deref(), Some(address.as_str()));
@@ -379,8 +460,8 @@ mod tests {
         assert_eq!(keystore_address(&config, "web"), Some(address));
     }
 
-    #[tokio::test]
-    async fn an_address_the_key_does_not_give_keeps_the_service_from_starting() {
+    #[test]
+    fn an_address_the_key_does_not_give_keeps_the_service_from_starting() {
         let (_tmp, config) = temp_config();
         let (key, _address) = identity::fresh_identity("web");
         let (_other_key, other_address) = identity::fresh_identity("web");
@@ -390,7 +471,8 @@ mod tests {
         proxy_config::Config::write_onion_services(&config, std::slice::from_ref(&entry))
             .expect("write");
 
-        assert_eq!(prepare_identity(Some(config.clone()), entry).await, None);
+        let prepared = identity::prepare_all(Some(&config), &[entry]);
+        assert_eq!(prepared[0].address, None);
         assert_eq!(
             keystore_address(&config, "web"),
             None,
@@ -398,8 +480,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_key_that_is_not_an_identity_keeps_the_service_from_starting() {
+    #[test]
+    fn a_key_that_is_not_an_identity_keeps_the_service_from_starting() {
         let (_tmp, config) = temp_config();
         let mut entry = service("web");
         entry.key = Some(
@@ -408,6 +490,7 @@ mod tests {
         proxy_config::Config::write_onion_services(&config, std::slice::from_ref(&entry))
             .expect("write");
 
-        assert_eq!(prepare_identity(Some(config), entry).await, None);
+        let prepared = identity::prepare_all(Some(&config), &[entry]);
+        assert_eq!(prepared[0].address, None);
     }
 }
