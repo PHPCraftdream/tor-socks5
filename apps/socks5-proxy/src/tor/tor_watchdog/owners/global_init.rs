@@ -39,10 +39,13 @@ pub(super) struct ShutdownHook {
 
 pub(super) fn launch_background() -> bool {
     #[cfg(test)]
-    if RUN_SERVER_SHUTDOWN.try_with(|_| ()).is_ok() {
-        return false;
+    {
+        RUN_SERVER_SHUTDOWN.try_with(|_| ()).is_err()
     }
-    true
+    #[cfg(not(test))]
+    {
+        true
+    }
 }
 
 pub(super) fn server_ready() {
