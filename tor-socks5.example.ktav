@@ -13,6 +13,13 @@
 ## starts at a bridge).
 tor.circuit_hops: 3
 
+## Spread circuits over that many primary guards (bridges): 1, 2 or 3
+## (default 1 = stock behavior, one guard at a time). 2 or 3 split the load
+## of many onion services over several bridges, and one bridge failing
+## disturbs only a part of the circuits; more bridges then see this client's
+## traffic. Meant for censorship circumvention under load, not anonymity.
+tor.guard_spread: 1
+
 ## Listen addresses — one SOCKS5 + HTTP CONNECT listener per address.
 ## Accepts a scalar or list; each value accepts host1,host2:port shorthand,
 ## e.g. listen: 127.0.0.1,[::1]:1080 (IPv6 must be bracketed).

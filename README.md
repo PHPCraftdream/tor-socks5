@@ -362,6 +362,15 @@ a shorter, ready-to-edit subset of the same defaults; any key you omit keeps the
 ## relays refuse streams from a 2-hop circuit that starts at a bridge.
 tor.circuit_hops: 3
 
+## How many primary guards (bridges) the circuits are spread over: 1, 2 or 3
+## (default 1). 1 is stock behavior: every circuit of the process — onion
+## services included — uses the first usable guard, and a guard failing
+## rebuilds every circuit at once. 2 or 3 split that load, so one bridge
+## failing disturbs only a part of the circuits; more bridges then see this
+## client's traffic. Meant for censorship circumvention under load, not
+## anonymity. See docs/guide/bridges.md.
+tor.guard_spread: 1
+
 ## Addresses to listen on — one SOCKS5 + HTTP CONNECT listener per address.
 ## Accepts a scalar or list; each value also accepts host1,host2:port.
 ## Example: listen: 127.0.0.1,[::1]:1080 (IPv6 must be bracketed).

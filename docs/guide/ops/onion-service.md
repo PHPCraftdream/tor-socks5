@@ -215,6 +215,58 @@ meant for censorship circumvention, not anonymity. Observed with a warm
 client: `2` → first request 7.4 s, repeats ~0.37 s; `3` → 4.7 s, repeats
 ~0.7 s.
 
+## Many services
+
+Every onion service costs circuits. In steady state Arti (0.48, the vendored
+stack) keeps **3 introduction-point circuits** per service — the minimum; it
+allows 3..=20, and up to 5 relays are used only while some introduction points
+are faulty. Each service uploads its descriptor to **8 HsDirs** per time
+period (2 replicas × 4), and re-uploads are rate-limited to one per minute
+per service.
+
+Circuits are a shared resource. By default **all circuits of the process** —
+introduction, HsDir uploads, rendezvous and ordinary traffic alike — go
+through **one bridge**: Arti uses the first usable of its 3 primary guards,
+and when that bridge fails, every circuit is rebuilt at once on the next one.
+Arti also fills its onion circuit pool one circuit at a time, so many
+services starting together exhaust the pool and then build their circuits on
+demand in a burst.
+
+The server paces this:
+
+- **Identities are settled up front.** The identities of all enabled services
+  are settled before anything launches, and the onion services file is
+  rewritten once (not once per keyless service). A service whose identity is
+  unusable does not start and does not stop the others; if that single write
+  fails, the services that would have needed a new key recorded do not
+  start.
+- **Gradual start.** At most 4 services are in their launch phase at once. A
+  service holds its slot until it reports running, reachable-but-degraded or
+  broken — for at most 90 s, or until shutdown. Relaunch attempts go through
+  the same gate, and the retry backoff (30 s doubling to 5 minutes) is
+  spread by ±20 %. Services start in the order of the services file (best
+  effort).
+- **Stream limits:** 256 concurrent forwarded streams per service and 512
+  across all services together.
+- **More than 10 enabled services log a warning at start** — the setup is
+  beyond what is known to work, and the warning names this documentation.
+  It is not an error, and nothing is refused.
+
+How far you can go is not settled. Hosting onion services is marked
+experimental by the Arti authors, and we have not measured more than a
+handful of services ourselves. External reports (the OnionPress issues #75
+and #96 on GitHub, against Arti 2.x) saw reliable operation at about
+10 services per process and rendezvous failures from about 13–20. Treat
+that as an external data point, not as a guarantee.
+
+In practice: start with few services, watch the status lines, and raise the
+count gradually. When enough services load a single bridge, set
+`tor.guard_spread: 2` or `3` — provided you have at least that many working
+bridges (see [bridges](../bridges.md)). For much more than ~10 services,
+consider splitting them across separate tor-socks5 processes, each with its
+own config directory and its own bridge set — an option you configure
+yourself, not a shipped feature.
+
 ## Limitations
 
 - **Android:** the `onion-service` cargo feature is off by default there;
@@ -225,7 +277,8 @@ client: `2` → first request 7.4 s, repeats ~0.37 s; `3` → 4.7 s, repeats
 - **`tor.circuit_hops` (2 or 3) affects only client-side onion
   circuits**; service-side length is the per-service `circuit_hops`
   (see Circuit length above and [bridges](../bridges.md)).
-- **At most 256 concurrent streams per service**; each connect to the
-  local target has a **10 s timeout**, and a refused or timed-out target
-  closes that stream only. A service whose launch fails is retried with a
-  backoff from 30 s up to 5 minutes.
+- **At most 256 concurrent streams per service, and 512 across all
+  services together**; each connect to the local target has a **10 s
+  timeout**, and a refused or timed-out target closes that stream only. A
+  service whose launch fails is retried with a backoff from 30 s up to
+  5 minutes.

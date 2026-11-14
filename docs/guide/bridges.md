@@ -23,6 +23,25 @@ relays refuse streams from a circuit whose first hop is a bridge and which has
 no middle relay (END cell, reason `TORPROTOCOL`), so a two-hop exit circuit
 cannot carry traffic when bridges are used.
 
+## Guard spread (`tor.guard_spread`)
+
+By default every circuit of the process — onion-service introduction, HsDir
+uploads and rendezvous circuits included, ordinary traffic alike — goes
+through one bridge: arti uses the first usable of its 3 primary guards, and
+when that bridge fails, every circuit is rebuilt at once on the next one.
+
+The main configuration accepts `tor.guard_spread`, next to
+`tor.circuit_hops`: an integer `1..=3`, default `1`. With `2` or `3`,
+circuits are spread over that many primary guards, so the load of many
+services is split and one bridge failing disturbs only a part of the
+circuits. The trade-off: more bridges see this client's traffic, and the
+best bridge is no longer the only one used — the setting is meant for
+censorship circumvention under load, not for anonymity. A startup info line
+is logged when it is above `1`.
+
+It is implemented through the Tor consensus parameter
+`guard-n-primary-guards-to-use` and applies with or without bridges.
+
 ## Single binary, two modes (busybox dispatch)
 
 The PT runs in-process — there is no second executable to ship. Tor's PT
