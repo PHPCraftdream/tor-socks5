@@ -33,8 +33,17 @@ pub(crate) const BRIDGE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ACTIVE_BRIDGES: usize = 30;
 
 fn settings_for_config(cfg: &Config) -> Settings {
+    if cfg.tor.guard_spread > 1 {
+        info!(
+            guards = cfg.tor.guard_spread,
+            "circuits are spread over multiple primary guards; more bridges see this \
+             client's traffic (trades guard stickiness for load spreading and failure \
+             isolation)"
+        );
+    }
     Settings {
         circuit_hops: cfg.tor.circuit_hops,
+        guard_spread: cfg.tor.guard_spread,
         // proxy-config validation guarantees all enabled services agree on
         // the value, so any enabled entry is representative.
         service_circuit_hops: cfg
@@ -624,6 +633,20 @@ mod tests {
     fn settings_for_config_forwards_circuit_hops() {
         let cfg: Config = ktav::from_str("tor.circuit_hops: 2\n").expect("config parses");
         assert_eq!(settings_for_config(&cfg).circuit_hops, 2);
+    }
+
+    #[test]
+    fn settings_for_config_forwards_guard_spread() {
+        for (value, expected) in [("1", 1), ("2", 2), ("3", 3)] {
+            let cfg: Config =
+                ktav::from_str(&format!("tor.guard_spread: {value}\n")).expect("config parses");
+            assert_eq!(settings_for_config(&cfg).guard_spread, expected);
+        }
+    }
+
+    #[test]
+    fn settings_for_config_defaults_guard_spread_to_one() {
+        assert_eq!(settings_for_config(&Config::default()).guard_spread, 1);
     }
 
     fn config_with_service(enabled: bool, circuit_hops: u8) -> Config {

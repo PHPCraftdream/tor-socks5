@@ -112,6 +112,12 @@ pub struct Settings {
     /// appended target relay. Defaults to `4`; only `2..=4` are valid. Ignored under
     /// Lite/Full vanguard modes.
     pub service_circuit_hops: u8,
+    /// How many primary guards (bridges) the client's circuits spread over,
+    /// via the `guard-n-primary-guards-to-use` net-param override. Defaults
+    /// to `1` — stock arti behavior, every circuit through the first guard.
+    /// `2` or `3` trade guard stickiness for load spreading and failure
+    /// isolation: more bridges see this client's traffic.
+    pub guard_spread: u8,
     /// Override the `iat-mode` parameter on every obfs4 bridge line before
     /// handing it to arti. `iat-mode` is a *client-side* obfs4 knob: `0`
     /// sends cells as they come (fastest, but leaves obfs4's packet-size and
@@ -154,6 +160,7 @@ impl Default for Settings {
             min_bandwidth_percentile: 0,
             circuit_hops: 3,
             service_circuit_hops: 4,
+            guard_spread: 1,
             obfs4_iat_mode: None,
             disable_preemptive_circuits: false,
             initial_connect_timeout: None,
@@ -176,6 +183,7 @@ impl Settings {
             && self.min_bandwidth_percentile == 0
             && self.circuit_hops == 3
             && self.service_circuit_hops == 4
+            && self.guard_spread == 1
             && self.obfs4_iat_mode.is_none()
             && !self.disable_preemptive_circuits
             && self.initial_connect_timeout.is_none()
@@ -755,14 +763,38 @@ pub use pre_endpoint::Socks5PreEndpoint;
 pub use routed_stream::RoutedStream;
 pub use socks5_proto::client::Credentials as PostSocksCredentials;
 use validate::{
-    validate_circuit_hops, validate_min_bandwidth_percentile, validate_service_circuit_hops,
+    validate_circuit_hops, validate_guard_spread, validate_min_bandwidth_percentile,
+    validate_service_circuit_hops,
 };
+
+/// Consensus net-param overridden by [`Settings::guard_spread`]: how many
+/// primary guards data circuits try.
+const GUARD_SPREAD_NET_PARAM: &str = "guard-n-primary-guards-to-use";
+
+/// The `override_net_params` entry implementing [`Settings::guard_spread`]:
+/// `None` at the default `1` (stock arti behavior), `Some(n)` for 2..=3.
+fn guard_spread_override(spread: u8) -> Option<i32> {
+    (spread > 1).then_some(i32::from(spread))
+}
+
+/// Apply [`guard_spread_override`] to the builder. Independent of bridges:
+/// applied whenever the spread is above 1, with or without them, and at
+/// most once per config build (the `cbtmintimeout` override below stays
+/// bridge-only and uses a different key).
+fn apply_guard_spread(builder: &mut TorClientConfigBuilder, spread: u8) {
+    if let Some(value) = guard_spread_override(spread) {
+        builder
+            .override_net_params()
+            .insert(GUARD_SPREAD_NET_PARAM.into(), value);
+    }
+}
 
 fn build_config(settings: &Settings) -> Result<TorClientConfig> {
     validate_circuit_hops(settings.circuit_hops).map_err(TorError::BuildConfig)?;
     validate_service_circuit_hops(settings.service_circuit_hops).map_err(TorError::BuildConfig)?;
     validate_min_bandwidth_percentile(settings.min_bandwidth_percentile)
         .map_err(TorError::BuildConfig)?;
+    validate_guard_spread(settings.guard_spread).map_err(TorError::BuildConfig)?;
 
     let mut builder: TorClientConfigBuilder = TorClientConfig::builder();
 
@@ -825,6 +857,8 @@ fn build_config(settings: &Settings) -> Result<TorClientConfig> {
             .initial_predicted_ports()
             .clear();
     }
+
+    apply_guard_spread(&mut builder, settings.guard_spread);
 
     if !settings.bridges.is_empty() {
         // Fast obfs4 history must not impose sub-second budgets on a slower bridge.

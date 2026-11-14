@@ -27,3 +27,11 @@ pub(crate) fn validate_service_circuit_hops(hops: u8) -> std::result::Result<(),
         ))
     }
 }
+
+pub(crate) fn validate_guard_spread(spread: u8) -> std::result::Result<(), String> {
+    if (1..=3).contains(&spread) {
+        Ok(())
+    } else {
+        Err(format!("guard_spread must be 1, 2 or 3, got {spread}"))
+    }
+}
