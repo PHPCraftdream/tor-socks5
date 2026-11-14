@@ -84,6 +84,14 @@ const ADDRESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// appear within seconds.
 const ADDRESS_WAIT_LIMIT: Duration = Duration::from_secs(120);
 
+/// Above this many enabled services the setup is beyond what is known to
+/// work through a small bridge pool: a warning is logged, nothing is refused.
+const SERVICES_SOFT_LIMIT: usize = 10;
+
+fn beyond_soft_limit(enabled: usize) -> bool {
+    enabled > SERVICES_SOFT_LIMIT
+}
+
 /// Spawn the onion-service producer if any configured service is enabled.
 /// Appends the producer's join handle to `producers` (cancelled and joined by
 /// the server's regular shutdown choreography). No-op when nothing is
@@ -108,6 +116,14 @@ pub(crate) fn spawn_services(
         at_once = start_gate::MAX_STARTING,
         "starting configured onion services; at most 4 launch at a time"
     );
+    if beyond_soft_limit(enabled.len()) {
+        warn!(
+            count = enabled.len(),
+            soft_limit = SERVICES_SOFT_LIMIT,
+            "more onion services are enabled than are known to work through a small \
+             bridge pool; see docs/guide/ops/onion-service.md (Many services)"
+        );
+    }
     let config_path = config_path.map(Path::to_path_buf);
     producers.push(tokio::spawn(run_services(
         handle,
@@ -393,6 +409,14 @@ mod tests {
             distinct.insert(delay);
         }
         assert!(distinct.len() >= 2, "the spread produces variety");
+    }
+
+    #[test]
+    fn the_soft_limit_warning_starts_above_ten_services() {
+        assert!(!beyond_soft_limit(1));
+        assert!(!beyond_soft_limit(10));
+        assert!(beyond_soft_limit(11));
+        assert!(beyond_soft_limit(100));
     }
 
     #[test]
