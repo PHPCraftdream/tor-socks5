@@ -3,6 +3,9 @@ mod pre_pt_tests;
 
 use super::*;
 
+#[path = "proxy/guard_spread_tests.rs"]
+mod guard_spread_tests;
+
 use crate::pre_endpoint::channel_proves_endpoint;
 use arti_client::config::circ::CircMgrConfig;
 use std::path::PathBuf;

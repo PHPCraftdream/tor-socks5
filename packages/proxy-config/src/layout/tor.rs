@@ -7,6 +7,9 @@ pub struct TorConfig {
     /// Client onion-service circuit length; 2 or 3 are permitted. Default `3`. Exit circuits ignore it.
     #[serde(deserialize_with = "circuit_hops")]
     pub circuit_hops: u8,
+    /// How many primary guards (bridges) client circuits spread over; 1..=3 are permitted. Default `1` is arti's stock single-guard behavior.
+    #[serde(deserialize_with = "guard_spread")]
+    pub guard_spread: u8,
 }
 
 fn circuit_hops<'de, D>(deserializer: D) -> Result<u8, D::Error>
@@ -23,9 +26,30 @@ where
     }
 }
 
+fn guard_spread<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = u8::deserialize(deserializer).map_err(|_| {
+        serde::de::Error::custom(
+            "tor.guard_spread must be an integer; permitted values are 1, 2, or 3",
+        )
+    })?;
+    if (1..=3).contains(&value) {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom(
+            "tor.guard_spread must be 1, 2, or 3",
+        ))
+    }
+}
+
 impl Default for TorConfig {
     fn default() -> Self {
-        Self { circuit_hops: 3 }
+        Self {
+            circuit_hops: 3,
+            guard_spread: 1,
+        }
     }
 }
 
@@ -79,6 +103,58 @@ mod tests {
             .expect("load")
             .into_config();
         assert_eq!(loaded.tor.circuit_hops, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tor_guard_spread_defaults_without_or_with_empty_tor_section() {
+        let omitted: Config =
+            ktav::from_str("listen: 127.0.0.1:1080\n").expect("omitted tor section parses");
+        assert_eq!(omitted.tor.guard_spread, 1);
+        let empty_tor: Config =
+            ktav::from_str("tor: {}\n").expect("empty tor section parses as defaults");
+        assert_eq!(empty_tor.tor.guard_spread, 1);
+    }
+
+    #[test]
+    fn tor_guard_spread_defaults_to_one_and_accepts_one_two_three() {
+        assert_eq!(Config::default().tor.guard_spread, 1);
+        for (value, expected) in [("1", 1), ("2", 2), ("3", 3)] {
+            let cfg: Config = ktav::from_str(&format!("tor.guard_spread: {value}\n"))
+                .expect("valid guard_spread parses");
+            assert_eq!(cfg.tor.guard_spread, expected);
+        }
+    }
+
+    #[test]
+    fn tor_guard_spread_rejects_invalid_values_and_non_integer_types() {
+        for value in ["0", "4", "255", "-1", "256", "\"2\""] {
+            let err = ktav::from_str::<Config>(&format!("tor.guard_spread: {value}\n"))
+                .expect_err("invalid guard_spread must fail");
+            let message = format!("{err:#}");
+            assert!(message.contains("guard_spread"), "{message}");
+            assert!(message.contains("tor"), "{message}");
+            assert!(
+                message.contains("1") && message.contains("2") && message.contains("3"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn tor_guard_spread_roundtrips_through_write() {
+        let dir =
+            std::env::temp_dir().join(format!("tor-guard-spread-roundtrip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test directory");
+        let path = dir.join("tor-socks5.ktav");
+        let mut cfg = Config::default();
+        cfg.tor.guard_spread = 2;
+        cfg.write(&path).expect("write");
+        let loaded = Config::load_with_override(Some(&path))
+            .expect("load")
+            .into_config();
+        assert_eq!(loaded.tor.guard_spread, 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
