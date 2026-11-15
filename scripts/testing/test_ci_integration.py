@@ -49,9 +49,10 @@ class External(unittest.TestCase):
                  "acl": ("tor-socks5-client-acl", "packages/proxy-config/client-acl", "lib"),
                  "bridge": ("bridge-probe", "packages/bridge-probe", "lib"),
                  "arti": ("arti-wrapper", "packages/arti-wrapper", "lib"),
-                 "ffi": ("android-ffi", "packages/android-ffi", "lib")}
+                 "ffi": ("android-ffi", "packages/android-ffi", "lib"),
+                 "runtime": ("tor-socks5-runtime", "apps/sdk/crates/runtime", "lib")}
         edges = {"proxy": ["auth", "config", "bridge", "arti"], "config": ["acl"], "ffi": ["config", "auth"],
-                 "auth": ["acl"], "acl": [], "bridge": [], "arti": []}
+                 "auth": ["acl"], "acl": [], "bridge": [], "arti": [], "runtime": []}
         packages = [{"id": i, "name": name, "manifest_path": str(self.root / path / "Cargo.toml"),
                      "targets": [{"kind": [kind]}]} for i, (name, path, kind) in names.items()]
         nodes = [{"id": i, "deps": [{"pkg": d, "name": d, "dep_kinds": [{"kind": None, "target": None}]} for d in deps]} for i, deps in edges.items()]
@@ -177,7 +178,7 @@ class External(unittest.TestCase):
 
     def test_commit_footer_full_trigger(self):
         members = sorted(["socks5-proxy", "android-ffi", "tor-socks5-auth", "tor-socks5-config",
-                          "tor-socks5-client-acl", "bridge-probe", "arti-wrapper"])
+                          "tor-socks5-client-acl", "bridge-probe", "arti-wrapper", "tor-socks5-runtime"])
         self.put("packages/auth/src/lib.rs", "auth\n")
         self.commit("auth")
         early = self.head()
