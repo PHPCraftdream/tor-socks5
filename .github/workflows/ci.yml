@@ -138,6 +138,14 @@ jobs:
       - name: Check first-party directories stay at 7 entries or fewer
         run: sh scripts/check-dir-entries.sh
 
+  private-paths:
+    name: No machine-specific paths in tracked files
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check tracked files stay free of machine-specific paths
+        run: sh .githooks/check-private-paths.sh
+
   publish-guard:
     name: Publish guard (publish = false)
     runs-on: ubuntu-latest
@@ -536,7 +544,7 @@ jobs:
   required:
     name: CI required
     if: always()
-    needs: [plan, fmt, line-limit, dir-entries, publish-guard, packageability, real-tor-channel, rust, msrv, android, docs-contract, installer-sh, installer-windows, release-scripts, native-portability, vendor-extra, features, stress, license-offline, license-audit, vendor-notices]
+    needs: [plan, fmt, line-limit, dir-entries, private-paths, publish-guard, packageability, real-tor-channel, rust, msrv, android, docs-contract, installer-sh, installer-windows, release-scripts, native-portability, vendor-extra, features, stress, license-offline, license-audit, vendor-notices]
     runs-on: ubuntu-latest
     env:
       NEEDS: ${{ toJSON(needs) }}

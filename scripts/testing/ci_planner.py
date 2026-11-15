@@ -20,6 +20,12 @@ CONTRACT_MANIFEST = ".config/ci-contracts.toml"
 LICENSE_DOCS = frozenset({".github/release/license/README.md"})
 LICENSE_POLICY_FILES = (".github/deny.toml",)
 
+# Одноразовое сопоставление удаления неиспользуемой зависимости (по аналогии
+# с удалённым заданием в JOB_SEGMENTS): запись остаётся, пока из старых баз
+# возможен diff с этим удалением.
+SANCTIONED_DEPENDENCY_REMOVALS = frozenset({
+    ("packages/arti-wrapper/Cargo.toml", "dependencies", "anyhow")})
+
 
 TOR_ANCHORS = ("scripts/testing/real-tor-channel.sh", "scripts/testing/real-tor-mutations.sh",
                "apps/socks5-proxy/src/bridges/bridge_maintenance/real_channel_tests.rs")
@@ -231,7 +237,7 @@ class Graph:
 
 
 JOB_SEGMENTS = {
-    "plan": "fast", "fmt": "fast", "line-limit": "fast", "dir-entries": "fast",
+    "plan": "fast", "fmt": "fast", "line-limit": "fast", "dir-entries": "fast", "private-paths": "fast",
     "clippy-full": "rust", "clippy-affected": "rust", "test-full": "rust",
     "test-affected": "rust", "msrv": "msrv", "android": "android",
     "real-tor-channel": "tor", "installer-sh": "installer-sh",
@@ -425,7 +431,7 @@ def lock_seeds(old, new, graph):
     return {graph_node(identity) for identity, entry in ib.items() if ia.get(identity) != entry}
 
 
-def check_removed_dependencies(old, new):
+def check_removed_dependencies(path, old, new):
     def dependencies(data):
         result = set()
         def visit(value, prefix=()):
@@ -438,7 +444,9 @@ def check_removed_dependencies(old, new):
                     visit(child, prefix + (key,))
         visit(data)
         return result
-    if dependencies(tomllib.loads(old)) - dependencies(tomllib.loads(new)):
+    allowed = {(table, name) for manifest, table, name in SANCTIONED_DEPENDENCY_REMOVALS if manifest == path}
+    removed = dependencies(tomllib.loads(old)) - dependencies(tomllib.loads(new))
+    if {entry[-2:] for entry in removed} - allowed:
         raise MappingError("missing mapping: удалена зависимость пакета")
 
 
@@ -603,7 +611,7 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
             if not sdk:
                 raise MappingError("missing mapping: SDK отсутствует в графе")
             seed(sdk, path)
-        elif path in ("scripts/testing/ci_planner.py", "scripts/testing/test_ci_planner.py", "scripts/testing/test_ci_integration.py", "scripts/testing/selftest.sh", "scripts/testing/test-affected.sh", "scripts/check-line-limit.sh", "scripts/check-dir-entries.sh", ".githooks/pre-push"):
+        elif path in ("scripts/testing/ci_planner.py", "scripts/testing/test_ci_planner.py", "scripts/testing/test_ci_integration.py", "scripts/testing/selftest.sh", "scripts/testing/test-affected.sh", "scripts/check-line-limit.sh", "scripts/check-dir-entries.sh", ".githooks/check-private-paths.sh", ".githooks/pre-push"):
             add("fast", path)
         elif path in ("scripts/testing/real-tor-channel.sh", "scripts/testing/real-tor-mutations.sh"):
             add("tor", path)
@@ -672,7 +680,7 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
                 if license_policy:
                     add("license-audit", path)
                 try:
-                    check_removed_dependencies(*blobs(path))
+                    check_removed_dependencies(path, *blobs(path))
                 except (ValueError, TypeError) as exc:
                     raise MappingError("missing mapping: ошибка TOML: " + path) from exc
             seed({owner}, path)
@@ -761,7 +769,7 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
 
 
 RESULT_JOBS = {
-    "fmt": ("fast", "regression"), "line-limit": ("fast",), "dir-entries": ("fast",),
+    "fmt": ("fast", "regression"), "line-limit": ("fast",), "dir-entries": ("fast",), "private-paths": ("fast",),
     "publish-guard": ("fast",), "packageability": ("fast",),
     "real-tor-channel": ("tor",), "rust": ("rust",), "msrv": ("msrv",),
     "android": ("android",), "docs-contract": ("docs-contract",),
@@ -798,6 +806,21 @@ def validate_results(plan, needs):
         actual = needs[job].get("result")
         if actual != expected:
             raise MappingError(f"{job}: expected {expected}, got {actual}")
+
+
+def emit_plan(result, stream=None):
+    # python -I игнорирует PYTHONUTF8/PYTHONIOENCODING: план пишется байтами UTF-8
+    # в buffer, чтобы вывод не зависел от кодовой страницы консоли (cp1252 на Windows).
+    output = (stream or sys.stdout).buffer
+    output.write(json.dumps(result, sort_keys=True, ensure_ascii=False).encode("utf-8") + b"\n")
+    output.flush()
+
+
+def emit_error(message, stream=None):
+    # Сообщение может быть с кириллицей: та же запись байтами UTF-8, префикс как раньше.
+    output = (stream or sys.stderr).buffer
+    output.write(("planner: " + (message if message.startswith("missing mapping:") else "missing mapping: " + message) + "\n").encode("utf-8"))
+    output.flush()
 
 
 def main():
@@ -866,10 +889,9 @@ def main():
         unsupported = set(result["segments"]) - supported
         if unsupported:
             raise MappingError("missing mapping: нет потребителя: " + ", ".join(sorted(unsupported)))
-        print(json.dumps(result, sort_keys=True, ensure_ascii=False))
+        emit_plan(result)
     except (MappingError, ValueError, KeyError, OSError, TypeError) as exc:
-        message = str(exc)
-        print("planner: " + (message if message.startswith("missing mapping:") else "missing mapping: " + message), file=sys.stderr)
+        emit_error(str(exc))
         return 1
     return 0
 
