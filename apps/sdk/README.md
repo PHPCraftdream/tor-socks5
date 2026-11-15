@@ -250,9 +250,38 @@ let flush = close_global().await; // Some(Ok(())) when a writer was running
 `close` returns the final flush outcome. Guard observations land in the
 `ObservationSink`; match them to your bridges and apply them to a store
 with `ObservationSink::drain_into_store` (`drain` returns the raw
-observations). The retrying maintenance loop around them, the verifier
-and the warmer are the bridge manager (SDK-8 in the plan) and are not
-part of the facade yet.
+observations).
+
+## Bridge manager and `bridges fetch` (SDK-8)
+
+With `runtime`, the SDK-8 surface of `tor-socks5-runtime` is the bridge
+manager: one handle owning the background bridge producers, plus the
+`bridges fetch` core as a library function.
+
+```rust
+use tor_socks5::runtime::{start, BridgeManagerHandle, ObservationSink};
+
+// Spawn maintenance (+ warmer and circuit verifier unless the global
+// pre_proxies branch is active) exactly as the proxy binary does.
+// One live manager per process (D5): the producers' shared state is
+// process-wide, sequential stop-then-start works.
+let manager: BridgeManagerHandle = start(handle, Some(config_path), &cfg, sink, settings);
+println!("running: {:?}", manager.status().producers);
+
+// At shutdown: cancel and join every producer so in-flight store writes
+// land, then close the bridge-store writer.
+manager.shutdown().await;
+// let flush = close_global().await;
+```
+
+`fetch_bridges` is the core of the CLI's `bridges fetch` command: it
+bootstraps Tor from the configured bridges (built-in seeds as fallback),
+refreshes the candidate pool from the configured HTTPS sources and,
+unless `probe` is `false`, probes candidates and promotes the reachable
+ones into the working config. The application keeps config loading,
+validation, tracing and printing; the outcome is
+`FetchBridgesOutcome { added, promoted, pool_len }`. Not cancel-safe:
+cancellation aborts the run mid-way and skips the trailing 200 ms sleep.
 
 ## What is not here
 
@@ -261,9 +290,9 @@ the proxy lives in the `socks5-proxy` binary and is **not** available as a
 library yet:
 
 - the proxy server (listeners, egress, pre/post pools, startup and shutdown);
-- the bridge manager (verifier, warmer, maintenance loop).
 
-The bridge health writer, the guard-event observation and the Tor client
+The bridge health writer, the guard-event observation, the bridge manager
+and the Tor client
 and watchdog surface are available behind the `runtime` feature (see
 [Tor client (runtime feature)](#tor-client-runtime-feature) and
 [Bridge health writer and guard observations](#bridge-health-writer-and-guard-observations)).

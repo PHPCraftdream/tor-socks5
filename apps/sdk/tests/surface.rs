@@ -148,6 +148,19 @@ fn runtime_module_tor_client_surface() {
     let _ = tor_socks5::runtime::conn_health::spawn_conn_health_logger;
 }
 
+/// The SDK-8 runtime surface: the bridge manager (one handle owning the
+/// background bridge producers) and the `bridges fetch` core.
+#[cfg(feature = "runtime")]
+#[test]
+fn runtime_bridge_manager_surface() {
+    assert!(names::<tor_socks5::runtime::BridgeManagerHandle>().contains("BridgeManagerHandle"));
+    assert!(names::<tor_socks5::runtime::BridgeManagerStatus>().contains("BridgeManagerStatus"));
+    assert!(names::<tor_socks5::runtime::FetchBridgesParams>().contains("FetchBridgesParams"));
+    assert!(names::<tor_socks5::runtime::FetchBridgesOutcome>().contains("FetchBridgesOutcome"));
+    let _ = tor_socks5::runtime::start;
+    let _ = tor_socks5::runtime::fetch_bridges;
+}
+
 /// The SDK-7 runtime surface: the bridge-health writer and the
 /// guard-event observation layer for the application's own subscriber.
 #[cfg(feature = "runtime")]

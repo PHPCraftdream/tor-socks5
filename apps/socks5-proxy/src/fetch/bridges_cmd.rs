@@ -6,14 +6,16 @@
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
-use arti_wrapper::TorTunnel;
-use tracing::info;
+use anyhow::{bail, Result};
+use tokio_util::sync::CancellationToken;
 
 use crate::cli::BridgesAction;
 use crate::config::{Config, Loaded};
 use crate::process::{init_tracing, install_crypto_provider};
 use crate::route::reject_unsupported_pool;
+use tor_socks5_runtime::bridge_manager::{fetch_bridges, FetchBridgesParams};
+
+#[cfg(test)]
 use tor_socks5_runtime::tor_setup::build_tor_settings;
 
 #[cfg(test)]
@@ -50,60 +52,39 @@ pub(crate) async fn cmd_bridges(
     let _log_guard = init_tracing(&cfg);
     install_crypto_provider();
 
-    if cfg.bridges.sources.is_empty() {
-        bail!("no bridge sources configured in the `sources` list of the bridges file — nothing to fetch");
-    }
-
-    // Bootstrap Tor using the configured bridges (or built-in seeds as a
-    // fallback) so we have a circuit to fetch over.
-    let settings = build_tor_settings(&cfg, Some(&config_path)).await?;
-    info!(
-        count = settings.bridges.len(),
-        "bootstrapping Tor to fetch fresh bridges"
-    );
-    let tor = TorTunnel::bootstrap_with(settings)
-        .await
-        .context("failed to bootstrap Tor for bridge fetching")?;
-
-    // Step 1: refresh the candidate pool from the sources over Tor.
-    let timeout = Duration::from_secs(timeout_secs);
-    let added = tor_socks5_runtime::fetch_merge::refresh_candidate_pool(
-        &tor,
+    // The core of the command lives in the runtime (`fetch_bridges`,
+    // SDK-8): bootstrap Tor, refresh the candidate pool, optionally probe
+    // and promote. The "no bridge sources configured" check, the trailing
+    // 200 ms post-drop sleep and the bootstrapping info log moved with it.
+    let outcome = fetch_bridges(
         &cfg,
         Some(&config_path),
-        timeout,
+        FetchBridgesParams {
+            timeout: Duration::from_secs(timeout_secs),
+            count,
+            probe: !(dry_run || no_probe),
+            cancel: CancellationToken::new(),
+        },
     )
     .await?;
 
-    if dry_run || no_probe {
-        // Fill the pool but do not probe/promote.
-        let pool = tor_socks5_runtime::candidate_pool::CandidatePool::load(
-            tor_socks5_runtime::candidate_pool::CandidatePool::resolve_path(Some(&config_path)),
-        )
-        .context("loading candidate pool")?;
-        println!(
-            "candidate pool refreshed: +{added} new, {} total ({}, no probing)",
-            pool.len(),
+    match outcome.promoted {
+        None => println!(
+            "candidate pool refreshed: +{} new, {} total ({}, no probing)",
+            outcome.added,
+            outcome.pool_len,
             if dry_run { "--dry-run" } else { "--no-probe" }
-        );
-    } else {
-        // Step 2: drain — lazily probe the pool and promote up to `count`
-        // reachable bridges into the working config.
-        let promoted =
-            tor_socks5_runtime::fetch_merge::drain_pool(Some(&config_path), count, Some(&tor))
-                .await?;
-        if promoted == 0 {
-            println!("pool refreshed (+{added}); no reachable new bridges promoted");
-        } else {
-            println!(
-                "pool refreshed (+{added}); promoted {promoted} reachable bridges into {}",
-                config_path.display()
-            );
-        }
+        ),
+        Some(0) => println!(
+            "pool refreshed (+{}); no reachable new bridges promoted",
+            outcome.added
+        ),
+        Some(promoted) => println!(
+            "pool refreshed (+{}); promoted {promoted} reachable bridges into {}",
+            outcome.added,
+            config_path.display()
+        ),
     }
-
-    drop(tor);
-    tokio::time::sleep(Duration::from_millis(200)).await;
     Ok(())
 }
 

@@ -9,34 +9,36 @@ pub(super) fn launch(
     producer_token: CancellationToken,
     producers: &mut Vec<tokio::task::JoinHandle<()>>,
 ) {
+    // The bridge producers (maintenance, warmer, circuit verifier) belong to
+    // one bridge manager (SDK-8): the manager owns their tasks and cancels
+    // them through its own token, so nothing is spawned here directly. The
+    // pre-endpoint warning now comes from the manager itself. The trampoline
+    // below links the manager to the server tree: it awaits the manager's
+    // `shutdown()` (cancel + join every producer, so in-flight store writes
+    // land) and is itself installed into the same `producers` vec the other
+    // producers go through — the owner registry joins it at exactly the
+    // point where the direct joins used to happen, so the shutdown ordering
+    // is unchanged.
+    let manager = tor_socks5_runtime::bridge_manager::start(
+        handle.clone(),
+        config_path.clone(),
+        cfg,
+        obs_sink,
+        settings.clone(),
+    );
+    producers.push(tokio::spawn({
+        let token = producer_token.clone();
+        async move {
+            token.cancelled().await;
+            manager.shutdown().await;
+        }
+    }));
+
     if settings.pre_endpoint.is_some() {
-        warn!("global pre_proxies: warmer, verifier, discovery and soft failover remain disabled");
-        producers.push(tor_socks5_runtime::bridge_maintenance::spawn(
-            handle.clone(),
-            config_path.clone(),
-            cfg.bridges.recheck_interval_mins,
-            obs_sink,
-            settings,
-            producer_token.clone(),
-        ));
         if let Some(run) = spawn_tor_watchdog(handle, config_path, cfg.watchdog, producer_token) {
             producers.push(run.join);
         }
     } else {
-        // Periodic upkeep: re-probe, prune dead bridges, top up when short,
-        // drain circuit-layer observations from arti's tracing into the
-        // health store so descriptor-mismatch / unsuitable bridges are
-        // pruned alongside the TCP-dead ones. Reads the tunnel through
-        // the handle so pool refreshes follow a watchdog rebuild.
-        producers.push(tor_socks5_runtime::bridge_maintenance::spawn(
-            handle.clone(),
-            config_path.clone(),
-            cfg.bridges.recheck_interval_mins,
-            obs_sink.clone(),
-            settings,
-            producer_token.clone(),
-        ));
-
         // Stale-channel watchdog: rebuilds the `TorClient` when circuits
         // keep failing against TCP-reachable bridges (the half-open
         // channel scenario). Joined at shutdown; disabled by config when unwanted.
@@ -56,37 +58,11 @@ pub(super) fn launch(
         // check cadence with the stale-channel watchdog above; disabled
         // by the same `enabled`/`check_interval_secs` switches.
         producers.extend(spawn_bridge_failover_watchdog(
-            handle.clone(),
-            config_path.clone(),
+            handle,
+            config_path,
             cfg.watchdog,
-            producer_token.clone(),
+            producer_token,
         ));
-
-        // Bridge-channel warm-pool: keeps channels to the healthiest
-        // candidate bridges open in the background, so a future
-        // switch-over (not built here) does not pay for a cold
-        // obfs4/webtunnel handshake. Opt-in; disabled by default.
-        producers.extend(tor_socks5_runtime::bridge_warmer::spawn_bridge_warmer(
-            handle.clone(),
-            config_path.clone(),
-            cfg.warm_pool,
-            producer_token.clone(),
-        ));
-
-        // Periodic circuit-level bridge verification: every 30 min, checks
-        // a small batch of channel-proven bridges for real end-to-end
-        // reachability (throwaway clients, live probe) and records the
-        // successes into the bridge store. This is the CLI counterpart of
-        // android-ffi's background circuit-verify tick; it is self-paced
-        // by store state (a tick with no due bridges is nearly free) and
-        // uses the active pool but verifies through separate clients.
-        producers.push(
-            tor_socks5_runtime::bridge_verifier::spawn_bridge_circuit_verifier(
-                config_path.clone(),
-                handle.clone(),
-                producer_token.clone(),
-            ),
-        );
     }
 }
 

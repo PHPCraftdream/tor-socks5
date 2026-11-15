@@ -1,9 +1,9 @@
 //! The runtime module tree of the socks5-proxy binary, moved verbatim into
-//! this crate (SDK-6; docs/plans/sdk-coverage-plan.md). The Tor-client API
-//! step SDK-9 is open: `tor_setup`, `pt` and the watchdog
-//! status/handle surface (see the README's "Tor client API (SDK-9)"). Bridge
-//! health writing/observation (SDK-7) and the bridge manager (SDK-8) are
-//! still closed.
+//! this crate (SDK-6; docs/plans/sdk-coverage-plan.md). The public API steps
+//! are open: the bridge-health writer and the guard observation layer
+//! (SDK-7), the Tor client (SDK-9: `tor_setup`, `pt`, the watchdog
+//! status/handle surface) and the bridge manager (SDK-8: `bridge_manager`).
+//! See the README for the contracts of each.
 //!
 //! The `test-seams` feature (dev-only, enabled by consumers' dev-dependencies,
 //! R10) exposes the `test_seams` module so cross-crate tests can exercise the
@@ -32,6 +32,9 @@ pub mod bridge_warmer;
 pub mod candidate_pool;
 
 mod config;
+
+#[path = "bridge_manager.rs"]
+pub mod bridge_manager;
 
 #[path = "tor/conn_health.rs"]
 pub mod conn_health;
