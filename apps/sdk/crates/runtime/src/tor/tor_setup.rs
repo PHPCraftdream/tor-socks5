@@ -16,6 +16,7 @@ use time::OffsetDateTime;
 use tracing::{info, warn};
 
 use crate::config::Config;
+pub(crate) use crate::pt::{extra_pt_protocols, resolve_pt_binary, PtBinary};
 use bridge_store::BridgeStore;
 use persist_lock::{PathLock, CLI_LOCK_WAIT};
 
@@ -63,14 +64,37 @@ pub use owner_settings::{restricted_owner_settings, validate_owner_routes};
 /// Parse the configured bridges, probe them for reachability, persist the
 /// live ones to the alive-bridges log, and assemble arti [`Settings`]
 /// (including pointing the PT manager at our own binary when needed).
+/// PT resolution follows [`PtBinary::Environment`]; embedding hosts that
+/// cannot dispatch PT mode themselves pass a different policy through
+/// [`build_tor_settings_with_pt`].
 pub async fn build_tor_settings(cfg: &Config, config_path: Option<&Path>) -> Result<Settings> {
-    build_tor_settings_preserving_live(cfg, config_path, &[]).await
+    build_tor_settings_with_pt(cfg, config_path, PtBinary::Environment).await
+}
+
+/// [`build_tor_settings`] with the embedding host's own pluggable-transport
+/// policy — see [`PtBinary`]. Everything else (probing, seeds, health store
+/// updates, pruning) is identical.
+pub async fn build_tor_settings_with_pt(
+    cfg: &Config,
+    config_path: Option<&Path>,
+    pt: PtBinary,
+) -> Result<Settings> {
+    build_tor_settings_inner(cfg, config_path, &[], pt).await
 }
 
 pub(crate) async fn build_tor_settings_preserving_live(
     cfg: &Config,
     config_path: Option<&Path>,
     live: &[BridgeLine],
+) -> Result<Settings> {
+    build_tor_settings_inner(cfg, config_path, live, PtBinary::Environment).await
+}
+
+async fn build_tor_settings_inner(
+    cfg: &Config,
+    config_path: Option<&Path>,
+    live: &[BridgeLine],
+    pt: PtBinary,
 ) -> Result<Settings> {
     if let Some(pool) = cfg.pre_proxies.as_ref() {
         let endpoint = owner_settings::select_anchor(pool).await?;
@@ -234,7 +258,7 @@ pub(crate) async fn build_tor_settings_preserving_live(
     // top of `main()` and runs the in-process lyrebird PT loop.
     let needs_pt = bridges.iter().any(|b| b.transport.is_some());
     let pt_binary = if needs_pt {
-        Some(resolve_pt_binary()?)
+        Some(resolve_pt_binary(&pt)?)
     } else {
         None
     };
@@ -247,17 +271,11 @@ pub(crate) async fn build_tor_settings_preserving_live(
     Ok(Settings {
         bridges,
         pt_binary,
-        extra_pt_protocols: if pt_binary_override_from(std::env::var_os("TOR_PT_BINARY").as_deref())
-            .is_none()
-        {
-            vec!["obfs4".into(), "webtunnel".into()]
-        } else {
-            cfg.bridges
-                .preferred_transport()
-                .into_iter()
-                .map(str::to_owned)
-                .collect()
-        },
+        extra_pt_protocols: extra_pt_protocols(
+            std::env::var_os("TOR_PT_BINARY").as_deref(),
+            &pt,
+            cfg,
+        ),
         state_dir: Some(arti_base),
         obfs4_iat_mode: cfg.bridges.iat_mode_override(),
         ..settings_for_config(cfg)
@@ -589,39 +607,6 @@ fn prune_bridges_from_config(path: &Path, dead: &[BridgeLine]) -> Result<usize> 
     Ok(removed)
 }
 
-#[path = "../fetch/pt_binary_override.rs"]
-mod pt_binary_override;
-use pt_binary_override::pt_binary_override_from;
-
-/// Resolve the PT binary path for arti's `tor-ptmgr` to spawn.
-///
-/// Precedence:
-/// 1. `TOR_PT_BINARY` env var (non-empty) — used for embedding hosts (Android JNI)
-///    and packaging layouts that rename/split the binary. Both control the process
-///    environment before startup, and `TOR_PT_*` env vars are this codebase's idiom
-///    for PT concerns (see the `TOR_PT_MANAGED_TRANSPORT_VER` busybox dispatch in
-///    `main.rs`). The ktav config file is a CLI-app concern.
-/// 2. Fallback: `std::env::current_exe()` — the busybox dispatch (same binary,
-///    invoked with `TOR_PT_*` env vars to run lyrebird in-process).
-///
-/// Library consumers already have the programmatic override
-/// `arti_wrapper::Settings::pt_binary` and are unaffected.
-///
-/// Returns an error only if `current_exe()` fails (e.g., on wasm or stripped
-/// binaries without runtime metadata). Existence validation is deferred to
-/// `arti_wrapper::build_config`, which rejects a non-existent path with
-/// `TorError::InvalidPt`.
-pub(crate) fn resolve_pt_binary() -> anyhow::Result<std::path::PathBuf> {
-    if let Some(path) = pt_binary_override_from(std::env::var_os("TOR_PT_BINARY").as_deref()) {
-        info!(path = %path.display(), "using TOR_PT_BINARY override as PT binary");
-        return Ok(path);
-    }
-
-    let exe = std::env::current_exe().context("resolving current_exe for PT")?;
-    info!(path = %exe.display(), "using own binary as PT (busybox dispatch)");
-    Ok(exe)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,25 +660,6 @@ mod tests {
         assert_eq!(settings_for_config(&disabled).service_circuit_hops, 4);
         let empty = Config::default();
         assert_eq!(settings_for_config(&empty).service_circuit_hops, 4);
-    }
-
-    #[test]
-    fn test_pt_binary_override_from_set() {
-        let path = std::path::PathBuf::from("/usr/bin/obfs4proxy");
-        let result = pt_binary_override_from(Some(path.as_os_str()));
-        assert_eq!(result, Some(path));
-    }
-
-    #[test]
-    fn test_pt_binary_override_from_none() {
-        let result = pt_binary_override_from(None);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_pt_binary_override_from_empty() {
-        let result = pt_binary_override_from(Some(std::ffi::OsStr::new("")));
-        assert_eq!(result, None);
     }
 
     fn obfs4_line(addr: &str) -> BridgeLine {

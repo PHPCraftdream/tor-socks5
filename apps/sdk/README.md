@@ -43,6 +43,7 @@ use tor_socks5::config::Config;
 | `tor` | `tor` | `arti-wrapper` | `socks5`, `acl` |
 | `fetch` | `fetch` | `bridge-fetcher` | `tor`, `bridges` |
 | `dns` | `dns` | `tor-socks5-dns` | `tor`, `acl` |
+| `runtime` | `runtime` | `tor-socks5-runtime` | `tor`, `config` |
 | `onion` | `onion` | `tor-socks5-onion` | |
 | `onion-keys` | `onion` (keys) | `tor-socks5-onion/keys` | |
 | `onion-service` | | `arti-wrapper/onion-service` | `tor` |
@@ -53,7 +54,7 @@ without Tor: probing, health storage and verification do not link Arti.
 
 ## Using the Tor features
 
-`tor`, `fetch`, `dns`, `onion-service` and `full` link Arti; `onion-keys`
+`tor`, `fetch`, `dns`, `runtime`, `onion-service` and `full` link Arti; `onion-keys`
 does **not** join this list (its `tor-keymgr` and `tor-hscrypto` are only
 the crypto and keystore part — no Tor client is linked). Cargo resolves
 stock Arti from crates.io unless the **final binary's or workspace's root**
@@ -137,6 +138,48 @@ let recorded = create_service(
 println!("created {}", recorded.address);
 ```
 
+## Tor client (runtime feature)
+
+The `runtime` feature is the SDK-9 Tor client surface of
+`tor-socks5-runtime` (`apps/sdk/crates/runtime`), exposed through the
+`tor_socks5::runtime` module. The flow of an embedding host:
+
+- **Build settings** from the ktav config:
+
+  ```rust
+  let settings = tor_socks5::runtime::tor_setup::build_tor_settings(
+      &cfg, Some(&config_path)).await?;
+  ```
+
+  This probes bridges, falls back over the preferred pool and the built-in
+  seeds, updates the bridge health store and prunes dead bridges.
+  `build_tor_settings_with_pt` lets you choose the pluggable-transport
+  binary.
+- **The PT entry point.** With bridges that need a transport, the CLI
+  binary resolves `TOR_PT_BINARY` or spawns itself (busybox dispatch on
+  `TOR_PT_MANAGED_TRANSPORT_VER`). An embedding host without such dispatch
+  passes `tor_socks5::runtime::pt::PtBinary::Explicit(path)` pointing at
+  its own dispatcher or the repository's `pt-helper` build.
+- **Run.** Wrap the bootstrapped `tor_socks5::tor::TorTunnel` in
+  `runtime::tor_watchdog::TorHandle` (`tunnel()`, `health()`, `drain()`
+  for shutdown), feed connect outcomes via `TorHealth`/`classify_and_record`
+  and arm the watchdogs: `spawn_tor_watchdog` returns `None` when disabled
+  or a `WatchdogRun` whose `join` you join at shutdown and whose `status`
+  (`watch::Receiver<WatchdogStatus>`) reports checks started, consecutive
+  heal failures and the last `HealOutcome`; `spawn_bridge_failover_watchdog`
+  for the soft-failover signals.
+- **Observe.** `runtime::conn_health::ConnHealthCounters` with
+  `snapshot_and_reset()` windowed `ConnHealthSnapshot`s and the optional
+  periodic summary via `spawn_conn_health_logger`.
+- **The restart contract:** one live Tor client per process; sequential
+  stop-then-start works.
+
+Note: the `runtime` feature links Arti — the patch-kit `[patch.crates-io]`
+block from [`vendor/README.md`](../../vendor/README.md) in your final
+binary/workspace root is **required**. The facade is a git dependency, not
+a crates.io release (the vendored forks cannot travel with a published
+package).
+
 ## What is not here
 
 The facade re-exports the libraries under `packages/` and `apps/sdk/crates/`. The logic that runs
@@ -146,8 +189,10 @@ library yet:
 - the proxy server (listeners, egress, pre/post pools, startup and shutdown);
 - hosting onion services (start gate, stream limits, statuses); the
   `onion-service` feature only turns on the onion support of `arti-wrapper`;
-- the bridge manager (verifier, warmer, health writer, maintenance) and the
-  Tor watchdog.
+- the bridge manager (verifier, warmer, health writer, maintenance).
+
+The Tor client and watchdog surface is available behind the `runtime`
+feature (see [Tor client (runtime feature)](#tor-client-runtime-feature)).
 
 To use these today, run the binary. Taking them into library crates is
 planned in [`docs/plans/sdk-coverage-plan.md`](../../docs/plans/sdk-coverage-plan.md).

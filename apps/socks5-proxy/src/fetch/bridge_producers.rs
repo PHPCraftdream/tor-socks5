@@ -19,12 +19,9 @@ pub(super) fn launch(
             settings,
             producer_token.clone(),
         ));
-        producers.extend(spawn_tor_watchdog(
-            handle,
-            config_path,
-            cfg.watchdog,
-            producer_token,
-        ));
+        if let Some(run) = spawn_tor_watchdog(handle, config_path, cfg.watchdog, producer_token) {
+            producers.push(run.join);
+        }
     } else {
         // Periodic upkeep: re-probe, prune dead bridges, top up when short,
         // drain circuit-layer observations from arti's tracing into the
@@ -43,12 +40,14 @@ pub(super) fn launch(
         // Stale-channel watchdog: rebuilds the `TorClient` when circuits
         // keep failing against TCP-reachable bridges (the half-open
         // channel scenario). Joined at shutdown; disabled by config when unwanted.
-        producers.extend(spawn_tor_watchdog(
+        if let Some(run) = spawn_tor_watchdog(
             handle.clone(),
             config_path.clone(),
             cfg.watchdog,
             producer_token.clone(),
-        ));
+        ) {
+            producers.push(run.join);
+        }
 
         // Soft-failover watchdog: nudges arti's guard manager away from
         // a specific bridge whose own circuit-layer health has degraded

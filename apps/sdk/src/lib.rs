@@ -18,8 +18,9 @@
 //! | [`fetch`] | `bridge-fetcher` | `fetch` |
 //! | [`dns`] | `tor-socks5-dns` | `dns` |
 //! | [`onion`] | `tor-socks5-onion` | `onion`, `onion-keys` |
+//! | [`runtime`] | `tor-socks5-runtime` — the curated SDK-9 surface, not the whole crate | `runtime` |
 //!
-//! The `tor` feature (and `fetch`, `dns`, `onion-service`, `full`, which
+//! The `tor` feature (and `fetch`, `dns`, `runtime`, `onion-service`, `full`, which
 //! imply it) links Arti. Without the vendored forks of the patch-kit a
 //! consumer gets stock Arti and silently loses their fixes; see the SDK guide
 //! (`apps/sdk/README.md`) for the `[patch.crates-io]` block.
@@ -82,3 +83,36 @@ pub use ::dns_server as dns;
 /// client linked.
 #[cfg(any(feature = "onion", feature = "onion-keys"))]
 pub use ::tor_socks5_onion as onion;
+
+/// The Tor client runtime: the SDK-9 surface of `tor-socks5-runtime`
+/// (`apps/sdk/crates/runtime`), curated by module — this is not the whole
+/// crate. The bridge health writer and the guard-observation layer (SDK-7)
+/// and the bridge manager (SDK-8) are not exposed yet; the proxy server
+/// itself stays with the binary (SDK-10/11).
+///
+/// - [`runtime::tor_setup`] — Tor client settings built from the ktav
+///   config (`build_tor_settings`, `build_tor_settings_with_pt`), the arti
+///   state dir (`arti_base_dir`) and the owner-routing relatives.
+/// - [`runtime::pt`] — the pluggable-transport entry point for an embedding
+///   host (`PtBinary`): environment-resolved (the CLI binary's busybox
+///   dispatch, `TOR_PT_BINARY` override) or an explicit dispatcher path.
+/// - [`runtime::tor_watchdog`] — the live-client handle (`TorHandle`,
+///   `TorHealth`), the watchdog spawn/status surface (`WatchdogRun`,
+///   `WatchdogStatus`) and failure classification.
+/// - [`runtime::conn_health`] — connection-health counters and windowed
+///   snapshots.
+///
+/// This feature links Arti: without the patch-kit (`[patch.crates-io]` in
+/// your final binary/workspace root, see the SDK guide in README.md and
+/// `vendor/README.md`) stock Arti is resolved and the fixes are lost.
+#[cfg(feature = "runtime")]
+pub mod runtime {
+    /// Connection-health counters and snapshots (`tor-socks5-runtime::conn_health`).
+    pub use ::tor_socks5_runtime::conn_health;
+    /// Pluggable-transport binary resolution (`tor-socks5-runtime::pt`).
+    pub use ::tor_socks5_runtime::pt;
+    /// Tor client settings built from the config file (`tor-socks5-runtime::tor_setup`).
+    pub use ::tor_socks5_runtime::tor_setup;
+    /// The live-client handle and the watchdog surface (`tor-socks5-runtime::tor_watchdog`).
+    pub use ::tor_socks5_runtime::tor_watchdog;
+}

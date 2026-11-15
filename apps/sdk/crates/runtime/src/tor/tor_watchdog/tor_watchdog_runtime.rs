@@ -436,7 +436,11 @@ pub(super) fn healthiest(candidates: &[(BridgeLine, Health)]) -> Option<Health> 
         })
 }
 
-/// Spawn the stale-channel watchdog, returning its join handle for the shutdown join.
+/// Spawn the stale-channel watchdog. Returns `None` when disabled (same
+/// `enabled`/`check_interval_secs` switches and log as before); otherwise a
+/// [`WatchdogRun`] pairing the shutdown join handle with the status channel
+/// (`tokio::sync::watch`, latest snapshot wins) — so embedding hosts can
+/// observe checks and heal outcomes without reading tracing logs.
 ///
 /// Every `check_interval` the task evaluates four trigger conditions (stale
 /// success, fresh attempts, alive bridges, and a failure-signature gate —
@@ -458,7 +462,7 @@ pub fn spawn_tor_watchdog(
     config_path: Option<PathBuf>,
     cfg: WatchdogConfig,
     token: CancellationToken,
-) -> Option<tokio::task::JoinHandle<()>> {
+) -> Option<WatchdogRun> {
     #[cfg(any(test, feature = "test-seams"))]
     crate::test_seams::forbid_producer("watchdog");
     if !cfg.enabled || cfg.check_interval_secs == 0 {
@@ -466,6 +470,7 @@ pub fn spawn_tor_watchdog(
         return None;
     }
 
+    let (status_tx, status_rx) = tokio::sync::watch::channel(WatchdogStatus::default());
     let interval = Duration::from_secs(cfg.check_interval_secs);
     let stale = Duration::from_secs(cfg.stale_after_secs);
     let cooldown = Duration::from_secs(cfg.rebuild_cooldown_secs);
@@ -478,236 +483,258 @@ pub fn spawn_tor_watchdog(
         "tor stale-channel watchdog armed"
     );
 
-    Some(tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        ticker.tick().await; // consume the immediate first tick
+    Some(WatchdogRun {
+        join: tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await; // consume the immediate first tick
 
-        let mut prev_attempts = handle.health().attempt_count();
-        let mut prev_last_success = handle.health().last_success_secs();
-        // Consecutive ticks during which conditions 1-3 held but the signature
-        // gate declined the heal (see `step_gated_ticks` /
-        // `should_override_decline`). Reset by any success or any performed heal.
-        let mut gated_ticks: u32 = 0;
-        // Baselines for the signature gate (see `should_decline_rebuild`):
-        // same delta-between-ticks convention as `prev_attempts` above, one
-        // per classified failure kind.
-        let mut prev_remote_timeout = handle.health().remote_timeout_count();
-        let mut prev_access_failed = handle.health().access_failed_count();
-        let mut prev_net_timeout = handle.health().net_timeout_count();
-        let mut last_rebuild: Option<Instant> = None;
-        // Consecutive failed heal attempts (post-termination reconnect
-        // verification timed out or never succeeded). Once it crosses
-        // [`CONSECUTIVE_FAILURES_BEFORE_BACKOFF`] the cooldown stretches to
-        // [`EXTENDED_REBUILD_COOLDOWN`] so a fully-blocked network is not
-        // hammered. Reset to 0 on the first successful heal.
-        let mut consecutive_failures: u32 = 0;
+            let mut prev_attempts = handle.health().attempt_count();
+            let mut prev_last_success = handle.health().last_success_secs();
+            // Consecutive ticks during which conditions 1-3 held but the signature
+            // gate declined the heal (see `step_gated_ticks` /
+            // `should_override_decline`). Reset by any success or any performed heal.
+            let mut gated_ticks: u32 = 0;
+            // Baselines for the signature gate (see `should_decline_rebuild`):
+            // same delta-between-ticks convention as `prev_attempts` above, one
+            // per classified failure kind.
+            let mut prev_remote_timeout = handle.health().remote_timeout_count();
+            let mut prev_access_failed = handle.health().access_failed_count();
+            let mut prev_net_timeout = handle.health().net_timeout_count();
+            let mut last_rebuild: Option<Instant> = None;
+            // Consecutive failed heal attempts (post-termination reconnect
+            // verification timed out or never succeeded). Once it crosses
+            // [`CONSECUTIVE_FAILURES_BEFORE_BACKOFF`] the cooldown stretches to
+            // [`EXTENDED_REBUILD_COOLDOWN`] so a fully-blocked network is not
+            // hammered. Reset to 0 on the first successful heal.
+            let mut consecutive_failures: u32 = 0;
+            // Checks started since spawn — published on the status watch channel
+            // after every tick so an embedding host can see liveness.
+            let mut checks_started: u64 = 0;
 
-        loop {
-            tokio::select! {
-                biased;
-                _ = token.cancelled() => break,
-                _ = ticker.tick() => {},
-            }
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => break,
+                    _ = ticker.tick() => {},
+                }
 
-            let health = handle.health();
-            let now_secs = unix_secs();
-            let last_success = health.last_success_secs();
-            // Any successful connect since the previous tick restarts the gate
-            // escalation — even if this tick exits early below, the outage was
-            // demonstrably interrupted.
-            gated_ticks =
-                reset_gated_ticks_on_success(gated_ticks, last_success != prev_last_success);
-            prev_last_success = last_success;
-            let attempts = health.attempt_count();
-            let new_attempts = attempts.saturating_sub(prev_attempts);
-            prev_attempts = attempts;
+                checks_started += 1;
+                {
+                    let mut snapshot = status_tx.borrow().clone();
+                    snapshot.checks_started = checks_started;
+                    status_tx.send_replace(snapshot);
+                }
 
-            let remote_timeout = health.remote_timeout_count();
-            let new_remote_timeout = remote_timeout.saturating_sub(prev_remote_timeout);
-            prev_remote_timeout = remote_timeout;
+                let health = handle.health();
+                let now_secs = unix_secs();
+                let last_success = health.last_success_secs();
+                // Any successful connect since the previous tick restarts the gate
+                // escalation — even if this tick exits early below, the outage was
+                // demonstrably interrupted.
+                gated_ticks =
+                    reset_gated_ticks_on_success(gated_ticks, last_success != prev_last_success);
+                prev_last_success = last_success;
+                let attempts = health.attempt_count();
+                let new_attempts = attempts.saturating_sub(prev_attempts);
+                prev_attempts = attempts;
 
-            let access_failed = health.access_failed_count();
-            let new_access_failed = access_failed.saturating_sub(prev_access_failed);
-            prev_access_failed = access_failed;
+                let remote_timeout = health.remote_timeout_count();
+                let new_remote_timeout = remote_timeout.saturating_sub(prev_remote_timeout);
+                prev_remote_timeout = remote_timeout;
 
-            let net_timeout = health.net_timeout_count();
-            let new_net_timeout = net_timeout.saturating_sub(prev_net_timeout);
-            prev_net_timeout = net_timeout;
+                let access_failed = health.access_failed_count();
+                let new_access_failed = access_failed.saturating_sub(prev_access_failed);
+                prev_access_failed = access_failed;
 
-            // Anchor the stale window on the last success, or — before the
-            // first one — on the watchdog start. This both gives the freshly
-            // bootstrapped client a warm-up grace period and covers the
-            // "bootstrap ok, network changed, first connect fails" case,
-            // where `last_success` is still 0.
-            let anchor = if last_success != 0 {
-                last_success
-            } else {
-                started_secs
-            };
-            let since_anchor = now_secs.saturating_sub(anchor);
+                let net_timeout = health.net_timeout_count();
+                let new_net_timeout = net_timeout.saturating_sub(prev_net_timeout);
+                prev_net_timeout = net_timeout;
 
-            // Condition 1: no successful circuit within the stale window.
-            if Duration::from_secs(since_anchor) < stale {
-                continue;
-            }
-            // Condition 2: attempts were made in this tick — silence here
-            // means "no traffic", not "circuits failing". Requires at least
-            // MIN_ATTEMPTS_TO_TRIGGER rather than just "> 0" — see that
-            // constant's doc comment for why 3 and not 0/1.
-            if new_attempts < MIN_ATTEMPTS_TO_TRIGGER {
-                continue;
-            }
-            // Канал pre может быть повторно использован и не доказывает свежую достижимость.
-            // Его наличие лишь разрешает попытку сброса при остальных условиях.
-            let Some(tor) = handle.tunnel().await else {
-                continue;
-            };
-            let alive =
-                route_bridge_count(&tor, &handle.active_bridges(), config_path.as_deref()).await;
-            if alive == 0 {
-                continue;
-            }
-            // Condition 4 (signature gate): the first three conditions only
-            // tell us "circuits are failing while attempts and bridges are
-            // both fine" — they cannot tell a stale channel from a healthy
-            // stack whose exits or guards are simply having a bad time.
-            // Terminating channels only forces a reconnect; if the failures
-            // this window are dominated by `RemoteNetworkTimeout` (exit went
-            // silent, Tor stack is fine) or `TorAccessFailed` (guards down/
-            // unsuitable), a reconnect over the same guards changes nothing.
-            // See `should_decline_rebuild`'s doc comment for the exact rule
-            // and docs/upstream/guard-exhaustion-watchdog-spiral.md §3.A/§4.2
-            // for the incident this closes (8 attempts in 218 s, all
-            // RemoteNetworkTimeout/ExitTimeout to one Telegram DC).
-            //
-            // Declining here is a deliberate non-attempt, not a failed one:
-            // `last_rebuild`/`consecutive_failures` are left untouched so
-            // the cooldown timer does not arm and a legitimate heal is not
-            // deferred if the signature flips to net-timeout-dominated on a
-            // later tick.
-            //
-            // After [`GATED_TICKS_BEFORE_OVERRIDE`] consecutive declined
-            // ticks the gate is overridden: the heal proceeds anyway (with
-            // cooldown/backoff/canary still applying), per the stability plan
-            // §1a — a sustained total outage is worth healing even when the
-            // failure signature is ambiguous.
-            let gate_declined =
-                should_decline_rebuild(new_remote_timeout, new_access_failed, new_net_timeout);
-            gated_ticks = step_gated_ticks(gated_ticks, gate_declined);
-            if gate_declined {
-                if should_override_decline(gated_ticks) {
-                    warn!(
-                        gated_ticks,
-                        new_remote_timeout,
-                        new_access_failed,
-                        new_net_timeout,
-                        "signature override: total outage persists — healing despite a \
-                         RemoteNetworkTimeout/TorAccessFailed-dominated window"
-                    );
+                // Anchor the stale window on the last success, or — before the
+                // first one — on the watchdog start. This both gives the freshly
+                // bootstrapped client a warm-up grace period and covers the
+                // "bootstrap ok, network changed, first connect fails" case,
+                // where `last_success` is still 0.
+                let anchor = if last_success != 0 {
+                    last_success
                 } else {
-                    warn!(
-                        new_remote_timeout,
-                        new_access_failed,
-                        new_net_timeout,
-                        "declining channel termination: failures in this window are \
+                    started_secs
+                };
+                let since_anchor = now_secs.saturating_sub(anchor);
+
+                // Condition 1: no successful circuit within the stale window.
+                if Duration::from_secs(since_anchor) < stale {
+                    continue;
+                }
+                // Condition 2: attempts were made in this tick — silence here
+                // means "no traffic", not "circuits failing". Requires at least
+                // MIN_ATTEMPTS_TO_TRIGGER rather than just "> 0" — see that
+                // constant's doc comment for why 3 and not 0/1.
+                if new_attempts < MIN_ATTEMPTS_TO_TRIGGER {
+                    continue;
+                }
+                // Канал pre может быть повторно использован и не доказывает свежую достижимость.
+                // Его наличие лишь разрешает попытку сброса при остальных условиях.
+                let Some(tor) = handle.tunnel().await else {
+                    continue;
+                };
+                let alive =
+                    route_bridge_count(&tor, &handle.active_bridges(), config_path.as_deref())
+                        .await;
+                if alive == 0 {
+                    continue;
+                }
+                // Condition 4 (signature gate): the first three conditions only
+                // tell us "circuits are failing while attempts and bridges are
+                // both fine" — they cannot tell a stale channel from a healthy
+                // stack whose exits or guards are simply having a bad time.
+                // Terminating channels only forces a reconnect; if the failures
+                // this window are dominated by `RemoteNetworkTimeout` (exit went
+                // silent, Tor stack is fine) or `TorAccessFailed` (guards down/
+                // unsuitable), a reconnect over the same guards changes nothing.
+                // See `should_decline_rebuild`'s doc comment for the exact rule
+                // and docs/upstream/guard-exhaustion-watchdog-spiral.md §3.A/§4.2
+                // for the incident this closes (8 attempts in 218 s, all
+                // RemoteNetworkTimeout/ExitTimeout to one Telegram DC).
+                //
+                // Declining here is a deliberate non-attempt, not a failed one:
+                // `last_rebuild`/`consecutive_failures` are left untouched so
+                // the cooldown timer does not arm and a legitimate heal is not
+                // deferred if the signature flips to net-timeout-dominated on a
+                // later tick.
+                //
+                // After [`GATED_TICKS_BEFORE_OVERRIDE`] consecutive declined
+                // ticks the gate is overridden: the heal proceeds anyway (with
+                // cooldown/backoff/canary still applying), per the stability plan
+                // §1a — a sustained total outage is worth healing even when the
+                // failure signature is ambiguous.
+                let gate_declined =
+                    should_decline_rebuild(new_remote_timeout, new_access_failed, new_net_timeout);
+                gated_ticks = step_gated_ticks(gated_ticks, gate_declined);
+                if gate_declined {
+                    if should_override_decline(gated_ticks) {
+                        warn!(
+                            gated_ticks,
+                            new_remote_timeout,
+                            new_access_failed,
+                            new_net_timeout,
+                            "signature override: total outage persists — healing despite a \
+                         RemoteNetworkTimeout/TorAccessFailed-dominated window"
+                        );
+                    } else {
+                        warn!(
+                            new_remote_timeout,
+                            new_access_failed,
+                            new_net_timeout,
+                            "declining channel termination: failures in this window are \
                          RemoteNetworkTimeout/TorAccessFailed, not TorNetworkTimeout \
                          — reconnecting over the same guards would reproduce the same \
                          state, not fix it"
-                    );
-                    continue;
+                        );
+                        continue;
+                    }
                 }
-            }
-            // Cooldown: never act more often than configured, even when it
-            // cannot help (a real network block). After a run of consecutive
-            // failures we stretch it further (see [`EXTENDED_REBUILD_COOLDOWN`])
-            // so a fully-blocked network is not hammered every
-            // `rebuild_cooldown_secs`.
-            let effective_cooldown = if consecutive_failures >= CONSECUTIVE_FAILURES_BEFORE_BACKOFF
-            {
-                EXTENDED_REBUILD_COOLDOWN
-            } else {
-                cooldown
-            };
-            if let Some(last) = last_rebuild {
-                if last.elapsed() < effective_cooldown {
-                    continue;
+                // Cooldown: never act more often than configured, even when it
+                // cannot help (a real network block). After a run of consecutive
+                // failures we stretch it further (see [`EXTENDED_REBUILD_COOLDOWN`])
+                // so a fully-blocked network is not hammered every
+                // `rebuild_cooldown_secs`.
+                let effective_cooldown =
+                    if consecutive_failures >= CONSECUTIVE_FAILURES_BEFORE_BACKOFF {
+                        EXTENDED_REBUILD_COOLDOWN
+                    } else {
+                        cooldown
+                    };
+                if let Some(last) = last_rebuild {
+                    if last.elapsed() < effective_cooldown {
+                        continue;
+                    }
                 }
-            }
 
-            warn!(
-                stale_secs = since_anchor,
-                attempts = new_attempts,
-                alive_bridges = alive,
-                threshold_secs = stale.as_secs(),
-                consecutive_failures,
-                effective_cooldown_secs = effective_cooldown.as_secs(),
-                "no successful Tor circuit in the stale window despite attempts \
+                warn!(
+                    stale_secs = since_anchor,
+                    attempts = new_attempts,
+                    alive_bridges = alive,
+                    threshold_secs = stale.as_secs(),
+                    consecutive_failures,
+                    effective_cooldown_secs = effective_cooldown.as_secs(),
+                    "no successful Tor circuit in the stale window despite attempts \
                  and alive bridges — terminating all live channels in place, \
                  possibly stale channels from a network change"
-            );
+                );
 
-            let canary_target = handle.health().last_success_target();
-            let Some(tor) = handle.tunnel().await else {
-                // Slot already drained (shutdown in progress) — nothing to
-                // heal. Leave the cooldown/failure counters untouched, same
-                // as the signature-gate decline above: this is not a failed
-                // attempt, just nothing to do.
-                continue;
-            };
-            match heal(&tor, canary_target).await {
-                HealResult::Healed => {
-                    last_rebuild = Some(Instant::now());
-                    if consecutive_failures > 0 {
-                        info!(
+                let canary_target = handle.health().last_success_target();
+                let Some(tor) = handle.tunnel().await else {
+                    // Slot already drained (shutdown in progress) — nothing to
+                    // heal. Leave the cooldown/failure counters untouched, same
+                    // as the signature-gate decline above: this is not a failed
+                    // attempt, just nothing to do.
+                    continue;
+                };
+                let heal_result = heal(&tor, canary_target).await;
+                match &heal_result {
+                    HealResult::Healed => {
+                        last_rebuild = Some(Instant::now());
+                        if consecutive_failures > 0 {
+                            info!(
                             prior_consecutive_failures = consecutive_failures,
                             "tor stale-channel watchdog: heal succeeded — backoff counter reset"
                         );
-                    }
-                    consecutive_failures = 0;
-                    info!(
-                        "tor stale-channel watchdog: channels terminated and client \
+                        }
+                        consecutive_failures = 0;
+                        info!(
+                            "tor stale-channel watchdog: channels terminated and client \
                          reconnected successfully"
-                    );
-                }
-                HealResult::StillUnhealthy => {
-                    consecutive_failures = consecutive_failures.saturating_add(1);
-                    last_rebuild = Some(Instant::now());
-                    warn!(
-                        verify_timeout_secs = VERIFY_TIMEOUT.as_secs(),
-                        consecutive_failures,
-                        threshold = CONSECUTIVE_FAILURES_BEFORE_BACKOFF,
-                        next_cooldown_secs =
-                            next_cooldown(consecutive_failures, cooldown).as_secs(),
-                        "tor stale-channel watchdog: channels terminated but the client \
+                        );
+                    }
+                    HealResult::StillUnhealthy => {
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        last_rebuild = Some(Instant::now());
+                        warn!(
+                            verify_timeout_secs = VERIFY_TIMEOUT.as_secs(),
+                            consecutive_failures,
+                            threshold = CONSECUTIVE_FAILURES_BEFORE_BACKOFF,
+                            next_cooldown_secs =
+                                next_cooldown(consecutive_failures, cooldown).as_secs(),
+                            "tor stale-channel watchdog: channels terminated but the client \
                          did not reconnect within the verify budget — will retry after \
                          cooldown"
-                    );
-                }
-                HealResult::TerminateFailed(e) => {
-                    // Count the failure and set the cooldown either way so a
-                    // persistently unreachable channel manager does not
-                    // trigger a retry storm. `next_cooldown` reports what
-                    // will gate the *next* attempt after this bump.
-                    consecutive_failures = consecutive_failures.saturating_add(1);
-                    last_rebuild = Some(Instant::now());
-                    warn!(
-                        error = format!("{e:#}"),
-                        consecutive_failures,
-                        threshold = CONSECUTIVE_FAILURES_BEFORE_BACKOFF,
-                        next_cooldown_secs =
-                            next_cooldown(consecutive_failures, cooldown).as_secs(),
-                        "tor stale-channel watchdog: could not terminate channels — \
+                        );
+                    }
+                    HealResult::TerminateFailed(e) => {
+                        // Count the failure and set the cooldown either way so a
+                        // persistently unreachable channel manager does not
+                        // trigger a retry storm. `next_cooldown` reports what
+                        // will gate the *next* attempt after this bump.
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        last_rebuild = Some(Instant::now());
+                        warn!(
+                            error = format!("{e:#}"),
+                            consecutive_failures,
+                            threshold = CONSECUTIVE_FAILURES_BEFORE_BACKOFF,
+                            next_cooldown_secs =
+                                next_cooldown(consecutive_failures, cooldown).as_secs(),
+                            "tor stale-channel watchdog: could not terminate channels — \
                          will retry after cooldown"
-                    );
+                        );
+                    }
                 }
+                {
+                    let mut snapshot = status_tx.borrow().clone();
+                    snapshot.checks_started = checks_started;
+                    snapshot.consecutive_failures = consecutive_failures;
+                    snapshot.last_heal = Some(HealOutcome::from(&heal_result));
+                    status_tx.send_replace(snapshot);
+                }
+                // A heal was performed — the gate escalation restarts regardless of
+                // outcome; how soon the *next* heal may run is the cooldown/backoff
+                // machinery's job, not this counter's.
+                gated_ticks = 0;
             }
-            // A heal was performed — the gate escalation restarts regardless of
-            // outcome; how soon the *next* heal may run is the cooldown/backoff
-            // machinery's job, not this counter's.
-            gated_ticks = 0;
-        }
-    }))
+        }),
+        status: status_rx,
+    })
 }
 
 /// Outcome of one [`heal`] attempt.
