@@ -66,9 +66,20 @@ impl Default for LogConfig {
     }
 }
 
+/// Product crates whose names start with `tor_`. A broad `tor_=warn` target
+/// (the default, meant to quiet arti's own `tor_*` crates) would otherwise
+/// silence them: their log lines used to carry the `socks5_proxy` target
+/// before the code moved into library crates.
+const PRODUCT_TARGETS: [&str; 2] = ["tor_socks5_runtime", "tor_socks5_onion"];
+
 impl LogConfig {
     /// Build a `tracing-subscriber` env-filter directive from the structured
     /// settings.
+    ///
+    /// A product crate (see [`PRODUCT_TARGETS`]) that a broader configured
+    /// target would catch, and that has no target of its own, inherits the
+    /// level of `socks5_proxy` (or the default level), so a config written
+    /// before the code moved keeps logging as it did.
     pub fn to_filter(&self) -> String {
         let mut out = self.default.clone();
         for (target, level) in &self.targets {
@@ -76,6 +87,19 @@ impl LogConfig {
             out.push_str(target);
             out.push('=');
             out.push_str(level);
+        }
+        let inherited = self.targets.get("socks5_proxy").unwrap_or(&self.default);
+        for krate in PRODUCT_TARGETS {
+            let swallowed = self
+                .targets
+                .keys()
+                .any(|target| krate.starts_with(target.as_str()));
+            if swallowed && !self.targets.contains_key(krate) {
+                out.push(',');
+                out.push_str(krate);
+                out.push('=');
+                out.push_str(inherited);
+            }
         }
         out
     }

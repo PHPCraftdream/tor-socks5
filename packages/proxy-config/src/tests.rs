@@ -47,27 +47,6 @@ fn iat_mode_override_only_accepts_defined_obfs4_modes() {
 }
 
 #[test]
-fn log_to_filter_renders_default_then_targets_in_order() {
-    let log = LogConfig::default();
-    let filter = log.to_filter();
-    // Default level first, then comma-separated target=level pairs in
-    // their insertion order.
-    assert!(filter.starts_with("info"));
-    assert!(filter.contains(",socks5_proxy=debug"));
-    assert!(filter.contains(",arti_wrapper=debug"));
-    assert!(filter.contains(",tor_=warn"));
-    // The first comma comes immediately after `info` — no whitespace.
-    assert_eq!(filter.find(','), Some("info".len()));
-}
-
-#[test]
-fn log_to_filter_handles_no_targets() {
-    let mut log = LogConfig::default();
-    log.targets.clear();
-    assert_eq!(log.to_filter(), log.default);
-}
-
-#[test]
 fn parses_minimal_ktav() {
     let src = r#"
 listen: 127.0.0.1:9050

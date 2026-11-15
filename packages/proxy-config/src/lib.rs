@@ -973,6 +973,9 @@ impl Config {
 }
 
 #[cfg(test)]
+#[path = "tests/log_filter.rs"]
+mod log_filter_tests;
+#[cfg(test)]
 #[path = "tests/socks5_config.rs"]
 mod socks5_config_tests;
 #[cfg(test)]
