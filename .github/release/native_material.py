@@ -38,12 +38,12 @@ MUSL_UNESTABLISHED_SCOPE = (
     "Applicable terms for the Rust-distributed self-contained musl libc.a "
     "and startup objects are not established here; host musl-tools/apt "
     "copyright material is not evidence for those inputs.")
-RUST_MUSL_RELEASE = "1.99.1"
-RUST_MUSL_COMMIT = "58cf8f9c35b355199727627d07ae34a4e2846d67"
+RUST_MUSL_RELEASE = "1.100.0"
+RUST_MUSL_COMMIT = "0ef1bc386059596dada8fb65b50425aab2ea637a"
 MUSL_TARGETS = (
     "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl")
 MUSL_SOURCE_LINKAGE_SCOPE = (
-    "For Rust 1.99.1 at the pinned commit, this payload preserves the "
+    "For Rust 1.100.0 at the pinned commit, this payload preserves the "
     "SHA-256-pinned musl 1.2.5 archive, exact patch set, and selected Rust "
     "and musl-cross-make source recipes linked to the distributed musl "
     "inputs. This does not establish legal clearance, a reproducible build, "
@@ -65,29 +65,34 @@ MUSL_SOURCE_PINS = {
         "d5b88fe87f9554238bdd69235694b0d50bb909f38149a7be417a0240a490e813"),
     "musl-cve-2026-6042.diff": (
         "https://raw.githubusercontent.com/rust-lang/rust/"
-        "58cf8f9c35b355199727627d07ae34a4e2846d67/src/ci/docker/scripts/"
+        "0ef1bc386059596dada8fb65b50425aab2ea637a/src/ci/docker/scripts/"
         "musl-cve-2026-6042.diff",
         "444fa70e52ca158fb7d4bad560637790bbf8f72e80b82fff840dd66fa83091e3"),
     "musl-cve-2026-40200.diff": (
         "https://raw.githubusercontent.com/rust-lang/rust/"
-        "58cf8f9c35b355199727627d07ae34a4e2846d67/src/ci/docker/scripts/"
+        "0ef1bc386059596dada8fb65b50425aab2ea637a/src/ci/docker/scripts/"
         "musl-cve-2026-40200.diff",
         "1ee29f64f9ca8e8ad7c349779d661ff6b52126a27575d3586981357a52c406fb"),
+    "musl-cve-2026-107891.diff": (
+        "https://raw.githubusercontent.com/rust-lang/rust/"
+        "0ef1bc386059596dada8fb65b50425aab2ea637a/src/ci/docker/scripts/"
+        "musl-cve-2026-107891.diff",
+        "0cf0090ab433e8f9ed08ae03a0c93aff557c1d3e347260f62a61a10281f5333b"),
     "musl-toolchain.sh": (
         "https://raw.githubusercontent.com/rust-lang/rust/"
-        "58cf8f9c35b355199727627d07ae34a4e2846d67/src/ci/docker/scripts/"
+        "0ef1bc386059596dada8fb65b50425aab2ea637a/src/ci/docker/scripts/"
         "musl-toolchain.sh",
-        "6089a487dc49ad220d4a928de288fee8b78038acfbe163d025e3bfed9d590a82"),
+        "e3638af5585f105c3ef4daa9b2bf0a5a3316f470d2fd4d58eab652d0a7535add"),
     "dist-x86_64-musl.Dockerfile": (
         "https://raw.githubusercontent.com/rust-lang/rust/"
-        "58cf8f9c35b355199727627d07ae34a4e2846d67/src/ci/docker/host-x86_64/"
+        "0ef1bc386059596dada8fb65b50425aab2ea637a/src/ci/docker/host-x86_64/"
         "dist-x86_64-musl/Dockerfile",
-        "b671f149b73e3bc1a7c0e6b2b9c8bbca1c6983d0879c65659441309ad433ed50"),
+        "cacd1176765ebedca11dec1b7d83f9a9951ebade1ae542dfb2c081e9b03e4d6a"),
     "dist-arm-linux-musl.Dockerfile": (
         "https://raw.githubusercontent.com/rust-lang/rust/"
-        "58cf8f9c35b355199727627d07ae34a4e2846d67/src/ci/docker/host-x86_64/"
+        "0ef1bc386059596dada8fb65b50425aab2ea637a/src/ci/docker/host-x86_64/"
         "dist-arm-linux-musl/Dockerfile",
-        "1cbf994d6ccfe7a72bb5501e888e8fcbb30e0639f4600e85ff548edca6214050"),
+        "e55808936d5a7a8fbcb3d33e8c28fe3365eb5763ffd1df29cc7cf6dfede36f8a"),
     "mcm-Makefile": (
         "https://raw.githubusercontent.com/richfelker/musl-cross-make/"
         "3635262e4524c991552789af6f36211a335a77b3/Makefile",
