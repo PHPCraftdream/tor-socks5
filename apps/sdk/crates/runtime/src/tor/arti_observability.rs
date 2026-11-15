@@ -65,7 +65,8 @@
 //! `circuit_observation_window`, threshold `max_circuit_fails`), not
 //! instantly.
 //!
-//! We install a [`tracing_subscriber::Layer`] that listens for these
+//! A [`tracing_subscriber::Layer`] — handed out ready-made, with its
+//! per-layer filter, by [`observation_layer`] — listens for these
 //! events (and only these), extracts the RSA identity fingerprint from
 //! the Debug-formatted `guard_id`, and pushes a [`GuardObservation`]
 //! into a shared sink. The sink is a bounded ring buffer: if the
@@ -95,6 +96,7 @@ use std::time::Duration;
 use bridge_line::BridgeLine;
 use time::OffsetDateTime;
 use tracing::field::{Field, Visit};
+use tracing_subscriber::filter::{EnvFilter, Filtered};
 use tracing_subscriber::layer::{Context, Layer};
 
 use bridge_store::BridgeStore;
@@ -310,10 +312,10 @@ impl ObservationSink {
 /// Install it next to the regular fmt layer (e.g. via
 /// `tracing_subscriber::registry().with(fmt_layer).with(layer)`). It
 /// emits no log output of its own. It also does **not** raise the
-/// global filter level — to be reached by arti's `trace!(...)` events,
-/// the layer needs a per-layer `EnvFilter::new("tor_guardmgr=trace")`
-/// applied on top of it; see [`Self::with_default_filter`] for the
-/// ready-made wrapper.
+/// global filter level: arti's `trace!(...)` events only reach it
+/// through a per-layer filter, which [`observation_layer`] applies for
+/// you — install the layer it returns, not a bare
+/// [`GuardObservabilityLayer`].
 #[derive(Debug, Clone)]
 pub struct GuardObservabilityLayer {
     sink: ObservationSink,
@@ -325,6 +327,45 @@ impl GuardObservabilityLayer {
     pub fn new(sink: ObservationSink) -> Self {
         Self { sink }
     }
+}
+
+/// Per-layer filter carried by [`observation_layer`]: arti emits the
+/// guard events at TRACE, invisible under any normal user filter, so
+/// the layer brings its own `EnvFilter` for the one target it needs.
+const OBSERVATION_LAYER_FILTER: &str = "tor_guardmgr=trace";
+
+/// The observation layer for the application's log subscriber (R6: the
+/// runtime never installs a subscriber — the application wires this
+/// into its own `tracing_subscriber::registry()` next to its fmt
+/// layer, exactly like the proxy binary does in its startup):
+///
+/// ```no_run
+/// use tracing_subscriber::layer::SubscriberExt;
+/// use tor_socks5_runtime::arti_observability::{observation_layer, ObservationSink};
+///
+/// let sink = ObservationSink::new();
+/// let fmt_layer = tracing_subscriber::fmt::layer();
+/// tracing_subscriber::registry()
+///     .with(fmt_layer)
+///     .with(observation_layer(&sink))
+///     .init();
+/// ```
+///
+/// The returned layer captures arti's per-guard usability events into
+/// `sink` and produces no log output of its own; the user's main log
+/// filter is untouched because the `tor_guardmgr=trace` [`EnvFilter`]
+/// applies to this layer only. Drain the sink from the maintenance
+/// loop: [`ObservationSink::drain`] for raw observations or
+/// [`ObservationSink::drain_into_store`] to feed them into a
+/// [`BridgeStore`].
+#[must_use]
+pub fn observation_layer<S>(
+    sink: &ObservationSink,
+) -> Filtered<GuardObservabilityLayer, EnvFilter, S>
+where
+    S: tracing::Subscriber,
+{
+    GuardObservabilityLayer::new(sink.clone()).with_filter(EnvFilter::new(OBSERVATION_LAYER_FILTER))
 }
 
 impl<S> Layer<S> for GuardObservabilityLayer

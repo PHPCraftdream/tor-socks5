@@ -7,7 +7,7 @@ use std::path::Path;
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 
 use crate::config::{Config, LogConfig, LogOutput};
-use tor_socks5_runtime::arti_observability::{GuardObservabilityLayer, ObservationSink};
+use tor_socks5_runtime::arti_observability::{observation_layer, ObservationSink};
 use tor_socks5_runtime::conn_health::{ConnErrorKind, ConnStage};
 
 /// `rustls` 0.23 requires picking a process-wide crypto provider explicitly.
@@ -29,10 +29,11 @@ pub(crate) fn install_crypto_provider() {
 /// flushes and stops the writer thread, so bind it to a variable that
 /// lives until shutdown.
 ///
-/// Active health observation: a second tracing layer
-/// ([`GuardObservabilityLayer`]) listens on `tor_guardmgr=trace`
-/// regardless of the user's main log filter. It pushes guard-usability
-/// observations into the returned [`ObservationSink`] without producing
+/// Active health observation: a second tracing layer —
+/// `arti_observability::observation_layer` — listens on
+/// `tor_guardmgr=trace` regardless of the user's main log filter. It
+/// pushes guard-usability observations into the returned
+/// [`ObservationSink`] without producing
 /// any log output of its own. The proxy's maintenance loop drains the
 /// sink into the bridge health store; see
 /// tor_socks5_runtime::tor_setup::update_health_and_prune.
@@ -67,8 +68,7 @@ pub(crate) fn init_tracing(cfg: &Config) -> (WorkerGuard, ObservationSink) {
     // the structured events it needs without dragging arti traffic noise
     // into the user-visible log.
     let sink = ObservationSink::new();
-    let observability_layer = GuardObservabilityLayer::new(sink.clone())
-        .with_filter(EnvFilter::new("tor_guardmgr=trace"));
+    let observability_layer = observation_layer(&sink);
 
     tracing_subscriber::registry()
         .with(fmt_layer)
