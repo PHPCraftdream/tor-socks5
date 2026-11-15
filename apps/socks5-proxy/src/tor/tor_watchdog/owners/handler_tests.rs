@@ -63,8 +63,16 @@ async fn run_server_reports_final_flush_worker_panic() {
                     writer,
                     ready: std::sync::Mutex::new(Some(ready_tx)),
                 });
+                let (config_path, config) =
+                    match crate::config::Config::load_with_override(Some(&path)).unwrap() {
+                        crate::config::Loaded::FromFile { path, config } => (Some(path), config),
+                        crate::config::Loaded::Defaults(config) => (None, config),
+                    };
+                let _ = rustls::crypto::ring::default_provider().install_default();
                 let args = super::super::ServerArgs {
-                    config_override: Some(path),
+                    config,
+                    config_path,
+                    obs_sink: tor_socks5_runtime::arti_observability::ObservationSink::new(),
                     upstream_addr: None,
                     upstream_user: None,
                     upstream_pass: None,
@@ -144,8 +152,16 @@ async fn parked_server_startup(global: bool) {
         gate: std::sync::Mutex::new(Some((entered_tx, release_rx))),
     });
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let (config_path, config) =
+        match crate::config::Config::load_with_override(Some(&path)).unwrap() {
+            crate::config::Loaded::FromFile { path, config } => (Some(path), config),
+            crate::config::Loaded::Defaults(config) => (None, config),
+        };
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let args = super::super::ServerArgs {
-        config_override: Some(path),
+        config,
+        config_path,
+        obs_sink: tor_socks5_runtime::arti_observability::ObservationSink::new(),
         upstream_addr: None,
         upstream_user: None,
         upstream_pass: None,

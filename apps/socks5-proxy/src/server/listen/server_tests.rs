@@ -1,12 +1,24 @@
 use super::*;
 
 #[tokio::test]
-async fn shutdown_is_polled_before_loading_config() {
+async fn shutdown_is_polled_before_validating_config() {
     let _serial = owners::TEST_LIFECYCLE.lock().await;
+    // pre_proxies together with the DNS listener fails
+    // `validate_pre_compatibility`, which runs right after the shutdown poll.
+    let mut config = Config {
+        pre_proxies: Some(
+            "127.0.0.1:1080"
+                .parse::<proxy_config::Socks5Endpoint>()
+                .unwrap()
+                .into(),
+        ),
+        ..Default::default()
+    };
+    config.dns_server.enabled = true;
     let args = ServerArgs {
-        config_override: Some(std::path::PathBuf::from(
-            "несуществующий-каталог/конфигурация.ktav",
-        )),
+        config,
+        config_path: None,
+        obs_sink: ObservationSink::new(),
         upstream_addr: None,
         upstream_user: None,
         upstream_pass: None,

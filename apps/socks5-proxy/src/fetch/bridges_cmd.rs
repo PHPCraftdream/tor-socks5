@@ -12,8 +12,8 @@ use tracing::info;
 
 use crate::cli::BridgesAction;
 use crate::config::{Config, Loaded};
+use crate::process::{init_tracing, install_crypto_provider};
 use crate::route::reject_unsupported_pool;
-use crate::startup::{init_tracing, install_crypto_provider};
 use tor_socks5_runtime::tor_setup::build_tor_settings;
 
 #[cfg(test)]

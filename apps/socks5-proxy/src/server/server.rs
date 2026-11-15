@@ -18,14 +18,15 @@ use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{Config, Loaded, SecurityConfig};
+use crate::config::{Config, SecurityConfig};
 use crate::dns_wiring::{convert_custom_doh_providers, convert_dns_overrides, dns_cache_path};
 use crate::route::{resolve_admitted_route, validate_account_routes, validate_post_compatibility};
 pub(crate) use crate::route::{RealTorConnector, TorConnector};
 use crate::startup::AuthStateVerifier;
+use crate::upstream;
 use crate::upstream::relay;
 use crate::upstream::RelayRemote::{Tor, Upstream};
-use crate::{shutdown, upstream};
+use tor_socks5_runtime::arti_observability::ObservationSink;
 use tor_socks5_runtime::conn_health::{spawn_conn_health_logger, ConnHealthCounters};
 use tor_socks5_runtime::tor_watchdog::{
     spawn_bridge_failover_watchdog, spawn_tor_watchdog, TorHandle,
@@ -86,16 +87,18 @@ impl Drop for HandlerRunGuard {
 /// Inputs needed to run the SOCKS5 server, gathered from the CLI (or, in
 /// the Windows-service case, synthesised from the installed image path).
 pub(crate) struct ServerArgs {
-    pub config_override: Option<std::path::PathBuf>,
+    pub config: Config,
+    pub config_path: Option<std::path::PathBuf>,
+    pub obs_sink: ObservationSink,
     pub upstream_addr: Option<String>,
     pub upstream_user: Option<String>,
     pub upstream_pass: Option<String>,
     pub no_upstream: bool,
 }
 
-/// Run the proxy until `shutdown` resolves. Factored out of `main` so the
-/// Windows-service runtime can drive it with an SCM-triggered shutdown
-/// instead of a console signal.
+/// Run the proxy until `shutdown` resolves. The stop future is supplied by
+/// the caller (console signal or SCM notification); process-wide setup
+/// (config loading, logging, signals) is done outside.
 pub(crate) async fn run_server(
     args: ServerArgs,
     shutdown: impl std::future::Future<Output = ()>,
@@ -108,12 +111,13 @@ pub(crate) async fn run_server(
         () = &mut shutdown => { recovery.await?; return Ok(()); }
         result = &mut recovery => result?,
     }
-    let loaded = Config::load_with_override(args.config_override.as_deref())?;
-    let (config_path, source) = match &loaded {
-        Loaded::FromFile { path, .. } => (Some(path.clone()), format!("file: {}", path.display())),
-        Loaded::Defaults(_) => (None, "built-in defaults".to_string()),
+    let cfg = args.config;
+    let config_path = args.config_path;
+    let obs_sink = args.obs_sink;
+    let source = match &config_path {
+        Some(p) => format!("file: {}", p.display()),
+        None => "built-in defaults".to_string(),
     };
-    let cfg = loaded.into_config();
     let pre_socks = cfg.pre_proxies.clone().map(Arc::new);
     validate_pre_compatibility(
         pre_socks.is_some(),
@@ -123,22 +127,6 @@ pub(crate) async fn run_server(
     )?;
     let post_socks = cfg.post_proxies.clone().map(Arc::new);
     validate_post_compatibility(post_socks.is_some(), cfg.dns_server.enabled, false)?;
-
-    // Held until the server shuts down so the non-blocking log writer
-    // keeps flushing for the whole run. The observation sink captures
-    // per-guard usability events from arti's tracing layer for the
-    // bridge maintenance loop to drain into the health store.
-    let (_log_guard, obs_sink) = global_init::init_server_tracing(&cfg);
-    shutdown::bind_child_processes_to_self();
-
-    // The PT child (busybox dispatch, re-exec of this same binary) inherits
-    // our environment and sets up its own tracing subscriber independently
-    // of `cfg.log`. Propagate our own ansi choice via the NO_COLOR
-    // convention (https://no-color.org) so a `log.ansi: false` config also
-    // silences the child's colored output, not just ours.
-    if !cfg.log.ansi {
-        std::env::set_var("NO_COLOR", "1");
-    }
 
     info!(%source, "loaded configuration");
     if let Some(path) = &config_path {

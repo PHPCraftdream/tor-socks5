@@ -57,25 +57,6 @@ pub(super) fn server_ready() {
     });
 }
 
-pub(super) fn init_server_tracing(
-    cfg: &crate::config::Config,
-) -> (
-    Option<tracing_appender::non_blocking::WorkerGuard>,
-    tor_socks5_runtime::arti_observability::ObservationSink,
-) {
-    #[cfg(test)]
-    if RUN_SERVER_STARTUP.try_with(|_| ()).is_ok() || RUN_SERVER_SHUTDOWN.try_with(|_| ()).is_ok() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        return (
-            None,
-            tor_socks5_runtime::arti_observability::ObservationSink::new(),
-        );
-    }
-    let (guard, sink) = crate::startup::init_tracing(cfg);
-    crate::startup::install_crypto_provider();
-    (Some(guard), sink)
-}
-
 pub(super) fn init_store_writer(path: Option<&std::path::Path>) {
     #[cfg(test)]
     if RUN_SERVER_STARTUP.try_with(|_| ()).is_ok() || RUN_SERVER_SHUTDOWN.try_with(|_| ()).is_ok() {
