@@ -17,9 +17,9 @@
 //! | [`tor`] | `arti-wrapper` | `tor` |
 //! | [`fetch`] | `bridge-fetcher` | `fetch` |
 //! | [`dns`] | `tor-socks5-dns` | `dns` |
-//! | [`runtime`] | `tor-socks5-runtime` (SDK-7 surface) | `runtime` |
+//! | [`runtime`] | `tor-socks5-runtime` (SDK-7/8/9 surfaces) | `runtime` |
 //! | [`onion`] | `tor-socks5-onion` | `onion`, `onion-keys` |
-//! | [`runtime`] | `tor-socks5-runtime` — the curated SDK-9 surface, not the whole crate | `runtime` |
+//! | [`runtime`] | `tor-socks5-runtime` — the curated SDK-7/8/9 surfaces, not the whole crate | `runtime` |
 //!
 //! The `tor` feature (and `fetch`, `dns`, `runtime`, `onion-service`,
 //! `full`, which imply it) links Arti. Without the vendored forks of the patch-kit a
@@ -86,8 +86,8 @@ pub use ::dns_server as dns;
 pub use ::tor_socks5_onion as onion;
 
 /// The embedded Tor runtime (`tor-socks5-runtime`, `apps/sdk/crates/runtime`),
-/// curated by module — this is not the whole crate. Two surfaces are open so
-/// far; the bridge manager (SDK-8) and the proxy server (SDK-10/11) are not
+/// curated by module — this is not the whole crate. Three surfaces are open
+/// so far (SDK-7, SDK-8, SDK-9); the proxy server (SDK-10/11) is not
 /// exposed yet.
 ///
 /// Nothing here installs process state on its own (R1): the bridge-health
@@ -126,6 +126,19 @@ pub use ::tor_socks5_onion as onion;
 /// - [`runtime::conn_health`] — connection-health counters and windowed
 ///   snapshots.
 ///
+/// **Bridge manager (SDK-8):**
+///
+/// - [`runtime::start`] — spawn the runtime-owned bridge producers
+///   (maintenance, plus the warmer and circuit verifier when enabled) and
+///   get a [`runtime::BridgeManagerHandle`] (`token`, `status`,
+///   `subscribe`, `shutdown().await`). One live manager per process (D5);
+///   await `shutdown()` before `close_global` so in-flight store writes
+///   land.
+/// - [`runtime::fetch_bridges`] — the `bridges fetch` core
+///   ([`runtime::FetchBridgesParams`], [`runtime::FetchBridgesOutcome`]):
+///   bootstrap Tor, refresh the candidate pool, optionally probe and
+///   promote into the config. Not cancel-safe; see the crate docs.
+///
 /// This feature links Arti: without the patch-kit (`[patch.crates-io]` in
 /// your final binary/workspace root, see the SDK guide in README.md and
 /// `vendor/README.md`) stock Arti is resolved and the fixes are lost.
@@ -150,5 +163,14 @@ pub mod runtime {
     /// observation and layer types.
     pub use ::tor_socks5_runtime::arti_observability::{
         observation_layer, GuardObservabilityLayer, GuardObservation, ObservationSink,
+    };
+
+    /// The bridge manager (SDK-8): [`start`] owns the background bridge
+    /// producers (one live manager per process, D5), [`BridgeManagerHandle`]
+    /// reports status and joins them at shutdown; [`fetch_bridges`] is the
+    /// `bridges fetch` core.
+    pub use ::tor_socks5_runtime::bridge_manager::{
+        fetch_bridges, start, BridgeManagerHandle, BridgeManagerStatus, FetchBridgesOutcome,
+        FetchBridgesParams,
     };
 }
