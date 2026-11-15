@@ -295,7 +295,7 @@ impl StoreWriter {
         let retirements: RetirementLog = Arc::default();
         #[cfg(test)]
         let actor_retirements = Arc::clone(&retirements);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seams"))]
         let registry = crate::workers::test_registry();
         let actor = async move {
             let path = actor_path;
@@ -570,14 +570,14 @@ impl StoreWriter {
                 }
             }
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seams"))]
         let handle = tokio::spawn(async move {
             match registry {
                 Some(registry) => registry.scope(actor).await,
                 None => actor.await,
             }
         });
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-seams")))]
         let handle = tokio::spawn(actor);
         Self {
             tx,
