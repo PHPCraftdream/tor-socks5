@@ -624,6 +624,7 @@ async fn shutdown_producers(
 // модуле; реэкспорт сохраняет существующие вызовы и видимость через `super::*`.
 use crate::upstream::pick_upstream;
 
+#[cfg(test)]
 pub(crate) use crate::conn_health::{ConnErrorKind, ConnStage};
 use crate::startup::{
     classify_conn_failure, STAGE_CONNECT_TOR, STAGE_CONNECT_UPSTREAM, STAGE_HANDSHAKE, STAGE_RELAY,

@@ -236,109 +236,6 @@ pub(crate) fn ensure_bridges_file(cfg: &Config, config_path: &Path) -> bool {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bridges_file_is_created_once_and_never_overwritten() {
-        let dir = std::env::temp_dir().join(format!("tor-socks5-ensure-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let config_path = dir.join("tor-socks5.ktav");
-        let mut cfg = Config::default();
-        assert!(ensure_bridges_file(&cfg, &config_path));
-        let bridges_path = Config::bridges_path(&config_path);
-        assert!(bridges_path.exists());
-
-        // An existing file (here: the operator's own pool) is left alone.
-        cfg.bridges.min_alive = 99;
-        assert!(!ensure_bridges_file(&cfg, &config_path));
-        let text = std::fs::read_to_string(&bridges_path).unwrap();
-        assert!(!text.contains("min_alive: 99"), "{text}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // (а) configured on + real terminal → colours on.
-    #[test]
-    fn ansi_on_when_configured_and_stdout_is_terminal() {
-        assert!(resolve_ansi(true, LogOutput::Stdout, true, false));
-    }
-
-    #[test]
-    fn ansi_on_when_configured_and_stderr_is_terminal() {
-        assert!(resolve_ansi(true, LogOutput::Stderr, false, true));
-    }
-
-    // (б) configured on but redirected (not a terminal) → colours off, so
-    // raw escape bytes never land in a redirected file/pipe.
-    #[test]
-    fn ansi_off_when_stdout_redirected() {
-        assert!(!resolve_ansi(true, LogOutput::Stdout, false, true));
-    }
-
-    #[test]
-    fn ansi_off_when_stderr_redirected() {
-        assert!(!resolve_ansi(true, LogOutput::Stderr, true, false));
-    }
-
-    // (в) explicitly disabled by the user → off even on a real terminal.
-    #[test]
-    fn ansi_off_when_configured_off_even_on_terminal() {
-        assert!(!resolve_ansi(false, LogOutput::Stdout, true, true));
-        assert!(!resolve_ansi(false, LogOutput::Stderr, true, true));
-    }
-
-    // (г) file destination → always off, regardless of flag or TTY status.
-    #[test]
-    fn ansi_always_off_for_file_output() {
-        assert!(!resolve_ansi(true, LogOutput::File, true, true));
-        assert!(!resolve_ansi(false, LogOutput::File, false, false));
-    }
-
-    // A stream's decision depends only on its own TTY status: the stdout
-    // rule never consults stderr's TTY bit, and vice versa.
-    #[test]
-    fn each_stream_uses_only_own_tty_status() {
-        assert!(resolve_ansi(true, LogOutput::Stdout, true, false));
-        assert!(!resolve_ansi(true, LogOutput::Stdout, false, true));
-        assert!(resolve_ansi(true, LogOutput::Stderr, false, true));
-        assert!(!resolve_ansi(true, LogOutput::Stderr, true, false));
-    }
-
-    // --- should_set_no_color (the PT-child colour-propagation decision) ---
-    //
-    // The PT child always writes to its inherited stderr, so NO_COLOR is
-    // set iff ANSI would be off for a stderr destination — i.e. the exact
-    // negation of `resolve_ansi(..., LogOutput::Stderr, t, t)`.
-
-    // configured on + stderr is a real terminal → colour on → NO_COLOR NOT
-    // set, so a terminal PT child still gets colours.
-    #[test]
-    fn no_color_not_set_when_configured_and_stderr_is_terminal() {
-        assert!(!should_set_no_color(true, true));
-    }
-
-    // configured on but stderr redirected (not a terminal) → colour off →
-    // NO_COLOR set, so the PT child's inherited-stderr bytes stay plain.
-    #[test]
-    fn no_color_set_when_stderr_redirected_even_if_configured() {
-        assert!(should_set_no_color(true, false));
-    }
-
-    // explicitly disabled by the user → colour off even on a terminal →
-    // NO_COLOR set, propagating the user's opt-out to the PT child too.
-    #[test]
-    fn no_color_set_when_configured_off_even_on_terminal() {
-        assert!(should_set_no_color(false, true));
-    }
-
-    // both off: configured off and no terminal → NO_COLOR set.
-    #[test]
-    fn no_color_set_when_configured_off_and_redirected() {
-        assert!(should_set_no_color(false, false));
-    }
-}
-
 // Подтверждение выдаётся только после проверки учётных данных.
 pub(crate) struct AuthStateVerifier(pub(crate) std::sync::Arc<auth::AuthState>);
 
@@ -457,4 +354,107 @@ pub(crate) fn classify_conn_failure(err: &anyhow::Error) -> (ConnStage, ConnErro
         }
     };
     (stage, kind)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bridges_file_is_created_once_and_never_overwritten() {
+        let dir = std::env::temp_dir().join(format!("tor-socks5-ensure-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("tor-socks5.ktav");
+        let mut cfg = Config::default();
+        assert!(ensure_bridges_file(&cfg, &config_path));
+        let bridges_path = Config::bridges_path(&config_path);
+        assert!(bridges_path.exists());
+
+        // An existing file (here: the operator's own pool) is left alone.
+        cfg.bridges.min_alive = 99;
+        assert!(!ensure_bridges_file(&cfg, &config_path));
+        let text = std::fs::read_to_string(&bridges_path).unwrap();
+        assert!(!text.contains("min_alive: 99"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // (а) configured on + real terminal → colours on.
+    #[test]
+    fn ansi_on_when_configured_and_stdout_is_terminal() {
+        assert!(resolve_ansi(true, LogOutput::Stdout, true, false));
+    }
+
+    #[test]
+    fn ansi_on_when_configured_and_stderr_is_terminal() {
+        assert!(resolve_ansi(true, LogOutput::Stderr, false, true));
+    }
+
+    // (б) configured on but redirected (not a terminal) → colours off, so
+    // raw escape bytes never land in a redirected file/pipe.
+    #[test]
+    fn ansi_off_when_stdout_redirected() {
+        assert!(!resolve_ansi(true, LogOutput::Stdout, false, true));
+    }
+
+    #[test]
+    fn ansi_off_when_stderr_redirected() {
+        assert!(!resolve_ansi(true, LogOutput::Stderr, true, false));
+    }
+
+    // (в) explicitly disabled by the user → off even on a real terminal.
+    #[test]
+    fn ansi_off_when_configured_off_even_on_terminal() {
+        assert!(!resolve_ansi(false, LogOutput::Stdout, true, true));
+        assert!(!resolve_ansi(false, LogOutput::Stderr, true, true));
+    }
+
+    // (г) file destination → always off, regardless of flag or TTY status.
+    #[test]
+    fn ansi_always_off_for_file_output() {
+        assert!(!resolve_ansi(true, LogOutput::File, true, true));
+        assert!(!resolve_ansi(false, LogOutput::File, false, false));
+    }
+
+    // A stream's decision depends only on its own TTY status: the stdout
+    // rule never consults stderr's TTY bit, and vice versa.
+    #[test]
+    fn each_stream_uses_only_own_tty_status() {
+        assert!(resolve_ansi(true, LogOutput::Stdout, true, false));
+        assert!(!resolve_ansi(true, LogOutput::Stdout, false, true));
+        assert!(resolve_ansi(true, LogOutput::Stderr, false, true));
+        assert!(!resolve_ansi(true, LogOutput::Stderr, true, false));
+    }
+
+    // --- should_set_no_color (the PT-child colour-propagation decision) ---
+    //
+    // The PT child always writes to its inherited stderr, so NO_COLOR is
+    // set iff ANSI would be off for a stderr destination — i.e. the exact
+    // negation of `resolve_ansi(..., LogOutput::Stderr, t, t)`.
+
+    // configured on + stderr is a real terminal → colour on → NO_COLOR NOT
+    // set, so a terminal PT child still gets colours.
+    #[test]
+    fn no_color_not_set_when_configured_and_stderr_is_terminal() {
+        assert!(!should_set_no_color(true, true));
+    }
+
+    // configured on but stderr redirected (not a terminal) → colour off →
+    // NO_COLOR set, so the PT child's inherited-stderr bytes stay plain.
+    #[test]
+    fn no_color_set_when_stderr_redirected_even_if_configured() {
+        assert!(should_set_no_color(true, false));
+    }
+
+    // explicitly disabled by the user → colour off even on a terminal →
+    // NO_COLOR set, propagating the user's opt-out to the PT child too.
+    #[test]
+    fn no_color_set_when_configured_off_even_on_terminal() {
+        assert!(should_set_no_color(false, true));
+    }
+
+    // both off: configured off and no terminal → NO_COLOR set.
+    #[test]
+    fn no_color_set_when_configured_off_and_redirected() {
+        assert!(should_set_no_color(false, false));
+    }
 }
