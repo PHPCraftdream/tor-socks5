@@ -13,6 +13,15 @@
 //! `show`, `export`, `import` and `remove` are built on. The keystore
 //! directory is always an explicit argument; printing, prompting and
 //! confirmation stay with the application.
+//!
+//! Behind the Tor-dependent `host` feature, [`host`] adds the server-side
+//! onion-service hosting that used to live in the binary: identity
+//! settlement, the gradual launch (at most 4 at a time), stream forwarding
+//! with per-service and process-wide caps, lifecycle logging and a `watch`
+//! status snapshot. The keystore directory and the services-file location
+//! are explicit arguments of [`host::OnionHostConfig`]; the host never
+//! prints and never installs process state — shutdown is a cancellation
+//! token, and dropping the handle only cancels that token.
 
 #![warn(missing_docs)]
 
@@ -21,3 +30,6 @@ pub mod vanity;
 
 #[cfg(feature = "keys")]
 pub mod keys;
+
+#[cfg(feature = "host")]
+pub mod host;

@@ -6,7 +6,7 @@ publish = false
 version = "0.2.0"
 edition.workspace = true
 license.workspace = true
-description = "v3 onion service addresses (rend-spec-v3), the vanity prefix-search core, and (behind the `keys` feature) onion identity keystore management via the Arti native keystore, without Tor."
+description = "v3 onion service addresses (rend-spec-v3), the vanity prefix-search core, (behind the `keys` feature) onion identity keystore management via the Arti native keystore, and (behind the Tor-dependent `host` feature) the hosted onion-service manager, without printing or process state."
 repository.workspace = true
 homepage.workspace = true
 readme = "README.md"
@@ -39,6 +39,29 @@ keys = [
 # Test helpers for dependent crates' own tests (R10): never in default/full.
 test-seams = []
 
+# Tor-dependent onion-service hosting (SDK-5): the whole server-side
+# launch/serve/status choreography moved out of the binary. Requires the
+# vendored Arti stack (patch-kit); implies `keys`.
+host = [
+    "keys",
+    "arti-wrapper/onion-service",
+    "dep:arti-wrapper",
+    "dep:tor-socks5-runtime",
+    "dep:tokio",
+    "dep:tokio-util",
+    "dep:futures",
+    "dep:tor-hsservice",
+    "dep:tor-cell",
+    "dep:tor-proto",
+    "dep:safelog",
+    "dep:tor-hscrypto",
+    "dep:tracing",
+    "dep:anyhow",
+    "dep:persist-lock",
+    "dep:proxy-config",
+    "dep:tempfile",
+]
+
 [dependencies]
 # Declared non-optional because derive-deftly's expansion requires it in the
 # manifest of the crate that uses `#[derive(Deftly)]` (keys/specifier.rs).
@@ -61,3 +84,22 @@ tracing = { workspace = true, optional = true }
 zeroize.workspace = true
 persist-lock = { path = "../../../../packages/persist-lock", version = "0.2.0", optional = true }
 proxy-config = { path = "../../../../packages/proxy-config", version = "0.2.0", package = "tor-socks5-config", optional = true }
+# `host` feature: the Tor-dependent onion-service hosting (same arti 0.48
+# stack as the binary and Cargo.lock; the forks come from the patch-kit).
+arti-wrapper = { path = "../../../../packages/arti-wrapper", version = "0.2.0", optional = true }
+tor-socks5-runtime = { path = "../runtime", version = "0.2.0", optional = true }
+tokio = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+tor-hsservice = { version = "0.48", optional = true }
+tor-cell = { version = "0.48", optional = true }
+tor-proto = { version = "0.48", optional = true }
+
+# `start_paused`/`advance` in the async tests (tokio's `full` does not
+# include `test-util`).
+[dev-dependencies]
+# `rustls::crypto::ring::default_provider().install_default()` in the host
+# tests (same workspace entry runtime's dev-dependencies use; the workspace
+# rustls enables the `ring` provider).
+rustls.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

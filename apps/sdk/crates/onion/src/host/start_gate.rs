@@ -52,7 +52,7 @@ impl StartGate {
             permit = self.permits.clone().acquire_owned() => {
                 // A closed semaphore gives no slot either.
                 permit.ok().map(|permit| StartSlot {
-                    permit,
+                    _permit: permit,
                     deadline: tokio::time::Instant::now() + START_SLOT_TIMEOUT,
                 })
             }
@@ -67,7 +67,8 @@ impl StartGate {
 
 /// One launch slot; dropping it releases the permit back to the gate.
 pub(crate) struct StartSlot {
-    permit: tokio::sync::OwnedSemaphorePermit,
+    // Kept (never read) for its Drop: dropping the slot releases the permit.
+    _permit: tokio::sync::OwnedSemaphorePermit,
     deadline: tokio::time::Instant,
 }
 

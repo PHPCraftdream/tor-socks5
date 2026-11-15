@@ -24,6 +24,50 @@ let recorded = keys::create_service(config_path, keystore_dir, "web", None, fals
 println!("{}", recorded.address);
 ```
 
+## Hosting onion services (`host` feature, Tor-dependent)
+
+Behind the Tor-dependent `host` feature (implies `keys`; links the Arti
+stack, so the patch-kit applies) the crate carries the server-side hosting
+that used to live in the `socks5-proxy` binary:
+
+- `OnionHostConfig` — config in: the `TorHandle`, the enabled service
+  entries, and **explicit arguments** for the keystore directory and the
+  onion services file location (never derived from anything here).
+- `OnionHost::new(config).start()` — handle out: spawns the producer task
+  (settle all identities in one batch → keystore lock held for the services'
+  lifetime → at most 4 launches at a time → one manager per service with
+  per-service 256 / process-wide 512 forwarded-stream caps) and returns an
+  `OnionHostHandle` immediately. With no enabled entries the producer exits
+  immediately and the status stays empty.
+- `OnionHostHandle` — `subscribe()`/`status()` for the `OnionHostStatus`
+  snapshot (one `tokio::sync::watch` slot: updates never block, work with
+  zero receivers, and a receiver always sees the latest state — R4 semantics,
+  no unbounded channels), `shutdown()` (cancel + join the producer),
+  `detach()` (hand the producer to the caller's shutdown choreography; the
+  token stays the cancellation path), and `token()`.
+- **Drop cancels the token only** — it never blocks and runs no async code
+  (R2). Sequential restart works because a new `start()` reacquires the
+  keystore lock; one live host per keystore: concurrent hosting of the same
+  keystore fails loudly but non-fatally (all services `Failed` with
+  `ServiceFailure::KeystoreLockHeld`).
+- `ServiceStatus`/`ServiceState`/`ServiceFailure` — per-service lifecycle.
+  Services whose identity could not be settled appear as `Failed` with
+  `failure: None` (the concrete cause is logged; no single typed reason
+  fits those paths, so none is invented).
+
+```text
+use tor_socks5_onion::host::{OnionHost, OnionHostConfig};
+
+let host_handle = OnionHost::new(
+    OnionHostConfig::new(handle, keystore_dir, token)
+        .with_entries(entries)
+        .with_config_path(Some(config_path)),
+)
+.start();
+let status = host_handle.subscribe();
+host_handle.shutdown().await;
+```
+
 ## Usage
 
 ```rust

@@ -36,14 +36,19 @@ dns = ["tor", "acl", "dep:tor-socks5-dns"]
 runtime = ["tor", "config", "bridges", "dep:tor-socks5-runtime"]
 # Tor-free onion address and vanity core (the CLI uses the same crate).
 onion = ["dep:tor-socks5-onion"]
-# Server-side onion services (the CLI enables the same feature).
-onion-service = ["tor", "arti-wrapper/onion-service"]
+# Server-side onion services (the CLI enables the same feature): hosting
+# through the tor-socks5-onion `host` feature plus the tunnel side.
+onion-service = ["tor", "arti-wrapper/onion-service", "onion-host"]
+# Hosted onion services (SDK-5): the server-side launch/serve/status
+# choreography in tor-socks5-onion's Tor-dependent `host` feature. Links
+# Arti — patch-kit needed (see README).
+onion-host = ["dep:tor-socks5-onion", "tor-socks5-onion/host"]
 # Onion service identity keys via the Arti native keystore (tor-keymgr +
 # tor-hscrypto only: no Tor client, no patch-kit). The keystore directory is
 # an explicit argument; printing, prompting and confirmations stay with the
 # application.
 onion-keys = ["dep:tor-socks5-onion", "tor-socks5-onion/keys"]
-full = ["socks5", "auth", "config", "bridges", "route", "tor", "fetch", "dns", "onion", "onion-keys", "onion-service", "runtime"]
+full = ["socks5", "auth", "config", "bridges", "route", "tor", "fetch", "dns", "onion", "onion-keys", "onion-service", "onion-host", "runtime"]
 
 [dependencies]
 persist-lock = { path = "../../packages/persist-lock", version = "0.2.0" }

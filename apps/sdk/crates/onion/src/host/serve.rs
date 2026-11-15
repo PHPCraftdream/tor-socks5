@@ -27,6 +27,8 @@ use tor_hsservice::{RendRequest, RunningOnionService, StreamRequest};
 use tor_proto::stream::IncomingStreamRequest;
 use tracing::{debug, info, trace, warn};
 
+use super::status::{ServiceState, ServiceStatus, StatusTracker};
+
 /// Maximum concurrent forwarded connections per onion service. Each is a
 /// plain local TCP forwarding pair, but unbounded spawns would still let a
 /// hostile client exhaust memory/file descriptors.
@@ -231,12 +233,14 @@ async fn handle_stream_request(
 /// (bootstrapping → running → shutdown), WARN when the service degrades.
 /// `started` fires once the service first reports Running,
 /// DegradedReachable or Broken — the launch-phase slot release signal
-/// (see `start_gate`).
+/// (see `start_gate`). Every logged transition is also published to the
+/// shared status tracker.
 pub(crate) async fn log_status_events(
     mut events: tor_hsservice::status::OnionServiceStatusStream,
     nickname: String,
     address: String,
     started: tokio::sync::oneshot::Sender<()>,
+    tracker: StatusTracker,
     token: CancellationToken,
 ) {
     // The stream yields the current status first, then every change; dedupe
@@ -269,25 +273,65 @@ pub(crate) async fn log_status_events(
                 if let Some(started) = started.take() {
                     let _ = started.send(());
                 }
+                tracker.set(
+                    &nickname,
+                    ServiceState {
+                        status: ServiceStatus::Running,
+                        failure: None,
+                    },
+                );
                 info!(nickname = %nickname, %address, "onion service reachable");
             }
             tor_hsservice::status::State::Broken => {
                 if let Some(started) = started.take() {
                     let _ = started.send(()); // see the Running arm
                 }
+                tracker.set(
+                    &nickname,
+                    ServiceState {
+                        status: ServiceStatus::Broken,
+                        failure: None,
+                    },
+                );
                 warn!(nickname = %nickname, %address, "onion service is broken");
             }
             tor_hsservice::status::State::DegradedReachable => {
                 if let Some(started) = started.take() {
                     let _ = started.send(()); // see the Running arm
                 }
+                tracker.set(
+                    &nickname,
+                    ServiceState {
+                        status: ServiceStatus::DegradedReachable,
+                        failure: None,
+                    },
+                );
                 warn!(nickname = %nickname, %address, "onion service reachable but degraded");
             }
             tor_hsservice::status::State::DegradedUnreachable
             | tor_hsservice::status::State::Recovering => {
+                let tracked_state = if state == tor_hsservice::status::State::DegradedUnreachable {
+                    ServiceStatus::DegradedUnreachable
+                } else {
+                    ServiceStatus::Recovering
+                };
+                tracker.set(
+                    &nickname,
+                    ServiceState {
+                        status: tracked_state,
+                        failure: None,
+                    },
+                );
                 warn!(nickname = %nickname, %address, "onion service unreachable, attempting recovery");
             }
             tor_hsservice::status::State::Bootstrapping => {
+                tracker.set(
+                    &nickname,
+                    ServiceState {
+                        status: ServiceStatus::Bootstrapping,
+                        failure: None,
+                    },
+                );
                 info!(nickname = %nickname, "onion service bootstrapping");
             }
             tor_hsservice::status::State::Shutdown => {
