@@ -147,7 +147,10 @@ async fn run_services(
     // joined below. Failing to get it is NOT fatal: the proxy keeps running
     // without onion services.
     let dir = store::keystore_dir(config_path.as_deref());
-    let lock = crate::workers::run_fallible_blocking(move || store::lock(&dir)).await;
+    let lock = crate::workers::run_fallible_blocking(move || {
+        store::lock(&dir).map_err(anyhow::Error::new)
+    })
+    .await;
     let _lock = match lock {
         Ok(Ok(guard)) => Some(guard),
         Ok(Err(error)) => {
@@ -169,7 +172,8 @@ async fn run_services(
     // keystore work blocks, so it runs on the blocking pool. A join error is
     // NOT fatal: the proxy keeps running without onion services.
     let prepared = match tokio::task::spawn_blocking(move || {
-        identity::prepare_all(config_path.as_deref(), &entries)
+        let keystore = store::keystore_dir(config_path.as_deref());
+        identity::prepare_all(config_path.as_deref(), &keystore, &entries)
     })
     .await
     {
@@ -475,7 +479,8 @@ mod tests {
         proxy_config::Config::write_onion_services(&config, std::slice::from_ref(&entry))
             .expect("write");
 
-        let prepared = identity::prepare_all(Some(&config), &[entry]);
+        let prepared =
+            identity::prepare_all(Some(&config), &store::keystore_dir(Some(&config)), &[entry]);
         let address = prepared[0].address.clone().expect("the service may start");
 
         let stored = proxy_config::Config::read_onion_services(&config).expect("read");
@@ -495,7 +500,8 @@ mod tests {
         proxy_config::Config::write_onion_services(&config, std::slice::from_ref(&entry))
             .expect("write");
 
-        let prepared = identity::prepare_all(Some(&config), &[entry]);
+        let prepared =
+            identity::prepare_all(Some(&config), &store::keystore_dir(Some(&config)), &[entry]);
         assert_eq!(prepared[0].address, None);
         assert_eq!(
             keystore_address(&config, "web"),
@@ -514,7 +520,8 @@ mod tests {
         proxy_config::Config::write_onion_services(&config, std::slice::from_ref(&entry))
             .expect("write");
 
-        let prepared = identity::prepare_all(Some(&config), &[entry]);
+        let prepared =
+            identity::prepare_all(Some(&config), &store::keystore_dir(Some(&config)), &[entry]);
         assert_eq!(prepared[0].address, None);
     }
 }

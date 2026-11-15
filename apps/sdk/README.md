@@ -44,6 +44,7 @@ use tor_socks5::config::Config;
 | `fetch` | `fetch` | `bridge-fetcher` | `tor`, `bridges` |
 | `dns` | `dns` | `tor-socks5-dns` | `tor`, `acl` |
 | `onion` | `onion` | `tor-socks5-onion` | |
+| `onion-keys` | `onion` (keys) | `tor-socks5-onion/keys` | |
 | `onion-service` | | `arti-wrapper/onion-service` | `tor` |
 | `full` | all of the above | | |
 
@@ -52,7 +53,9 @@ without Tor: probing, health storage and verification do not link Arti.
 
 ## Using the Tor features
 
-`tor`, `fetch`, `dns`, `onion-service` and `full` link Arti. Cargo resolves
+`tor`, `fetch`, `dns`, `onion-service` and `full` link Arti; `onion-keys`
+does **not** join this list (its `tor-keymgr` and `tor-hscrypto` are only
+the crypto and keystore part — no Tor client is linked). Cargo resolves
 stock Arti from crates.io unless the **final binary's or workspace's root**
 `Cargo.toml` carries the `[patch.crates-io]` block of the patch-kit, and stock
 Arti silently lacks our fixes (bridge descriptor fetch hangs, a poisoned
@@ -106,6 +109,34 @@ registry.set_onion("alice", true)?;
 registry.set_proxies("alice", Hop::Post, None)?; // inherit the global pool
 ```
 
+## Onion service addresses, vanity and keys
+
+With `onion`, `onion::address` prints and parses v3 onion addresses and
+`onion::vanity` searches for a vanity prefix, with a progress callback and
+a cancellation flag.
+
+Behind `onion-keys`, `onion::keys` covers the service identities of the
+Arti native keystore: `new`, `list`, `show`, `export`, `import` and
+`remove` as plain functions, without printing or prompting — the keystore
+directory is an explicit argument (typically `<state>/keystore` next to the
+config). Export produces the keystore file itself (an OpenSSH-format
+ed25519-expanded key) and import accepts the same file. Confirmations (the
+`--yes` analog), passwords and all output stay with the application.
+`onion-keys` does not pull in a Tor client — no patch-kit is needed for it
+— and the keystore files are compatible with `arti`.
+
+```rust
+use tor_socks5::onion::keys::{create_service, NewIdentity};
+
+// `state` — the arti state directory your launch uses.
+let recorded = create_service(
+    &config_path,            // the main config (`<stem>.onion.ktav` lives next to it)
+    &state.join("keystore"), // the keystore directory: an explicit argument
+    "web", None, false, NewIdentity::Random,
+)?;
+println!("created {}", recorded.address);
+```
+
 ## What is not here
 
 The facade re-exports the libraries under `packages/` and `apps/sdk/crates/`. The logic that runs
@@ -113,9 +144,8 @@ the proxy lives in the `socks5-proxy` binary and is **not** available as a
 library yet:
 
 - the proxy server (listeners, egress, pre/post pools, startup and shutdown);
-- hosting onion services (start gate, stream limits, statuses) and the
-  onion key store; the `onion-service` feature only turns
-  on the onion support of `arti-wrapper`;
+- hosting onion services (start gate, stream limits, statuses); the
+  `onion-service` feature only turns on the onion support of `arti-wrapper`;
 - the bridge manager (verifier, warmer, health writer, maintenance) and the
   Tor watchdog.
 

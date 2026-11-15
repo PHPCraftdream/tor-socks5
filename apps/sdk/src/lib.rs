@@ -17,7 +17,7 @@
 //! | [`tor`] | `arti-wrapper` | `tor` |
 //! | [`fetch`] | `bridge-fetcher` | `fetch` |
 //! | [`dns`] | `tor-socks5-dns` | `dns` |
-//! | [`onion`] | `tor-socks5-onion` | `onion` |
+//! | [`onion`] | `tor-socks5-onion` | `onion`, `onion-keys` |
 //!
 //! The `tor` feature (and `fetch`, `dns`, `onion-service`, `full`, which
 //! imply it) links Arti. Without the vendored forks of the patch-kit a
@@ -73,6 +73,12 @@ pub use ::bridge_fetcher as fetch;
 #[cfg(feature = "dns")]
 pub use ::dns_server as dns;
 
-/// v3 onion addresses and the vanity prefix search, without Tor (`tor-socks5-onion`).
-#[cfg(feature = "onion")]
+/// v3 onion addresses and the vanity prefix search, without Tor
+/// (`tor-socks5-onion`).
+///
+/// Behind the `onion-keys` feature the crate also carries the service
+/// identity keys and keystore of the Arti native keystore: `onion::keys`
+/// (`create_service`, `import_identity`, `export_identity`, …), with no Tor
+/// client linked.
+#[cfg(any(feature = "onion", feature = "onion-keys"))]
 pub use ::tor_socks5_onion as onion;

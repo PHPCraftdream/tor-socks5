@@ -6,8 +6,18 @@
 //! external cancel flag and a shared progress counter. Nothing here prints,
 //! touches the network or links Tor: stderr progress, Ctrl-C handling and the
 //! key store stay with the application (`apps/socks5-proxy`).
+//!
+//! Behind the `keys` feature, [`keys`] adds onion *identity* management: the
+//! Arti native keystore (tor-keymgr/tor-hscrypto only — no Tor client, no
+//! patch-kit), the onion services file, and the command cores `new`, `list`,
+//! `show`, `export`, `import` and `remove` are built on. The keystore
+//! directory is always an explicit argument; printing, prompting and
+//! confirmation stay with the application.
 
 #![warn(missing_docs)]
 
 pub mod address;
 pub mod vanity;
+
+#[cfg(feature = "keys")]
+pub mod keys;

@@ -698,6 +698,24 @@ jobs:
                             blobs={"packages/arti-wrapper/Cargo.toml": (old, new)})
         self.assertIn("arti-wrapper", result["packages"])
 
+        # SDK-4: the eight sanctioned removals from the binary's manifest.
+        old_sdk4 = '[dependencies]\n' + ''.join(
+            f'{name} = "{ver}"\n' for name, ver in [
+                ("data-encoding", "2.11.0"), ("ed25519-dalek", "2.2.0"), ("sha2", "0.10.9"),
+                ("sha3", "0.10.9"), ("zeroize", "1.9.1"), ("fs-mistrust", "0.16"),
+                ("tor-keymgr", "0.48"), ("tor-llcrypto", "0.48"), ("tempfile", "3")])
+        new_sdk4 = '[dependencies]\ntempfile = "3"\n'
+        p.check_removed_dependencies("apps/socks5-proxy/Cargo.toml", old_sdk4, new_sdk4)
+        # An unsanctioned removal from the same manifest is refused.
+        with self.assertRaisesRegex(p.MappingError, "missing mapping: удалена зависимость пакета"):
+            p.check_removed_dependencies("apps/socks5-proxy/Cargo.toml", new_sdk4, '[dependencies]\n')
+        # The same sanctioned name in another table of the same manifest is refused.
+        dev_sdk4 = new_sdk4 + '[dev-dependencies]\ntor-keymgr = "0.48"\n'
+        with self.assertRaisesRegex(p.MappingError, "missing mapping: удалена зависимость пакета"):
+            p.check_removed_dependencies(
+                "apps/socks5-proxy/Cargo.toml", dev_sdk4,
+                dev_sdk4.replace('[dev-dependencies]\ntor-keymgr = "0.48"\n', ''))
+
     def test_required_results(self):
         plan = {"segments": ["fast", "rust"], "capabilities": {"real_tor_channel": True, "license_policy": False}, "full": False}
         needs = {job: {"result": "success" if any(s in plan["segments"] for s in selections) else "skipped"} for job, selections in p.RESULT_JOBS.items()}
