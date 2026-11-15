@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Изолированные проверки маршрутизации без git и cargo."""
 import importlib.util
+import io
 import os
 from pathlib import Path
 import random
@@ -668,6 +669,22 @@ jobs:
         self.assertNotIn("'regression'", blocks["stress"])
         self.assertIn("name: CI required", blocks["required"])
 
+    def test_sanctioned_dependency_removal(self):
+        old = '[dependencies]\nanyhow = { workspace = true }\ntokio = { workspace = true }\n'
+        new = '[dependencies]\ntokio = { workspace = true }\n'
+        p.check_removed_dependencies("packages/arti-wrapper/Cargo.toml", old, new)
+        with self.assertRaisesRegex(p.MappingError, "missing mapping: удалена зависимость пакета"):
+            p.check_removed_dependencies("packages/auth/Cargo.toml", old, new)
+        other = '[dependencies]\nanyhow = { workspace = true }\n'
+        with self.assertRaisesRegex(p.MappingError, "missing mapping: удалена зависимость пакета"):
+            p.check_removed_dependencies("packages/arti-wrapper/Cargo.toml", old, other)
+        dev = '[dependencies]\nanyhow = { workspace = true }\n[dev-dependencies]\ntempfile = "3"\n'
+        with self.assertRaisesRegex(p.MappingError, "missing mapping: удалена зависимость пакета"):
+            p.check_removed_dependencies("packages/arti-wrapper/Cargo.toml", dev, dev.replace('[dev-dependencies]\ntempfile = "3"\n', ''))
+        result = self.route("packages/arti-wrapper/Cargo.toml",
+                            blobs={"packages/arti-wrapper/Cargo.toml": (old, new)})
+        self.assertIn("arti-wrapper", result["packages"])
+
     def test_required_results(self):
         plan = {"segments": ["fast", "rust"], "capabilities": {"real_tor_channel": True, "license_policy": False}, "full": False}
         needs = {job: {"result": "success" if any(s in plan["segments"] for s in selections) else "skipped"} for job, selections in p.RESULT_JOBS.items()}
@@ -799,6 +816,40 @@ jobs:
             raise p.MappingError("git")
         with self.assertRaises(p.MappingError):
             p.comparison("push", "affected", "base", "head", "", failed)
+
+
+class PlannerOutput(unittest.TestCase):
+    """Вывод планировщика не зависит от кодовой страницы консоли: байты UTF-8 мимо текстового слоя."""
+
+    PAYLOAD = {"reasons": {"fast": ["всегда"], "rust": ["обратное замыкание графа"]}}
+
+    def cp1252_stream(self):
+        # Имитация Windows-канала: текстовый слой cp1252, .buffer — исходный BytesIO.
+        return io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+
+    def test_emit_plan_writes_utf8_bytes(self):
+        stream = self.cp1252_stream()
+        p.emit_plan(self.PAYLOAD, stream)
+        expected = p.json.dumps(self.PAYLOAD, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        # Точное равенство байтов гарантирует запись через .buffer: кириллица
+        # в cp1252 текстовом слое не кодируется (см. регрессию ниже).
+        self.assertEqual(stream.buffer.getvalue(), expected)
+
+    def test_emit_error_prefix_and_utf8_bytes(self):
+        for message, expected in (
+                ("команда не выполнена: git", "planner: missing mapping: команда не выполнена: git\n"),
+                ("missing mapping: неизвестное событие", "planner: missing mapping: неизвестное событие\n")):
+            with self.subTest(message=message):
+                stream = self.cp1252_stream()
+                p.emit_error(message, stream)
+                self.assertEqual(stream.buffer.getvalue(), expected.encode("utf-8"))
+
+    def test_plain_print_regresses_on_cp1252(self):
+        # Регрессия прежнего дефекта: обычный print() того же payload на cp1252
+        # поднимает UnicodeEncodeError — поэтому требуется запись в buffer.
+        stream = self.cp1252_stream()
+        with self.assertRaises(UnicodeEncodeError):
+            print(self.PAYLOAD, file=stream)
 
 
 class LockSpecification(unittest.TestCase):

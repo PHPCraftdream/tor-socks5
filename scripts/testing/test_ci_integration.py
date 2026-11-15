@@ -212,7 +212,7 @@ class External(unittest.TestCase):
                          ["ubuntu-latest", "macos-latest", "windows-latest"])
         expected_consumers = {
             "fmt": ("fast", "regression"), "line-limit": ("fast",),
-            "dir-entries": ("fast",), "publish-guard": ("fast",),
+            "dir-entries": ("fast",), "private-paths": ("fast",), "publish-guard": ("fast",),
             "packageability": ("fast",), "real-tor-channel": ("tor",),
             "rust": ("rust",), "msrv": ("msrv",), "android": ("android",),
             "docs-contract": ("docs-contract",), "installer-sh": ("installer-sh",),

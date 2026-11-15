@@ -20,14 +20,16 @@ dynamic linking against `/system/bin/linker(64)`, `for Android 21`, and
 - NDK r27c (27.2.12479018, latest 27.x LTS)
 - cargo-ndk 4.1.2
 - Rust 1.97.0 (tested environment; workspace MSRV is 1.92)
-- SDK: D:\system_artefact\android-sdk
+- SDK: machine-specific; the Android SDK root is provided via the `ANDROID_HOME` / `ANDROID_NDK_HOME` environment variables
 - Min API level: 21 (cargo-ndk default)
 
 ## Working command
 
 ```powershell
-$env:ANDROID_NDK_HOME = 'D:\system_artefact\android-sdk\ndk\27.2.12479018'
-$env:ANDROID_HOME = 'D:\system_artefact\android-sdk'
+# The SDK root is machine-specific: point ANDROID_HOME at the local SDK
+# installation and derive the NDK home from it (NDK r27c: ndk\27.2.12479018).
+$env:ANDROID_HOME = '<local Android SDK root>'
+$env:ANDROID_NDK_HOME = "$env:ANDROID_HOME\ndk\27.2.12479018"
 cargo ndk -t arm64-v8a build -p socks5-proxy --release
 ```
 
@@ -54,7 +56,7 @@ These items were the focus of this task, confirmed by compiling all 4 ABIs and E
 
 ## Artifacts note
 
-Builds land in the shared `CARGO_TARGET_DIR=D:\dev\rust\.cargo-target\<triple>\release\socks5-proxy` on this machine (global cargo config), not `target\` in the repo.
+Builds land in the shared target directory configured globally on the build machine (`CARGO_TARGET_DIR` in the global cargo config, outside the repo; per-triple binaries under `<triple>\release\socks5-proxy`), not `target\` in the repo.
 
 ## Runtime testing
 
