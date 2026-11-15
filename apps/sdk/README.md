@@ -43,6 +43,7 @@ use tor_socks5::config::Config;
 | `tor` | `tor` | `arti-wrapper` | `socks5`, `acl` |
 | `fetch` | `fetch` | `bridge-fetcher` | `tor`, `bridges` |
 | `dns` | `dns` | `tor-socks5-dns` | `tor`, `acl` |
+| `onion` | `onion` | `tor-socks5-onion` | |
 | `onion-service` | | `arti-wrapper/onion-service` | `tor` |
 | `full` | all of the above | | |
 
@@ -107,13 +108,13 @@ registry.set_proxies("alice", Hop::Post, None)?; // inherit the global pool
 
 ## What is not here
 
-The facade re-exports the libraries under `packages/`. The logic that runs
+The facade re-exports the libraries under `packages/` and `apps/sdk/crates/`. The logic that runs
 the proxy lives in the `socks5-proxy` binary and is **not** available as a
 library yet:
 
 - the proxy server (listeners, egress, pre/post pools, startup and shutdown);
 - hosting onion services (start gate, stream limits, statuses) and the
-  onion key store and vanity search; the `onion-service` feature only turns
+  onion key store; the `onion-service` feature only turns
   on the onion support of `arti-wrapper`;
 - the bridge manager (verifier, warmer, health writer, maintenance) and the
   Tor watchdog.

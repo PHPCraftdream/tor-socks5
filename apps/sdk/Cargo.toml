@@ -28,9 +28,11 @@ bridges = ["dep:bridge-probe", "dep:bridge-store", "dep:bridge-verify-core"]
 tor = ["socks5", "acl", "dep:arti-wrapper"]
 fetch = ["tor", "bridges", "dep:bridge-fetcher"]
 dns = ["tor", "acl", "dep:tor-socks5-dns"]
+# Tor-free onion address and vanity core (the CLI uses the same crate).
+onion = ["dep:tor-socks5-onion"]
 # Server-side onion services (the CLI enables the same feature).
 onion-service = ["tor", "arti-wrapper/onion-service"]
-full = ["socks5", "auth", "config", "bridges", "route", "tor", "fetch", "dns", "onion-service"]
+full = ["socks5", "auth", "config", "bridges", "route", "tor", "fetch", "dns", "onion", "onion-service"]
 
 [dependencies]
 persist-lock = { path = "../../packages/persist-lock", version = "0.2.0" }
@@ -45,6 +47,7 @@ bridge-verify-core = { path = "../../packages/bridge-verify-core", version = "0.
 arti-wrapper = { path = "../../packages/arti-wrapper", version = "0.2.0", optional = true }
 bridge-fetcher = { path = "../../packages/bridge-fetcher", version = "0.2.0", optional = true }
 tor-socks5-dns = { path = "../../packages/dns-server", version = "0.2.0", optional = true }
+tor-socks5-onion = { path = "crates/onion", version = "0.2.0", optional = true }
 
 [package.metadata.docs.rs]
 all-features = true

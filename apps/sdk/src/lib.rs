@@ -17,6 +17,7 @@
 //! | [`tor`] | `arti-wrapper` | `tor` |
 //! | [`fetch`] | `bridge-fetcher` | `fetch` |
 //! | [`dns`] | `tor-socks5-dns` | `dns` |
+//! | [`onion`] | `tor-socks5-onion` | `onion` |
 //!
 //! The `tor` feature (and `fetch`, `dns`, `onion-service`, `full`, which
 //! imply it) links Arti. Without the vendored forks of the patch-kit a
@@ -71,3 +72,7 @@ pub use ::bridge_fetcher as fetch;
 /// A local DNS resolver that asks over Tor (`tor-socks5-dns`).
 #[cfg(feature = "dns")]
 pub use ::dns_server as dns;
+
+/// v3 onion addresses and the vanity prefix search, without Tor (`tor-socks5-onion`).
+#[cfg(feature = "onion")]
+pub use ::tor_socks5_onion as onion;
