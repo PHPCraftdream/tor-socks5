@@ -46,7 +46,8 @@ use tor_socks5::config::Config;
 | `runtime` | `runtime` | `tor-socks5-runtime` | `tor`, `config`, `bridges` |
 | `onion` | `onion` | `tor-socks5-onion` | |
 | `onion-keys` | `onion` (keys) | `tor-socks5-onion/keys` | |
-| `onion-service` | | `arti-wrapper/onion-service` | `tor` |
+| `onion-service` | | `arti-wrapper/onion-service` | `tor`, `onion-host` |
+| `onion-host` | `onion` (host) | `tor-socks5-onion/host` | |
 | `full` | all of the above | | |
 
 `default = ["socks5", "auth", "config", "bridges"]`. The bridge modules work
@@ -54,7 +55,8 @@ without Tor: probing, health storage and verification do not link Arti.
 
 ## Using the Tor features
 
-`tor`, `fetch`, `dns`, `runtime`, `onion-service` and `full` link Arti; `onion-keys`
+`tor`, `fetch`, `dns`, `runtime`, `onion-service`, `onion-host` and `full` link
+Arti; `onion-keys`
 does **not** join this list (its `tor-keymgr` and `tor-hscrypto` are only
 the crypto and keystore part — no Tor client is linked). Cargo resolves
 stock Arti from crates.io unless the **final binary's or workspace's root**
@@ -137,6 +139,37 @@ let recorded = create_service(
 )?;
 println!("created {}", recorded.address);
 ```
+
+## Hosting onion services (`onion-host` feature)
+
+Behind `onion-host`, `onion::host` is the server-side hosting that used to
+live only in the binary: identity settlement, the gradual launch (at most 4
+services at a time), per-service (256) and process-wide (512) forwarded-
+stream caps, lifecycle logging and a `watch` status snapshot. The keystore
+directory and the onion services file location are explicit arguments;
+nothing prints and no process state is installed — shutdown is the
+cancellation token, and dropping the handle only cancels that token
+(`shutdown().await` additionally joins the producer). One live host per
+keystore: the keystore lock makes concurrent hosting of the same keystore
+fail loudly but non-fatally (status `Failed`/`KeystoreLockHeld`); a
+sequential restart works because a new `start()` reacquires the lock.
+
+```text
+use tor_socks5_onion::host::{OnionHost, OnionHostConfig};
+// handle: the runtime's TorHandle; token: a tokio_util CancellationToken.
+let host_handle = OnionHost::new(
+    OnionHostConfig::new(handle, keystore_dir, token)
+        .with_entries(cfg.onion_services)
+        .with_config_path(Some(config_path)),
+)
+.start();
+let status = host_handle.subscribe();          // watch::Receiver<OnionHostStatus>
+// ... in the shutdown choreography:
+host_handle.shutdown().await;
+```
+
+This feature links Arti — the patch-kit applies (see
+[Using the Tor features](#using-the-tor-features)).
 
 ## Tor client (runtime feature)
 
@@ -257,8 +290,6 @@ the proxy lives in the `socks5-proxy` binary and is **not** available as a
 library yet:
 
 - the proxy server (listeners, egress, pre/post pools, startup and shutdown);
-- hosting onion services (start gate, stream limits, statuses); the
-  `onion-service` feature only turns on the onion support of `arti-wrapper`.
 
 The bridge health writer, the guard-event observation, the bridge manager
 and the Tor client

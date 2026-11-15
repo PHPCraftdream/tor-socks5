@@ -20,11 +20,7 @@ default = ["onion-service"]
 onion-service = [
     "arti-wrapper/onion-service",
     "dep:tor-hsservice",
-    "dep:tor-hscrypto",
     "dep:tor-socks5-onion",
-    "dep:safelog",
-    "dep:tor-cell",
-    "dep:tor-proto",
 ]
 
 [dependencies]
@@ -37,7 +33,7 @@ bridge-store = { path = "../../packages/bridge-store", version = "0.2.0" }
 bridge-verify-core = { path = "../../packages/bridge-verify-core", version = "0.2.0" }
 dns-server = { path = "../../packages/dns-server", version = "0.2.0", package = "tor-socks5-dns" }
 persist-lock = { path = "../../packages/persist-lock", version = "0.2.0" }
-tor-socks5-onion = { path = "../../apps/sdk/crates/onion", version = "0.2.0", optional = true, features = ["keys"] }
+tor-socks5-onion = { path = "../../apps/sdk/crates/onion", version = "0.2.0", optional = true, features = ["keys", "host"] }
 tor-socks5-runtime = { path = "../../apps/sdk/crates/runtime", version = "0.2.0" }
 rusqlite = { workspace = true }
 proxy-config = { path = "../../packages/proxy-config", version = "0.2.0", package = "tor-socks5-config" }
@@ -45,17 +41,10 @@ socks5-proto = { path = "../../packages/socks5-proto", version = "0.2.0", packag
 tor-error.workspace = true
 lyrebird.workspace = true
 
-# Onion-service identity keystore management (tor-socks5 onion ...),
-# behind the `onion-service` feature; the key logic itself lives in the
-# tor-socks5-onion crate.
+# `commands/onion/commands.rs` builds/validates `HsNickname` values, behind
+# the `onion-service` feature; the launch/serve/status logic itself lives in
+# the tor-socks5-onion crate (its `host` feature, pulled above).
 tor-hsservice = { version = "0.48", optional = true }
-tor-hscrypto = { workspace = true, optional = true }
-safelog = { workspace = true, optional = true }
-# Relay cells (`Connected`/`End`) and `IncomingStreamRequest` for the
-# server-side onion-service forwarder. Same arti 0.48 stack as Cargo.lock;
-# optional so `--no-default-features` stays light.
-tor-cell = { version = "0.48", optional = true }
-tor-proto = { version = "0.48", optional = true }
 
 ktav.workspace = true
 service-manager.workspace = true

@@ -4,12 +4,10 @@
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "onion-service")]
-pub(crate) use ::tor_socks5_onion::keys::{lock, nickname};
+pub(crate) use ::tor_socks5_onion::keys::nickname;
 
 #[cfg(all(feature = "onion-service", test))]
-pub(crate) use ::tor_socks5_onion::keys::{
-    address, encode_key, generate, identity_file, lock_with, open,
-};
+pub(crate) use ::tor_socks5_onion::keys::{generate, identity_file, open};
 
 /// The keystore directory for a config: `<config dir>/arti-data/state/keystore`.
 ///

@@ -17,8 +17,7 @@
 //! | [`tor`] | `arti-wrapper` | `tor` |
 //! | [`fetch`] | `bridge-fetcher` | `fetch` |
 //! | [`dns`] | `tor-socks5-dns` | `dns` |
-//! | [`runtime`] | `tor-socks5-runtime` (SDK-7/8/9 surfaces) | `runtime` |
-//! | [`onion`] | `tor-socks5-onion` | `onion`, `onion-keys` |
+//! | [`onion`] | `tor-socks5-onion` | `onion`, `onion-keys`, `onion-host` |
 //! | [`runtime`] | `tor-socks5-runtime` — the curated SDK-7/8/9 surfaces, not the whole crate | `runtime` |
 //!
 //! The `tor` feature (and `fetch`, `dns`, `runtime`, `onion-service`,
@@ -82,7 +81,12 @@ pub use ::dns_server as dns;
 /// identity keys and keystore of the Arti native keystore: `onion::keys`
 /// (`create_service`, `import_identity`, `export_identity`, …), with no Tor
 /// client linked.
-#[cfg(any(feature = "onion", feature = "onion-keys"))]
+///
+/// Behind the Tor-dependent `onion-host` feature it also carries the hosted
+/// onion-service manager: `onion::host` (`OnionHost`, `OnionHostHandle`,
+/// `OnionHostStatus`), with the keystore directory and services-file path as
+/// explicit arguments and a cancellation token for shutdown.
+#[cfg(any(feature = "onion", feature = "onion-keys", feature = "onion-host"))]
 pub use ::tor_socks5_onion as onion;
 
 /// The embedded Tor runtime (`tor-socks5-runtime`, `apps/sdk/crates/runtime`),
