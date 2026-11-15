@@ -158,7 +158,7 @@ class External(unittest.TestCase):
         self.planner("--event", "push", "--mode", "sprint-full", "--head", self.head(), ok=False)
         full = self.planner("--event", "workflow_dispatch", "--mode", "sprint-full", "--head", self.head())
         self.assertTrue(full["full"])
-        self.assertEqual(full["library_packages"], ["android-ffi", "arti-wrapper", "bridge-probe", "tor-socks5-auth", "tor-socks5-client-acl", "tor-socks5-config"])
+        self.assertEqual(full["library_packages"], ["android-ffi", "arti-wrapper", "bridge-probe", "tor-socks5-auth", "tor-socks5-client-acl", "tor-socks5-config", "tor-socks5-runtime"])
         self.metadata.write_text('{}', encoding="utf-8")
         self.push(ok=False)
 
@@ -195,7 +195,7 @@ class External(unittest.TestCase):
         self.assertEqual(result["segments"], sorted(["fast", "rust", "msrv", "android", "tor", "vendor", "vendor-extra", "docs-contract", "installer-sh", "installer-windows", "release", "features", "stress", "regression", "native-portability", "vendor-notices", "required"]))
         self.assertEqual(result["command_packages"]["android"], ["android-ffi", "socks5-proxy"])
         self.assertEqual(result["shipping_packages"], ["android-ffi", "socks5-proxy"])
-        self.assertEqual(result["library_packages"], sorted(["android-ffi", "arti-wrapper", "bridge-probe", "tor-socks5-auth", "tor-socks5-client-acl", "tor-socks5-config"]))
+        self.assertEqual(result["library_packages"], sorted(["android-ffi", "arti-wrapper", "bridge-probe", "tor-socks5-auth", "tor-socks5-client-acl", "tor-socks5-config", "tor-socks5-runtime"]))
         self.assertEqual(result["native_rows"], [
             {"runner": "macos-15", "target": "aarch64-apple-darwin", "musl": False},
             {"runner": "ubuntu-latest", "target": "aarch64-linux-android", "musl": False},
