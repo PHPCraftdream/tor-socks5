@@ -67,6 +67,20 @@ rpassword = "7"
 clap = { version = "4.5", features = ["derive"] }
 service-manager = "0.11"
 
+# Onion identity keystore (tor-socks5-onion `keys`; the proxy's onion commands
+# use the same stack until its host half moves, docs/plans/sdk-coverage-plan.md SDK-4).
+tor-keymgr = "0.48"
+tor-hscrypto = "0.48"
+tor-llcrypto = "0.48"
+tor-persist = "0.48"
+# Key-specifier derive support (keys/specifier.rs of tor-socks5-onion;
+# the derive expansion requires it declared in the user crate's manifest).
+derive-deftly = "1"
+fs-mistrust = "0.16"
+safelog = "0.10"
+# Staging keystores for portable identity key files (tor-socks5-onion keys).
+tempfile = "3"
+
 # Unix-only: режим `--angel` (fork/setsid/перенаправление stdio через
 # alias angelize). Подключается только на `cfg(unix)`.
 angelize = { package = "daemonize", version = "0.5" }

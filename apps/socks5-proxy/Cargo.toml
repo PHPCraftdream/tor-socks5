@@ -20,10 +20,8 @@ default = ["onion-service"]
 onion-service = [
     "arti-wrapper/onion-service",
     "dep:tor-hsservice",
-    "dep:tor-keymgr",
     "dep:tor-hscrypto",
-    "dep:tor-llcrypto",
-    "dep:fs-mistrust",
+    "dep:tor-socks5-onion",
     "dep:safelog",
     "dep:tor-cell",
     "dep:tor-proto",
@@ -39,7 +37,7 @@ bridge-store = { path = "../../packages/bridge-store", version = "0.2.0" }
 bridge-verify-core = { path = "../../packages/bridge-verify-core", version = "0.2.0" }
 dns-server = { path = "../../packages/dns-server", version = "0.2.0", package = "tor-socks5-dns" }
 persist-lock = { path = "../../packages/persist-lock", version = "0.2.0" }
-tor-socks5-onion = { path = "../../apps/sdk/crates/onion", version = "0.2.0" }
+tor-socks5-onion = { path = "../../apps/sdk/crates/onion", version = "0.2.0", optional = true, features = ["keys"] }
 tor-socks5-runtime = { path = "../../apps/sdk/crates/runtime", version = "0.2.0" }
 rusqlite = { workspace = true }
 proxy-config = { path = "../../packages/proxy-config", version = "0.2.0", package = "tor-socks5-config" }
@@ -48,13 +46,11 @@ tor-error.workspace = true
 lyrebird.workspace = true
 
 # Onion-service identity keystore management (tor-socks5 onion ...),
-# behind the `onion-service` feature.
+# behind the `onion-service` feature; the key logic itself lives in the
+# tor-socks5-onion crate.
 tor-hsservice = { version = "0.48", optional = true }
-tor-keymgr = { version = "0.48", optional = true }
-tor-hscrypto = { version = "0.48", optional = true }
-tor-llcrypto = { version = "0.48", optional = true }
-fs-mistrust = { version = "0.16", optional = true }
-safelog = { version = "0.10", optional = true }
+tor-hscrypto = { workspace = true, optional = true }
+safelog = { workspace = true, optional = true }
 # Relay cells (`Connected`/`End`) and `IncomingStreamRequest` for the
 # server-side onion-service forwarder. Same arti 0.48 stack as Cargo.lock;
 # optional so `--no-default-features` stays light.
@@ -65,7 +61,7 @@ ktav.workspace = true
 service-manager.workspace = true
 serde.workspace = true
 serde_json = "1"
-tempfile = "3"
+tempfile = { workspace = true }
 indexmap.workspace = true
 time.workspace = true
 clap.workspace = true
@@ -75,16 +71,6 @@ rustls.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 futures.workspace = true
-
-# Keystore BASE64 (store.rs). The address/vanity math moved to the
-# tor-socks5-onion crate; these declarations stay until their last consumer
-# moves there too (docs/plans/sdk-coverage-plan.md, SDK-4/SDK-5).
-data-encoding = "2.11.0"
-# hazmat exposes ExpandedSecretKey; it used to be enabled only through tor-llcrypto.
-ed25519-dalek = { version = "2.2.0", features = ["hazmat"] }
-sha2 = "0.10.9"
-sha3 = "0.10.9"
-zeroize = "1.9.1"
 
 anyhow.workspace = true
 thiserror.workspace = true
@@ -100,6 +86,9 @@ tracing-appender.workspace = true
 criterion.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tor-socks5-runtime = { path = "../../apps/sdk/crates/runtime", version = "0.2.0", features = ["test-seams"] }
+# `fresh_identity` (R10: the test-seams feature is enabled only by a
+# dev-dependency on tor-socks5-onion).
+tor-socks5-onion = { path = "../../apps/sdk/crates/onion", version = "0.2.0", features = ["keys", "test-seams"] }
 
 [[bench]]
 name = "socks5_bench"

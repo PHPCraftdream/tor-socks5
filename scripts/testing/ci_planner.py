@@ -25,7 +25,18 @@ LICENSE_POLICY_FILES = (".github/deny.toml",)
 # с удалённым заданием в JOB_SEGMENTS): запись остаётся, пока из старых баз
 # возможен diff с этим удалением.
 SANCTIONED_DEPENDENCY_REMOVALS = frozenset({
-    ("packages/arti-wrapper/Cargo.toml", "dependencies", "anyhow")})
+    ("packages/arti-wrapper/Cargo.toml", "dependencies", "anyhow"),
+    # SDK-4: onion keystore/identity code moved to tor-socks5-onion
+    # (apps/sdk/crates/onion); the binary no longer links these directly.
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "data-encoding"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "ed25519-dalek"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "sha2"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "sha3"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "zeroize"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "fs-mistrust"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "tor-keymgr"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "tor-llcrypto"),
+})
 
 
 TOR_ANCHORS = ("scripts/testing/real-tor-channel.sh", "scripts/testing/real-tor-mutations.sh",
