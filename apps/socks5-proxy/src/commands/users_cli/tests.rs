@@ -1,4 +1,6 @@
 use super::*;
+use auth::{compute_hash, verify_hash, User, INIT_SENTINEL};
+use proxy_config::{PoolOverride, Socks5Endpoint};
 
 #[test]
 fn run_uses_effective_config_path() {

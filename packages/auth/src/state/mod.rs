@@ -50,7 +50,7 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
 use crate::compute_hash::{compute_hash, verify_hash};
-use crate::users_config::UsersConfig;
+use crate::registry::UsersConfig;
 
 type HmacSha256 = Hmac<Sha256>;
 

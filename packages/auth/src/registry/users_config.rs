@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::user::User;
+use super::user::User;
 
 const DEFAULT_FILE: &str = "tor-socks5.users.ktav";
 

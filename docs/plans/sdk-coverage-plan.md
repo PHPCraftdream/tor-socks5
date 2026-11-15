@@ -118,7 +118,7 @@ L3  tor-socks5-server    listen, egress, запуск, остановка, DNS-�
 | 7 | SDK-8 (#483), SDK-10 (#485) | мосты и fetch_merge; выход и маршрутизация, pre-владельцы | SDK-6, SDK-7, SDK-9 |
 | 8 | SDK-5 (#480) | хостинг onion: гейт, лимиты, статусы | SDK-4, SDK-9 |
 | 9 | SDK-11 (#486) | `tor-socks5-server`: `ServerHandle` | SDK-5, SDK-8, SDK-9, SDK-10 |
-| 10 | SDK-12 (#487) | пользователи и `config migrate` как API без prompt | SDK-1 |
+| 10 | SDK-12 (#487) | пользователи как API без prompt (`auth::Registry`); `config migrate` уже была библиотекой (`proxy_config::migrate_config`), в CLI осталась только печать | SDK-1 |
 | 11 | SDK-13 (#488) | `android-ffi` на общий рантайм | SDK-11, D3 |
 | 12 | SDK-14 (#489) | примеры, матрица фич в CI, итог в README фасада | SDK-11, SDK-12 |
 

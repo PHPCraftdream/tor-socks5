@@ -85,6 +85,26 @@ let settings = Settings {
 };
 ```
 
+## Accounts and config migration
+
+With `auth`, `auth::Registry` edits the users file the way the `users`
+command does. Each call is one transaction (the registry lock, bounded wait,
+atomic save); nothing prompts or prints, so the password is an argument. With
+`config`, `config::migrate_config` converts a config in the old layout to the
+current one.
+
+```rust
+use tor_socks5::auth::{Hop, NewUser, Registry, UsersConfig};
+
+let registry = Registry::new(UsersConfig::resolve_path(None));
+registry.add(
+    NewUser { name: "alice".into(), ..NewUser::default() },
+    "alice-pass",
+)?;
+registry.set_onion("alice", true)?;
+registry.set_proxies("alice", Hop::Post, None)?; // inherit the global pool
+```
+
 ## What is not here
 
 The facade re-exports the libraries under `packages/`. The logic that runs
@@ -96,8 +116,7 @@ library yet:
   onion key store and vanity search; the `onion-service` feature only turns
   on the onion support of `arti-wrapper`;
 - the bridge manager (verifier, warmer, health writer, maintenance) and the
-  Tor watchdog;
-- the `users` and `config migrate` actions.
+  Tor watchdog.
 
 To use these today, run the binary. Taking them into library crates is
 planned in [`docs/plans/sdk-coverage-plan.md`](../../docs/plans/sdk-coverage-plan.md).

@@ -1,6 +1,6 @@
 use super::*;
 use crate::compute_hash::compute_hash;
-use crate::user::User;
+use crate::registry::User;
 
 fn mk_user(name: &str, password: &str, enabled: bool) -> User {
     User {

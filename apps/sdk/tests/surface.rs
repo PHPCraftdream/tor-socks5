@@ -35,12 +35,15 @@ fn route_module() {
 #[test]
 fn auth_module() {
     assert!(names::<tor_socks5::auth::AuthState>().contains("AuthState"));
+    assert!(names::<tor_socks5::auth::Registry>().contains("Registry"));
 }
 
 #[cfg(feature = "config")]
 #[test]
 fn config_module() {
     assert!(names::<tor_socks5::config::Config>().contains("Config"));
+    // `config migrate` is the library function; the CLI only prints.
+    let _ = tor_socks5::config::migrate_config;
 }
 
 #[cfg(feature = "bridges")]
