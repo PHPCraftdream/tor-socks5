@@ -1,17 +1,8 @@
-//! Two-layered process lifetime management.
-//!
-//! * [`bind_child_processes_to_self`] is called once at startup. On Windows
-//!   it puts our process into a Job Object with `KILL_ON_JOB_CLOSE`, so
-//!   every child arti spawns (the lyrebird PT) is destroyed when we exit
-//!   — clean exit, panic, `taskkill /F`, OS shutdown, all the same. This
-//!   is the safety net for unclean termination.
-//!
-//! * [`wait_for_signal`] resolves on the first Ctrl+C (and on Windows also
-//!   on Ctrl+Break). The caller uses it in a `tokio::select!` to break
-//!   out of the accept loop. Combined with explicit `drop` of the
-//!   `TorTunnel` it lets arti tear PTs down cleanly and release its
-//!   state-directory lock — so the *next* run doesn't see "another
-//!   instance has the lock".
+//! Process lifetime safety net: [`bind_child_processes_to_self`] is called
+//! once at startup. On Windows it puts our process into a Job Object with
+//! `KILL_ON_JOB_CLOSE`, so every child arti spawns (the lyrebird PT) is
+//! destroyed when we exit — clean exit, panic, `taskkill /F`, OS shutdown,
+//! all the same. This is the safety net for unclean termination.
 
 /// Install OS-level guarantees that our child processes do not outlive us.
 /// Safe to call multiple times; failures are logged and tolerated (the
@@ -82,58 +73,4 @@ pub fn bind_child_processes_to_self() {
 pub fn bind_child_processes_to_self() {
     // TODO: prctl(PR_SET_PDEATHSIG) on Linux, posix_spawn flags elsewhere.
     // Not currently a supported target.
-}
-
-/// Resolve when the user asks us to stop. Returns the human-readable name
-/// of the signal observed.
-#[cfg(windows)]
-pub async fn wait_for_signal() -> &'static str {
-    use tokio::signal::windows::{ctrl_break, ctrl_c};
-    let mut c_c = match ctrl_c() {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not register Ctrl+C handler — falling back to no signal");
-            std::future::pending::<()>().await;
-            unreachable!();
-        }
-    };
-    let mut c_break = match ctrl_break() {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not register Ctrl+Break handler");
-            // We still want Ctrl+C to work.
-            c_c.recv().await;
-            return "Ctrl+C";
-        }
-    };
-
-    tokio::select! {
-        _ = c_c.recv() => "Ctrl+C",
-        _ = c_break.recv() => "Ctrl+Break",
-    }
-}
-
-#[cfg(not(windows))]
-pub async fn wait_for_signal() -> &'static str {
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut sigint = match signal(SignalKind::interrupt()) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not register SIGINT handler");
-            std::future::pending::<()>().await;
-            unreachable!();
-        }
-    };
-    let mut sigterm = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not register SIGTERM handler");
-            sigint.recv().await;
-            return "SIGINT";
-        }
-    };
-    tokio::select! {
-        _ = sigint.recv() => "SIGINT",
-        _ = sigterm.recv() => "SIGTERM",
-    }
 }

@@ -259,14 +259,12 @@ pub mod windows_runtime {
         let shutdown = async move {
             notify.notified().await;
         };
-        let result = runtime.block_on(crate::server::run_server(
-            crate::server::ServerArgs {
-                config_override: config_from_image_args(),
-                upstream_addr: None,
-                upstream_user: None,
-                upstream_pass: None,
-                no_upstream: false,
-            },
+        let result = runtime.block_on(crate::process::run_server_process(
+            config_from_image_args(),
+            None,
+            None,
+            None,
+            false,
             shutdown,
         ));
         match result {
