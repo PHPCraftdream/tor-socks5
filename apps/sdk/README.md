@@ -63,8 +63,44 @@ Check the result with `cargo tree -i tor-dirclient`: the source must be this
 repository's git URL, not `crates.io`. Nothing in the facade can detect a
 missing patch, so this check is yours to make.
 
+## Tor client settings
+
+With `tor` and `config`, the circuit knobs of the config file are plain
+fields on both sides: `tor.circuit_hops` and `tor.guard_spread` in
+`config::Config`, and `circuit_hops`, `service_circuit_hops` and
+`guard_spread` in `tor::Settings`. `guard_spread` (1..=3, default 1) is how
+many primary guards (bridges) the client circuits spread over; the default is
+stock Arti behavior. Raise it only to isolate the failure of one bridge, and
+note that more bridges then see your traffic (see
+[Many services](../../docs/guide/ops/onion-service.md) for what was measured).
+
+```rust
+use tor_socks5::config::Config;
+use tor_socks5::tor::Settings;
+
+let cfg = Config::default();
+let settings = Settings {
+    guard_spread: cfg.tor.guard_spread,
+    ..Settings::default()
+};
+```
+
 ## What is not here
 
-The `socks5-proxy` binary, the Android `cdylib` and `pt-helper` are not
-libraries and stay out of the facade. The vendored crates are never exposed
-through it.
+The facade re-exports the libraries under `packages/`. The logic that runs
+the proxy lives in the `socks5-proxy` binary and is **not** available as a
+library yet:
+
+- the proxy server (listeners, egress, pre/post pools, startup and shutdown);
+- hosting onion services (start gate, stream limits, statuses) and the
+  onion key store and vanity search; the `onion-service` feature only turns
+  on the onion support of `arti-wrapper`;
+- the bridge manager (verifier, warmer, health writer, maintenance) and the
+  Tor watchdog;
+- the `users` and `config migrate` actions.
+
+To use these today, run the binary. Taking them into library crates is
+planned in [`docs/plans/sdk-coverage-plan.md`](../../docs/plans/sdk-coverage-plan.md).
+Also outside the facade by design: the Android `cdylib`, `pt-helper`, the OS
+service installer and the command-line parser. The vendored crates are never
+exposed through it.

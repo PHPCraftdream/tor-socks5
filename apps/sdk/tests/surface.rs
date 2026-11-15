@@ -58,6 +58,25 @@ fn tor_module() {
     assert!(names::<tor_socks5::tor::Settings>().contains("Settings"));
 }
 
+/// The circuit knobs reach the SDK user as plain fields, with the stock
+/// defaults: one guard, three-hop onion circuits.
+#[cfg(feature = "tor")]
+#[test]
+fn tor_settings_carry_the_circuit_knobs() {
+    let settings = tor_socks5::tor::Settings::default();
+    assert_eq!(settings.guard_spread, 1);
+    assert_eq!(settings.circuit_hops, 3);
+}
+
+/// The config file side of the same knobs.
+#[cfg(feature = "config")]
+#[test]
+fn config_carries_the_circuit_knobs() {
+    let cfg = tor_socks5::config::Config::default();
+    assert_eq!(cfg.tor.guard_spread, 1);
+    assert_eq!(cfg.tor.circuit_hops, 3);
+}
+
 #[cfg(feature = "fetch")]
 #[test]
 fn fetch_module() {
