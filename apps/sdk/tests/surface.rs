@@ -100,6 +100,17 @@ fn onion_module() {
     let _ = tor_socks5::onion::vanity::search;
 }
 
+/// The keys are available without the `onion` feature too: `onion-keys`
+/// alone links the keystore part of the crate, no Tor client.
+#[cfg(feature = "onion-keys")]
+#[test]
+fn onion_keys_module() {
+    assert!(names::<tor_socks5::onion::keys::KeysError>().contains("KeysError"));
+    assert!(names::<tor_socks5::onion::keys::NewIdentity>().contains("NewIdentity"));
+    let _ = tor_socks5::onion::keys::create_service;
+    let _ = tor_socks5::onion::keys::prepare_all;
+}
+
 /// One type is the same through every path that reaches it: the facade
 /// re-exports the crates, it does not wrap them.
 #[cfg(all(feature = "config", feature = "auth"))]

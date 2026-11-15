@@ -1,9 +1,8 @@
-//! Onion-service helpers: the address re-exports (always built) plus the key
-//! store, CLI commands and the vanity CLI shell (behind the `onion-service`
-//! feature). The address math and the search core live in the
-//! `tor-socks5-onion` crate.
+//! Onion-service helpers: the keystore directory of a config, the identity
+//! settlement re-export, the CLI commands and the vanity CLI shell (behind
+//! the `onion-service` feature). The keystore/identity logic and the address
+//! math live in the `tor-socks5-onion` crate.
 
-pub(crate) mod address;
 #[cfg(feature = "onion-service")]
 pub(crate) mod commands;
 #[cfg(feature = "onion-service")]

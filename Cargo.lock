@@ -5479,9 +5479,6 @@ dependencies = [
  "clap",
  "criterion",
  "daemonize",
- "data-encoding",
- "ed25519-dalek 2.2.0",
- "fs-mistrust",
  "futures",
  "getrandom 0.2.17",
  "indexmap 2.14.0",
@@ -5497,8 +5494,6 @@ dependencies = [
  "serde",
  "serde_json",
  "service-manager",
- "sha2 0.10.9",
- "sha3 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "time",
@@ -5508,8 +5503,6 @@ dependencies = [
  "tor-error",
  "tor-hscrypto",
  "tor-hsservice",
- "tor-keymgr",
- "tor-llcrypto",
  "tor-proto",
  "tor-socks5-auth",
  "tor-socks5-config",
@@ -5522,7 +5515,6 @@ dependencies = [
  "tracing-subscriber",
  "windows-service",
  "windows-sys 0.61.2",
- "zeroize",
 ]
 
 [[package]]
@@ -7413,12 +7405,24 @@ dependencies = [
 name = "tor-socks5-onion"
 version = "0.2.0"
 dependencies = [
+ "anyhow",
  "data-encoding",
+ "derive-deftly",
  "ed25519-dalek 2.2.0",
+ "fs-mistrust",
  "getrandom 0.2.17",
+ "persist-lock",
+ "safelog",
  "sha2 0.10.9",
  "sha3 0.10.9",
+ "tempfile",
  "thiserror 2.0.18",
+ "tor-hscrypto",
+ "tor-keymgr",
+ "tor-llcrypto",
+ "tor-persist",
+ "tor-socks5-config",
+ "tracing",
  "zeroize",
 ]
 

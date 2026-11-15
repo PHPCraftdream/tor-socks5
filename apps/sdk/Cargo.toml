@@ -32,7 +32,12 @@ dns = ["tor", "acl", "dep:tor-socks5-dns"]
 onion = ["dep:tor-socks5-onion"]
 # Server-side onion services (the CLI enables the same feature).
 onion-service = ["tor", "arti-wrapper/onion-service"]
-full = ["socks5", "auth", "config", "bridges", "route", "tor", "fetch", "dns", "onion", "onion-service"]
+# Onion service identity keys via the Arti native keystore (tor-keymgr +
+# tor-hscrypto only: no Tor client, no patch-kit). The keystore directory is
+# an explicit argument; printing, prompting and confirmations stay with the
+# application.
+onion-keys = ["dep:tor-socks5-onion", "tor-socks5-onion/keys"]
+full = ["socks5", "auth", "config", "bridges", "route", "tor", "fetch", "dns", "onion", "onion-keys", "onion-service"]
 
 [dependencies]
 persist-lock = { path = "../../packages/persist-lock", version = "0.2.0" }
