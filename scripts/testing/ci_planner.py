@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Детерминированный план CI; ошибки входных данных не превращаются в FULL."""
 import argparse
+import fnmatch
 import json
 import re
 import subprocess
@@ -316,8 +317,18 @@ def manifest_seeds(old, new, graph):
                     if remaining:
                         raise MappingError("missing mapping: удалён член workspace")
                     for member in additions:
-                        if not isinstance(member, str) or not member or any(char in member for char in "*?[]{}"):
+                        if not isinstance(member, str) or not member or any(char in member for char in "?[]{}"):
                             raise MappingError("missing mapping: неоднозначный член workspace: " + str(member))
+                        if "*" in member:
+                            # Глоб-член (например "apps/sdk/crates/*") не сопоставляется
+                            # одному пути: он засеивает все члены workspace, попадающие
+                            # в шаблон; пустой шаблон остаётся ошибкой.
+                            matches = {ident for ident in graph.members
+                                       if fnmatch.fnmatchcase(graph.paths.get(ident, ""), member)}
+                            if not matches:
+                                raise MappingError("missing mapping: член workspace отсутствует или неоднозначен: " + member)
+                            seeds |= matches
+                            continue
                         path = Path(member)
                         if (path.is_absolute() or re.match(r"^[A-Za-z]:", member) or ".." in path.parts or
                                 "\\" in member):

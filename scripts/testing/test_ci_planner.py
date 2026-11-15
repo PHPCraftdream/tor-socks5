@@ -184,22 +184,35 @@ class Routing(unittest.TestCase):
         self.assertIsNone(combined["full_trigger"])
         self.assertEqual(combined["packages"], ["pt-helper", "socks5-proxy", "tor-ptmgr"])
         self.assertNotIn("bridge-probe", combined["packages"])
+        glob_new = old.replace('"apps/*"]', '"apps/*", "apps/sdk/crates/*"]')
+        glob_graph = lock_graph(extra_members=(
+            ("tor-onion", "tor-socks5-onion", "0.2.0", None, "apps/sdk/crates/onion", "lib"),))
+        self.assertEqual(p.manifest_seeds(old, glob_new, glob_graph), {"tor-onion"})
+        glob_result = p.plan(glob_graph, ["Cargo.toml"], lambda path: (old, glob_new))
+        self.assertEqual(glob_result["packages"], ["tor-socks5-onion"])
+        self.assertIn("rust", glob_result["segments"])
+        self.assertIn("msrv", glob_result["segments"])
+        multi_graph = lock_graph(extra_members=(
+            ("tor-onion", "tor-socks5-onion", "0.2.0", None, "apps/sdk/crates/onion", "lib"),
+            ("tor-runtime", "tor-socks5-runtime", "0.2.0", None, "apps/sdk/crates/runtime", "lib")))
+        self.assertEqual(p.manifest_seeds(old, glob_new, multi_graph),
+                         {"tor-onion", "tor-runtime"})
         for invalid_old, invalid_new in (
                 (new, old),
-                (old, old.replace('"apps/*"]', '"apps/*", "vendor/*"]')),
+                (old, old.replace('"apps/*"]', '"apps/*", "nowhere/*"]')),
                 (old, old.replace('"apps/*"]', '"apps/*", "../outside"]')),
                 (old, old.replace('"apps/*"]', '"apps/*", "/absolute/member"]')),
                 (old, old.replace('"apps/*"]', '"apps/*", "vendor/missing"]')),
                 (old, old.replace('"apps/*"]', '"apps/*", "vendor\\\\tor-ptmgr"]')),
                 (old, old.replace('"apps/*"]', '"apps/*", "C:/outside/member"]')),
-                (old.replace('"packages/*", ', ''), new)):
+                (new, new.replace('"packages/*", ', ''))):
             with self.subTest(member=invalid_new), self.assertRaisesRegex(p.MappingError, "missing mapping"):
                 p.manifest_seeds(invalid_old, invalid_new, graph)
         duplicate_member = old.replace('"apps/*"]', '"apps/*", "vendor/tor-ptmgr", "vendor/tor-ptmgr"]')
         with self.assertRaisesRegex(p.MappingError, "missing mapping"):
             p.manifest_seeds(old, duplicate_member, graph)
         with self.assertRaisesRegex(p.MappingError, "missing mapping"):
-            p.manifest_seeds(old.replace('"packages/*", ', ''), new, graph)
+            p.manifest_seeds(new, new.replace('"packages/*", ', ''), graph)
         ambiguous_graph = lock_graph(extra_members=(
             ("tor-ptmgr-a", "tor-ptmgr", "0.47.0", None, "vendor/tor-ptmgr", "lib"),
             ("tor-ptmgr-b", "tor-ptmgr", "0.47.0", None, "vendor/tor-ptmgr", "lib")))

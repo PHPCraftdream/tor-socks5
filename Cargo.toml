@@ -5,6 +5,7 @@ members = [
     "packages/proxy-config/client-acl",
     "packages/proxy-config/route-pool",
     "apps/*",
+    "apps/sdk/crates/*",
     "vendor/saturating-time",
     "vendor/arti-client",
     "vendor/tor-circmgr",
@@ -53,6 +54,12 @@ time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 
 argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
 sha2 = "0.10"
+sha3 = "0.10.9"
+# Onion address and vanity math (tor-socks5-onion).
+data-encoding = "2.11.0"
+# hazmat exposes ExpandedSecretKey; it used to be enabled only through tor-llcrypto.
+ed25519-dalek = { version = "2.2.0", features = ["hazmat"] }
+zeroize = "1.9.1"
 hmac = "0.12"
 subtle = "2.6"
 dashmap = "6"

@@ -92,6 +92,14 @@ fn dns_module() {
     assert!(names::<tor_socks5::dns::DohProvider>().contains("DohProvider"));
 }
 
+#[cfg(feature = "onion")]
+#[test]
+fn onion_module() {
+    assert!(names::<tor_socks5::onion::address::Keypair>().contains("Keypair"));
+    let _ = tor_socks5::onion::address::parse_onion_address;
+    let _ = tor_socks5::onion::vanity::search;
+}
+
 /// One type is the same through every path that reaches it: the facade
 /// re-exports the crates, it does not wrap them.
 #[cfg(all(feature = "config", feature = "auth"))]

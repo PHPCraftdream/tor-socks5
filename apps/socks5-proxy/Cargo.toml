@@ -39,6 +39,7 @@ bridge-store = { path = "../../packages/bridge-store", version = "0.2.0" }
 bridge-verify-core = { path = "../../packages/bridge-verify-core", version = "0.2.0" }
 dns-server = { path = "../../packages/dns-server", version = "0.2.0", package = "tor-socks5-dns" }
 persist-lock = { path = "../../packages/persist-lock", version = "0.2.0" }
+tor-socks5-onion = { path = "../../apps/sdk/crates/onion", version = "0.2.0" }
 rusqlite = { workspace = true }
 proxy-config = { path = "../../packages/proxy-config", version = "0.2.0", package = "tor-socks5-config" }
 socks5-proto = { path = "../../packages/socks5-proto", version = "0.2.0", package = "tor-socks5-proto" }
@@ -74,7 +75,9 @@ tokio.workspace = true
 tokio-util.workspace = true
 futures.workspace = true
 
-# Vanity v3 onion address generation (see src/onion/).
+# Keystore BASE64 (store.rs). The address/vanity math moved to the
+# tor-socks5-onion crate; these declarations stay until their last consumer
+# moves there too (docs/plans/sdk-coverage-plan.md, SDK-4/SDK-5).
 data-encoding = "2.11.0"
 # hazmat exposes ExpandedSecretKey; it used to be enabled only through tor-llcrypto.
 ed25519-dalek = { version = "2.2.0", features = ["hazmat"] }
