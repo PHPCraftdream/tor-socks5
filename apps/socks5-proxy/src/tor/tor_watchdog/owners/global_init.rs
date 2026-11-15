@@ -33,7 +33,8 @@ tokio::task_local! {
 #[cfg(test)]
 pub(super) struct ShutdownHook {
     pub settings: Settings,
-    pub writer: tor_socks5_runtime::bridge_store_writer::StoreWriter,
+    /// `None` отдаёт запись настоящему процессному слоту `WRITER`.
+    pub writer: Option<tor_socks5_runtime::bridge_store_writer::StoreWriter>,
     pub ready: StdMutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
@@ -59,7 +60,11 @@ pub(super) fn server_ready() {
 
 pub(super) fn init_store_writer(path: Option<&std::path::Path>) {
     #[cfg(test)]
-    if RUN_SERVER_STARTUP.try_with(|_| ()).is_ok() || RUN_SERVER_SHUTDOWN.try_with(|_| ()).is_ok() {
+    if RUN_SERVER_STARTUP.try_with(|_| ()).is_ok()
+        || RUN_SERVER_SHUTDOWN
+            .try_with(|hook| hook.writer.is_some())
+            .unwrap_or(false)
+    {
         return;
     }
     tor_socks5_runtime::bridge_store_writer::init_global(path);
@@ -67,7 +72,7 @@ pub(super) fn init_store_writer(path: Option<&std::path::Path>) {
 
 pub(super) async fn close_store_writer() -> Option<Result<()>> {
     #[cfg(test)]
-    if let Ok(writer) = RUN_SERVER_SHUTDOWN.try_with(|hook| hook.writer.clone()) {
+    if let Ok(Some(writer)) = RUN_SERVER_SHUTDOWN.try_with(|hook| hook.writer.clone()) {
         return Some(writer.close().await);
     }
     #[cfg(test)]

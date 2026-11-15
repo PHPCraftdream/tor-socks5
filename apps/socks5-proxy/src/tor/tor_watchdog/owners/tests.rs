@@ -380,3 +380,159 @@ mod pre_policy_tests {
         assert!(validate_pre_compatibility(true, false, false, false).is_ok());
     }
 }
+
+// D5: один живой экземпляр на процесс, последовательный перезапуск работает.
+// Сеть Tor подменена хуком `RUN_SERVER_SHUTDOWN` (туннель не загружается), всё
+// остальное — настоящий `run_server`: привязка портов, процессные слоты, остановка.
+mod restart_tests {
+    use super::super::super::handlers::HandlerTasks;
+    use super::super::super::{global_init, producers, run_server, ServerArgs};
+    use super::super::storage::quarantine_held;
+    use super::*;
+    use tor_socks5_runtime::{bridge_store_writer, workers};
+
+    #[derive(Debug, PartialEq)]
+    struct Slots {
+        settings: bool,
+        global_init: bool,
+        producers: bool,
+        handlers: bool,
+        registry: bool,
+        writer: bool,
+        workers_busy: usize,
+        quarantine: usize,
+    }
+
+    async fn slots() -> Slots {
+        Slots {
+            settings: global_init::startup_snapshot(false).0,
+            global_init: global_init::startup_snapshot(true).0,
+            producers: producers::ProducerTasks::is_retained(),
+            handlers: HandlerTasks::retained().is_some(),
+            registry: OwnerRegistry::is_retained(),
+            writer: !bridge_store_writer::global_is_idle(),
+            workers_busy: workers::global_busy_count().await,
+            quarantine: quarantine_held(),
+        }
+    }
+
+    fn free(quarantine: usize) -> Slots {
+        Slots {
+            settings: false,
+            global_init: false,
+            producers: false,
+            handlers: false,
+            registry: false,
+            writer: false,
+            workers_busy: 0,
+            quarantine,
+        }
+    }
+
+    /// Один полный запуск: до основного цикла, проверка занятых слотов, остановка.
+    async fn run_once(dir: &std::path::Path, port: u16, upstream: bool) -> (Slots, Result<()>) {
+        let cfg = crate::config::Config {
+            listen: vec![format!("127.0.0.1:{port}")],
+            ..Default::default()
+        };
+        let path = dir.join("server.ktav");
+        std::fs::write(&path, ktav::to_string(&cfg).unwrap()).unwrap();
+        let (config_path, config) =
+            match crate::config::Config::load_with_override(Some(&path)).unwrap() {
+                crate::config::Loaded::FromFile { path, config } => (Some(path), config),
+                crate::config::Loaded::Defaults(config) => (None, config),
+            };
+        let settings = Settings {
+            bridges: vec!["192.0.2.1:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01"
+                .parse()
+                .unwrap()],
+            state_dir: Some(dir.join("state")),
+            ..Default::default()
+        };
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let hook = Arc::new(global_init::ShutdownHook {
+            settings,
+            writer: None,
+            ready: std::sync::Mutex::new(Some(ready_tx)),
+        });
+        let args = ServerArgs {
+            config,
+            config_path,
+            obs_sink: tor_socks5_runtime::arti_observability::ObservationSink::new(),
+            upstream_addr: upstream.then(|| "127.0.0.1:1".to_string()),
+            upstream_user: None,
+            upstream_pass: None,
+            no_upstream: false,
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = global_init::RUN_SERVER_SHUTDOWN.scope(hook, async {
+            run_server(args, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+        });
+        let trigger = async {
+            ready_rx.await.expect("сервер не достиг основного цикла");
+            let running = slots().await;
+            // Настоящий блокирующий работник в процессном реестре: остановка обязана его дождаться.
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let worker = tokio::spawn(workers::run_fallible_blocking(move || {
+                let _ = release_rx.recv();
+                Ok(())
+            }));
+            while workers::global_busy_count().await == 0 {
+                tokio::task::yield_now().await;
+            }
+            shutdown_tx.send(()).unwrap();
+            release_tx.send(()).unwrap();
+            worker.await.unwrap().unwrap().unwrap();
+            running
+        };
+        let (result, running) = tokio::join!(server, trigger);
+        (running, result)
+    }
+
+    async fn restart_twice(upstream: bool) {
+        let _serial = TEST_LIFECYCLE.lock().await;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let quarantine = quarantine_held();
+        assert_eq!(slots().await, free(quarantine), "слоты заняты до запуска");
+        // Слот писателя и реестр владельцев занимает только Tor-ветка.
+        let expected_running = Slots {
+            producers: true,
+            handlers: true,
+            registry: !upstream,
+            writer: !upstream,
+            ..free(quarantine)
+        };
+        tokio::time::timeout(Duration::from_secs(120), async {
+            for run in 1..=2 {
+                let (running, result) = run_once(dir.path(), port, upstream).await;
+                result.unwrap_or_else(|error| panic!("запуск {run} завершился ошибкой: {error:#}"));
+                assert_eq!(running, expected_running, "запуск {run}: слоты в цикле");
+                assert_eq!(
+                    slots().await,
+                    free(quarantine),
+                    "слоты остались занятыми после остановки запуска {run}"
+                );
+            }
+        })
+        .await
+        .expect("тайм-аут перезапуска сервера");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn server_restart_in_one_process_frees_and_retakes_tor_slots() {
+        restart_twice(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn server_restart_in_one_process_frees_and_retakes_upstream_slots() {
+        restart_twice(true).await;
+    }
+}

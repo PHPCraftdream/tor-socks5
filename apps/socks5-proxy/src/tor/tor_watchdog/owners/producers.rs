@@ -87,6 +87,11 @@ impl ProducerTasks {
     }
 
     #[cfg(test)]
+    pub(super) fn is_retained() -> bool {
+        RETAINED.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
+    #[cfg(test)]
     pub(super) fn for_test(token: CancellationToken) -> Arc<Self> {
         Arc::new(Self {
             token,
