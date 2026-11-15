@@ -45,7 +45,7 @@ fn restricted_owner_settings_with_override(
         bail!("pre_proxies requires at least one explicitly configured usable bridge");
     }
     let needs_pt = bridges.iter().any(|b| b.transport.is_some());
-    let override_path = pt_binary_override_from(pt_override);
+    let override_path = crate::pt::pt_binary_override_from(pt_override);
     let pt_binary = if needs_pt {
         Some(match &override_path {
             Some(path) => path.clone(),

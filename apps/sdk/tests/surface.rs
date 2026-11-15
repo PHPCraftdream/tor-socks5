@@ -131,6 +131,23 @@ fn shared_types_are_not_duplicated() {
     same(&from_acl, &from_auth);
 }
 
+#[cfg(feature = "runtime")]
+#[test]
+fn runtime_module_tor_client_surface() {
+    assert!(names::<tor_socks5::runtime::tor_watchdog::TorHandle>().contains("TorHandle"));
+    assert!(names::<tor_socks5::runtime::tor_watchdog::TorHealth>().contains("TorHealth"));
+    assert!(names::<tor_socks5::runtime::tor_watchdog::WatchdogStatus>().contains("WatchdogStatus"));
+    assert!(
+        names::<tor_socks5::runtime::conn_health::ConnHealthSnapshot>()
+            .contains("ConnHealthSnapshot")
+    );
+    assert!(names::<tor_socks5::runtime::pt::PtBinary>().contains("PtBinary"));
+    let _ = tor_socks5::runtime::tor_setup::build_tor_settings;
+    let _ = tor_socks5::runtime::tor_setup::build_tor_settings_with_pt;
+    let _ = tor_socks5::runtime::tor_watchdog::spawn_tor_watchdog;
+    let _ = tor_socks5::runtime::conn_health::spawn_conn_health_logger;
+}
+
 /// The SDK-7 runtime surface: the bridge-health writer and the
 /// guard-event observation layer for the application's own subscriber.
 #[cfg(feature = "runtime")]

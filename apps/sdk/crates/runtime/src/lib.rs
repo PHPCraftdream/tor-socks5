@@ -1,6 +1,9 @@
 //! The runtime module tree of the socks5-proxy binary, moved verbatim into
-//! this crate (SDK-6; docs/plans/sdk-coverage-plan.md). The public surface is
-//! minimal until the API steps SDK-7/8/9 open it up.
+//! this crate (SDK-6; docs/plans/sdk-coverage-plan.md). The Tor-client API
+//! step SDK-9 is open: `tor_setup`, `pt` and the watchdog
+//! status/handle surface (see the README's "Tor client API (SDK-9)"). Bridge
+//! health writing/observation (SDK-7) and the bridge manager (SDK-8) are
+//! still closed.
 //!
 //! The `test-seams` feature (dev-only, enabled by consumers' dev-dependencies,
 //! R10) exposes the `test_seams` module so cross-crate tests can exercise the
@@ -38,6 +41,8 @@ pub mod fetch_merge;
 
 #[path = "fetch/seed.rs"]
 mod seed;
+
+pub mod pt;
 
 #[path = "tor/tor_setup.rs"]
 pub mod tor_setup;

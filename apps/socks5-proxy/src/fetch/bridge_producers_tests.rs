@@ -122,7 +122,7 @@ async fn producer_boundaries_remain_guarded() {
             assert_eq!(panic.downcast_ref::<&'static str>(), Some(&"warmer"));
 
             let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _handle = spawn_tor_watchdog(
+                let _run = spawn_tor_watchdog(
                     handle.clone(),
                     Some(path.clone()),
                     cfg.watchdog,

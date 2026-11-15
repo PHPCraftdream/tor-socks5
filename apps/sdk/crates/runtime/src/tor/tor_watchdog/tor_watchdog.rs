@@ -122,12 +122,15 @@ use bridge_store::BridgeStore;
 mod health;
 #[path = "tor_watchdog_runtime.rs"]
 mod runtime;
+#[path = "tor_watchdog_status.rs"]
+mod status;
 
 #[allow(unused_imports)]
 pub use health::{classify_and_record, BridgeRefresh, TorHandle, TorHealth};
 #[cfg(test)]
 pub(crate) use runtime::{route_bridge_count, test_heal};
 pub use runtime::{spawn_bridge_failover_watchdog, spawn_tor_watchdog};
+pub use status::{HealOutcome, WatchdogRun, WatchdogStatus};
 
 #[cfg(test)]
 #[path = "tor_watchdog_tests.rs"]

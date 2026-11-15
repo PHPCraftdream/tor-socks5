@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::pt::PtBinary;
 use bridge_line::BridgeLine;
 use bridge_store::BridgeStore;
 use time::OffsetDateTime;
@@ -131,7 +132,7 @@ fn admission_verification(
     let scratch = tempfile::Builder::new()
         .prefix("tor-socks5-admission-")
         .tempdir()?;
-    let pt = Some(crate::tor_setup::resolve_pt_binary()?);
+    let pt = Some(crate::tor_setup::resolve_pt_binary(&PtBinary::default())?);
     let mut verified = false;
     verify_bridges_sequential(
         &live_cache,
@@ -234,7 +235,7 @@ pub(crate) async fn run_circuit_verify_tick(config_path: Option<&Path>, active: 
     // Only resolve the PT binary when the batch actually needs one — the
     // resolver inspects the current executable / env and is not free.
     let pt_binary = if due.iter().any(|b| b.transport.is_some()) {
-        match crate::tor_setup::resolve_pt_binary() {
+        match crate::tor_setup::resolve_pt_binary(&PtBinary::default()) {
             Ok(pt) => Some(pt),
             Err(error) => {
                 warn!(error = %error, "circuit-verify: could not resolve PT binary");

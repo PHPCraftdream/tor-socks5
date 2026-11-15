@@ -84,11 +84,15 @@ impl TorHealth {
             .clone()
     }
 
-    pub(super) fn last_success_secs(&self) -> u64 {
+    /// Unix-seconds of the last successful connect; 0 until the first
+    /// success is recorded. Part of the public status surface.
+    pub fn last_success_secs(&self) -> u64 {
         self.last_success.load(Ordering::Relaxed)
     }
 
-    pub(super) fn attempt_count(&self) -> u64 {
+    /// Monotonic attempt counter across the handle's lifetime. Part of the
+    /// public status surface.
+    pub fn attempt_count(&self) -> u64 {
         self.attempts.load(Ordering::Relaxed)
     }
 
@@ -205,6 +209,10 @@ impl ActiveBridges {
     }
 }
 
+/// Cross-task signaling for bridge refresh: the bridge-maintenance loop
+/// sets `needed` and waits on `notified`; connection paths request recovery
+/// through `request`/`request_after_failure` and tick `recovery` while a
+/// long connection attempt is in flight.
 #[derive(Debug, Default)]
 pub struct BridgeRefresh {
     needed: AtomicBool,
@@ -213,26 +221,33 @@ pub struct BridgeRefresh {
 }
 
 impl BridgeRefresh {
+    /// Mark whether a bridge refresh is currently needed.
     pub fn set_needed(&self, needed: bool) {
         self.needed.store(needed, Ordering::Relaxed);
     }
 
+    /// Wake the refresh waiter if a refresh is currently needed.
     pub fn request(&self) {
         if self.needed.load(Ordering::Relaxed) {
             self.notify.notify_one();
         }
     }
 
+    /// Wait until a refresh has been requested (cancel-safe: the permit
+    /// is returned on drop).
     pub async fn notified(&self) {
         self.notify.notified().await;
     }
 
+    /// The notify used to signal in-flight recovery attempts.
     pub fn recovery(&self) -> &Arc<Notify> {
         &self.recovery
     }
 
     /// Request recovery while keeping the same connection attempt alive.
     /// cancel-safe: NO — dropping this wrapper also drops the owned attempt.
+    /// Poll `recovery` periodically while `connection` runs, so a stalled
+    /// attempt can trigger bridge refresh mid-flight.
     pub async fn track_connection<F: std::future::Future>(&self, connection: F) -> F::Output {
         tokio::pin!(connection);
         let period = Duration::from_secs(15);
@@ -247,6 +262,8 @@ impl BridgeRefresh {
         }
     }
 
+    /// Request recovery after a connect failure whose error kind is one
+    /// the bridge refresh can plausibly fix; other errors are ignored.
     pub fn request_after_failure(&self, error: &arti_wrapper::TorError) {
         let arti_wrapper::TorError::Connect { source, .. } = error else {
             return;
@@ -286,6 +303,7 @@ impl TorHandle {
         &self.health
     }
 
+    /// The bridge lines currently active in the underlying client config.
     pub fn active_bridges(&self) -> Vec<BridgeLine> {
         self.active_bridges
             .lock()
@@ -294,6 +312,8 @@ impl TorHandle {
             .clone()
     }
 
+    /// Replace the tracked active bridge set (records activation time so
+    /// `route_is_settling` can judge freshness).
     pub fn set_active_bridges(&self, bridges: Vec<BridgeLine>) {
         self.active_bridges
             .lock()
@@ -302,6 +322,9 @@ impl TorHandle {
     }
 
     /// Give an authenticated channel time to fetch its descriptor and build a circuit.
+    /// True while the route was recently (re)activated and has not yet
+    /// seen its first successful connect — callers should wait instead of
+    /// treating the route as broken.
     pub fn route_is_settling(&self) -> bool {
         let last_success = *self
             .health
@@ -314,6 +337,7 @@ impl TorHandle {
             .settling(last_success)
     }
 
+    /// Access the shared [`BridgeRefresh`] signaling state.
     pub fn bridge_refresh(&self) -> &BridgeRefresh {
         &self.refresh
     }

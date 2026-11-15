@@ -19,6 +19,7 @@
 //! | [`dns`] | `tor-socks5-dns` | `dns` |
 //! | [`runtime`] | `tor-socks5-runtime` (SDK-7 surface) | `runtime` |
 //! | [`onion`] | `tor-socks5-onion` | `onion`, `onion-keys` |
+//! | [`runtime`] | `tor-socks5-runtime` — the curated SDK-9 surface, not the whole crate | `runtime` |
 //!
 //! The `tor` feature (and `fetch`, `dns`, `runtime`, `onion-service`,
 //! `full`, which imply it) links Arti. Without the vendored forks of the patch-kit a
@@ -84,22 +85,23 @@ pub use ::dns_server as dns;
 #[cfg(any(feature = "onion", feature = "onion-keys"))]
 pub use ::tor_socks5_onion as onion;
 
-/// The embedded Tor runtime (`tor-socks5-runtime`), opened step by step
-/// as the SDK plan's API tasks land. This is the SDK-7 surface: the
-/// bridge-health writer and the guard-event observation layer. The Tor
-/// client setup, the bridge manager and the server are not exposed yet
-/// (SDK-8/9/10).
+/// The embedded Tor runtime (`tor-socks5-runtime`, `apps/sdk/crates/runtime`),
+/// curated by module — this is not the whole crate. Two surfaces are open so
+/// far; the bridge manager (SDK-8) and the proxy server (SDK-10/11) are not
+/// exposed yet.
 ///
-/// Nothing here installs process state on its own (R1):
-/// [`init_global`]/[`close_global`] are the documented process-wide
-/// writer slot the application drives — one live writer per process,
-/// sequential restart works — and [`observation_layer`] is a tracing
-/// layer for the application's own log subscriber; the runtime never
-/// sets a subscriber.
+/// Nothing here installs process state on its own (R1): the bridge-health
+/// writer slot ([`init_global`]/[`close_global`]: one live writer per
+/// process, sequential restart works) is driven by the application, and
+/// [`observation_layer`] is a tracing layer for the application's own log
+/// subscriber; the runtime never sets a subscriber.
+///
+/// **Bridge health and observation (SDK-7):**
 ///
 /// ```no_run
 /// use tor_socks5::runtime::{init_global, observation_layer, ObservationSink};
 /// use tracing_subscriber::layer::SubscriberExt;
+/// use tracing_subscriber::util::SubscriberInitExt;
 ///
 /// let _writer = init_global(Some(std::path::Path::new("tor-socks5.ktav")));
 /// let sink = ObservationSink::new();
@@ -109,8 +111,35 @@ pub use ::tor_socks5_onion as onion;
 ///     .with(observation_layer(&sink))
 ///     .init();
 /// ```
+///
+/// **Tor client (SDK-9):**
+///
+/// - [`runtime::tor_setup`] — Tor client settings built from the ktav
+///   config (`build_tor_settings`, `build_tor_settings_with_pt`), the arti
+///   state dir (`arti_base_dir`) and the owner-routing relatives.
+/// - [`runtime::pt`] — the pluggable-transport entry point for an embedding
+///   host (`PtBinary`): environment-resolved (the CLI binary's busybox
+///   dispatch, `TOR_PT_BINARY` override) or an explicit dispatcher path.
+/// - [`runtime::tor_watchdog`] — the live-client handle (`TorHandle`,
+///   `TorHealth`), the watchdog spawn/status surface (`WatchdogRun`,
+///   `WatchdogStatus`) and failure classification.
+/// - [`runtime::conn_health`] — connection-health counters and windowed
+///   snapshots.
+///
+/// This feature links Arti: without the patch-kit (`[patch.crates-io]` in
+/// your final binary/workspace root, see the SDK guide in README.md and
+/// `vendor/README.md`) stock Arti is resolved and the fixes are lost.
 #[cfg(feature = "runtime")]
 pub mod runtime {
+    /// Connection-health counters and snapshots (`tor-socks5-runtime::conn_health`).
+    pub use ::tor_socks5_runtime::conn_health;
+    /// Pluggable-transport binary resolution (`tor-socks5-runtime::pt`).
+    pub use ::tor_socks5_runtime::pt;
+    /// Tor client settings built from the config file (`tor-socks5-runtime::tor_setup`).
+    pub use ::tor_socks5_runtime::tor_setup;
+    /// The live-client handle and the watchdog surface (`tor-socks5-runtime::tor_watchdog`).
+    pub use ::tor_socks5_runtime::tor_watchdog;
+
     /// The bridge-health writer: the [`StoreWriter`] handle (`apply`,
     /// `close`) and the process-wide `init_global`/`close_global` slot
     /// (one live writer per process, sequential restart works).
