@@ -311,7 +311,9 @@ mod tests {
 
     #[tokio::test]
     async fn empty_sources_bails_before_any_tor_or_io() {
-        let cfg = Config::default();
+        // The default config carries the built-in sources, so clear them.
+        let mut cfg = Config::default();
+        cfg.bridges.sources.clear();
         let error = fetch_bridges(
             &cfg,
             None,
