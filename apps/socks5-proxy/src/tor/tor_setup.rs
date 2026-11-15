@@ -78,7 +78,7 @@ pub(crate) async fn build_tor_settings_preserving_live(
     if let Some(pool) = cfg.pre_proxies.as_ref() {
         let endpoint = owner_settings::select_anchor(pool).await?;
         let mut settings = restricted_owner_settings(cfg, config_path)?;
-        settings.pre_endpoint = Some(crate::route::pre_endpoint(endpoint));
+        settings.pre_endpoint = Some(arti_wrapper::Socks5PreEndpoint::from_pool_member(endpoint));
         return Ok(settings);
     }
     let parsed = cfg

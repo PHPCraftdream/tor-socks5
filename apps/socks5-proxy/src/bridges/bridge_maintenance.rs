@@ -319,7 +319,7 @@ async fn refresh_pre(
     let configured = cfg.pre_proxies.as_ref().is_some_and(|pool| {
         pool.members()
             .iter()
-            .any(|member| &crate::route::pre_endpoint(member) == endpoint)
+            .any(|member| &arti_wrapper::Socks5PreEndpoint::from_pool_member(member) == endpoint)
     });
     if !configured || active.pre_endpoint.as_ref() != Some(endpoint) {
         anyhow::bail!("изменение pre требует перезапуска");
