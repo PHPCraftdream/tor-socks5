@@ -767,6 +767,7 @@ class NativeMuslSourceTests(unittest.TestCase):
             "0002-cve-2025-26519-p2.diff": "d5b88fe87f9554238bdd69235694b0d50bb909f38149a7be417a0240a490e813",
             "musl-cve-2026-6042.diff": "444fa70e52ca158fb7d4bad560637790bbf8f72e80b82fff840dd66fa83091e3",
             "musl-cve-2026-40200.diff": "1ee29f64f9ca8e8ad7c349779d661ff6b52126a27575d3586981357a52c406fb",
+            "musl-cve-2026-107891.diff": "0cf0090ab433e8f9ed08ae03a0c93aff557c1d3e347260f62a61a10281f5333b",
             "mcm-musl-1.2.5.tar.gz.sha1": "5c5d074634ed2dedef96c21d52040bfdf056e17d8ec0ccae96e7bf0eb86c3026",
         }
         pins = native_material.MUSL_SOURCE_PINS
