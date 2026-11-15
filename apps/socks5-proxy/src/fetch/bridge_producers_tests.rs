@@ -21,7 +21,7 @@ async fn pre_launch_keeps_only_maintenance_and_watchdog() {
     cfg.warm_pool.enabled = true;
     let mut valid = cfg.clone();
     valid.warm_pool.enabled = false;
-    let settings = crate::tor_setup::build_tor_settings(&valid, Some(dir.path()))
+    let settings = tor_socks5_runtime::tor_setup::build_tor_settings(&valid, Some(dir.path()))
         .await
         .unwrap();
     ensure_crypto_provider();
@@ -32,7 +32,7 @@ async fn pre_launch_keeps_only_maintenance_and_watchdog() {
         TorHandle::new(tor),
         Some(dir.path().join("missing.ktav")),
         &cfg,
-        crate::arti_observability::ObservationSink::new(),
+        tor_socks5_runtime::arti_observability::ObservationSink::new(),
         settings,
         token.clone(),
         &mut tasks,
@@ -55,7 +55,7 @@ async fn producer_boundaries_remain_guarded() {
     cfg.bridges.auto_fetch = false;
     cfg.bridges.lines = vec!["8.8.8.8:443 1111111111111111111111111111111111111111".into()];
     let path = dir.path().join("proxy.ktav");
-    let settings = crate::tor_setup::build_tor_settings(&cfg, Some(&path))
+    let settings = tor_socks5_runtime::tor_setup::build_tor_settings(&cfg, Some(&path))
         .await
         .unwrap();
     assert!(settings.pre_endpoint.is_some());
@@ -63,7 +63,7 @@ async fn producer_boundaries_remain_guarded() {
     ensure_crypto_provider();
     let tor = TorTunnel::create_unbootstrapped_with(settings.clone()).unwrap();
     let handle = TorHandle::new(tor);
-    crate::test_seams::FORBID_PRODUCER
+    tor_socks5_runtime::test_seams::FORBID_PRODUCER
         .scope((), async {
             let mut producers = Vec::new();
             let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -71,7 +71,7 @@ async fn producer_boundaries_remain_guarded() {
                     handle.clone(),
                     Some(path.clone()),
                     &cfg,
-                    crate::arti_observability::ObservationSink::new(),
+                    tor_socks5_runtime::arti_observability::ObservationSink::new(),
                     settings.clone(),
                     CancellationToken::new(),
                     &mut producers,
@@ -90,7 +90,7 @@ async fn producer_boundaries_remain_guarded() {
                     handle.clone(),
                     Some(path.clone()),
                     &cfg,
-                    crate::arti_observability::ObservationSink::new(),
+                    tor_socks5_runtime::arti_observability::ObservationSink::new(),
                     default_settings,
                     CancellationToken::new(),
                     &mut producers,
@@ -101,7 +101,7 @@ async fn producer_boundaries_remain_guarded() {
             assert!(producers.is_empty());
 
             let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _handle = crate::bridge_verifier::spawn_bridge_circuit_verifier(
+                let _handle = tor_socks5_runtime::bridge_verifier::spawn_bridge_circuit_verifier(
                     Some(path.clone()),
                     handle.clone(),
                     CancellationToken::new(),
@@ -111,7 +111,7 @@ async fn producer_boundaries_remain_guarded() {
             assert_eq!(panic.downcast_ref::<&'static str>(), Some(&"verifier"));
 
             let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _handle = crate::bridge_warmer::spawn_bridge_warmer(
+                let _handle = tor_socks5_runtime::bridge_warmer::spawn_bridge_warmer(
                     handle.clone(),
                     Some(path.clone()),
                     cfg.warm_pool,

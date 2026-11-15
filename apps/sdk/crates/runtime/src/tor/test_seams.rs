@@ -1,10 +1,10 @@
 //! Test-only synchronization seams for the cross-process race tests.
 //! Gates are path- and site-scoped, RAII-armed (release + deregister on
 //! drop, so a panicking test cannot leave one armed). Compiles away outside
-//! `cfg(test)`.
+//! `cfg(test)` and the `test-seams` feature.
 
 tokio::task_local! {
-    pub(crate) static FORBID_PRODUCER: ();
+    pub static FORBID_PRODUCER: ();
 }
 
 pub(crate) fn forbid_producer(site: &'static str) {
@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 /// Where a gate parks a transaction: before its lock acquisition or after
 /// its load (snapshot pinned, mutation/save not yet run).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) enum Site {
+pub enum Site {
     PreAcquire,
     PostLoad,
     /// Inside the admission verifier's blocking worker, right after it
@@ -47,14 +47,14 @@ pub(crate) enum Site {
 
 /// Guard for waits that must succeed (a transaction reaching its gated
 /// site); firing means a broken seam, never a slow machine under test.
-pub(crate) const HANG_GUARD: Duration = Duration::from_secs(10);
+pub const HANG_GUARD: Duration = Duration::from_secs(10);
 
 /// Fixed wait for a completion that must NOT happen while the first writer
 /// owns the lock. Firing is the correct-protocol case (the test then
 /// releases the pinned writer); an early completion proves the lock was
 /// bypassed and the final data assertions fail. Ordering never depends on
 /// the timeout — only on the lock and the gate releases.
-pub(crate) const UNBLOCK_GUARD: Duration = Duration::from_secs(2);
+pub const UNBLOCK_GUARD: Duration = Duration::from_secs(2);
 
 struct GateInner {
     state: Mutex<(bool, bool)>, // (parked, released)
@@ -72,7 +72,7 @@ fn registry() -> &'static Mutex<HashMap<GateKey, Arc<GateInner>>> {
 
 /// A gate a test arms to park the first transaction matching its site and
 /// path. Only the controller releases it on drop; wait clones do not.
-pub(crate) struct ParkedGate {
+pub struct ParkedGate {
     key: GateKey,
     inner: Arc<GateInner>,
     controller: bool,
@@ -89,7 +89,7 @@ impl Clone for ParkedGate {
 }
 
 impl ParkedGate {
-    pub(crate) fn arm(site: Site, path: &Path) -> Self {
+    pub fn arm(site: Site, path: &Path) -> Self {
         let inner = Arc::new(GateInner {
             state: Mutex::new((false, false)),
             cv: Condvar::new(),
@@ -108,7 +108,7 @@ impl ParkedGate {
 
     /// Block until a transaction reached the gated site (hang guard only).
     /// Panics without holding the lock, so `Drop`'s release stays safe.
-    pub(crate) fn wait_parked(&self, guard: Duration) {
+    pub fn wait_parked(&self, guard: Duration) {
         let deadline = Instant::now() + guard;
         let mut state = self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
         while !state.0 {
@@ -127,7 +127,7 @@ impl ParkedGate {
         assert!(parked, "transaction never reached {:?}", self.key.0);
     }
 
-    pub(crate) fn promotion_slot(&self) -> Option<Option<crate::workers::WorkerSlot>> {
+    pub fn promotion_slot(&self) -> Option<Option<crate::workers::WorkerSlot>> {
         self.inner
             .promotion_slot
             .lock()
@@ -135,7 +135,7 @@ impl ParkedGate {
             .clone()
     }
 
-    pub(crate) fn release(&self) {
+    pub fn release(&self) {
         let mut state = self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
         state.1 = true;
         self.inner.cv.notify_all();
@@ -207,7 +207,7 @@ pub(crate) fn mark_worker_done(site: Site, path: &Path) {
 /// How many times a worker marked itself done at this site and path.
 // Consumer arrives with the TS17-02 regression test (next chunk).
 #[allow(dead_code)]
-pub(crate) fn worker_done_count(site: Site, path: &Path) -> usize {
+pub fn worker_done_count(site: Site, path: &Path) -> usize {
     done_registry()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -229,7 +229,7 @@ fn failure_registry() -> &'static Mutex<HashSet<GateKey>> {
 
 /// Arm a one-shot failure for `site` at `path`: the next
 /// [take_failure] there returns true.
-pub(crate) fn arm_failure(site: Site, path: &Path) {
+pub fn arm_failure(site: Site, path: &Path) {
     failure_registry()
         .lock()
         .expect("failure registry")
@@ -267,7 +267,7 @@ pub(crate) fn note_task_context(site: Site) {
 }
 
 /// The thread that executed the site's blocking read, if recorded yet.
-pub(crate) fn ran_on_thread(site: Site) -> Option<std::thread::ThreadId> {
+pub fn ran_on_thread(site: Site) -> Option<std::thread::ThreadId> {
     RAN_ON_THREAD
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()

@@ -80,12 +80,12 @@ impl CandidatePool {
     /// lock wait blocks; async flows holding the lock across awaits use
     /// [`CandidatePool::acquire_transaction_lock`] directly.
     pub fn transaction<T>(path: &Path, f: impl FnOnce(&mut CandidatePool) -> T) -> Result<T> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::test_seams::park_if_armed(crate::test_seams::Site::PreAcquire, path);
         let _lock = PathLock::acquire_bounded(path, POOL_LOCK_WAIT)
             .with_context(|| format!("candidate pool transaction lock for {}", path.display()))?;
         let mut pool = CandidatePool::load(path.to_path_buf())?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::test_seams::park_if_armed(crate::test_seams::Site::PostLoad, path);
         let out = f(&mut pool);
         pool.save()?;

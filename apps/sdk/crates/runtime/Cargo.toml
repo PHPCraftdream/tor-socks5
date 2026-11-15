@@ -1,0 +1,60 @@
+[package]
+name = "tor-socks5-runtime"
+# Not published: the release artifact is the single `tor-socks5` package;
+# workspace crates are its internal modules (docs/project/sdk-package-design.md).
+publish = false
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+description = "Runtime module tree of the socks5-proxy binary (Tor setup, bridge maintenance/fetching, watchdogs), moved verbatim from the binary (SDK-6)."
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+# Test seams for tests in other crates (R10). Enabled only via consumers'
+# dev-dependencies; never in default/full builds.
+test-seams = []
+
+[dependencies]
+anyhow.workspace = true
+auth = { path = "../../../../packages/auth", version = "0.2.0", package = "tor-socks5-auth" }
+arti-wrapper = { path = "../../../../packages/arti-wrapper", version = "0.2.0" }
+bridge-line.workspace = true
+bridge-fetcher = { path = "../../../../packages/bridge-fetcher", version = "0.2.0" }
+bridge-probe = { path = "../../../../packages/bridge-probe", version = "0.2.0" }
+bridge-store = { path = "../../../../packages/bridge-store", version = "0.2.0" }
+bridge-verify-core = { path = "../../../../packages/bridge-verify-core", version = "0.2.0" }
+futures.workspace = true
+getrandom.workspace = true
+persist-lock = { path = "../../../../packages/persist-lock", version = "0.2.0" }
+proxy-config = { path = "../../../../packages/proxy-config", version = "0.2.0", package = "tor-socks5-config" }
+route-pool = { path = "../../../../packages/proxy-config/route-pool", version = "0.2.0", package = "tor-socks5-route-pool" }
+serde_json = "1"
+tempfile = "3"
+time.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tor-error.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+ktav.workspace = true
+rustls.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+] }

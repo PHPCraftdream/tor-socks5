@@ -19,15 +19,17 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, Loaded, SecurityConfig};
-use crate::conn_health::{spawn_conn_health_logger, ConnHealthCounters};
 use crate::dns_wiring::{convert_custom_doh_providers, convert_dns_overrides, dns_cache_path};
 use crate::route::{resolve_admitted_route, validate_account_routes, validate_post_compatibility};
 pub(crate) use crate::route::{RealTorConnector, TorConnector};
 use crate::startup::AuthStateVerifier;
-use crate::tor_watchdog::{spawn_bridge_failover_watchdog, spawn_tor_watchdog, TorHandle};
 use crate::upstream::relay;
 use crate::upstream::RelayRemote::{Tor, Upstream};
 use crate::{shutdown, upstream};
+use tor_socks5_runtime::conn_health::{spawn_conn_health_logger, ConnHealthCounters};
+use tor_socks5_runtime::tor_watchdog::{
+    spawn_bridge_failover_watchdog, spawn_tor_watchdog, TorHandle,
+};
 
 /// Maximum concurrent SOCKS5 connections. Each may run an Argon2id verify
 /// (~5 MiB working memory, 2 passes), so unbounded spawns risk resource
@@ -148,8 +150,9 @@ pub(crate) async fn run_server(
     // back to the legacy NO_AUTH path.
     let users_path = UsersConfig::resolve_path(config_path.as_deref());
     let users = UsersConfig::load(&users_path).context("loading users registry")?;
-    crate::tor_setup::validate_owner_routes(&cfg, &users, config_path.as_deref())?;
-    let owner_template = crate::tor_setup::restricted_owner_settings(&cfg, config_path.as_deref());
+    tor_socks5_runtime::tor_setup::validate_owner_routes(&cfg, &users, config_path.as_deref())?;
+    let owner_template =
+        tor_socks5_runtime::tor_setup::restricted_owner_settings(&cfg, config_path.as_deref());
     validate_account_routes(
         &users,
         cfg.pre_proxies.as_ref(),
@@ -290,7 +293,10 @@ pub(crate) async fn run_server(
             handle.set_active_bridges(settings.bridges.clone());
             handle.bridge_refresh().set_needed(
                 cfg.bridges.auto_fetch
-                    && crate::bridge_maintenance::preferred_missing(&cfg, &settings.bridges),
+                    && tor_socks5_runtime::bridge_maintenance::preferred_missing(
+                        &cfg,
+                        &settings.bridges,
+                    ),
             );
 
             let template = if settings.pre_endpoint.is_some() {
@@ -624,11 +630,11 @@ async fn shutdown_producers(
 // модуле; реэкспорт сохраняет существующие вызовы и видимость через `super::*`.
 use crate::upstream::pick_upstream;
 
-#[cfg(test)]
-pub(crate) use crate::conn_health::{ConnErrorKind, ConnStage};
 use crate::startup::{
     classify_conn_failure, STAGE_CONNECT_TOR, STAGE_CONNECT_UPSTREAM, STAGE_HANDSHAKE, STAGE_RELAY,
 };
+#[cfg(test)]
+pub(crate) use tor_socks5_runtime::conn_health::{ConnErrorKind, ConnStage};
 
 /// cancel-safe: NO — partial protocol replies/prefix writes/relay are terminal;
 /// dropping this handler closes its owned client and egress, with no replay.

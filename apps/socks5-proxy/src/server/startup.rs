@@ -6,9 +6,9 @@ use std::path::Path;
 
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 
-use crate::arti_observability::{GuardObservabilityLayer, ObservationSink};
 use crate::config::{Config, LogConfig, LogOutput};
-use crate::conn_health::{ConnErrorKind, ConnStage};
+use tor_socks5_runtime::arti_observability::{GuardObservabilityLayer, ObservationSink};
+use tor_socks5_runtime::conn_health::{ConnErrorKind, ConnStage};
 
 /// `rustls` 0.23 requires picking a process-wide crypto provider explicitly.
 pub(crate) fn install_crypto_provider() {
@@ -35,7 +35,7 @@ pub(crate) fn install_crypto_provider() {
 /// observations into the returned [`ObservationSink`] without producing
 /// any log output of its own. The proxy's maintenance loop drains the
 /// sink into the bridge health store; see
-/// [`crate::tor_setup::update_health_and_prune`].
+/// tor_socks5_runtime::tor_setup::update_health_and_prune.
 ///
 /// `RUST_LOG` overrides the config file's level/target settings for the
 /// fmt layer only; the observability layer's filter is fixed.

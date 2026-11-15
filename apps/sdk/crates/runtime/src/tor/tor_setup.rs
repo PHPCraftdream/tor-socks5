@@ -1,7 +1,7 @@
 //! Bridge reachability probing and arti `Settings` construction.
 //!
-//! Shared by the server startup path ([`crate::server::run_server`]) and
-//! the `bridges fetch` command ([`crate::bridges_cmd::cmd_bridges`]).
+//! Shared by the server startup path (crate::server::run_server) and
+//! the `bridges fetch` command (crate::bridges_cmd::cmd_bridges).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -58,15 +58,12 @@ fn settings_for_config(cfg: &Config) -> Settings {
 
 #[path = "tor_watchdog/owner_settings.rs"]
 mod owner_settings;
-pub(crate) use owner_settings::{restricted_owner_settings, validate_owner_routes};
+pub use owner_settings::{restricted_owner_settings, validate_owner_routes};
 
 /// Parse the configured bridges, probe them for reachability, persist the
 /// live ones to the alive-bridges log, and assemble arti [`Settings`]
 /// (including pointing the PT manager at our own binary when needed).
-pub(crate) async fn build_tor_settings(
-    cfg: &Config,
-    config_path: Option<&Path>,
-) -> Result<Settings> {
+pub async fn build_tor_settings(cfg: &Config, config_path: Option<&Path>) -> Result<Settings> {
     build_tor_settings_preserving_live(cfg, config_path, &[]).await
 }
 
@@ -78,7 +75,7 @@ pub(crate) async fn build_tor_settings_preserving_live(
     if let Some(pool) = cfg.pre_proxies.as_ref() {
         let endpoint = owner_settings::select_anchor(pool).await?;
         let mut settings = restricted_owner_settings(cfg, config_path)?;
-        settings.pre_endpoint = Some(crate::route::pre_endpoint(endpoint));
+        settings.pre_endpoint = Some(arti_wrapper::Socks5PreEndpoint::from_pool_member(endpoint));
         return Ok(settings);
     }
     let parsed = cfg
@@ -272,7 +269,7 @@ pub(crate) async fn build_tor_settings_preserving_live(
 /// background circuit-verify task (`bridge_verifier.rs`) derives the live
 /// client's cache dir (`base.join("cache")`, per `arti_wrapper::build_config`)
 /// from the same logic and cannot drift from the actually-running client.
-pub(crate) fn arti_base_dir(config_path: Option<&Path>) -> std::path::PathBuf {
+pub fn arti_base_dir(config_path: Option<&Path>) -> std::path::PathBuf {
     match config_path.and_then(Path::parent) {
         Some(dir) if !dir.as_os_str().is_empty() => dir.join("arti-data"),
         _ => std::path::PathBuf::from("arti-data"),

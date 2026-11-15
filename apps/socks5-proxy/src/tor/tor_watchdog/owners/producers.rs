@@ -46,7 +46,7 @@ impl std::error::Error for ProducerFailures {
 pub(super) async fn join_final_workers() -> Result<()> {
     tokio::time::timeout(
         Duration::from_secs(5),
-        crate::workers::join_blocking_workers(),
+        tor_socks5_runtime::workers::join_blocking_workers(),
     )
     .await
     .map_err(|_| anyhow!("final blocking worker shutdown timed out; process registry retained"))?
@@ -64,7 +64,7 @@ pub(super) struct ProducerTasks {
     tasks: Mutex<Vec<Arc<Task>>>,
     failure: Mutex<ProducerFailures>,
     #[cfg(test)]
-    children: Option<Arc<crate::workers::TestWorkers>>,
+    children: Option<Arc<tor_socks5_runtime::workers::TestWorkers>>,
 }
 
 impl ProducerTasks {
@@ -92,7 +92,7 @@ impl ProducerTasks {
             token,
             tasks: Mutex::new(Vec::new()),
             failure: Mutex::new(ProducerFailures::default()),
-            children: Some(Arc::new(crate::workers::TestWorkers::default())),
+            children: Some(Arc::new(tor_socks5_runtime::workers::TestWorkers::default())),
         })
     }
 
@@ -170,11 +170,11 @@ impl ProducerTasks {
                 }
             }
             #[cfg(not(test))]
-            let children_result = crate::workers::join_blocking_workers().await;
+            let children_result = tor_socks5_runtime::workers::join_blocking_workers().await;
             #[cfg(test)]
             let children_result = match &self.children {
                 Some(children) => children.join().await,
-                None => crate::workers::join_blocking_workers().await,
+                None => tor_socks5_runtime::workers::join_blocking_workers().await,
             };
             if let Err(error) = children_result {
                 self.failure
@@ -275,7 +275,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pre_launch_cancellation_retains_parked_maintenance_until_join() {
-        use crate::test_seams::{ParkedGate, Site, HANG_GUARD};
+        use tor_socks5_runtime::test_seams::{ParkedGate, Site, HANG_GUARD};
         let _serial = super::super::owners::TEST_LIFECYCLE.lock().await;
         let _ = rustls::crypto::ring::default_provider().install_default();
         let dir = tempfile::tempdir().unwrap();
@@ -291,7 +291,7 @@ mod tests {
                 .into(),
         );
         cfg.write(&path).unwrap();
-        let settings = crate::tor_setup::build_tor_settings(&cfg, Some(&path))
+        let settings = tor_socks5_runtime::tor_setup::build_tor_settings(&cfg, Some(&path))
             .await
             .unwrap();
         let tunnel = arti_wrapper::TorTunnel::create_unbootstrapped_with(settings.clone()).unwrap();
@@ -299,10 +299,10 @@ mod tests {
         let owner = ProducerTasks::retain().unwrap();
         let mut launch = LaunchGuard::new(owner.clone());
         super::super::bridge_producers::launch(
-            crate::tor_watchdog::TorHandle::new(tunnel),
+            tor_socks5_runtime::tor_watchdog::TorHandle::new(tunnel),
             Some(path),
             &cfg,
-            crate::arti_observability::ObservationSink::new(),
+            tor_socks5_runtime::arti_observability::ObservationSink::new(),
             settings,
             owner.token(),
             &mut launch.handles,
@@ -367,7 +367,7 @@ mod tests {
             .unwrap()
             .is_panic());
         let children = failures.errors()[1]
-            .downcast_ref::<crate::workers::WorkerFailures>()
+            .downcast_ref::<tor_socks5_runtime::workers::WorkerFailures>()
             .unwrap();
         assert_eq!(children.errors().len(), 2);
         assert!(children

@@ -8,7 +8,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::tor_watchdog::TorHandle;
+use tor_socks5_runtime::tor_watchdog::TorHandle;
 
 mod storage;
 

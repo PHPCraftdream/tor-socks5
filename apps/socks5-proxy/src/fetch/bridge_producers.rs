@@ -4,14 +4,14 @@ pub(super) fn launch(
     handle: TorHandle,
     config_path: Option<std::path::PathBuf>,
     cfg: &Config,
-    obs_sink: crate::arti_observability::ObservationSink,
+    obs_sink: tor_socks5_runtime::arti_observability::ObservationSink,
     settings: arti_wrapper::Settings,
     producer_token: CancellationToken,
     producers: &mut Vec<tokio::task::JoinHandle<()>>,
 ) {
     if settings.pre_endpoint.is_some() {
         warn!("global pre_proxies: warmer, verifier, discovery and soft failover remain disabled");
-        producers.push(crate::bridge_maintenance::spawn(
+        producers.push(tor_socks5_runtime::bridge_maintenance::spawn(
             handle.clone(),
             config_path.clone(),
             cfg.bridges.recheck_interval_mins,
@@ -31,7 +31,7 @@ pub(super) fn launch(
         // health store so descriptor-mismatch / unsuitable bridges are
         // pruned alongside the TCP-dead ones. Reads the tunnel through
         // the handle so pool refreshes follow a watchdog rebuild.
-        producers.push(crate::bridge_maintenance::spawn(
+        producers.push(tor_socks5_runtime::bridge_maintenance::spawn(
             handle.clone(),
             config_path.clone(),
             cfg.bridges.recheck_interval_mins,
@@ -67,7 +67,7 @@ pub(super) fn launch(
         // candidate bridges open in the background, so a future
         // switch-over (not built here) does not pay for a cold
         // obfs4/webtunnel handshake. Opt-in; disabled by default.
-        producers.extend(crate::bridge_warmer::spawn_bridge_warmer(
+        producers.extend(tor_socks5_runtime::bridge_warmer::spawn_bridge_warmer(
             handle.clone(),
             config_path.clone(),
             cfg.warm_pool,
@@ -81,11 +81,13 @@ pub(super) fn launch(
         // android-ffi's background circuit-verify tick; it is self-paced
         // by store state (a tick with no due bridges is nearly free) and
         // uses the active pool but verifies through separate clients.
-        producers.push(crate::bridge_verifier::spawn_bridge_circuit_verifier(
-            config_path.clone(),
-            handle.clone(),
-            producer_token.clone(),
-        ));
+        producers.push(
+            tor_socks5_runtime::bridge_verifier::spawn_bridge_circuit_verifier(
+                config_path.clone(),
+                handle.clone(),
+                producer_token.clone(),
+            ),
+        );
     }
 }
 

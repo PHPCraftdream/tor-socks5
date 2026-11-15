@@ -146,7 +146,7 @@ fn admission_verification(
     // Test-visible completion event, set by the worker itself (NOT the
     // caller) after `verify_bridges_sequential` returned — i.e. after its
     // VERIFY_LOCK guard was dropped.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seams"))]
     crate::test_seams::mark_worker_done(
         crate::test_seams::Site::AdmissionVerifyPostLock,
         &live_cache,
@@ -167,12 +167,12 @@ fn admission_verification(
 /// non-cancellable `spawn_blocking` job) runs to completion and its results are
 /// persisted before the caller joins the handle and closes the bridge-store
 /// writer.
-pub(crate) fn spawn_bridge_circuit_verifier(
+pub fn spawn_bridge_circuit_verifier(
     config_path: Option<PathBuf>,
     handle: crate::tor_watchdog::TorHandle,
     token: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seams"))]
     crate::test_seams::forbid_producer("verifier");
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(CIRCUIT_VERIFY_INTERVAL);
@@ -196,7 +196,7 @@ pub(crate) async fn run_circuit_verify_tick(config_path: Option<&Path>, active: 
     // Blocking file read (incl. reader-side stale-temp cleanup) must not run
     // on an async worker (TS19-01).
     let due_rx = match spawn_fallible_blocking(move || {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::test_seams::note_task_context(crate::test_seams::Site::CircuitVerifyStoreLoad);
         BridgeStore::load(store_path)
     })
@@ -599,7 +599,7 @@ pub(crate) fn verify_bridges_sequential(
     // test can pin an admission worker mid-run deterministically. Placed
     // after the guard acquisition on purpose: a worker parked here is a
     // worker that owns the verifier lock.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seams"))]
     crate::test_seams::park_if_armed(
         crate::test_seams::Site::AdmissionVerifyPostLock,
         live_cache_dir,

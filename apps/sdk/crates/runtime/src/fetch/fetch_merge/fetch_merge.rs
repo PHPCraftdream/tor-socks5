@@ -154,7 +154,7 @@ async fn fetch_sources(
 /// вне асинхронного потока и остаётся в реестре после отмены вызывающего кода.
 ///
 /// cancel-safe: NO — performs network I/O over Tor and writes the pool.
-pub(crate) async fn refresh_candidate_pool(
+pub async fn refresh_candidate_pool(
     tor: &TorTunnel,
     cfg: &Config,
     config_path: Option<&Path>,
@@ -345,7 +345,7 @@ fn channel_checker(
 /// is the cold-start path, where no live tunnel exists yet to warm through.
 ///
 /// cancel-safe: NO — probes the network and writes the pool + config.
-pub(crate) async fn drain_pool(
+pub async fn drain_pool(
     config_path: Option<&Path>,
     target: usize,
     tor: Option<&TorTunnel>,
@@ -391,7 +391,7 @@ async fn drain_pool_with(
     let pool_path = CandidatePool::resolve_path(config_path);
     // Test-only forcing point: park before the acquisition (blocking pool —
     // never block a worker on the gate).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seams"))]
     {
         let seam_path = pool_path.clone();
         crate::workers::run_tracked_blocking(move || {
@@ -563,7 +563,7 @@ async fn drain_pool_with(
     // loads the pool FRESH under the cross-process lock, so a refresh that
     // merged newcomers while this drain was promoting is merged with, never
     // overwritten by, these removals (TS17-08).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seams"))]
     {
         let seam_path = pool_path.clone();
         crate::workers::run_tracked_blocking(move || {
@@ -636,11 +636,11 @@ fn migrate_legacy_source(path: &Path) -> Result<()> {
 /// added again, and when nothing is new the file is not rewritten at all —
 /// this is what makes the drain's retry after a failed promotion safe.
 fn promote_bridges_in_config(path: &Path, promoted: &[BridgeLine]) -> Result<usize> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seams"))]
     crate::test_seams::note_promotion_slot(path, crate::workers::current_slot());
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seams"))]
     crate::test_seams::park_if_armed(crate::test_seams::Site::ConfigPromotion, path);
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seams"))]
     if crate::test_seams::take_failure(crate::test_seams::Site::ConfigPromotion, path) {
         anyhow::bail!("injected config promotion failure");
     }

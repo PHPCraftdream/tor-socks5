@@ -18,7 +18,7 @@ pub(crate) use ::tor_socks5_onion::keys::{
 /// `<state>/keystore`. The library takes the directory as an explicit
 /// argument; deriving it from the config stays with the application.
 pub(crate) fn keystore_dir(config_path: Option<&Path>) -> PathBuf {
-    crate::tor_setup::arti_base_dir(config_path)
+    tor_socks5_runtime::tor_setup::arti_base_dir(config_path)
         .join("state")
         .join("keystore")
 }

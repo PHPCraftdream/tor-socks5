@@ -45,7 +45,7 @@ async fn next_discovery_event<F: Future + ?Sized>(
     }
 }
 
-pub(crate) fn preferred_missing(cfg: &Config, bridges: &[BridgeLine]) -> bool {
+pub fn preferred_missing(cfg: &Config, bridges: &[BridgeLine]) -> bool {
     cfg.bridges.preferred_transport().is_some_and(|transport| {
         !bridges
             .iter()
@@ -104,7 +104,7 @@ fn activate(
     Ok(())
 }
 
-pub(crate) fn spawn(
+pub fn spawn(
     handle: TorHandle,
     config_path: Option<PathBuf>,
     interval_mins: u64,
@@ -112,7 +112,7 @@ pub(crate) fn spawn(
     mut active: Settings,
     token: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seams"))]
     crate::test_seams::forbid_producer("maintenance");
     #[cfg(test)]
     let probe = PRE_PROBE.try_with(std::sync::Arc::clone).ok();
@@ -190,9 +190,9 @@ pub(crate) fn spawn(
 pub(crate) async fn load_config_off_worker(path: Option<&Path>) -> Result<Config> {
     let path = path.map(Path::to_path_buf);
     crate::workers::run_fallible_blocking(move || {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seams"))]
         crate::test_seams::note_task_context(crate::test_seams::Site::MaintenanceConfigLoad);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(path) = path.as_deref() {
             crate::test_seams::park_if_armed(crate::test_seams::Site::MaintenanceConfigLoad, path);
         }
@@ -319,7 +319,7 @@ async fn refresh_pre(
     let configured = cfg.pre_proxies.as_ref().is_some_and(|pool| {
         pool.members()
             .iter()
-            .any(|member| &crate::route::pre_endpoint(member) == endpoint)
+            .any(|member| &arti_wrapper::Socks5PreEndpoint::from_pool_member(member) == endpoint)
     });
     if !configured || active.pre_endpoint.as_ref() != Some(endpoint) {
         anyhow::bail!("изменение pre требует перезапуска");
