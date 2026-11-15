@@ -341,6 +341,7 @@ const OBSERVATION_LAYER_FILTER: &str = "tor_guardmgr=trace";
 ///
 /// ```no_run
 /// use tracing_subscriber::layer::SubscriberExt;
+/// use tracing_subscriber::util::SubscriberInitExt;
 /// use tor_socks5_runtime::arti_observability::{observation_layer, ObservationSink};
 ///
 /// let sink = ObservationSink::new();
