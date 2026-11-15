@@ -5,6 +5,16 @@
 `tor_watchdog.rs` / `fetch_merge.rs` / `bridge-store` / `android-ffi/engine.rs`,
 документ `docs/upstream/guard-exhaustion-watchdog-spiral.md`.
 
+**Статус (сверено с кодом 2026-11-15).** Фазы 1a, 1b, 2a–2c и 3 реализованы:
+`should_override_decline`, `should_signal_failover` и `signal_budget_available`
+(`tor_watchdog_runtime.rs`); канальная проверка и `note_channel_success_at`
+(`bridge_maintenance/channel_probe.rs`); `run_circuit_verify_tick`
+(`bridge_verifier.rs`); запасной пробинг по `preferred_bridges` (`tor_setup.rs`).
+Пункт 2d (ранжирование) с кодом не сверялся. Фаза 0 — операционная, по
+репозиторию не проверяется. Фаза 4 не начата. Текст ниже — запись решения на
+дату плана и не обновлялся; порядок сборки из §4 устарел: тесты и сборки идут
+в GitHub CI ([testing.md](../project/testing.md)).
+
 ---
 
 ## 1. Диагноз: почему нестабильно
@@ -76,9 +86,8 @@
 
 ### Фаза 0 — операционная, без кода: вычистить мусор
 
-- Удалить `obfs4 8.8.8.8:443 0353110423...` из
-  `C:\Users\Computer\Desktop\resocks5\tor-socks5\tor-socks5.ktav`
-  (`bridges.lines`) и из `tor-socks5.candidates.log` (если есть).
+- Удалить `obfs4 8.8.8.8:443 0353110423...` из рабочего конфига сервиса
+  `tor-socks5.ktav` (`bridges.lines`) и из `tor-socks5.candidates.log` (если есть).
 - Перезапуск сервиса. Бекап перед изменением (стандартная практика).
 - Примечание: до Фазы 2 мусор может вернуться через `drain_pool` из
   свежескрейпленных источников — это приемлемо на несколько дней.
@@ -194,8 +203,8 @@ unreachable» retry идёт по `parsed_bridges` (все транспорты)
 
 ## 4. Сборка, деплой, проверка успеха
 
-- Сборка только в изолированном
-  `CARGO_TARGET_DIR=D:\dev\rust\tor-socks5\.target-local`; полный
+- Сборка только в изолированном `CARGO_TARGET_DIR` внутри репозитория
+  (`.target-local`); полный
   `fmt` / `clippy -D warnings` / `test --workspace` перед каждым коммитом.
 - Деплой — только по явной команде пользователя, с бекапом прод-состояния
   (exe/ktav/логи/arti-data) перед заменой.
