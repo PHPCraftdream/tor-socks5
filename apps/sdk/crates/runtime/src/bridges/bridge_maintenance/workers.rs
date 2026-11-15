@@ -360,6 +360,23 @@ impl TestWorkers {
     }
 }
 
+/// Занятые ячейки процессного реестра: несобранный поток или несданная ошибка.
+/// Ноль после остановки сервера означает, что реестр свободен для следующего запуска.
+#[cfg(any(test, feature = "test-seams"))]
+pub async fn global_busy_count() -> usize {
+    let mut busy = 0;
+    for slot in BLOCKING_WORKERS.snapshot().expect("process registry") {
+        let state = slot.lock().await;
+        let failed = state
+            .failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+        busy += usize::from(state.handle.is_some() || failed);
+    }
+    busy
+}
+
 // Отмена ожидания не удаляет дескрипторы и сохранённые ошибки.
 pub async fn join_blocking_workers() -> anyhow::Result<()> {
     #[cfg(any(test, feature = "test-seams"))]

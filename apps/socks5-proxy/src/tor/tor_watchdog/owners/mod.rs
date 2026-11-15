@@ -407,6 +407,11 @@ impl OwnerRegistry {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(super) fn is_retained() -> bool {
+        RETAINED.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
     pub(super) async fn recover_retained_with_deadline(deadline: Instant) -> Result<()> {
         let registry = RETAINED
             .lock()

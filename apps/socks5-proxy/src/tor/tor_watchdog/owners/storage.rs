@@ -7,7 +7,8 @@ use anyhow::{anyhow, bail, Result};
 
 const LIMIT: usize = 15;
 const MARKER: &[u8] = b"tor-socks5 owners-v1\n";
-#[cfg(not(test))]
+// Статик существует и в тестах ради `quarantine_held`; сами тесты берут хранилище
+// через карантин реестра.
 static QUARANTINE: Mutex<Vec<File>> = Mutex::new(Vec::new());
 
 pub(super) struct Storage {
@@ -44,6 +45,12 @@ fn require_directory(path: &Path) -> Result<()> {
 #[cfg(not(test))]
 pub(super) fn acquire(base: &Path) -> Result<Storage> {
     acquire_with_quarantine(base, &QUARANTINE)
+}
+
+/// Сколько блокировок процессный карантин держит до выхода процесса.
+#[cfg(test)]
+pub(super) fn quarantine_held() -> usize {
+    QUARANTINE.lock().unwrap_or_else(|e| e.into_inner()).len()
 }
 
 pub(super) fn acquire_with_quarantine(

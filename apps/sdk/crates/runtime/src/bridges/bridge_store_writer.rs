@@ -832,6 +832,15 @@ pub fn init_global(config_path: Option<&Path>) -> StoreWriter {
     }
 }
 
+/// Свободен ли процессный слот писателя: нет ни живого, ни закрываемого.
+#[cfg(any(test, feature = "test-seams"))]
+pub fn global_is_idle() -> bool {
+    matches!(
+        &*WRITER.lock().unwrap_or_else(|error| error.into_inner()),
+        Slot::Idle
+    )
+}
+
 /// The process writer, if one exists (live, or still finishing a close).
 fn global() -> Option<StoreWriter> {
     match &*WRITER.lock().unwrap_or_else(|error| error.into_inner()) {

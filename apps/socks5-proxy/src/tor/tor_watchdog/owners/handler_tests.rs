@@ -60,7 +60,7 @@ async fn run_server_reports_final_flush_worker_panic() {
                 let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
                 let hook = Arc::new(super::super::global_init::ShutdownHook {
                     settings,
-                    writer,
+                    writer: Some(writer),
                     ready: std::sync::Mutex::new(Some(ready_tx)),
                 });
                 let (config_path, config) =
