@@ -94,8 +94,9 @@ fn new_list_show_export_remove_import_roundtrip() {
     let bytes = std::fs::read(&export).expect("export bytes");
     assert!(!bytes.is_empty());
 
-    // remove (guarded), then import restores the same address
-    assert!(ops::remove_service(&t.config, &t.keystore, "svc").is_err());
+    // remove, then import restores the same address
+    // The library remove has no confirmation guard: `--yes` is the CLI's
+    // concern (the CLI shell keeps that guard and tests it there).
     ops::remove_service(&t.config, &t.keystore, "svc").expect("remove");
     assert!(stored(&t).is_empty());
     let recorded =
@@ -614,5 +615,16 @@ fn specifier_paths_match_the_tor_hsservice_layout() {
             .expect("arti path")
             .as_str(),
         "hss/web/kp_hs_id"
+    );
+    // The public specifier must carry the keypair link: KeyMgr derives the
+    // public part from the pair through it (`KeyMgr::get_from_store`);
+    // without it `store::address` returns None even though the pair is
+    // stored (this exact regression shipped once).
+    let keypair = HsIdPublicKeySpecifier::new(store::nickname("web").expect("nickname"))
+        .keypair_specifier()
+        .expect("the public specifier must know its keypair");
+    assert_eq!(
+        keypair.arti_path().expect("arti path").as_str(),
+        "hss/web/ks_hs_id"
     );
 }
