@@ -67,7 +67,10 @@
 //!   deadline — and resolves with the flush result. Server shutdown calls
 //!   [`close_global`] after stopping the producer tasks. Test writers that
 //!   drop all handles without closing keep the legacy best-effort final
-//!   flush, but the angel must use the explicit protocol.
+//!   flush, but the angel must use the explicit protocol. After
+//!   [`close_global`] the slot is empty, so the next [`init_global`] starts
+//!   a fresh writer — an engine restarted in the same process does not
+//!   inherit a dead one.
 //! * CLI subcommands and unit tests run without an initialized writer and
 //!   fall back to an inline load→mutate→save under the same per-path write
 //!   lock, with a bounded wait ([`persist_lock::CLI_LOCK_WAIT`]) so a
@@ -77,7 +80,7 @@
 
 use std::any::Any;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -707,36 +710,122 @@ async fn try_start_publish(
     }
 }
 
-static WRITER: OnceLock<StoreWriter> = OnceLock::new();
-
-/// Start the process-wide store writer. Angel startup calls this once,
-/// before any task that writes the store. A second call logs a warning and
-/// returns the existing writer.
-pub(crate) fn init_global(config_path: Option<&Path>) -> StoreWriter {
-    let resolved = BridgeStore::resolve_path(config_path);
-    let writer = WRITER.get_or_init(|| {
-        StoreWriter::spawn(resolved.clone(), Arc::new(|s| s.save()), INITIAL_BACKOFF)
-    });
-    if writer.path() != resolved {
-        warn!(
-            configured = %resolved.display(),
-            active = %writer.path().display(),
-            "bridge store writer already started for a different path; keeping the original"
-        );
-    }
-    writer.clone()
+/// Process-wide writer slot. Unlike a `OnceLock`, [`close_global`] empties
+/// the slot, so a restarted engine in the same process gets a fresh writer
+/// instead of a closed one.
+///
+/// The mutex guards only slot bookkeeping and is never held across an
+/// `.await`. Race contract:
+/// * `init_global` spawns only in `Idle`, under the lock — two racing inits
+///   cannot create two writers.
+/// * `close_global` claims `Active -> Closing` under the lock, then closes
+///   on a dedicated task; while `Closing`, `init_global` hands back the
+///   writer being closed instead of spawning a second live writer, and a
+///   second `close_global` gets `None`.
+/// * The closing task empties the slot (`Closing -> Idle`) as soon as the
+///   close completes, so the slot never keeps referencing a closed writer.
+enum Slot {
+    Idle,
+    Active(StoreWriter),
+    Closing(StoreWriter),
 }
 
-fn global() -> Option<&'static StoreWriter> {
-    WRITER.get()
+static WRITER: Mutex<Slot> = Mutex::new(Slot::Idle);
+
+/// Serializes the tests that drive the process-global writer slot (each
+/// uses its own tempdir path, but the slot itself is process-global).
+#[cfg(test)]
+pub(crate) static GLOBAL_WRITER_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+/// Start the process-wide store writer. Angel startup calls this once,
+/// before any task that writes the store. A second call returns the
+/// existing writer; while a close started by [`close_global`] is still
+/// finishing, that writer is the one being closed — spawning a second live
+/// writer would break the single-writer contract. After a close completes
+/// the next call starts a fresh writer, so an engine restarted in the same
+/// process does not inherit a dead one.
+pub(crate) fn init_global(config_path: Option<&Path>) -> StoreWriter {
+    let resolved = BridgeStore::resolve_path(config_path);
+    let mut slot = WRITER.lock().unwrap_or_else(|error| error.into_inner());
+    let writer = match &*slot {
+        Slot::Active(writer) | Slot::Closing(writer) => Some(writer.clone()),
+        Slot::Idle => None,
+    };
+    match writer {
+        Some(writer) => {
+            if writer.path() != resolved {
+                warn!(
+                    configured = %resolved.display(),
+                    active = %writer.path().display(),
+                    "bridge store writer already started for a different path; keeping the original"
+                );
+            }
+            writer
+        }
+        None => {
+            let writer =
+                StoreWriter::spawn(resolved.clone(), Arc::new(|s| s.save()), INITIAL_BACKOFF);
+            *slot = Slot::Active(writer.clone());
+            writer
+        }
+    }
+}
+
+/// The process writer, if one exists (live, or still finishing a close).
+fn global() -> Option<StoreWriter> {
+    match &*WRITER.lock().unwrap_or_else(|error| error.into_inner()) {
+        Slot::Active(writer) | Slot::Closing(writer) => Some(writer.clone()),
+        Slot::Idle => None,
+    }
 }
 
 /// Close the process-wide store writer at server shutdown, after the
 /// producer tasks have stopped: waits for the in-flight publish, flushes any
-/// retained snapshot and joins the actor. `None` when no writer was started
-/// (CLI subcommands, tests).
+/// retained snapshot and joins the actor. Returns `None` when no writer is
+/// running — none was started (CLI subcommands, tests), one already
+/// stopped, or another caller owns the in-progress close. The close always
+/// finishes and empties the slot, even if the caller is cancelled.
 pub(crate) async fn close_global() -> Option<Result<()>> {
-    Some(global()?.close().await)
+    let writer = {
+        let mut slot = WRITER.lock().unwrap_or_else(|error| error.into_inner());
+        let Slot::Active(writer) = &*slot else {
+            // Idle: nothing was started (or it already stopped); Closing:
+            // another caller owns the in-progress close.
+            return None;
+        };
+        let writer = writer.clone();
+        *slot = Slot::Closing(writer.clone());
+        writer
+    };
+    // Close on a dedicated task: the claim above is synchronous, so a
+    // cancelled caller can never strand the slot in `Closing` — the spawned
+    // close always runs to completion and empties the slot. On cancellation
+    // the handle is dropped and the task detaches: fire-and-forget on
+    // purpose, the close itself must still finish.
+    let joined = tokio::spawn(async move {
+        let result = writer.close().await;
+        let mut slot = WRITER.lock().unwrap_or_else(|error| error.into_inner());
+        if matches!(&*slot, Slot::Closing(_)) {
+            *slot = Slot::Idle;
+        }
+        result
+    })
+    .await;
+    match joined {
+        Ok(result) => Some(result),
+        Err(join_error) => {
+            // The close task died before emptying the slot; release it so a
+            // later init can start a fresh writer.
+            let mut slot = WRITER.lock().unwrap_or_else(|error| error.into_inner());
+            if matches!(&*slot, Slot::Closing(_)) {
+                *slot = Slot::Idle;
+            }
+            Some(Err(anyhow!(
+                "bridge store writer close task panicked: {join_error}"
+            )))
+        }
+    }
 }
 
 /// Apply a mutation through the single writer when this process has one for

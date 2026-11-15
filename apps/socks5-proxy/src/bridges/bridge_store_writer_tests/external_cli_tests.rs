@@ -173,3 +173,74 @@ async fn external_cli_write_after_successful_retry_survives() {
         "no leftover temp files"
     );
 }
+
+/// init_global → close_global → init_global must hand out a fresh, live
+/// writer (the engine restart path runs in one process), never the closed
+/// one. Serialized with the other global-slot test via the shared test
+/// lock; each side clears a writer left behind by a failed predecessor
+/// before initializing.
+#[tokio::test]
+async fn init_close_init_gets_a_fresh_live_writer() {
+    let _lifecycle = crate::bridge_store_writer::GLOBAL_WRITER_TEST_LOCK
+        .lock()
+        .await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let b = test_bridge();
+    let path = config_path(dir.path());
+    seed_store(&path, &b);
+
+    // Clear any writer a panicked predecessor may have left behind.
+    drop(close_global().await);
+
+    let first = init_global(Some(path.as_path()));
+    // Re-init without close returns the existing writer, not a second one.
+    let again = init_global(Some(path.as_path()));
+    assert!(
+        Arc::ptr_eq(&first.actor, &again.actor),
+        "re-init without close must return the existing writer"
+    );
+
+    close_global()
+        .await
+        .expect("close runs when a writer is up")
+        .expect("close succeeds");
+
+    // The closed writer is dead: it must reject mutations.
+    let b1 = b.clone();
+    assert!(
+        first
+            .apply(move |s| s.note_channel_success_at(&b1, OffsetDateTime::now_utc()))
+            .await
+            .is_err(),
+        "the closed writer must reject mutations"
+    );
+
+    // Re-init after close must NOT hand back the closed writer.
+    let second = init_global(Some(path.as_path()));
+    assert!(
+        !Arc::ptr_eq(&first.actor, &second.actor),
+        "init after close must start a fresh writer"
+    );
+
+    // The fresh writer accepts and publishes records end to end.
+    let b2 = b.clone();
+    second
+        .apply(move |s| s.note_channel_success_at(&b2, OffsetDateTime::now_utc()))
+        .await
+        .expect("fresh writer absorbs the mutation");
+    wait_for_file_count(&path, &b, 1, "fresh writer publishes").await;
+
+    // Stopping again empties the slot: a second close reports None.
+    close_global()
+        .await
+        .expect("close runs when a writer is up")
+        .expect("close succeeds");
+    assert!(
+        close_global().await.is_none(),
+        "close without a running writer returns None"
+    );
+    assert!(
+        leftover_tmp_files(dir.path()).is_empty(),
+        "no leftover temp files"
+    );
+}
