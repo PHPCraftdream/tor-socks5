@@ -480,7 +480,7 @@ class External(unittest.TestCase):
 
     def test_capability_git_removal_and_absence(self):
         anchors = ("scripts/testing/real-tor-channel.sh", "scripts/testing/real-tor-mutations.sh",
-                   "apps/socks5-proxy/src/bridges/bridge_maintenance/real_channel_tests.rs")
+                   "apps/sdk/crates/runtime/src/bridges/bridge_maintenance/real_channel_tests.rs")
         self.git("rm", anchors[0])
         self.commit("remove one anchor")
         self.push(ok=False)

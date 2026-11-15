@@ -86,7 +86,7 @@
 //! by CI rather than silently breaking observation in production.
 //!
 //! Coupling: this module knows nothing about [`BridgeStore`] — it only
-//! produces observations. The consumer side ([`crate::server`]) decides
+//! produces observations. The consumer side (crate::server) decides
 //! when and how to apply them.
 
 use std::sync::{Arc, Mutex};

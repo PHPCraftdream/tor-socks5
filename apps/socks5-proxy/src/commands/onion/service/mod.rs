@@ -45,7 +45,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::onion::{identity, store};
-use crate::tor_watchdog::TorHandle;
+use tor_socks5_runtime::tor_watchdog::TorHandle;
 
 /// Delay before the first relaunch attempt after a failed launch; doubles
 /// up to [`RETRY_DELAY_MAX`] and stays there for the process' lifetime.
@@ -147,7 +147,7 @@ async fn run_services(
     // joined below. Failing to get it is NOT fatal: the proxy keeps running
     // without onion services.
     let dir = store::keystore_dir(config_path.as_deref());
-    let lock = crate::workers::run_fallible_blocking(move || store::lock(&dir)).await;
+    let lock = tor_socks5_runtime::workers::run_fallible_blocking(move || store::lock(&dir)).await;
     let _lock = match lock {
         Ok(Ok(guard)) => Some(guard),
         Ok(Err(error)) => {

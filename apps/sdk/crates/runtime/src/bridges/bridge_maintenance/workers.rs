@@ -2,24 +2,24 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 // Неполученные ошибки занимают ячейки до терминального join.
 const BLOCKING_WORKER_LIMIT: usize = 64;
-pub(crate) type WorkerSlot = Arc<tokio::sync::Mutex<WorkerState>>;
+pub type WorkerSlot = Arc<tokio::sync::Mutex<WorkerState>>;
 #[derive(Default)]
-pub(crate) struct WorkerState {
+pub struct WorkerState {
     handle: Option<tokio::task::JoinHandle<()>>,
     failure: Arc<Mutex<Option<anyhow::Error>>>,
 }
 #[derive(Debug)]
-pub(crate) struct WorkerFailures(Vec<anyhow::Error>);
+pub struct WorkerFailures(Vec<anyhow::Error>);
 impl WorkerFailures {
     pub(crate) fn new(errors: Vec<anyhow::Error>) -> Self {
         Self(errors)
     }
 
-    #[cfg(test)]
-    pub(crate) fn into_errors(self) -> Vec<anyhow::Error> {
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn into_errors(self) -> Vec<anyhow::Error> {
         self.0
     }
-    pub(crate) fn errors(&self) -> &[anyhow::Error] {
+    pub fn errors(&self) -> &[anyhow::Error] {
         &self.0
     }
 }
@@ -41,15 +41,15 @@ impl std::error::Error for WorkerFailures {
 struct WorkerRegistry {
     slots: Mutex<Vec<WorkerSlot>>,
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seams"))]
 thread_local! { static CURRENT_SLOT: std::cell::RefCell<Option<WorkerSlot>> = const { std::cell::RefCell::new(None) }; }
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn current_slot() -> Option<WorkerSlot> {
     CURRENT_SLOT.with(|slot| slot.borrow().clone())
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seams"))]
 struct SlotGuard;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seams"))]
 impl Drop for SlotGuard {
     fn drop(&mut self) {
         CURRENT_SLOT.with(|slot| *slot.borrow_mut() = None);
@@ -121,7 +121,7 @@ impl<T> Delivery<T> {
         self.result
     }
 }
-pub(crate) struct FallibleReceiver<T>(tokio::sync::oneshot::Receiver<Delivery<T>>);
+pub struct FallibleReceiver<T>(tokio::sync::oneshot::Receiver<Delivery<T>>);
 impl<T> std::future::Future for FallibleReceiver<T> {
     type Output = Result<anyhow::Result<T>, tokio::sync::oneshot::error::RecvError>;
     fn poll(
@@ -269,11 +269,11 @@ impl WorkerRegistry {
         let state = WorkerState::default();
         let failure = state.failure.clone();
         let slot = Arc::new(tokio::sync::Mutex::new(state));
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-seams"))]
         let current = slot.clone();
         let worker = tokio::task::spawn_blocking(move || {
             let _guard = span.enter();
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-seams"))]
             let _slot_guard = {
                 CURRENT_SLOT.with(|slot| *slot.borrow_mut() = Some(current));
                 SlotGuard
@@ -294,28 +294,28 @@ impl WorkerRegistry {
 }
 
 // Отдельный реестр исключает влияние параллельных тестов на общий бюджет ожидания.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seams"))]
 #[derive(Default)]
-pub(crate) struct TestWorkers(WorkerRegistry);
+pub struct TestWorkers(WorkerRegistry);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seams"))]
 tokio::task_local! {
     static TEST_WORKERS: Arc<TestWorkers>;
 }
 
-#[cfg(test)]
-pub(crate) fn test_registry() -> Option<Arc<TestWorkers>> {
+#[cfg(any(test, feature = "test-seams"))]
+pub fn test_registry() -> Option<Arc<TestWorkers>> {
     TEST_WORKERS.try_with(Arc::clone).ok()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seams"))]
 impl TestWorkers {
     // Область действует только в текущей задаче, а не в её потомках.
-    pub(crate) async fn scope<F: std::future::Future>(self: &Arc<Self>, future: F) -> F::Output {
+    pub async fn scope<F: std::future::Future>(self: &Arc<Self>, future: F) -> F::Output {
         TEST_WORKERS.scope(self.clone(), future).await
     }
 
-    pub(crate) async fn owns_pending(&self, target: &WorkerSlot) -> bool {
+    pub async fn owns_pending(&self, target: &WorkerSlot) -> bool {
         let owns = self
             .0
             .snapshot()
@@ -329,11 +329,11 @@ impl TestWorkers {
             .as_ref()
             .is_some_and(|handle| !handle.is_finished())
     }
-    pub(crate) async fn cleared(&self, target: &WorkerSlot) -> bool {
+    pub async fn cleared(&self, target: &WorkerSlot) -> bool {
         target.lock().await.handle.is_none()
     }
 
-    pub(crate) async fn pending_count(&self) -> usize {
+    pub async fn pending_count(&self) -> usize {
         let mut count = 0;
         for slot in self.0.snapshot().expect("test registry") {
             count += usize::from(slot.lock().await.handle.is_some());
@@ -341,28 +341,28 @@ impl TestWorkers {
         count
     }
 
-    pub(crate) async fn spawn<T: Send + 'static>(
+    pub async fn spawn<T: Send + 'static>(
         &self,
         work: impl FnOnce() -> T + Send + 'static,
     ) -> anyhow::Result<tokio::sync::oneshot::Receiver<T>> {
         self.0.spawn(work, None).await
     }
 
-    pub(crate) async fn spawn_fallible<T: Send + 'static>(
+    pub async fn spawn_fallible<T: Send + 'static>(
         &self,
         work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
     ) -> anyhow::Result<FallibleReceiver<T>> {
         self.0.spawn_fallible(work, None).await
     }
 
-    pub(crate) async fn join(&self) -> anyhow::Result<()> {
+    pub async fn join(&self) -> anyhow::Result<()> {
         self.0.join().await
     }
 }
 
 // Отмена ожидания не удаляет дескрипторы и сохранённые ошибки.
-pub(crate) async fn join_blocking_workers() -> anyhow::Result<()> {
-    #[cfg(test)]
+pub async fn join_blocking_workers() -> anyhow::Result<()> {
+    #[cfg(any(test, feature = "test-seams"))]
     if let Ok(registry) = TEST_WORKERS.try_with(Arc::clone) {
         return registry.0.join().await;
     }
@@ -372,7 +372,7 @@ pub(crate) async fn join_blocking_workers() -> anyhow::Result<()> {
 pub(crate) async fn spawn_tracked_blocking<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> anyhow::Result<tokio::sync::oneshot::Receiver<T>> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seams"))]
     if let Ok(registry) = TEST_WORKERS.try_with(Arc::clone) {
         return registry.0.spawn(work, None).await;
     }
@@ -382,7 +382,7 @@ pub(crate) async fn spawn_tracked_blocking<T: Send + 'static>(
 pub(crate) async fn run_tracked_blocking<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> anyhow::Result<T> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seams"))]
     if let Ok(registry) = TEST_WORKERS.try_with(Arc::clone) {
         return registry.0.run(work).await;
     }
@@ -392,17 +392,17 @@ pub(crate) async fn run_tracked_blocking<T: Send + 'static>(
 pub(crate) async fn spawn_blocking_with_failure<T: Send + 'static>(
     work: impl FnOnce(Arc<Mutex<Option<anyhow::Error>>>) -> T + Send + 'static,
 ) -> anyhow::Result<tokio::sync::oneshot::Receiver<T>> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seams"))]
     if let Ok(registry) = TEST_WORKERS.try_with(Arc::clone) {
         return registry.0.spawn_with_failure(work, None).await;
     }
     BLOCKING_WORKERS.spawn_with_failure(work, None).await
 }
 
-pub(crate) async fn run_fallible_blocking<T: Send + 'static>(
+pub async fn run_fallible_blocking<T: Send + 'static>(
     work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
 ) -> anyhow::Result<anyhow::Result<T>> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seams"))]
     if let Ok(registry) = TEST_WORKERS.try_with(Arc::clone) {
         return registry.0.run_fallible(work).await;
     }
@@ -411,7 +411,7 @@ pub(crate) async fn run_fallible_blocking<T: Send + 'static>(
 pub(crate) async fn spawn_fallible_blocking<T: Send + 'static>(
     work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
 ) -> anyhow::Result<FallibleReceiver<T>> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seams"))]
     if let Ok(registry) = TEST_WORKERS.try_with(Arc::clone) {
         return registry.0.spawn_fallible(work, None).await;
     }
@@ -465,7 +465,7 @@ pub(super) async fn spawn_for_admission<T: Send + 'static>(
     work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
     group: &AdmissionWorkers,
 ) -> anyhow::Result<FallibleReceiver<T>> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-seams"))]
     if let Ok(registry) = TEST_WORKERS.try_with(Arc::clone) {
         return registry.0.spawn_fallible(work, Some(group)).await;
     }

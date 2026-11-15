@@ -56,7 +56,7 @@ use crate::config::ConnHealthConfig;
 /// tell "the client misbehaved" from "Tor is having a bad time" from
 /// "something else" without grepping the error text — see [`ConnErrorKind`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConnErrorKind {
+pub enum ConnErrorKind {
     /// The client side of the SOCKS5 session misbehaved or disconnected —
     /// e.g. it dropped the TCP connection mid-handshake. Not a proxy or Tor
     /// problem; normal for clients that churn through many parallel
@@ -87,7 +87,7 @@ pub(crate) enum ConnErrorKind {
 /// identical reset mid-relay is reported as [`ConnStage::Relay`] so it does
 /// not inflate the client-misbehavior count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConnStage {
+pub enum ConnStage {
     /// SOCKS5 method negotiation / auth / CONNECT request.
     Handshake,
     /// Establishing the egress (Tor circuit or upstream proxy) connection.
@@ -105,7 +105,7 @@ pub(crate) enum ConnStage {
 /// snapshot); `pending` is the live in-flight gauge and is deliberately NOT
 /// reset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct ConnHealthSnapshot {
+pub struct ConnHealthSnapshot {
     pub started: u64,
     pub connect_ok: u64,
     pub connect_failed: u64,
@@ -164,7 +164,7 @@ impl ConnHealthSnapshot {
 /// per-connection task so the decrement happens wherever that task ends —
 /// error, success, or panic (a panic unwinds through `Drop`, making the
 /// gauge robust against task aborts).
-pub(crate) struct PendingConnectionGuard {
+pub struct PendingConnectionGuard {
     counters: ConnHealthCounters,
 }
 impl Drop for PendingConnectionGuard {
@@ -257,7 +257,7 @@ impl ConnHealthCounters {
     /// periodic summary (at most one event misattributed to the neighboring
     /// window out of however many the window covers) and not worth a `Mutex`
     /// to close.
-    pub(crate) fn snapshot_and_reset(&self) -> ConnHealthSnapshot {
+    pub fn snapshot_and_reset(&self) -> ConnHealthSnapshot {
         ConnHealthSnapshot {
             started: self.started.swap(0, Ordering::Relaxed),
             connect_ok: self.connect_ok.swap(0, Ordering::Relaxed),

@@ -29,13 +29,13 @@ if text.count(old) != 1:
     raise SystemExit("Не найдено единственное место мутации")
 path.write_text(text.replace(old, new, 1), encoding="utf-8")
 PY
-    cargo test -p socks5-proxy --bin socks5-proxy --locked --no-run --message-format=json > "$work/$mutation.json"
+    cargo test -p tor-socks5-runtime --lib --locked --no-run --message-format=json > "$work/$mutation.json"
     binary=$(python3 -I - "$work/$mutation.json" <<'PY'
 import json
 import sys
 items = [x["executable"] for line in open(sys.argv[1], encoding="utf-8")
          if (x := json.loads(line)).get("reason") == "compiler-artifact"
-         and x.get("target", {}).get("name") == "socks5-proxy"
+         and x.get("target", {}).get("name") == "tor_socks5_runtime"
          and x.get("profile", {}).get("test") and x.get("executable")]
 if len(items) != 1:
     raise SystemExit("Не найден единственный тестовый исполняемый файл")

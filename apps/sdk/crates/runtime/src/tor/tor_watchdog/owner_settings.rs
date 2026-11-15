@@ -2,10 +2,7 @@ use super::*;
 
 /// Создаёт ограниченный шаблон владельца без сетевых операций.
 /// Вызывающий код обязан проверить эффективный upstream с учётом CLI и задать pre endpoint.
-pub(crate) fn restricted_owner_settings(
-    cfg: &Config,
-    config_path: Option<&Path>,
-) -> Result<Settings> {
+pub fn restricted_owner_settings(cfg: &Config, config_path: Option<&Path>) -> Result<Settings> {
     restricted_owner_settings_with_override(
         cfg,
         config_path,
@@ -74,7 +71,7 @@ fn restricted_owner_settings_with_override(
 /// Проверяет отличающиеся действующие pre-маршруты до сетевых операций.
 /// Прямому альтернативному маршруту шаблон не нужен; вызывающий код обязан
 /// проверить эффективный upstream с учётом CLI и сохранить шаблон для перезагрузки.
-pub(crate) fn validate_owner_routes(
+pub fn validate_owner_routes(
     cfg: &Config,
     users: &auth::UsersConfig,
     config_path: Option<&Path>,

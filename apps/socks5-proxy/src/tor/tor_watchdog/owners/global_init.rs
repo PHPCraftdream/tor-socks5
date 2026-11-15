@@ -33,7 +33,7 @@ tokio::task_local! {
 #[cfg(test)]
 pub(super) struct ShutdownHook {
     pub settings: Settings,
-    pub writer: crate::bridge_store_writer::StoreWriter,
+    pub writer: tor_socks5_runtime::bridge_store_writer::StoreWriter,
     pub ready: StdMutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
@@ -61,12 +61,15 @@ pub(super) fn init_server_tracing(
     cfg: &crate::config::Config,
 ) -> (
     Option<tracing_appender::non_blocking::WorkerGuard>,
-    crate::arti_observability::ObservationSink,
+    tor_socks5_runtime::arti_observability::ObservationSink,
 ) {
     #[cfg(test)]
     if RUN_SERVER_STARTUP.try_with(|_| ()).is_ok() || RUN_SERVER_SHUTDOWN.try_with(|_| ()).is_ok() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        return (None, crate::arti_observability::ObservationSink::new());
+        return (
+            None,
+            tor_socks5_runtime::arti_observability::ObservationSink::new(),
+        );
     }
     let (guard, sink) = crate::startup::init_tracing(cfg);
     crate::startup::install_crypto_provider();
@@ -78,7 +81,7 @@ pub(super) fn init_store_writer(path: Option<&std::path::Path>) {
     if RUN_SERVER_STARTUP.try_with(|_| ()).is_ok() || RUN_SERVER_SHUTDOWN.try_with(|_| ()).is_ok() {
         return;
     }
-    crate::bridge_store_writer::init_global(path);
+    tor_socks5_runtime::bridge_store_writer::init_global(path);
 }
 
 pub(super) async fn close_store_writer() -> Option<Result<()>> {
@@ -90,7 +93,7 @@ pub(super) async fn close_store_writer() -> Option<Result<()>> {
     if RUN_SERVER_STARTUP.try_with(|_| ()).is_ok() {
         return None;
     }
-    crate::bridge_store_writer::close_global().await
+    tor_socks5_runtime::bridge_store_writer::close_global().await
 }
 
 fn cleanup_budget() -> Duration {
@@ -127,7 +130,10 @@ impl SettingsInit {
         }
         let runtime = tokio::runtime::Handle::current();
         Self::start_job(move || {
-            runtime.block_on(crate::tor_setup::build_tor_settings(&cfg, path.as_deref()))
+            runtime.block_on(tor_socks5_runtime::tor_setup::build_tor_settings(
+                &cfg,
+                path.as_deref(),
+            ))
         })
     }
 

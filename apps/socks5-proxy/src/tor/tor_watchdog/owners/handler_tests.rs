@@ -36,14 +36,14 @@ async fn run_server_reports_final_flush_worker_panic() {
             state_dir: Some(dir.path().join("state")),
             ..Default::default()
         };
-        let registry = Arc::new(crate::workers::TestWorkers::default());
+        let registry = Arc::new(tor_socks5_runtime::workers::TestWorkers::default());
         registry
             .scope(async {
                 let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let publisher_calls = calls.clone();
                 let (first_tx, first_rx) = tokio::sync::oneshot::channel();
                 let first = std::sync::Mutex::new(Some(first_tx));
-                let writer = crate::bridge_store_writer::StoreWriter::spawn(
+                let writer = tor_socks5_runtime::bridge_store_writer::StoreWriter::spawn(
                     bridge_store::BridgeStore::resolve_path(Some(&path)),
                     Arc::new(move |_| {
                         if publisher_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
@@ -89,7 +89,11 @@ async fn run_server_reports_final_flush_worker_panic() {
                     .into_errors();
                 let worker_errors = errors
                     .into_iter()
-                    .filter_map(|error| error.downcast::<crate::workers::WorkerFailures>().ok())
+                    .filter_map(|error| {
+                        error
+                            .downcast::<tor_socks5_runtime::workers::WorkerFailures>()
+                            .ok()
+                    })
                     .flat_map(|failures| failures.into_errors());
                 let panic = worker_errors
                     .filter_map(|error| error.downcast::<tokio::task::JoinError>().ok())

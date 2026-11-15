@@ -29,9 +29,9 @@ SANCTIONED_DEPENDENCY_REMOVALS = frozenset({
 
 
 TOR_ANCHORS = ("scripts/testing/real-tor-channel.sh", "scripts/testing/real-tor-mutations.sh",
-               "apps/socks5-proxy/src/bridges/bridge_maintenance/real_channel_tests.rs")
+               "apps/sdk/crates/runtime/src/bridges/bridge_maintenance/real_channel_tests.rs")
 TOR_MARKERS = {
-    "apps/socks5-proxy/src/bridges/bridge_maintenance.rs": ('#[cfg(test)]\n#[path = "bridge_maintenance/real_channel_tests.rs"]\nmod real_channel_tests;',),
+    "apps/sdk/crates/runtime/src/bridges/bridge_maintenance.rs": ('#[cfg(test)]\n#[path = "bridge_maintenance/real_channel_tests.rs"]\nmod real_channel_tests;',),
     "packages/arti-wrapper/src/lib.rs": ('pub use arti_client::config::BridgeConfigBuilder;', 'pub use tor_chanmgr::ChannelUsage;', '        chanmgr.terminate_all_channels();\n', '        self.inner\n            .reconfigure(&config, Reconfigure::AllOrNothing)\n            .map_err(TorError::Reconfigure)?;\n'),
     TOR_ANCHORS[0]: ('TOR_REAL_ISOLATED', 'real_channel_heal_and_config_selection', '--ignored --exact'),
     TOR_ANCHORS[1]: ('for mutation in terminate reconfigure', 'scripts/testing/real-tor-channel.sh', 'GITHUB_ACTIONS'),
@@ -708,7 +708,7 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
     # Фича-матрица фасада SDK зависит только от его манифеста и тестов.
     if seeds & (graph.named({"tor-socks5"}) & graph.members):
         add("features", "изменён фасад SDK")
-    if any(path.startswith("apps/socks5-proxy/") and any(part in {"tor", "arti", "bridge", "bridges"} or part.startswith(("tor_", "arti_", "bridge_", "bridges_")) for part in path.split("/")) for path in paths):
+    if any(path.startswith(("apps/socks5-proxy/", "apps/sdk/crates/runtime/")) and any(part in {"tor", "arti", "bridge", "bridges"} or part.startswith(("tor_", "arti_", "bridge_", "bridges_")) for part in path.split("/")) for path in paths):
         add("tor", "изменён код контракта Tor proxy")
     if mode == "sprint-full":
         selected = set(graph.members)

@@ -5517,6 +5517,7 @@ dependencies = [
  "tor-socks5-onion",
  "tor-socks5-proto",
  "tor-socks5-route-pool",
+ "tor-socks5-runtime",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -7441,6 +7442,36 @@ dependencies = [
  "tokio-util",
  "tor-socks5-client-acl",
  "tracing",
+]
+
+[[package]]
+name = "tor-socks5-runtime"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "arti-wrapper",
+ "bridge-fetcher",
+ "bridge-probe",
+ "bridge-store",
+ "bridge-verify-core",
+ "futures",
+ "getrandom 0.2.17",
+ "ktav",
+ "persist-lock",
+ "ptrs-gesher-bridge-line",
+ "rustls",
+ "serde_json",
+ "tempfile",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tor-error",
+ "tor-socks5-auth",
+ "tor-socks5-config",
+ "tor-socks5-route-pool",
+ "tracing",
+ "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

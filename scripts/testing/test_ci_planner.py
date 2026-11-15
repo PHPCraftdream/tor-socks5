@@ -465,6 +465,10 @@ class Routing(unittest.TestCase):
     def test_contracts_and_native(self):
         self.assertNotIn("tor", self.route("apps/socks5-proxy/src/commands/auth.rs")["segments"])
         self.assertIn("tor", self.route("apps/socks5-proxy/src/tor/channel.rs")["segments"])
+        self.assertIn("tor", self.route("apps/sdk/crates/runtime/src/tor/conn_health.rs")["segments"])
+        self.assertIn("tor", self.route("apps/sdk/crates/runtime/src/bridges/bridge_verifier.rs")["segments"])
+        self.assertNotIn("tor", self.route("apps/sdk/crates/runtime/src/fetch/seed.rs")["segments"])
+        self.assertNotIn("tor", self.route("apps/sdk/crates/runtime/src/lib.rs")["segments"])
         self.assertIn("license-offline", self.route(".github/release/license/check.py")["segments"])
         self.assertEqual(self.route("LICENSE-MIT")["segments"], ["fast"])
         self.assertEqual(self.route("Cargo.toml", blobs={"Cargo.toml": ("[workspace]\nresolver='2'", "[workspace]\nresolver='2'")})["segments"],

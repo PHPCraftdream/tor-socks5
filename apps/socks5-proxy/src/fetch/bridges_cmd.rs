@@ -14,7 +14,7 @@ use crate::cli::BridgesAction;
 use crate::config::{Config, Loaded};
 use crate::route::reject_unsupported_pool;
 use crate::startup::{init_tracing, install_crypto_provider};
-use crate::tor_setup::build_tor_settings;
+use tor_socks5_runtime::tor_setup::build_tor_settings;
 
 #[cfg(test)]
 tokio::task_local! {
@@ -67,13 +67,18 @@ pub(crate) async fn cmd_bridges(
 
     // Step 1: refresh the candidate pool from the sources over Tor.
     let timeout = Duration::from_secs(timeout_secs);
-    let added =
-        crate::fetch_merge::refresh_candidate_pool(&tor, &cfg, Some(&config_path), timeout).await?;
+    let added = tor_socks5_runtime::fetch_merge::refresh_candidate_pool(
+        &tor,
+        &cfg,
+        Some(&config_path),
+        timeout,
+    )
+    .await?;
 
     if dry_run || no_probe {
         // Fill the pool but do not probe/promote.
-        let pool = crate::candidate_pool::CandidatePool::load(
-            crate::candidate_pool::CandidatePool::resolve_path(Some(&config_path)),
+        let pool = tor_socks5_runtime::candidate_pool::CandidatePool::load(
+            tor_socks5_runtime::candidate_pool::CandidatePool::resolve_path(Some(&config_path)),
         )
         .context("loading candidate pool")?;
         println!(
@@ -85,7 +90,8 @@ pub(crate) async fn cmd_bridges(
         // Step 2: drain — lazily probe the pool and promote up to `count`
         // reachable bridges into the working config.
         let promoted =
-            crate::fetch_merge::drain_pool(Some(&config_path), count, Some(&tor)).await?;
+            tor_socks5_runtime::fetch_merge::drain_pool(Some(&config_path), count, Some(&tor))
+                .await?;
         if promoted == 0 {
             println!("pool refreshed (+{added}); no reachable new bridges promoted");
         } else {

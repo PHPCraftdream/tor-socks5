@@ -40,6 +40,7 @@ bridge-verify-core = { path = "../../packages/bridge-verify-core", version = "0.
 dns-server = { path = "../../packages/dns-server", version = "0.2.0", package = "tor-socks5-dns" }
 persist-lock = { path = "../../packages/persist-lock", version = "0.2.0" }
 tor-socks5-onion = { path = "../../apps/sdk/crates/onion", version = "0.2.0" }
+tor-socks5-runtime = { path = "../../apps/sdk/crates/runtime", version = "0.2.0" }
 rusqlite = { workspace = true }
 proxy-config = { path = "../../packages/proxy-config", version = "0.2.0", package = "tor-socks5-config" }
 socks5-proto = { path = "../../packages/socks5-proto", version = "0.2.0", package = "tor-socks5-proto" }
@@ -98,6 +99,7 @@ tracing-appender.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+tor-socks5-runtime = { path = "../../apps/sdk/crates/runtime", version = "0.2.0", features = ["test-seams"] }
 
 [[bench]]
 name = "socks5_bench"

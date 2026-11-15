@@ -206,7 +206,7 @@ impl ActiveBridges {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct BridgeRefresh {
+pub struct BridgeRefresh {
     needed: AtomicBool,
     notify: Notify,
     recovery: Arc<Notify>,

@@ -700,7 +700,7 @@ async fn shutdown_producers_delayed_write_lands_before_close() {
     // A real writer (the same actor the angel's producers write through),
     // locally spawned: the process-global OnceLock would leak this test's
     // path into every other test in the binary.
-    let writer = crate::bridge_store_writer::StoreWriter::spawn(
+    let writer = tor_socks5_runtime::bridge_store_writer::StoreWriter::spawn(
         BridgeStore::resolve_path(Some(&config_path)),
         Arc::new(|s| s.save()),
         Duration::from_secs(1),

@@ -151,7 +151,7 @@ struct ActorState {
 }
 
 #[derive(Clone)]
-pub(crate) struct StoreWriter {
+pub struct StoreWriter {
     tx: mpsc::Sender<Op>,
     path: PathBuf,
     /// Дескриптор остаётся в ячейке до завершения ожидания, даже при отмене close.
@@ -233,10 +233,7 @@ impl StoreWriter {
     /// a panic the snapshot's state is unknown, so it is dropped (the next
     /// op reloads from disk) and the caller must assume the mutation did
     /// not land.
-    pub(crate) async fn apply(
-        &self,
-        apply: impl FnOnce(&mut BridgeStore) + Send + 'static,
-    ) -> Result<()> {
+    pub async fn apply(&self, apply: impl FnOnce(&mut BridgeStore) + Send + 'static) -> Result<()> {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.tx
             .send(Op::Mutate {
@@ -256,7 +253,7 @@ impl StoreWriter {
     /// отмена ожидания ответа или handle сохраняет исходный результат актора.
     /// Первый завершивший join получает результат; последующие получают `Ok`.
     /// Возвращает `Err` при ошибке финальной записи или гибели актора.
-    pub(crate) async fn close(&self) -> Result<()> {
+    pub async fn close(&self) -> Result<()> {
         let mut state = self.actor.lock().await;
         if state.handle.is_none() {
             return Ok(());
@@ -292,7 +289,7 @@ impl StoreWriter {
         result
     }
 
-    pub(crate) fn spawn(path: PathBuf, publish: Publisher, initial_backoff: Duration) -> Self {
+    pub fn spawn(path: PathBuf, publish: Publisher, initial_backoff: Duration) -> Self {
         let (tx, mut rx) = mpsc::channel::<Op>(64);
         let actor_path = path.clone();
         let retirements: RetirementLog = Arc::default();
@@ -394,7 +391,7 @@ impl StoreWriter {
                         };
                         let _ = reply.send(reply_result);
                     }
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-seams"))]
                     {
                         let seam_path = path.clone();
                         let _ = tokio::task::spawn_blocking(move || {
@@ -745,7 +742,7 @@ pub(crate) static GLOBAL_WRITER_TEST_LOCK: tokio::sync::Mutex<()> =
 /// writer would break the single-writer contract. After a close completes
 /// the next call starts a fresh writer, so an engine restarted in the same
 /// process does not inherit a dead one.
-pub(crate) fn init_global(config_path: Option<&Path>) -> StoreWriter {
+pub fn init_global(config_path: Option<&Path>) -> StoreWriter {
     let resolved = BridgeStore::resolve_path(config_path);
     let mut slot = WRITER.lock().unwrap_or_else(|error| error.into_inner());
     let writer = match &*slot {
@@ -786,7 +783,7 @@ fn global() -> Option<StoreWriter> {
 /// running — none was started (CLI subcommands, tests), one already
 /// stopped, or another caller owns the in-progress close. The close always
 /// finishes and empties the slot, even if the caller is cancelled.
-pub(crate) async fn close_global() -> Option<Result<()>> {
+pub async fn close_global() -> Option<Result<()>> {
     let writer = {
         let mut slot = WRITER.lock().unwrap_or_else(|error| error.into_inner());
         let Slot::Active(writer) = &*slot else {
@@ -839,12 +836,12 @@ pub(crate) async fn apply(
     match global() {
         Some(writer) if writer.path() == resolved => writer.apply(apply).await,
         _ => crate::workers::run_fallible_blocking(move || {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-seams"))]
             crate::test_seams::park_if_armed(crate::test_seams::Site::PreAcquire, &resolved);
             let lock = PathLock::acquire_bounded(&resolved, CLI_LOCK_WAIT)
                 .context("bridge health store write lock")?;
             let mut store = BridgeStore::load(resolved.clone())?;
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-seams"))]
             crate::test_seams::park_if_armed(crate::test_seams::Site::PostLoad, &resolved);
             apply(&mut store);
             let saved = store.save();

@@ -1,32 +1,14 @@
 #[path = "commands/angel.rs"]
 mod angel;
-#[path = "tor/arti_observability.rs"]
-mod arti_observability;
-#[path = "bridges/bridge_maintenance.rs"]
-mod bridge_maintenance;
-#[path = "bridges/bridge_maintenance/bridge_rank.rs"]
-mod bridge_rank;
-#[path = "bridges/bridge_store_writer.rs"]
-mod bridge_store_writer;
-#[path = "bridges/bridge_verifier.rs"]
-mod bridge_verifier;
-#[path = "bridges/bridge_warmer.rs"]
-mod bridge_warmer;
 #[path = "fetch/bridges_cmd.rs"]
 mod bridges_cmd;
-#[path = "bridges/candidate_pool.rs"]
-mod candidate_pool;
 #[path = "commands/cli.rs"]
 mod cli;
 mod config;
 #[path = "commands/config_cmd.rs"]
 mod config_cmd;
-#[path = "tor/conn_health.rs"]
-mod conn_health;
 #[path = "server/dns_wiring.rs"]
 mod dns_wiring;
-#[path = "fetch/fetch_merge/fetch_merge.rs"]
-mod fetch_merge;
 #[path = "commands/help_cmd.rs"]
 mod help_cmd;
 // Onion helpers: the address/vanity core is not wired into the CLI yet.
@@ -35,8 +17,6 @@ mod help_cmd;
 mod onion;
 #[path = "server/egress/route.rs"]
 mod route;
-#[path = "fetch/seed.rs"]
-mod seed;
 #[path = "server/server.rs"]
 mod server;
 #[path = "commands/service.rs"]
@@ -45,22 +25,10 @@ mod service;
 mod shutdown;
 #[path = "server/startup.rs"]
 mod startup;
-#[cfg(test)]
-#[path = "tor/test_seams.rs"]
-mod test_seams;
-#[path = "tor/tor_setup.rs"]
-mod tor_setup;
-#[path = "tor/tor_watchdog/tor_watchdog.rs"]
-mod tor_watchdog;
-#[cfg(test)]
-#[path = "tor/ts19_tests.rs"]
-mod ts19_tests;
 #[path = "server/egress/upstream.rs"]
 mod upstream;
 #[path = "commands/users_cli/mod.rs"]
 mod users_cli;
-#[path = "bridges/bridge_maintenance/workers.rs"]
-mod workers;
 
 use anyhow::{Context, Result};
 use clap::Parser;

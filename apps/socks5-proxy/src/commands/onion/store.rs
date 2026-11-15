@@ -38,7 +38,7 @@ const EXPANDED_PRIVATE_EXT: &str = "ed25519_expanded_private";
 /// server hands to arti as its state base, and arti pins its keystore under
 /// `<state>/keystore`.
 pub(crate) fn keystore_dir(config_path: Option<&Path>) -> PathBuf {
-    crate::tor_setup::arti_base_dir(config_path)
+    tor_socks5_runtime::tor_setup::arti_base_dir(config_path)
         .join("state")
         .join("keystore")
 }

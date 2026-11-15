@@ -94,8 +94,8 @@ jobs:
           ./configure --disable-asciidoc --disable-manpage
           make -j2
           cd "$GITHUB_WORKSPACE"
-          cargo test -p socks5-proxy --bin socks5-proxy --locked --no-run --message-format=json > "$work/artifacts.json"
-          python3 -I -c 'import json,sys; p=sys.argv[1]; a=[x["executable"] for l in open(p) if (x:=json.loads(l)).get("reason")=="compiler-artifact" and x.get("target",{}).get("name")=="socks5-proxy" and x.get("profile",{}).get("test") and x.get("executable")]; assert len(a)==1, a; open(sys.argv[2], "w").write(a[0])' "$work/artifacts.json" "$work/test-path"
+          cargo test -p tor-socks5-runtime --lib --locked --no-run --message-format=json > "$work/artifacts.json"
+          python3 -I -c 'import json,sys; p=sys.argv[1]; a=[x["executable"] for l in open(p) if (x:=json.loads(l)).get("reason")=="compiler-artifact" and x.get("target",{}).get("name")=="tor_socks5_runtime" and x.get("profile",{}).get("test") and x.get("executable")]; assert len(a)==1, a; open(sys.argv[2], "w").write(a[0])' "$work/artifacts.json" "$work/test-path"
           echo "tor=$work/tor-0.4.9.15/src/app/tor" >> "$GITHUB_OUTPUT"
           echo "test=$(<"$work/test-path")" >> "$GITHUB_OUTPUT"
       - name: Проверить в сетевом пространстве без внешних интерфейсов

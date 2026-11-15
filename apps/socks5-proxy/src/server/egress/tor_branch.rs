@@ -14,7 +14,7 @@ use tracing::info;
 use super::owners::{self, Owner, OwnerRegistry};
 use super::pre_pool;
 use crate::route::{pre_endpoint, TorConnector};
-use crate::tor_watchdog::TorHandle;
+use tor_socks5_runtime::tor_watchdog::TorHandle;
 
 const TOR_TIMEOUT: &str = "истекло время подключения Tor";
 const OWNER_TIMEOUT: &str = "истекло время подключения владельца";
@@ -182,7 +182,7 @@ async fn attempt<C: TorConnector + Send>(
         Err(error) => {
             // Data collection for the watchdog only; it needs the RAW `TorError`.
             if global {
-                crate::tor_watchdog::classify_and_record(&error, handle.health());
+                tor_socks5_runtime::tor_watchdog::classify_and_record(&error, handle.health());
                 handle.bridge_refresh().request_after_failure(&error);
             }
             Err(AttemptError::Connect(error))
