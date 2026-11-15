@@ -189,6 +189,9 @@ mod tests {
     /// load→mutate→save cycles would lose updates.
     #[tokio::test]
     async fn warm_successes_are_recorded_through_the_single_writer() {
+        let _lifecycle = crate::bridge_store_writer::GLOBAL_WRITER_TEST_LOCK
+            .lock()
+            .await;
         let dir = tempfile::tempdir().expect("tempdir");
         let config_path = dir.path().join("tor-socks5.ktav");
         let warmed_bridge = bridge(OBFS4_A);
@@ -236,5 +239,12 @@ mod tests {
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "tmp"))
             .collect();
         assert!(leftovers.is_empty(), "no leftover temp files");
+
+        // Hand the global slot back: the writer must close cleanly so the
+        // other global-slot test starts from an empty slot.
+        crate::bridge_store_writer::close_global()
+            .await
+            .expect("close runs when a writer is up")
+            .expect("global writer closes");
     }
 }

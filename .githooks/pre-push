@@ -26,17 +26,25 @@ while read -r local_ref local_sha remote_ref remote_sha; do
 done
 [ "$updates" -gt 0 ] || exit 0
 [ "$head" = "$(git rev-parse --verify 'HEAD^{commit}')" ] || { echo 'pre-push: checkout differs from pushed commit' >&2; exit 1; }
+# PRE_PUSH_TESTS=0 пропускает только прогон затронутых тестов (--mode list строит план
+# и печатает выбранные пакеты); fmt и структурные проверки выполняются как обычно.
+# Любое другое значение или отсутствие переменной оставляет прежнее поведение.
+tests_mode=run
+if [ "${PRE_PUSH_TESTS:-1}" = 0 ]; then
+    tests_mode=list
+fi
 run cargo fmt --all -- --check
 run sh scripts/check-dir-entries.sh
+run sh .githooks/check-private-paths.sh
 run sh scripts/check-line-limit.sh
 if [ "${FULL:-0}" = 1 ]; then
-    sh scripts/testing/test-affected.sh --full --mode run --kind all
+    sh scripts/testing/test-affected.sh --full --mode "$tests_mode" --kind all
 else
     if [ "$new" = 1 ]; then
         [ -z "$base" ] || { echo 'pre-push: mixed new and existing refs' >&2; exit 1; }
         base=$(git merge-base HEAD origin/main) || { echo 'pre-push: no base' >&2; exit 1; }
     fi
     [ -n "$base" ] || { echo 'pre-push: no base' >&2; exit 1; }
-    sh scripts/testing/test-affected.sh --base "$base" --mode run --kind all
+    sh scripts/testing/test-affected.sh --base "$base" --mode "$tests_mode" --kind all
 fi
 if [ "${TEST_AFFECTED_DRY:-0}" != 1 ]; then cargo sweep --time 7 2>/dev/null || true; fi

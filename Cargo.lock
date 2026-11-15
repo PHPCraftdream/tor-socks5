@@ -294,7 +294,6 @@ dependencies = [
 name = "arti-wrapper"
 version = "0.2.0"
 dependencies = [
- "anyhow",
  "arti-client",
  "futures",
  "ptrs-gesher-bridge-line",
