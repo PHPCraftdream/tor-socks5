@@ -830,7 +830,7 @@ class PlannerOutput(unittest.TestCase):
     def test_emit_plan_writes_utf8_bytes(self):
         stream = self.cp1252_stream()
         p.emit_plan(self.PAYLOAD, stream)
-        expected = p.json.dumps(self.PAYLOAD, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        expected = p.json.dumps(self.PAYLOAD, sort_keys=True, ensure_ascii=False).encode("utf-8") + b"\n"
         # Точное равенство байтов гарантирует запись через .buffer: кириллица
         # в cp1252 текстовом слое не кодируется (см. регрессию ниже).
         self.assertEqual(stream.buffer.getvalue(), expected)
