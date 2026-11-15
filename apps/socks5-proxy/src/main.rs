@@ -15,14 +15,14 @@ mod help_cmd;
 #[allow(dead_code)]
 #[path = "commands/onion/mod.rs"]
 mod onion;
+#[path = "process/mod.rs"]
+mod process;
 #[path = "server/egress/route.rs"]
 mod route;
 #[path = "server/server.rs"]
 mod server;
 #[path = "commands/service.rs"]
 mod service;
-#[path = "server/shutdown.rs"]
-mod shutdown;
 #[path = "server/startup.rs"]
 mod startup;
 #[path = "server/egress/upstream.rs"]
@@ -218,17 +218,15 @@ async fn async_main(cli: Cli) -> Result<()> {
 
     // Normal foreground server: shut down on Ctrl-C / SIGINT / SIGTERM.
     let shutdown = async {
-        let sig = shutdown::wait_for_signal().await;
+        let sig = process::wait_for_signal().await;
         info!(%sig, "shutdown signal received");
     };
-    server::run_server(
-        server::ServerArgs {
-            config_override: cli.config.clone(),
-            upstream_addr: cli.upstream.clone(),
-            upstream_user: cli.upstream_user.clone(),
-            upstream_pass: cli.upstream_pass.clone(),
-            no_upstream: cli.no_upstream,
-        },
+    process::run_server_process(
+        cli.config.clone(),
+        cli.upstream.clone(),
+        cli.upstream_user.clone(),
+        cli.upstream_pass.clone(),
+        cli.no_upstream,
         shutdown,
     )
     .await
