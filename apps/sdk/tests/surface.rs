@@ -167,3 +167,13 @@ fn runtime_bridge_health_and_observation() {
     let _subscriber =
         tracing_subscriber::registry().with(tor_socks5::runtime::observation_layer(&sink));
 }
+
+/// The hosted-onion-service surface (SDK-5).
+#[cfg(feature = "onion-host")]
+#[test]
+fn onion_host_module() {
+    assert!(names::<tor_socks5::onion::host::OnionHostHandle>().contains("OnionHostHandle"));
+    assert!(names::<tor_socks5::onion::host::ServiceFailure>().contains("ServiceFailure"));
+    let _ = tor_socks5::onion::host::OnionHost::new;
+    let _ = tor_socks5::onion::host::OnionHostHandle::subscribe;
+}

@@ -720,6 +720,17 @@ jobs:
                 "apps/socks5-proxy/Cargo.toml", dev_sdk4,
                 dev_sdk4.replace('[dev-dependencies]\ntor-keymgr = "0.48"\n', ''))
 
+        # SDK-5: the four sanctioned removals from the binary's manifest.
+        old_sdk5 = '[dependencies]\n' + ''.join(
+            f'{name} = "{ver}"\n' for name, ver in [
+                ("tor-hscrypto", "0.48"), ("safelog", "0.4"), ("tor-cell", "0.48"),
+                ("tor-proto", "0.48"), ("tempfile", "3")])
+        new_sdk5 = '[dependencies]\ntempfile = "3"\n'
+        p.check_removed_dependencies("apps/socks5-proxy/Cargo.toml", old_sdk5, new_sdk5)
+        # An unsanctioned removal from the same manifest is refused.
+        with self.assertRaisesRegex(p.MappingError, "missing mapping: удалена зависимость пакета"):
+            p.check_removed_dependencies("apps/socks5-proxy/Cargo.toml", new_sdk5, '[dependencies]\n')
+
     def test_required_results(self):
         plan = {"segments": ["fast", "rust"], "capabilities": {"real_tor_channel": True, "license_policy": False}, "full": False}
         needs = {job: {"result": "success" if any(s in plan["segments"] for s in selections) else "skipped"} for job, selections in p.RESULT_JOBS.items()}
