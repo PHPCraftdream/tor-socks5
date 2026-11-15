@@ -1,6 +1,6 @@
 use super::*;
-use crate::bridge_verifier::{AdmissionWorkers, TestWorkers};
 use crate::test_seams::{ParkedGate, Site, HANG_GUARD};
+use crate::workers::{AdmissionWorkers, TestWorkers};
 use std::sync::Arc;
 
 #[tokio::test]

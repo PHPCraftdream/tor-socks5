@@ -36,7 +36,7 @@ async fn run_server_reports_final_flush_worker_panic() {
             state_dir: Some(dir.path().join("state")),
             ..Default::default()
         };
-        let registry = Arc::new(crate::bridge_verifier::TestWorkers::default());
+        let registry = Arc::new(crate::workers::TestWorkers::default());
         registry
             .scope(async {
                 let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -89,11 +89,7 @@ async fn run_server_reports_final_flush_worker_panic() {
                     .into_errors();
                 let worker_errors = errors
                     .into_iter()
-                    .filter_map(|error| {
-                        error
-                            .downcast::<crate::bridge_verifier::WorkerFailures>()
-                            .ok()
-                    })
+                    .filter_map(|error| error.downcast::<crate::workers::WorkerFailures>().ok())
                     .flat_map(|failures| failures.into_errors());
                 let panic = worker_errors
                     .filter_map(|error| error.downcast::<tokio::task::JoinError>().ok())

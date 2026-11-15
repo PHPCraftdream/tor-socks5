@@ -198,9 +198,9 @@ impl WorkerRegistry {
         if errors.is_empty() {
             Ok(())
         } else {
-            Err(anyhow::Error::new(
-                crate::bridge_verifier::WorkerFailures::new(errors),
-            ))
+            Err(anyhow::Error::new(crate::workers::WorkerFailures::new(
+                errors,
+            )))
         }
     }
     async fn run<T: Send + 'static>(

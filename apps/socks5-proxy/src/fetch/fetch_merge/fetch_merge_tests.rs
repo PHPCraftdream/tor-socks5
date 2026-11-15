@@ -3,8 +3,8 @@
 //! cross-process transaction behaviour.
 
 use super::*;
-use crate::bridge_verifier::AdmissionWorkers;
 use crate::test_seams::{HANG_GUARD, UNBLOCK_GUARD};
+use crate::workers::AdmissionWorkers;
 use bridge_store::BridgeStore;
 
 /// Fresh worker registry for a test drain call (keeps the arg lists short).

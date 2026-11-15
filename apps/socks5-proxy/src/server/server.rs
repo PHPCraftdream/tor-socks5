@@ -624,10 +624,11 @@ async fn shutdown_producers(
 // модуле; реэкспорт сохраняет существующие вызовы и видимость через `super::*`.
 use crate::upstream::pick_upstream;
 
+#[cfg(test)]
+pub(crate) use crate::conn_health::{ConnErrorKind, ConnStage};
 use crate::startup::{
     classify_conn_failure, STAGE_CONNECT_TOR, STAGE_CONNECT_UPSTREAM, STAGE_HANDSHAKE, STAGE_RELAY,
 };
-pub(crate) use crate::startup::{ConnErrorKind, ConnStage};
 
 /// cancel-safe: NO — partial protocol replies/prefix writes/relay are terminal;
 /// dropping this handler closes its owned client and egress, with no replay.
@@ -853,24 +854,6 @@ async fn handle_client_with_connector<C: TorConnector + Send>(
         }
     }
     Ok(())
-}
-
-/// How many working bridges we are short of, accounting for *both* layers
-/// of bridge health: TCP reachability and circuit-layer usability.
-///
-/// `tcp_alive` is the count of bridges that answered a TCP probe;
-/// `circuit_healthy` is the subset of those whose accumulated circuit-
-/// layer failures are still below the pruning threshold. Only a bridge
-/// healthy at *both* layers can actually carry traffic, so the deficit is
-/// driven by the smaller (circuit-aware) count. Used by
-/// [`crate::bridge_maintenance`] to decide whether to promote fresh
-/// candidates from the pool into the working set.
-pub(crate) fn compute_deficit(min_alive: usize, tcp_alive: usize, circuit_healthy: usize) -> usize {
-    // `circuit_healthy` is by construction a subset of `tcp_alive`, but
-    // take the min defensively: a caller passing independent counts must
-    // never over-report healthy bridges.
-    let effective_healthy = tcp_alive.min(circuit_healthy);
-    min_alive.saturating_sub(effective_healthy)
 }
 
 #[path = "../fetch/bridge_producers.rs"]

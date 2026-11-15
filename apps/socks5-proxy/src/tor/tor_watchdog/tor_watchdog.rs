@@ -114,7 +114,7 @@ use tokio::sync::{Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::bridge_warmer::{candidates_with_health, Health};
+use crate::bridge_rank::{candidates_with_health, Health};
 use crate::config::{Config, WatchdogConfig};
 use bridge_store::BridgeStore;
 

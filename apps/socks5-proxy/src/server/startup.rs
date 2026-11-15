@@ -8,6 +8,7 @@ use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 
 use crate::arti_observability::{GuardObservabilityLayer, ObservationSink};
 use crate::config::{Config, LogConfig, LogOutput};
+use crate::conn_health::{ConnErrorKind, ConnStage};
 
 /// `rustls` 0.23 requires picking a process-wide crypto provider explicitly.
 pub(crate) fn install_crypto_provider() {
@@ -235,6 +236,126 @@ pub(crate) fn ensure_bridges_file(cfg: &Config, config_path: &Path) -> bool {
     }
 }
 
+// Подтверждение выдаётся только после проверки учётных данных.
+pub(crate) struct AuthStateVerifier(pub(crate) std::sync::Arc<auth::AuthState>);
+
+impl socks5_proto::ProofVerifier for AuthStateVerifier {
+    type Proof = auth::CredentialProof;
+
+    fn verify_proof(&self, username: &str, password: &str) -> Option<Self::Proof> {
+        self.0.verify_proof(username, password)
+    }
+
+    fn username<'a>(&self, proof: &'a Self::Proof) -> &'a str {
+        proof.username()
+    }
+}
+
+/// Decide whether a `.onion` connection is allowed for this request.
+///
+/// * No authenticator (anonymous proxy) → allowed: there is no account
+///   to gate on.
+/// * Authenticated → allowed iff the named account carries
+///   `allowed_onion` (and is still enabled).
+/// * Auth required but no account on the request (should not happen for
+///   a completed handshake) → denied, fail-closed.
+#[cfg(test)]
+pub(crate) fn onion_permitted(auth: Option<&auth::AuthState>, authed_user: Option<&str>) -> bool {
+    match (auth, authed_user) {
+        (None, _) => true,
+        (Some(state), Some(name)) => state.allowed_onion(name),
+        (Some(_), None) => false,
+    }
+}
+
+/// Internal, stable context tags `handle_client` attaches to each stage.
+/// Classification string-matches ONLY these — never arbitrary error message
+/// text (message text is not a stable classification key).
+pub(crate) const STAGE_HANDSHAKE: &str = "SOCKS5 handshake";
+pub(crate) const STAGE_CONNECT_TOR: &str = "tor connect";
+pub(crate) const STAGE_CONNECT_UPSTREAM: &str = "upstream connect";
+pub(crate) const STAGE_RELAY: &str = "relay";
+
+/// Classify a [`handle_client`] failure into a stage and an error kind, by
+/// the *type* of its root cause and the stage context tag in the chain,
+/// never by string-matching arbitrary rendered error message text (only the
+/// internal `STAGE_*` context tags above are matched — message text is not a
+/// stable classification key).
+///
+/// Order of checks:
+/// 1. Stage: the first chain cause matching a `STAGE_*` tag wins (relay →
+///    handshake → connect → other).
+/// 2. Kind: any `arti_wrapper::TorError::Connect` in the chain →
+///    [`ConnErrorKind::Tor`], regardless of stage (a Tor connect failure is
+///    unambiguous and takes priority over any incidental I/O wrapping).
+/// 3. Otherwise by stage: handshake → Client (everything escaping the
+///    handshake phase is client-side, including the deadline); relay →
+///    Relay when a chain cause is a client-drop-ish `io::Error`
+///    (ConnectionReset/Aborted/BrokenPipe/UnexpectedEof), else Other;
+///    connect → Other (a non-Tor connect failure is not attributable to the
+///    SOCKS client — the `connect_failed` counter carries the stage signal);
+///    other stage → Client when a chain cause is a drop-ish `io::Error`
+///    (after the stage tags the only untagged I/O escape path is the SOCKS
+///    reply writes, which are client-side), else Other.
+pub(crate) fn classify_conn_failure(err: &anyhow::Error) -> (ConnStage, ConnErrorKind) {
+    let stage = if err.chain().any(|cause| cause.to_string() == STAGE_RELAY) {
+        ConnStage::Relay
+    } else if err
+        .chain()
+        .any(|cause| cause.to_string() == STAGE_HANDSHAKE)
+    {
+        ConnStage::Handshake
+    } else if err.chain().any(|cause| {
+        cause.to_string() == STAGE_CONNECT_TOR || cause.to_string() == STAGE_CONNECT_UPSTREAM
+    }) {
+        ConnStage::Connect
+    } else {
+        ConnStage::Other
+    };
+
+    let is_dropish_io = err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_err| {
+                matches!(
+                    io_err.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                )
+            })
+    });
+
+    for cause in err.chain() {
+        if let Some(tor_err) = cause.downcast_ref::<arti_wrapper::TorError>() {
+            if matches!(tor_err, arti_wrapper::TorError::Connect { .. }) {
+                return (stage, ConnErrorKind::Tor);
+            }
+        }
+    }
+
+    let kind = match stage {
+        ConnStage::Handshake => ConnErrorKind::Client,
+        ConnStage::Relay => {
+            if is_dropish_io {
+                ConnErrorKind::Relay
+            } else {
+                ConnErrorKind::Other
+            }
+        }
+        ConnStage::Connect => ConnErrorKind::Other,
+        ConnStage::Other => {
+            if is_dropish_io {
+                ConnErrorKind::Client
+            } else {
+                ConnErrorKind::Other
+            }
+        }
+    };
+    (stage, kind)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,170 +457,4 @@ mod tests {
     fn no_color_set_when_configured_off_and_redirected() {
         assert!(should_set_no_color(false, false));
     }
-}
-
-// Подтверждение выдаётся только после проверки учётных данных.
-pub(crate) struct AuthStateVerifier(pub(crate) std::sync::Arc<auth::AuthState>);
-
-impl socks5_proto::ProofVerifier for AuthStateVerifier {
-    type Proof = auth::CredentialProof;
-
-    fn verify_proof(&self, username: &str, password: &str) -> Option<Self::Proof> {
-        self.0.verify_proof(username, password)
-    }
-
-    fn username<'a>(&self, proof: &'a Self::Proof) -> &'a str {
-        proof.username()
-    }
-}
-
-/// Decide whether a `.onion` connection is allowed for this request.
-///
-/// * No authenticator (anonymous proxy) → allowed: there is no account
-///   to gate on.
-/// * Authenticated → allowed iff the named account carries
-///   `allowed_onion` (and is still enabled).
-/// * Auth required but no account on the request (should not happen for
-///   a completed handshake) → denied, fail-closed.
-#[cfg(test)]
-pub(crate) fn onion_permitted(auth: Option<&auth::AuthState>, authed_user: Option<&str>) -> bool {
-    match (auth, authed_user) {
-        (None, _) => true,
-        (Some(state), Some(name)) => state.allowed_onion(name),
-        (Some(_), None) => false,
-    }
-}
-
-/// Coarse classification of a [`handle_client`] failure, so operators can
-/// tell "the client misbehaved" from "Tor is having a bad time" from
-/// "something else" without grepping the error text — see [`ConnErrorKind`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConnErrorKind {
-    /// The client side of the SOCKS5 session misbehaved or disconnected —
-    /// e.g. it dropped the TCP connection mid-handshake. Not a proxy or Tor
-    /// problem; normal for clients that churn through many parallel
-    /// connections (Telegram and similar).
-    Client,
-    /// A Tor-side failure building a circuit/stream — an
-    /// `arti_wrapper::TorError::Connect` anywhere in the error's cause
-    /// chain. Finer-grained classification (which `tor_error::ErrorKind`)
-    /// already happens in [`crate::tor_watchdog::classify_and_record`]; this
-    /// variant only answers "is this Tor's problem at all".
-    Tor,
-    /// relay-stage I/O failure. Deliberately NOT Client:
-    /// `tokio::io::copy_bidirectional` does not expose WHICH end errored, so the
-    /// client-vs-Tor direction of a mid-relay reset is indeterminate; what is
-    /// determinate is the stage, and a relay-stage reset must not inflate the
-    /// client-misbehavior count. Per-direction byte counts exist only on
-    /// success.
-    Relay,
-    /// Anything else: I/O errors unrelated to the SOCKS5 handshake, bugs,
-    /// or failures that don't fit any bucket above.
-    Other,
-}
-
-/// Which protocol stage a connection failed at. Discriminating on stage (an
-/// internal, stable anyhow context tag — see the `STAGE_*` constants) rather
-/// than on error text lets the same I/O condition be attributed differently:
-/// a ConnectionReset during the handshake is the client's doing, while the
-/// identical reset mid-relay is reported as [`ConnStage::Relay`] so it does
-/// not inflate the client-misbehavior count.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConnStage {
-    /// SOCKS5 method negotiation / auth / CONNECT request.
-    Handshake,
-    /// Establishing the egress (Tor circuit or upstream proxy) connection.
-    Connect,
-    /// Bidirectional data transfer between client and egress.
-    Relay,
-    /// No stage context tag found in the error chain.
-    Other,
-}
-
-/// Internal, stable context tags `handle_client` attaches to each stage.
-/// Classification string-matches ONLY these — never arbitrary error message
-/// text (message text is not a stable classification key).
-pub(crate) const STAGE_HANDSHAKE: &str = "SOCKS5 handshake";
-pub(crate) const STAGE_CONNECT_TOR: &str = "tor connect";
-pub(crate) const STAGE_CONNECT_UPSTREAM: &str = "upstream connect";
-pub(crate) const STAGE_RELAY: &str = "relay";
-
-/// Classify a [`handle_client`] failure into a stage and an error kind, by
-/// the *type* of its root cause and the stage context tag in the chain,
-/// never by string-matching arbitrary rendered error message text (only the
-/// internal `STAGE_*` context tags above are matched — message text is not a
-/// stable classification key).
-///
-/// Order of checks:
-/// 1. Stage: the first chain cause matching a `STAGE_*` tag wins (relay →
-///    handshake → connect → other).
-/// 2. Kind: any `arti_wrapper::TorError::Connect` in the chain →
-///    [`ConnErrorKind::Tor`], regardless of stage (a Tor connect failure is
-///    unambiguous and takes priority over any incidental I/O wrapping).
-/// 3. Otherwise by stage: handshake → Client (everything escaping the
-///    handshake phase is client-side, including the deadline); relay →
-///    Relay when a chain cause is a client-drop-ish `io::Error`
-///    (ConnectionReset/Aborted/BrokenPipe/UnexpectedEof), else Other;
-///    connect → Other (a non-Tor connect failure is not attributable to the
-///    SOCKS client — the `connect_failed` counter carries the stage signal);
-///    other stage → Client when a chain cause is a drop-ish `io::Error`
-///    (after the stage tags the only untagged I/O escape path is the SOCKS
-///    reply writes, which are client-side), else Other.
-pub(crate) fn classify_conn_failure(err: &anyhow::Error) -> (ConnStage, ConnErrorKind) {
-    let stage = if err.chain().any(|cause| cause.to_string() == STAGE_RELAY) {
-        ConnStage::Relay
-    } else if err
-        .chain()
-        .any(|cause| cause.to_string() == STAGE_HANDSHAKE)
-    {
-        ConnStage::Handshake
-    } else if err.chain().any(|cause| {
-        cause.to_string() == STAGE_CONNECT_TOR || cause.to_string() == STAGE_CONNECT_UPSTREAM
-    }) {
-        ConnStage::Connect
-    } else {
-        ConnStage::Other
-    };
-
-    let is_dropish_io = err.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io_err| {
-                matches!(
-                    io_err.kind(),
-                    std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::ConnectionAborted
-                        | std::io::ErrorKind::BrokenPipe
-                        | std::io::ErrorKind::UnexpectedEof
-                )
-            })
-    });
-
-    for cause in err.chain() {
-        if let Some(tor_err) = cause.downcast_ref::<arti_wrapper::TorError>() {
-            if matches!(tor_err, arti_wrapper::TorError::Connect { .. }) {
-                return (stage, ConnErrorKind::Tor);
-            }
-        }
-    }
-
-    let kind = match stage {
-        ConnStage::Handshake => ConnErrorKind::Client,
-        ConnStage::Relay => {
-            if is_dropish_io {
-                ConnErrorKind::Relay
-            } else {
-                ConnErrorKind::Other
-            }
-        }
-        ConnStage::Connect => ConnErrorKind::Other,
-        ConnStage::Other => {
-            if is_dropish_io {
-                ConnErrorKind::Client
-            } else {
-                ConnErrorKind::Other
-            }
-        }
-    };
-    (stage, kind)
 }

@@ -189,7 +189,7 @@ pub(crate) fn spawn(
 /// cannot stall an async worker (TS19-01).
 pub(crate) async fn load_config_off_worker(path: Option<&Path>) -> Result<Config> {
     let path = path.map(Path::to_path_buf);
-    crate::bridge_verifier::run_fallible_blocking(move || {
+    crate::workers::run_fallible_blocking(move || {
         #[cfg(test)]
         crate::test_seams::note_task_context(crate::test_seams::Site::MaintenanceConfigLoad);
         #[cfg(test)]
@@ -241,7 +241,7 @@ async fn refresh(
         .bridges
         .min_alive
         .max(usize::from(cfg.bridges.preferred_transport().is_some()));
-    let deficit = crate::server::compute_deficit(minimum, usable, usable);
+    let deficit = compute_deficit(minimum, usable, usable);
     info!(preferred = ?cfg.bridges.preferred_transport(), usable, deficit, "maintenance: preferred bridge health");
 
     if cfg.bridges.auto_fetch && deficit > 0 {
@@ -499,6 +499,24 @@ async fn live_route_works(
     }
 }
 
+/// How many working bridges we are short of, accounting for *both* layers
+/// of bridge health: TCP reachability and circuit-layer usability.
+///
+/// `tcp_alive` is the count of bridges that answered a TCP probe;
+/// `circuit_healthy` is the subset of those whose accumulated circuit-
+/// layer failures are still below the pruning threshold. Only a bridge
+/// healthy at *both* layers can actually carry traffic, so the deficit is
+/// driven by the smaller (circuit-aware) count. Used by the maintenance
+/// loop to decide whether to promote fresh candidates from the pool into
+/// the working set.
+fn compute_deficit(min_alive: usize, tcp_alive: usize, circuit_healthy: usize) -> usize {
+    // `circuit_healthy` is by construction a subset of `tcp_alive`, but
+    // take the min defensively: a caller passing independent counts must
+    // never over-report healthy bridges.
+    let effective_healthy = tcp_alive.min(circuit_healthy);
+    min_alive.saturating_sub(effective_healthy)
+}
+
 #[cfg(test)]
 #[path = "bridge_maintenance/real_channel_tests.rs"]
 mod real_channel_tests;
@@ -520,7 +538,7 @@ mod tests {
         let path = dir.path().join("proxy.ktav");
         Config::default().write(&path).unwrap();
         let gate = ParkedGate::arm(Site::MaintenanceConfigLoad, &path);
-        let registry = Arc::new(crate::bridge_verifier::TestWorkers::default());
+        let registry = Arc::new(crate::workers::TestWorkers::default());
         let owner = registry.clone();
         let outer =
             tokio::spawn(async move { owner.scope(load_config_off_worker(Some(&path))).await });
@@ -741,5 +759,54 @@ mod tests {
         refresh.set_needed(false);
         refresh.request();
         assert!(refresh.notified().now_or_never().is_none());
+    }
+}
+
+#[cfg(test)]
+mod deficit_tests {
+    use super::compute_deficit;
+
+    #[test]
+    fn compute_deficit_zero_when_both_layers_healthy() {
+        // 31 TCP-alive, all circuit-healthy, min 8 → no deficit.
+        assert_eq!(compute_deficit(8, 31, 31), 0);
+    }
+
+    #[test]
+    fn compute_deficit_triggers_on_circuit_degradation_with_full_tcp() {
+        // Reproduces the production incident: every bridge TCP-alive but
+        // most saturated with circuit-layer failures — deficit must follow
+        // the circuit-healthy count, not the TCP count.
+        assert_eq!(compute_deficit(8, 31, 2), 6);
+    }
+
+    #[test]
+    fn compute_deficit_uses_lower_count_when_both_layers_low() {
+        // TCP itself is scarce; circuit-healthy is the binding constraint.
+        assert_eq!(compute_deficit(8, 3, 2), 6);
+    }
+
+    #[test]
+    fn compute_deficit_boundary_exactly_at_min() {
+        // circuit_healthy == min_alive → exactly enough, no deficit.
+        assert_eq!(compute_deficit(8, 31, 8), 0);
+    }
+
+    #[test]
+    fn compute_deficit_boundary_one_below_min() {
+        // circuit_healthy one short of min_alive → deficit of exactly 1.
+        assert_eq!(compute_deficit(8, 31, 7), 1);
+    }
+
+    #[test]
+    fn compute_deficit_zero_circuit_healthy_is_full_deficit() {
+        // Every bridge circuit-degraded → full deficit regardless of TCP.
+        assert_eq!(compute_deficit(8, 31, 0), 8);
+    }
+
+    #[test]
+    fn compute_deficit_saturates_at_zero_when_overhealthy() {
+        // More healthy than required → never goes negative.
+        assert_eq!(compute_deficit(8, 40, 40), 0);
     }
 }

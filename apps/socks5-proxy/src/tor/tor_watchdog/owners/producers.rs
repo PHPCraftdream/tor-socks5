@@ -46,7 +46,7 @@ impl std::error::Error for ProducerFailures {
 pub(super) async fn join_final_workers() -> Result<()> {
     tokio::time::timeout(
         Duration::from_secs(5),
-        crate::bridge_verifier::join_blocking_workers(),
+        crate::workers::join_blocking_workers(),
     )
     .await
     .map_err(|_| anyhow!("final blocking worker shutdown timed out; process registry retained"))?
@@ -64,7 +64,7 @@ pub(super) struct ProducerTasks {
     tasks: Mutex<Vec<Arc<Task>>>,
     failure: Mutex<ProducerFailures>,
     #[cfg(test)]
-    children: Option<Arc<crate::bridge_verifier::TestWorkers>>,
+    children: Option<Arc<crate::workers::TestWorkers>>,
 }
 
 impl ProducerTasks {
@@ -92,7 +92,7 @@ impl ProducerTasks {
             token,
             tasks: Mutex::new(Vec::new()),
             failure: Mutex::new(ProducerFailures::default()),
-            children: Some(Arc::new(crate::bridge_verifier::TestWorkers::default())),
+            children: Some(Arc::new(crate::workers::TestWorkers::default())),
         })
     }
 
@@ -170,11 +170,11 @@ impl ProducerTasks {
                 }
             }
             #[cfg(not(test))]
-            let children_result = crate::bridge_verifier::join_blocking_workers().await;
+            let children_result = crate::workers::join_blocking_workers().await;
             #[cfg(test)]
             let children_result = match &self.children {
                 Some(children) => children.join().await,
-                None => crate::bridge_verifier::join_blocking_workers().await,
+                None => crate::workers::join_blocking_workers().await,
             };
             if let Err(error) = children_result {
                 self.failure
@@ -367,7 +367,7 @@ mod tests {
             .unwrap()
             .is_panic());
         let children = failures.errors()[1]
-            .downcast_ref::<crate::bridge_verifier::WorkerFailures>()
+            .downcast_ref::<crate::workers::WorkerFailures>()
             .unwrap();
         assert_eq!(children.errors().len(), 2);
         assert!(children

@@ -59,7 +59,7 @@ pub(crate) const UNBLOCK_GUARD: Duration = Duration::from_secs(2);
 struct GateInner {
     state: Mutex<(bool, bool)>, // (parked, released)
     cv: Condvar,
-    promotion_slot: Mutex<Option<Option<crate::bridge_verifier::WorkerSlot>>>,
+    promotion_slot: Mutex<Option<Option<crate::workers::WorkerSlot>>>,
 }
 
 type GateKey = (Site, PathBuf);
@@ -127,7 +127,7 @@ impl ParkedGate {
         assert!(parked, "transaction never reached {:?}", self.key.0);
     }
 
-    pub(crate) fn promotion_slot(&self) -> Option<Option<crate::bridge_verifier::WorkerSlot>> {
+    pub(crate) fn promotion_slot(&self) -> Option<Option<crate::workers::WorkerSlot>> {
         self.inner
             .promotion_slot
             .lock()
@@ -158,7 +158,7 @@ impl Drop for ParkedGate {
     }
 }
 
-pub(crate) fn note_promotion_slot(path: &Path, slot: Option<crate::bridge_verifier::WorkerSlot>) {
+pub(crate) fn note_promotion_slot(path: &Path, slot: Option<crate::workers::WorkerSlot>) {
     let gate = registry()
         .lock()
         .expect("park gate registry")

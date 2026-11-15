@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use time::OffsetDateTime;
 #[tokio::test(start_paused = true)]
 async fn handled_publish_failures_recover_worker_capacity() {
-    let registry = Arc::new(crate::bridge_verifier::TestWorkers::default());
+    let registry = Arc::new(crate::workers::TestWorkers::default());
     let dir = tempfile::tempdir().unwrap();
     let path = config_path(dir.path());
     let bridge = test_bridge();

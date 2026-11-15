@@ -542,7 +542,7 @@ pub(crate) async fn update_health_and_prune(
             let path = path.to_path_buf();
             let log_path = path.clone();
             let dead = pruned.clone();
-            match crate::bridge_verifier::run_fallible_blocking(move || {
+            match crate::workers::run_fallible_blocking(move || {
                 prune_bridges_from_config(&path, &dead)
             })
             .await
