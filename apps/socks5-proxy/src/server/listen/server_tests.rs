@@ -231,50 +231,6 @@ async fn accept_loop_respects_concurrency_cap() {
     );
 }
 
-#[test]
-fn compute_deficit_zero_when_both_layers_healthy() {
-    // 31 TCP-alive, all circuit-healthy, min 8 → no deficit.
-    assert_eq!(compute_deficit(8, 31, 31), 0);
-}
-
-#[test]
-fn compute_deficit_triggers_on_circuit_degradation_with_full_tcp() {
-    // Reproduces the production incident: every bridge TCP-alive but
-    // most saturated with circuit-layer failures — deficit must follow
-    // the circuit-healthy count, not the TCP count.
-    assert_eq!(compute_deficit(8, 31, 2), 6);
-}
-
-#[test]
-fn compute_deficit_uses_lower_count_when_both_layers_low() {
-    // TCP itself is scarce; circuit-healthy is the binding constraint.
-    assert_eq!(compute_deficit(8, 3, 2), 6);
-}
-
-#[test]
-fn compute_deficit_boundary_exactly_at_min() {
-    // circuit_healthy == min_alive → exactly enough, no deficit.
-    assert_eq!(compute_deficit(8, 31, 8), 0);
-}
-
-#[test]
-fn compute_deficit_boundary_one_below_min() {
-    // circuit_healthy one short of min_alive → deficit of exactly 1.
-    assert_eq!(compute_deficit(8, 31, 7), 1);
-}
-
-#[test]
-fn compute_deficit_zero_circuit_healthy_is_full_deficit() {
-    // Every bridge circuit-degraded → full deficit regardless of TCP.
-    assert_eq!(compute_deficit(8, 31, 0), 8);
-}
-
-#[test]
-fn compute_deficit_saturates_at_zero_when_overhealthy() {
-    // More healthy than required → never goes negative.
-    assert_eq!(compute_deficit(8, 40, 40), 0);
-}
-
 // -- classify_conn_failure -------------------------------------------------
 
 /// Install rustls's process-wide `CryptoProvider` exactly once for this

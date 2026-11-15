@@ -296,7 +296,7 @@ impl StoreWriter {
         #[cfg(test)]
         let actor_retirements = Arc::clone(&retirements);
         #[cfg(test)]
-        let registry = crate::bridge_verifier::test_registry();
+        let registry = crate::workers::test_registry();
         let actor = async move {
             let path = actor_path;
             #[cfg(test)]
@@ -313,7 +313,7 @@ impl StoreWriter {
             let mut close_replies: Vec<oneshot::Sender<Result<()>>> = Vec::new();
             // Completion channel for in-flight publishes; the actor holds the
             // receiver, each spawn_blocking job gets a clone of the sender.
-            let (done_tx, mut done_rx) = mpsc::channel::<crate::bridge_verifier::Delivery<()>>(1);
+            let (done_tx, mut done_rx) = mpsc::channel::<crate::workers::Delivery<()>>(1);
 
             loop {
                 if closing {
@@ -351,17 +351,14 @@ impl StoreWriter {
                         match store.clone() {
                             Some(snapshot) => {
                                 let publish = publish.clone();
-                                let flush =
-                                    crate::bridge_verifier::run_fallible_blocking(move || {
-                                        publish(&snapshot)
-                                    })
-                                    .await
-                                    .map_err(|join_error| {
-                                        anyhow!(
-                                            "bridge health store publish task failed: {join_error}"
-                                        )
-                                    })
-                                    .and_then(|published| published);
+                                let flush = crate::workers::run_fallible_blocking(move || {
+                                    publish(&snapshot)
+                                })
+                                .await
+                                .map_err(|join_error| {
+                                    anyhow!("bridge health store publish task failed: {join_error}")
+                                })
+                                .and_then(|published| published);
                                 match flush {
                                     Ok(()) => {
                                         info!("bridge health store published on shutdown");
@@ -425,7 +422,7 @@ impl StoreWriter {
                             // blocking pool; ops buffer in the channel.
                             if store.is_none() {
                                 let load_path = path.clone();
-                                match crate::bridge_verifier::run_fallible_blocking(move || {
+                                match crate::workers::run_fallible_blocking(move || {
                                     let lock = PathLock::acquire(&load_path)?;
                                     let store = BridgeStore::load(load_path.clone())?;
                                     Ok::<(PathLock, BridgeStore), anyhow::Error>((lock, store))
@@ -467,7 +464,7 @@ impl StoreWriter {
                             // earlier acknowledged mutations riding in the
                             // retained snapshot (TS5-06 regression guard).
                             let cloned = store.clone().expect("store loaded above");
-                            match crate::bridge_verifier::run_tracked_blocking(move || {
+                            match crate::workers::run_tracked_blocking(move || {
                                 let mut owned = cloned;
                                 apply(Arc::make_mut(&mut owned));
                                 owned
@@ -601,7 +598,7 @@ impl StoreWriter {
 /// absorbed during the save (clean state ⇒ the next op re-reads the file);
 /// on failure retain the snapshot and arm the backoff.
 fn absorb_publish_result(
-    res: crate::bridge_verifier::Delivery<()>,
+    res: crate::workers::Delivery<()>,
     retry: &mut RetryState,
     store: &mut Option<Arc<BridgeStore>>,
     lock: &mut Option<PathLock>,
@@ -671,7 +668,7 @@ async fn try_start_publish(
     store: &Option<Arc<BridgeStore>>,
     mutations_since_publish: &mut u32,
     publish: &Publisher,
-    done_tx: &mpsc::Sender<crate::bridge_verifier::Delivery<()>>,
+    done_tx: &mpsc::Sender<crate::workers::Delivery<()>>,
 ) {
     if *publishing || !retry.dirty || store.is_none() {
         return;
@@ -688,11 +685,11 @@ async fn try_start_publish(
     let done_tx = done_tx.clone();
     // Сохраняем задачу независимо от ожидания актора; панику публикации
     // считаем ошибкой, чтобы изменённый снимок можно было отправить повторно.
-    match crate::bridge_verifier::spawn_blocking_with_failure(move |failure| {
+    match crate::workers::spawn_blocking_with_failure(move |failure| {
         let delivery =
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| publish(&snapshot))) {
-                Ok(result) => crate::bridge_verifier::Delivery::new(result, failure),
-                Err(payload) => crate::bridge_verifier::Delivery::panic(
+                Ok(result) => crate::workers::Delivery::new(result, failure),
+                Err(payload) => crate::workers::Delivery::panic(
                     Err(anyhow::Error::new(PublisherPanic::new(payload))),
                     failure,
                 ),
@@ -752,7 +749,7 @@ pub(crate) async fn apply(
     let resolved = BridgeStore::resolve_path(config_path);
     match global() {
         Some(writer) if writer.path() == resolved => writer.apply(apply).await,
-        _ => crate::bridge_verifier::run_fallible_blocking(move || {
+        _ => crate::workers::run_fallible_blocking(move || {
             #[cfg(test)]
             crate::test_seams::park_if_armed(crate::test_seams::Site::PreAcquire, &resolved);
             let lock = PathLock::acquire_bounded(&resolved, CLI_LOCK_WAIT)

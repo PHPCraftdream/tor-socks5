@@ -8,6 +8,7 @@ use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 
 use crate::arti_observability::{GuardObservabilityLayer, ObservationSink};
 use crate::config::{Config, LogConfig, LogOutput};
+use crate::conn_health::{ConnErrorKind, ConnStage};
 
 /// `rustls` 0.23 requires picking a process-wide crypto provider explicitly.
 pub(crate) fn install_crypto_provider() {
@@ -368,52 +369,6 @@ pub(crate) fn onion_permitted(auth: Option<&auth::AuthState>, authed_user: Optio
         (Some(state), Some(name)) => state.allowed_onion(name),
         (Some(_), None) => false,
     }
-}
-
-/// Coarse classification of a [`handle_client`] failure, so operators can
-/// tell "the client misbehaved" from "Tor is having a bad time" from
-/// "something else" without grepping the error text — see [`ConnErrorKind`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConnErrorKind {
-    /// The client side of the SOCKS5 session misbehaved or disconnected —
-    /// e.g. it dropped the TCP connection mid-handshake. Not a proxy or Tor
-    /// problem; normal for clients that churn through many parallel
-    /// connections (Telegram and similar).
-    Client,
-    /// A Tor-side failure building a circuit/stream — an
-    /// `arti_wrapper::TorError::Connect` anywhere in the error's cause
-    /// chain. Finer-grained classification (which `tor_error::ErrorKind`)
-    /// already happens in [`crate::tor_watchdog::classify_and_record`]; this
-    /// variant only answers "is this Tor's problem at all".
-    Tor,
-    /// relay-stage I/O failure. Deliberately NOT Client:
-    /// `tokio::io::copy_bidirectional` does not expose WHICH end errored, so the
-    /// client-vs-Tor direction of a mid-relay reset is indeterminate; what is
-    /// determinate is the stage, and a relay-stage reset must not inflate the
-    /// client-misbehavior count. Per-direction byte counts exist only on
-    /// success.
-    Relay,
-    /// Anything else: I/O errors unrelated to the SOCKS5 handshake, bugs,
-    /// or failures that don't fit any bucket above.
-    Other,
-}
-
-/// Which protocol stage a connection failed at. Discriminating on stage (an
-/// internal, stable anyhow context tag — see the `STAGE_*` constants) rather
-/// than on error text lets the same I/O condition be attributed differently:
-/// a ConnectionReset during the handshake is the client's doing, while the
-/// identical reset mid-relay is reported as [`ConnStage::Relay`] so it does
-/// not inflate the client-misbehavior count.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConnStage {
-    /// SOCKS5 method negotiation / auth / CONNECT request.
-    Handshake,
-    /// Establishing the egress (Tor circuit or upstream proxy) connection.
-    Connect,
-    /// Bidirectional data transfer between client and egress.
-    Relay,
-    /// No stage context tag found in the error chain.
-    Other,
 }
 
 /// Internal, stable context tags `handle_client` attaches to each stage.

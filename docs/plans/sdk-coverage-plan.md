@@ -49,15 +49,19 @@
 
 В `main.rs` модули подключены плоско через `#[path]`, поэтому граф читается по `crate::<модуль>`.
 
-**Один крупный клубок.** `tor_setup`, `bridge_store_writer`, `bridge_verifier`, `bridge_warmer`, `tor_watchdog` ссылаются друг на друга: `tor_setup` вызывает `bridge_store_writer::apply` и `bridge_verifier::run_fallible_blocking` (строки 491 и 545), а `bridge_verifier` зовёт `tor_setup`; `tor_watchdog` берёт `select_top_n` и `candidates_with_health` из `bridge_warmer`, а `bridge_warmer` берёт `TorHandle` из `tor_watchdog`. Выносить их по одному нельзя: библиотека не может ссылаться на модуль бинарника.
+**Клубок модулей.** `tor_setup`, `bridge_store_writer`, `bridge_verifier`, `bridge_warmer`, `tor_watchdog` ссылались друг на друга. Выносить их по одному нельзя: библиотека не может ссылаться на модуль бинарника. Причины оказались не там, где предполагал первый набросок этого плана (который считал причиной вызов `update_health_and_prune`: он вызывается из самой `tor_setup`, так что вынос этой функции ничего не разрезал):
 
-**Три узких разреза решают это без трейтов и без смены поведения** (все — внутри бинарника, до выноса):
+- `bridge_store_writer` и `tor_setup` брали у `bridge_verifier` не верификацию, а универсальные помощники фоновых блокирующих задач (`run_fallible_blocking`, `run_tracked_blocking`, `spawn_blocking_with_failure`, `Delivery`, `WorkerFailures`, `TestWorkers`, `join_blocking_workers`, `AdmissionWorkers`). Они лежали в `bridge_maintenance/workers.rs` и пробрасывались через `bridge_verifier` реэкспортом; тем же путём ими пользовались `commands/onion/service` и `owners/producers`.
+- `tor_watchdog` брал чистое ранжирование (`select_top_n`, `candidates_with_health`, `Health`) из `bridge_warmer`, а `bridge_warmer` брал `TorHandle` из `tor_watchdog`.
+- `conn_health` брал типы `ConnStage` / `ConnErrorKind` из `server`, а `bridge_maintenance` — чистую `compute_deficit` оттуда же.
 
-1. Чистые функции ранжирования (`select_top_n`, `candidates_with_health`, `Health`) — в листовой модуль без зависимостей: связь watchdog ↔ warmer становится односторонней.
-2. Функция применения мостов к клиенту (`tor_setup.rs`, строки ≈ 472–545) — из `tor_setup` в слой мостов: `tor_setup` перестаёт зависеть от store_writer и верификатора.
-3. `ConnStage`, `ConnErrorKind` (нужны `conn_health`) и `compute_deficit` (нужна `bridge_maintenance`) сегодня лежат в `server` — в листовой модуль ниже обоих.
+**Три узких разреза решают это без трейтов и без смены поведения** (сделаны внутри бинарника, SDK-0, до выноса):
 
-После разрезов порядок снизу вверх: `seed`, `route`-помощники, `arti_observability`, `tor_setup` → `tor_watchdog` + `TorHandle`, `conn_health` → `bridge_store_writer` и `bridge_verifier` (ссылаются друг на друга, переносятся одним PR), `candidate_pool`, `bridge_warmer` → `fetch_merge`, `bridge_maintenance` → `server`. Хостинг onion зависит только от `TorHandle` и `tor_setup::arti_base_dir`, поэтому стоит над рантаймом.
+1. `bridge_maintenance/workers.rs` стал модулем верхнего уровня `crate::workers`; реэкспорт через `bridge_verifier` убран, все вызовы идут напрямую. `bridge_store_writer`, `tor_setup`, онион-хостинг и `owners` больше не зависят от верификатора.
+2. Ранжирование (`Health`, `select_top_n`, `candidates_with_health`) вынесено из `bridge_warmer` в листовой `bridge_maintenance/bridge_rank.rs`: `tor_watchdog` и `bridge_warmer` ссылаются на него, а не друг на друга.
+3. `ConnStage` и `ConnErrorKind` переехали в `conn_health`, `compute_deficit` — в `bridge_maintenance` (единственный потребитель вне тестов).
+
+Порядок снизу вверх после разрезов: `workers`, `bridge_rank`, `seed`, `route`-помощники, `arti_observability` → `bridge_store_writer` → `tor_setup` → `tor_watchdog` + `TorHandle`, `conn_health` → `bridge_verifier`, `candidate_pool`, `bridge_warmer` → `fetch_merge`, `bridge_maintenance` → `server`. Хостинг onion зависит от `TorHandle`, `tor_setup::arti_base_dir` и `workers`, поэтому стоит над рантаймом.
 
 `route::pre_endpoint` — одна строка поверх `Socks5PreEndpoint::from_pool_member`, `reject_unsupported_pool` — проверка конфига; оба нужны ниже `server`, их место решает задача выноса `tor_setup`.
 
@@ -106,7 +110,7 @@ L3  tor-socks5-server    listen, egress, запуск, остановка, DNS-�
 |---|---|---|---|
 | 0 | SDK-1 (#476) | этот документ | — |
 | 1 | SDK-2 (#477) | README фасада: `guard_spread`, честный список «чего нет»; assert поля `guard_spread` в `surface.rs` | — |
-| 2 | новая | три разреза §4 внутри бинарника (ранжирование, применение мостов, `ConnStage`/`ConnErrorKind`/`compute_deficit`) | SDK-1 |
+| 2 | SDK-0 (#490) | три разреза §4 внутри бинарника (`workers`, `bridge_rank`, `ConnStage`/`ConnErrorKind`/`compute_deficit`) | SDK-1 |
 | 3 | SDK-3 (#478) | первый крейт `tor-socks5-onion`: адрес и vanity, без Tor; заодно проверяет раскладку D1, `members`, планировщик CI | SDK-1, D1 |
 | 4 | SDK-4 (#479) | ключи и идентичности как API | SDK-3 |
 | 5 | SDK-6 (#481), SDK-7 (#482) | `tor-socks5-runtime`: `tor_setup`, seed, пробинг, наблюдение за guard | шаг 2 |

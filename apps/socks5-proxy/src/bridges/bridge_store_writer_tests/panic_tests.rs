@@ -84,7 +84,7 @@ async fn cancelled_close_retains_actor_outcome() {
 #[tokio::test]
 async fn close_final_flush_panic_remains_in_registry() {
     tokio::time::timeout(Duration::from_secs(5), async {
-        let registry = Arc::new(crate::bridge_verifier::TestWorkers::default());
+        let registry = Arc::new(crate::workers::TestWorkers::default());
         registry
             .scope(async {
                 let dir = tempfile::tempdir().unwrap();
@@ -109,7 +109,7 @@ async fn close_final_flush_panic_remains_in_registry() {
                     .join()
                     .await
                     .unwrap_err()
-                    .downcast::<crate::bridge_verifier::WorkerFailures>()
+                    .downcast::<crate::workers::WorkerFailures>()
                     .unwrap()
                     .into_errors();
                 let panic = errors
@@ -134,7 +134,7 @@ async fn close_final_flush_panic_remains_in_registry() {
 #[tokio::test]
 async fn publisher_panic_payload_survives_actor_retry_and_registry_join() {
     tokio::time::timeout(Duration::from_secs(5), async {
-        let registry = Arc::new(crate::bridge_verifier::TestWorkers::default());
+        let registry = Arc::new(crate::workers::TestWorkers::default());
         registry
             .scope(async {
                 let dir = tempfile::tempdir().unwrap();
@@ -156,7 +156,7 @@ async fn publisher_panic_payload_survives_actor_retry_and_registry_join() {
                 assert_eq!(calls.load(Ordering::SeqCst), 2);
                 let error = registry.join().await.unwrap_err();
                 let failures = error
-                    .downcast_ref::<crate::bridge_verifier::WorkerFailures>()
+                    .downcast_ref::<crate::workers::WorkerFailures>()
                     .unwrap();
                 let panic = failures
                     .errors()

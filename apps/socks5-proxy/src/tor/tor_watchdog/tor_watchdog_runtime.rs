@@ -246,7 +246,7 @@ pub(super) fn signal_budget_available(signals_sent: u32) -> bool {
 /// their health, and for each bridge whose `circuit_fails` has crossed
 /// [`WatchdogConfig::failover_min_circuit_fails`] checks
 /// [`should_signal_failover`] against the healthiest remaining alternative
-/// (via [`crate::bridge_warmer::select_top_n`]'s ranking, excluding the
+/// (via [`crate::bridge_rank::select_top_n`]'s ranking, excluding the
 /// degraded bridge itself). When it returns `true`, calls
 /// [`arti_wrapper::TorTunnel::signal_bridge_failure`] for the degraded
 /// bridge — arti's own prop271 guard-state machine decides what to do next
@@ -419,13 +419,13 @@ pub fn spawn_bridge_failover_watchdog(
 }
 
 /// The healthiest single candidate among `candidates`, per the same
-/// ranking [`crate::bridge_warmer::select_top_n`] uses (TCP-unreachable
+/// ranking [`crate::bridge_rank::select_top_n`] uses (TCP-unreachable
 /// bridges excluded, then ascending `circuit_fails`, ties broken by
 /// descending `ok_count`). Returns the winning [`Health`] only — the
 /// soft-failover check only needs the alternative's health, not its
 /// identity.
 pub(super) fn healthiest(candidates: &[(BridgeLine, Health)]) -> Option<Health> {
-    crate::bridge_warmer::select_top_n(candidates, 1)
+    crate::bridge_rank::select_top_n(candidates, 1)
         .into_iter()
         .next()
         .and_then(|winner| {

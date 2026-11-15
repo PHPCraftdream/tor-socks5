@@ -147,7 +147,7 @@ async fn run_services(
     // joined below. Failing to get it is NOT fatal: the proxy keeps running
     // without onion services.
     let dir = store::keystore_dir(config_path.as_deref());
-    let lock = crate::bridge_verifier::run_fallible_blocking(move || store::lock(&dir)).await;
+    let lock = crate::workers::run_fallible_blocking(move || store::lock(&dir)).await;
     let _lock = match lock {
         Ok(Ok(guard)) => Some(guard),
         Ok(Err(error)) => {

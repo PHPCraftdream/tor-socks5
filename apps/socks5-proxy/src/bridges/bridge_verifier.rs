@@ -74,15 +74,8 @@ const VERIFY_RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const LIVE_PROBE_URL: &str = "https://check.torproject.org/api/ip";
 static VERIFY_LOCK: Mutex<()> = Mutex::new(());
 
-#[path = "bridge_maintenance/workers.rs"]
-mod workers;
-use workers::spawn_for_admission;
-#[cfg(test)]
-pub(crate) use workers::{current_slot, test_registry, TestWorkers, WorkerSlot};
-pub(crate) use workers::{
-    join_blocking_workers, run_fallible_blocking, run_tracked_blocking,
-    spawn_blocking_with_failure, spawn_fallible_blocking, spawn_tracked_blocking, AdmissionWorkers,
-    Delivery, WorkerFailures,
+use crate::workers::{
+    spawn_fallible_blocking, spawn_for_admission, spawn_tracked_blocking, AdmissionWorkers,
 };
 
 pub(crate) fn confirms_tor(body: &str) -> bool {

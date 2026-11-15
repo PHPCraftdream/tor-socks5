@@ -4,6 +4,8 @@ mod angel;
 mod arti_observability;
 #[path = "bridges/bridge_maintenance.rs"]
 mod bridge_maintenance;
+#[path = "bridges/bridge_maintenance/bridge_rank.rs"]
+mod bridge_rank;
 #[path = "bridges/bridge_store_writer.rs"]
 mod bridge_store_writer;
 #[path = "bridges/bridge_verifier.rs"]
@@ -57,6 +59,8 @@ mod ts19_tests;
 mod upstream;
 #[path = "commands/users_cli/mod.rs"]
 mod users_cli;
+#[path = "bridges/bridge_maintenance/workers.rs"]
+mod workers;
 
 use anyhow::{Context, Result};
 use clap::Parser;
