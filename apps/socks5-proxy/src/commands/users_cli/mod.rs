@@ -4,10 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use auth::{compute_hash, verify_hash, User, UsersConfig, INIT_SENTINEL};
+use auth::{parse_pool_override, Hop, NewUser, Registry, UsersConfig};
 use clap::Subcommand;
-use persist_lock::{PathLock, CLI_LOCK_WAIT};
-use proxy_config::{PoolOverride, ProxyPool, Socks5Endpoint};
+use persist_lock::CLI_LOCK_WAIT;
 
 /// Test-only override (milliseconds) for the CLI lock wait; `0` uses the
 /// production [`CLI_LOCK_WAIT`]. Lets tests exercise the busy path
@@ -151,16 +150,9 @@ pub fn run(
     }
 }
 
-/// Take the registry's cross-process transaction lock (bounded wait) and
-/// load the registry **under it**. Callers must hold the returned lock
-/// until their mutation's `save` has published: the lock is what turns
-/// the whole read-modify-write into one serialised transaction across
-/// processes (TS17-07). The busy error is returned as-is — it already
-/// names the lock file and the wait.
-fn lock_and_load(users_path: &Path) -> Result<(PathLock, UsersConfig)> {
-    let lock = PathLock::acquire_bounded(users_path, cli_lock_wait())?;
-    let users = UsersConfig::load(users_path)?;
-    Ok((lock, users))
+/// The registry at `users_path`, waiting for its lock as long as the CLI does.
+fn registry(users_path: &Path) -> Registry {
+    Registry::new(users_path).with_lock_wait(cli_lock_wait())
 }
 
 fn read_and_confirm(prompt: &mut dyn PasswordPrompt) -> Result<String> {
@@ -175,6 +167,28 @@ fn read_and_confirm(prompt: &mut dyn PasswordPrompt) -> Result<String> {
     Ok(pw)
 }
 
+fn new_user(
+    name: &str,
+    allow_onion: bool,
+    pre_proxies: &[String],
+    post_proxies: &[String],
+) -> Result<NewUser> {
+    Ok(NewUser {
+        name: name.to_string(),
+        allow_onion,
+        pre_proxies: parse_pool_override(pre_proxies)?,
+        post_proxies: parse_pool_override(post_proxies)?,
+    })
+}
+
+fn onion_label(allow_onion: bool) -> &'static str {
+    if allow_onion {
+        "allowed"
+    } else {
+        "denied"
+    }
+}
+
 fn cmd_add(
     users_path: &Path,
     name: &str,
@@ -183,36 +197,16 @@ fn cmd_add(
     pre_proxies: &[String],
     post_proxies: &[String],
 ) -> Result<()> {
+    let new = new_user(name, allow_onion, pre_proxies, post_proxies)?;
+    let registry = registry(users_path);
     // Fail fast before the interactive prompt; the authoritative check
-    // re-runs under the transaction lock below.
-    let pre_proxies = parse_user_pool(pre_proxies)?;
-    let post_proxies = parse_user_pool(post_proxies)?;
-    if UsersConfig::load(users_path)?.find(name).is_some() {
-        bail!("user \"{name}\" already exists — use `set-password` to change the password");
-    }
-    // Prompting and Argon2id hashing happen BEFORE the lock: never hold
-    // the registry lock on a human or on expensive hashing.
+    // re-runs under the transaction lock inside `add`.
+    registry.ensure_absent(name)?;
     let pw = read_and_confirm(prompt)?;
-    let hash = compute_hash(&pw)?;
-    let (lock, mut users) = lock_and_load(users_path)?;
-    if users.find(name).is_some() {
-        bail!("user \"{name}\" already exists — use `set-password` to change the password");
-    }
-    users.users.push(User {
-        name: name.to_string(),
-        hash,
-        is_enabled: true,
-        allowed_onion: allow_onion,
-        // Новые пользователи создаются без per-user ACL.
-        allowed_clients: None,
-        pre_proxies,
-        post_proxies,
-    });
-    users.save(users_path)?;
-    drop(lock);
+    registry.add(new, &pw)?;
     println!(
         "user \"{name}\" added (onion: {}) ({})",
-        if allow_onion { "allowed" } else { "denied" },
+        onion_label(allow_onion),
         users_path.display()
     );
     Ok(())
@@ -228,115 +222,38 @@ fn cmd_add_init(
     pre_proxies: &[String],
     post_proxies: &[String],
 ) -> Result<()> {
-    let pre_proxies = parse_user_pool(pre_proxies)?;
-    let post_proxies = parse_user_pool(post_proxies)?;
-    let (lock, mut users) = lock_and_load(users_path)?;
-    if users.find(name).is_some() {
-        bail!("user \"{name}\" already exists — use `set-password` to change the password");
-    }
-    users.users.push(User {
-        name: name.to_string(),
-        hash: INIT_SENTINEL.to_string(),
-        is_enabled: true,
-        allowed_onion: allow_onion,
-        // Новые пользователи создаются без per-user ACL.
-        allowed_clients: None,
-        pre_proxies,
-        post_proxies,
-    });
-    users.save(users_path)?;
-    drop(lock);
+    let new = new_user(name, allow_onion, pre_proxies, post_proxies)?;
+    registry(users_path).add_init(new)?;
     println!(
         "user \"{name}\" added in init mode (onion: {}) — the first password presented at login \
          will be set as its password ({})",
-        if allow_onion { "allowed" } else { "denied" },
+        onion_label(allow_onion),
         users_path.display()
     );
     Ok(())
 }
 
 fn cmd_set_proxies(path: &Path, name: &str, hop: &str, values: &[String]) -> Result<()> {
-    if !matches!(hop, "pre" | "post") {
-        bail!("hop must be `pre` or `post`");
-    }
-    let setting = parse_user_pool(values)?;
-    let (lock, mut users) = lock_and_load(path)?;
-    let user = users
-        .find_mut(name)
-        .ok_or_else(|| anyhow::anyhow!("user does not exist"))?;
-    match hop {
-        "pre" => user.pre_proxies = setting,
-        "post" => user.post_proxies = setting,
-        _ => bail!("hop must be `pre` or `post`"),
-    }
-    users.save(path)?;
-    drop(lock);
+    let hop: Hop = hop.parse()?;
+    let setting = parse_pool_override(values)?;
+    registry(path).set_proxies(name, hop, setting)?;
     println!("user proxy pool updated");
     Ok(())
 }
 
-/// `inherit` (or nothing) keeps the global pool, `none` disables the hop,
-/// anything else is the account's own pool.
-fn parse_user_pool(values: &[String]) -> Result<Option<PoolOverride>> {
-    match values {
-        [] => Ok(None),
-        [only] if only == "inherit" => Ok(None),
-        [only] if only == "none" => Ok(Some(PoolOverride::Disabled)),
-        values => {
-            let members = values
-                .iter()
-                .map(|value| {
-                    value
-                        .parse::<Socks5Endpoint>()
-                        .map_err(|_| anyhow::anyhow!("invalid proxy endpoint"))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            ProxyPool::new(members)
-                .map(|pool| Some(PoolOverride::Pool(pool)))
-                .map_err(|error| anyhow::anyhow!(error))
-        }
-    }
-}
-
 fn cmd_remove(users_path: &Path, name: &str) -> Result<()> {
-    let (lock, mut users) = lock_and_load(users_path)?;
-    let before = users.users.len();
-    users.users.retain(|u| u.name != name);
-    if users.users.len() == before {
-        bail!("user \"{name}\" does not exist");
-    }
-    users.save(users_path)?;
-    drop(lock);
+    registry(users_path).remove(name)?;
     println!("user \"{name}\" removed ({})", users_path.display());
     Ok(())
 }
 
 fn cmd_set_password(users_path: &Path, name: &str, prompt: &mut dyn PasswordPrompt) -> Result<()> {
+    let registry = registry(users_path);
     // Fail fast before the interactive prompt; the authoritative check
-    // re-runs under the transaction lock below.
-    if UsersConfig::load(users_path)?.find(name).is_none() {
-        anyhow::bail!("user \"{name}\" does not exist");
-    }
-    // Prompting and Argon2id hashing happen BEFORE the lock: never hold
-    // the registry lock on a human or on expensive hashing.
+    // re-runs under the transaction lock inside `set_password`.
+    registry.ensure_present(name)?;
     let pw = read_and_confirm(prompt)?;
-    let new_hash = compute_hash(&pw)?;
-    let (lock, mut users) = lock_and_load(users_path)?;
-    let user = users
-        .find_mut(name)
-        .ok_or_else(|| anyhow::anyhow!("user \"{name}\" does not exist"))?;
-    let old_hash = user.hash.clone();
-    user.hash = new_hash;
-    users.save(users_path)?;
-    drop(lock);
-    // An `init`-sentinel account has no real old hash to verify against;
-    // only run the sanity check when the previous hash was a real one.
-    // Runs after the publish and outside the lock: it is expensive and
-    // cannot change the outcome of the transaction.
-    let still_works = old_hash != INIT_SENTINEL && verify_hash(&old_hash, &pw)?;
-    if still_works {
-        bail!("internal error: old password still verifies after change");
-    }
+    registry.set_password(name, &pw)?;
     println!("password changed for \"{name}\" ({})", users_path.display());
     Ok(())
 }
@@ -344,7 +261,7 @@ fn cmd_set_password(users_path: &Path, name: &str, prompt: &mut dyn PasswordProm
 fn cmd_list(users_path: &Path) -> Result<()> {
     // Read-only: no transaction lock — a list never publishes, so it can
     // neither lose nor clobber a concurrent writer's mutation.
-    let users = UsersConfig::load(users_path)?;
+    let users = registry(users_path).load()?;
     if users.users.is_empty() {
         println!("no users yet");
         return Ok(());
@@ -377,40 +294,22 @@ pub fn render_list(users: &UsersConfig) -> String {
 }
 
 fn cmd_enable(users_path: &Path, name: &str) -> Result<()> {
-    let (lock, mut users) = lock_and_load(users_path)?;
-    let user = users
-        .find_mut(name)
-        .ok_or_else(|| anyhow::anyhow!("user \"{name}\" does not exist"))?;
-    user.is_enabled = true;
-    users.save(users_path)?;
-    drop(lock);
+    registry(users_path).set_enabled(name, true)?;
     println!("user \"{name}\" enabled ({})", users_path.display());
     Ok(())
 }
 
 fn cmd_disable(users_path: &Path, name: &str) -> Result<()> {
-    let (lock, mut users) = lock_and_load(users_path)?;
-    let user = users
-        .find_mut(name)
-        .ok_or_else(|| anyhow::anyhow!("user \"{name}\" does not exist"))?;
-    user.is_enabled = false;
-    users.save(users_path)?;
-    drop(lock);
+    registry(users_path).set_enabled(name, false)?;
     println!("user \"{name}\" disabled ({})", users_path.display());
     Ok(())
 }
 
 fn cmd_set_onion(users_path: &Path, name: &str, allowed: bool) -> Result<()> {
-    let (lock, mut users) = lock_and_load(users_path)?;
-    let user = users
-        .find_mut(name)
-        .ok_or_else(|| anyhow::anyhow!("user \"{name}\" does not exist"))?;
-    user.allowed_onion = allowed;
-    users.save(users_path)?;
-    drop(lock);
-    let verb = if allowed { "allowed" } else { "denied" };
+    registry(users_path).set_onion(name, allowed)?;
     println!(
-        "user \"{name}\" onion access {verb} ({})",
+        "user \"{name}\" onion access {} ({})",
+        onion_label(allowed),
         users_path.display()
     );
     Ok(())

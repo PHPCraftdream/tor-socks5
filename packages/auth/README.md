@@ -31,6 +31,19 @@ let state = AuthState::build(&registry)?;
 
 The registry saves atomically (temp-file guard + rename) and lives next to the main config file, sharing its stem — `UsersConfig::resolve_path` derives the path.
 
+## Administration
+
+`Registry` edits the file the way the `users` command does: `add`, `add_init`, `remove`, `set_password`, `set_proxies`, `set_enabled`, `set_onion`. Each call is one transaction under the registry's cross-process lock (bounded wait, see `with_lock_wait`); Argon2id hashing happens before the lock is taken. It never prompts or prints: the password is an argument, and `ensure_absent` / `ensure_present` let a caller fail fast before it asks a human for one.
+
+```rust
+use auth::{Hop, NewUser, Registry, UsersConfig};
+
+let registry = Registry::new(UsersConfig::resolve_path(None));
+registry.add(NewUser { name: "alice".into(), ..NewUser::default() }, "alice-pass")?;
+registry.set_onion("alice", true)?;
+registry.set_proxies("alice", Hop::Pre, None)?; // inherit the global pool
+```
+
 ## Example
 
 `cargo run --example auth_flow -p tor-socks5-auth` runs the whole flow: hashing, a disabled account, an unknown one, an HMAC-cache hit, and a TOFU `init` adoption.
