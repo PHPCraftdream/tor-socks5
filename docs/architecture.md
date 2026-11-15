@@ -225,6 +225,11 @@ The user-facing binary. Source modules under `src/`:
   the per-mask override engine and binds the UDP/TCP listeners.
   Requires the Tor egress; a DNS-listener runtime error is logged,
   not fatal — the SOCKS5 proxy path keeps running.
+* Module paths below that start with `bridges/`, `tor/` (except
+  `tor/tor_watchdog/owners/`) or `fetch/` (`seed`, `fetch_merge`) live in the
+  `tor-socks5-runtime` crate (`apps/sdk/crates/runtime/src/`); `server/`,
+  `commands/`, `fetch/bridges_cmd.rs`, `fetch/bridge_producers.rs` and
+  `tor/tor_watchdog/owners/` stay in the binary (`apps/socks5-proxy/src/`).
 * `bridges/bridge_store_writer.rs` — dedup-upsert log of bridges that completed a
   TCP probe, stored as `<config_stem>.alive-bridges.log` next to the
   active config. Carries the health counters (`fails`, `seen`,
