@@ -7331,6 +7331,7 @@ dependencies = [
  "tor-socks5-proto",
  "tor-socks5-route-pool",
  "tor-socks5-runtime",
+ "tracing-subscriber",
 ]
 
 [[package]]

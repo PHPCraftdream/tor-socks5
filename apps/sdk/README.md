@@ -43,7 +43,7 @@ use tor_socks5::config::Config;
 | `tor` | `tor` | `arti-wrapper` | `socks5`, `acl` |
 | `fetch` | `fetch` | `bridge-fetcher` | `tor`, `bridges` |
 | `dns` | `dns` | `tor-socks5-dns` | `tor`, `acl` |
-| `runtime` | `runtime` | `tor-socks5-runtime` | `tor`, `config` |
+| `runtime` | `runtime` | `tor-socks5-runtime` | `tor`, `config`, `bridges` |
 | `onion` | `onion` | `tor-socks5-onion` | |
 | `onion-keys` | `onion` (keys) | `tor-socks5-onion/keys` | |
 | `onion-service` | | `arti-wrapper/onion-service` | `tor` |
@@ -180,6 +180,47 @@ binary/workspace root is **required**. The facade is a git dependency, not
 a crates.io release (the vendored forks cannot travel with a published
 package).
 
+## Bridge health writer and guard observations
+
+With `runtime`, the SDK-7 surface of `tor-socks5-runtime` is exposed: the
+single writer of the bridge health store and the observation layer for
+arti's guard events. Neither installs process state on its own: the
+writer runs where you start and stop it, and the observation layer is
+wired into your own `tracing_subscriber` registry — the proxy binary
+does exactly this in its startup.
+
+```rust
+use tor_socks5::runtime::{close_global, init_global, observation_layer, ObservationSink};
+use tracing_subscriber::layer::SubscriberExt;
+
+// Start the process-wide writer (one live instance per process; after a
+// close, the next init starts a fresh writer, never the closed one).
+// `config_path` is the main config; the store is its sibling file.
+let writer = init_global(Some(config_path));
+
+let sink = ObservationSink::new();
+tracing_subscriber::registry()
+    .with(fmt_layer)                  // your own log layer
+    .with(observation_layer(&sink))   // carries the tor_guardmgr=trace filter
+    .init();
+
+// One health mutation; `Ok` once absorbed — a slow or failing disk is
+// the writer's retry problem. At shutdown, stop and get the final
+// flush result:
+writer
+    .apply(|store| store.note_circuit_success_at(&bridge, now))
+    .await?;
+let flush = close_global().await; // Some(Ok(())) when a writer was running
+```
+
+`StoreWriter` is cheap to clone — hand it to every producer task — and
+`close` returns the final flush outcome. Guard observations land in the
+`ObservationSink`; match them to your bridges and apply them to a store
+with `ObservationSink::drain_into_store` (`drain` returns the raw
+observations). The retrying maintenance loop around them, the verifier
+and the warmer are the bridge manager (SDK-8 in the plan) and are not
+part of the facade yet.
+
 ## What is not here
 
 The facade re-exports the libraries under `packages/` and `apps/sdk/crates/`. The logic that runs
@@ -189,10 +230,12 @@ library yet:
 - the proxy server (listeners, egress, pre/post pools, startup and shutdown);
 - hosting onion services (start gate, stream limits, statuses); the
   `onion-service` feature only turns on the onion support of `arti-wrapper`;
-- the bridge manager (verifier, warmer, health writer, maintenance).
+- the bridge manager (verifier, warmer, maintenance loop).
 
-The Tor client and watchdog surface is available behind the `runtime`
-feature (see [Tor client (runtime feature)](#tor-client-runtime-feature)).
+The bridge health writer, the guard-event observation and the Tor client
+and watchdog surface are available behind the `runtime` feature (see
+[Tor client (runtime feature)](#tor-client-runtime-feature) and
+[Bridge health writer and guard observations](#bridge-health-writer-and-guard-observations)).
 
 To use these today, run the binary. Taking them into library crates is
 planned in [`docs/plans/sdk-coverage-plan.md`](../../docs/plans/sdk-coverage-plan.md).

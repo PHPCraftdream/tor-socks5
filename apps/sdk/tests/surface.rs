@@ -147,3 +147,23 @@ fn runtime_module_tor_client_surface() {
     let _ = tor_socks5::runtime::tor_watchdog::spawn_tor_watchdog;
     let _ = tor_socks5::runtime::conn_health::spawn_conn_health_logger;
 }
+
+/// The SDK-7 runtime surface: the bridge-health writer and the
+/// guard-event observation layer for the application's own subscriber.
+#[cfg(feature = "runtime")]
+#[test]
+fn runtime_bridge_health_and_observation() {
+    use tracing_subscriber::prelude::*;
+
+    assert!(names::<tor_socks5::runtime::StoreWriter>().contains("StoreWriter"));
+    assert!(names::<tor_socks5::runtime::ObservationSink>().contains("ObservationSink"));
+    assert!(names::<tor_socks5::runtime::GuardObservation>().contains("GuardObservation"));
+    let _ = tor_socks5::runtime::init_global;
+    let _ = tor_socks5::runtime::close_global;
+
+    // The observation layer fits a real subscriber — the wiring the
+    // proxy binary itself does in its startup.
+    let sink = tor_socks5::runtime::ObservationSink::new();
+    let _subscriber =
+        tracing_subscriber::registry().with(tor_socks5::runtime::observation_layer(&sink));
+}
