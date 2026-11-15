@@ -17,10 +17,11 @@
 //! | [`tor`] | `arti-wrapper` | `tor` |
 //! | [`fetch`] | `bridge-fetcher` | `fetch` |
 //! | [`dns`] | `tor-socks5-dns` | `dns` |
+//! | [`runtime`] | `tor-socks5-runtime` (SDK-7 surface) | `runtime` |
 //! | [`onion`] | `tor-socks5-onion` | `onion`, `onion-keys` |
 //!
-//! The `tor` feature (and `fetch`, `dns`, `onion-service`, `full`, which
-//! imply it) links Arti. Without the vendored forks of the patch-kit a
+//! The `tor` feature (and `fetch`, `dns`, `runtime`, `onion-service`,
+//! `full`, which imply it) links Arti. Without the vendored forks of the patch-kit a
 //! consumer gets stock Arti and silently loses their fixes; see the SDK guide
 //! (`apps/sdk/README.md`) for the `[patch.crates-io]` block.
 
@@ -82,3 +83,43 @@ pub use ::dns_server as dns;
 /// client linked.
 #[cfg(any(feature = "onion", feature = "onion-keys"))]
 pub use ::tor_socks5_onion as onion;
+
+/// The embedded Tor runtime (`tor-socks5-runtime`), opened step by step
+/// as the SDK plan's API tasks land. This is the SDK-7 surface: the
+/// bridge-health writer and the guard-event observation layer. The Tor
+/// client setup, the bridge manager and the server are not exposed yet
+/// (SDK-8/9/10).
+///
+/// Nothing here installs process state on its own (R1):
+/// [`init_global`]/[`close_global`] are the documented process-wide
+/// writer slot the application drives — one live writer per process,
+/// sequential restart works — and [`observation_layer`] is a tracing
+/// layer for the application's own log subscriber; the runtime never
+/// sets a subscriber.
+///
+/// ```no_run
+/// use tor_socks5::runtime::{init_global, observation_layer, ObservationSink};
+/// use tracing_subscriber::layer::SubscriberExt;
+///
+/// let _writer = init_global(Some(std::path::Path::new("tor-socks5.ktav")));
+/// let sink = ObservationSink::new();
+/// let fmt_layer = tracing_subscriber::fmt::layer();
+/// tracing_subscriber::registry()
+///     .with(fmt_layer)
+///     .with(observation_layer(&sink))
+///     .init();
+/// ```
+#[cfg(feature = "runtime")]
+pub mod runtime {
+    /// The bridge-health writer: the [`StoreWriter`] handle (`apply`,
+    /// `close`) and the process-wide `init_global`/`close_global` slot
+    /// (one live writer per process, sequential restart works).
+    pub use ::tor_socks5_runtime::bridge_store_writer::{close_global, init_global, StoreWriter};
+
+    /// Guard-event observation: [`observation_layer`] for the
+    /// application's subscriber, the shared [`ObservationSink`], and the
+    /// observation and layer types.
+    pub use ::tor_socks5_runtime::arti_observability::{
+        observation_layer, GuardObservabilityLayer, GuardObservation, ObservationSink,
+    };
+}

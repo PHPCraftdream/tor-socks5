@@ -244,3 +244,36 @@ async fn init_close_init_gets_a_fresh_live_writer() {
         "no leftover temp files"
     );
 }
+
+/// The public handle constructor `StoreWriter::open` (SDK-7) runs the
+/// same actor without the process-global slot: it accepts mutations,
+/// publishes them, and `close` reports the final flush result; a closed
+/// handle rejects further mutations.
+#[tokio::test]
+async fn open_starts_a_live_writer_and_close_reports_the_flush_result() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let b = test_bridge();
+    let path = config_path(dir.path());
+    seed_store(&path, &b);
+
+    let writer = StoreWriter::open(Some(path.as_path()));
+    let b1 = b.clone();
+    writer
+        .apply(move |s| s.note_channel_success_at(&b1, OffsetDateTime::now_utc()))
+        .await
+        .expect("open writer absorbs the mutation");
+    wait_for_file_count(&path, &b, 1, "open writer publishes").await;
+
+    writer
+        .close()
+        .await
+        .expect("close reports the flush result");
+    assert!(
+        writer.apply(|_| {}).await.is_err(),
+        "a closed writer must reject mutations"
+    );
+    assert!(
+        leftover_tmp_files(dir.path()).is_empty(),
+        "no leftover temp files"
+    );
+}

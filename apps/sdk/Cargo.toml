@@ -28,6 +28,10 @@ bridges = ["dep:bridge-probe", "dep:bridge-store", "dep:bridge-verify-core"]
 tor = ["socks5", "acl", "dep:arti-wrapper"]
 fetch = ["tor", "bridges", "dep:bridge-fetcher"]
 dns = ["tor", "acl", "dep:tor-socks5-dns"]
+# Embedded Tor runtime APIs, opened step by step
+# (docs/plans/sdk-coverage-plan.md): SDK-7 — the bridge-health writer and
+# the guard-event observation layer.
+runtime = ["tor", "bridges", "dep:tor-socks5-runtime"]
 # Tor-free onion address and vanity core (the CLI uses the same crate).
 onion = ["dep:tor-socks5-onion"]
 # Server-side onion services (the CLI enables the same feature).
@@ -37,7 +41,7 @@ onion-service = ["tor", "arti-wrapper/onion-service"]
 # an explicit argument; printing, prompting and confirmations stay with the
 # application.
 onion-keys = ["dep:tor-socks5-onion", "tor-socks5-onion/keys"]
-full = ["socks5", "auth", "config", "bridges", "route", "tor", "fetch", "dns", "onion", "onion-keys", "onion-service"]
+full = ["socks5", "auth", "config", "bridges", "route", "tor", "fetch", "dns", "onion", "onion-keys", "onion-service", "runtime"]
 
 [dependencies]
 persist-lock = { path = "../../packages/persist-lock", version = "0.2.0" }
@@ -53,6 +57,12 @@ arti-wrapper = { path = "../../packages/arti-wrapper", version = "0.2.0", option
 bridge-fetcher = { path = "../../packages/bridge-fetcher", version = "0.2.0", optional = true }
 tor-socks5-dns = { path = "../../packages/dns-server", version = "0.2.0", optional = true }
 tor-socks5-onion = { path = "crates/onion", version = "0.2.0", optional = true }
+tor-socks5-runtime = { path = "crates/runtime", version = "0.2.0", optional = true }
+
+# The surface test wires `runtime::observation_layer` into a real
+# subscriber — the same wiring the proxy binary does.
+[dev-dependencies]
+tracing-subscriber.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true

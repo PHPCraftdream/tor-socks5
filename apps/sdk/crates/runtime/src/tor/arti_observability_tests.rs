@@ -573,3 +573,34 @@ fn observation_queue_is_bounded_and_keeps_the_most_recent_suffix() {
         assert_eq!(obs.usable, (100 + i) % 2 == 0);
     }
 }
+
+/// `observation_layer` must arrive pre-filtered: the binary installs it
+/// next to the user's fmt layer without touching the user's filter, so
+/// the layer itself must admit arti's TRACE-level guard events — a typo
+/// in the built-in filter (level or target) would silently starve the
+/// sink in production.
+#[test]
+fn observation_layer_admits_guardmgr_trace_events_through_a_registry() {
+    let sink = ObservationSink::new();
+    let captured = sink.clone();
+    let subscriber = tracing_subscriber::registry()
+        .with(observation_layer::<tracing_subscriber::Registry>(&sink));
+    tracing::subscriber::with_default(subscriber, || {
+        let guard_id = "RsaIdentity { $cd193cf0d0c29551928c01fcb28d1200d9f27cfa }";
+        tracing::event!(
+            target: "tor_guardmgr",
+            Level::TRACE,
+            guard_id = ?guard_id,
+            usable = true,
+            "Known usability status",
+        );
+    });
+    let obs = captured.drain();
+    assert_eq!(
+        obs.len(),
+        1,
+        "TRACE guardmgr event must pass the built-in filter"
+    );
+    assert_eq!(obs[0].fingerprint, FP_A);
+    assert!(obs[0].usable);
+}

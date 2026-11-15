@@ -1,5 +1,18 @@
 //! Single writer for the bridge health store (`<config>.alive-bridges.log`).
 //!
+//! # Public surface (SDK-7)
+//!
+//! [`StoreWriter`] is the handle: [`StoreWriter::open`] starts it (config
+//! path in, handle out), [`StoreWriter::apply`] sends one mutation,
+//! [`StoreWriter::close`] stops it and returns the final flush result.
+//! [`init_global`] / [`close_global`] are the process-wide slot on top of
+//! the same actor: at most one live writer per process, and a sequential
+//! restart works — after a close the slot is empty, so the next
+//! [`init_global`] starts a fresh writer, never the closed one. The
+//! publish strategy (production: `BridgeStore::save`, standard retry
+//! backoff) is not configurable through the public API; the injectable
+//! constructor is a test seam (R10).
+//!
 //! Concurrency contract (fixes the P1 racing-writes finding in
 //! docs/reviews/2026-09-07-08/stability-review-2026-09-08.md, plus TS2-02/TS2-03 in
 //! docs/reviews/2026-09-07-08/review-round-2-2026-09-08.md):
@@ -150,6 +163,27 @@ struct ActorState {
     close_requested: bool,
 }
 
+/// Handle to the single bridge-health writer actor for one store path.
+/// Cloning is cheap — the clones share one actor — so the handle can be
+/// handed to every producer task.
+///
+/// Operations:
+///
+/// * [`StoreWriter::apply`] — one mutation; resolves `Ok` once it is
+///   absorbed into the actor's snapshot (a failed disk publish is the
+///   actor's retry problem), `Err` when the on-disk snapshot could not
+///   be loaded or the mutation job panicked (the mutation did not land).
+/// * [`StoreWriter::close`] — stop: wait for the in-flight publish,
+///   flush a dirty snapshot regardless of the retry backoff, join the
+///   actor and return the final flush result (`Err` on a failed final
+///   write or a dead actor). Concurrent close callers share the
+///   outcome; once the actor has been joined, further calls return
+///   `Ok(())`.
+///
+/// Run at most one writer per store path in a process: [`init_global`]
+/// enforces that for the engine's process-wide writer, and two `open`
+/// handles on one path behave like two concurrent CLI writers (per-path
+/// lock plus the clean-state re-read), not like one writer.
 #[derive(Clone)]
 pub struct StoreWriter {
     tx: mpsc::Sender<Op>,
@@ -289,7 +323,32 @@ impl StoreWriter {
         result
     }
 
+    /// Start the writer for the store file that belongs to the config at
+    /// `config_path` (`<config stem>.alive-bridges.log`, the same
+    /// resolution [`init_global`] applies): config in, handle out.
+    /// Publishes with the production strategy — `BridgeStore::save`
+    /// under the per-path lock, retried with the standard backoff.
+    ///
+    /// The engine itself uses [`init_global`]/[`close_global`], which
+    /// keep the single process-wide writer; `open` is for code that
+    /// owns the handle explicitly. See the type-level note on running
+    /// more than one writer per store path.
+    pub fn open(config_path: Option<&Path>) -> Self {
+        let resolved = BridgeStore::resolve_path(config_path);
+        Self::spawn_writer(resolved, Arc::new(|store| store.save()), INITIAL_BACKOFF)
+    }
+
+    /// Test seam (R10): a custom publisher and initial backoff, for the
+    /// writer's own tests and for tests in other crates that enable the
+    /// `test-seams` feature through their dev-dependencies. Production
+    /// code starts the writer with [`StoreWriter::open`]; this
+    /// constructor does not exist outside test builds.
+    #[cfg(any(test, feature = "test-seams"))]
     pub fn spawn(path: PathBuf, publish: Publisher, initial_backoff: Duration) -> Self {
+        Self::spawn_writer(path, publish, initial_backoff)
+    }
+
+    fn spawn_writer(path: PathBuf, publish: Publisher, initial_backoff: Duration) -> Self {
         let (tx, mut rx) = mpsc::channel::<Op>(64);
         let actor_path = path.clone();
         let retirements: RetirementLog = Arc::default();
@@ -742,6 +801,11 @@ pub(crate) static GLOBAL_WRITER_TEST_LOCK: tokio::sync::Mutex<()> =
 /// writer would break the single-writer contract. After a close completes
 /// the next call starts a fresh writer, so an engine restarted in the same
 /// process does not inherit a dead one.
+///
+/// Contract (RT-0): at most one live writer per process, and a
+/// sequential restart works — the close empties the slot, so
+/// [`init_global`] after a completed [`close_global`] never hands back
+/// a closed writer.
 pub fn init_global(config_path: Option<&Path>) -> StoreWriter {
     let resolved = BridgeStore::resolve_path(config_path);
     let mut slot = WRITER.lock().unwrap_or_else(|error| error.into_inner());
@@ -761,8 +825,7 @@ pub fn init_global(config_path: Option<&Path>) -> StoreWriter {
             writer
         }
         None => {
-            let writer =
-                StoreWriter::spawn(resolved.clone(), Arc::new(|s| s.save()), INITIAL_BACKOFF);
+            let writer = StoreWriter::open(config_path);
             *slot = Slot::Active(writer.clone());
             writer
         }
