@@ -2,7 +2,7 @@
 
 The internal runtime module tree of the `tor-socks5` proxy binary — Tor bootstrap setup, bridge maintenance (ranking, channel probes, candidate pooling), bridge store writing, circuit verification, warming, fetch merging, conn health counters and the Tor watchdog — moved as-is out of the binary (SDK-6, docs/plans/sdk-coverage-plan.md). Behavior-neutral: the binary links this crate and keeps its own CLI/server/commands code.
 
-Not published: the release artifact is the single `tor-socks5` package; consumers take the facade by git. The public surface is the Tor client API of SDK-9 (see below); the bridge health writer and observation layer (SDK-7) and the bridge manager (SDK-8) are still closed.
+Not published: the release artifact is the single `tor-socks5` package; consumers take the facade by git. The public surface is the Tor client API of SDK-9 (see below); the bridge health writer and observation layer (SDK-7) and the bridge manager (SDK-8, see below) are also open.
 
 The `test-seams` feature is dev-only: it is enabled solely through consumers' dev-dependencies so tests in other crates can drive the same internal seams the binary's tests use (R10). Never enable it in default/full builds.
 
@@ -43,8 +43,42 @@ Restart contract (plan decision D5): what this surface opens is one live Tor
 client per process; sequential stop-then-start works. Concurrent clients or
 restart-in-parallel are not supported.
 
-The bridge health writer and the guard-observation layer (SDK-7) and the
-bridge manager (SDK-8) are not public yet.
+The bridge health writer and the guard-observation layer (SDK-7) are part of
+the facade's `runtime` module too; the bridge manager (SDK-8) — see below.
+
+## Bridge manager (SDK-8)
+
+The SDK-8 step opens the bridge manager: one handle owning the runtime's
+background bridge producers, plus the `bridges fetch` core as a library
+function.
+
+- `bridge_manager::start(handle, config_path, cfg, observations, settings)`
+  spawns the producers the binary would spawn — `bridge_maintenance`, plus
+  `bridge_warmer` and `bridge_verifier` when the pre-endpoint branch is not
+  active (there only maintenance runs, and the same warning is logged) — and
+  returns a `BridgeManagerHandle`: `token()` (the cancellation token driving
+  every producer), `status()`/`subscribe()` (`BridgeManagerStatus` via a
+  `tokio::sync::watch`: producer names and whether shutdown happened) and
+  `shutdown().await`, which cancels the token and awaits every producer so
+  in-flight work (probe batches, store writes) lands. Dropping the handle
+  cancels the token without blocking.
+- `bridge_manager::fetch_bridges(cfg, config_path, FetchBridgesParams)` is
+  the core of the CLI's `bridges fetch` command: bootstrap Tor from the
+  configured bridges (built-in seeds as fallback), refresh the candidate
+  pool from the configured HTTPS sources, optionally probe-and-promote
+  (`FetchBridgesParams { timeout, count, probe, cancel }`), and merge into
+  the config; returns `FetchBridgesOutcome { added, promoted, pool_len }`.
+  Not cancel-safe: cancellation aborts network I/O and file writes mid-way
+  and skips the trailing 200 ms post-drop sleep.
+
+The watchdog producers (`spawn_tor_watchdog`,
+`spawn_bridge_failover_watchdog`) belong to the server tree, not to this
+manager; a host composes them alongside. Shutdown order for a correct
+restart: `shutdown()` first, then `bridge_store_writer::close_global`.
+
+Restart contract (plan decision D5): one live manager per process — the
+producers' shared state (writer slot, blocking-worker registry, verify lock,
+save counter) is process-wide; sequential stop-then-start works.
 
 ## Patched Arti (patch-kit)
 
