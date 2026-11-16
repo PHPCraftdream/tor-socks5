@@ -17,7 +17,30 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::Semaphore;
 use tokio::time::{interval, timeout_at, Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
+
+#[derive(Debug)]
+struct SharedStartupError(Arc<anyhow::Error>);
+
+impl std::fmt::Display for SharedStartupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for SharedStartupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.chain().next()
+    }
+}
+
+fn shared_startup_error(error: anyhow::Error) -> (anyhow::Error, anyhow::Error) {
+    let shared = Arc::new(error);
+    (
+        anyhow::Error::new(SharedStartupError(shared.clone())),
+        anyhow::Error::new(SharedStartupError(shared)),
+    )
+}
 
 use crate::cache::DnsCache;
 use crate::doh_client::resolve_with_pool;
@@ -134,13 +157,106 @@ where
     T: Fn() -> F + Send + Clone + 'static,
     F: Future<Output = Option<TorTunnel>> + Send + 'static,
 {
-    let bound = bind_listeners(listen).await?;
+    run_with_client_access_inner(
+        listen,
+        tunnel,
+        cache,
+        providers,
+        overrides,
+        cache_path,
+        shutdown,
+        client_access,
+        None,
+    )
+    .await
+}
+
+/// Like [`run_with_client_access`], but reports readiness after the initial
+/// UDP/TCP listener pairs bind. Success contains actual socket addresses; on
+/// bind failure this future returns the same error sent through `ready`.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_client_access_and_ready<T, F>(
+    listen: &[String],
+    tunnel: T,
+    cache: Arc<DnsCache>,
+    providers: Vec<DohProvider>,
+    overrides: Vec<DnsOverride>,
+    cache_path: PathBuf,
+    shutdown: CancellationToken,
+    client_access: AllowedClients,
+    ready: tokio::sync::oneshot::Sender<Result<Vec<SocketAddr>>>,
+) -> Result<()>
+where
+    T: Fn() -> F + Send + Clone + 'static,
+    F: Future<Output = Option<TorTunnel>> + Send + 'static,
+{
+    run_with_client_access_inner(
+        listen,
+        tunnel,
+        cache,
+        providers,
+        overrides,
+        cache_path,
+        shutdown,
+        client_access,
+        Some(ready),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_with_client_access_inner<T, F>(
+    listen: &[String],
+    tunnel: T,
+    cache: Arc<DnsCache>,
+    providers: Vec<DohProvider>,
+    overrides: Vec<DnsOverride>,
+    cache_path: PathBuf,
+    shutdown: CancellationToken,
+    client_access: AllowedClients,
+    mut ready: Option<tokio::sync::oneshot::Sender<Result<Vec<SocketAddr>>>>,
+) -> Result<()>
+where
+    T: Fn() -> F + Send + Clone + 'static,
+    F: Future<Output = Option<TorTunnel>> + Send + 'static,
+{
+    let bound = match bind_listeners(listen).await {
+        Ok(bound) => bound,
+        Err(error) => {
+            if let Some(ready) = ready.take() {
+                error!(%error, "dns server exited");
+                let (reported, returned) = shared_startup_error(error);
+                let _ = ready.send(Err(reported));
+                return Err(returned);
+            }
+            return Err(error);
+        }
+    };
     let BoundListeners {
         udp: udp_sockets,
         tcp: tcp_listeners,
         endpoints,
         retry,
     } = bound;
+    if let Some(ready) = ready.take() {
+        let addresses = udp_sockets
+            .iter()
+            .map(|socket| socket.local_addr())
+            .chain(tcp_listeners.iter().map(TcpListener::local_addr))
+            .collect::<std::io::Result<Vec<_>>>();
+        let addresses = match addresses {
+            Ok(addresses) => addresses,
+            Err(error) => {
+                let error =
+                    anyhow::Error::new(error).context("getting bound DNS listener addresses");
+                error!(%error, "dns server exited");
+                let (reported, returned) = shared_startup_error(error);
+                let _ = ready.send(Err(reported));
+                return Err(returned);
+            }
+        };
+        let _ = ready.send(Ok(addresses));
+    }
     let (statistics, worker) = match StatisticsWorker::open(StatisticsPaths::from_cache_path(
         &cache_path,
     ))

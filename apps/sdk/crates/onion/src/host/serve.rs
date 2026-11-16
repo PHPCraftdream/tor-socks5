@@ -1,16 +1,19 @@
 //! Per-service request serving: consume rendezvous requests, accept streams,
 //! and forward each accepted stream to the configured local target; plus a
-//! status-event logger.
+//! Host ownership is producer → managers `JoinSet` → per-manager children
+//! `JoinSet` → rendezvous/forwarding `JoinSet`s. Aborting any owner drops its
+//! set and aborts descendants; graceful cancellation awaits children before
+//! returning. This module owns the rendezvous and forwarding levels.
 //!
 //! Concurrency: one `Arc<Semaphore>` (256 permits) per service plus one
 //! process-wide `Arc<Semaphore>` (512 permits) across ALL services together.
 //! Every forwarded stream holds one permit of each for its whole life — the
 //! per-service one acquired first, then the global one, always in that
 //! order, so a stream its own service cannot admit never consumes a global
-//! permit. Connection tasks are spawned detached-but-bounded exactly as
-//! before: both owned permits move into the task, which self-cleans on drop.
-//! The accept loop itself never blocks on a permit; excess streams are
-//! served as soon as permits free up.
+//! permit. Forwarding tasks live in their rendezvous parent's `JoinSet`; the
+//! semaphores bound their count. Rendezvous workers are separately capped per
+//! service, and cancellation aborts and joins active forwarding tasks. The
+//! accept loops never wait for a permit without also observing cancellation.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,6 +41,11 @@ pub(crate) const MAX_CONCURRENT_STREAMS: usize = 256;
 /// together. Bounds the process' total file-descriptor/memory footprint
 /// on top of the per-service [`MAX_CONCURRENT_STREAMS`].
 pub(crate) const MAX_TOTAL_CONCURRENT_STREAMS: usize = 512;
+
+/// Maximum concurrent rendezvous workers per onion service. This bounds the
+/// service's spawned handshake/circuit tasks independently of forwarded
+/// stream permits; excess rendezvous requests remain in the source stream.
+const MAX_CONCURRENT_RENDEZVOUS_TASKS: usize = MAX_CONCURRENT_STREAMS;
 
 /// Deadline for the local `TcpStream::connect` to a service target.
 const TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -95,24 +103,32 @@ pub(crate) async fn serve_service(
     token: CancellationToken,
 ) {
     let mut rend_requests = rend_requests;
+    let children_token = token.child_token();
+    let mut rendezvous_tasks = tokio::task::JoinSet::new();
     loop {
         let rend = tokio::select! {
             biased;
-            () = token.cancelled() => return,
-            rend = rend_requests.next() => match rend {
+            () = token.cancelled() => break,
+            Some(_) = rendezvous_tasks.join_next(), if !rendezvous_tasks.is_empty() => continue,
+            rend = rend_requests.next(), if rendezvous_tasks.len() < MAX_CONCURRENT_RENDEZVOUS_TASKS => match rend {
                 Some(rend) => rend,
                 None => {
                     debug!("onion service rendezvous stream ended");
-                    return;
+                    break;
                 }
             },
         };
         let ports = ports.clone();
         let semaphore = semaphore.clone();
         let global = global.clone();
-        let token = token.clone();
-        tokio::spawn(async move {
-            match rend.accept().await {
+        let token = children_token.clone();
+        rendezvous_tasks.spawn(async move {
+            let accepted = tokio::select! {
+                biased;
+                () = token.cancelled() => return,
+                accepted = rend.accept() => accepted,
+            };
+            match accepted {
                 Ok(stream_requests) => {
                     serve_stream_requests(stream_requests, ports, semaphore, global, token).await;
                 }
@@ -124,6 +140,11 @@ pub(crate) async fn serve_service(
             }
         });
     }
+
+    // Let each parent observe cancellation and join its own forwarding tasks
+    // before joining the rendezvous workers here.
+    children_token.cancel();
+    while rendezvous_tasks.join_next().await.is_some() {}
 }
 
 /// The two permits one forwarded stream holds for its whole life: the
@@ -155,20 +176,27 @@ async fn serve_stream_requests(
     global: Arc<Semaphore>,
     token: CancellationToken,
 ) {
-    loop {
+    let mut forwarding_tasks = tokio::task::JoinSet::new();
+    let cancelled = loop {
         let request = tokio::select! {
             biased;
-            () = token.cancelled() => return,
+            () = token.cancelled() => break true,
+            Some(_) = forwarding_tasks.join_next(), if !forwarding_tasks.is_empty() => continue,
             request = stream_requests.next() => match request {
                 Some(request) => request,
-                None => return, // client circuit closed
+                None => break false, // client circuit closed
             },
         };
 
         let port = requested_port(request.request());
         let Some(target) = target_for_port(&ports, port).cloned() else {
             trace!(?port, "onion service: rejecting stream for unknown port");
-            if let Err(error) = request.reject(end_done()).await {
+            let rejected = tokio::select! {
+                biased;
+                () = token.cancelled() => break true,
+                result = request.reject(end_done()) => result,
+            };
+            if let Err(error) = rejected {
                 debug!(%error, "onion service: failed to send END for rejected stream");
             }
             continue;
@@ -176,18 +204,44 @@ async fn serve_stream_requests(
 
         // Owned permits, moved into the connection task: they cap in-flight
         // forwards and are released when the task ends.
-        let Some((permit, global_permit)) = acquire_stream_permits(&semaphore, &global).await
-        else {
-            // Semaphores closed: only happens at process teardown.
-            let _ = request.reject(end_done()).await;
-            return;
+        let permits = tokio::select! {
+            biased;
+            () = token.cancelled() => break true,
+            permits = acquire_stream_permits(&semaphore, &global) => permits,
         };
-        tokio::spawn(handle_stream_request(
+        let Some((permit, global_permit)) = permits else {
+            // Semaphores closed: only happens at process teardown.
+            let _ = tokio::select! {
+                biased;
+                () = token.cancelled() => break true,
+                result = request.reject(end_done()) => result,
+            };
+            break false;
+        };
+        forwarding_tasks.spawn(handle_stream_request(
             request,
             target,
             permit,
             global_permit,
         ));
+    };
+
+    if cancelled {
+        // Cancelling a JoinSet aborts and joins every active network forward.
+        forwarding_tasks.shutdown().await;
+    } else {
+        // The circuit may close while already-accepted streams continue. Keep
+        // them owned by this parent until completion, unless host shutdown wins.
+        while !forwarding_tasks.is_empty() {
+            tokio::select! {
+                biased;
+                () = token.cancelled() => {
+                    forwarding_tasks.shutdown().await;
+                    return;
+                }
+                _ = forwarding_tasks.join_next() => {}
+            }
+        }
     }
 }
 

@@ -9,30 +9,20 @@ pub(super) fn launch(
     producer_token: CancellationToken,
     producers: &mut Vec<tokio::task::JoinHandle<()>>,
 ) {
-    // The bridge producers (maintenance, warmer, circuit verifier) belong to
-    // one bridge manager (SDK-8): the manager owns their tasks and cancels
-    // them through its own token, so nothing is spawned here directly. The
-    // pre-endpoint warning now comes from the manager itself. The trampoline
-    // below links the manager to the server tree: it awaits the manager's
-    // `shutdown()` (cancel + join every producer, so in-flight store writes
-    // land) and is itself installed into the same `producers` vec the other
-    // producers go through — the owner registry joins it at exactly the
-    // point where the direct joins used to happen, so the shutdown ordering
-    // is unchanged.
-    let manager = tor_socks5_runtime::bridge_manager::start(
+    // Bridge producer tasks must live in the same cancellation-safe owner as
+    // the server's other producers. A trampoline awaiting manager.shutdown()
+    // would own the child handles; aborting that trampoline at the shutdown
+    // deadline would drop and detach those children. Transfer the actual tasks
+    // instead. This is the SDK-11 bridge until SDK-14 unifies task ownership.
+    let manager = tor_socks5_runtime::bridge_manager::start_for_server(
         handle.clone(),
         config_path.clone(),
         cfg,
         obs_sink,
         settings.clone(),
+        producer_token.clone(),
     );
-    producers.push(tokio::spawn({
-        let token = producer_token.clone();
-        async move {
-            token.cancelled().await;
-            manager.shutdown().await;
-        }
-    }));
+    producers.extend(manager.into_tasks());
 
     if settings.pre_endpoint.is_some() {
         if let Some(run) = spawn_tor_watchdog(handle, config_path, cfg.watchdog, producer_token) {

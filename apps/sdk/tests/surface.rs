@@ -190,3 +190,46 @@ fn onion_host_module() {
     let _ = tor_socks5::onion::host::OnionHost::new;
     let _ = tor_socks5::onion::host::OnionHostHandle::subscribe;
 }
+
+/// The SDK-11 embedded server surface: its builder future, shutdown result,
+/// and inferred token/status channel traits compile through the facade.
+#[cfg(feature = "server")]
+#[test]
+fn server_surface_signatures() {
+    use std::future::Future;
+
+    use tor_socks5::server::{
+        DnsStartupPolicy, Server, ServerBuilder, ServerError, ServerHandle, ServerStatus,
+    };
+
+    fn expect_builder(_: ServerBuilder) {}
+    fn expect_dns_policy(_: DnsStartupPolicy) {}
+    fn expect_start<F>(_: F)
+    where
+        F: Future<Output = Result<ServerHandle, ServerError>>,
+    {
+    }
+    fn expect_shutdown(handle: ServerHandle) -> impl Future<Output = Result<(), ServerError>> {
+        handle.shutdown()
+    }
+    fn assert_clone_send_sync<T: Clone + Send + Sync + 'static>(_: &T) {}
+    fn assert_send_sync<T: Send + Sync + 'static>(_: &T) {}
+
+    let builder = Server::builder(tor_socks5::config::Config::default());
+    expect_builder(builder);
+    expect_dns_policy(DnsStartupPolicy::Required);
+    let start = Server::builder(tor_socks5::config::Config::default())
+        .dns_startup_policy(DnsStartupPolicy::Required)
+        .upstream(Some("127.0.0.1:9050".into()), None, None)
+        .start();
+    expect_start(start);
+    let _shutdown = expect_shutdown;
+
+    fn assert_handle_channels(handle: &ServerHandle) {
+        let token = handle.token();
+        assert_clone_send_sync(&token);
+        let status: tokio::sync::watch::Receiver<ServerStatus> = handle.subscribe();
+        assert_send_sync(&status);
+    }
+    let _channels = assert_handle_channels;
+}

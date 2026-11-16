@@ -490,6 +490,8 @@ jobs:
       - run: cargo hack check --each-feature --no-dev-deps -p tor-socks5-config -p arti-wrapper
       - name: SDK facade, every feature with its surface tests
         run: cargo hack check --each-feature --tests -p tor-socks5
+      - name: Embedded server example through the facade
+        run: cargo check --locked -p tor-socks5 --features server --examples
 
   stress:
     needs: plan

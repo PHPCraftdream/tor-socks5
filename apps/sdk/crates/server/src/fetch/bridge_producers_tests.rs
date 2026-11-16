@@ -8,8 +8,11 @@ fn ensure_crypto_provider() {
     });
 }
 
+/// Smoke test: checks the producer count and cooperative completion only.
+/// It does not prove descendant ownership after abort; a trampoline
+/// implementation would also pass.
 #[tokio::test]
-async fn pre_launch_keeps_only_maintenance_and_watchdog() {
+async fn sdk11_server_bridge_tasks_are_directly_owned_by_producer_vec() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = Config::default();
     cfg.bridges.use_seeds = false;
@@ -37,7 +40,11 @@ async fn pre_launch_keeps_only_maintenance_and_watchdog() {
         token.clone(),
         &mut tasks,
     );
-    assert_eq!(tasks.len(), 2);
+    assert_eq!(
+        tasks.len(),
+        2,
+        "maintenance and watchdog tasks are directly supervised"
+    );
     token.cancel();
     for task in tasks {
         task.await.unwrap();

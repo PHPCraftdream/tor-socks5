@@ -1,9 +1,9 @@
 # tor-socks5 — SDK facade
 
 One dependency for the libraries of this repository. The crate is a thin
-facade: each module is a workspace crate re-exported whole, so nothing is
-copied or wrapped, the crates keep their own tests and docs, and a fix in one
-of them reaches the facade at once.
+facade: most leaf-library modules re-export their workspace crate, while the
+runtime and embedded-server modules expose curated APIs. Features select which
+crates are linked.
 
 It is **not published to crates.io**. The Tor stack needs the vendored Arti
 forks, and a crates.io package cannot carry them (`[patch]` is dropped on
@@ -44,6 +44,7 @@ use tor_socks5::config::Config;
 | `fetch` | `fetch` | `bridge-fetcher` | `tor`, `bridges` |
 | `dns` | `dns` | `tor-socks5-dns` | `tor`, `acl` |
 | `runtime` | `runtime` | `tor-socks5-runtime` | `tor`, `config`, `bridges` |
+| `server` | `server` | `tor-socks5-server` | `runtime`, `onion-service` |
 | `onion` | `onion` | `tor-socks5-onion` | |
 | `onion-keys` | `onion` (keys) | `tor-socks5-onion/keys` | |
 | `onion-service` | | `arti-wrapper/onion-service` | `tor`, `onion-host` |
@@ -55,8 +56,8 @@ without Tor: probing, health storage and verification do not link Arti.
 
 ## Using the Tor features
 
-`tor`, `fetch`, `dns`, `runtime`, `onion-service`, `onion-host` and `full` link
-Arti; `onion-keys`
+`tor`, `fetch`, `dns`, `runtime`, `server`, `onion-service`, `onion-host` and
+`full` link Arti; `onion-keys`
 does **not** join this list (its `tor-keymgr` and `tor-hscrypto` are only
 the crypto and keystore part — no Tor client is linked). Cargo resolves
 stock Arti from crates.io unless the **final binary's or workspace's root**
@@ -283,22 +284,73 @@ validation, tracing and printing; the outcome is
 `FetchBridgesOutcome { added, promoted, pool_len }`. Not cancel-safe:
 cancellation aborts the run mid-way and skips the trailing 200 ms sleep.
 
-## What is not here
+## Embedded SOCKS5 server (`server` feature)
 
-The facade re-exports the libraries under `packages/` and `apps/sdk/crates/`. The logic that runs
-the proxy lives in the `socks5-proxy` binary and is **not** available as a
-library yet:
+With `server`, `tor_socks5::server` exposes only `Server`, `ServerBuilder`,
+`ServerHandle`, `ServerError` and `ServerStatus`. The builder accepts the
+facade's `config::Config`; for upstream SOCKS5 egress, configure it explicitly
+with `.upstream(Some(address), username, password)`. Starting the server does
+not connect to or validate the upstream proxy; that proxy must already be
+available when client connections need egress.
 
-- the proxy server (listeners, egress, pre/post pools, startup and shutdown);
+```rust,no_run
+use tor_socks5::config::Config;
+use tor_socks5::server::Server;
 
-The bridge health writer, the guard-event observation, the bridge manager
-and the Tor client
-and watchdog surface are available behind the `runtime` feature (see
-[Tor client (runtime feature)](#tor-client-runtime-feature) and
-[Bridge health writer and guard observations](#bridge-health-writer-and-guard-observations)).
+# async fn run() -> Result<(), tor_socks5::server::ServerError> {
+let cfg = Config {
+    listen: vec!["127.0.0.1:0".into()],
+    ..Config::default()
+};
+let server = Server::builder(cfg)
+    .dns_startup_policy(tor_socks5::server::DnsStartupPolicy::Required)
+    .upstream(Some("127.0.0.1:9050".into()), None, None)
+    .start()
+    .await?;
+server.shutdown().await?;
+# Ok(())
+# }
+```
 
-To use these today, run the binary. Taking them into library crates is
-planned in [`docs/plans/sdk-coverage-plan.md`](../../docs/plans/sdk-coverage-plan.md).
+The embedded-server contract is one live server per process: await
+`shutdown()` before starting another; sequential restart is supported. Embedded
+startup requires at least one configured DNS UDP/TCP pair to bind
+(`DnsStartupPolicy::Required`) by default; unavailable pairs are skipped
+(`AddrInUse`, `PermissionDenied`, or `AddrNotAvailable`, the latter queued for
+retry). Set the builder to `DnsStartupPolicy::Background` for the proxy CLI's
+legacy optional/non-fatal DNS behavior; the CLI sets this policy explicitly.
+`Running` addresses include only successfully bound sockets. Startup returns
+`ServerError::Bind` only when no pair binds.
+Each run that allocates owner storage consumes one of the 15 process-lifetime
+quarantine slots, so repeated restarts that use owner storage can exhaust that
+limit. The handle's `Drop` only cancels its token and never blocks, so use
+explicit `shutdown().await` to finish the cleanup attempt. Settings/global-init/owner
+recovery uses explicit deadlines; producer and handler joins have their own budgets
+(normal producer grace is 120 seconds). The final blocking-worker join has a
+five-second timeout. Closing the bridge-store writer is awaited without a deadline.
+`Stopped` means that attempt completed (successfully or with an error;
+`ServerError::Cleanup` preserves a secondary cleanup failure), not that every task
+handle was provably joined; timed-out handles remain retained in process slots for
+recovery by the next start. The server library does not install a tracing subscriber or crypto provider, bind child processes,
+load process config, or handle OS signals; those remain the host application's
+responsibility.
+
+This Tor-linked feature requires the patch-kit (see
+[Using the Tor features](#using-the-tor-features)). The facade example is
+[embedded_server.rs](examples/embedded_server.rs); enable it with
+`features = ["server"]` and run `cargo run -p tor-socks5 --example
+embedded_server --features server`. It does not start or require a Tor
+bootstrap, but client egress still needs the configured upstream proxy.
+
+## What remains host-owned
+
+The facade provides library APIs, not the proxy executable's process shell.
+The embedded server is available with `server` (above); the host application
+still owns process initialization and configuration loading, signals, CLI
+commands and operating-system service management. The bridge health writer,
+guard-event observation, bridge manager, Tor client and watchdog surfaces are
+available behind `runtime` (see [Tor client (runtime feature)](#tor-client-runtime-feature)
+and [Bridge health writer and guard observations](#bridge-health-writer-and-guard-observations)).
 Also outside the facade by design: the Android `cdylib`, `pt-helper`, the OS
-service installer and the command-line parser. The vendored crates are never
+service installer and the command-line parser. Vendored crates are never
 exposed through it.

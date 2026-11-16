@@ -25,6 +25,7 @@ def graph():
         "ffi": ("android-ffi", "packages/android-ffi"),
         "runtime": ("tor-socks5-runtime", "apps/sdk/crates/runtime"),
         "server": ("tor-socks5-server", "apps/sdk/crates/server"),
+        "onion": ("tor-socks5-onion", "apps/sdk/crates/onion"),
         "sdk": ("resocks5-net", "external/sdk"),
         "vendor": ("tor-dirclient", "vendor/tor-dirclient"),
         "middle": ("middle", "external/middle"),
@@ -35,9 +36,9 @@ def graph():
                  **({"source": "registry+https://github.com/rust-lang/crates.io-index"} if i == "sdk" else {}),
                  "manifest_path": str(root / path / "Cargo.toml"), "targets": [{"kind": ["lib"]}]}
                 for i, (name, path) in names.items()]
-    edges = {"proxy": ["auth", "config", "bridge", "arti", "sdk", "native", "server"], "ffi": ["config", "auth"], "bridge": ["middle"], "arti": [], "middle": ["vendor"], "acl": [], "auth": ["acl"], "config": ["acl"], "sdk": [], "vendor": [], "native": [], "facade": [], "runtime": [], "server": ["runtime"]}
+    edges = {"proxy": ["auth", "config", "bridge", "arti", "sdk", "native", "server"], "ffi": ["config", "auth"], "bridge": ["middle"], "arti": [], "middle": ["vendor"], "acl": [], "auth": ["acl"], "config": ["acl"], "sdk": [], "vendor": [], "native": [], "facade": ["server", "runtime", "onion"], "runtime": [], "server": ["runtime", "onion"], "onion": []}
     nodes = [{"id": i, "deps": [{"pkg": d, "name": "alias_" + d, "dep_kinds": [{"kind": "build" if d == "middle" else "dev" if d == "auth" else None, "target": "cfg(unix)" if d == "vendor" else None}]} for d in deps]} for i, deps in edges.items()]
-    return p.Graph({"packages": packages, "workspace_members": ["proxy", "auth", "config", "acl", "bridge", "arti", "ffi", "facade", "runtime", "server"], "resolve": {"nodes": nodes}}, root)
+    return p.Graph({"packages": packages, "workspace_members": ["proxy", "auth", "config", "acl", "bridge", "arti", "ffi", "facade", "runtime", "server", "onion"], "resolve": {"nodes": nodes}}, root)
 
 
 def lock_graph(extra_packages=(), lyrebird_versions=("0.8.0",), extra_members=()):
@@ -462,6 +463,9 @@ class Routing(unittest.TestCase):
         facade = self.route("apps/sdk/src/lib.rs")
         self.assertEqual(facade["packages"], ["tor-socks5"])
         self.assertIn("features", facade["segments"])
+        example = self.route("apps/sdk/examples/embedded_server.rs")
+        self.assertEqual(example["packages"], ["tor-socks5"])
+        self.assertIn("features", example["segments"])
         self.assertNotIn("features", self.route("packages/auth/src/lib.rs")["segments"])
 
     def test_contracts_and_native(self):
@@ -554,6 +558,7 @@ class Routing(unittest.TestCase):
             self.assertIn(job, blocks["required"])
         self.assertNotIn("license-lifecycle", blocks)
         self.assertIn("always()", blocks["required"])
+        self.assertIn("cargo check --locked -p tor-socks5 --features server --examples", blocks["features"])
         self.assertIn("cargo deny --locked --config .github/deny.toml check licenses", blocks["license-audit"])
         self.assertIn("cargo fetch --locked", blocks["license-audit"])
         self.assertNotIn("python", blocks["license-audit"])

@@ -66,7 +66,7 @@ async fn probe_once(
     match arti_wrapper::probe_proxy_direct(&proxy, deadline).await {
         ProxyProbe::Alive => {
             if let Some(endpoint) = client_endpoint(&proxy) {
-                registry.revive(endpoint);
+                registry.revive(endpoint).await;
             }
             ProbeOutcome::Alive
         }

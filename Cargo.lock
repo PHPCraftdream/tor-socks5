@@ -5967,6 +5967,7 @@ dependencies = [
  "futures-core",
  "futures-io",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",
@@ -7310,6 +7311,7 @@ dependencies = [
  "bridge-store",
  "bridge-verify-core",
  "persist-lock",
+ "tokio",
  "tor-socks5-auth",
  "tor-socks5-client-acl",
  "tor-socks5-config",
@@ -7318,6 +7320,7 @@ dependencies = [
  "tor-socks5-proto",
  "tor-socks5-route-pool",
  "tor-socks5-runtime",
+ "tor-socks5-server",
  "tracing-subscriber",
 ]
 
@@ -7490,6 +7493,7 @@ dependencies = [
  "resocks5-net",
  "rustls",
  "tempfile",
+ "thiserror 2.0.18",
  "time",
  "tokio",
  "tokio-util",

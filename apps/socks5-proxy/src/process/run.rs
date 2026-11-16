@@ -4,13 +4,14 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use tor_socks5_runtime::arti_observability::ObservationSink;
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 use tracing_appender::non_blocking::WorkerGuard;
 
 use super::children::bind_child_processes_to_self;
 use super::logging::{init_tracing, install_crypto_provider};
 use crate::config::{Config, Loaded};
-use tor_socks5_server::{run_server, ServerArgs};
+use tor_socks5_server::{DnsStartupPolicy, Server, ServerError, ServerStatus};
 
 /// Process-wide state that must outlive the server run.
 pub(crate) struct ServerProcess {
@@ -18,7 +19,7 @@ pub(crate) struct ServerProcess {
     _log_guard: WorkerGuard,
     /// Captures per-guard usability events from arti's tracing layer for
     /// the bridge maintenance loop to drain into the health store.
-    pub(crate) obs_sink: ObservationSink,
+    pub(crate) obs_sink: tor_socks5_runtime::arti_observability::ObservationSink,
 }
 
 /// Initialise the process for serving: tracing, rustls provider, Job
@@ -44,7 +45,7 @@ pub(crate) fn init_server_process(cfg: &Config) -> ServerProcess {
 
 /// Load the configuration, initialise the process and run the server until
 /// `shutdown` resolves. The log guard is dropped on return, so buffered
-/// records are flushed before the caller reports any error.
+/// records are flushed after all startup or shutdown cleanup has completed.
 pub(crate) async fn run_server_process(
     config_override: Option<PathBuf>,
     upstream_addr: Option<String>,
@@ -58,17 +59,72 @@ pub(crate) async fn run_server_process(
         Loaded::Defaults(config) => (None, config),
     };
     let process = init_server_process(&config);
-    run_server(
-        ServerArgs {
-            config,
-            config_path,
-            obs_sink: process.obs_sink.clone(),
-            upstream_addr,
-            upstream_user,
-            upstream_pass,
-            no_upstream,
-        },
-        shutdown,
-    )
-    .await
+    tokio::pin!(shutdown);
+    let token = CancellationToken::new();
+
+    let start = Server::builder(config)
+        .config_path(config_path)
+        .observation_sink(process.obs_sink.clone())
+        .upstream(upstream_addr, upstream_user, upstream_pass)
+        .no_upstream(no_upstream)
+        // Keep the CLI's legacy non-fatal DNS listener behavior. Embedded SDK
+        // callers default to requiring DNS bind readiness.
+        .dns_startup_policy(DnsStartupPolicy::Background)
+        .cancellation_token(token.clone())
+        .start();
+    tokio::pin!(start);
+
+    // Once the signal arrives, cancel startup but keep polling the same start
+    // future to completion. This joins startup cleanup and preserves cleanup
+    // failures instead of dropping the future with work still running.
+    let mut shutdown_requested = false;
+    let mut started = None;
+    tokio::select! {
+        biased;
+        () = &mut shutdown => {
+            shutdown_requested = true;
+            token.cancel();
+        }
+        result = &mut start => started = Some(result),
+    }
+    let started = match started {
+        Some(result) => result,
+        None => start.await,
+    };
+
+    let handle = match started {
+        Ok(handle) => handle,
+        Err(ServerError::Cancelled) if shutdown_requested => return Ok(()),
+        Err(error) => return Err(error.into_anyhow()),
+    };
+
+    if shutdown_requested {
+        return handle.shutdown().await.map_err(ServerError::into_anyhow);
+    }
+
+    let mut status = handle.subscribe();
+    let shutdown_requested = tokio::select! {
+        biased;
+        () = &mut shutdown => true,
+        _ = wait_for_terminal(&mut status) => false,
+    };
+    if shutdown_requested {
+        handle.shutdown().await.map_err(ServerError::into_anyhow)
+    } else {
+        handle.wait().await.map_err(ServerError::into_anyhow)
+    }
+}
+
+async fn wait_for_terminal(status: &mut watch::Receiver<ServerStatus>) {
+    loop {
+        if matches!(
+            status.borrow_and_update().clone(),
+            ServerStatus::Stopped { .. }
+        ) {
+            return;
+        }
+        if status.changed().await.is_err() {
+            return;
+        }
+    }
 }

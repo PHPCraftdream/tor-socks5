@@ -61,6 +61,7 @@ async fn run_server_reports_final_flush_worker_panic() {
                 let hook = Arc::new(super::super::global_init::ShutdownHook {
                     settings,
                     writer: Some(writer),
+                    failure: None,
                     ready: std::sync::Mutex::new(Some(ready_tx)),
                 });
                 let (config_path, config) =
@@ -77,6 +78,7 @@ async fn run_server_reports_final_flush_worker_panic() {
                     upstream_user: None,
                     upstream_pass: None,
                     no_upstream: false,
+                    dns_startup_policy: crate::api::DnsStartupPolicy::Required,
                 };
                 let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
                 let server = super::super::global_init::RUN_SERVER_SHUTDOWN.scope(hook, async {
@@ -166,6 +168,7 @@ async fn parked_server_startup(global: bool) {
         upstream_user: None,
         upstream_pass: None,
         no_upstream: false,
+        dns_startup_policy: crate::api::DnsStartupPolicy::Required,
     };
     let mut server = AbortOnDrop(tokio::spawn(
         super::super::global_init::RUN_SERVER_STARTUP.scope(hook, async move {

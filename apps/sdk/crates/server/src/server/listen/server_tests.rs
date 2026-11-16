@@ -23,6 +23,7 @@ async fn shutdown_is_polled_before_validating_config() {
         upstream_user: None,
         upstream_pass: None,
         no_upstream: false,
+        dns_startup_policy: crate::api::DnsStartupPolicy::Required,
     };
     assert!(run_server(args, std::future::ready(())).await.is_ok());
 }

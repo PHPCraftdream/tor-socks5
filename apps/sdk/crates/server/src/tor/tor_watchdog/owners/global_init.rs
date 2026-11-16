@@ -31,10 +31,18 @@ tokio::task_local! {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BootstrapFailure {
+    Error,
+    Panic,
+}
+
+#[cfg(test)]
 pub(super) struct ShutdownHook {
     pub settings: Settings,
     /// `None` отдаёт запись настоящему процессному слоту `WRITER`.
     pub writer: Option<tor_socks5_runtime::bridge_store_writer::StoreWriter>,
+    pub failure: Option<BootstrapFailure>,
     pub ready: StdMutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
@@ -192,12 +200,44 @@ impl SettingsInit {
 }
 
 pub(super) async fn recover_startup() -> Result<()> {
+    let mut errors = recover_startup_all().await;
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.remove(0))
+    }
+}
+
+/// Recover every retained startup/runtime owner, preserving each failure so
+/// failed-run cleanup can continue through the remaining stages.
+pub(super) async fn recover_startup_all() -> Vec<anyhow::Error> {
     let deadline = Instant::now() + Duration::from_secs(5);
-    SettingsInit::recover(deadline).await?;
-    GlobalInit::recover(deadline).await?;
-    super::producers::ProducerTasks::recover().await?;
-    super::handlers::HandlerTasks::recover().await?;
-    super::owners::OwnerRegistry::recover_retained_with_deadline(deadline).await
+    let mut errors = Vec::new();
+    if let Err(error) = SettingsInit::recover(deadline).await {
+        errors.push(error);
+    }
+    if let Err(error) = GlobalInit::recover(deadline).await {
+        errors.push(error);
+    }
+    if let Err(error) = super::producers::ProducerTasks::recover().await {
+        errors.push(error);
+    }
+    if let Err(error) = super::handlers::HandlerTasks::recover().await {
+        errors.push(error);
+    }
+    if let Err(error) = super::owners::OwnerRegistry::recover_retained_with_deadline(deadline).await
+    {
+        errors.push(error);
+    }
+    errors
+}
+
+/// Close a writer left by an earlier run after its retained owners recovered.
+pub(super) async fn close_orphaned_store_writer() -> Option<Result<()>> {
+    // Startup recovery only owns the process-global orphan. A test-scoped
+    // shutdown hook may provide this run's writer, which must stay open until
+    // server shutdown (and may deliberately be blocked to test Stopping).
+    tor_socks5_runtime::bridge_store_writer::close_global().await
 }
 
 /// Ожидает задачу запуска или восстанавливает её после сигнала завершения.
@@ -275,6 +315,13 @@ impl GlobalInit {
     }
 
     pub(super) fn start(settings: Settings) -> Result<Arc<Self>> {
+        #[cfg(test)]
+        if let Ok(Some(failure)) = RUN_SERVER_SHUTDOWN.try_with(|hook| hook.failure) {
+            return Self::start_job(move |_| match failure {
+                BootstrapFailure::Error => Err(anyhow!("sdk11 synthetic bootstrap failure")),
+                BootstrapFailure::Panic => panic!("sdk11 synthetic bootstrap panic"),
+            });
+        }
         #[cfg(test)]
         if let Ok(hook) = RUN_SERVER_STARTUP.try_with(Arc::clone) {
             if hook.park_global {

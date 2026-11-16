@@ -1,9 +1,8 @@
 //! One dependency for the tor-socks5 libraries.
 //!
-//! A facade: every module is the workspace crate of the same name re-exported
-//! whole, so nothing here is copied or wrapped and the crates keep their own
-//! versions, tests and docs. Features pick which crates are linked; the
-//! default set is Tor-free.
+//! A facade over selected workspace APIs. Most leaf-library modules are
+//! re-exported whole; the runtime and embedded-server modules are curated
+//! surfaces. Features pick which crates are linked; the default set is Tor-free.
 //!
 //! | Module | Crate | Feature |
 //! |---|---|---|
@@ -19,8 +18,9 @@
 //! | [`dns`] | `tor-socks5-dns` | `dns` |
 //! | [`onion`] | `tor-socks5-onion` | `onion`, `onion-keys`, `onion-host` |
 //! | [`runtime`] | `tor-socks5-runtime` — the curated SDK-7/8/9 surfaces, not the whole crate | `runtime` |
+//! | [`server`] | `tor-socks5-server` — the curated embedded server API | `server` |
 //!
-//! The `tor` feature (and `fetch`, `dns`, `runtime`, `onion-service`,
+//! The `tor` feature (and `fetch`, `dns`, `runtime`, `server`, `onion-service`,
 //! `full`, which imply it) links Arti. Without the vendored forks of the patch-kit a
 //! consumer gets stock Arti and silently loses their fixes; see the SDK guide
 //! (`apps/sdk/README.md`) for the `[patch.crates-io]` block.
@@ -91,8 +91,8 @@ pub use ::tor_socks5_onion as onion;
 
 /// The embedded Tor runtime (`tor-socks5-runtime`, `apps/sdk/crates/runtime`),
 /// curated by module — this is not the whole crate. Three surfaces are open
-/// so far (SDK-7, SDK-8, SDK-9); the proxy server (SDK-10/11) is not
-/// exposed yet.
+/// so far (SDK-7, SDK-8, SDK-9); the embedded server is available through
+/// [`server`] (SDK-11).
 ///
 /// Nothing here installs process state on its own (R1): the bridge-health
 /// writer slot ([`init_global`]/[`close_global`]: one live writer per
@@ -176,5 +176,15 @@ pub mod runtime {
     pub use ::tor_socks5_runtime::bridge_manager::{
         fetch_bridges, start, BridgeManagerHandle, BridgeManagerStatus, FetchBridgesOutcome,
         FetchBridgesParams,
+    };
+}
+
+/// Embedded SOCKS5/HTTP CONNECT server API (`tor-socks5-server`), curated to
+/// the builder, running handle, status and error types. Requires `server`;
+/// the same feature also enables the `runtime` and `onion-service` features.
+#[cfg(feature = "server")]
+pub mod server {
+    pub use ::tor_socks5_server::{
+        DnsStartupPolicy, Server, ServerBuilder, ServerError, ServerHandle, ServerStatus,
     };
 }
