@@ -92,11 +92,12 @@ pub(crate) async fn verify_for_admission(
     config_path: Option<PathBuf>,
     deadline: std::time::Instant,
     workers: &AdmissionWorkers,
+    pt_binary: PtBinary,
 ) -> anyhow::Result<bool> {
     let live_cache = crate::tor_setup::arti_base_dir(config_path.as_deref()).join("cache");
     let decision_rx = spawn_for_admission(
         move || {
-            let result = admission_verification(bridge, live_cache, deadline);
+            let result = admission_verification(bridge, live_cache, deadline, pt_binary);
             if let Err(error) = &result {
                 warn!(%error, "circuit-verify: admission worker failed");
             }
@@ -128,11 +129,12 @@ fn admission_verification(
     bridge: BridgeLine,
     live_cache: PathBuf,
     deadline: std::time::Instant,
+    pt_binary: PtBinary,
 ) -> anyhow::Result<bool> {
     let scratch = tempfile::Builder::new()
         .prefix("tor-socks5-admission-")
         .tempdir()?;
-    let pt = Some(crate::tor_setup::resolve_pt_binary(&PtBinary::default())?);
+    let pt = Some(crate::tor_setup::resolve_pt_binary(&pt_binary)?);
     let mut verified = false;
     verify_bridges_sequential(
         &live_cache,
@@ -173,9 +175,20 @@ pub fn spawn_bridge_circuit_verifier(
     handle: crate::tor_watchdog::TorHandle,
     token: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_bridge_circuit_verifier_with_pt(config_path, handle, PtBinary::Environment, token)
+}
+
+pub(crate) fn spawn_bridge_circuit_verifier_with_pt(
+    config_path: Option<PathBuf>,
+    handle: crate::tor_watchdog::TorHandle,
+    pt_binary: PtBinary,
+    token: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     #[cfg(any(test, feature = "test-seams"))]
     crate::test_seams::forbid_producer("verifier");
-    tokio::spawn(async move {
+    #[cfg(test)]
+    let observer = crate::pt::sdk14_observer();
+    let run = async move {
         let mut tick = tokio::time::interval(CIRCUIT_VERIFY_INTERVAL);
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         tick.tick().await; // consume the immediate first tick (see doc above)
@@ -186,13 +199,35 @@ pub fn spawn_bridge_circuit_verifier(
                 _ = token.cancelled() => break,
                 _ = tick.tick() => {},
             }
-            run_circuit_verify_tick(config_path.as_deref(), &handle.active_bridges()).await;
+            run_circuit_verify_tick_with_pt(
+                config_path.as_deref(),
+                &handle.active_bridges(),
+                pt_binary.clone(),
+            )
+            .await;
         }
-    })
+    };
+    #[cfg(test)]
+    if let Some((_, tx)) = observer {
+        tokio::spawn(crate::pt::SDK14_PT_OBSERVER.scope(("verifier", tx), run))
+    } else {
+        tokio::spawn(run)
+    }
+    #[cfg(not(test))]
+    tokio::spawn(run)
 }
 
 /// One tick: pick the due batch, verify it, persist the results.
+#[cfg(test)]
 pub(crate) async fn run_circuit_verify_tick(config_path: Option<&Path>, active: &[BridgeLine]) {
+    run_circuit_verify_tick_with_pt(config_path, active, PtBinary::Environment).await;
+}
+
+pub(crate) async fn run_circuit_verify_tick_with_pt(
+    config_path: Option<&Path>,
+    active: &[BridgeLine],
+    pt_policy: PtBinary,
+) {
     let store_path = BridgeStore::resolve_path(config_path);
     // Blocking file read (incl. reader-side stale-temp cleanup) must not run
     // on an async worker (TS19-01).
@@ -235,7 +270,7 @@ pub(crate) async fn run_circuit_verify_tick(config_path: Option<&Path>, active: 
     // Only resolve the PT binary when the batch actually needs one — the
     // resolver inspects the current executable / env and is not free.
     let pt_binary = if due.iter().any(|b| b.transport.is_some()) {
-        match crate::tor_setup::resolve_pt_binary(&PtBinary::default()) {
+        match crate::tor_setup::resolve_pt_binary(&pt_policy) {
             Ok(pt) => Some(pt),
             Err(error) => {
                 warn!(error = %error, "circuit-verify: could not resolve PT binary");
@@ -245,6 +280,11 @@ pub(crate) async fn run_circuit_verify_tick(config_path: Option<&Path>, active: 
     } else {
         None
     };
+
+    #[cfg(test)]
+    if crate::pt::sdk14_observer().is_some() {
+        return;
+    }
 
     // The live client's cache dir, derived from the same base dir
     // `build_tor_settings` uses (see `tor_setup::arti_base_dir`), so the

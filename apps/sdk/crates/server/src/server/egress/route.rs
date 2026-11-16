@@ -7,17 +7,6 @@ use arti_wrapper::{PostPools, RoutedStream, Socks5PreEndpoint, TorTunnel};
 use auth::UsersConfig;
 use proxy_config::{PoolOverride, ProxyPool, Socks5Endpoint};
 
-/// Отклонить пул прокси там, где он не поддерживается, до запуска сети.
-/// `#[doc(hidden)] pub`: the `bridges` CLI of the binary uses it; the API
-/// step is SDK-11.
-#[doc(hidden)]
-pub fn reject_unsupported_pool(setting: &Option<ProxyPool>, scope: &str) -> anyhow::Result<()> {
-    if setting.is_some() {
-        anyhow::bail!("{scope} proxy pool is not supported here; remove it");
-    }
-    Ok(())
-}
-
 /// Tor clients that can run next to the main one, one per extra pre endpoint.
 pub(crate) const MAX_PRE_OWNERS: usize = 15;
 

@@ -24,11 +24,6 @@ mod startup;
 #[path = "server/egress/upstream.rs"]
 mod upstream;
 
-// The bridges CLI needs this one validation helper; keep the route
-// implementation private rather than exposing the server's internal modules.
-#[doc(hidden)]
-pub use route::reject_unsupported_pool;
-
 pub use api::{
     DnsStartupPolicy, Server, ServerBuilder, ServerError, ServerHandle, ServerStage, ServerStatus,
 };

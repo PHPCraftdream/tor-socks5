@@ -290,9 +290,8 @@ async fn run_server_inner(
             // through this handle, so a watchdog rebuild becomes visible to
             // both without re-distribution. Cheap to clone (one
             // `Arc<RwLock<_>>` + two atomics).
-            let handle = TorHandle::new(tor);
+            let handle = TorHandle::new_with_settings(tor, &settings);
             obs_sink.set_recovery_notifier(handle.bridge_refresh().recovery());
-            handle.set_active_bridges(settings.bridges.clone());
             handle.bridge_refresh().set_needed(
                 cfg.bridges.auto_fetch
                     && tor_socks5_runtime::bridge_maintenance::preferred_missing(

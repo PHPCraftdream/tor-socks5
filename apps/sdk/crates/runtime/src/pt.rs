@@ -42,6 +42,31 @@ pub enum PtBinary {
     Explicit(std::path::PathBuf),
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static SDK14_PT_OBSERVER: (
+        &'static str,
+        tokio::sync::mpsc::Sender<(&'static str, std::path::PathBuf)>,
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn sdk14_report_resolution(path: &std::path::Path) {
+    let _ = SDK14_PT_OBSERVER.try_with(|(name, sender)| {
+        sender
+            .try_send((*name, path.to_path_buf()))
+            .expect("SDK14 PT observer channel send failed");
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn sdk14_observer() -> Option<(
+    &'static str,
+    tokio::sync::mpsc::Sender<(&'static str, std::path::PathBuf)>,
+)> {
+    SDK14_PT_OBSERVER.try_with(Clone::clone).ok()
+}
+
 /// Pure decision: extract a PT binary path from an optional env var value.
 /// `None` for `None` or an empty value; `Some(PathBuf)` otherwise.
 pub(crate) fn pt_binary_override_from(
@@ -61,17 +86,25 @@ pub(crate) fn pt_binary_override_from(
 pub(crate) fn resolve_pt_binary(pt: &PtBinary) -> anyhow::Result<std::path::PathBuf> {
     use anyhow::Context;
     match pt {
-        PtBinary::Explicit(path) => Ok(path.clone()),
+        PtBinary::Explicit(path) => {
+            #[cfg(test)]
+            sdk14_report_resolution(path);
+            Ok(path.clone())
+        }
         PtBinary::Environment => {
             if let Some(path) =
                 pt_binary_override_from(std::env::var_os("TOR_PT_BINARY").as_deref())
             {
                 tracing::info!(path = %path.display(), "using TOR_PT_BINARY override as PT binary");
+                #[cfg(test)]
+                sdk14_report_resolution(&path);
                 return Ok(path);
             }
 
             let exe = std::env::current_exe().context("resolving current_exe for PT")?;
             tracing::info!(path = %exe.display(), "using own binary as PT (busybox dispatch)");
+            #[cfg(test)]
+            sdk14_report_resolution(&exe);
             Ok(exe)
         }
     }

@@ -109,11 +109,33 @@ pub fn spawn(
     config_path: Option<PathBuf>,
     interval_mins: u64,
     observations: ObservationSink,
+    active: Settings,
+    token: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    spawn_with_pt(
+        handle,
+        config_path,
+        interval_mins,
+        observations,
+        active,
+        crate::pt::PtBinary::Environment,
+        token,
+    )
+}
+
+pub(crate) fn spawn_with_pt(
+    handle: TorHandle,
+    config_path: Option<PathBuf>,
+    interval_mins: u64,
+    observations: ObservationSink,
     mut active: Settings,
+    pt_binary: crate::pt::PtBinary,
     token: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     #[cfg(any(test, feature = "test-seams"))]
     crate::test_seams::forbid_producer("maintenance");
+    #[cfg(test)]
+    let observer = crate::pt::sdk14_observer().map(|(_, sender)| sender);
     #[cfg(test)]
     let probe = PRE_PROBE.try_with(std::sync::Arc::clone).ok();
     #[cfg(test)]
@@ -159,13 +181,14 @@ pub fn spawn(
                     .started
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            let cycle: futures::future::BoxFuture<'_, Result<()>> = Box::pin(refresh(
+            let cycle: futures::future::BoxFuture<'_, Result<()>> = Box::pin(refresh_with_pt(
                 &handle,
                 config_path.as_deref(),
                 &observations,
                 &mut active,
                 &mut next_recovery,
                 &mut channel_cursor,
+                &pt_binary,
             ));
             if let Err(error) = cycle.await {
                 warn!(%error, "bridge refresh failed; keeping current routes");
@@ -174,6 +197,18 @@ pub fn spawn(
             #[cfg(test)]
             if let Some(control) = &control {
                 control.completed().await;
+            }
+        }
+    };
+    #[cfg(test)]
+    let run = {
+        async move {
+            if let Some(sender) = observer {
+                crate::pt::SDK14_PT_OBSERVER
+                    .scope(("maintenance", sender), run)
+                    .await;
+            } else {
+                run.await;
             }
         }
     };
@@ -203,6 +238,7 @@ pub(crate) async fn load_config_off_worker(path: Option<&Path>) -> Result<Config
     .map_err(|e| anyhow::anyhow!("config load task failed: {e}"))?
 }
 
+#[cfg(test)]
 async fn refresh(
     handle: &TorHandle,
     path: Option<&Path>,
@@ -211,24 +247,46 @@ async fn refresh(
     next_recovery: &mut Instant,
     channel_cursor: &mut usize,
 ) -> Result<()> {
+    refresh_with_pt(
+        handle,
+        path,
+        observations,
+        active,
+        next_recovery,
+        channel_cursor,
+        &crate::pt::PtBinary::Environment,
+    )
+    .await
+}
+
+async fn refresh_with_pt(
+    handle: &TorHandle,
+    path: Option<&Path>,
+    observations: &ObservationSink,
+    active: &mut Settings,
+    next_recovery: &mut Instant,
+    channel_cursor: &mut usize,
+    pt_binary: &crate::pt::PtBinary,
+) -> Result<()> {
     let cfg = load_config_off_worker(path).await?;
     let Some(tor) = handle.tunnel().await else {
         return Ok(());
     };
     if let Some(Some(endpoint)) = tor.configured_pre_endpoint() {
-        let result = refresh_pre(handle, path, active, &cfg, &tor, endpoint).await;
+        let result =
+            refresh_pre_with_pt(handle, path, active, &cfg, &tor, endpoint, pt_binary).await;
         *next_recovery = Instant::now() + RECOVERY_REFRESH_INTERVAL;
         return result;
     }
     if active.pre_endpoint.is_some() {
         anyhow::bail!("неизвестный маршрут действующего клиента");
     }
-    let mut usable = refresh_routes(
+    let mut usable = refresh_routes_with_pt(
         handle,
         path,
         observations,
         active,
-        &cfg,
+        (&cfg, pt_binary),
         &tor,
         channel_cursor,
     )
@@ -251,8 +309,9 @@ async fn refresh(
         } else {
             deficit.min(3)
         };
-        let mut discovery: futures::future::BoxFuture<'_, Result<usize>> =
-            Box::pin(crate::fetch_merge::top_up_working(&tor, &cfg, path, target));
+        let mut discovery: futures::future::BoxFuture<'_, Result<usize>> = Box::pin(
+            crate::fetch_merge::top_up_working_with_pt(&tor, &cfg, path, target, pt_binary.clone()),
+        );
         let added = loop {
             match next_discovery_event(
                 discovery.as_mut(),
@@ -264,12 +323,12 @@ async fn refresh(
                 DiscoveryEvent::Finished(result) => break result?,
                 DiscoveryEvent::Recheck => {
                     info!("rechecking active bridges after a Tor failure");
-                    match refresh_routes(
+                    match refresh_routes_with_pt(
                         handle,
                         path,
                         observations,
                         active,
-                        &cfg,
+                        (&cfg, pt_binary),
                         &tor,
                         channel_cursor,
                     )
@@ -290,12 +349,12 @@ async fn refresh(
         };
         if added > 0 {
             let latest = Config::load_with_override(path)?.into_config();
-            usable = refresh_routes(
+            usable = refresh_routes_with_pt(
                 handle,
                 path,
                 observations,
                 active,
-                &latest,
+                (&latest, pt_binary),
                 &tor,
                 channel_cursor,
             )
@@ -308,6 +367,7 @@ async fn refresh(
     Ok(())
 }
 
+#[cfg(test)]
 async fn refresh_pre(
     handle: &TorHandle,
     path: Option<&Path>,
@@ -315,6 +375,27 @@ async fn refresh_pre(
     cfg: &Config,
     tor: &arti_wrapper::TorTunnel,
     endpoint: &arti_wrapper::Socks5PreEndpoint,
+) -> Result<()> {
+    refresh_pre_with_pt(
+        handle,
+        path,
+        active,
+        cfg,
+        tor,
+        endpoint,
+        &crate::pt::PtBinary::Environment,
+    )
+    .await
+}
+
+async fn refresh_pre_with_pt(
+    handle: &TorHandle,
+    path: Option<&Path>,
+    active: &mut Settings,
+    cfg: &Config,
+    tor: &arti_wrapper::TorTunnel,
+    endpoint: &arti_wrapper::Socks5PreEndpoint,
+    pt_binary: &crate::pt::PtBinary,
 ) -> Result<()> {
     let configured = cfg.pre_proxies.as_ref().is_some_and(|pool| {
         pool.members()
@@ -327,7 +408,7 @@ async fn refresh_pre(
     if cfg.upstream.enabled {
         anyhow::bail!("pre несовместим с upstream");
     }
-    let validated = crate::tor_setup::restricted_owner_settings(cfg, path)?;
+    let validated = crate::tor_setup::restricted_owner_settings_with_pt(cfg, path, pt_binary)?;
     let mut selected = active.clone();
     selected.bridges = validated.bridges;
     use futures::StreamExt;
@@ -369,15 +450,16 @@ pub(crate) async fn pre_channel_ready(tor: &arti_wrapper::TorTunnel, bridge: &Br
     )
 }
 
-fn refresh_routes<'a>(
+fn refresh_routes_with_pt<'a>(
     handle: &'a TorHandle,
     path: Option<&'a Path>,
     observations: &'a ObservationSink,
     active: &'a mut Settings,
-    cfg: &'a Config,
+    policy: (&'a Config, &'a crate::pt::PtBinary),
     tor: &'a arti_wrapper::TorTunnel,
     channel_cursor: &'a mut usize,
 ) -> futures::future::BoxFuture<'a, Result<usize>> {
+    let (cfg, pt_binary) = policy;
     Box::pin(async move {
         let configured = cfg.bridges.parsed()?.bridges;
         // Through the single writer: a publish failure no longer aborts the
@@ -422,8 +504,19 @@ fn refresh_routes<'a>(
         } else {
             &[]
         };
-        match crate::tor_setup::build_tor_settings_preserving_live(cfg, path, live).await {
+        match crate::tor_setup::build_tor_settings_preserving_live_with_pt(
+            cfg,
+            path,
+            live,
+            pt_binary.clone(),
+        )
+        .await
+        {
             Ok(mut selected) => {
+                #[cfg(test)]
+                if crate::pt::sdk14_observer().is_some() {
+                    return Ok(preferred_count(cfg, &selected.bridges));
+                }
                 if keep_current {
                     info!("keeping the preferred route that still carries Tor traffic");
                     return Ok(preferred_count(cfg, &selected.bridges).max(1));
@@ -472,6 +565,10 @@ async fn live_route_works(
     tor: &arti_wrapper::TorTunnel,
     health: &crate::tor_watchdog::TorHealth,
 ) -> bool {
+    #[cfg(test)]
+    if crate::pt::sdk14_observer().is_some() {
+        return false;
+    }
     if health.successful_within(RECOVERY_REFRESH_INTERVAL) {
         return true;
     }

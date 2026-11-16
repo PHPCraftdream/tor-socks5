@@ -484,14 +484,48 @@ jobs:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-local-sdk
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-hack
       - run: cargo hack check --each-feature --no-dev-deps -p tor-socks5-config -p arti-wrapper
       - name: SDK facade, every feature with its surface tests
-        run: cargo hack check --each-feature --tests -p tor-socks5
-      - name: Embedded server example through the facade
-        run: cargo check --locked -p tor-socks5 --features server --examples
+        shell: bash
+        run: |
+          python3 -I - <<'PY'
+          import importlib.util
+          import subprocess
+          import tomllib
+          from pathlib import Path
+
+          manifest = tomllib.loads(Path("apps/sdk/Cargo.toml").read_text(encoding="utf-8"))
+          spec = importlib.util.spec_from_file_location("ci_planner", "scripts/testing/ci_planner.py")
+          planner = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(planner)
+          entries = planner.feature_entries(manifest)
+          base = ["--locked", "-p", "tor-socks5", "--no-default-features"]
+
+          def run(*args):
+              subprocess.run(["cargo", *args], check=True)
+
+          for entry in entries:
+              args = [*base]
+              if entry["kind"] == "feature":
+                  feature = entry["feature"]
+                  if feature is not None:
+                      args.extend(("--features", feature))
+                  label = "no-default-features" if feature is None else feature
+                  print(f"Checking facade feature: {label}", flush=True)
+                  run("check", *args, "--test", "surface")
+                  run("clippy", *args, "--all-targets", "--", "-D", "warnings")
+              else:
+                  required = entry["required_features"]
+                  if required:
+                      args.extend(("--features", ",".join(required)))
+                  print(f"Checking facade example: {entry['name']}", flush=True)
+                  run("check", *args, "--example", entry["name"])
+          PY
 
   stress:
     needs: plan

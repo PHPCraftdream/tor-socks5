@@ -290,6 +290,13 @@ impl TorHandle {
         }
     }
 
+    /// Wrap the bootstrapped tunnel and initialize its tracked bridge set from the settings.
+    pub fn new_with_settings(tor: TorTunnel, settings: &arti_wrapper::Settings) -> Self {
+        let handle = Self::new(tor);
+        handle.set_active_bridges(settings.bridges.clone());
+        handle
+    }
+
     /// Snapshot the current tunnel for a new connection. Returns `None`
     /// only while the server is shutting down (the slot has been drained);
     /// callers should treat that as a transient "unavailable" error. A
@@ -347,6 +354,65 @@ impl TorHandle {
     /// reactor/PT teardown follows once the remaining in-flight clones drain.
     pub async fn drain(self) -> Option<TorTunnel> {
         self.slot.write().await.take()
+    }
+}
+
+#[cfg(test)]
+mod sdk14_tests {
+    use super::*;
+    use std::sync::Once;
+
+    #[tokio::test]
+    async fn sdk14_new_with_settings_initializes_active_bridges_and_verifier_candidates() {
+        static CRYPTO_PROVIDER: Once = Once::new();
+        CRYPTO_PROVIDER.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let bridge: BridgeLine = "192.0.2.14:443 1414141414141414141414141414141414141414"
+            .parse()
+            .unwrap();
+        let inactive: BridgeLine = "192.0.2.15:443 1515151515151515151515151515151515151515"
+            .parse()
+            .unwrap();
+        let settings = arti_wrapper::Settings {
+            state_dir: Some(dir.path().to_path_buf()),
+            bridges: vec![bridge.clone()],
+            ..Default::default()
+        };
+        let tunnel = TorTunnel::create_unbootstrapped_with(settings.clone()).unwrap();
+        let handle = TorHandle::new_with_settings(tunnel, &settings);
+
+        assert_eq!(handle.active_bridges(), vec![bridge.clone()]);
+        assert!(handle.route_is_settling());
+
+        let store_path = dir.path().join("bridge-health.log");
+        let mut store = bridge_store::BridgeStore::load(store_path.clone()).unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        let bridges = [bridge.clone(), inactive];
+        let alive = bridges
+            .iter()
+            .cloned()
+            .map(|bridge| (bridge, Duration::from_millis(5)))
+            .collect::<Vec<_>>();
+        assert!(store
+            .note_probe_round(&bridges, &alive, now, Duration::from_secs(60), 5, 5,)
+            .is_empty());
+        for (bridge, _) in &alive {
+            store.note_channel_success_at(bridge, now);
+        }
+        store.save().unwrap();
+
+        let saved = bridge_store::BridgeStore::load(store_path).unwrap();
+        let active = handle.active_bridges();
+        let candidates = saved.needing_circuit_verification(
+            now,
+            Duration::from_secs(24 * 60 * 60),
+            2,
+            |candidate| active.contains(candidate),
+        );
+        assert_eq!(candidates, vec![bridge]);
     }
 }
 

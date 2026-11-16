@@ -4,6 +4,9 @@
 
 use std::any::type_name;
 
+#[path = "support/runtime_use_tree_oracle.rs"]
+mod runtime_use_tree_oracle;
+
 fn names<T: ?Sized>() -> &'static str {
     type_name::<T>()
 }
@@ -134,18 +137,74 @@ fn shared_types_are_not_duplicated() {
 #[cfg(feature = "runtime")]
 #[test]
 fn runtime_module_tor_client_surface() {
-    assert!(names::<tor_socks5::runtime::tor_watchdog::TorHandle>().contains("TorHandle"));
-    assert!(names::<tor_socks5::runtime::tor_watchdog::TorHealth>().contains("TorHealth"));
-    assert!(names::<tor_socks5::runtime::tor_watchdog::WatchdogStatus>().contains("WatchdogStatus"));
-    assert!(
-        names::<tor_socks5::runtime::conn_health::ConnHealthSnapshot>()
-            .contains("ConnHealthSnapshot")
+    use std::future::Future;
+
+    use tor_socks5::runtime::{
+        ConnErrorKind, ConnHealthConfig, ConnHealthCounters, ConnHealthSnapshot, ConnStage,
+        HealOutcome, PendingConnectionGuard, PtBinary, TorHandle, TorHealth, WatchdogConfig,
+        WatchdogRun, WatchdogStatus,
+    };
+
+    assert!(names::<TorHandle>().contains("TorHandle"));
+    assert!(names::<TorHealth>().contains("TorHealth"));
+    assert!(names::<WatchdogRun>().contains("WatchdogRun"));
+    assert!(names::<WatchdogStatus>().contains("WatchdogStatus"));
+    assert!(names::<HealOutcome>().contains("HealOutcome"));
+    assert!(names::<ConnHealthSnapshot>().contains("ConnHealthSnapshot"));
+    assert!(names::<ConnHealthCounters>().contains("ConnHealthCounters"));
+    assert!(names::<ConnStage>().contains("ConnStage"));
+    assert!(names::<ConnErrorKind>().contains("ConnErrorKind"));
+    assert!(names::<PendingConnectionGuard>().contains("PendingConnectionGuard"));
+    assert!(names::<PtBinary>().contains("PtBinary"));
+
+    let counters = ConnHealthCounters::default();
+    let _: PendingConnectionGuard = counters.record_started();
+
+    let _ = tor_socks5::runtime::arti_base_dir;
+    let _ = tor_socks5::runtime::arti_keystore_dir;
+    let _ = tor_socks5::runtime::build_tor_settings;
+    let _ = tor_socks5::runtime::build_tor_settings_with_pt;
+    let _ = tor_socks5::runtime::spawn_tor_watchdog;
+    let _ = tor_socks5::runtime::spawn_bridge_failover_watchdog;
+    let _ = tor_socks5::runtime::classify_and_record;
+    let _ = tor_socks5::runtime::spawn_conn_health_logger;
+
+    // These annotations pin the public handle-method signatures without
+    // requiring a live Arti client to construct a TorHandle.
+    fn assert_handle_methods(handle: &TorHandle) {
+        let _: &TorHealth = handle.health();
+        let _: fn(&TorHandle) -> &TorHealth = TorHandle::health;
+        let _: bool = handle.route_is_settling();
+        let _: fn(&TorHandle) -> bool = TorHandle::route_is_settling;
+        let _: fn(&TorHandle) -> Vec<_> = TorHandle::active_bridges;
+        let _: fn(&TorHandle, Vec<_>) = TorHandle::set_active_bridges;
+        let _: fn(&TorHandle) -> &tor_socks5::runtime::BridgeRefresh = TorHandle::bridge_refresh;
+
+        fn expect_tunnel_future<F>(_: F)
+        where
+            F: Future<Output = Option<tor_socks5::tor::TorTunnel>> + Send,
+        {
+        }
+        expect_tunnel_future(handle.tunnel());
+        expect_tunnel_future(handle.clone().drain());
+        let _: fn(tor_socks5::tor::TorTunnel, &tor_socks5::tor::Settings) -> TorHandle =
+            TorHandle::new_with_settings;
+    }
+    let _ = assert_handle_methods;
+
+    // Config types are the actual arguments accepted by the exposed spawners.
+    fn assert_config_types(_: WatchdogConfig, _: ConnHealthConfig) {}
+    let _ = assert_config_types;
+}
+
+#[cfg(feature = "runtime")]
+#[test]
+fn runtime_facade_source_has_no_nested_module_reexports_or_globs() {
+    let result = runtime_use_tree_oracle::check_facade(
+        include_str!("../src/lib.rs"),
+        include_str!("../crates/runtime/src/lib.rs"),
     );
-    assert!(names::<tor_socks5::runtime::pt::PtBinary>().contains("PtBinary"));
-    let _ = tor_socks5::runtime::tor_setup::build_tor_settings;
-    let _ = tor_socks5::runtime::tor_setup::build_tor_settings_with_pt;
-    let _ = tor_socks5::runtime::tor_watchdog::spawn_tor_watchdog;
-    let _ = tor_socks5::runtime::conn_health::spawn_conn_health_logger;
+    assert!(result.is_ok(), "{}", result.unwrap_err());
 }
 
 /// The SDK-8 runtime surface: the bridge manager (one handle owning the
@@ -153,12 +212,56 @@ fn runtime_module_tor_client_surface() {
 #[cfg(feature = "runtime")]
 #[test]
 fn runtime_bridge_manager_surface() {
+    use std::future::Future;
+
     assert!(names::<tor_socks5::runtime::BridgeManagerHandle>().contains("BridgeManagerHandle"));
     assert!(names::<tor_socks5::runtime::BridgeManagerStatus>().contains("BridgeManagerStatus"));
     assert!(names::<tor_socks5::runtime::FetchBridgesParams>().contains("FetchBridgesParams"));
     assert!(names::<tor_socks5::runtime::FetchBridgesOutcome>().contains("FetchBridgesOutcome"));
-    let _ = tor_socks5::runtime::start;
     let _ = tor_socks5::runtime::fetch_bridges;
+    assert!(names::<tor_socks5::runtime::BridgeManagerConfig>().contains("BridgeManagerConfig"));
+    fn assert_start_signature(
+        handle: tor_socks5::runtime::TorHandle,
+        cfg: &tor_socks5::config::Config,
+        observations: tor_socks5::runtime::ObservationSink,
+    ) -> tor_socks5::runtime::BridgeManagerHandle {
+        let config = tor_socks5::runtime::BridgeManagerConfig {
+            settings: tor_socks5::tor::Settings::default(),
+            pt_binary: tor_socks5::runtime::PtBinary::Environment,
+        };
+        tor_socks5::runtime::start(handle, None, cfg, observations, config)
+    }
+    fn assert_parent_token_start_signature(
+        manager: &tor_socks5::runtime::BridgeManagerHandle,
+        handle: tor_socks5::runtime::TorHandle,
+        cfg: &tor_socks5::config::Config,
+        observations: tor_socks5::runtime::ObservationSink,
+        config: tor_socks5::runtime::BridgeManagerConfig,
+    ) -> tor_socks5::runtime::BridgeManagerHandle {
+        tor_socks5::runtime::start_with_parent_token(
+            handle,
+            None,
+            cfg,
+            observations,
+            config,
+            manager.token(),
+        )
+    }
+    let _ = (assert_start_signature, assert_parent_token_start_signature);
+    fn assert_clone_send_sync<T: Clone + Send + Sync + 'static>(_: &T) {}
+    fn expect_shutdown(
+        handle: tor_socks5::runtime::BridgeManagerHandle,
+    ) -> impl Future<Output = ()> {
+        handle.shutdown()
+    }
+    fn assert_bridge_manager_methods(handle: &tor_socks5::runtime::BridgeManagerHandle) {
+        let _: tor_socks5::runtime::BridgeManagerStatus = handle.status();
+        let _: tokio::sync::watch::Receiver<tor_socks5::runtime::BridgeManagerStatus> =
+            handle.subscribe();
+        let token = handle.token();
+        assert_clone_send_sync(&token);
+    }
+    let _ = (assert_bridge_manager_methods, expect_shutdown);
 }
 
 /// The SDK-7 runtime surface: the bridge-health writer and the
@@ -166,6 +269,7 @@ fn runtime_bridge_manager_surface() {
 #[cfg(feature = "runtime")]
 #[test]
 fn runtime_bridge_health_and_observation() {
+    use std::future::Future;
     use tracing_subscriber::prelude::*;
 
     assert!(names::<tor_socks5::runtime::StoreWriter>().contains("StoreWriter"));
@@ -173,6 +277,16 @@ fn runtime_bridge_health_and_observation() {
     assert!(names::<tor_socks5::runtime::GuardObservation>().contains("GuardObservation"));
     let _ = tor_socks5::runtime::init_global;
     let _ = tor_socks5::runtime::close_global;
+
+    fn assert_store_writer_close(writer: &tor_socks5::runtime::StoreWriter) {
+        fn expect_close<F>(_: F)
+        where
+            F: Future + Send,
+        {
+        }
+        expect_close(writer.close());
+    }
+    let _ = assert_store_writer_close;
 
     // The observation layer fits a real subscriber — the wiring the
     // proxy binary itself does in its startup.
