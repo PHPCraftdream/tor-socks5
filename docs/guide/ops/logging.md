@@ -26,9 +26,10 @@ log.targets.arti_: warn
 
 - **`default`** is the baseline level. **`targets`** are per-module overrides; they are applied
   in insertion order, producing a stable `tracing-subscriber` env-filter directive
-  (e.g. `info,socks5_proxy=debug,tor_=warn`). The product crates `tor_socks5_runtime` and
-  `tor_socks5_onion` start with `tor_` too; when a broader target such as `tor_` would catch them
-  and they have no target of their own, they inherit the level of `socks5_proxy` (or `default`),
+  (e.g. `info,socks5_proxy=debug,tor_=warn`). The product crates `tor_socks5_runtime`,
+  `tor_socks5_onion` and `tor_socks5_server` start with `tor_` too; when a broader target such
+  as `tor_` would catch them and they have no target of their own, they inherit the level of
+  `socks5_proxy` (or `default`),
   so `tor_=warn` quiets arti without silencing this program's own messages.
 - **`output`** selects the sink. `file` writes to **`file`**; if the path is empty or cannot be
   opened, it falls back to stderr (with a message on the original stderr).

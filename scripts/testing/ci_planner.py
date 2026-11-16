@@ -725,7 +725,7 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
     # Фича-матрица фасада SDK зависит только от его манифеста и тестов.
     if seeds & (graph.named({"tor-socks5"}) & graph.members):
         add("features", "изменён фасад SDK")
-    if any(path.startswith(("apps/socks5-proxy/", "apps/sdk/crates/runtime/")) and any(part in {"tor", "arti", "bridge", "bridges"} or part.startswith(("tor_", "arti_", "bridge_", "bridges_")) for part in path.split("/")) for path in paths):
+    if any(path.startswith(("apps/socks5-proxy/", "apps/sdk/crates/runtime/", "apps/sdk/crates/server/")) and any(part in {"tor", "arti", "bridge", "bridges"} or part.startswith(("tor_", "arti_", "bridge_", "bridges_")) for part in path.split("/")) for path in paths):
         add("tor", "изменён код контракта Tor proxy")
     if mode == "sprint-full":
         selected = set(graph.members)

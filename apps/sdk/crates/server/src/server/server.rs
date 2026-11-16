@@ -86,7 +86,10 @@ impl Drop for HandlerRunGuard {
 
 /// Inputs needed to run the SOCKS5 server, gathered from the CLI (or, in
 /// the Windows-service case, synthesised from the installed image path).
-pub(crate) struct ServerArgs {
+/// `#[doc(hidden)] pub`: the binary's process layer drives `run_server` with
+/// it; the API step is SDK-11.
+#[doc(hidden)]
+pub struct ServerArgs {
     pub config: Config,
     pub config_path: Option<std::path::PathBuf>,
     pub obs_sink: ObservationSink,
@@ -99,7 +102,10 @@ pub(crate) struct ServerArgs {
 /// Run the proxy until `shutdown` resolves. The stop future is supplied by
 /// the caller (console signal or SCM notification); process-wide setup
 /// (config loading, logging, signals) is done outside.
-pub(crate) async fn run_server(
+/// `#[doc(hidden)] pub`: the binary's process layer calls it; the API step
+/// is SDK-11.
+#[doc(hidden)]
+pub async fn run_server(
     args: ServerArgs,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {

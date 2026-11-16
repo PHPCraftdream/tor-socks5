@@ -70,7 +70,11 @@ impl Default for LogConfig {
 /// (the default, meant to quiet arti's own `tor_*` crates) would otherwise
 /// silence them: their log lines used to carry the `socks5_proxy` target
 /// before the code moved into library crates.
-const PRODUCT_TARGETS: [&str; 2] = ["tor_socks5_runtime", "tor_socks5_onion"];
+const PRODUCT_TARGETS: [&str; 3] = [
+    "tor_socks5_runtime",
+    "tor_socks5_onion",
+    "tor_socks5_server",
+];
 
 impl LogConfig {
     /// Build a `tracing-subscriber` env-filter directive from the structured

@@ -7,8 +7,6 @@ mod cli;
 mod config;
 #[path = "commands/config_cmd.rs"]
 mod config_cmd;
-#[path = "server/dns_wiring.rs"]
-mod dns_wiring;
 #[path = "commands/help_cmd.rs"]
 mod help_cmd;
 // Onion helpers: the address/vanity core is not wired into the CLI yet.
@@ -17,16 +15,8 @@ mod help_cmd;
 mod onion;
 #[path = "process/mod.rs"]
 mod process;
-#[path = "server/egress/route.rs"]
-mod route;
-#[path = "server/server.rs"]
-mod server;
 #[path = "commands/service.rs"]
 mod service;
-#[path = "server/startup.rs"]
-mod startup;
-#[path = "server/egress/upstream.rs"]
-mod upstream;
 #[path = "commands/users_cli/mod.rs"]
 mod users_cli;
 

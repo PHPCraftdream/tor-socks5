@@ -5507,6 +5507,7 @@ dependencies = [
  "tor-socks5-proto",
  "tor-socks5-route-pool",
  "tor-socks5-runtime",
+ "tor-socks5-server",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -7483,6 +7484,34 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tor-socks5-server"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "arti-wrapper",
+ "bridge-store",
+ "futures",
+ "ktav",
+ "persist-lock",
+ "ptrs-gesher-bridge-line",
+ "resocks5-net",
+ "rustls",
+ "tempfile",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tor-socks5-auth",
+ "tor-socks5-config",
+ "tor-socks5-dns",
+ "tor-socks5-onion",
+ "tor-socks5-proto",
+ "tor-socks5-route-pool",
+ "tor-socks5-runtime",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
