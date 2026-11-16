@@ -294,6 +294,13 @@ pub fn arti_base_dir(config_path: Option<&Path>) -> std::path::PathBuf {
     }
 }
 
+/// Arti's native keystore for a config: `<arti base>/state/keystore` (arti
+/// pins it under its state dir). The one place the onion CLI tools and the
+/// server's onion host derive it from, so both resolve the same keys.
+pub fn arti_keystore_dir(config_path: Option<&Path>) -> std::path::PathBuf {
+    arti_base_dir(config_path).join("state").join("keystore")
+}
+
 /// Narrow the startup pool to the configured preferred transport, if any.
 ///
 /// Deliberately a preference, not a filter: an unmatched preference

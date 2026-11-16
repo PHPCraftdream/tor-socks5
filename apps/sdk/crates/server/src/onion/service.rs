@@ -12,11 +12,11 @@ use tokio_util::sync::CancellationToken;
 use tor_socks5_onion::host::OnionHostConfig;
 use tor_socks5_runtime::tor_watchdog::TorHandle;
 
-/// Same base as the running server: `tor_setup::arti_base_dir` is what the
-/// binary's `commands/onion/store.rs` computes too, so the CLI tools and the
-/// server resolve the same keystore.
+/// Arti's native keystore (`<arti base>/state/keystore`), the same directory
+/// the onion CLI tools use: the identity from the onion services file must
+/// land where arti reads it, or arti mints a different address.
 fn keystore_dir(config_path: Option<&Path>) -> PathBuf {
-    tor_socks5_runtime::tor_setup::arti_base_dir(config_path)
+    tor_socks5_runtime::tor_setup::arti_keystore_dir(config_path)
 }
 
 /// Spawn the onion-service host producer if any configured service is
@@ -49,4 +49,25 @@ pub(crate) fn spawn_services(
             .start()
             .detach(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    #[test]
+    fn keystore_dir_is_arti_native_keystore_under_state() {
+        let cfg = Path::new("conf").join("tor-socks5.ktav");
+        assert_eq!(
+            super::keystore_dir(Some(&cfg)),
+            Path::new("conf")
+                .join("arti-data")
+                .join("state")
+                .join("keystore")
+        );
+        assert_eq!(
+            super::keystore_dir(None),
+            Path::new("arti-data").join("state").join("keystore")
+        );
+    }
 }
