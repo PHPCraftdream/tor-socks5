@@ -79,6 +79,30 @@ tracing-subscriber.workspace = true
 name = "embedded_server"
 required-features = ["server"]
 
+[[example]]
+name = "onion_address"
+required-features = ["onion"]
+
+[[example]]
+name = "onion_keys"
+required-features = ["onion-keys"]
+
+[[example]]
+name = "accounts_config"
+required-features = ["auth", "config"]
+
+[[example]]
+name = "tor_runtime"
+required-features = ["runtime"]
+
+[[example]]
+name = "onion_host"
+required-features = ["runtime", "onion-host"]
+
+[[example]]
+name = "bridge_fetch"
+required-features = ["runtime"]
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

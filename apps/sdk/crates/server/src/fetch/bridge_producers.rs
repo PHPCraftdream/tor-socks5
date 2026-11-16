@@ -9,12 +9,10 @@ pub(super) fn launch(
     producer_token: CancellationToken,
     producers: &mut Vec<tokio::task::JoinHandle<()>>,
 ) {
-    // Bridge producer tasks must live in the same cancellation-safe owner as
-    // the server's other producers. A trampoline awaiting manager.shutdown()
-    // would own the child handles; aborting that trampoline at the shutdown
-    // deadline would drop and detach those children. Transfer the actual tasks
-    // instead. This is the SDK-11 bridge until SDK-14 unifies task ownership.
-    let manager = tor_socks5_runtime::bridge_manager::start_for_server(
+    // Bridge producer tasks live in the same cancellation-safe owner as the
+    // server's other producers. Transfer the actual tasks so the server can
+    // join or abort each one directly at shutdown.
+    let manager = tor_socks5_runtime::bridge_manager::start_with_parent_token(
         handle.clone(),
         config_path.clone(),
         cfg,
@@ -22,7 +20,7 @@ pub(super) fn launch(
         settings.clone(),
         producer_token.clone(),
     );
-    producers.extend(manager.into_tasks());
+    manager.transfer_tasks(producers);
 
     if settings.pre_endpoint.is_some() {
         if let Some(run) = spawn_tor_watchdog(handle, config_path, cfg.watchdog, producer_token) {

@@ -59,6 +59,7 @@ fn settings_for_config(cfg: &Config) -> Settings {
 
 #[path = "tor_watchdog/owner_settings.rs"]
 mod owner_settings;
+pub(crate) use owner_settings::restricted_owner_settings_with_pt;
 pub use owner_settings::{restricted_owner_settings, validate_owner_routes};
 
 /// Parse the configured bridges, probe them for reachability, persist the
@@ -82,12 +83,22 @@ pub async fn build_tor_settings_with_pt(
     build_tor_settings_inner(cfg, config_path, &[], pt).await
 }
 
+#[cfg(test)]
 pub(crate) async fn build_tor_settings_preserving_live(
     cfg: &Config,
     config_path: Option<&Path>,
     live: &[BridgeLine],
 ) -> Result<Settings> {
-    build_tor_settings_inner(cfg, config_path, live, PtBinary::Environment).await
+    build_tor_settings_preserving_live_with_pt(cfg, config_path, live, PtBinary::Environment).await
+}
+
+pub(crate) async fn build_tor_settings_preserving_live_with_pt(
+    cfg: &Config,
+    config_path: Option<&Path>,
+    live: &[BridgeLine],
+    pt: PtBinary,
+) -> Result<Settings> {
+    build_tor_settings_inner(cfg, config_path, live, pt).await
 }
 
 async fn build_tor_settings_inner(
@@ -98,7 +109,8 @@ async fn build_tor_settings_inner(
 ) -> Result<Settings> {
     if let Some(pool) = cfg.pre_proxies.as_ref() {
         let endpoint = owner_settings::select_anchor(pool).await?;
-        let mut settings = restricted_owner_settings(cfg, config_path)?;
+        let mut settings =
+            owner_settings::restricted_owner_settings_with_pt(cfg, config_path, &pt)?;
         settings.pre_endpoint = Some(arti_wrapper::Socks5PreEndpoint::from_pool_member(endpoint));
         return Ok(settings);
     }
@@ -268,14 +280,17 @@ async fn build_tor_settings_inner(
     // sample / cached consensus across runs that can shadow our bridges.
     let arti_base = arti_base_dir(config_path);
 
+    let explicit = matches!(&pt, PtBinary::Explicit(_));
+    let env_override = if explicit {
+        None
+    } else {
+        std::env::var_os("TOR_PT_BINARY")
+    };
+    let env_override = env_override.as_deref();
     Ok(Settings {
         bridges,
         pt_binary,
-        extra_pt_protocols: extra_pt_protocols(
-            std::env::var_os("TOR_PT_BINARY").as_deref(),
-            &pt,
-            cfg,
-        ),
+        extra_pt_protocols: extra_pt_protocols(env_override, &pt, cfg),
         state_dir: Some(arti_base),
         obfs4_iat_mode: cfg.bridges.iat_mode_override(),
         ..settings_for_config(cfg)
@@ -354,6 +369,15 @@ pub(crate) async fn probe_measured(
     bridges: Vec<BridgeLine>,
     cfg: &Config,
 ) -> (Vec<BridgeLine>, Vec<(BridgeLine, Duration)>) {
+    #[cfg(test)]
+    if crate::pt::sdk14_observer().is_some() {
+        let alive = bridges
+            .iter()
+            .cloned()
+            .map(|b| (b, Duration::from_millis(1)))
+            .collect();
+        return (bridges, alive);
+    }
     #[cfg(test)]
     assert!(
         FORBID_STARTUP_PROBE.try_with(|_| ()).is_err(),

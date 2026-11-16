@@ -90,9 +90,10 @@ pub use ::dns_server as dns;
 pub use ::tor_socks5_onion as onion;
 
 /// The embedded Tor runtime (`tor-socks5-runtime`, `apps/sdk/crates/runtime`),
-/// curated by module — this is not the whole crate. Three surfaces are open
-/// so far (SDK-7, SDK-8, SDK-9); the embedded server is available through
-/// [`server`] (SDK-11).
+/// curated as a flat surface — this is not the whole crate. It exposes the
+/// selected Tor setup, PT, watchdog, and connection-health APIs, alongside
+/// the bridge-health writer, observation, and manager APIs (SDK-7/8/9). The
+/// embedded server is available through [`server`] (SDK-11).
 ///
 /// Nothing here installs process state on its own (R1): the bridge-health
 /// writer slot ([`init_global`]/[`close_global`]: one live writer per
@@ -118,26 +119,34 @@ pub use ::tor_socks5_onion as onion;
 ///
 /// **Tor client (SDK-9):**
 ///
-/// - [`runtime::tor_setup`] — Tor client settings built from the ktav
-///   config (`build_tor_settings`, `build_tor_settings_with_pt`), the arti
-///   state dir (`arti_base_dir`) and the owner-routing relatives.
-/// - [`runtime::pt`] — the pluggable-transport entry point for an embedding
-///   host (`PtBinary`): environment-resolved (the CLI binary's busybox
+/// - [`runtime::arti_base_dir`] and [`runtime::arti_keystore_dir`],
+///   [`runtime::build_tor_settings`], and [`runtime::build_tor_settings_with_pt`]
+///   construct the Arti paths and client settings from the config and PT
+///   policy. The keystore path is exposed for host-managed onion-service keys.
+/// - [`runtime::PtBinary`] is the pluggable-transport entry point for an
+///   embedding host: environment-resolved (the CLI binary's busybox
 ///   dispatch, `TOR_PT_BINARY` override) or an explicit dispatcher path.
-/// - [`runtime::tor_watchdog`] — the live-client handle (`TorHandle`,
-///   `TorHealth`), the watchdog spawn/status surface (`WatchdogRun`,
-///   `WatchdogStatus`) and failure classification.
-/// - [`runtime::conn_health`] — connection-health counters and windowed
-///   snapshots.
+/// - [`runtime::TorHandle`], [`runtime::TorHealth`],
+///   [`runtime::BridgeRefresh`], [`runtime::WatchdogRun`],
+///   [`runtime::WatchdogStatus`], and [`runtime::HealOutcome`] provide the
+///   live-client handle, refresh signaling, watchdog status, and failure
+///   classification. The watchdog spawn functions and
+///   [`runtime::classify_and_record`] are exported at the same flat level.
+/// - [`runtime::ConnHealthCounters`], [`runtime::ConnHealthSnapshot`],
+///   [`runtime::PendingConnectionGuard`], [`runtime::ConnStage`],
+///   [`runtime::ConnErrorKind`], and [`runtime::spawn_conn_health_logger`]
+///   expose connection-health counters and windowed snapshots.
+///
+/// These functions take [`runtime::WatchdogConfig`] and
+/// [`runtime::ConnHealthConfig`] where applicable. [`runtime::TorError`] is
+/// the error type accepted by [`runtime::classify_and_record`].
 ///
 /// **Bridge manager (SDK-8):**
 ///
-/// - [`runtime::start`] — spawn the runtime-owned bridge producers
-///   (maintenance, plus the warmer and circuit verifier when enabled) and
-///   get a [`runtime::BridgeManagerHandle`] (`token`, `status`,
-///   `subscribe`, `shutdown().await`). One live manager per process (D5);
-///   await `shutdown()` before `close_global` so in-flight store writes
-///   land.
+/// - [`runtime::start`] owns the standalone bridge producers;
+///   [`runtime::start_with_parent_token`] composes them under a caller's
+///   cancellation tree. [`runtime::BridgeManagerHandle`] exposes typed status
+///   subscription and async shutdown; await shutdown before closing the writer.
 /// - [`runtime::fetch_bridges`] — the `bridges fetch` core
 ///   ([`runtime::FetchBridgesParams`], [`runtime::FetchBridgesOutcome`]):
 ///   bootstrap Tor, refresh the candidate pool, optionally probe and
@@ -148,14 +157,26 @@ pub use ::tor_socks5_onion as onion;
 /// `vendor/README.md`) stock Arti is resolved and the fixes are lost.
 #[cfg(feature = "runtime")]
 pub mod runtime {
-    /// Connection-health counters and snapshots (`tor-socks5-runtime::conn_health`).
-    pub use ::tor_socks5_runtime::conn_health;
-    /// Pluggable-transport binary resolution (`tor-socks5-runtime::pt`).
-    pub use ::tor_socks5_runtime::pt;
-    /// Tor client settings built from the config file (`tor-socks5-runtime::tor_setup`).
-    pub use ::tor_socks5_runtime::tor_setup;
-    /// The live-client handle and the watchdog surface (`tor-socks5-runtime::tor_watchdog`).
-    pub use ::tor_socks5_runtime::tor_watchdog;
+    /// Tor error accepted by [`classify_and_record`].
+    pub use ::arti_wrapper::TorError;
+    /// Configuration types used by the runtime spawn functions.
+    pub use ::proxy_config::{ConnHealthConfig, WatchdogConfig};
+    /// Connection-health counters and their periodic logger.
+    pub use ::tor_socks5_runtime::conn_health::{
+        spawn_conn_health_logger, ConnErrorKind, ConnHealthCounters, ConnHealthSnapshot, ConnStage,
+        PendingConnectionGuard,
+    };
+    /// Pluggable-transport executable policy.
+    pub use ::tor_socks5_runtime::pt::PtBinary;
+    /// Tor state-directory, keystore, and settings constructors.
+    pub use ::tor_socks5_runtime::tor_setup::{
+        arti_base_dir, arti_keystore_dir, build_tor_settings, build_tor_settings_with_pt,
+    };
+    /// Live Tor handle, watchdog, and failure-classification API.
+    pub use ::tor_socks5_runtime::tor_watchdog::{
+        classify_and_record, spawn_bridge_failover_watchdog, spawn_tor_watchdog, BridgeRefresh,
+        HealOutcome, TorHandle, TorHealth, WatchdogRun, WatchdogStatus,
+    };
 
     /// The bridge-health writer: the [`StoreWriter`] handle (`apply`,
     /// `close`) and the process-wide `init_global`/`close_global` slot
@@ -174,8 +195,8 @@ pub mod runtime {
     /// reports status and joins them at shutdown; [`fetch_bridges`] is the
     /// `bridges fetch` core.
     pub use ::tor_socks5_runtime::bridge_manager::{
-        fetch_bridges, start, BridgeManagerHandle, BridgeManagerStatus, FetchBridgesOutcome,
-        FetchBridgesParams,
+        fetch_bridges, start, start_with_parent_token, BridgeManagerConfig, BridgeManagerHandle,
+        BridgeManagerStatus, FetchBridgesOutcome, FetchBridgesParams,
     };
 }
 

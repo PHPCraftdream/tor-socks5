@@ -549,6 +549,29 @@ def config_targets(old, new):
     return targets
 
 
+def feature_entries(manifest):
+    """Return the SDK facade feature checks and manifest-declared examples."""
+    features = manifest.get("features")
+    examples = manifest.get("example", [])
+    if not isinstance(features, dict) or not all(isinstance(name, str) for name in features):
+        raise MappingError("missing mapping: SDK facade features")
+    if not isinstance(examples, list):
+        raise MappingError("missing mapping: SDK facade examples")
+    entries = [{"kind": "feature", "feature": None}]
+    entries.extend({"kind": "feature", "feature": name}
+                   for name in sorted(features) if name != "default")
+    for example in examples:
+        if (not isinstance(example, dict) or not isinstance(example.get("name"), str) or
+                not example["name"]):
+            raise MappingError("missing mapping: SDK facade example")
+        required = example.get("required-features", [])
+        if not isinstance(required, list) or not all(isinstance(name, str) for name in required):
+            raise MappingError("missing mapping: SDK facade example required-features")
+        entries.append({"kind": "example", "name": example["name"],
+                        "required_features": required})
+    return entries
+
+
 def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_request",
          full_reason="ручной sprint-full", full_trigger=None):
     if capabilities is None:

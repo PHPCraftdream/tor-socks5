@@ -2,8 +2,10 @@
 
 One dependency for the libraries of this repository. The crate is a thin
 facade: most leaf-library modules re-export their workspace crate, while the
-runtime and embedded-server modules expose curated APIs. Features select which
-crates are linked.
+runtime and embedded-server modules expose curated APIs. Runtime functions and
+types are re-exported directly from `tor_socks5::runtime`; the facade does not
+expose the runtime crate's internal module tree. Features select which crates
+are linked.
 
 It is **not published to crates.io**. The Tor stack needs the vendored Arti
 forks, and a crates.io package cannot carry them (`[patch]` is dropped on
@@ -43,7 +45,7 @@ use tor_socks5::config::Config;
 | `tor` | `tor` | `arti-wrapper` | `socks5`, `acl` |
 | `fetch` | `fetch` | `bridge-fetcher` | `tor`, `bridges` |
 | `dns` | `dns` | `tor-socks5-dns` | `tor`, `acl` |
-| `runtime` | `runtime` | `tor-socks5-runtime` | `tor`, `config`, `bridges` |
+| `runtime` | `runtime` (curated flat exports) | `tor-socks5-runtime` | `tor`, `config`, `bridges` |
 | `server` | `server` | `tor-socks5-server` | `runtime`, `onion-service` |
 | `onion` | `onion` | `tor-socks5-onion` | |
 | `onion-keys` | `onion` (keys) | `tor-socks5-onion/keys` | |
@@ -174,39 +176,56 @@ This feature links Arti — the patch-kit applies (see
 
 ## Tor client (runtime feature)
 
-The `runtime` feature is the SDK-9 Tor client surface of
-`tor-socks5-runtime` (`apps/sdk/crates/runtime`), exposed through the
-`tor_socks5::runtime` module. The flow of an embedding host:
+`runtime` exposes selected Tor-client functions and types as flat exports from
+`tor_socks5::runtime`, not as the runtime crate's internal module tree. The
+host can build settings, choose a PT binary, operate the Tor handle and arm the
+watchdogs using these facade exports. `build_tor_settings` probes bridges,
+falls back over the preferred pool and built-in seeds, updates the bridge
+health store and prunes dead bridges; `build_tor_settings_with_pt` accepts a
+`PtBinary` for a host-provided dispatcher.
 
-- **Build settings** from the ktav config:
+The runtime exports include the settings/path helpers, `PtBinary`, `TorHandle`,
+`TorHealth`, `BridgeRefresh`, `classify_and_record`, watchdog status and spawn
+APIs, plus connection-health counters and snapshots. These names are available
+at the flat `tor_socks5::runtime::*` level; no `tor_setup`, `tor_watchdog`,
+`conn_health` or `pt` submodule path is part of the facade API.
 
-  ```rust
-  let settings = tor_socks5::runtime::tor_setup::build_tor_settings(
-      &cfg, Some(&config_path)).await?;
-  ```
+After bootstrapping, wrap the tunnel with `TorHandle::new_with_settings(tunnel,
+&settings)`. In addition to holding the tunnel, it seeds the handle's active
+bridge set from `settings.bridges`; bridge verification selects due candidates
+only from that active set. The proxy server and the runtime examples use this
+constructor. `TorHandle::new(tunnel)` remains available when settings are not
+at hand, but does not perform that initialization.
 
-  This probes bridges, falls back over the preferred pool and the built-in
-  seeds, updates the bridge health store and prunes dead bridges.
-  `build_tor_settings_with_pt` lets you choose the pluggable-transport
-  binary.
-- **The PT entry point.** With bridges that need a transport, the CLI
-  binary resolves `TOR_PT_BINARY` or spawns itself (busybox dispatch on
-  `TOR_PT_MANAGED_TRANSPORT_VER`). An embedding host without such dispatch
-  passes `tor_socks5::runtime::pt::PtBinary::Explicit(path)` pointing at
-  its own dispatcher or the repository's `pt-helper` build.
-- **Run.** Wrap the bootstrapped `tor_socks5::tor::TorTunnel` in
-  `runtime::tor_watchdog::TorHandle` (`tunnel()`, `health()`, `drain()`
-  for shutdown), feed connect outcomes via `TorHealth`/`classify_and_record`
-  and arm the watchdogs: `spawn_tor_watchdog` returns `None` when disabled
-  or a `WatchdogRun` whose `join` you join at shutdown and whose `status`
-  (`watch::Receiver<WatchdogStatus>`) reports checks started, consecutive
-  heal failures and the last `HealOutcome`; `spawn_bridge_failover_watchdog`
-  for the soft-failover signals.
-- **Observe.** `runtime::conn_health::ConnHealthCounters` with
-  `snapshot_and_reset()` windowed `ConnHealthSnapshot`s and the optional
-  periodic summary via `spawn_conn_health_logger`.
-- **The restart contract:** one live Tor client per process; sequential
-  stop-then-start works.
+`PtBinary::Environment` remains the default policy, matching the CLI: it uses
+`TOR_PT_BINARY` when set, otherwise the current executable (the CLI busybox PT
+dispatch). For bridge-manager producers this policy is captured for the
+manager's lifetime in `BridgeManagerConfig`; passing `Settings` directly to
+`start` or `start_with_parent_token` converts it to a config with
+`PtBinary::Environment`. This preserves the policy, not a resolved path or
+snapshot of environment variables; the environment policy is still resolved
+when a producer needs a PT binary. Hosts using an explicit PT dispatcher should
+pass the same policy used to build settings, for example:
+
+```rust
+use tor_socks5::runtime::{start, BridgeManagerConfig, PtBinary};
+
+let manager_config = BridgeManagerConfig {
+    settings,
+    pt_binary: PtBinary::Explicit(pt_path),
+};
+let manager = start(handle, Some(config_path), &cfg, sink, manager_config);
+```
+
+The facade intentionally retains these health counters, failure
+classification, watchdogs, settings builders, PT helper and bridge-manager
+start helpers: custom egress, reporting and pluggable-transport setup need
+them. Runtime maintenance, worker and owner implementation modules are not
+re-exported.
+
+The restart contract is one live Tor client per process; sequential
+stop-then-start is supported. This documents the API contract; no live runtime
+verification is claimed here.
 
 Note: the `runtime` feature links Arti — the patch-kit `[patch.crates-io]`
 block from [`vendor/README.md`](../../vendor/README.md) in your final
@@ -216,12 +235,11 @@ package).
 
 ## Bridge health writer and guard observations
 
-With `runtime`, the SDK-7 surface of `tor-socks5-runtime` is exposed: the
-single writer of the bridge health store and the observation layer for
-arti's guard events. Neither installs process state on its own: the
-writer runs where you start and stop it, and the observation layer is
-wired into your own `tracing_subscriber` registry — the proxy binary
-does exactly this in its startup.
+With `runtime`, the facade exports the bridge-health writer and observation
+APIs directly from `tor_socks5::runtime`. Neither installs process state on
+its own: the writer runs where you start and stop it, and the observation
+layer is wired into your own `tracing_subscriber` registry — the proxy
+binary does exactly this in its startup.
 
 ```rust
 use tor_socks5::runtime::{close_global, init_global, observation_layer, ObservationSink};
@@ -255,33 +273,34 @@ observations).
 
 ## Bridge manager and `bridges fetch` (SDK-8)
 
-With `runtime`, the SDK-8 surface of `tor-socks5-runtime` is the bridge
-manager: one handle owning the background bridge producers, plus the
-`bridges fetch` core as a library function.
+With `runtime`, use the facade's flat bridge-manager exports. `start` owns its
+background bridge producers; one live manager per process (D5), so stop it
+before starting another. At shutdown, cancel and join the producers before
+closing the bridge-store writer:
 
 ```rust
-use tor_socks5::runtime::{start, BridgeManagerHandle, ObservationSink};
+use tor_socks5::runtime::{close_global, start, ObservationSink};
 
-// Spawn maintenance (+ warmer and circuit verifier unless the global
-// pre_proxies branch is active) exactly as the proxy binary does.
-// One live manager per process (D5): the producers' shared state is
-// process-wide, sequential stop-then-start works.
-let manager: BridgeManagerHandle = start(handle, Some(config_path), &cfg, sink, settings);
+let manager = start(handle, Some(config_path), &cfg, sink, settings);
 println!("running: {:?}", manager.status().producers);
-
-// At shutdown: cancel and join every producer so in-flight store writes
-// land, then close the bridge-store writer.
 manager.shutdown().await;
-// let flush = close_global().await;
+let flush = close_global().await;
 ```
 
-`fetch_bridges` is the core of the CLI's `bridges fetch` command: it
-bootstraps Tor from the configured bridges (built-in seeds as fallback),
-refreshes the candidate pool from the configured HTTPS sources and,
-unless `probe` is `false`, probes candidates and promotes the reachable
-ones into the working config. The application keeps config loading,
-validation, tracing and printing; the outcome is
-`FetchBridgesOutcome { added, promoted, pool_len }`. Not cancel-safe:
+For a host with a parent cancellation token, `start_with_parent_token` makes
+the manager's producer token its child. `BridgeManagerHandle::transfer_tasks`
+can move join handles into the host's own task owner; after transfer that owner
+must arrange cancellation and join or abort every task. Dropping an untransferred
+manager cancels its token and aborts its owned joins. Cancelling a polled
+`shutdown()` future also drops the manager and aborts any remaining joins;
+await shutdown to let cooperative producer work finish normally.
+
+`fetch_bridges` is the core of the CLI's `bridges fetch` command: it bootstraps
+Tor from configured bridges (built-in seeds as fallback), refreshes the
+candidate pool from configured HTTPS sources and, unless `probe` is `false`,
+probes candidates and promotes reachable ones into the working config. The
+application keeps config loading, validation, tracing and printing; the result
+is `FetchBridgesOutcome { added, promoted, pool_len }`. It is not cancel-safe:
 cancellation aborts the run mid-way and skips the trailing 200 ms sleep.
 
 ## Embedded SOCKS5 server (`server` feature)
@@ -331,26 +350,65 @@ five-second timeout. Closing the bridge-store writer is awaited without a deadli
 `Stopped` means that attempt completed (successfully or with an error;
 `ServerError::Cleanup` preserves a secondary cleanup failure), not that every task
 handle was provably joined; timed-out handles remain retained in process slots for
-recovery by the next start. The server library does not install a tracing subscriber or crypto provider, bind child processes,
+recovery by the next start. SDK-14 does not change embedded-server `Drop` or
+shutdown semantics. The server library does not install a tracing subscriber or crypto provider, bind child processes,
 load process config, or handle OS signals; those remain the host application's
 responsibility.
 
 This Tor-linked feature requires the patch-kit (see
-[Using the Tor features](#using-the-tor-features)). The facade example is
-[embedded_server.rs](examples/embedded_server.rs); enable it with
-`features = ["server"]` and run `cargo run -p tor-socks5 --example
-embedded_server --features server`. It does not start or require a Tor
-bootstrap, but client egress still needs the configured upstream proxy.
+[Using the Tor features](#using-the-tor-features)). The seven facade examples
+are [embedded_server.rs](examples/embedded_server.rs),
+[onion_address.rs](examples/onion_address.rs),
+[onion_keys.rs](examples/onion_keys.rs),
+[accounts_config.rs](examples/accounts_config.rs),
+[tor_runtime.rs](examples/tor_runtime.rs),
+[onion_host.rs](examples/onion_host.rs) and
+[bridge_fetch.rs](examples/bridge_fetch.rs). Their manifest-declared required
+features, respectively, are `server`, `onion`, `onion-keys`, `auth` + `config`,
+`runtime`, `runtime` + `onion-host`, and `runtime`; CI derives example feature
+checks from those declarations. The embedded-server example does not start or
+require a Tor bootstrap, but client egress still needs the configured upstream
+proxy.
 
-## What remains host-owned
+## CLI capability mapping
 
-The facade provides library APIs, not the proxy executable's process shell.
-The embedded server is available with `server` (above); the host application
-still owns process initialization and configuration loading, signals, CLI
-commands and operating-system service management. The bridge health writer,
-guard-event observation, bridge manager, Tor client and watchdog surfaces are
-available behind `runtime` (see [Tor client (runtime feature)](#tor-client-runtime-feature)
-and [Bridge health writer and guard observations](#bridge-health-writer-and-guard-observations)).
-Also outside the facade by design: the Android `cdylib`, `pt-helper`, the OS
-service installer and the command-line parser. Vendored crates are never
-exposed through it.
+The facade exposes library functions, not a replacement executable. Host
+configuration and validation, `tracing`/crypto installation and result
+printing remain in the CLI; unsupported-pool validation is private there. The
+facade export checker parses only public `use` trees rooted at the literal
+`tor_socks5_runtime` name. Its bounded syntax is ASCII identifiers, `::`,
+aliases, nested brace groups, `self` and globs. It does not perform Rust name
+resolution or follow private import aliases/re-export chains.
+
+| CLI capability | Facade API | Feature |
+|---|---|---|
+| `users` account operations | `auth::Registry` | `auth` |
+| SOCKS5 framing and HTTP CONNECT protocol | `proto` | `socks5` |
+| Client access rules and ACL types | `acl` | `acl` |
+| Proxy route pools and rotation | `route` | `route` |
+| `config migrate` and config schema | `config::migrate_config`, `config::Config` | `config` |
+| Bridge reachability probing | `probe` | `bridges` |
+| Bridge health storage | `store` | `bridges` |
+| Pluggable-transport verification state | `verify` | `bridges` |
+| Tor tunnel | `tor::TorTunnel`, `tor::Settings` | `tor` |
+| Bridge-list retrieval | `fetch` | `fetch` |
+| DNS resolver and server APIs | `dns` | `dns` |
+| `bridges fetch` core | `runtime::fetch_bridges` | `runtime` |
+| Bridge maintenance and health writer | `runtime::start`, `runtime::StoreWriter`, `runtime::ObservationSink` | `runtime` |
+| Tor settings, PT policy, health and watchdog | flat `runtime` exports | `runtime` |
+| Onion address and vanity operations | `onion::address`, `onion::vanity` | `onion` |
+| Onion identity/keystore operations | `onion::keys` | `onion-keys` |
+| Onion service hosting | `onion::host` | `onion-host` |
+| Embedded SOCKS5 server | `server::Server` and builder | `server` |
+| Process shell, `clap` commands, help, signals, angel and OS service management | Not provided | — |
+| Android FFI / `cdylib` | Not provided; SDK-13 is pending | — |
+| `pt-helper` executable | Not provided; separate workspace app | — |
+
+CI compiles the facade surface test and runs clippy for the no-default build and
+each manifest feature (including `acl`); it checks example compilation with
+each manifest-declared required feature set. These are configured checks, not
+a claim that CI has run for this change.
+
+The host application still owns process initialization and configuration
+loading, signals, CLI parsing/printing and operating-system service
+management. Vendored crates are never exposed through the facade.

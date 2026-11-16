@@ -62,6 +62,25 @@ use crate::arti_observability::ObservationSink;
 use crate::config::Config;
 use crate::tor_watchdog::TorHandle;
 
+/// Runtime producer configuration. The PT policy is captured once at manager
+/// start and reused for every later settings rebuild and admission check.
+#[derive(Clone, Debug)]
+pub struct BridgeManagerConfig {
+    /// Initial Tor settings (including pre-endpoint mode).
+    pub settings: arti_wrapper::Settings,
+    /// PT executable policy retained for this manager's lifetime.
+    pub pt_binary: crate::pt::PtBinary,
+}
+
+impl From<arti_wrapper::Settings> for BridgeManagerConfig {
+    fn from(settings: arti_wrapper::Settings) -> Self {
+        Self {
+            settings,
+            pt_binary: crate::pt::PtBinary::Environment,
+        }
+    }
+}
+
 /// Snapshot of what the manager is currently running (R4: current state via
 /// `watch`). Minimal by design: the producers expose no deeper introspection.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,8 +95,8 @@ pub struct BridgeManagerStatus {
 }
 
 /// Handle owning the producers started by [`start`] (R3).
-/// `Drop` cancels the token without blocking; unless tasks are explicitly
-/// transferred to the server, their JoinHandles are simply dropped.
+/// Dropping the handle cancels the token and aborts owned tasks unless their
+/// join handles have been transferred to another owner.
 pub struct BridgeManagerHandle {
     token: CancellationToken,
     status_tx: watch::Sender<BridgeManagerStatus>,
@@ -91,6 +110,9 @@ impl Drop for BridgeManagerHandle {
         if !self.tasks_transferred {
             self.token.cancel();
             self.status_tx.send_modify(|s| s.cancelled = true);
+            for handle in &self.handles {
+                handle.abort();
+            }
         }
     }
 }
@@ -114,25 +136,24 @@ impl BridgeManagerHandle {
     /// Cancel the token and await every producer JoinHandle, so in-flight
     /// work (probe batches, store writes) lands before the caller closes the
     /// bridge-store writer.
+    ///
+    /// Cancel-safe: no. Cancelling this future drops the handle, aborting any
+    /// remaining producer tasks without awaiting their completion.
     pub async fn shutdown(mut self) {
         self.status_tx.send_modify(|s| s.cancelled = true);
         self.token.cancel();
-        for handle in self.handles.drain(..) {
+        for handle in &mut self.handles {
             let _ = handle.await;
         }
+        self.handles.clear();
     }
 
-    /// Transfer the producer tasks to the server's cancellation-safe owner.
-    ///
-    /// Transitional SDK-11 bridge: call only on a handle returned by
-    /// [`start_for_server`], whose producer token is a child of the server
-    /// token. The server retains these handles directly because cancelling a
-    /// task awaiting `shutdown()` would detach the manager's children. Remove
-    /// this hidden cross-crate API when SDK-14 unifies task ownership.
-    #[doc(hidden)]
-    pub fn into_tasks(mut self) -> Vec<JoinHandle<()>> {
+    /// Transfer producer tasks to `destination` and disable cancellation on
+    /// this handle's drop. The caller inherits responsibility for joining or
+    /// aborting every transferred task and must arrange their cancellation.
+    pub fn transfer_tasks(mut self, destination: &mut Vec<JoinHandle<()>>) {
         self.tasks_transferred = true;
-        std::mem::take(&mut self.handles)
+        destination.extend(std::mem::take(&mut self.handles));
     }
 }
 
@@ -140,46 +161,43 @@ impl BridgeManagerHandle {
 /// binary's `fetch::bridge_producers::launch`). In the pre-endpoint branch
 /// only maintenance runs — warmer and verifier are disabled, and the same
 /// warning is logged as the binary logs. The tasks belong to the returned
-/// handle; nothing is detached (R3).
+/// handle; nothing is detached (R3). The PT executable policy from `config`
+/// is retained for later maintenance rebuilds and verifier admission checks.
 pub fn start(
     handle: TorHandle,
     config_path: Option<PathBuf>,
     cfg: &Config,
     observations: ObservationSink,
-    settings: arti_wrapper::Settings,
+    config: impl Into<BridgeManagerConfig>,
 ) -> BridgeManagerHandle {
     start_with_token(
         handle,
         config_path,
         cfg,
         observations,
-        settings,
+        config.into(),
         CancellationToken::new(),
     )
 }
 
-/// Start bridge producers under a child of the server's producer token.
-///
-/// Transitional SDK-11 server bridge: cancelling or aborting the server's
-/// producer owner synchronously cancels the bridge tasks too, even if the
-/// owner's shutdown join is timed out. Remove with the SDK-14 ownership
-/// unification.
-#[doc(hidden)]
-pub fn start_for_server(
+/// Start bridge producers under a child of `parent_token`. Cancelling the
+/// parent token cancels the producer token as well; the returned handle owns
+/// the producer tasks until they are transferred or shut down.
+pub fn start_with_parent_token(
     handle: TorHandle,
     config_path: Option<PathBuf>,
     cfg: &Config,
     observations: ObservationSink,
-    settings: arti_wrapper::Settings,
-    server_token: CancellationToken,
+    config: impl Into<BridgeManagerConfig>,
+    parent_token: CancellationToken,
 ) -> BridgeManagerHandle {
     start_with_token(
         handle,
         config_path,
         cfg,
         observations,
-        settings,
-        server_token.child_token(),
+        config.into(),
+        parent_token.child_token(),
     )
 }
 
@@ -188,9 +206,13 @@ fn start_with_token(
     config_path: Option<PathBuf>,
     cfg: &Config,
     observations: ObservationSink,
-    settings: arti_wrapper::Settings,
+    config: BridgeManagerConfig,
     token: CancellationToken,
 ) -> BridgeManagerHandle {
+    let BridgeManagerConfig {
+        settings,
+        pt_binary,
+    } = config;
     let (status_tx, status_rx) = watch::channel(BridgeManagerStatus {
         producers: Vec::new(),
         cancelled: false,
@@ -203,24 +225,26 @@ fn start_with_token(
         );
         producers.push((
             "maintenance",
-            crate::bridge_maintenance::spawn(
+            crate::bridge_maintenance::spawn_with_pt(
                 handle,
                 config_path,
                 cfg.bridges.recheck_interval_mins,
                 observations,
                 settings,
+                pt_binary.clone(),
                 token.clone(),
             ),
         ));
     } else {
         producers.push((
             "maintenance",
-            crate::bridge_maintenance::spawn(
+            crate::bridge_maintenance::spawn_with_pt(
                 handle.clone(),
                 config_path.clone(),
                 cfg.bridges.recheck_interval_mins,
                 observations,
                 settings,
+                pt_binary.clone(),
                 token.clone(),
             ),
         ));
@@ -234,9 +258,10 @@ fn start_with_token(
         }
         producers.push((
             "verifier",
-            crate::bridge_verifier::spawn_bridge_circuit_verifier(
+            crate::bridge_verifier::spawn_bridge_circuit_verifier_with_pt(
                 config_path,
                 handle,
+                pt_binary,
                 token.clone(),
             ),
         ));
@@ -429,5 +454,279 @@ mod tests {
         };
         drop(handle);
         assert!(token.is_cancelled());
+    }
+
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(signal) = self.0.take() {
+                let _ = signal.send(());
+            }
+        }
+    }
+
+    async fn guarded_task(
+        wait_for: Option<CancellationToken>,
+    ) -> (JoinHandle<()>, tokio::sync::oneshot::Receiver<()>) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _guard = DropSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            match wait_for {
+                Some(token) => token.cancelled().await,
+                None => std::future::pending::<()>().await,
+            }
+        });
+        started_rx.await.expect("task reached its pending point");
+        (handle, dropped_rx)
+    }
+
+    fn test_manager(token: CancellationToken, handles: Vec<JoinHandle<()>>) -> BridgeManagerHandle {
+        let (status_tx, status_rx) = watch::channel(BridgeManagerStatus {
+            producers: Vec::new(),
+            cancelled: false,
+        });
+        BridgeManagerHandle {
+            token,
+            status_tx,
+            status_rx,
+            handles,
+            tasks_transferred: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk14_dropping_manager_aborts_pending_tasks() {
+        let (task, dropped) = guarded_task(None).await;
+        drop(test_manager(CancellationToken::new(), vec![task]));
+        tokio::time::timeout(Duration::from_secs(10), dropped)
+            .await
+            .expect("manager drop aborts its pending task within 10s")
+            .expect("aborted task dropped its guard");
+    }
+
+    #[tokio::test]
+    async fn sdk14_cancelling_polled_shutdown_aborts_pending_tasks() {
+        use std::future::Future;
+
+        let (task, dropped) = guarded_task(None).await;
+        let token = CancellationToken::new();
+        let mut shutdown = Box::pin(test_manager(token.clone(), vec![task]).shutdown());
+        std::future::poll_fn(|cx| match shutdown.as_mut().poll(cx) {
+            std::task::Poll::Pending => std::task::Poll::Ready(()),
+            std::task::Poll::Ready(()) => panic!("shutdown unexpectedly completed"),
+        })
+        .await;
+        assert!(token.is_cancelled());
+        drop(shutdown);
+        tokio::time::timeout(Duration::from_secs(10), dropped)
+            .await
+            .expect("cancelled shutdown aborts its pending task within 10s")
+            .expect("cancelled shutdown aborted its task");
+    }
+
+    // Synthetic handles and tokens cover transfer and token-tree behavior;
+    // this does not exercise start_with_parent_token's production wiring.
+    #[tokio::test]
+    async fn sdk14_synthetic_child_cancellation_does_not_cancel_parent() {
+        let parent = CancellationToken::new();
+        let child = parent.child_token();
+        test_manager(child.clone(), Vec::new()).shutdown().await;
+        assert!(child.is_cancelled());
+        assert!(!parent.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn sdk14_transferred_synthetic_task_lives_until_parent_cancellation() {
+        let parent = CancellationToken::new();
+        let child = parent.child_token();
+        let (task, mut dropped) = guarded_task(Some(child.clone())).await;
+        let manager = test_manager(child.clone(), vec![task]);
+        let mut destination = Vec::new();
+        manager.transfer_tasks(&mut destination);
+
+        assert_eq!(destination.len(), 1);
+        assert!(!destination[0].is_finished());
+        assert!(matches!(
+            dropped.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        parent.cancel();
+        assert!(child.is_cancelled());
+        for task in destination {
+            task.await.expect("cooperatively cancelled task completed");
+        }
+        dropped
+            .await
+            .expect("task completed after parent cancellation");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sdk14_manager_explicit_pt_reaches_maintenance_and_verifier() {
+        use std::sync::Once;
+
+        static CRYPTO_PROVIDER: Once = Once::new();
+        CRYPTO_PROVIDER.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+
+        let dir = tempfile::tempdir().expect("temporary config directory");
+        let config_path = dir.path().join("proxy.ktav");
+        let bridge: bridge_line::BridgeLine =
+            "obfs4 8.8.8.8:443 1414141414141414141414141414141414141414 cert=AAA"
+                .parse()
+                .expect("valid public obfs4 bridge");
+        let mut cfg = Config::default();
+        cfg.bridges.lines = vec![bridge.to_string()];
+        cfg.bridges.sources.clear();
+        cfg.bridges.use_seeds = false;
+        cfg.bridges.auto_fetch = false;
+        cfg.bridges.recheck_interval_mins = 0;
+        cfg.warm_pool.enabled = false;
+        cfg.write(&config_path).expect("write isolated config");
+        cfg.write_bridges(&config_path)
+            .expect("write isolated bridge lines");
+
+        let expected_pt = dir.path().join("explicit-host-pt");
+        assert_ne!(
+            expected_pt,
+            std::env::current_exe().expect("current executable")
+        );
+        let state_dir = dir.path().join("client-state");
+        let initial_settings = arti_wrapper::Settings {
+            state_dir: Some(state_dir.clone()),
+            bridges: vec![bridge.clone()],
+            pt_binary: Some(expected_pt.clone()),
+            ..Default::default()
+        };
+        let tunnel = TorTunnel::create_unbootstrapped_with(arti_wrapper::Settings {
+            state_dir: Some(state_dir),
+            ..Default::default()
+        })
+        .expect("create transport-free unbootstrapped tunnel");
+        let handle = crate::tor_watchdog::TorHandle::new_with_settings(tunnel, &initial_settings);
+
+        let store_path = bridge_store::BridgeStore::resolve_path(Some(&config_path));
+        let mut store = bridge_store::BridgeStore::load(store_path).expect("load bridge store");
+        let now = time::OffsetDateTime::now_utc();
+        let alive = [(bridge.clone(), Duration::from_millis(1))];
+        store.note_probe_round(
+            std::slice::from_ref(&bridge),
+            &alive,
+            now,
+            Duration::ZERO,
+            u32::MAX,
+            u32::MAX,
+        );
+        store.note_channel_success_at(&bridge, now);
+        store
+            .save()
+            .expect("seed channel-proven verifier candidate");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let manager = crate::pt::SDK14_PT_OBSERVER
+            .scope(("manager", tx), async {
+                start(
+                    handle,
+                    Some(config_path),
+                    &cfg,
+                    ObservationSink::default(),
+                    BridgeManagerConfig {
+                        settings: initial_settings,
+                        pt_binary: crate::pt::PtBinary::Explicit(expected_pt.clone()),
+                    },
+                )
+            })
+            .await;
+
+        let mut observed = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3600), async {
+            while !observed.iter().any(|(role, _)| *role == "maintenance")
+                || !observed.iter().any(|(role, _)| *role == "verifier")
+            {
+                observed.push(rx.recv().await.expect("producer PT resolution report"));
+            }
+        })
+        .await
+        .expect("maintenance and >30-minute verifier tick report within one hour");
+
+        manager.shutdown().await;
+        for (role, path) in observed {
+            assert!(matches!(role, "maintenance" | "verifier"));
+            assert_eq!(path, expected_pt, "{role} must retain manager PT policy");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sdk14_manager_explicit_pt_reaches_maintenance_after_transport_free_start() {
+        use std::sync::Once;
+
+        static CRYPTO_PROVIDER: Once = Once::new();
+        CRYPTO_PROVIDER.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+
+        let dir = tempfile::tempdir().expect("temporary config directory");
+        let config_path = dir.path().join("proxy.ktav");
+        let bridge: bridge_line::BridgeLine =
+            "obfs4 8.8.8.8:443 1414141414141414141414141414141414141414 cert=AAA"
+                .parse()
+                .expect("valid public obfs4 bridge");
+        let mut cfg = Config::default();
+        cfg.bridges.lines = vec![bridge.to_string()];
+        cfg.bridges.sources.clear();
+        cfg.bridges.use_seeds = false;
+        cfg.bridges.auto_fetch = false;
+        cfg.bridges.recheck_interval_mins = 0;
+        cfg.warm_pool.enabled = false;
+        cfg.write(&config_path).expect("write isolated config");
+        cfg.write_bridges(&config_path)
+            .expect("write isolated bridge lines");
+
+        let expected_pt = dir.path().join("explicit-host-pt");
+        let state_dir = dir.path().join("client-state");
+        let initial_settings = arti_wrapper::Settings {
+            state_dir: Some(state_dir.clone()),
+            bridges: Vec::new(),
+            pt_binary: None,
+            ..Default::default()
+        };
+        let tunnel = TorTunnel::create_unbootstrapped_with(arti_wrapper::Settings {
+            state_dir: Some(state_dir),
+            ..Default::default()
+        })
+        .expect("create transport-free unbootstrapped tunnel");
+        let handle = crate::tor_watchdog::TorHandle::new_with_settings(tunnel, &initial_settings);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let manager = crate::pt::SDK14_PT_OBSERVER
+            .scope(("manager", tx), async {
+                start(
+                    handle,
+                    Some(config_path),
+                    &cfg,
+                    ObservationSink::default(),
+                    BridgeManagerConfig {
+                        settings: initial_settings,
+                        pt_binary: crate::pt::PtBinary::Explicit(expected_pt.clone()),
+                    },
+                )
+            })
+            .await;
+
+        let mut observed = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3600), async {
+            while !observed.iter().any(|(role, _)| *role == "maintenance") {
+                observed.push(rx.recv().await.expect("maintenance PT resolution report"));
+            }
+        })
+        .await
+        .expect("maintenance PT resolution report within one hour");
+
+        manager.shutdown().await;
+        assert_eq!(observed, vec![("maintenance", expected_pt)]);
     }
 }

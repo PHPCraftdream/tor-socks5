@@ -468,6 +468,25 @@ class Routing(unittest.TestCase):
         self.assertIn("features", example["segments"])
         self.assertNotIn("features", self.route("packages/auth/src/lib.rs")["segments"])
 
+    def test_sdk_facade_feature_matrix_is_manifest_driven(self):
+        root = Path(__file__).resolve().parents[2]
+        manifest = p.tomllib.loads((root / "apps/sdk/Cargo.toml").read_text(encoding="utf-8"))
+        entries = p.feature_entries(manifest)
+        feature_rows = [entry["feature"] for entry in entries if entry["kind"] == "feature"]
+        self.assertEqual(feature_rows[0], None)
+        self.assertEqual(set(feature_rows[1:]), {
+            "acl", "socks5", "auth", "config", "bridges", "route", "tor", "fetch", "dns",
+            "onion", "onion-keys", "onion-host", "onion-service", "runtime", "server", "full",
+        })
+        example_rows = [entry for entry in entries if entry["kind"] == "example"]
+        self.assertEqual(example_rows, [
+            {"kind": "example", "name": example["name"],
+             "required_features": example.get("required-features", [])}
+            for example in manifest["example"]
+        ])
+        embedded = next(entry for entry in example_rows if entry["name"] == "embedded_server")
+        self.assertEqual(embedded["required_features"], ["server"])
+
     def test_contracts_and_native(self):
         self.assertNotIn("tor", self.route("apps/socks5-proxy/src/commands/auth.rs")["segments"])
         self.assertIn("tor", self.route("apps/socks5-proxy/src/tor/channel.rs")["segments"])
@@ -558,7 +577,11 @@ class Routing(unittest.TestCase):
             self.assertIn(job, blocks["required"])
         self.assertNotIn("license-lifecycle", blocks)
         self.assertIn("always()", blocks["required"])
-        self.assertIn("cargo check --locked -p tor-socks5 --features server --examples", blocks["features"])
+        self.assertIn("planner.feature_entries(manifest)", blocks["features"])
+        self.assertIn('"--no-default-features"', blocks["features"])
+        self.assertIn('"clippy", *args, "--all-targets"', blocks["features"])
+        self.assertIn('"--test", "surface"', blocks["features"])
+        self.assertIn('"--example", entry["name"]', blocks["features"])
         self.assertIn("cargo deny --locked --config .github/deny.toml check licenses", blocks["license-audit"])
         self.assertIn("cargo fetch --locked", blocks["license-audit"])
         self.assertNotIn("python", blocks["license-audit"])

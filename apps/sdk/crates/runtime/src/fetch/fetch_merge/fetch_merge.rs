@@ -13,7 +13,7 @@
 //!    bridges; when a live [`TorTunnel`]
 //!    is available, admission also requires a real Tor channel to the bridge,
 //!    so mere TCP-alive impostors are rejected.
-//! 3. [`top_up_working`] ties them together: drain what we already have,
+//! 3. [`top_up_working_with_pt`] ties them together: drain what we already have,
 //!    and only fetch more if the pool can't cover the shortfall.
 //!
 //! Used by the startup auto-fetch, the periodic maintenance loop, and the
@@ -288,6 +288,7 @@ fn channel_checker(
     tor: &TorTunnel,
     admission_config: Option<std::path::PathBuf>,
     workers: std::sync::Arc<crate::workers::AdmissionWorkers>,
+    pt_binary: crate::pt::PtBinary,
 ) -> ChannelCheck<'static> {
     // Clone the tunnel handle (cheap, Arc-backed) so the future owns its
     // data and the checker is HRTB over the bridge reference alone.
@@ -297,6 +298,7 @@ fn channel_checker(
             let tor = tor.clone();
             let admission_config = admission_config.clone();
             let workers = workers.clone();
+            let pt_binary = pt_binary.clone();
             Box::pin(async move {
                 if bridge.transport.as_deref() == Some("webtunnel") {
                     return match crate::bridge_verifier::verify_for_admission(
@@ -304,6 +306,7 @@ fn channel_checker(
                         admission_config,
                         std::time::Instant::now() + budget.saturating_sub(ADMISSION_JOIN_MARGIN),
                         &workers,
+                        pt_binary.clone(),
                     )
                     .await
                     {
@@ -350,13 +353,22 @@ pub async fn drain_pool(
     target: usize,
     tor: Option<&TorTunnel>,
 ) -> Result<usize> {
+    drain_pool_with_pt(config_path, target, tor, crate::pt::PtBinary::Environment).await
+}
+
+pub(crate) async fn drain_pool_with_pt(
+    config_path: Option<&Path>,
+    target: usize,
+    tor: Option<&TorTunnel>,
+    pt_binary: crate::pt::PtBinary,
+) -> Result<usize> {
     let admission_config = config_path.map(Path::to_path_buf);
     // One registry per drain: it owns every verification worker the
     // admission decision outlives, and `drain_pool_with` joins them after
     // the pool transaction closes (TS17-02).
     let workers = std::sync::Arc::new(crate::workers::AdmissionWorkers::default());
     let checker: Option<ChannelCheck<'static>> =
-        tor.map(|tor| channel_checker(tor, admission_config, workers.clone()));
+        tor.map(|tor| channel_checker(tor, admission_config, workers.clone(), pt_binary.clone()));
     let cfg = Config::load_with_override(config_path)?.into_config();
     let policy = bridge_probe::ResolverPolicy {
         doh_enabled: cfg.dns.doh_enabled,
@@ -670,17 +682,22 @@ fn promote_bridges_in_config(path: &Path, promoted: &[BridgeLine]) -> Result<usi
 /// sources over Tor if the pool couldn't cover the shortfall. Returns the
 /// number promoted into the working config.
 ///
+/// The PT executable policy is retained for admission checks across both
+/// drains.
+///
 /// cancel-safe: NO.
-pub(crate) async fn top_up_working(
+pub(crate) async fn top_up_working_with_pt(
     tor: &TorTunnel,
     cfg: &Config,
     config_path: Option<&Path>,
     target: usize,
+    pt_binary: crate::pt::PtBinary,
 ) -> Result<usize> {
     if target == 0 {
         return Ok(0);
     }
-    let mut promoted = drain_pool(config_path, target, Some(tor)).await?;
+    let mut promoted =
+        drain_pool_with_pt(config_path, target, Some(tor), pt_binary.clone()).await?;
     if promoted < target && !cfg.bridges.sources.is_empty() {
         info!(
             have = promoted,
@@ -688,7 +705,8 @@ pub(crate) async fn top_up_working(
             "pool short — refreshing candidates from sources over Tor"
         );
         refresh_candidate_pool(tor, cfg, config_path, REFRESH_FETCH_TIMEOUT).await?;
-        promoted += drain_pool(config_path, target - promoted, Some(tor)).await?;
+        promoted +=
+            drain_pool_with_pt(config_path, target - promoted, Some(tor), pt_binary).await?;
     }
     Ok(promoted)
 }

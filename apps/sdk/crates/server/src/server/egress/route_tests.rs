@@ -1,6 +1,6 @@
 use super::{
-    reject_unsupported_pool, resolve_account_route, resolve_admitted_route, select_post_route,
-    validate_account_routes, validate_post_compatibility, validate_pre_capacity, AdmittedRoute,
+    resolve_account_route, resolve_admitted_route, select_post_route, validate_account_routes,
+    validate_post_compatibility, validate_pre_capacity, AdmittedRoute,
 };
 use auth::{User, UsersConfig};
 use proxy_config::{PoolOverride, ProxyPool, Socks5Endpoint};
@@ -294,15 +294,6 @@ async fn no_post_never_polls_post_route() {
 }
 
 #[test]
-fn rejects_global_pre_and_post_pools() {
-    for scope in ["global pre_proxies", "global post_proxies"] {
-        let error = reject_unsupported_pool(&Some(global_pool()), scope).unwrap_err();
-        assert!(error.to_string().contains(scope));
-        assert!(error.to_string().contains("not supported here"));
-    }
-}
-
-#[test]
 fn account_pre_is_independent_of_global_pre() {
     let users = UsersConfig {
         users: vec![user(true, Some(endpoint()), None)],
@@ -390,9 +381,4 @@ fn account_pre_stock_pt_template_uses_current_executable() {
     assert_eq!(settings.pt_binary, Some(std::env::current_exe().unwrap()));
     assert_eq!(settings.bridges, cfg.bridges.parsed().unwrap().bridges);
     settings.validate_stock_pt_proxy().unwrap();
-}
-
-#[test]
-fn absent_settings_are_allowed() {
-    assert!(reject_unsupported_pool(&None, "endpoint").is_ok());
 }

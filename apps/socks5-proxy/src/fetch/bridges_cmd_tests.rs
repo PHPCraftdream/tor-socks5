@@ -10,6 +10,18 @@ fn action() -> BridgesAction {
     }
 }
 
+#[test]
+fn sdk14_pool_validation_rejects_unsupported_pool() {
+    assert!(reject_unsupported_pool(&None, "bridges fetch").is_ok());
+
+    let pool = Some("127.0.0.1:1080".parse::<Socks5Endpoint>().unwrap().into());
+    let error = reject_unsupported_pool(&pool, "bridges fetch global pre_proxies").unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "bridges fetch global pre_proxies proxy pool is not supported here; remove it"
+    );
+}
+
 #[tokio::test]
 async fn fetch_rejects_pre_before_network_startup() {
     let dir = tempfile::tempdir().unwrap();

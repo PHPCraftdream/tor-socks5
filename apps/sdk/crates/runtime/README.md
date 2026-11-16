@@ -24,7 +24,19 @@ is public now:
   executable, which busybox-dispatches on `TOR_PT_MANAGED_TRANSPORT_VER`;
   `Explicit(path)` is the dispatcher of the embedding host, such as this
   repository's `apps/pt-helper` build. The path's existence is not checked
-  here — arti validates it later and reports `TorError::InvalidPt`.
+  here — arti validates it later and reports `TorError::InvalidPt`. Producers
+  started by the bridge manager retain the chosen policy for that manager's
+  lifetime in `BridgeManagerConfig`; converting plain `Settings` uses
+  `PtBinary::Environment`, preserving the CLI policy. To preserve an explicit
+  dispatcher, construct `BridgeManagerConfig { settings, pt_binary:
+  PtBinary::Explicit(path) }` with the same policy used for settings.
+  `Environment` is a policy, not a resolved-path/environment snapshot;
+  resolution occurs when a producer needs the PT binary. Before SDK-14, the
+  main path built settings with the default `Environment` policy and separately
+  resolved PT for verifier work; SDK-14 carries that policy into maintenance,
+  verifier and webtunnel-admission producers consistently. Standalone
+  `fetch_bridges` remains outside the manager and uses `build_tor_settings`
+  with `Environment`, preserving the CLI default resolver and its log order.
 - `tor_watchdog` — the live-client handle (`TorHandle`), the health reading
   (`TorHealth`, including `last_success_secs` and `attempt_count`), the
   bridge-refresh signal (`BridgeRefresh`) and the watchdog spawns:
@@ -34,6 +46,12 @@ is public now:
   consecutive heal failures, the last `HealOutcome`); 
   `spawn_bridge_failover_watchdog` for the soft-failover signals;
   `classify_and_record` for failure classification.
+- `TorHandle::new_with_settings(tunnel, &settings)` wraps the bootstrapped
+  client and initializes the handle's active bridge set from those settings.
+  Bridge verification filters due candidates against that active set. Use this
+  constructor when settings are available; `TorHandle::new(tunnel)` does not
+  seed the set. The embedded server and SDK Tor/onion-host examples use the
+  settings-aware constructor.
 - `conn_health` — `ConnHealthCounters` with windowed
   `ConnHealthSnapshot`s via `snapshot_and_reset()`, the error/stage kinds
   (`ConnErrorKind`, `ConnStage`), the pending-connection guard and the
@@ -52,16 +70,24 @@ The SDK-8 step opens the bridge manager: one handle owning the runtime's
 background bridge producers, plus the `bridges fetch` core as a library
 function.
 
-- `bridge_manager::start(handle, config_path, cfg, observations, settings)`
-  spawns the producers the binary would spawn — `bridge_maintenance`, plus
-  `bridge_warmer` and `bridge_verifier` when the pre-endpoint branch is not
-  active (there only maintenance runs, and the same warning is logged) — and
-  returns a `BridgeManagerHandle`: `token()` (the cancellation token driving
-  every producer), `status()`/`subscribe()` (`BridgeManagerStatus` via a
+- `bridge_manager::start(handle, config_path, cfg, observations, config)`
+  accepts `BridgeManagerConfig` (or `Settings`, which converts to the
+  `PtBinary::Environment` default), spawns the producers the binary would
+  spawn — `bridge_maintenance`, plus `bridge_warmer` and `bridge_verifier`
+  when the pre-endpoint branch is not active (there only maintenance runs,
+  and the same warning is logged) — and returns a `BridgeManagerHandle`:
+  `token()` (the cancellation token driving every producer),
+  `status()`/`subscribe()` (`BridgeManagerStatus` via a
   `tokio::sync::watch`: producer names and whether shutdown happened) and
   `shutdown().await`, which cancels the token and awaits every producer so
   in-flight work (probe batches, store writes) lands. Dropping the handle
-  cancels the token without blocking.
+  cancels its token and aborts the producer tasks it still owns; before
+  SDK-14, main's `Drop` only cancelled the token, leaving dropped joins
+  detached. A cancelled `shutdown()` future likewise aborts joins not yet
+  completed. The transitional hidden APIs `start_for_server` and `into_tasks`
+  were replaced by `start_with_parent_token` and
+  `transfer_tasks(&mut Vec<JoinHandle<()>>)` hands task ownership to the
+receiving owner.
 - `bridge_manager::fetch_bridges(cfg, config_path, FetchBridgesParams)` is
   the core of the CLI's `bridges fetch` command: bootstrap Tor from the
   configured bridges (built-in seeds as fallback), refresh the candidate
@@ -69,7 +95,13 @@ function.
   (`FetchBridgesParams { timeout, count, probe, cancel }`), and merge into
   the config; returns `FetchBridgesOutcome { added, promoted, pool_len }`.
   Not cancel-safe: cancellation aborts network I/O and file writes mid-way
-  and skips the trailing 200 ms post-drop sleep.
+  and skips the trailing 200 ms post-drop sleep. The CLI wrapper retains
+  config loading, `reject_unsupported_pool` validation, tracing/crypto
+  installation and printing. The facade surface checker is deliberately not
+  Rust name resolution: it parses a bounded subset of public `use` trees
+  (ASCII identifiers, `::`, aliases, nested brace groups, `self`, and globs),
+  examines direct paths rooted at the literal `tor_socks5_runtime` crate name,
+  and does not follow private aliases or re-export chains.
 
 The watchdog producers (`spawn_tor_watchdog`,
 `spawn_bridge_failover_watchdog`) belong to the server tree, not to this

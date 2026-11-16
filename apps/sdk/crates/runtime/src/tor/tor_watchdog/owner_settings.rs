@@ -3,10 +3,27 @@ use super::*;
 /// Создаёт ограниченный шаблон владельца без сетевых операций.
 /// Вызывающий код обязан проверить эффективный upstream с учётом CLI и задать pre endpoint.
 pub fn restricted_owner_settings(cfg: &Config, config_path: Option<&Path>) -> Result<Settings> {
+    restricted_owner_settings_with_policy(cfg, config_path, &crate::pt::PtBinary::Environment)
+}
+
+pub(crate) fn restricted_owner_settings_with_pt(
+    cfg: &Config,
+    config_path: Option<&Path>,
+    pt: &crate::pt::PtBinary,
+) -> Result<Settings> {
+    restricted_owner_settings_with_policy(cfg, config_path, pt)
+}
+
+fn restricted_owner_settings_with_policy(
+    cfg: &Config,
+    config_path: Option<&Path>,
+    pt: &crate::pt::PtBinary,
+) -> Result<Settings> {
     restricted_owner_settings_with_override(
         cfg,
         config_path,
         std::env::var_os("TOR_PT_BINARY").as_deref(),
+        pt,
     )
 }
 
@@ -14,6 +31,7 @@ fn restricted_owner_settings_with_override(
     cfg: &Config,
     config_path: Option<&Path>,
     pt_override: Option<&std::ffi::OsStr>,
+    pt: &crate::pt::PtBinary,
 ) -> Result<Settings> {
     if cfg.dns_server.enabled || cfg.onion_services.iter().any(|service| service.enabled) {
         bail!("pre_proxies is incompatible with DNS listener, onion services, or upstream egress");
@@ -45,11 +63,18 @@ fn restricted_owner_settings_with_override(
         bail!("pre_proxies requires at least one explicitly configured usable bridge");
     }
     let needs_pt = bridges.iter().any(|b| b.transport.is_some());
-    let override_path = crate::pt::pt_binary_override_from(pt_override);
+    let override_path = match pt {
+        crate::pt::PtBinary::Explicit(_) => None,
+        crate::pt::PtBinary::Environment => crate::pt::pt_binary_override_from(pt_override),
+    };
+    let explicit = matches!(pt, crate::pt::PtBinary::Explicit(_));
     let pt_binary = if needs_pt {
-        Some(match &override_path {
-            Some(path) => path.clone(),
-            None => std::env::current_exe().context("resolving current_exe for PT")?,
+        Some(match pt {
+            crate::pt::PtBinary::Explicit(path) => path.clone(),
+            crate::pt::PtBinary::Environment => match &override_path {
+                Some(path) => path.clone(),
+                None => std::env::current_exe().context("resolving current_exe for PT")?,
+            },
         })
     } else {
         None
@@ -59,7 +84,7 @@ fn restricted_owner_settings_with_override(
         state_dir: Some(arti_base_dir(config_path)),
         pre_endpoint: None,
         pt_binary,
-        stock_pt_proxy: needs_pt && override_path.is_none(),
+        stock_pt_proxy: needs_pt && !explicit && override_path.is_none(),
         extra_pt_protocols: Vec::new(),
         obfs4_iat_mode: cfg.bridges.iat_mode_override(),
         ..settings_for_config(cfg)
@@ -141,18 +166,40 @@ mod tests {
         cfg.warm_pool.enabled = false;
         let external = std::ffi::OsStr::new("external-pt");
         cfg.bridges.lines = vec!["8.8.8.8:443 1111111111111111111111111111111111111111".into()];
-        let plain = restricted_owner_settings_with_override(&cfg, None, Some(external)).unwrap();
+        let plain = restricted_owner_settings_with_override(
+            &cfg,
+            None,
+            Some(external),
+            &crate::pt::PtBinary::Environment,
+        )
+        .unwrap();
         assert!(plain.pt_binary.is_none());
         assert!(!plain.stock_pt_proxy);
         cfg.bridges.lines.push(
             "obfs4 8.8.4.4:443 2222222222222222222222222222222222222222 cert=AAA iat-mode=0".into(),
         );
-        assert!(restricted_owner_settings_with_override(&cfg, None, Some(external)).is_err());
+        assert!(restricted_owner_settings_with_override(
+            &cfg,
+            None,
+            Some(external),
+            &crate::pt::PtBinary::Environment
+        )
+        .is_err());
         let current = std::env::current_exe().unwrap();
-        assert!(
-            restricted_owner_settings_with_override(&cfg, None, Some(current.as_os_str())).is_err()
-        );
-        let stock = restricted_owner_settings_with_override(&cfg, None, None).unwrap();
+        assert!(restricted_owner_settings_with_override(
+            &cfg,
+            None,
+            Some(current.as_os_str()),
+            &crate::pt::PtBinary::Environment
+        )
+        .is_err());
+        let stock = restricted_owner_settings_with_override(
+            &cfg,
+            None,
+            None,
+            &crate::pt::PtBinary::Environment,
+        )
+        .unwrap();
         assert!(stock.stock_pt_proxy);
         assert_eq!(stock.pt_binary, Some(current));
     }

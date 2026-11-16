@@ -13,7 +13,6 @@ use crate::cli::BridgesAction;
 use crate::config::{Config, Loaded};
 use crate::process::{init_tracing, install_crypto_provider};
 use tor_socks5_runtime::bridge_manager::{fetch_bridges, FetchBridgesParams};
-use tor_socks5_server::reject_unsupported_pool;
 
 #[cfg(test)]
 use tor_socks5_runtime::tor_setup::build_tor_settings;
@@ -21,6 +20,13 @@ use tor_socks5_runtime::tor_setup::build_tor_settings;
 #[cfg(test)]
 tokio::task_local! {
     static FETCH_BOUNDARY: std::cell::Cell<bool>;
+}
+
+fn reject_unsupported_pool(setting: &Option<proxy_config::ProxyPool>, scope: &str) -> Result<()> {
+    if setting.is_some() {
+        bail!("{scope} proxy pool is not supported here; remove it");
+    }
+    Ok(())
 }
 
 /// cancel-safe: NO — bootstraps Tor, performs network I/O, writes config.
