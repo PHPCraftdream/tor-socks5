@@ -742,6 +742,37 @@ jobs:
         with self.assertRaisesRegex(p.MappingError, "missing mapping: удалена зависимость пакета"):
             p.check_removed_dependencies("apps/socks5-proxy/Cargo.toml", new_sdk5, '[dependencies]\n')
 
+    def test_deps1_proxy_dependency_removals(self):
+        path = "apps/socks5-proxy/Cargo.toml"
+        dependencies = (
+            "dns-server", "resocks5-net", "socks5-proto", "bridge-store",
+            "bridge-probe", "bridge-verify-core", "route-pool", "futures",
+            "ktav", "rusqlite",
+        )
+        old = '[dependencies]\n' + ''.join(f'{name} = "1"\n' for name in dependencies)
+        for name in dependencies:
+            with self.subTest(dependency=name):
+                new = '[dependencies]\n' + ''.join(
+                    f'{other} = "1"\n' for other in dependencies if other != name)
+                p.check_removed_dependencies(path, old, new)
+                result = self.route(path, blobs={path: (old, new)})
+                self.assertIn("socks5-proxy", result["packages"])
+
+        dependency = "dns-server"
+        other_package = '[dependencies]\n' + f'{dependency} = "1"\n'
+        with self.assertRaisesRegex(p.MappingError, "missing mapping: удалена зависимость пакета"):
+            p.check_removed_dependencies(
+                "packages/auth/Cargo.toml", other_package, '[dependencies]\n')
+        for table in ("dev-dependencies", "build-dependencies"):
+            with self.subTest(table=table):
+                old_table = f'[{table}]\n{dependency} = "1"\n'
+                with self.assertRaisesRegex(p.MappingError, "missing mapping: удалена зависимость пакета"):
+                    p.check_removed_dependencies(path, old_table, f'[{table}]\n')
+
+        retained = '[dependencies]\nbridge-fetcher = "1"\n'
+        with self.assertRaisesRegex(p.MappingError, "missing mapping: удалена зависимость пакета"):
+            p.check_removed_dependencies(path, retained, '[dependencies]\n')
+
     def test_required_results(self):
         plan = {"segments": ["fast", "rust"], "capabilities": {"real_tor_channel": True, "license_policy": False}, "full": False}
         needs = {job: {"result": "success" if any(s in plan["segments"] for s in selections) else "skipped"} for job, selections in p.RESULT_JOBS.items()}

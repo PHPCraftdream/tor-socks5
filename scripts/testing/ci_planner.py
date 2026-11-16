@@ -36,6 +36,16 @@ SANCTIONED_DEPENDENCY_REMOVALS = frozenset({
     ("apps/socks5-proxy/Cargo.toml", "dependencies", "fs-mistrust"),
     ("apps/socks5-proxy/Cargo.toml", "dependencies", "tor-keymgr"),
     ("apps/socks5-proxy/Cargo.toml", "dependencies", "tor-llcrypto"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "dns-server"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "resocks5-net"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "socks5-proto"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "bridge-store"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "bridge-probe"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "bridge-verify-core"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "route-pool"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "futures"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "ktav"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "rusqlite"),
     # SDK-5: onion-service hosting moved to tor-socks5-onion
     # (apps/sdk/crates/onion); the binary no longer links these directly.
     ("apps/socks5-proxy/Cargo.toml", "dependencies", "tor-hscrypto"),
