@@ -76,19 +76,22 @@ pub struct BridgeManagerStatus {
 }
 
 /// Handle owning the producers started by [`start`] (R3).
-/// `Drop` cancels the token without blocking; producers stop on their next
-/// cancellation checkpoint and their JoinHandles are simply dropped.
+/// `Drop` cancels the token without blocking; unless tasks are explicitly
+/// transferred to the server, their JoinHandles are simply dropped.
 pub struct BridgeManagerHandle {
     token: CancellationToken,
     status_tx: watch::Sender<BridgeManagerStatus>,
     status_rx: watch::Receiver<BridgeManagerStatus>,
     handles: Vec<JoinHandle<()>>,
+    tasks_transferred: bool,
 }
 
 impl Drop for BridgeManagerHandle {
     fn drop(&mut self) {
-        self.token.cancel();
-        self.status_tx.send_modify(|s| s.cancelled = true);
+        if !self.tasks_transferred {
+            self.token.cancel();
+            self.status_tx.send_modify(|s| s.cancelled = true);
+        }
     }
 }
 
@@ -118,6 +121,19 @@ impl BridgeManagerHandle {
             let _ = handle.await;
         }
     }
+
+    /// Transfer the producer tasks to the server's cancellation-safe owner.
+    ///
+    /// Transitional SDK-11 bridge: call only on a handle returned by
+    /// [`start_for_server`], whose producer token is a child of the server
+    /// token. The server retains these handles directly because cancelling a
+    /// task awaiting `shutdown()` would detach the manager's children. Remove
+    /// this hidden cross-crate API when SDK-14 unifies task ownership.
+    #[doc(hidden)]
+    pub fn into_tasks(mut self) -> Vec<JoinHandle<()>> {
+        self.tasks_transferred = true;
+        self.handles.drain(..).collect()
+    }
 }
 
 /// Start the runtime-owned bridge producers (the non-watchdog part of the
@@ -132,7 +148,49 @@ pub fn start(
     observations: ObservationSink,
     settings: arti_wrapper::Settings,
 ) -> BridgeManagerHandle {
-    let token = CancellationToken::new();
+    start_with_token(
+        handle,
+        config_path,
+        cfg,
+        observations,
+        settings,
+        CancellationToken::new(),
+    )
+}
+
+/// Start bridge producers under a child of the server's producer token.
+///
+/// Transitional SDK-11 server bridge: cancelling or aborting the server's
+/// producer owner synchronously cancels the bridge tasks too, even if the
+/// owner's shutdown join is timed out. Remove with the SDK-14 ownership
+/// unification.
+#[doc(hidden)]
+pub fn start_for_server(
+    handle: TorHandle,
+    config_path: Option<PathBuf>,
+    cfg: &Config,
+    observations: ObservationSink,
+    settings: arti_wrapper::Settings,
+    server_token: CancellationToken,
+) -> BridgeManagerHandle {
+    start_with_token(
+        handle,
+        config_path,
+        cfg,
+        observations,
+        settings,
+        server_token.child_token(),
+    )
+}
+
+fn start_with_token(
+    handle: TorHandle,
+    config_path: Option<PathBuf>,
+    cfg: &Config,
+    observations: ObservationSink,
+    settings: arti_wrapper::Settings,
+    token: CancellationToken,
+) -> BridgeManagerHandle {
     let (status_tx, status_rx) = watch::channel(BridgeManagerStatus {
         producers: Vec::new(),
         cancelled: false,
@@ -193,6 +251,7 @@ pub fn start(
         status_tx,
         status_rx,
         handles: producers.into_iter().map(|(_, handle)| handle).collect(),
+        tasks_transferred: false,
     }
 }
 
@@ -344,6 +403,7 @@ mod tests {
             status_tx,
             status_rx,
             handles: Vec::new(),
+            tasks_transferred: false,
         };
         assert_eq!(handle.status().producers, vec!["maintenance".to_string()]);
         assert!(!handle.status().cancelled);
@@ -365,6 +425,7 @@ mod tests {
             status_tx,
             status_rx,
             handles: Vec::new(),
+            tasks_transferred: false,
         };
         drop(handle);
         assert!(token.is_cancelled());

@@ -19,16 +19,18 @@
 //!   └─ holds the keystore PathLock guard for its whole life
 //!      ├─ settles every service's identity first, in one batch
 //!      │  (one rewrite of the onion services file for the whole launch)
-//!      └─ one manager task per service that may start
-//!         ├─ holds one of at most MAX_STARTING launch slots (`start_gate`)
-//!         │  from just before the launch until a terminal status, the 90 s
-//!         │  slot cap, or shutdown
-//!         ├─ launch + retry/backoff loop (30 s doubling to 5 min, ±20% spread)
-//!         ├─ waits for the .onion address, then spawns:
-//!         │   ├─ request-serving task (rendezvous → stream requests → TCP; ≤512 process-wide)
-//!         │   └─ status-event logging task (fires the slot release signal)
-//!         └─ keeps the Arc<RunningOnionService> alive until shutdown
+//!      └─ managers JoinSet (one manager per service that may start)
+//!         └─ per-manager children JoinSet (slot holder, serving, status logger)
+//!            └─ rendezvous JoinSet → forwarding JoinSets
 //! ```
+//!
+//! Each JoinSet owns its children: aborting a parent drops its set and aborts
+//! descendants rather than detaching them. Graceful cancellation awaits the
+//! children before the parent returns. Managers hold one of at most MAX_STARTING
+//! launch slots from just before launch until terminal status, the 90 s slot
+//! cap, or shutdown; retry/backoff is 30 s doubling to 5 min, ±20% spread.
+//! The request-serving task forwards rendezvous streams to local TCP targets
+//! (≤512 process-wide), while the status logger releases the launch slot.
 //!
 //! The watchdog heals the Tor client *in place* (it never rebuilds the
 //! `TorClient`), so services launched once survive heals; we still read the
@@ -59,6 +61,10 @@ pub mod forward;
 pub mod serve;
 pub(crate) mod start_gate;
 pub mod status;
+
+#[cfg(test)]
+#[path = "ownership_tests.rs"]
+mod ownership_tests;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -368,7 +374,7 @@ async fn run_services(config: OnionHostConfig, tracker: StatusTracker) {
     ));
     // One manager per service that may start; a failing service must not
     // affect the others (the ones that may not start are already logged).
-    let mut managers = Vec::with_capacity(prepared.len());
+    let mut managers = tokio::task::JoinSet::new();
     for service in prepared {
         if service.address.is_none() {
             // The service never starts: its identity could not be settled or
@@ -378,20 +384,36 @@ async fn run_services(config: OnionHostConfig, tracker: StatusTracker) {
             mark_failed(&tracker, &service.entry);
             continue;
         }
-        managers.push(tokio::spawn(service_manager(
+        managers.spawn(service_manager(
             handle.clone(),
             service.entry,
             gate.clone(),
             global_streams.clone(),
             token.clone(),
             tracker.clone(),
-        )));
+        ));
     }
     // Join the managers so the keystore lock guard is only dropped after
     // every service stopped. Managers exit promptly on cancellation.
-    for manager in managers {
-        if let Err(error) = manager.await {
-            warn!(%error, "onion service manager task ended with a join error");
+    join_logged(
+        &mut managers,
+        "onion service manager task ended with a join error",
+    )
+    .await;
+}
+
+/// Join every child task and log unexpected join failures. Cancelled joins
+/// are expected during shutdown.
+///
+/// This ownership boundary is essential: aborting a parent that owns a
+/// `JoinSet` aborts its remaining children on drop. An aborted parent must
+/// never detach children, or descendant work would outlive the host.
+pub(crate) async fn join_logged(set: &mut tokio::task::JoinSet<()>, message: &'static str) {
+    while let Some(result) = set.join_next().await {
+        if let Err(error) = result {
+            if !error.is_cancelled() {
+                warn!(%error, message);
+            }
         }
     }
 }
@@ -502,8 +524,8 @@ async fn service_manager(
                     // The slot is released by its own task (terminal status,
                     // the 90 s cap, or shutdown) while this manager continues
                     // with the address wait and the serving tasks.
-                    let slot_release =
-                        tokio::spawn(slot.hold_until_started(started_rx, token.clone()));
+                    let mut children = tokio::task::JoinSet::new();
+                    children.spawn(slot.hold_until_started(started_rx, token.clone()));
                     match wait_for_address(&service, &token, &nick).await {
                         AddressWait::Available(address) => {
                             tracker.set(
@@ -522,7 +544,7 @@ async fn service_manager(
                             // both exit on cancellation. The manager keeps this first
                             // clone alive; dropping the last clone would unpublish the
                             // service.
-                            let serving = tokio::spawn(serve::serve_service(
+                            children.spawn(serve::serve_service(
                                 service.clone(),
                                 rend_requests,
                                 ports,
@@ -530,7 +552,7 @@ async fn service_manager(
                                 global_streams.clone(),
                                 token.clone(),
                             ));
-                            let status = tokio::spawn(serve::log_status_events(
+                            children.spawn(serve::log_status_events(
                                 service.status_events(),
                                 nick.clone(),
                                 address.display_unredacted().to_string(),
@@ -539,9 +561,11 @@ async fn service_manager(
                                 token.clone(),
                             ));
                             token.cancelled().await;
-                            let _ = serving.await;
-                            let _ = status.await;
-                            let _ = slot_release.await; // completes on its own; joined for tidiness
+                            join_logged(
+                                &mut children,
+                                "onion service child task ended with a join error",
+                            )
+                            .await;
                             info!(nickname = %nick, "onion service stopped");
                             mark_stopped(&tracker, &nick);
                             return;
@@ -551,10 +575,14 @@ async fn service_manager(
                         // line; the status is still `Stopped`, because
                         // shutdown is the cause.
                         AddressWait::Cancelled => {
+                            // hold_until_started only waits and owns a StartSlot; aborting it drops the slot and releases its permit.
+                            children.shutdown().await;
                             mark_stopped(&tracker, &nick);
-                            return; // started_tx drops; the slot task unwinds on cancellation
+                            return;
                         }
                         AddressWait::TimedOut => {
+                            // hold_until_started only waits and owns a StartSlot; aborting it drops the slot and releases its permit.
+                            children.shutdown().await;
                             tracker.set(
                                 &nick,
                                 ServiceState {

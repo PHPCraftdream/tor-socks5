@@ -51,9 +51,11 @@ class External(unittest.TestCase):
                  "arti": ("arti-wrapper", "packages/arti-wrapper", "lib"),
                  "ffi": ("android-ffi", "packages/android-ffi", "lib"),
                  "runtime": ("tor-socks5-runtime", "apps/sdk/crates/runtime", "lib"),
-                 "server": ("tor-socks5-server", "apps/sdk/crates/server", "lib")}
+                 "server": ("tor-socks5-server", "apps/sdk/crates/server", "lib"),
+                 "onion": ("tor-socks5-onion", "apps/sdk/crates/onion", "lib"),
+                 "facade": ("tor-socks5", "apps/sdk", "lib")}
         edges = {"proxy": ["auth", "config", "bridge", "arti", "server"], "config": ["acl"], "ffi": ["config", "auth"],
-                 "auth": ["acl"], "acl": [], "bridge": [], "arti": [], "runtime": [], "server": ["runtime"]}
+                 "auth": ["acl"], "acl": [], "bridge": [], "arti": [], "runtime": [], "server": ["runtime", "onion"], "onion": [], "facade": ["server", "runtime", "onion"]}
         packages = [{"id": i, "name": name, "manifest_path": str(self.root / path / "Cargo.toml"),
                      "targets": [{"kind": [kind]}]} for i, (name, path, kind) in names.items()]
         nodes = [{"id": i, "deps": [{"pkg": d, "name": d, "dep_kinds": [{"kind": None, "target": None}]} for d in deps]} for i, deps in edges.items()]
@@ -159,9 +161,16 @@ class External(unittest.TestCase):
         self.planner("--event", "push", "--mode", "sprint-full", "--head", self.head(), ok=False)
         full = self.planner("--event", "workflow_dispatch", "--mode", "sprint-full", "--head", self.head())
         self.assertTrue(full["full"])
-        self.assertEqual(full["library_packages"], ["android-ffi", "arti-wrapper", "bridge-probe", "tor-socks5-auth", "tor-socks5-client-acl", "tor-socks5-config", "tor-socks5-runtime", "tor-socks5-server"])
+        self.assertEqual(full["library_packages"], ["android-ffi", "arti-wrapper", "bridge-probe", "tor-socks5", "tor-socks5-auth", "tor-socks5-client-acl", "tor-socks5-config", "tor-socks5-onion", "tor-socks5-runtime", "tor-socks5-server"])
         self.metadata.write_text('{}', encoding="utf-8")
         self.push(ok=False)
+
+    def test_sdk_server_example_routes_to_feature_matrix(self):
+        self.put("apps/sdk/examples/embedded_server.rs", "facade server example\\n")
+        self.commit("SDK server example")
+        result = self.push()
+        self.assertEqual(result["packages"], ["tor-socks5"])
+        self.assertIn("features", result["segments"])
 
     def test_license_policy_checkout_missing_file_fails_closed(self):
         previous = self.head()
@@ -180,7 +189,7 @@ class External(unittest.TestCase):
     def test_commit_footer_full_trigger(self):
         members = sorted(["socks5-proxy", "android-ffi", "tor-socks5-auth", "tor-socks5-config",
                           "tor-socks5-client-acl", "bridge-probe", "arti-wrapper", "tor-socks5-runtime",
-                          "tor-socks5-server"])
+                          "tor-socks5-server", "tor-socks5-onion", "tor-socks5"])
         self.put("packages/auth/src/lib.rs", "auth\n")
         self.commit("auth")
         early = self.head()
@@ -197,7 +206,7 @@ class External(unittest.TestCase):
         self.assertEqual(result["segments"], sorted(["fast", "rust", "msrv", "android", "tor", "vendor", "vendor-extra", "docs-contract", "installer-sh", "installer-windows", "release", "features", "stress", "regression", "native-portability", "vendor-notices", "required"]))
         self.assertEqual(result["command_packages"]["android"], ["android-ffi", "socks5-proxy"])
         self.assertEqual(result["shipping_packages"], ["android-ffi", "socks5-proxy"])
-        self.assertEqual(result["library_packages"], sorted(["android-ffi", "arti-wrapper", "bridge-probe", "tor-socks5-auth", "tor-socks5-client-acl", "tor-socks5-config", "tor-socks5-runtime", "tor-socks5-server"]))
+        self.assertEqual(result["library_packages"], sorted(["android-ffi", "arti-wrapper", "bridge-probe", "tor-socks5", "tor-socks5-auth", "tor-socks5-client-acl", "tor-socks5-config", "tor-socks5-onion", "tor-socks5-runtime", "tor-socks5-server"]))
         self.assertEqual(result["native_rows"], [
             {"runner": "macos-15", "target": "aarch64-apple-darwin", "musl": False},
             {"runner": "ubuntu-latest", "target": "aarch64-linux-android", "musl": False},

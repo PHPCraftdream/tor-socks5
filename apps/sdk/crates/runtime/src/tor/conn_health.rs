@@ -44,6 +44,7 @@
 //! CONNECT success and a relay layer that resets every connection is
 //! immediately visible.
 
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -272,48 +273,45 @@ impl ConnHealthCounters {
     }
 }
 
-/// Spawn the periodic connection-health summary task as a detached tokio
-/// task.
+/// Run the periodic connection-health summary into a caller-owned task group.
 ///
-/// Every `interval_secs` the task drains [`ConnHealthCounters`] (resetting
-/// them for the next window — see [`ConnHealthCounters::snapshot_and_reset`])
-/// and logs one structured `info!` line with the raw counts and, when
-/// computable, a `connect_rate_pct`. A window is skipped ONLY if it contains
-/// no events at all ([`ConnHealthSnapshot::is_empty`]) — an interval in which
-/// only OLD connections finished (relay completions or errors, no new
-/// accepts) is still logged.
-///
-/// Connect-rate semantics: the rate is over *completions* in the window
-/// (`connect_ok + connect_failed` is a self-consistent completion cohort). A
-/// connection started in window N and completing in window N+1 is counted as
-/// a completion in N+1; the gap `started - connect_ok - connect_failed` makes
-/// cross-window skew visible instead of corrupting one blended percentage.
-/// `cfg.enabled == false` or `interval_secs == 0` disables the task entirely.
-pub fn spawn_conn_health_logger(counters: ConnHealthCounters, cfg: ConnHealthConfig) {
-    if !cfg.enabled || cfg.interval_secs == 0 {
+/// The caller provides a cancellation token and owns the returned future's
+/// task lifetime. Production server code should retain the spawned task in its
+/// producer owner so cancellation and joining are coordinated with the other
+/// producers.
+pub fn run_conn_health_logger(
+    counters: ConnHealthCounters,
+    cfg: ConnHealthConfig,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> impl Future<Output = ()> + Send {
+    let interval_secs = cfg.interval_secs;
+    let enabled = cfg.enabled && interval_secs != 0;
+    if enabled {
+        info!(interval_secs, "conn-health summary armed");
+    } else {
         info!("conn-health summary disabled");
-        return;
     }
 
-    let interval = Duration::from_secs(cfg.interval_secs);
-    info!(
-        interval_secs = cfg.interval_secs,
-        "conn-health summary armed"
-    );
+    async move {
+        if !enabled {
+            return;
+        }
 
-    tokio::spawn(async move {
+        let interval = Duration::from_secs(interval_secs);
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticker.tick().await; // consume the immediate first tick
 
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => break,
+                _ = ticker.tick() => {}
+            }
 
             let snap = counters.snapshot_and_reset();
             if snap.is_empty() {
-                // No events at all this window — nothing meaningful to
-                // report. (A nonzero `pending` alone does not count as an
-                // event; see `is_empty`'s doc.)
+                // No events at all this window — nothing meaningful to report.
                 continue;
             }
 
@@ -332,7 +330,44 @@ pub fn spawn_conn_health_logger(counters: ConnHealthCounters, cfg: ConnHealthCon
                 "conn health"
             );
         }
-    });
+    }
+}
+
+/// Spawn the periodic connection-health summary task as a caller-owned Tokio task.
+///
+/// Every `interval_secs` the task drains [`ConnHealthCounters`] (resetting
+/// them for the next window — see [`ConnHealthCounters::snapshot_and_reset`])
+/// and logs one structured `info!` line with the raw counts and, when
+/// computable, a `connect_rate_pct`. A window is skipped ONLY if it contains
+/// no events at all ([`ConnHealthSnapshot::is_empty`]) — an interval in which
+/// only OLD connections finished (relay completions or errors, no new
+/// accepts) is still logged.
+///
+/// Connect-rate semantics: the rate is over *completions* in the window
+/// (`connect_ok + connect_failed` is a self-consistent completion cohort). A
+/// connection started in window N and completing in window N+1 is counted as
+/// a completion in N+1; the gap `started - connect_ok - connect_failed` makes
+/// cross-window skew visible instead of corrupting one blended percentage.
+/// `cfg.enabled == false` or `interval_secs == 0` disables the task entirely.
+///
+/// The returned handle owns the logger task and can be awaited or aborted. A
+/// disabled configuration logs synchronously and returns `None`, so callers
+/// do not need a Tokio runtime merely to configure logging.
+/// Production server code should use [`run_conn_health_logger`] directly and
+/// retain that task in its producer owner so cancellation and joining are
+/// coordinated with the other producers.
+pub fn spawn_conn_health_logger(
+    counters: ConnHealthCounters,
+    cfg: ConnHealthConfig,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let enabled = cfg.enabled && cfg.interval_secs != 0;
+    let logger = run_conn_health_logger(counters, cfg, tokio_util::sync::CancellationToken::new());
+    if enabled {
+        Some(tokio::spawn(logger))
+    } else {
+        drop(logger);
+        None
+    }
 }
 
 #[cfg(test)]
@@ -596,19 +631,21 @@ mod tests {
         // return immediately without spawning a task — nothing to await
         // here since the function is synchronous in that branch.
         let counters = ConnHealthCounters::default();
-        spawn_conn_health_logger(
+        assert!(spawn_conn_health_logger(
             counters.clone(),
             ConnHealthConfig {
                 enabled: false,
                 interval_secs: 60,
             },
-        );
-        spawn_conn_health_logger(
+        )
+        .is_none());
+        assert!(spawn_conn_health_logger(
             counters,
             ConnHealthConfig {
                 enabled: true,
                 interval_secs: 0,
             },
-        );
+        )
+        .is_none());
     }
 }

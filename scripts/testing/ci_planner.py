@@ -649,6 +649,9 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
             add("android", path)
             native.add("aarch64-linux-android")
             add("native-portability", path)
+        elif path.startswith("apps/sdk/examples/"):
+            seed(graph.named({"tor-socks5"}), path)
+            add("features", path)
         elif path.startswith("packages/proxy-config/examples/") or path == "README.md" or path == "tor-socks5.example.ktav" or path == "docs/architecture.md" or path.startswith("docs/guide/"):
             add("docs-contract", path)
         elif path == "vendor/PROVENANCE.md":
@@ -722,7 +725,7 @@ def plan(graph, paths, blobs, mode="affected", capabilities=None, event="pull_re
     tor_upstream = graph.closure(tor_roots, graph.forward) if tor_roots else set()
     if seeds & tor_upstream:
         add("tor", "изменена зависимость контракта Tor")
-    # Фича-матрица фасада SDK зависит только от его манифеста и тестов.
+    # Фича-матрица фасада SDK, including server-only examples.
     if seeds & (graph.named({"tor-socks5"}) & graph.members):
         add("features", "изменён фасад SDK")
     if any(path.startswith(("apps/socks5-proxy/", "apps/sdk/crates/runtime/", "apps/sdk/crates/server/")) and any(part in {"tor", "arti", "bridge", "bridges"} or part.startswith(("tor_", "arti_", "bridge_", "bridges_")) for part in path.split("/")) for path in paths):

@@ -44,11 +44,12 @@ route-pool = { path = "../../../../packages/proxy-config/route-pool", version = 
 socks5-proto = { path = "../../../../packages/socks5-proto", version = "0.2.0", package = "tor-socks5-proto" }
 time.workspace = true
 tokio.workspace = true
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
 tor-socks5-onion = { path = "../onion", version = "0.2.0", optional = true, features = ["host"] }
 tor-socks5-runtime = { path = "../runtime", version = "0.2.0" }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 ktav.workspace = true

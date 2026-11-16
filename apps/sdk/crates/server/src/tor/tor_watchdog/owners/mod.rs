@@ -57,6 +57,9 @@ struct EntryState {
 struct State {
     closed: bool,
     entries: Vec<Arc<Entry>>,
+    /// Revive retries are owned here until close joins them. At most one
+    /// unfinished retry is retained per owner endpoint.
+    revivals: Vec<(Socks5PreEndpoint, Option<JoinHandle<()>>)>,
 }
 
 #[cfg(test)]
@@ -112,6 +115,7 @@ impl OwnerRegistry {
             state: Mutex::new(State {
                 closed: false,
                 entries: Vec::new(),
+                revivals: Vec::new(),
             }),
             cancel: CancellationToken::new(),
             close_failed: std::sync::atomic::AtomicBool::new(false),
@@ -200,14 +204,51 @@ impl OwnerRegistry {
         }))
     }
 
-    /// Retries, in the background, a client that failed to finish starting.
-    /// Does nothing for the main client or a client in any other state.
-    pub(super) fn revive(self: &Arc<Self>, pre: Socks5PreEndpoint) {
+    pub(crate) async fn revive(self: &Arc<Self>, pre: Socks5PreEndpoint) {
+        let mut state = self.state.lock().await;
+        if state.closed || self.cancel.is_cancelled() {
+            return;
+        }
+        let mut index = 0;
+        while index < state.revivals.len() {
+            if state.revivals[index]
+                .1
+                .as_ref()
+                .is_some_and(JoinHandle::is_finished)
+            {
+                let (_, task) = state.revivals.swap_remove(index);
+                if task
+                    .expect("finished retry handle remains stored")
+                    .await
+                    .is_err()
+                {
+                    self.close_failed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            } else {
+                index += 1;
+            }
+        }
+        if state.revivals.iter().any(|(endpoint, task)| {
+            endpoint == &pre && task.as_ref().is_some_and(|task| !task.is_finished())
+        }) {
+            return;
+        }
+        let Some(entry) = state
+            .entries
+            .iter()
+            .find(|entry| entry.pre.as_ref() == Some(&pre))
+            .cloned()
+        else {
+            return;
+        };
         let registry = Arc::clone(self);
-        tokio::spawn(async move { registry.revive_inner(pre).await });
+        let task = tokio::spawn(async move { registry.revive_entry_inner(entry).await });
+        state.revivals.push((pre, Some(task)));
     }
 
     /// cancel-safe: YES — the entry keeps its tunnel; a cancelled retry leaves it failed.
+    #[cfg(test)]
     async fn revive_inner(&self, pre: Socks5PreEndpoint) {
         let entry = {
             let state = self.state.lock().await;
@@ -217,7 +258,12 @@ impl OwnerRegistry {
                 .find(|entry| entry.pre.as_ref() == Some(&pre))
                 .cloned()
         };
-        let Some(entry) = entry else { return };
+        if let Some(entry) = entry {
+            self.revive_entry_inner(entry).await;
+        }
+    }
+
+    async fn revive_entry_inner(&self, entry: Arc<Entry>) {
         let mut state = entry.state.lock().await;
         if !state.failed || state.constructing.is_some() {
             return;
@@ -449,6 +495,19 @@ impl OwnerRegistry {
         let entries = {
             let mut state = self.state.lock().await;
             state.closed = true;
+            // Keep handles in the registry while awaiting them: cancellation
+            // of close leaves them available for a later close attempt.
+            for (_, task) in &mut state.revivals {
+                if let Some(handle) = task.as_mut() {
+                    let result = handle.await;
+                    *task = None;
+                    if result.is_err() {
+                        self.close_failed
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+            state.revivals.clear();
             state.entries.clone()
         };
         use futures::stream::{FuturesUnordered, StreamExt};
@@ -578,4 +637,5 @@ impl OwnerRegistry {
 #[cfg(test)]
 pub(crate) mod handler_tests;
 #[cfg(test)]
+#[path = "tests/mod.rs"]
 mod tests;
