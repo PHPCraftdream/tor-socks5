@@ -132,7 +132,7 @@ impl BridgeManagerHandle {
     #[doc(hidden)]
     pub fn into_tasks(mut self) -> Vec<JoinHandle<()>> {
         self.tasks_transferred = true;
-        self.handles.drain(..).collect()
+        std::mem::take(&mut self.handles)
     }
 }
 
