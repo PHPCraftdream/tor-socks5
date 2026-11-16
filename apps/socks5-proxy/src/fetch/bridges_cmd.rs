@@ -12,8 +12,8 @@ use tokio_util::sync::CancellationToken;
 use crate::cli::BridgesAction;
 use crate::config::{Config, Loaded};
 use crate::process::{init_tracing, install_crypto_provider};
-use crate::route::reject_unsupported_pool;
 use tor_socks5_runtime::bridge_manager::{fetch_bridges, FetchBridgesParams};
+use tor_socks5_server::route::reject_unsupported_pool;
 
 #[cfg(test)]
 use tor_socks5_runtime::tor_setup::build_tor_settings;

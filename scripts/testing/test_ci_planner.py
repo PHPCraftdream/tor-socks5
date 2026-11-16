@@ -23,6 +23,8 @@ def graph():
         "bridge": ("bridge-probe", "packages/bridge-probe"),
         "facade": ("tor-socks5", "apps/sdk"),
         "ffi": ("android-ffi", "packages/android-ffi"),
+        "runtime": ("tor-socks5-runtime", "apps/sdk/crates/runtime"),
+        "server": ("tor-socks5-server", "apps/sdk/crates/server"),
         "sdk": ("resocks5-net", "external/sdk"),
         "vendor": ("tor-dirclient", "vendor/tor-dirclient"),
         "middle": ("middle", "external/middle"),
@@ -33,9 +35,9 @@ def graph():
                  **({"source": "registry+https://github.com/rust-lang/crates.io-index"} if i == "sdk" else {}),
                  "manifest_path": str(root / path / "Cargo.toml"), "targets": [{"kind": ["lib"]}]}
                 for i, (name, path) in names.items()]
-    edges = {"proxy": ["auth", "config", "bridge", "arti", "sdk", "native"], "ffi": ["config", "auth"], "bridge": ["middle"], "arti": [], "middle": ["vendor"], "acl": [], "auth": ["acl"], "config": ["acl"], "sdk": [], "vendor": [], "native": [], "facade": []}
+    edges = {"proxy": ["auth", "config", "bridge", "arti", "sdk", "native", "server"], "ffi": ["config", "auth"], "bridge": ["middle"], "arti": [], "middle": ["vendor"], "acl": [], "auth": ["acl"], "config": ["acl"], "sdk": [], "vendor": [], "native": [], "facade": [], "runtime": [], "server": ["runtime"]}
     nodes = [{"id": i, "deps": [{"pkg": d, "name": "alias_" + d, "dep_kinds": [{"kind": "build" if d == "middle" else "dev" if d == "auth" else None, "target": "cfg(unix)" if d == "vendor" else None}]} for d in deps]} for i, deps in edges.items()]
-    return p.Graph({"packages": packages, "workspace_members": ["proxy", "auth", "config", "acl", "bridge", "arti", "ffi", "facade"], "resolve": {"nodes": nodes}}, root)
+    return p.Graph({"packages": packages, "workspace_members": ["proxy", "auth", "config", "acl", "bridge", "arti", "ffi", "facade", "runtime", "server"], "resolve": {"nodes": nodes}}, root)
 
 
 def lock_graph(extra_packages=(), lyrebird_versions=("0.8.0",), extra_members=()):
@@ -469,6 +471,10 @@ class Routing(unittest.TestCase):
         self.assertIn("tor", self.route("apps/sdk/crates/runtime/src/bridges/bridge_verifier.rs")["segments"])
         self.assertNotIn("tor", self.route("apps/sdk/crates/runtime/src/fetch/seed.rs")["segments"])
         self.assertNotIn("tor", self.route("apps/sdk/crates/runtime/src/lib.rs")["segments"])
+        self.assertIn("tor", self.route("apps/sdk/crates/server/src/tor/channel.rs")["segments"])
+        self.assertIn("tor", self.route("apps/sdk/crates/server/src/bridges/bridge_verifier.rs")["segments"])
+        self.assertNotIn("tor", self.route("apps/sdk/crates/server/src/commands/auth.rs")["segments"])
+        self.assertNotIn("tor", self.route("apps/sdk/crates/server/src/lib.rs")["segments"])
         self.assertIn("license-offline", self.route(".github/release/license/check.py")["segments"])
         self.assertEqual(self.route("LICENSE-MIT")["segments"], ["fast"])
         self.assertEqual(self.route("Cargo.toml", blobs={"Cargo.toml": ("[workspace]\nresolver='2'", "[workspace]\nresolver='2'")})["segments"],

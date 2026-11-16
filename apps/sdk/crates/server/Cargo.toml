@@ -1,0 +1,60 @@
+[package]
+name = "tor-socks5-server"
+# Not published: the release artifact is the single `tor-socks5` package;
+# workspace crates are its internal modules (docs/project/sdk-package-design.md).
+publish = false
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+description = "Server module tree of the socks5-proxy binary (listen, egress, DNS wiring, Tor-owner watchdogs, bridge producers), moved verbatim from the binary (SDK-10)."
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["onion-service"]
+# Hosting of configured onion services (the `spawn_services` shell over
+# `tor-socks5-onion`'s host). A build without it only warns at startup when
+# enabled services are configured — same as the binary before the move.
+onion-service = ["dep:tor-socks5-onion"]
+# Test seams for tests in other crates (R10). Enabled only via consumers'
+# dev-dependencies; never in default/full builds.
+test-seams = []
+
+[dependencies]
+anyhow.workspace = true
+arti-wrapper = { path = "../../../../packages/arti-wrapper", version = "0.2.0" }
+auth = { path = "../../../../packages/auth", version = "0.2.0", package = "tor-socks5-auth" }
+bridge-line.workspace = true
+bridge-store = { path = "../../../../packages/bridge-store", version = "0.2.0" }
+dns-server = { path = "../../../../packages/dns-server", version = "0.2.0", package = "tor-socks5-dns" }
+futures.workspace = true
+persist-lock = { path = "../../../../packages/persist-lock", version = "0.2.0" }
+proxy-config = { path = "../../../../packages/proxy-config", version = "0.2.0", package = "tor-socks5-config" }
+resocks5-net.workspace = true
+route-pool = { path = "../../../../packages/proxy-config/route-pool", version = "0.2.0", package = "tor-socks5-route-pool" }
+socks5-proto = { path = "../../../../packages/socks5-proto", version = "0.2.0", package = "tor-socks5-proto" }
+time.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tor-socks5-onion = { path = "../onion", version = "0.2.0", optional = true, features = ["host"] }
+tor-socks5-runtime = { path = "../runtime", version = "0.2.0" }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+ktav.workspace = true
+rustls.workspace = true
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+# The moved tests drive the runtime's test seams (ParkedGate, TestWorkers,
+# FORBID_PRODUCER, ...); R10: the feature is enabled only here.
+tor-socks5-runtime = { path = "../runtime", version = "0.2.0", features = ["test-seams"] }

@@ -10,7 +10,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 use super::children::bind_child_processes_to_self;
 use super::logging::{init_tracing, install_crypto_provider};
 use crate::config::{Config, Loaded};
-use crate::server::{run_server, ServerArgs};
+use tor_socks5_server::{run_server, ServerArgs};
 
 /// Process-wide state that must outlive the server run.
 pub(crate) struct ServerProcess {

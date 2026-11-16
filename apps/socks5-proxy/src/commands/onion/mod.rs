@@ -5,7 +5,11 @@
 
 #[cfg(feature = "onion-service")]
 pub(crate) mod commands;
+// The hosting shell moved into the server crate (SDK-10); the CLI onion
+// commands do not call it. The file stays (fail-closed on deletions) until
+// the API step decides its fate.
 #[cfg(feature = "onion-service")]
+#[allow(dead_code)]
 pub(crate) mod service;
 #[cfg(feature = "onion-service")]
 pub(crate) mod store;

@@ -21,6 +21,7 @@ onion-service = [
     "arti-wrapper/onion-service",
     "dep:tor-hsservice",
     "dep:tor-socks5-onion",
+    "tor-socks5-server/onion-service",
 ]
 
 [dependencies]
@@ -35,6 +36,7 @@ dns-server = { path = "../../packages/dns-server", version = "0.2.0", package = 
 persist-lock = { path = "../../packages/persist-lock", version = "0.2.0" }
 tor-socks5-onion = { path = "../../apps/sdk/crates/onion", version = "0.2.0", optional = true, features = ["keys", "host"] }
 tor-socks5-runtime = { path = "../../apps/sdk/crates/runtime", version = "0.2.0" }
+tor-socks5-server = { path = "../../apps/sdk/crates/server", version = "0.2.0", default-features = false }
 rusqlite = { workspace = true }
 proxy-config = { path = "../../packages/proxy-config", version = "0.2.0", package = "tor-socks5-config" }
 socks5-proto = { path = "../../packages/socks5-proto", version = "0.2.0", package = "tor-socks5-proto" }
