@@ -26,4 +26,5 @@ ignore = [
     { id = "RUSTSEC-2023-0071", reason = "Marvin timing attack on RSA private-key operations; no fixed 0.9 release exists. rsa comes from tor-llcrypto and ssh-key, and a Tor client only verifies RSA signatures; the private-key paths serve relay roles this proxy does not run." },
     { id = "RUSTSEC-2025-0069", reason = "daemonize is unmaintained but sound for its one job, the double-fork in the angel command on Unix. Replace it if a maintained equivalent appears." },
     { id = "RUSTSEC-2024-0436", reason = "paste is an unmaintained proc-macro that only runs at compile time; it is pulled in by arti crates, not by this project." },
+    { id = "RUSTSEC-2026-0542", reason = "humantime is unmaintained, with no known vulnerability and no safe upgrade; it is pulled in by the vendored arti-client for duration parsing, not used by this project directly. Drop this entry once arti moves to a maintained crate." },
 ]
