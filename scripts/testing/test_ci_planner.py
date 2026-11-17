@@ -476,7 +476,7 @@ class Routing(unittest.TestCase):
         self.assertEqual(feature_rows[0], None)
         self.assertEqual(set(feature_rows[1:]), {
             "acl", "socks5", "auth", "config", "bridges", "route", "tor", "fetch", "dns",
-            "onion", "onion-keys", "onion-host", "onion-service", "runtime", "server", "full",
+            "onion", "onion-keys", "onion-host", "onion-service", "runtime", "pt", "server", "full",
         })
         example_rows = [entry for entry in entries if entry["kind"] == "example"]
         self.assertEqual(example_rows, [

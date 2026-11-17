@@ -46,6 +46,10 @@ SANCTIONED_DEPENDENCY_REMOVALS = frozenset({
     ("apps/socks5-proxy/Cargo.toml", "dependencies", "futures"),
     ("apps/socks5-proxy/Cargo.toml", "dependencies", "ktav"),
     ("apps/socks5-proxy/Cargo.toml", "dependencies", "rusqlite"),
+    # H12: the PT busybox dispatcher moved to tor-socks5-runtime (feature pt).
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "lyrebird"),
+    # H12: rustls is now a normal dependency of tor-socks5-runtime (crypto provider helper).
+    ("apps/sdk/crates/runtime/Cargo.toml", "dev-dependencies", "rustls"),
     # SDK-5: onion-service hosting moved to tor-socks5-onion
     # (apps/sdk/crates/onion); the binary no longer links these directly.
     ("apps/socks5-proxy/Cargo.toml", "dependencies", "tor-hscrypto"),

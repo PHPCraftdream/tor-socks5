@@ -54,32 +54,11 @@ fn main() -> Result<()> {
     }
 
     // Busybox-style dispatch: when arti spawns us as a managed pluggable
-    // transport, it sets `TOR_PT_MANAGED_TRANSPORT_VER`. In that case we
-    // skip the SOCKS5-proxy startup entirely and run the lyrebird PT
-    // loop instead — same binary, two modes, no second executable on
-    // disk. This MUST run before clap parsing because arti passes weird
-    // argv to PT subprocesses that would blow up the parser. PT mode
-    // must NEVER angelise, so it is handled here, out of the clap path
-    // entirely, and returns directly.
-    if std::env::var_os("TOR_PT_MANAGED_TRANSPORT_VER").is_some() {
-        // arti (tor-ptmgr) sets TOR_PT_EXIT_ON_STDIN_CLOSE=1 on managed PT
-        // children and, per the pluggable-transport spec, signals shutdown by
-        // closing the child's stdin. `ptrs-gesher-lyrebird` 0.6.0+ honours
-        // this itself (fixed upstream: the process now watches stdin and
-        // exits cleanly on EOF when the env var is set) — no workaround
-        // needed here.
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            // See the matching comment on the proxy-mode runtime below: a
-            // bursty client (e.g. Telegram opening dozens of simultaneous
-            // connections) drives just as many concurrent obfs4/webtunnel
-            // handshake attempts here, in the PT child. A small pool risks
-            // the same worker-starvation pattern that once stalled the
-            // bridge-descriptor fetch task.
-            .worker_threads(32)
-            .enable_all()
-            .build()
-            .context("building Tokio runtime for pluggable-transport mode")?;
-        return rt.block_on(lyrebird::run());
+    // transport (TOR_PT_MANAGED_TRANSPORT_VER), run the in-process lyrebird
+    // PT loop instead of the proxy. Must run before clap parsing (arti passes
+    // argv that would blow up the parser) and must never angelise.
+    if let Some(result) = tor_socks5_runtime::pt::run_if_managed_transport() {
+        return result;
     }
 
     let cli = Cli::parse();

@@ -174,6 +174,33 @@ host_handle.shutdown().await;
 This feature links Arti — the patch-kit applies (see
 [Using the Tor features](#using-the-tor-features)).
 
+## Host process initialisation
+
+An embedding host sets up the process itself before any Tor client bootstraps;
+the SDK never installs process-wide state on its own (R1).
+
+- `tor_socks5::install_crypto_provider()` (feature `runtime`): installs the
+  process-wide rustls crypto provider. rustls 0.23 requires an explicit
+  provider — call this exactly once, before bootstrapping; a fresh state dir
+  fails its TLS setup without it.
+- `tor_socks5::runtime::bind_child_processes_to_self()`: on Windows, puts the
+  process in a `KILL_ON_JOB_CLOSE` Job Object so spawned children (the
+  lyrebird PT) die with the host even on hard termination; a documented no-op
+  elsewhere.
+- `tor_socks5::runtime::log_layer(&LogConfig)`: builds the tracing fmt layer
+  from a `tor_socks5::config::LogConfig` and returns it together with the
+  non-blocking writer's guard — without installing a global subscriber. Keep
+  the guard alive for the lifetime of the program.
+
+```rust
+let (layer, _guard) = tor_socks5::runtime::log_layer(&log_config);
+tracing_subscriber::registry().with(layer).init();
+```
+
+With the `pt` feature, `tor_socks5::pt::run_if_managed_transport()` runs the
+in-process lyrebird PT loop when arti spawns this process as a managed
+transport.
+
 ## Tor client (runtime feature)
 
 `runtime` exposes selected Tor-client functions and types as flat exports from

@@ -20,6 +20,8 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
+# Busybox PT dispatch for an embedding host.
+pt = ["dep:lyrebird"]
 # Test seams for tests in other crates (R10). Enabled only via consumers'
 # dev-dependencies; never in default/full builds.
 test-seams = []
@@ -35,21 +37,24 @@ bridge-store = { path = "../../../../packages/bridge-store", version = "0.2.0" }
 bridge-verify-core = { path = "../../../../packages/bridge-verify-core", version = "0.2.0" }
 futures.workspace = true
 getrandom.workspace = true
+lyrebird = { workspace = true, optional = true }
 persist-lock = { path = "../../../../packages/persist-lock", version = "0.2.0" }
 proxy-config = { path = "../../../../packages/proxy-config", version = "0.2.0", package = "tor-socks5-config" }
 route-pool = { path = "../../../../packages/proxy-config/route-pool", version = "0.2.0", package = "tor-socks5-route-pool" }
+rustls.workspace = true
 serde_json = "1"
+tracing-core.workspace = true
 tempfile = "3"
 time.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tor-error.workspace = true
 tracing.workspace = true
+tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
 ktav.workspace = true
-rustls.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(windows)'.dependencies]
@@ -57,4 +62,5 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Threading",
+    "Win32_System_JobObjects",
 ] }

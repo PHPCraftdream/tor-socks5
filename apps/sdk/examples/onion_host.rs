@@ -5,9 +5,21 @@ use tor_socks5::config::Config;
 use tor_socks5::onion::host::{OnionHost, OnionHostConfig};
 use tor_socks5::runtime::{build_tor_settings_with_pt, PtBinary, TorHandle};
 use tor_socks5::tor::TorTunnel;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    // Host-process initialisation (R1): the host installs the crypto provider
+    // and sets up its own log subscriber; the SDK never does this on its own.
+    tor_socks5::install_crypto_provider();
+    let log = tor_socks5::config::LogConfig {
+        default: "info".to_owned(),
+        targets: Default::default(),
+        ..Default::default()
+    };
+    let (log_layer, _guard) = tor_socks5::runtime::log_layer(&log);
+    tracing_subscriber::registry().with(log_layer).init();
     let mut args = std::env::args_os().skip(1);
     let config_path = PathBuf::from(
         args.next()

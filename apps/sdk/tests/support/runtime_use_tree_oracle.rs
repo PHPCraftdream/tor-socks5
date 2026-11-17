@@ -27,6 +27,8 @@ const ALLOWED_RUNTIME_ITEMS: &[&str] = &[
     "conn_health::ConnHealthSnapshot",
     "conn_health::ConnStage",
     "conn_health::PendingConnectionGuard",
+    "host::bind_child_processes_to_self",
+    "host::logging::log_layer",
     "pt::PtBinary",
     "tor_setup::arti_base_dir",
     "tor_setup::arti_keystore_dir",
