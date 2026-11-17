@@ -876,14 +876,12 @@ mod tests {
         registry
             .scope(async {
                 for _ in 0..72 {
-                    assert!(
-                        crate::bridge_maintenance::load_config_off_worker(Some(&path))
-                            .await
-                            .is_err()
-                    );
+                    assert!(crate::bridge_maintenance::load_config_off_worker(&path)
+                        .await
+                        .is_err());
                 }
                 crate::config::Config::default().write(&path).unwrap();
-                crate::bridge_maintenance::load_config_off_worker(Some(&path))
+                crate::bridge_maintenance::load_config_off_worker(&path)
                     .await
                     .unwrap();
             })

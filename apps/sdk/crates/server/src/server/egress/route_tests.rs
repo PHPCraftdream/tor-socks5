@@ -321,7 +321,7 @@ fn restricted_owner_template_and_alternate_validation() {
     let settings = tor_socks5_runtime::tor_setup::validate_owner_routes(
         &cfg,
         &users,
-        None,
+        std::path::Path::new("tor-socks5.ktav"),
         &tor_socks5_runtime::pt::PtBinary::Environment,
     )
     .unwrap()
@@ -334,7 +334,7 @@ fn restricted_owner_template_and_alternate_validation() {
     assert!(tor_socks5_runtime::tor_setup::validate_owner_routes(
         &cfg,
         &users,
-        None,
+        std::path::Path::new("tor-socks5.ktav"),
         &tor_socks5_runtime::pt::PtBinary::Environment,
     )
     .is_err());
@@ -342,7 +342,7 @@ fn restricted_owner_template_and_alternate_validation() {
     cfg.bridges.auto_fetch = true;
     assert!(tor_socks5_runtime::tor_setup::restricted_owner_settings(
         &cfg,
-        None,
+        std::path::Path::new("tor-socks5.ktav"),
         &tor_socks5_runtime::pt::PtBinary::Environment,
     )
     .is_err());
@@ -350,7 +350,7 @@ fn restricted_owner_template_and_alternate_validation() {
     cfg.warm_pool.enabled = true;
     assert!(tor_socks5_runtime::tor_setup::restricted_owner_settings(
         &cfg,
-        None,
+        std::path::Path::new("tor-socks5.ktav"),
         &tor_socks5_runtime::pt::PtBinary::Environment,
     )
     .is_err());
@@ -358,7 +358,7 @@ fn restricted_owner_template_and_alternate_validation() {
     cfg.dns_server.enabled = true;
     assert!(tor_socks5_runtime::tor_setup::restricted_owner_settings(
         &cfg,
-        None,
+        std::path::Path::new("tor-socks5.ktav"),
         &tor_socks5_runtime::pt::PtBinary::Environment,
     )
     .is_err());
@@ -366,7 +366,7 @@ fn restricted_owner_template_and_alternate_validation() {
     cfg.upstream.enabled = true;
     assert!(tor_socks5_runtime::tor_setup::restricted_owner_settings(
         &cfg,
-        None,
+        std::path::Path::new("tor-socks5.ktav"),
         &tor_socks5_runtime::pt::PtBinary::Environment,
     )
     .is_ok());
@@ -378,14 +378,14 @@ fn restricted_owner_template_and_alternate_validation() {
     );
     assert!(tor_socks5_runtime::tor_setup::restricted_owner_settings(
         &cfg,
-        None,
+        std::path::Path::new("tor-socks5.ktav"),
         &tor_socks5_runtime::pt::PtBinary::Environment,
     )
     .is_err());
     cfg.bridges.lines.clear();
     assert!(tor_socks5_runtime::tor_setup::restricted_owner_settings(
         &cfg,
-        None,
+        std::path::Path::new("tor-socks5.ktav"),
         &tor_socks5_runtime::pt::PtBinary::Environment,
     )
     .is_err());
@@ -396,7 +396,7 @@ fn restricted_owner_template_and_alternate_validation() {
     assert!(tor_socks5_runtime::tor_setup::validate_owner_routes(
         &cfg,
         &direct,
-        None,
+        std::path::Path::new("tor-socks5.ktav"),
         &tor_socks5_runtime::pt::PtBinary::Environment,
     )
     .unwrap()
@@ -420,7 +420,7 @@ fn account_pre_stock_pt_template_uses_current_executable() {
     let settings = tor_socks5_runtime::tor_setup::validate_owner_routes(
         &cfg,
         &users,
-        None,
+        std::path::Path::new("tor-socks5.ktav"),
         &tor_socks5_runtime::pt::PtBinary::Environment,
     )
     .unwrap()

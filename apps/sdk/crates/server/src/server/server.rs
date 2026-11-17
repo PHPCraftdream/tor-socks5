@@ -131,10 +131,7 @@ async fn run_server_body(
     let cfg = args.config;
     let config_path = args.config_path;
     let obs_sink = args.obs_sink;
-    let source = match &config_path {
-        Some(p) => format!("file: {}", p.display()),
-        None => "built-in defaults".to_string(),
-    };
+    let source = format!("file: {}", config_path.display());
     let pre_socks = cfg.pre_proxies.clone().map(Arc::new);
     validate_pre_compatibility(
         pre_socks.is_some(),
@@ -146,26 +143,28 @@ async fn run_server_body(
     validate_post_compatibility(post_socks.is_some(), cfg.dns_server.enabled, false)?;
 
     info!(%source, "loaded configuration");
-    if let Some(path) = &config_path {
-        crate::startup::ensure_bridges_file(&cfg, path).await;
-    }
+    crate::startup::ensure_bridges_file(&cfg, &config_path).await;
 
-    // Load the users registry (sits next to the main config). The file
-    // is optional — when absent or empty, the SOCKS5 listener falls
+    // Load the users registry (sits next to the main config). A missing file
+    // is warned about once; when absent or empty, the SOCKS5 listener falls
     // back to the legacy NO_AUTH path.
-    let users_path = UsersConfig::resolve_path(config_path.as_deref());
+    let users_path = UsersConfig::resolve_path(&config_path);
+    if !users_path.exists() {
+        tracing::warn!(
+            path = %users_path.display(),
+            "no users file — SOCKS5 will accept anonymous clients"
+        );
+    }
     let users = UsersConfig::load(&users_path).context("loading users registry")?;
+    let config_ref = &config_path;
     tor_socks5_runtime::tor_setup::validate_owner_routes(
         &cfg,
         &users,
-        config_path.as_deref(),
+        config_ref,
         &args.pt_binary,
     )?;
-    let owner_template = tor_socks5_runtime::tor_setup::restricted_owner_settings(
-        &cfg,
-        config_path.as_deref(),
-        &args.pt_binary,
-    );
+    let owner_template =
+        tor_socks5_runtime::tor_setup::restricted_owner_settings(&cfg, config_ref, &args.pt_binary);
     validate_account_routes(
         &users,
         cfg.pre_proxies.as_ref(),
@@ -174,7 +173,14 @@ async fn run_server_body(
         false,
     )?;
     let auth_state = if users.users.is_empty() {
-        info!(path = %users_path.display(), "no users configured — SOCKS5 will accept anonymous clients");
+        // A missing file was already warned about above; keep the info line
+        // for an existing-but-empty registry.
+        if users_path.exists() {
+            info!(
+                path = %users_path.display(),
+                "no users configured — SOCKS5 will accept anonymous clients"
+            );
+        }
         None
     } else {
         let state = AuthState::build_persistent(&users, users_path.clone())
@@ -285,10 +291,7 @@ async fn run_server_body(
             if settings.bridges.is_empty() {
                 bail!(
                     "no bridges configured in {} — add at least one `lines: [ obfs4 ... ]` entry",
-                    config_path
-                        .as_deref()
-                        .map(|p| Config::bridges_path(p).display().to_string())
-                        .unwrap_or_else(|| "<defaults>".to_string())
+                    Config::bridges_path(&config_path).display()
                 );
             }
             let alive = settings.bridges.len();
@@ -298,7 +301,7 @@ async fn run_server_body(
             // Mark before init so even a panic after installing the process slot
             // routes through this run's cleanup without closing unrelated writers.
             writer_started.store(true, std::sync::atomic::Ordering::Release);
-            global_init::init_store_writer(config_path.as_deref());
+            global_init::init_store_writer(&config_path);
 
             let init = global_init::GlobalInit::start(settings.clone())?;
             let _init_guard = global_init::InitGuard(init.clone());
@@ -361,7 +364,7 @@ async fn run_server_body(
                 crate::onion::service::spawn_services(
                     handle.clone(),
                     &cfg.onion_services,
-                    config_path.as_deref(),
+                    &config_path,
                     producer_token.clone(),
                     &mut launch.handles,
                 );
@@ -438,7 +441,7 @@ async fn run_server_body(
         let pool =
             dns_server::providers::provider_pool(&custom, cfg.dns_server.disable_builtin_providers);
         let overrides = convert_dns_overrides(&cfg.dns_server.overrides);
-        let cache_path = dns_cache_path(config_path.as_deref());
+        let cache_path = dns_cache_path(&config_path);
         let cache = Arc::new(dns_server::cache::DnsCache::load(&cache_path).await);
         info!(
             listen = ?cfg.dns_server.listen,

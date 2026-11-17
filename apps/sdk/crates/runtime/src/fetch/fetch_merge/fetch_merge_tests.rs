@@ -21,7 +21,7 @@ fn discovery_fixture() -> (tempfile::TempDir, std::path::PathBuf, BridgeLine) {
     cfg.write(&path).unwrap();
     let wt: BridgeLine = "webtunnel [2001:db8::1]:443 0123456789ABCDEF0123456789ABCDEF01234567 url=https://example.com/bridge"
         .parse().unwrap();
-    let mut pool = CandidatePool::load(CandidatePool::resolve_path(Some(&path))).unwrap();
+    let mut pool = CandidatePool::load(CandidatePool::resolve_path(&path)).unwrap();
     let obfs = (1..=100).map(|i| {
         format!("obfs4 1.2.4.{i}:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA")
             .parse::<BridgeLine>()
@@ -45,7 +45,7 @@ fn promotion_fixture() -> (tempfile::TempDir, std::path::PathBuf, BridgeLine) {
     cfg.write(&path).unwrap();
     let wt: BridgeLine = "webtunnel [2001:db8::1]:443 0123456789ABCDEF0123456789ABCDEF01234567 url=https://example.com/bridge"
         .parse().unwrap();
-    let mut pool = CandidatePool::load(CandidatePool::resolve_path(Some(&path))).unwrap();
+    let mut pool = CandidatePool::load(CandidatePool::resolve_path(&path)).unwrap();
     assert_eq!(pool.merge([wt.clone()], &HashSet::new()), 1);
     pool.save().unwrap();
     (dir, path, wt)
@@ -86,31 +86,25 @@ fn working_set_with_stale_cert_does_not_exclude_fresh_cert() {
     );
     let dir = tempfile::tempdir().unwrap();
     let mut pool =
-        CandidatePool::load(CandidatePool::resolve_path(Some(&dir.path().join("c.log")))).unwrap();
+        CandidatePool::load(CandidatePool::resolve_path(&dir.path().join("c.log"))).unwrap();
     assert_eq!(pool.merge([fresh], &exclude), 1);
 }
 
 #[tokio::test]
 async fn discovery_promotes_webtunnel_and_records_channel_evidence() {
     let (_dir, path, wt) = discovery_fixture();
-    let added = drain_with(
-        Some(&path),
-        1,
-        Some(&check(true)),
-        &reachable_probe(),
-        &aw(),
-    )
-    .await
-    .unwrap();
+    let added = drain_with(&path, 1, Some(&check(true)), &reachable_probe(), &aw())
+        .await
+        .unwrap();
     assert_eq!(added, 1);
     let cfg = Config::load_with_override(Some(&path))
         .unwrap()
         .into_config();
     assert!(cfg.bridges.parsed().unwrap().bridges.contains(&wt));
-    let store = BridgeStore::load(BridgeStore::resolve_path(Some(&path))).unwrap();
+    let store = BridgeStore::load(BridgeStore::resolve_path(&path)).unwrap();
     assert_eq!(store.channel_ok_count(&wt), 1);
     assert_eq!(store.ok_count(&wt), 1);
-    let mut pool = CandidatePool::load(CandidatePool::resolve_path(Some(&path))).unwrap();
+    let mut pool = CandidatePool::load(CandidatePool::resolve_path(&path)).unwrap();
     assert_eq!(pool.len(), 100);
     assert!(pool
         .take(100)
@@ -126,7 +120,7 @@ async fn drain_caps_probes_at_max_drain_attempts_regardless_of_target() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("proxy.ktav");
     Config::default().write(&path).unwrap();
-    let mut pool = CandidatePool::load(CandidatePool::resolve_path(Some(&path))).unwrap();
+    let mut pool = CandidatePool::load(CandidatePool::resolve_path(&path)).unwrap();
     let obfs = (1..=20).map(|i| {
         format!("obfs4 1.2.5.{i}:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA")
             .parse::<BridgeLine>()
@@ -144,7 +138,7 @@ async fn drain_caps_probes_at_max_drain_attempts_regardless_of_target() {
             }
         })
     });
-    let added = drain_with(Some(&path), usize::MAX, None, &probe, &aw())
+    let added = drain_with(&path, usize::MAX, None, &probe, &aw())
         .await
         .unwrap();
     assert_eq!(
@@ -166,27 +160,21 @@ async fn resolver_failure_keeps_webtunnel_for_a_later_successful_attempt() {
         })
     });
     assert_eq!(
-        drain_with(Some(&path), 1, Some(&check(true)), &unavailable, &aw())
+        drain_with(&path, 1, Some(&check(true)), &unavailable, &aw())
             .await
             .unwrap(),
         0
     );
     assert_eq!(
-        CandidatePool::load(CandidatePool::resolve_path(Some(&path)))
+        CandidatePool::load(CandidatePool::resolve_path(&path))
             .unwrap()
             .len(),
         101
     );
     assert_eq!(
-        drain_with(
-            Some(&path),
-            1,
-            Some(&check(true)),
-            &reachable_probe(),
-            &aw()
-        )
-        .await
-        .unwrap(),
+        drain_with(&path, 1, Some(&check(true)), &reachable_probe(), &aw())
+            .await
+            .unwrap(),
         1
     );
     let cfg = Config::load_with_override(Some(&path))
@@ -199,27 +187,15 @@ async fn resolver_failure_keeps_webtunnel_for_a_later_successful_attempt() {
 async fn transient_channel_failure_does_not_discard_a_candidate() {
     let (_dir, path, _) = discovery_fixture();
     assert_eq!(
-        drain_with(
-            Some(&path),
-            1,
-            Some(&check(false)),
-            &reachable_probe(),
-            &aw()
-        )
-        .await
-        .unwrap(),
+        drain_with(&path, 1, Some(&check(false)), &reachable_probe(), &aw())
+            .await
+            .unwrap(),
         0
     );
     assert_eq!(
-        drain_with(
-            Some(&path),
-            1,
-            Some(&check(true)),
-            &reachable_probe(),
-            &aw()
-        )
-        .await
-        .unwrap(),
+        drain_with(&path, 1, Some(&check(true)), &reachable_probe(), &aw())
+            .await
+            .unwrap(),
         1
     );
 }
@@ -325,7 +301,7 @@ async fn drain_joins_an_outlived_verification_worker_before_returning() {
         "webtunnel [2001:db8::1]:443 0123456789ABCDEF0123456789ABCDEF01234567 url=https://example.com/bridge"
             .parse()
             .unwrap();
-    let pool_path = CandidatePool::resolve_path(Some(&path));
+    let pool_path = CandidatePool::resolve_path(&path);
     let mut pool = CandidatePool::load(pool_path.clone()).unwrap();
     assert_eq!(pool.merge([candidate], &HashSet::new()), 1);
     pool.save().unwrap();
@@ -333,7 +309,7 @@ async fn drain_joins_an_outlived_verification_worker_before_returning() {
     // The worker parks here while it "holds VERIFY_LOCK"; the site and
     // path are the ones the real verifier uses.
     let worker_site = crate::test_seams::Site::AdmissionVerifyPostLock;
-    let live_cache = crate::tor_setup::arti_base_dir(Some(&path)).join("cache");
+    let live_cache = crate::tor_setup::arti_base_dir(&path).join("cache");
     let gate = crate::test_seams::ParkedGate::arm(worker_site, &live_cache);
     assert_eq!(
         crate::test_seams::worker_done_count(worker_site, &live_cache),
@@ -373,7 +349,7 @@ async fn drain_joins_an_outlived_verification_worker_before_returning() {
     // free to advance its paused clock.
     let drain = async move {
         let probe = reachable_probe();
-        drain_with(Some(&drain_path), 1, Some(&checker), &probe, &drain_workers).await
+        drain_with(&drain_path, 1, Some(&checker), &probe, &drain_workers).await
     };
     tokio::pin!(drain);
 
@@ -433,7 +409,7 @@ async fn admission_timeout_returns_candidate_and_releases_pool_lock() {
         "webtunnel [2001:db8::1]:443 0123456789ABCDEF0123456789ABCDEF01234567 url=https://example.com/bridge"
             .parse()
             .unwrap();
-    let pool_path = CandidatePool::resolve_path(Some(&path));
+    let pool_path = CandidatePool::resolve_path(&path);
     let mut pool = CandidatePool::load(pool_path.clone()).unwrap();
     assert_eq!(pool.merge([candidate.clone()], &HashSet::new()), 1);
     pool.save().unwrap();
@@ -455,9 +431,8 @@ async fn admission_timeout_returns_candidate_and_releases_pool_lock() {
         })
     });
     let task_path = path.clone();
-    let task = tokio::spawn(async move {
-        drain_with(Some(&task_path), 1, Some(&checker), &probe, &aw()).await
-    });
+    let task =
+        tokio::spawn(async move { drain_with(&task_path, 1, Some(&checker), &probe, &aw()).await });
     started_rx.await.unwrap();
     tokio::time::advance(DRAIN_BUDGET).await;
     assert_eq!(task.await.unwrap().unwrap(), 0);
@@ -474,7 +449,7 @@ async fn admission_timeout_returns_candidate_and_releases_pool_lock() {
     .unwrap()
     .unwrap();
     assert_eq!(added, 0);
-    let restored = CandidatePool::load(CandidatePool::resolve_path(Some(&path)))
+    let restored = CandidatePool::load(CandidatePool::resolve_path(&path))
         .unwrap()
         .take(1);
     assert_eq!(restored, vec![candidate]);
@@ -510,7 +485,7 @@ async fn drain_waits_for_a_concurrent_pool_transaction_and_both_effects_survive(
             .parse()
             .unwrap();
 
-    let pool_path = CandidatePool::resolve_path(Some(&path));
+    let pool_path = CandidatePool::resolve_path(&path);
     let mut seed = CandidatePool::load(pool_path.clone()).unwrap();
     assert_eq!(
         seed.merge(vec![other.clone(), wt.clone()], &HashSet::new()),
@@ -526,7 +501,7 @@ async fn drain_waits_for_a_concurrent_pool_transaction_and_both_effects_survive(
     let drain_task = tokio::spawn(async move {
         let checker = check(true);
         let probe = reachable_probe();
-        let out = drain_with(Some(&drain_path), 1, Some(&checker), &probe, &aw()).await;
+        let out = drain_with(&drain_path, 1, Some(&checker), &probe, &aw()).await;
         post_for_drain.release();
         let _ = drain_done_tx.send(());
         out
@@ -587,18 +562,12 @@ async fn drain_waits_for_a_concurrent_pool_transaction_and_both_effects_survive(
 #[tokio::test]
 async fn failed_config_promotion_keeps_the_verified_candidate_pooled() {
     let (_dir, path, wt) = promotion_fixture();
-    let pool_path = CandidatePool::resolve_path(Some(&path));
+    let pool_path = CandidatePool::resolve_path(&path);
 
     crate::test_seams::arm_failure(crate::test_seams::Site::ConfigPromotion, &path);
-    let first = drain_with(
-        Some(&path),
-        1,
-        Some(&check(true)),
-        &reachable_probe(),
-        &aw(),
-    )
-    .await
-    .expect_err("the injected config-write failure must surface");
+    let first = drain_with(&path, 1, Some(&check(true)), &reachable_probe(), &aw())
+        .await
+        .expect_err("the injected config-write failure must surface");
     // `{:#}`, not `to_string()`: anyhow's plain Display shows only the
     // outermost context ("promoting bridges in config"), so the injected
     // cause would never match.
@@ -622,15 +591,9 @@ async fn failed_config_promotion_keeps_the_verified_candidate_pooled() {
 
     // Retry drain, still no fetch: the same candidate is returned, promoted
     // (the injection was one-shot and is consumed) and only then shed.
-    let added = drain_with(
-        Some(&path),
-        1,
-        Some(&check(true)),
-        &reachable_probe(),
-        &aw(),
-    )
-    .await
-    .unwrap();
+    let added = drain_with(&path, 1, Some(&check(true)), &reachable_probe(), &aw())
+        .await
+        .unwrap();
     assert_eq!(added, 1);
     let cfg = Config::load_with_override(Some(&path))
         .unwrap()
@@ -651,17 +614,11 @@ async fn failed_config_promotion_keeps_the_verified_candidate_pooled() {
 #[tokio::test]
 async fn successful_drain_promotes_sheds_and_a_repeat_drain_sees_nothing() {
     let (_dir, path, wt) = promotion_fixture();
-    let pool_path = CandidatePool::resolve_path(Some(&path));
+    let pool_path = CandidatePool::resolve_path(&path);
 
-    let added = drain_with(
-        Some(&path),
-        1,
-        Some(&check(true)),
-        &reachable_probe(),
-        &aw(),
-    )
-    .await
-    .unwrap();
+    let added = drain_with(&path, 1, Some(&check(true)), &reachable_probe(), &aw())
+        .await
+        .unwrap();
     assert_eq!(added, 1);
     let cfg = Config::load_with_override(Some(&path))
         .unwrap()
@@ -674,15 +631,9 @@ async fn successful_drain_promotes_sheds_and_a_repeat_drain_sees_nothing() {
     );
 
     // Second drain without any fetch: the pool is empty, nothing to do.
-    let again = drain_with(
-        Some(&path),
-        1,
-        Some(&check(true)),
-        &reachable_probe(),
-        &aw(),
-    )
-    .await
-    .unwrap();
+    let again = drain_with(&path, 1, Some(&check(true)), &reachable_probe(), &aw())
+        .await
+        .unwrap();
     assert_eq!(again, 0);
 
     // Idempotent promotion: the same line again adds nothing.
@@ -701,7 +652,7 @@ async fn successful_drain_promotes_sheds_and_a_repeat_drain_sees_nothing() {
 #[tokio::test]
 async fn confirm_removals_merge_with_a_concurrent_refresh_instead_of_clobbering_it() {
     let (_dir, path, wt) = promotion_fixture();
-    let pool_path = CandidatePool::resolve_path(Some(&path));
+    let pool_path = CandidatePool::resolve_path(&path);
     let newcomer: BridgeLine =
         "obfs4 1.2.3.9:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=CCC iat-mode=0"
             .parse()
@@ -713,7 +664,7 @@ async fn confirm_removals_merge_with_a_concurrent_refresh_instead_of_clobbering_
     let drain_path = path.clone();
     let drain = tokio::spawn(async move {
         drain_with(
-            Some(&drain_path),
+            &drain_path,
             1,
             Some(&check(true)),
             &reachable_probe(),
@@ -774,7 +725,7 @@ fn wt_pool_fixture(
     cfg.bridges.transport = "webtunnel".into();
     cfg.bridges.lines = vec![bridge().to_string()];
     cfg.write(&path).unwrap();
-    let pool_path = CandidatePool::resolve_path(Some(&path));
+    let pool_path = CandidatePool::resolve_path(&path);
     let mut pool = CandidatePool::load(pool_path.clone()).unwrap();
     let candidates: Vec<BridgeLine> = candidates.into_iter().collect();
     let expected = candidates.len();
@@ -803,7 +754,7 @@ async fn dead_only_drain_confirms_its_batch_and_the_next_drain_reaches_past_it()
             }
         })
     });
-    let first = drain_with(Some(&path), 1, Some(&check(true)), &dead_probe, &aw())
+    let first = drain_with(&path, 1, Some(&check(true)), &dead_probe, &aw())
         .await
         .unwrap();
     assert_eq!(first, 0, "nothing was probed alive, so nothing is promoted");
@@ -822,15 +773,9 @@ async fn dead_only_drain_confirms_its_batch_and_the_next_drain_reaches_past_it()
         "the good bridge must be the only candidate left"
     );
 
-    let added = drain_with(
-        Some(&path),
-        1,
-        Some(&check(true)),
-        &reachable_probe(),
-        &aw(),
-    )
-    .await
-    .unwrap();
+    let added = drain_with(&path, 1, Some(&check(true)), &reachable_probe(), &aw())
+        .await
+        .unwrap();
     assert_eq!(added, 1, "the second drain reaches the good bridge");
     let cfg = Config::load_with_override(Some(&path))
         .unwrap()
@@ -863,7 +808,7 @@ async fn deferred_prefix_rotates_and_the_working_tail_is_reached_within_two_roun
             }
         })
     });
-    let first = drain_with(Some(&path), 1, Some(&check(true)), &unmeasured_probe, &aw())
+    let first = drain_with(&path, 1, Some(&check(true)), &unmeasured_probe, &aw())
         .await
         .unwrap();
     assert_eq!(first, 0, "nothing was measured, so nothing is promoted");
@@ -871,7 +816,7 @@ async fn deferred_prefix_rotates_and_the_working_tail_is_reached_within_two_roun
     // THE core assertion: the deferred prefix is now at the BACK — the good
     // bridge sits at the front of the queue (pre-fix it was still deferred
     // candidate #1).
-    let mut pool = CandidatePool::load(CandidatePool::resolve_path(Some(&path))).unwrap();
+    let mut pool = CandidatePool::load(CandidatePool::resolve_path(&path)).unwrap();
     assert_eq!(
         pool.take_transport(1, Some("webtunnel")),
         vec![good.clone()],
@@ -901,7 +846,7 @@ async fn deferred_prefix_rotates_and_the_working_tail_is_reached_within_two_roun
             }
         })
     };
-    let added = drain_with(Some(&path), 1, Some(&check(true)), &good_probe, &aw())
+    let added = drain_with(&path, 1, Some(&check(true)), &good_probe, &aw())
         .await
         .unwrap();
     assert_eq!(added, 1, "the second round reaches the good bridge");
@@ -950,14 +895,7 @@ async fn confirm_of_dead_and_rotation_merges_with_a_concurrent_refresh_instead_o
     let gate = crate::test_seams::ParkedGate::arm(crate::test_seams::Site::PreRestore, &pool_path);
     let drain_path = path.clone();
     let drain = tokio::spawn(async move {
-        drain_with(
-            Some(&drain_path),
-            1,
-            Some(&check(true)),
-            &mixed_probe,
-            &aw(),
-        )
-        .await
+        drain_with(&drain_path, 1, Some(&check(true)), &mixed_probe, &aw()).await
     });
     let wait = gate.clone();
     tokio::task::spawn_blocking(move || wait.wait_parked(HANG_GUARD))

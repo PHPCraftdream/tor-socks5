@@ -236,9 +236,15 @@ pub struct ServerBuilder {
 }
 
 impl ServerBuilder {
-    /// Set the optional path associated with the supplied configuration.
-    pub fn config_path(mut self, path: Option<PathBuf>) -> Self {
-        self.config_path = path;
+    /// Set the path of the configuration file the server runs from. Required:
+    /// sibling files (users registry, bridge store, DNS cache, keystore) are
+    /// resolved from it, and startup fails with [`ServerError::Config`] when
+    /// it is missing — nothing is ever written to the current directory.
+    ///
+    /// The supplied [`Config`] is a startup snapshot: the server reads it once
+    /// at startup and never re-reads the file live.
+    pub fn config_path(mut self, path: PathBuf) -> Self {
+        self.config_path = Some(path);
         self
     }
 
@@ -411,6 +417,16 @@ impl ServerBuilder {
                 return Err(error);
             }
         };
+        // First thing after admission, before any file I/O: the config path
+        // anchors every on-disk location the server uses.
+        let Some(config_path) = self.config_path else {
+            self.status.send_replace(ServerStatus::Stopped {
+                listen_addrs: Vec::new(),
+            });
+            return Err(ServerError::Config(anyhow!(
+                "config path is required: ServerBuilder::config_path must be called before start"
+            )));
+        };
         let token = worker_token.unwrap_or_else(|| self.cancellation_token.child_token());
         let mut cancel_on_drop = StartCancelGuard(Some(token.clone()));
         let result = Arc::new(StdMutex::new(None));
@@ -420,7 +436,7 @@ impl ServerBuilder {
         let tracker = TaskTracker::new();
         let args = ServerArgs {
             config: self.config,
-            config_path: self.config_path,
+            config_path,
             obs_sink: self.observation_sink,
             upstream_addr: self.upstream_addr,
             upstream_user: self.upstream_user,
@@ -799,6 +815,23 @@ mod tests {
         let helper = std::path::PathBuf::from("host-pt-helper");
         let explicit = build(PtBinary::Explicit(helper.clone()));
         assert_eq!(explicit.pt_binary, PtBinary::Explicit(helper));
+    }
+
+    #[tokio::test]
+    async fn start_without_config_path_fails_before_file_io() {
+        // H13/D-H1: the check is the first thing after admission, before any
+        // file I/O — nothing is written to the current directory (the check
+        // runs before the worker, so no file access can precede it).
+        let error = match Server::builder(Config::default()).start().await {
+            Ok(_) => panic!("start without a config path must fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, ServerError::Config(_)), "{error:?}");
+        assert_eq!(error.stage(), Some(ServerStage::Config));
+        assert!(
+            error.to_string().contains("config path is required"),
+            "unexpected message: {error}"
+        );
     }
 
     #[test]

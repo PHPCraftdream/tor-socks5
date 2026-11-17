@@ -24,7 +24,7 @@ async fn wait_for_status(
 
 async fn start_immediately_after_release(
     config: crate::config::Config,
-    config_path: Option<std::path::PathBuf>,
+    config_path: std::path::PathBuf,
     settings: Settings,
     upstream: bool,
 ) -> crate::ServerHandle {
@@ -206,7 +206,7 @@ async fn sdk11_server_restart_in_one_process_frees_and_retakes_upstream_slots() 
 
 async fn start_server_with_failure(
     config: crate::config::Config,
-    config_path: Option<std::path::PathBuf>,
+    config_path: std::path::PathBuf,
     settings: Settings,
     failure: global_init::BootstrapFailure,
 ) -> std::result::Result<crate::ServerHandle, ServerError> {
@@ -616,7 +616,7 @@ async fn sdk11_server_watch_reports_starting_running_stopping_and_stopped() {
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let release = std::sync::Mutex::new(Some(release_rx));
     let writer = bridge_store_writer::StoreWriter::spawn(
-        bridge_store::BridgeStore::resolve_path(Some(&path)),
+        bridge_store::BridgeStore::resolve_path(&path),
         Arc::new(move |store| {
             if let Some(entered) = entered.lock().unwrap().take() {
                 let _ = entered.send(());

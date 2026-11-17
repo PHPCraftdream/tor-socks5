@@ -85,7 +85,7 @@ where
 pub(super) async fn authenticate_fallback(
     tor: &TorTunnel,
     cfg: &Config,
-    path: Option<&Path>,
+    path: &Path,
     active: &Settings,
     selected: &mut Settings,
     cursor: &mut usize,

@@ -133,7 +133,7 @@ async fn real_channel_heal_and_config_selection() {
     cfg.bridges.auto_fetch = false;
     cfg.bridges.lines = vec![a.clone()];
     cfg.write(&path).unwrap();
-    let mut active = crate::tor_setup::build_tor_settings(&cfg, Some(&path))
+    let mut active = crate::tor_setup::build_tor_settings(&cfg, &path)
         .await
         .unwrap();
     let tor = arti_wrapper::TorTunnel::create_unbootstrapped_with(active.clone()).unwrap();
@@ -279,7 +279,7 @@ async fn real_channel_heal_and_config_selection() {
             probe,
             refresh(
                 &handle,
-                Some(&path),
+                &path,
                 &ObservationSink::new(),
                 &mut active,
                 &mut next,

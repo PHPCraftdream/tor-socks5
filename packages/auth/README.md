@@ -38,7 +38,7 @@ The registry saves atomically (temp-file guard + rename) and lives next to the m
 ```rust
 use auth::{Hop, NewUser, Registry, UsersConfig};
 
-let registry = Registry::new(UsersConfig::resolve_path(None));
+let registry = Registry::new(UsersConfig::resolve_path(config_path));
 registry.add(NewUser { name: "alice".into(), ..NewUser::default() }, "alice-pass")?;
 registry.set_onion("alice", true)?;
 registry.set_proxies("alice", Hop::Pre, None)?; // inherit the global pool

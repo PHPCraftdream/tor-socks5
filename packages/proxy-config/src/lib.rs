@@ -651,6 +651,18 @@ pub struct BridgeSource {
     pub allow_credentials_cross_origin: bool,
 }
 
+/// Arti's native keystore directory for a config path: `<config file's
+/// parent>/arti-data/state/keystore`. This matches what the running
+/// server hands to arti: arti pins its keystore under its state dir,
+/// and the state dir is `<config dir>/arti-data`.
+pub fn arti_keystore_dir(config_path: &Path) -> PathBuf {
+    let base = match config_path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    base.join("arti-data").join("state").join("keystore")
+}
+
 /// Bridge-list collectors shipped as defaults, as `(label, url)`.
 ///
 /// Public, regenerated automatically, and reachable over plain HTTPS — they are

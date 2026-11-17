@@ -91,7 +91,11 @@ function.
   `transfer_tasks(&mut Vec<JoinHandle<()>>)` hands task ownership to the
 receiving owner.
 - `bridge_manager::fetch_bridges(cfg, config_path, FetchBridgesParams)` is
-  the core of the CLI's `bridges fetch` command: bootstrap Tor from the
+  the core of the CLI's `bridges fetch` command. `config_path` is required
+  (no `Option`, H13/D-H1): a path to a nonexistent config file is the typed
+  `NoConfigFile` error, returned before any file I/O beyond the existence
+  check — the SDK never creates a default config file. It: bootstraps Tor
+  from the
   configured bridges (built-in seeds as fallback), refresh the candidate
   pool from the configured HTTPS sources, optionally probe-and-promote
   (`FetchBridgesParams { timeout, count, probe, pt_binary, cancel }`), and

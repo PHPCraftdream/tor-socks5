@@ -98,6 +98,10 @@ pub enum ServiceFailure {
     /// Another process holds the onion keystore lock, so nothing was hosted.
     #[error("the onion keystore lock is held elsewhere")]
     KeystoreLockHeld,
+    /// The configured keystore directory does not match the running client's
+    /// keystore, so keys written there would never be read by arti.
+    #[error("the configured onion keystore does not match the running client's keystore")]
+    KeystoreMismatch,
 }
 
 /// Internal clonable updater sharing one `watch::Sender<OnionHostStatus>`.

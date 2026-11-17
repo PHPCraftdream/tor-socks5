@@ -64,7 +64,7 @@ pub(crate) async fn cmd_bridges(
     // bootstrapping info log; the SDK errors propagate via `?`.
     let outcome = fetch_bridges(
         &cfg,
-        Some(&config_path),
+        &config_path,
         FetchBridgesParams {
             timeout: Duration::from_secs(timeout_secs),
             count,

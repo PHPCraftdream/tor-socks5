@@ -522,7 +522,7 @@ pub(super) fn verify_bridges_blocking(
     // bridge that has not had a chance to change. Reported through the same callback as a real
     // check would be, so the QR bottom sheet's row still updates (and the bridge stays out of
     // the set that gets added), just without a fresh network attempt.
-    let store = BridgeStore::load(BridgeStore::resolve_path(Some(config_path))).ok();
+    let store = BridgeStore::load(BridgeStore::resolve_path(config_path)).ok();
     let today = time::OffsetDateTime::now_utc();
     let (dead_today, to_check): (Vec<_>, Vec<_>) = bridges
         .into_iter()

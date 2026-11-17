@@ -59,14 +59,13 @@ async fn parked_startup_reports_pt(pt: tor_socks5_runtime::pt::PtBinary) {
         gate: std::sync::Mutex::new(Some((entered_tx, release_rx))),
         async_gate: std::sync::Mutex::new(None),
     });
-    // The config is passed in memory; the path only anchors the (optional)
-    // users-registry resolution. The template stage must be constructible
-    // from it — this is the same eager call `run_server` makes before the
-    // startup gate.
-    let config_path = Some(path);
+    // The config is passed in memory; the path only anchors the users-registry
+    // resolution. The template stage must be constructible from it — this is
+    // the same eager call `run_server` makes before the startup gate.
+    let config_path = path;
     let template = tor_socks5_runtime::tor_setup::restricted_owner_settings(
         &cfg,
-        config_path.as_deref(),
+        &config_path,
         &tor_socks5_runtime::pt::PtBinary::Environment,
     );
     assert!(

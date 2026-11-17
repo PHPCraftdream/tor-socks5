@@ -13,6 +13,7 @@ use crate::bridge_verifier::run_circuit_verify_tick;
 use crate::config::Config;
 use crate::test_seams::{ran_on_thread, Site};
 use proxy_config::Socks5Endpoint;
+use std::path::Path;
 
 use crate::tor_setup::{
     build_tor_settings, build_tor_settings_preserving_live, FORBID_STARTUP_PROBE,
@@ -39,9 +40,12 @@ fn restricted_owner_settings_are_network_free_and_reject_incompatible_options() 
     let mut cfg = pre_config();
     cfg.warm_pool.enabled = false;
     cfg.upstream.enabled = true;
-    let settings =
-        crate::tor_setup::restricted_owner_settings(&cfg, None, &crate::pt::PtBinary::Environment)
-            .unwrap();
+    let settings = crate::tor_setup::restricted_owner_settings(
+        &cfg,
+        Path::new("tor-socks5.ktav"),
+        &crate::pt::PtBinary::Environment,
+    )
+    .unwrap();
     assert_eq!(settings.bridges, cfg.bridges.parsed().unwrap().bridges);
     assert!(settings.pre_endpoint.is_none());
     assert!(settings.pt_binary.is_none());
@@ -50,7 +54,7 @@ fn restricted_owner_settings_are_network_free_and_reject_incompatible_options() 
     cfg.bridges.use_seeds = true;
     assert!(crate::tor_setup::restricted_owner_settings(
         &cfg,
-        None,
+        Path::new("tor-socks5.ktav"),
         &crate::pt::PtBinary::Environment,
     )
     .is_err());
@@ -58,7 +62,7 @@ fn restricted_owner_settings_are_network_free_and_reject_incompatible_options() 
     cfg.dns_server.enabled = true;
     assert!(crate::tor_setup::restricted_owner_settings(
         &cfg,
-        None,
+        Path::new("tor-socks5.ktav"),
         &crate::pt::PtBinary::Environment,
     )
     .is_err());
@@ -68,7 +72,7 @@ fn restricted_owner_settings_are_network_free_and_reject_incompatible_options() 
         .push("unknownpt 8.8.4.4:443 2222222222222222222222222222222222222222 cert=AAA".into());
     assert!(crate::tor_setup::restricted_owner_settings(
         &cfg,
-        None,
+        Path::new("tor-socks5.ktav"),
         &crate::pt::PtBinary::Environment,
     )
     .unwrap_err()
@@ -81,9 +85,12 @@ fn restricted_owner_settings_are_network_free_and_reject_incompatible_options() 
         "webtunnel 8.8.8.8:443 3333333333333333333333333333333333333333 url=https://example.com/x ver=0.0.3".into(),
     ]);
     let expected = cfg.bridges.parsed().unwrap().bridges;
-    let settings =
-        crate::tor_setup::restricted_owner_settings(&cfg, None, &crate::pt::PtBinary::Environment)
-            .unwrap();
+    let settings = crate::tor_setup::restricted_owner_settings(
+        &cfg,
+        Path::new("tor-socks5.ktav"),
+        &crate::pt::PtBinary::Environment,
+    )
+    .unwrap();
     assert_eq!(settings.bridges, expected);
     assert!(settings.pre_endpoint.is_none());
     assert!(settings.stock_pt_proxy);
@@ -97,7 +104,7 @@ async fn pre_settings_use_configured_plain_bridges_without_probing() {
         .scope((), async {
             let cfg = pre_config();
             let path = std::path::Path::new("config-dir/config.ktav");
-            let settings = build_tor_settings(&cfg, Some(path)).await.unwrap();
+            let settings = build_tor_settings(&cfg, path).await.unwrap();
             assert_eq!(settings.bridges, cfg.bridges.parsed().unwrap().bridges);
             assert_eq!(
                 settings.state_dir,
@@ -112,7 +119,7 @@ async fn pre_settings_use_configured_plain_bridges_without_probing() {
             );
             assert!(settings.pt_binary.is_none());
             assert!(settings.extra_pt_protocols.is_empty());
-            let rebuilt = build_tor_settings_preserving_live(&cfg, Some(path), &settings.bridges)
+            let rebuilt = build_tor_settings_preserving_live(&cfg, path, &settings.bridges)
                 .await
                 .unwrap();
             assert_eq!(rebuilt.pre_endpoint, settings.pre_endpoint);
@@ -125,6 +132,8 @@ async fn pre_settings_use_configured_plain_bridges_without_probing() {
 async fn pre_settings_accept_stock_pt_bridges_without_probing() {
     FORBID_STARTUP_PROBE
         .scope((), async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cfg_path = dir.path().join("ts19.ktav");
             for line in [
                 "obfs4 8.8.4.4:443 2222222222222222222222222222222222222222 cert=AAA iat-mode=0",
                 "webtunnel 8.8.8.8:443 3333333333333333333333333333333333333333 url=https://example.com/x ver=0.0.3",
@@ -132,7 +141,7 @@ async fn pre_settings_accept_stock_pt_bridges_without_probing() {
                 let mut cfg = pre_config();
                 cfg.bridges.lines.push(line.into());
                 let parsed = cfg.bridges.parsed().unwrap();
-                let settings = build_tor_settings(&cfg, None).await.unwrap();
+                let settings = build_tor_settings(&cfg, &cfg_path).await.unwrap();
 
                 assert_eq!(settings.bridges, parsed.bridges);
                 assert_eq!(settings.bridges.len(), 2);
@@ -156,39 +165,41 @@ async fn pre_settings_accept_stock_pt_bridges_without_probing() {
 async fn pre_rejects_pt_and_incompatible_configuration() {
     FORBID_STARTUP_PROBE
         .scope((), async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cfg_path = dir.path().join("ts19.ktav");
             let mut cfg = pre_config();
             cfg.bridges.lines.push(
                 "unknownpt 8.8.4.4:443 2222222222222222222222222222222222222222 cert=AAA".into(),
             );
-            assert!(build_tor_settings(&cfg, None)
+            assert!(build_tor_settings(&cfg, &cfg_path)
                 .await
                 .unwrap_err()
                 .to_string()
                 .contains("unknown protocols"));
             cfg = pre_config();
             cfg.bridges.lines.clear();
-            assert!(build_tor_settings(&cfg, None)
+            assert!(build_tor_settings(&cfg, &cfg_path)
                 .await
                 .unwrap_err()
                 .to_string()
                 .contains("usable bridge"));
             cfg = pre_config();
             cfg.bridges.use_seeds = true;
-            assert!(build_tor_settings(&cfg, None)
+            assert!(build_tor_settings(&cfg, &cfg_path)
                 .await
                 .unwrap_err()
                 .to_string()
                 .contains("use_seeds"));
             cfg.bridges.use_seeds = false;
             cfg.bridges.auto_fetch = true;
-            assert!(build_tor_settings(&cfg, None)
+            assert!(build_tor_settings(&cfg, &cfg_path)
                 .await
                 .unwrap_err()
                 .to_string()
                 .contains("auto_fetch"));
             cfg.bridges.auto_fetch = false;
             cfg.warm_pool.enabled = true;
-            assert!(build_tor_settings(&cfg, None)
+            assert!(build_tor_settings(&cfg, &cfg_path)
                 .await
                 .unwrap_err()
                 .to_string()
@@ -212,11 +223,13 @@ async fn probe_forbidden_seam_intercepts_real_probe_entry() {
 async fn pre_hint_and_rejected_pt_cannot_bypass_validation() {
     FORBID_STARTUP_PROBE
         .scope((), async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cfg_path = dir.path().join("ts19.ktav");
             let mut cfg = pre_config();
             cfg.bridges
                 .lines
                 .push("# xorbot:dns example.invalid 8.8.8.8 1".into());
-            let settings = build_tor_settings(&cfg, None).await.unwrap();
+            let settings = build_tor_settings(&cfg, &cfg_path).await.unwrap();
             assert_eq!(settings.bridges.len(), 1);
             assert!(settings.bridges.iter().all(|b| b.transport.is_none()));
 
@@ -229,7 +242,7 @@ async fn pre_hint_and_rejected_pt_cannot_bypass_validation() {
             assert_eq!(parsed.rejected, 1);
             assert_eq!(parsed.duplicates, 0);
             assert_eq!(parsed.bridges, settings.bridges);
-            let filtered_settings = build_tor_settings(&cfg, None).await.unwrap();
+            let filtered_settings = build_tor_settings(&cfg, &cfg_path).await.unwrap();
             assert_eq!(filtered_settings.bridges, parsed.bridges);
             assert!(!filtered_settings.stock_pt_proxy);
             assert!(filtered_settings.pt_binary.is_none());
@@ -241,7 +254,7 @@ async fn pre_hint_and_rejected_pt_cannot_bypass_validation() {
             assert_eq!(parsed.rejected, 1);
             assert_eq!(parsed.duplicates, 0);
             assert_eq!(parsed.bridges, settings.bridges);
-            assert!(build_tor_settings(&cfg, None)
+            assert!(build_tor_settings(&cfg, &cfg_path)
                 .await
                 .unwrap_err()
                 .to_string()
@@ -256,7 +269,7 @@ async fn pre_hint_and_rejected_pt_cannot_bypass_validation() {
             assert_eq!(parsed.bridges.len(), 2);
             assert_eq!(parsed.bridges[0], settings.bridges[0]);
             assert!(parsed.bridges[1].transport.is_some());
-            assert!(build_tor_settings(&cfg, None)
+            assert!(build_tor_settings(&cfg, &cfg_path)
                 .await
                 .unwrap_err()
                 .to_string()
@@ -267,18 +280,20 @@ async fn pre_hint_and_rejected_pt_cannot_bypass_validation() {
                 .lines
                 .push(" # xorbot:dns example.invalid 8.8.8.8 1".into());
             assert!(cfg.bridges.parsed().is_err());
-            assert!(build_tor_settings(&cfg, None).await.is_err());
+            assert!(build_tor_settings(&cfg, &cfg_path).await.is_err());
         })
         .await;
 }
 
 #[tokio::test]
 async fn absent_pre_keeps_existing_empty_pool_policy() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg_path = dir.path().join("ts19.ktav");
     for pre in [None::<proxy_config::ProxyPool>] {
         let mut cfg = pre_config();
         cfg.pre_proxies = pre;
         cfg.bridges.lines.clear();
-        let error = build_tor_settings(&cfg, None)
+        let error = build_tor_settings(&cfg, &cfg_path)
             .await
             .unwrap_err()
             .to_string();
@@ -293,7 +308,7 @@ async fn config_load_runs_off_the_async_worker() {
     Config::default().write(&path).unwrap();
 
     let caller_thread = std::thread::current().id();
-    let result = load_config_off_worker(Some(path.as_path())).await;
+    let result = load_config_off_worker(path.as_path()).await;
     assert!(result.is_ok(), "config load failed: {:?}", result.err());
 
     let ran_on = ran_on_thread(Site::MaintenanceConfigLoad).expect("the load must have run");
@@ -310,7 +325,7 @@ async fn circuit_verify_store_load_runs_off_the_async_worker() {
 
     let caller_thread = std::thread::current().id();
     // Missing file -> empty store -> cheap early return.
-    run_circuit_verify_tick(Some(path.as_path()), &[]).await;
+    run_circuit_verify_tick(path.as_path(), &[]).await;
 
     let ran_on = ran_on_thread(Site::CircuitVerifyStoreLoad).expect("the load must have run");
     assert_ne!(

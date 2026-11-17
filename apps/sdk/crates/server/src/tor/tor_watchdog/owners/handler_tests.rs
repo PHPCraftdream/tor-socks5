@@ -44,7 +44,7 @@ async fn run_server_reports_final_flush_worker_panic() {
                 let (first_tx, first_rx) = tokio::sync::oneshot::channel();
                 let first = std::sync::Mutex::new(Some(first_tx));
                 let writer = tor_socks5_runtime::bridge_store_writer::StoreWriter::spawn(
-                    bridge_store::BridgeStore::resolve_path(Some(&path)),
+                    bridge_store::BridgeStore::resolve_path(&path),
                     Arc::new(move |_| {
                         if publisher_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                             let _ = first.lock().unwrap().take().unwrap().send(());
@@ -68,15 +68,15 @@ async fn run_server_reports_final_flush_worker_panic() {
                     failure: None,
                     ready: std::sync::Mutex::new(Some(ready_tx)),
                 });
-                let (config_path, config) =
+                let (_config_path, config) =
                     match crate::config::Config::load_with_override(Some(&path)).unwrap() {
-                        crate::config::Loaded::FromFile { path, config } => (Some(path), config),
-                        crate::config::Loaded::Defaults(config) => (None, config),
+                        crate::config::Loaded::FromFile { path, config } => (path, config),
+                        crate::config::Loaded::Defaults(config) => (path.clone(), config),
                     };
                 let _ = rustls::crypto::ring::default_provider().install_default();
                 let args = super::super::ServerArgs {
                     config,
-                    config_path,
+                    config_path: path,
                     obs_sink: tor_socks5_runtime::arti_observability::ObservationSink::new(),
                     upstream_addr: None,
                     upstream_user: None,
@@ -168,11 +168,11 @@ async fn parked_server_startup(global: bool) {
         async_gate: std::sync::Mutex::new(None),
     });
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let (config_path, config) =
-        match crate::config::Config::load_with_override(Some(&path)).unwrap() {
-            crate::config::Loaded::FromFile { path, config } => (Some(path), config),
-            crate::config::Loaded::Defaults(config) => (None, config),
-        };
+    let config_path = path.clone();
+    let config = match crate::config::Config::load_with_override(Some(&path)).unwrap() {
+        crate::config::Loaded::FromFile { config, .. } => config,
+        crate::config::Loaded::Defaults(config) => config,
+    };
     let _ = rustls::crypto::ring::default_provider().install_default();
     let args = super::super::ServerArgs {
         config,

@@ -26,8 +26,6 @@ use serde::{Deserialize, Serialize};
 
 use super::user::User;
 
-const DEFAULT_FILE: &str = "tor-socks5.users.ktav";
-
 /// Monotonic counter giving every save() call a unique temp-file name, even
 /// when saves run concurrently within one process.
 static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -48,21 +46,19 @@ pub struct UsersConfig {
 impl UsersConfig {
     /// Resolve the users-file path given the main config path. The
     /// rule mirrors `bridge_store` and `alive-bridges.log`: same
-    /// directory, same stem, fixed `.users.ktav` suffix. Falls back to
-    /// `./tor-socks5.users.ktav` when the main config came from
-    /// built-in defaults (no path on disk).
-    pub fn resolve_path(config_path: Option<&Path>) -> PathBuf {
-        match config_path {
-            Some(cfg) => {
-                let dir = cfg.parent().unwrap_or_else(|| Path::new("."));
-                let stem = cfg
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "tor-socks5".to_string());
-                dir.join(format!("{stem}.users.ktav"))
-            }
-            None => PathBuf::from(DEFAULT_FILE),
-        }
+    /// directory, same stem, fixed `.users.ktav` suffix. There is deliberately no fallback: callers without a
+    /// config path must fail upstream instead of deriving a write path
+    /// from the current directory.
+    pub fn resolve_path(config_path: &Path) -> PathBuf {
+        let dir = config_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let stem = config_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "tor-socks5".to_string());
+        dir.join(format!("{stem}.users.ktav"))
     }
 
     /// Load the registry from disk. A missing file is **not** an error
@@ -222,7 +218,7 @@ allowed_clients: 192.168.1*
 
     #[test]
     fn resolve_path_uses_config_dir_and_stem() {
-        let p = UsersConfig::resolve_path(Some(Path::new("/etc/tor-socks5.ktav")));
+        let p = UsersConfig::resolve_path(Path::new("/etc/tor-socks5.ktav"));
         assert_eq!(
             p.file_name().unwrap().to_string_lossy(),
             "tor-socks5.users.ktav"
@@ -231,12 +227,6 @@ allowed_clients: 192.168.1*
             p.parent().unwrap().to_string_lossy().replace('\\', "/"),
             "/etc"
         );
-    }
-
-    #[test]
-    fn resolve_path_falls_back_for_defaults() {
-        let p = UsersConfig::resolve_path(None);
-        assert_eq!(p, PathBuf::from(DEFAULT_FILE));
     }
 
     #[test]

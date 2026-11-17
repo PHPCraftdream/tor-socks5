@@ -20,7 +20,7 @@ async fn retired_snapshots_are_dropped_off_the_async_worker() {
     seed_store(&path, &b);
 
     let writer = StoreWriter::spawn(
-        BridgeStore::resolve_path(Some(&path)),
+        BridgeStore::resolve_path(&path),
         Arc::new(|s| s.save()),
         INITIAL_BACKOFF,
     );

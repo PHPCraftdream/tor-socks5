@@ -27,7 +27,7 @@ async fn fetch_rejects_pre_before_network_startup() {
     let loaded = Config::load_with_override(Some(&path))
         .unwrap()
         .into_config();
-    let settings = build_tor_settings(&loaded, Some(&path)).await.unwrap();
+    let settings = build_tor_settings(&loaded, &path).await.unwrap();
     assert!(settings.pre_endpoint.is_some());
     assert_eq!(settings.bridges.len(), 1);
 

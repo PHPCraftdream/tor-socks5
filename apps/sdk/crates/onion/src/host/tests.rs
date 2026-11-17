@@ -499,3 +499,31 @@ async fn dropping_the_handle_cancels_the_token() {
     std::mem::drop(host_handle);
     assert!(token.is_cancelled(), "Drop cancelled the token");
 }
+
+// Keystore-dir validation (pure; no live client, no heavy I/O).
+#[test]
+fn keystore_validation_accepts_the_matching_dir() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    assert_eq!(
+        validate_keystore_dir(Some(tmp.path()), &tmp.path().join("keystore")),
+        Ok(())
+    );
+}
+
+#[test]
+fn keystore_validation_rejects_a_foreign_dir() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let foreign = tempfile::tempdir().expect("temp dir");
+    let error = validate_keystore_dir(Some(tmp.path()), &foreign.path().join("keystore"))
+        .expect_err("a foreign keystore dir must be rejected");
+    assert!(error.contains("does not match the running client's keystore"));
+}
+
+#[test]
+fn keystore_validation_skips_when_state_dir_is_unknown() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    assert_eq!(
+        validate_keystore_dir(None, &tmp.path().join("anything")),
+        Ok(())
+    );
+}

@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 #[allow(clippy::too_many_arguments)]
 pub fn launch_producers(
     handle: TorHandle,
-    config_path: Option<std::path::PathBuf>,
+    config_path: std::path::PathBuf,
     cfg: &Config,
     obs_sink: ObservationSink,
     settings: Settings,

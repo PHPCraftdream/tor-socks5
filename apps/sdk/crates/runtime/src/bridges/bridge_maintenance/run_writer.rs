@@ -26,7 +26,7 @@ static RUN: Mutex<Slot> = Mutex::new(Slot::Idle);
 /// Start the run-scoped store writer. Mirrors `init_global`: a second call
 /// hands back the existing writer (while a close is finishing, the one
 /// being closed), warning when it was opened for a different path.
-pub fn init_run(config_path: Option<&Path>) -> StoreWriter {
+pub fn init_run(config_path: &Path) -> StoreWriter {
     let resolved = BridgeStore::resolve_path(config_path);
     let mut slot = RUN.lock().unwrap_or_else(|error| error.into_inner());
     let writer = match &*slot {

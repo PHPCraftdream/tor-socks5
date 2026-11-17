@@ -29,7 +29,7 @@ const SERVICE_LABEL: &str = "tor-socks5";
 
 /// Default config filename created/pinned at install time when no
 /// explicit `--config` is given. Mirrors `config::DEFAULT_FILE`.
-const DEFAULT_CONFIG_FILE: &str = "tor-socks5.ktav";
+pub(crate) const DEFAULT_CONFIG_FILE: &str = "tor-socks5.ktav";
 
 /// Marker argument injected into the installed Windows service image
 /// path so the binary knows to enter the SCM dispatcher at startup.

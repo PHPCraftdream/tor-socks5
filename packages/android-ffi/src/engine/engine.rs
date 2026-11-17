@@ -808,8 +808,8 @@ use bootstrap::*;
 pub(crate) use bootstrap::{LIVE_PROBE_PORT, LIVE_PROBE_TARGET};
 use bridges::*;
 pub(crate) use bridges::{
-    bridge_store_write_lock, get_current_tunnel, persist_and_rank_probe, take_auto_fetched_bridges,
-    take_pruned_bridges,
+    bridge_store_path, bridge_store_write_lock, get_current_tunnel, persist_and_rank_probe,
+    take_auto_fetched_bridges, take_pruned_bridges,
 };
 pub(crate) use egress::PostRouting;
 use egress::RoutedTor;

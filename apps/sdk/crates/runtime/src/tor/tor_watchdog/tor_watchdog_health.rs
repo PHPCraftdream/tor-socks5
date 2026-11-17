@@ -184,6 +184,9 @@ pub struct TorHandle {
     health: TorHealth,
     active_bridges: Arc<Mutex<ActiveBridges>>,
     refresh: Arc<BridgeRefresh>,
+    /// The arti state dir the running client uses (the value
+    /// `Settings::state_dir` set by `tor_setup::arti_base_dir`).
+    pub(crate) state_dir: Option<std::path::PathBuf>,
 }
 
 #[derive(Default)]
@@ -296,14 +299,22 @@ impl TorHandle {
             health: TorHealth::default(),
             active_bridges: Arc::new(Mutex::new(ActiveBridges::default())),
             refresh: Arc::new(BridgeRefresh::default()),
+            state_dir: None,
         }
     }
 
-    /// Wrap the bootstrapped tunnel and initialize its tracked bridge set from the settings.
+    /// Wrap the bootstrapped tunnel and initialize its tracked bridge set and
+    /// state dir from the settings the client was built with.
     pub fn new_with_settings(tor: TorTunnel, settings: &arti_wrapper::Settings) -> Self {
-        let handle = Self::new(tor);
+        let mut handle = Self::new(tor);
         handle.set_active_bridges(settings.bridges.clone());
+        handle.state_dir = settings.state_dir.clone();
         handle
+    }
+
+    /// The arti state dir the running client uses, when known.
+    pub fn state_dir(&self) -> Option<&std::path::Path> {
+        self.state_dir.as_deref()
     }
 
     /// Snapshot the current tunnel for a new connection. Returns `None`

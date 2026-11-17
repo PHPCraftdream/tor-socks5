@@ -89,12 +89,12 @@ pub(crate) fn confirms_tor(body: &str) -> bool {
 /// Срок ограничивает решение, но не завершение принадлежащей группе задачи.
 pub(crate) async fn verify_for_admission(
     bridge: BridgeLine,
-    config_path: Option<PathBuf>,
+    config_path: PathBuf,
     deadline: std::time::Instant,
     workers: &AdmissionWorkers,
     pt_binary: PtBinary,
 ) -> anyhow::Result<bool> {
-    let live_cache = crate::tor_setup::arti_base_dir(config_path.as_deref()).join("cache");
+    let live_cache = crate::tor_setup::arti_base_dir(&config_path).join("cache");
     let decision_rx = spawn_for_admission(
         move || {
             let result = admission_verification(bridge, live_cache, deadline, pt_binary);
@@ -178,7 +178,7 @@ fn admission_verification(
 /// performs. `PtBinary::Environment` resolves the documented
 /// `TOR_PT_BINARY` override, else the current process executable.
 pub fn spawn_bridge_circuit_verifier(
-    config_path: Option<PathBuf>,
+    config_path: PathBuf,
     handle: crate::tor_watchdog::TorHandle,
     pt_binary: PtBinary,
     token: CancellationToken,
@@ -199,7 +199,7 @@ pub fn spawn_bridge_circuit_verifier(
                 _ = tick.tick() => {},
             }
             run_circuit_verify_tick_with_pt(
-                config_path.as_deref(),
+                &config_path,
                 &handle.active_bridges(),
                 pt_binary.clone(),
                 &token,
@@ -219,13 +219,13 @@ pub fn spawn_bridge_circuit_verifier(
 
 /// One tick: pick the due batch, verify it, persist the results.
 #[cfg(test)]
-pub(crate) async fn run_circuit_verify_tick(config_path: Option<&Path>, active: &[BridgeLine]) {
+pub(crate) async fn run_circuit_verify_tick(config_path: &Path, active: &[BridgeLine]) {
     let token = tokio_util::sync::CancellationToken::new();
     run_circuit_verify_tick_with_pt(config_path, active, PtBinary::Environment, &token).await;
 }
 
 pub(crate) async fn run_circuit_verify_tick_with_pt(
-    config_path: Option<&Path>,
+    config_path: &Path,
     active: &[BridgeLine],
     pt_policy: PtBinary,
     token: &CancellationToken,
@@ -827,10 +827,7 @@ pub(crate) fn verify_bridges_sequential(
 /// Routed through the single bridge-store writer: an unreadable on-disk
 /// store is logged (as before), while publish failures are the writer's
 /// retry problem.
-async fn persist_circuit_verify_results(
-    results: &[(BridgeLine, bool)],
-    config_path: Option<&Path>,
-) {
+async fn persist_circuit_verify_results(results: &[(BridgeLine, bool)], config_path: &Path) {
     if results.is_empty() {
         return;
     }
@@ -905,10 +902,10 @@ mod tests {
         assert!(markers.contains(&marker_b));
     }
 
-    fn seed_failed_bridge(dir: &Path, bridge: &BridgeLine) -> Option<PathBuf> {
-        let config_path = Some(dir.join("tor-socks5.ktav"));
-        let mut store = BridgeStore::load(BridgeStore::resolve_path(config_path.as_deref()))
-            .expect("load fresh store");
+    fn seed_failed_bridge(dir: &Path, bridge: &BridgeLine) -> PathBuf {
+        let config_path = dir.join("tor-socks5.ktav");
+        let mut store =
+            BridgeStore::load(BridgeStore::resolve_path(&config_path)).expect("load fresh store");
         let t0 = OffsetDateTime::now_utc();
         // Inserts the (unknown) bridge with `circuit_fails = 1`.
         store.note_circuit_failure_at(bridge, t0, StdDuration::from_secs(60));
@@ -929,10 +926,10 @@ mod tests {
             .expect("bridge line");
         let config_path = seed_failed_bridge(dir.path(), &bridge);
 
-        persist_circuit_verify_results(&[(bridge.clone(), true)], config_path.as_deref()).await;
+        persist_circuit_verify_results(&[(bridge.clone(), true)], &config_path).await;
 
-        let store = BridgeStore::load(BridgeStore::resolve_path(config_path.as_deref()))
-            .expect("reload store");
+        let store =
+            BridgeStore::load(BridgeStore::resolve_path(&config_path)).expect("reload store");
         assert_eq!(store.verified_count(&bridge), 1, "verification recorded");
         assert_eq!(store.circuit_fails(&bridge), 0, "circuit_fails reset");
         assert_eq!(
@@ -952,10 +949,10 @@ mod tests {
             .expect("bridge line");
         let config_path = seed_failed_bridge(dir.path(), &bridge);
 
-        persist_circuit_verify_results(&[(bridge.clone(), false)], config_path.as_deref()).await;
+        persist_circuit_verify_results(&[(bridge.clone(), false)], &config_path).await;
 
-        let store = BridgeStore::load(BridgeStore::resolve_path(config_path.as_deref()))
-            .expect("reload store");
+        let store =
+            BridgeStore::load(BridgeStore::resolve_path(&config_path)).expect("reload store");
         assert_eq!(store.circuit_fails(&bridge), 1, "circuit_fails unchanged");
         assert_eq!(store.verified_count(&bridge), 0, "no verification recorded");
     }

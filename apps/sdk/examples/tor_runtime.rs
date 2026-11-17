@@ -39,16 +39,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // This is the explicit network-start boundary: settings may probe bridges;
     // PT_BINARY must dispatch PT mode when configured bridges need it.
     let pt_binary = PtBinary::Explicit(pt_path);
-    let settings =
-        build_tor_settings_with_pt(&config, Some(&config_path), pt_binary.clone()).await?;
+    let settings = build_tor_settings_with_pt(&config, &config_path, pt_binary.clone()).await?;
     let tunnel = TorTunnel::bootstrap_with(settings.clone()).await?;
     let handle = TorHandle::new_with_settings(tunnel, &settings);
-    let _writer = init_global(Some(&config_path));
+    let _writer = init_global(&config_path);
     let token = CancellationToken::new();
     let mut producers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     launch_producers(
         handle.clone(),
-        Some(config_path.clone()),
+        config_path.clone(),
         &config,
         observations.clone(),
         settings.clone(),

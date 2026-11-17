@@ -22,7 +22,7 @@ async fn empty_sources_bails_before_any_tor_or_io() {
     let dir = tempfile::tempdir().expect("temporary config directory");
     let path = dir.path().join("proxy.ktav");
     cfg.write(&path).expect("write isolated config");
-    let error = fetch_bridges(&cfg, Some(&path), params())
+    let error = fetch_bridges(&cfg, &path, params())
         .await
         .expect_err("no sources configured");
     assert_eq!(
@@ -48,7 +48,7 @@ async fn h10_pre_cancelled_token_cancels_before_any_io() {
     assert!(!cfg.bridges.sources.is_empty());
     let p = params();
     p.cancel.cancel();
-    let error = fetch_bridges(&cfg, Some(&path), p)
+    let error = fetch_bridges(&cfg, &path, p)
         .await
         .expect_err("pre-cancelled token");
     assert!(matches!(error, FetchBridgesError::Cancelled), "{error:?}");
@@ -70,7 +70,7 @@ async fn h10_pre_proxies_is_a_typed_sdk_error_before_tor_work() {
             .into(),
     );
     let before = std::fs::read(&path).expect("config readable before the call");
-    let error = fetch_bridges(&cfg, Some(&path), params())
+    let error = fetch_bridges(&cfg, &path, params())
         .await
         .expect_err("pre_proxies configured");
     assert!(matches!(error, FetchBridgesError::PreProxies), "{error:?}");
@@ -83,21 +83,18 @@ async fn h10_pre_proxies_is_a_typed_sdk_error_before_tor_work() {
 }
 
 #[tokio::test]
-async fn h10_none_config_path_errors_without_creating_a_default_file() {
-    // Regression (D-H1/H10-5): `config_path: None` is a typed
-    // `NoConfigFile` error — never `Some(0)`, never a fresh default
-    // config file created in the current directory.
-    let default_path = Config::resolve_path(None);
-    assert!(
-        !default_path.exists(),
-        "precondition: no default config file at {}",
-        default_path.display()
-    );
+async fn h13_nonexistent_config_path_is_no_config_file_without_creating_files() {
+    // Regression (D-H1/H13): `config_path` is required and points at an
+    // existing file; a path to a nonexistent config is a typed
+    // `NoConfigFile` error — and the call must not create anything (no
+    // default config, no store/pool files) anywhere in the directory.
+    let dir = tempfile::tempdir().expect("temporary config directory");
+    let path = dir.path().join("missing.ktav");
     let cfg = Config::default();
     assert!(!cfg.bridges.sources.is_empty());
-    let error = fetch_bridges(&cfg, None, params())
+    let error = fetch_bridges(&cfg, &path, params())
         .await
-        .expect_err("None config path");
+        .expect_err("nonexistent config path");
     assert!(
         matches!(error, FetchBridgesError::NoConfigFile),
         "{error:?}"
@@ -106,9 +103,14 @@ async fn h10_none_config_path_errors_without_creating_a_default_file() {
         error.to_string(),
         "no config file found; run the server once to create defaults"
     );
+    let left: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("read config directory")
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.file_name())
+        .collect();
     assert!(
-        !default_path.exists(),
-        "no default config file may be created by fetch_bridges(None)"
+        left.is_empty(),
+        "fetch_bridges must not create files for a nonexistent config: {left:?}"
     );
 }
 
@@ -134,7 +136,7 @@ async fn h10_pt_binary_reaches_the_bootstrap_settings() {
     p.pt_binary = crate::pt::PtBinary::Explicit(missing_pt.clone());
     p.cancel = cancel.clone();
     let fetch = tokio::spawn(SDK14_PT_OBSERVER.scope(("fetch", tx), async move {
-        fetch_bridges(&cfg, Some(&path), p).await
+        fetch_bridges(&cfg, &path, p).await
     }));
     let (role, resolved) = tokio::time::timeout(Duration::from_secs(3600), rx.recv())
         .await
@@ -404,7 +406,7 @@ async fn sdk14_manager_explicit_pt_reaches_maintenance_and_verifier() {
     .expect("create transport-free unbootstrapped tunnel");
     let handle = crate::tor_watchdog::TorHandle::new_with_settings(tunnel, &initial_settings);
 
-    let store_path = bridge_store::BridgeStore::resolve_path(Some(&config_path));
+    let store_path = bridge_store::BridgeStore::resolve_path(&config_path);
     let mut store = bridge_store::BridgeStore::load(store_path).expect("load bridge store");
     let now = time::OffsetDateTime::now_utc();
     let alive = [(bridge.clone(), Duration::from_millis(1))];
@@ -426,7 +428,7 @@ async fn sdk14_manager_explicit_pt_reaches_maintenance_and_verifier() {
         .scope(("manager", tx), async {
             start(
                 handle,
-                Some(config_path),
+                config_path,
                 &cfg,
                 ObservationSink::default(),
                 BridgeManagerConfig {
@@ -501,7 +503,7 @@ async fn sdk14_manager_explicit_pt_reaches_maintenance_after_transport_free_star
         .scope(("manager", tx), async {
             start(
                 handle,
-                Some(config_path),
+                config_path,
                 &cfg,
                 ObservationSink::default(),
                 BridgeManagerConfig {

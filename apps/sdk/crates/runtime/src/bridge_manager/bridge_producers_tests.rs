@@ -30,7 +30,7 @@ async fn launch_producers_tasks_are_directly_owned_by_producer_vec() {
     let cfg = smoke_cfg();
     let mut valid = cfg.clone();
     valid.warm_pool.enabled = false;
-    let settings = crate::tor_setup::build_tor_settings(&valid, Some(dir.path()))
+    let settings = crate::tor_setup::build_tor_settings(&valid, dir.path())
         .await
         .unwrap();
     ensure_crypto_provider();
@@ -39,7 +39,7 @@ async fn launch_producers_tasks_are_directly_owned_by_producer_vec() {
     let mut tasks = Vec::new();
     launch_producers(
         TorHandle::new_with_settings(tor, &settings),
-        Some(dir.path().join("missing.ktav")),
+        dir.path().join("missing.ktav"),
         &cfg,
         crate::arti_observability::ObservationSink::new(),
         settings,
@@ -86,7 +86,7 @@ async fn set_needed_is_set_when_preferred_transport_is_missing() {
     let mut tasks = Vec::new();
     launch_producers(
         handle.clone(),
-        Some(dir.path().join("missing.ktav")),
+        dir.path().join("missing.ktav"),
         &cfg,
         crate::arti_observability::ObservationSink::new(),
         settings.clone(),
@@ -113,7 +113,7 @@ async fn set_needed_is_set_when_preferred_transport_is_missing() {
     let mut tasks = Vec::new();
     launch_producers(
         handle.clone(),
-        Some(dir.path().join("missing.ktav")),
+        dir.path().join("missing.ktav"),
         &plain_cfg,
         crate::arti_observability::ObservationSink::new(),
         plain_settings,
@@ -135,7 +135,7 @@ async fn producer_boundaries_remain_guarded() {
     let path = dir.path().join("proxy.ktav");
     let mut build_cfg = cfg.clone();
     build_cfg.warm_pool.enabled = false;
-    let settings = crate::tor_setup::build_tor_settings(&build_cfg, Some(&path))
+    let settings = crate::tor_setup::build_tor_settings(&build_cfg, &path)
         .await
         .unwrap();
     assert!(settings.pre_endpoint.is_some());
@@ -149,7 +149,7 @@ async fn producer_boundaries_remain_guarded() {
             let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 launch_producers(
                     handle.clone(),
-                    Some(path.clone()),
+                    path.clone(),
                     &cfg,
                     crate::arti_observability::ObservationSink::new(),
                     settings.clone(),

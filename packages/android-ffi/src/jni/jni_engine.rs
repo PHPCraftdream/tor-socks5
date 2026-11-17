@@ -339,7 +339,7 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
             None
         } else {
             let users_path = if cfg.auth.users_file.is_empty() {
-                UsersConfig::resolve_path(Some(std::path::Path::new(&config_path_str)))
+                UsersConfig::resolve_path(std::path::Path::new(&config_path_str))
             } else {
                 std::path::PathBuf::from(&cfg.auth.users_file)
             };
@@ -711,7 +711,7 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
     match panic::catch_unwind(AssertUnwindSafe(|| {
         let config_path_str: Option<String> = env.get_string(&config_path).ok().map(|s| s.into());
         let store_path =
-            BridgeStore::resolve_path(config_path_str.as_ref().map(std::path::Path::new));
+            engine::bridge_store_path(config_path_str.as_deref().map(std::path::Path::new));
         let joined = match BridgeStore::load(store_path) {
             Ok(store) => store
                 .healthiest_bridges(limit.max(0) as usize)
@@ -797,7 +797,7 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
     match panic::catch_unwind(AssertUnwindSafe(|| {
         let config_path_str: Option<String> = env.get_string(&config_path).ok().map(|s| s.into());
         let store_path =
-            BridgeStore::resolve_path(config_path_str.as_ref().map(std::path::Path::new));
+            engine::bridge_store_path(config_path_str.as_deref().map(std::path::Path::new));
         let joined = match BridgeStore::load(store_path) {
             Ok(store) => store
                 .transport_summary()
@@ -866,7 +866,7 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
         }
         let _store_write = crate::engine::bridge_store_write_lock();
         let store_path =
-            BridgeStore::resolve_path(config_path_str.as_ref().map(std::path::Path::new));
+            engine::bridge_store_path(config_path_str.as_deref().map(std::path::Path::new));
         let Ok(mut store) = BridgeStore::load(store_path) else {
             return;
         };
@@ -903,7 +903,7 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
     match panic::catch_unwind(AssertUnwindSafe(|| {
         let config_path_str: Option<String> = env.get_string(&config_path).ok().map(|s| s.into());
         let store_path =
-            BridgeStore::resolve_path(config_path_str.as_ref().map(std::path::Path::new));
+            engine::bridge_store_path(config_path_str.as_deref().map(std::path::Path::new));
         let joined = match BridgeStore::load(store_path) {
             Ok(store) => store
                 .channel_proven_bridges(limit.max(0) as usize)
@@ -944,7 +944,7 @@ pub extern "system" fn Java_org_torproject_android_service_TorSocks5Bridge_nativ
     match panic::catch_unwind(AssertUnwindSafe(|| {
         let config_path_str: Option<String> = env.get_string(&config_path).ok().map(|s| s.into());
         let store_path =
-            BridgeStore::resolve_path(config_path_str.as_ref().map(std::path::Path::new));
+            engine::bridge_store_path(config_path_str.as_deref().map(std::path::Path::new));
         let joined = match BridgeStore::load(store_path) {
             Ok(store) => store
                 .source_summary()

@@ -18,7 +18,7 @@ async fn app_global_writer_survives_server_start_and_stop() {
     let dir = tempfile::tempdir().unwrap();
     let app_path = dir.path().join("app.ktav");
     // The app opens its own process-global writer before any server run.
-    let app_writer = bridge_store_writer::init_global(Some(&app_path));
+    let app_writer = bridge_store_writer::init_global(&app_path);
     assert!(!bridge_store_writer::global_is_idle());
     // Benign mutation through the app's own writer.
     app_writer.apply(|_| {}).await.unwrap();

@@ -157,7 +157,7 @@ async fn fetch_sources(
 pub async fn refresh_candidate_pool(
     tor: &TorTunnel,
     cfg: &Config,
-    config_path: Option<&Path>,
+    config_path: &Path,
     fetch_timeout: Duration,
 ) -> Result<usize> {
     let fetched = fetch_sources(tor, cfg, fetch_timeout).await?;
@@ -191,13 +191,11 @@ pub async fn refresh_candidate_pool(
     .map_err(|e| anyhow::anyhow!("candidate pool update task failed: {e}"))?
     .context("updating candidate pool")?;
     if config_stale {
-        if let Some(path) = config_path {
-            let path = path.to_path_buf();
-            crate::workers::run_fallible_blocking(move || migrate_legacy_source(&path))
-                .await
-                .map_err(|e| anyhow::anyhow!("config migration task failed: {e}"))??;
-            info!("updated legacy bridge sources in the config (moved or retired)");
-        }
+        let path = config_path.to_path_buf();
+        crate::workers::run_fallible_blocking(move || migrate_legacy_source(&path))
+            .await
+            .map_err(|e| anyhow::anyhow!("config migration task failed: {e}"))??;
+        info!("updated legacy bridge sources in the config (moved or retired)");
     }
     info!(
         added,
@@ -286,7 +284,7 @@ async fn admits_candidate(
 /// — the drain joins them outside the pool transaction (TS17-02).
 fn channel_checker(
     tor: &TorTunnel,
-    admission_config: Option<std::path::PathBuf>,
+    admission_config: std::path::PathBuf,
     workers: std::sync::Arc<crate::workers::AdmissionWorkers>,
     pt_binary: crate::pt::PtBinary,
 ) -> ChannelCheck<'static> {
@@ -353,22 +351,17 @@ fn channel_checker(
 /// executable chosen here. `PtBinary::Environment` resolves the documented
 /// `TOR_PT_BINARY` override, else the current process executable.
 pub async fn drain_pool(
-    config_path: Option<&Path>,
+    config_path: &Path,
     target: usize,
     tor: Option<&TorTunnel>,
     pt_binary: crate::pt::PtBinary,
 ) -> Result<usize> {
-    // Cheap guards first: no target or no config path means no drain, and
-    // the path check must come before the config load (which would create a
-    // default file when `config_path` is `None`).
+    // Cheap guard first: no target means no drain.
     if target == 0 {
         return Ok(0);
     }
-    let Some(_) = config_path else {
-        return Ok(0);
-    };
-    let cfg = Config::load_with_override(config_path)?.into_config();
-    let admission_config = config_path.map(Path::to_path_buf);
+    let cfg = Config::load_with_override(Some(config_path))?.into_config();
+    let admission_config = config_path.to_path_buf();
     // One registry per drain: it owns every verification worker the
     // admission decision outlives, and `drain_pool_with` joins them after
     // the pool transaction closes (TS17-02).
@@ -401,7 +394,7 @@ pub async fn drain_pool(
 
 async fn drain_pool_with(
     cfg: &Config,
-    config_path: Option<&Path>,
+    config_path: &Path,
     target: usize,
     checker: Option<&ChannelCheck<'_>>,
     probe: &ProbeCheck<'_>,
@@ -410,9 +403,6 @@ async fn drain_pool_with(
     if target == 0 {
         return Ok(0);
     }
-    let Some(path) = config_path else {
-        return Ok(0);
-    };
     let pool_path = CandidatePool::resolve_path(config_path);
     // Test-only forcing point: park before the acquisition (blocking pool —
     // never block a worker on the gate).
@@ -574,12 +564,14 @@ async fn drain_pool_with(
     let promotion: Result<usize> = if promoted.is_empty() {
         Ok(0)
     } else {
-        let path = path.to_path_buf();
+        let config_path = config_path.to_path_buf();
         let for_config = promoted.clone();
-        crate::workers::run_fallible_blocking(move || promote_bridges_in_config(&path, &for_config))
-            .await
-            .map_err(|e| anyhow::anyhow!("config promotion task failed: {e}"))
-            .and_then(|added| added.context("promoting bridges in config"))
+        crate::workers::run_fallible_blocking(move || {
+            promote_bridges_in_config(&config_path, &for_config)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("config promotion task failed: {e}"))
+        .and_then(|added| added.context("promoting bridges in config"))
     };
 
     // The confirm: shed exactly the candidates whose outcome is now durable
@@ -704,7 +696,7 @@ fn promote_bridges_in_config(path: &Path, promoted: &[BridgeLine]) -> Result<usi
 pub(crate) async fn top_up_working_with_pt(
     tor: &TorTunnel,
     cfg: &Config,
-    config_path: Option<&Path>,
+    config_path: &Path,
     target: usize,
     pt_binary: crate::pt::PtBinary,
 ) -> Result<usize> {
@@ -729,13 +721,13 @@ pub(crate) async fn top_up_working_with_pt(
 /// that by loading here and passing the `Config` down).
 #[cfg(test)]
 pub(crate) async fn drain_with(
-    config_path: Option<&Path>,
+    config_path: &Path,
     target: usize,
     checker: Option<&ChannelCheck<'_>>,
     probe: &ProbeCheck<'_>,
     workers: &crate::workers::AdmissionWorkers,
 ) -> Result<usize> {
-    let cfg = Config::load_with_override(config_path)?.into_config();
+    let cfg = Config::load_with_override(Some(config_path))?.into_config();
     drain_pool_with(&cfg, config_path, target, checker, probe, workers).await
 }
 

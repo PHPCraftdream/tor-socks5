@@ -27,7 +27,7 @@ async fn cancelled_close_retains_actor_outcome() {
 
     tokio::time::timeout(HANG_GUARD, async {
         let dir = tempfile::tempdir().unwrap();
-        let path = BridgeStore::resolve_path(Some(&config_path(dir.path())));
+        let path = BridgeStore::resolve_path(&config_path(dir.path()));
         let gate = ParkedGate::arm(Site::WriterCloseReplySent, &path);
         let calls = Arc::new(AtomicUsize::new(0));
         let publisher_calls = calls.clone();
@@ -92,7 +92,7 @@ async fn close_final_flush_panic_remains_in_registry() {
                 let calls = Arc::new(AtomicUsize::new(0));
                 let publisher_calls = calls.clone();
                 let writer = StoreWriter::spawn(
-                    BridgeStore::resolve_path(Some(&path)),
+                    BridgeStore::resolve_path(&path),
                     Arc::new(move |_| {
                         if publisher_calls.fetch_add(1, Ordering::SeqCst) == 0 {
                             Err(anyhow!("first failure"))
@@ -142,7 +142,7 @@ async fn publisher_panic_payload_survives_actor_retry_and_registry_join() {
                 let calls = Arc::new(AtomicUsize::new(0));
                 let publisher_calls = calls.clone();
                 let writer = StoreWriter::spawn(
-                    BridgeStore::resolve_path(Some(&path)),
+                    BridgeStore::resolve_path(&path),
                     Arc::new(move |_| {
                         if publisher_calls.fetch_add(1, Ordering::SeqCst) == 0 {
                             std::panic::panic_any(PublisherSentinel(73));
@@ -186,7 +186,7 @@ async fn mutation_panic_rejects_the_ack_and_the_next_mutation_succeeds() {
     seed_store(&path, &b);
 
     let writer = StoreWriter::spawn(
-        BridgeStore::resolve_path(Some(&path)),
+        BridgeStore::resolve_path(&path),
         Arc::new(|s| s.save()),
         INITIAL_BACKOFF,
     );
@@ -237,7 +237,7 @@ async fn panic_after_a_failed_publish_keeps_the_confirmed_mutation() {
 
     let calls = Arc::new(AtomicUsize::new(0));
     let writer = StoreWriter::spawn(
-        BridgeStore::resolve_path(Some(&path)),
+        BridgeStore::resolve_path(&path),
         fail_first_publisher(calls.clone()),
         INITIAL_BACKOFF,
     );
@@ -351,11 +351,7 @@ async fn retries_stay_on_the_backoff_schedule_after_a_panicking_mutation() {
             }
         })
     };
-    let writer = StoreWriter::spawn(
-        BridgeStore::resolve_path(Some(&path)),
-        publisher,
-        INITIAL_BACKOFF,
-    );
+    let writer = StoreWriter::spawn(BridgeStore::resolve_path(&path), publisher, INITIAL_BACKOFF);
 
     // Mutation A: acked, publish call 1 fails at t≈0, backoff 1s→2s.
     let b_a = b.clone();
@@ -431,7 +427,7 @@ async fn close_after_a_panicking_mutation_flushes_the_retained_snapshot() {
 
     let calls = Arc::new(AtomicUsize::new(0));
     let writer = StoreWriter::spawn(
-        BridgeStore::resolve_path(Some(&path)),
+        BridgeStore::resolve_path(&path),
         fail_first_publisher(calls.clone()),
         INITIAL_BACKOFF,
     );
@@ -485,7 +481,7 @@ async fn close_after_a_panicking_mutation_reports_a_persistent_failure() {
     let calls = Arc::new(AtomicUsize::new(0));
     let counter = calls.clone();
     let writer = StoreWriter::spawn(
-        BridgeStore::resolve_path(Some(&path)),
+        BridgeStore::resolve_path(&path),
         Arc::new(move |_s: &BridgeStore| {
             counter.fetch_add(1, Ordering::SeqCst);
             Err(anyhow!("disk is full"))

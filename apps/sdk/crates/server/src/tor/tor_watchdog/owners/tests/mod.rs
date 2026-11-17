@@ -528,10 +528,7 @@ async fn assert_slots_free() {
     });
 }
 
-fn test_config(
-    dir: &std::path::Path,
-    port: u16,
-) -> (Option<std::path::PathBuf>, crate::config::Config) {
+fn test_config(dir: &std::path::Path, port: u16) -> (std::path::PathBuf, crate::config::Config) {
     let config = crate::config::Config {
         listen: vec![format!("127.0.0.1:{port}")],
         ..Default::default()
@@ -539,8 +536,8 @@ fn test_config(
     let path = dir.join("server.ktav");
     std::fs::write(&path, ktav::to_string(&config).unwrap()).unwrap();
     match crate::config::Config::load_with_override(Some(&path)).unwrap() {
-        crate::config::Loaded::FromFile { path, config } => (Some(path), config),
-        crate::config::Loaded::Defaults(config) => (None, config),
+        crate::config::Loaded::FromFile { path, config } => (path, config),
+        crate::config::Loaded::Defaults(config) => (path, config),
     }
 }
 
@@ -568,7 +565,7 @@ fn shutdown_hook(
 
 fn builder(
     config: crate::config::Config,
-    config_path: Option<std::path::PathBuf>,
+    config_path: std::path::PathBuf,
     upstream: bool,
 ) -> crate::ServerBuilder {
     Server::builder(config).config_path(config_path).upstream(
@@ -580,7 +577,7 @@ fn builder(
 
 async fn start_server(
     config: crate::config::Config,
-    config_path: Option<std::path::PathBuf>,
+    config_path: std::path::PathBuf,
     settings: Settings,
     upstream: bool,
 ) -> std::result::Result<crate::ServerHandle, ServerError> {

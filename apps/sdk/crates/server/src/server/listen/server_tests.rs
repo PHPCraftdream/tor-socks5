@@ -107,7 +107,9 @@ async fn shutdown_is_polled_before_validating_config() {
     config.dns_server.enabled = true;
     let args = ServerArgs {
         config,
-        config_path: None,
+        // The shutdown future resolves before any config-file access; the
+        // path is required by `ServerArgs` but never touched here.
+        config_path: std::path::PathBuf::from("shutdown-first.ktav"),
         obs_sink: ObservationSink::new(),
         upstream_addr: None,
         upstream_user: None,
@@ -768,7 +770,7 @@ mod dual_port;
 
 /// Reload the on-disk bridge store for a test config path.
 fn reload_store(config_path: &Path) -> BridgeStore {
-    BridgeStore::load(BridgeStore::resolve_path(Some(config_path))).expect("reload store")
+    BridgeStore::load(BridgeStore::resolve_path(config_path)).expect("reload store")
 }
 
 fn test_bridge_line() -> BridgeLine {
@@ -805,7 +807,7 @@ async fn shutdown_producers_delayed_write_lands_before_close() {
     // locally spawned: the process-global OnceLock would leak this test's
     // path into every other test in the binary.
     let writer = tor_socks5_runtime::bridge_store_writer::StoreWriter::spawn(
-        BridgeStore::resolve_path(Some(&config_path)),
+        BridgeStore::resolve_path(&config_path),
         Arc::new(|s| s.save()),
         Duration::from_secs(1),
     );

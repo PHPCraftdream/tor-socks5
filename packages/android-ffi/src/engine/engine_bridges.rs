@@ -57,7 +57,7 @@ pub(super) fn select_active_probe_bridges(
     configured: &[BridgeLine],
     bridge_health: &BridgeHealthContext,
 ) -> Vec<BridgeLine> {
-    let store_path = BridgeStore::resolve_path(bridge_health.config_path.as_deref());
+    let store_path = bridge_store_path(bridge_health.config_path.as_deref());
     let store = BridgeStore::load(store_path).ok();
 
     // Drop retired bridges before anything else looks at the list. They are
@@ -170,7 +170,7 @@ pub(crate) fn persist_and_rank_probe(
 
     let _store_write = bridge_store_write_lock();
 
-    let store_path = BridgeStore::resolve_path(bridge_health.config_path.as_deref());
+    let store_path = bridge_store_path(bridge_health.config_path.as_deref());
     match BridgeStore::load(store_path.clone()) {
         Ok(mut store) => {
             let now = OffsetDateTime::now_utc();
@@ -226,6 +226,16 @@ pub(crate) async fn persist_and_rank_probe_async(
     }
 }
 
+/// Android resolves the bridge store itself: without a config path it keeps
+/// the historical default next to the working directory (the SDK crates no
+/// longer have such a fallback).
+pub(crate) fn bridge_store_path(config_path: Option<&std::path::Path>) -> std::path::PathBuf {
+    match config_path {
+        Some(path) => BridgeStore::resolve_path(path),
+        None => std::path::PathBuf::from("tor-socks5.alive-bridges.log"),
+    }
+}
+
 /// Path for the on-disk DNS fallback cache, next to the config file --
 /// same sibling-file convention as `active_bridges_path` in `lib.rs`.
 pub(super) fn dns_cache_path(config_path: Option<&std::path::Path>) -> std::path::PathBuf {
@@ -263,7 +273,7 @@ pub(super) fn barren_sources(bridge_health: &BridgeHealthContext, round: u32) ->
     if round.is_multiple_of(BARREN_SOURCE_RETRY_EVERY) {
         return HashSet::new();
     }
-    let path = BridgeStore::resolve_path(bridge_health.config_path.as_deref());
+    let path = bridge_store_path(bridge_health.config_path.as_deref());
     let Ok(store) = BridgeStore::load(path) else {
         return HashSet::new();
     };
@@ -301,7 +311,7 @@ pub(super) async fn barren_sources_async(
 pub(super) async fn needing_circuit_verification_async(
     bridge_health: &BridgeHealthContext,
 ) -> Vec<BridgeLine> {
-    let path = BridgeStore::resolve_path(bridge_health.config_path.as_deref());
+    let path = bridge_store_path(bridge_health.config_path.as_deref());
     let job = tokio::task::spawn_blocking(move || {
         BridgeStore::load(path).map(|store| {
             store.needing_circuit_verification(
@@ -335,7 +345,7 @@ pub(super) fn persist_bridge_sources(
         return;
     }
     let _store_write = bridge_store_write_lock();
-    let path = BridgeStore::resolve_path(bridge_health.config_path.as_deref());
+    let path = bridge_store_path(bridge_health.config_path.as_deref());
     let mut store = match BridgeStore::load(path) {
         Ok(store) => store,
         Err(error) => {
@@ -469,7 +479,7 @@ pub(super) fn persist_warm_results(pool: &WarmPool, bridge_health: &BridgeHealth
         return;
     }
     let _store_write = bridge_store_write_lock();
-    let path = BridgeStore::resolve_path(bridge_health.config_path.as_deref());
+    let path = bridge_store_path(bridge_health.config_path.as_deref());
     let mut store = match BridgeStore::load(path) {
         Ok(store) => store,
         Err(error) => {
@@ -528,7 +538,7 @@ pub(super) fn persist_circuit_verify_results(
         return;
     }
     let _store_write = bridge_store_write_lock();
-    let path = BridgeStore::resolve_path(bridge_health.config_path.as_deref());
+    let path = bridge_store_path(bridge_health.config_path.as_deref());
     let mut store = match BridgeStore::load(path) {
         Ok(store) => store,
         Err(error) => {
