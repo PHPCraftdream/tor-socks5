@@ -111,7 +111,6 @@ fn onion_keys_module() {
     assert!(names::<tor_socks5::onion::keys::KeysError>().contains("KeysError"));
     assert!(names::<tor_socks5::onion::keys::NewIdentity>().contains("NewIdentity"));
     let _ = tor_socks5::onion::keys::create_service;
-    let _ = tor_socks5::onion::keys::prepare_all;
 }
 
 /// One type is the same through every path that reaches it: the facade

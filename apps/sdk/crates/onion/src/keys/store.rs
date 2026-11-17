@@ -27,6 +27,7 @@ use safelog::DisplayRedacted as _;
 use tor_hscrypto::pk::{HsIdKey, HsIdKeypair};
 use tor_keymgr::{ArtiNativeKeystore, KeyMgr, KeyMgrBuilder, KeystoreSelector};
 use tor_llcrypto::rng::CautiousRng;
+use zeroize::Zeroizing;
 
 use super::specifier::{HsIdKeypairSpecifier, HsIdPublicKeySpecifier};
 use tor_persist::hsnickname::{HsNickname, InvalidNickname};
@@ -44,16 +45,16 @@ pub enum KeysError {
     #[error("invalid service nickname")]
     InvalidNickname(#[from] InvalidNickname),
     /// An identity already exists for the nickname.
-    #[error("nickname {0:?} already has an identity; pass --force to replace it (the old .onion address will be lost)")]
+    #[error("nickname {0:?} already has an identity")]
     IdentityExists(String),
     /// No service with this nickname.
     #[error("no onion service named {0:?}")]
     NotFound(String),
     /// The service exists but has no identity key yet.
-    #[error("service {0:?} has no key yet: it is created at the first start (or by `onion new --force`)")]
+    #[error("service {0:?} has no key yet: it is created at the first start")]
     NoKey(String),
     /// The export output file already exists.
-    #[error("{0} already exists; pass --force to overwrite it")]
+    #[error("{0} already exists")]
     ExportExists(String),
     /// The derived address does not match the address the key source claimed.
     #[error("address mismatch; key not saved")]
@@ -70,16 +71,15 @@ const EXPANDED_PRIVATE_EXT: &str = "ed25519_expanded_private";
 
 /// Parse and validate a service nickname.
 pub fn nickname(s: &str) -> Result<HsNickname, KeysError> {
-    Ok(HsNickname::new(s.to_owned()).context("invalid service nickname")?)
+    HsNickname::new(s.to_owned()).map_err(KeysError::InvalidNickname)
 }
 
 /// Cross-process mutation lock (sibling `<keystore>.lock`).
 ///
 /// Serialises onion mutations with each other AND with the running server:
 /// the server holds this lock for the whole time its configured onion
-/// services are published, so key mutations cannot race a live service. If
-/// the server is running, stop it first (`stop tor-socks5`) or the caller
-/// fails with the busy-lock error.
+/// services are published, so key mutations cannot race a live service. A
+/// caller that hits the busy lock must wait or retry on its own.
 pub fn lock(dir: &Path) -> Result<persist_lock::PathLock, KeysError> {
     lock_with(dir, persist_lock::CLI_LOCK_WAIT)
 }
@@ -87,7 +87,7 @@ pub fn lock(dir: &Path) -> Result<persist_lock::PathLock, KeysError> {
 /// [`lock`] with an explicit wait bound (tests use a short one).
 pub fn lock_with(dir: &Path, wait: Duration) -> Result<persist_lock::PathLock, KeysError> {
     Ok(persist_lock::PathLock::acquire_bounded(dir, wait).context(
-        "onion keystore lock is busy (the running tor-socks5 server or another onion command holds it; stop tor-socks5 first)",
+        "onion keystore lock is busy (a running server or another onion operation holds it)",
     )?)
 }
 
@@ -130,10 +130,12 @@ pub fn encode_key(file_bytes: &[u8]) -> String {
 }
 
 /// The keystore key file bytes behind a key text of the onion services file.
-pub fn decode_key(text: &str) -> Result<Vec<u8>, KeysError> {
-    Ok(BASE64
-        .decode(text.as_bytes())
-        .context("the key is not valid base64")?)
+pub fn decode_key(text: &str) -> Result<Zeroizing<Vec<u8>>, KeysError> {
+    Ok(Zeroizing::new(
+        BASE64
+            .decode(text.as_bytes())
+            .context("the key is not valid base64")?,
+    ))
 }
 
 /// Generate a fresh random identity keypair for `nick`.
@@ -200,10 +202,17 @@ pub fn remove_all(keystore_dir: &Path, nick: &HsNickname) -> Result<(), KeysErro
 /// staged in a throwaway keystore under the target nickname's path and read
 /// back as an [`HsIdKeypair`]. Anything that does not parse as a valid
 /// expanded ed25519 keypair is rejected.
-pub fn parse_identity_file(bytes: &[u8], nick: &HsNickname) -> Result<HsIdKeypair, KeysError> {
-    let staging = tempfile::tempdir().context("creating a staging keystore")?;
-    // Throwaway directory we just created: its parent (e.g. a shared /tmp) must
-    // not fail the permission check.
+pub fn parse_identity_file(
+    bytes: &[u8],
+    nick: &HsNickname,
+    staging_parent: &Path,
+) -> Result<HsIdKeypair, KeysError> {
+    // The caller chose the staging parent (the keystore dir): create it when
+    // it does not exist yet.
+    std::fs::create_dir_all(staging_parent).context("creating the staging parent")?;
+    let staging = tempfile::tempdir_in(staging_parent).context("creating a staging keystore")?;
+    // Throwaway directory we just created: its parent must not fail the
+    // permission check.
     let store = ArtiNativeKeystore::from_path_and_mistrust(
         staging.path(),
         &Mistrust::new_dangerously_trust_everyone(),
@@ -228,8 +237,13 @@ pub fn parse_identity_file(bytes: &[u8], nick: &HsNickname) -> Result<HsIdKeypai
 /// The bytes of the key file the keystore stores for `key` under `nick`:
 /// the portable format, produced by the keystore's own writer in a
 /// throwaway keystore (the mirror of [`parse_identity_file`]).
-pub fn identity_file_bytes(key: HsIdKeypair, nick: &HsNickname) -> Result<Vec<u8>, KeysError> {
-    let staging = tempfile::tempdir().context("creating a staging keystore")?;
+pub fn identity_file_bytes(
+    key: HsIdKeypair,
+    nick: &HsNickname,
+    staging_parent: &Path,
+) -> Result<Zeroizing<Vec<u8>>, KeysError> {
+    std::fs::create_dir_all(staging_parent).context("creating the staging parent")?;
+    let staging = tempfile::tempdir_in(staging_parent).context("creating a staging keystore")?;
     let store = ArtiNativeKeystore::from_path_and_mistrust(
         staging.path(),
         &Mistrust::new_dangerously_trust_everyone(),
@@ -241,23 +255,79 @@ pub fn identity_file_bytes(key: HsIdKeypair, nick: &HsNickname) -> Result<Vec<u8
         .context("building the staging key manager")?;
     insert(&keymgr, key, nick, true)?;
     let file = identity_file(staging.path(), nick).context("the staged identity file")?;
-    Ok(std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?)
+    Ok(Zeroizing::new(
+        std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?,
+    ))
+}
+
+/// Open a new secret file for writing (owner-only on Unix, refusing any
+/// existing path).
+#[cfg(unix)]
+fn open_new(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // `create_new` (O_CREAT|O_EXCL) refuses any existing path, symlinks included.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Open a new secret file for writing (refusing any existing path).
+#[cfg(not(unix))]
+fn open_new(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 /// Write a key file, restricting permissions to the owner where the OS
-/// supports it (Unix: mode 0600). On Windows there is no chmod: the file
-/// inherits the default ACL of its directory (private per-user temp/profile
-/// directories), like every other file arti writes there.
-pub fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), KeysError> {
+/// supports it (Unix: mode 0600, set at creation). On Windows there is no
+/// POSIX mode: the mode call is a no-op there and access is governed by the
+/// ACLs of the directory the caller chose.
+///
+/// Without `force` the file must not exist yet (`create_new`, which never
+/// follows an existing symlink) and an existing path is a typed
+/// [`KeysError::ExportExists`]. With `force` the bytes replace `path`
+/// atomically through a uniquely named temp file in the same parent
+/// directory (a symlink at `path` is replaced, not followed); a failure
+/// before the rename cleans the temp file up.
+pub fn write_secret_file(path: &Path, bytes: &[u8], force: bool) -> Result<(), KeysError> {
     use std::io::Write;
-    let mut file =
-        std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+    use std::os::unix::fs::PermissionsExt;
+
+    if force {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let temp = tempfile::Builder::new()
+            .prefix("onion-key")
+            .tempfile_in(parent)
+            .with_context(|| format!("creating a temp file next to {}", path.display()))?;
+        #[cfg(unix)]
+        temp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(anyhow::Error::new)?;
+        let (mut file, temp_path) = temp.into_parts();
+        file.write_all(bytes).map_err(anyhow::Error::new)?;
+        file.sync_all().map_err(anyhow::Error::new)?;
+        drop(file);
+        std::fs::rename(&temp_path, path)
+            .with_context(|| format!("replacing {}", path.display()))?;
+        return Ok(());
     }
+
+    let mut file = match open_new(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(KeysError::ExportExists(path.display().to_string()));
+        }
+        Err(error) => {
+            return Err(anyhow::Error::new(error)
+                .context(format!("creating {}", path.display()))
+                .into())
+        }
+    };
     file.write_all(bytes).map_err(anyhow::Error::new)?;
     file.sync_all().map_err(anyhow::Error::new)?;
     Ok(())
