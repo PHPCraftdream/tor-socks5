@@ -17,7 +17,11 @@ static RETAINED: std::sync::Mutex<Option<Arc<OwnerRegistry>>> = std::sync::Mutex
 #[cfg(test)]
 pub(super) static TEST_LIFECYCLE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-const CAPACITY: usize = 16;
+/// Extra Tor clients ("owners") the process can host besides the main one.
+/// One shared limit: `route::MAX_PRE_OWNERS` (route admission) and `storage`
+/// (slot locks) both derive from it.
+pub(crate) const MAX_OWNERS: usize = crate::route::MAX_PRE_OWNERS;
+const CAPACITY: usize = MAX_OWNERS + 1;
 
 pub(super) const SETUP_DEADLINE: Duration = Duration::from_secs(120);
 
@@ -27,6 +31,10 @@ const START_CONCURRENCY: usize = 3;
 struct Entry {
     pre: Option<Socks5PreEndpoint>,
     state: Mutex<EntryState>,
+    /// Set when the owner's client can carry a connection: the constructor
+    /// finished successfully (or the entry was adopted in tests) and no close
+    /// is in progress. Read without the state lock by `is_ready`.
+    ready: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug)]
@@ -60,6 +68,8 @@ struct State {
     /// Revive retries are owned here until close joins them. At most one
     /// unfinished retry is retained per owner endpoint.
     revivals: Vec<(Socks5PreEndpoint, Option<JoinHandle<()>>)>,
+    /// Background start tasks; joined on close like the revivals.
+    backgrounds: Vec<Option<JoinHandle<()>>>,
 }
 
 #[cfg(test)]
@@ -116,6 +126,7 @@ impl OwnerRegistry {
                 closed: false,
                 entries: Vec::new(),
                 revivals: Vec::new(),
+                backgrounds: Vec::new(),
             }),
             cancel: CancellationToken::new(),
             close_failed: std::sync::atomic::AtomicBool::new(false),
@@ -164,11 +175,7 @@ impl OwnerRegistry {
                 .find(|entry| entry.pre == *pre)
                 .cloned()
         };
-        entry.is_some_and(|entry| {
-            entry.state.try_lock().is_ok_and(|state| {
-                state.tunnel.is_some() && !state.failed && state.constructing.is_none()
-            })
-        })
+        entry.is_some_and(|entry| entry.ready.load(std::sync::atomic::Ordering::Acquire))
     }
 
     /// Starts the clients of `pres` in the background, a few at a time, and
@@ -191,7 +198,11 @@ impl OwnerRegistry {
             return None;
         }
         let registry = Arc::clone(self);
-        Some(tokio::spawn(async move {
+        // The registry keeps the real task handle so close() can join it; the
+        // returned handle is a completion monitor (a JoinHandle cannot be
+        // stored and handed out at once). Callers only track completion.
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
             use futures::StreamExt;
             futures::stream::iter(fresh)
                 .for_each_concurrent(START_CONCURRENCY, |pre| {
@@ -201,7 +212,22 @@ impl OwnerRegistry {
                     }
                 })
                 .await;
-        }))
+            let _ = done_tx.send(());
+        });
+        let handle = tokio::spawn(async move {
+            let _ = done_rx.await;
+        });
+        {
+            let mut state = self.state.lock().await;
+            if state.closed {
+                drop(state);
+                task.abort();
+                handle.abort();
+                return None;
+            }
+            state.backgrounds.push(Some(task));
+        }
+        Some(handle)
     }
 
     pub(crate) async fn revive(self: &Arc<Self>, pre: Socks5PreEndpoint) {
@@ -288,6 +314,9 @@ impl OwnerRegistry {
             result = retry => {
                 if matches!(result, Ok(Ok(()))) {
                     state.failed = false;
+                    entry
+                        .ready
+                        .store(true, std::sync::atomic::Ordering::Release);
                 }
             }
         }
@@ -323,6 +352,7 @@ impl OwnerRegistry {
                 }
                 let entry = Arc::new(Entry {
                     pre,
+                    ready: std::sync::atomic::AtomicBool::new(false),
                     state: Mutex::new(EntryState {
                         slot: None,
                         constructing: None,
@@ -416,6 +446,9 @@ impl OwnerRegistry {
                 Ok(Ok(value)) => value,
                 _ => {
                     state.failed = true;
+                    entry
+                        .ready
+                        .store(false, std::sync::atomic::Ordering::Release);
                     bail!("конструктор Tor завершился ошибкой");
                 }
             };
@@ -423,12 +456,21 @@ impl OwnerRegistry {
             state.tunnel = Some(constructed.tunnel);
             if let Err(error) = constructed.outcome {
                 state.failed = true;
+                entry
+                    .ready
+                    .store(false, std::sync::atomic::Ordering::Release);
                 return Err(error);
             }
         }
         if state.tunnel.is_none() {
+            entry
+                .ready
+                .store(false, std::sync::atomic::Ordering::Release);
             bail!("конструктор Tor владельца завершился ошибкой");
         }
+        entry
+            .ready
+            .store(true, std::sync::atomic::Ordering::Release);
         let selected = state.tunnel.clone();
         drop(state);
         Ok(Owner {
@@ -440,6 +482,16 @@ impl OwnerRegistry {
 
     pub(super) fn begin_close(&self) {
         self.cancel.cancel();
+        // A closing registry is not ready. Best effort: if the state lock is
+        // held by a selection in flight, that selection observes the
+        // cancellation itself; new selections bail at once.
+        if let Ok(state) = self.state.try_lock() {
+            for entry in &state.entries {
+                entry
+                    .ready
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
     }
 
     pub(super) fn retain_for_shutdown(self: &Arc<Self>) -> Result<()> {
@@ -508,6 +560,21 @@ impl OwnerRegistry {
                 }
             }
             state.revivals.clear();
+            // Same retention pattern as revivals: join finished background
+            // starts, keep the rest for a later close attempt.
+            for handle in &mut state.backgrounds {
+                if let Some(task) = handle.as_mut() {
+                    if task.is_finished() {
+                        let result = task.await;
+                        *handle = None;
+                        if result.is_err() {
+                            self.close_failed
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+            state.backgrounds.retain(Option::is_some);
             state.entries.clone()
         };
         use futures::stream::{FuturesUnordered, StreamExt};
@@ -629,6 +696,9 @@ impl OwnerRegistry {
         let mut state = entry.state.lock().await;
         state.attempted = true;
         state.failed = failed;
+        entry
+            .ready
+            .store(!failed, std::sync::atomic::Ordering::Release);
         state.slot = Some(1);
         state.tunnel = Some(tunnel);
     }

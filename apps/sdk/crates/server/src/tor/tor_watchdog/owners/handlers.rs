@@ -54,8 +54,11 @@ impl HandlerTasks {
         while let Some(result) = tasks.try_join_next() {
             Self::report(result);
         }
-        if self.closed.load(Ordering::Acquire) || tasks.len() >= MAX_CONCURRENT_CONNECTIONS {
-            warn!("connection task admission closed or full");
+        // Concurrency is bounded by the connection-permit semaphore
+        // (`MAX_CONCURRENT_CONNECTIONS` permits); the JoinSet only holds tasks
+        // whose permit was already released, so it must never reject.
+        if self.closed.load(Ordering::Acquire) {
+            warn!("connection admission closed");
             return;
         }
         tasks.spawn(task);
@@ -352,6 +355,105 @@ mod tests {
                 })
                 .await;
             assert!(late_rx.await.is_err());
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A permit released while its handler task still sits in the JoinSet must
+    /// not make the next connection fail admission: the waiting client has to
+    /// be served (SOCKS greeting) once the slot frees, never closed silently.
+    #[tokio::test]
+    async fn a_freed_slot_serves_a_connection_that_waited_out_the_saturation() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let handlers = Arc::new(HandlerTasks::new());
+            let permits = Arc::new(tokio::sync::Semaphore::new(1));
+            // An upstream that completes the TCP connect (listener backlog) but
+            // never answers the SOCKS handshake: the first handler hangs, holding
+            // the only permit.
+            let hang = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let hang_addr = hang.local_addr().unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            // Drive the accept loop in the background: a `FuturesUnordered`
+            // only progresses while polled.
+            let mut accept_loops = futures::stream::FuturesUnordered::new();
+            accept_loops.push(handlers.clone().accept_loop_tracked(
+                listener,
+                Egress::Upstream(Arc::new(upstream::Upstream::new(
+                    hang_addr.to_string(),
+                    None,
+                ))),
+                None,
+                permits.clone(),
+                ConnectionTracking {
+                    conn_health: ConnHealthCounters::default(),
+                    next_conn_id: Arc::new(AtomicU64::new(1)),
+                },
+                Default::default(),
+            ));
+            let driver = tokio::spawn(async move {
+                use futures::StreamExt;
+                while accept_loops.next().await.is_some() {}
+            });
+            // First client: greeting + CONNECT; its handler hangs in the upstream.
+            let mut first = TcpStream::connect(address).await.unwrap();
+            first.write_all(&[5, 1, 0]).await.unwrap();
+            let mut greeting = [0u8; 2];
+            first.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 0]);
+            first
+                .write_all(&[
+                    5, 1, 0, 3, 11, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o',
+                    b'm', 0x01, 0xbb,
+                ])
+                .await
+                .unwrap();
+            while permits.available_permits() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // Take over the upstream socket the handler connected to, so its
+            // reset can end the hung handshake later.
+            let (hang_conn, _) = hang.accept().await.unwrap();
+            assert_eq!(handlers.tasks.lock().await.len(), 1);
+            // Second client arrives while saturated: its greeting must NOT be
+            // answered yet (the accept loop is parked in permit acquisition).
+            let mut second = TcpStream::connect(address).await.unwrap();
+            second.write_all(&[5, 1, 0]).await.unwrap();
+            let mut probe = [0u8; 1];
+            assert!(tokio::time::timeout(
+                Duration::from_millis(200),
+                second.read_exact(&mut probe)
+            )
+            .await
+            .is_err());
+            // Free the slot: closing the client alone is not enough because
+            // the handler is parked on the upstream read — resetting the
+            // upstream socket makes the handler finish and release its
+            // permit; the waiting connection must then be served and get a
+            // SOCKS greeting reply (the old code closed it silently instead).
+            drop(first);
+            drop(hang_conn);
+            drop(hang);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while permits.available_permits() != 1 {
+                if tokio::time::Instant::now() > deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let reply = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut reply = [0u8; 2];
+                second.read_exact(&mut reply).await.unwrap();
+                reply
+            })
+            .await
+            .unwrap();
+            assert_eq!(reply, [5, 0]);
+            driver.abort();
+            handlers.shutdown().await.unwrap();
+            drop(second);
         })
         .await
         .unwrap();

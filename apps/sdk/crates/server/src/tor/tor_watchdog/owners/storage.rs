@@ -5,7 +5,8 @@ use std::sync::Mutex;
 
 use anyhow::{anyhow, bail, Result};
 
-const LIMIT: usize = 15;
+// Same shared limit as route admission: one extra Tor client per slot.
+const LIMIT: usize = super::MAX_OWNERS;
 const MARKER: &[u8] = b"tor-socks5 owners-v1\n";
 // Статик существует и в тестах ради `quarantine_held`; сами тесты берут хранилище
 // через карантин реестра.

@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use arti_wrapper::{RoutedStream, TorError};
 use proxy_config::ProxyPool;
+use resocks5_net::server::Reply;
 use resocks5_net::types::ProxyConfig;
 use route_pool::{PoolError, Verdict};
 use tokio::time::{timeout_at, Instant};
@@ -51,6 +52,28 @@ enum AttemptError {
     TimedOut(&'static str),
     Closed,
     Connect(TorError),
+}
+
+impl Failure {
+    /// The SOCKS reply the client should get for this failure.
+    pub(super) fn reply(&self) -> Reply {
+        match self {
+            Self::Forbidden => Reply::Forbidden,
+            Self::TimedOut(_) => Reply::TimedOut,
+            Self::Unavailable | Self::Closed | Self::Connect(_) => Reply::GeneralFailure,
+        }
+    }
+
+    /// The error the connection task reports for this failure.
+    pub(super) fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Forbidden => anyhow::anyhow!("route rejected"),
+            Self::Unavailable => anyhow::anyhow!("tor tunnel unavailable (shutting down?)"),
+            Self::Closed => anyhow::anyhow!("owner registry is closing"),
+            Self::TimedOut(message) => anyhow::anyhow!(message),
+            Self::Connect(error) => anyhow::Error::new(error),
+        }
+    }
 }
 
 impl From<AttemptError> for Failure {
@@ -111,7 +134,9 @@ pub(super) async fn connect<C: TorConnector + Send>(
         Plan::Direct(registry) => {
             let owner = match timeout_at(deadline, registry.select_endpoint(None)).await {
                 Ok(Ok(owner)) => owner,
-                _ => return Err(Failure::Forbidden),
+                Ok(Err(_)) if registry.is_closing() => return Err(Failure::Closed),
+                Ok(Err(_)) => return Err(Failure::Forbidden),
+                Err(_) => return Err(Failure::TimedOut(OWNER_TIMEOUT)),
             };
             Ok(attempt(leg, &owner, connector, host, port, deadline).await?)
         }
@@ -345,6 +370,19 @@ mod tests {
     use super::*;
 
     const BRIDGE: &str = "192.0.2.1:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01";
+
+    #[test]
+    fn failure_replies_distinguish_shutdown_timeout_and_policy() {
+        assert_eq!(Failure::Forbidden.reply(), Reply::Forbidden);
+        assert_eq!(Failure::Closed.reply(), Reply::GeneralFailure);
+        assert_eq!(Failure::Unavailable.reply(), Reply::GeneralFailure);
+        assert_eq!(Failure::TimedOut(OWNER_TIMEOUT).reply(), Reply::TimedOut);
+        let connect = Failure::Connect(TorError::PostSocks(
+            socks5_proto::client::Error::InvalidInput,
+        ));
+        assert_eq!(connect.reply(), Reply::GeneralFailure);
+        assert!(Failure::Closed.into_error().to_string().contains("closing"));
+    }
 
     fn ensure_crypto_provider() {
         static INIT: std::sync::Once = std::sync::Once::new();
