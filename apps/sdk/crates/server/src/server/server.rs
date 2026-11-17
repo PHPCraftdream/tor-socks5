@@ -31,9 +31,7 @@ use crate::upstream::RelayRemote::{Tor, Upstream};
 #[cfg(test)]
 use tor_socks5_runtime::arti_observability::ObservationSink;
 use tor_socks5_runtime::conn_health::ConnHealthCounters;
-use tor_socks5_runtime::tor_watchdog::{
-    spawn_bridge_failover_watchdog, spawn_tor_watchdog, TorHandle,
-};
+use tor_socks5_runtime::tor_watchdog::TorHandle;
 
 /// Maximum concurrent SOCKS5 connections. Each may run an Argon2id verify
 /// (~5 MiB working memory, 2 passes), so unbounded spawns risk resource
@@ -88,6 +86,18 @@ impl Drop for HandlerRunGuard {
 }
 
 async fn run_server_inner(
+    set_stage: &mut impl FnMut(crate::api::ServerStage),
+    on_ready: &mut impl FnMut(Vec<std::net::SocketAddr>),
+    args: ServerArgs,
+    shutdown: impl std::future::Future<Output = ()>,
+    writer_started: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    tor_socks5_runtime::workers::begin_run_group()?;
+    let result = run_server_body(set_stage, on_ready, args, shutdown, writer_started).await;
+    lifecycle::finish_run_group(result).await
+}
+
+async fn run_server_body(
     set_stage: &mut impl FnMut(crate::api::ServerStage),
     on_ready: &mut impl FnMut(Vec<std::net::SocketAddr>),
     args: ServerArgs,
@@ -298,7 +308,8 @@ async fn run_server_inner(
             let Some(tor) = global_init::wait_startup(&mut shutdown, init.wait(), || async {
                 init.cancel();
                 global_init::stop_startup().await?;
-                if let Some(result) = global_init::close_store_writer().await {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                if let Some(result) = global_init::close_store_writer(Some(deadline)).await {
                     result?;
                 }
                 Ok(())
@@ -317,14 +328,6 @@ async fn run_server_inner(
             // both without re-distribution. Cheap to clone (one
             // `Arc<RwLock<_>>` + two atomics).
             let handle = TorHandle::new_with_settings(tor, &settings);
-            obs_sink.set_recovery_notifier(handle.bridge_refresh().recovery());
-            handle.bridge_refresh().set_needed(
-                cfg.bridges.auto_fetch
-                    && tor_socks5_runtime::bridge_maintenance::preferred_missing(
-                        &cfg,
-                        &settings.bridges,
-                    ),
-            );
 
             let template = if settings.pre_endpoint.is_some() {
                 Ok(settings.clone())
@@ -341,7 +344,7 @@ async fn run_server_inner(
             init.complete_handoff()?;
             if global_init::launch_background() {
                 let mut launch = producers::LaunchGuard::new(producer_owner.clone());
-                bridge_producers::launch(
+                tor_socks5_runtime::bridge_producers::launch_producers(
                     handle.clone(),
                     config_path.clone(),
                     &cfg,
@@ -661,8 +664,10 @@ async fn run_server_inner(
         // its actor task, so a publish that only recovered after the last
         // mutation is not silently lost when the runtime tears down. With
         // Writer закрывается после ограниченного ожидания производителей.
-        // Если задача ещё сохранена, её поздние обновления могут быть отклонены.
-        if let Some(Err(error)) = global_init::close_store_writer().await {
+        // Close is bounded: on timeout the writer stays retained in its
+        // closing slot and late flushes still land.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        if let Some(Err(error)) = global_init::close_store_writer(Some(deadline)).await {
             warn!(error = %error, "bridge health store had unpublished updates at shutdown");
             shutdown_errors.push(error);
         }
@@ -934,9 +939,6 @@ async fn handle_client_with_connector<C: TorConnector + Send>(
     }
     Ok(())
 }
-
-#[path = "../fetch/bridge_producers.rs"]
-mod bridge_producers;
 
 #[path = "../tor/tor_watchdog/owners/producers.rs"]
 mod producers;

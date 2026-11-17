@@ -2,113 +2,9 @@
 // Сеть Tor подменена хуком `RUN_SERVER_SHUTDOWN` (туннель не загружается), всё
 // остальное — SDK `Server::builder`: привязка портов, процессные слоты, остановка.
 
-use super::storage::quarantine_held;
 use super::*;
-use crate::server::handlers::HandlerTasks;
-use crate::server::{global_init, producers};
-use crate::{Server, ServerError, ServerStatus};
 use std::future::Future;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tor_socks5_runtime::{bridge_store_writer, workers};
-
-#[derive(Debug, PartialEq)]
-struct Slots {
-    settings: bool,
-    global_init: bool,
-    producers: bool,
-    handlers: bool,
-    registry: bool,
-    writer: bool,
-    workers_busy: usize,
-    quarantine: usize,
-}
-
-async fn slots() -> Slots {
-    Slots {
-        settings: global_init::startup_snapshot(false).0,
-        global_init: global_init::startup_snapshot(true).0,
-        producers: producers::ProducerTasks::is_retained(),
-        handlers: HandlerTasks::retained().is_some(),
-        registry: OwnerRegistry::is_retained(),
-        writer: !bridge_store_writer::global_is_idle(),
-        workers_busy: workers::global_busy_count().await,
-        quarantine: quarantine_held(),
-    }
-}
-
-fn free(quarantine: usize) -> Slots {
-    Slots {
-        settings: false,
-        global_init: false,
-        producers: false,
-        handlers: false,
-        registry: false,
-        writer: false,
-        workers_busy: 0,
-        quarantine,
-    }
-}
-
-fn test_config(dir: &std::path::Path, port: u16) -> (std::path::PathBuf, crate::config::Config) {
-    let config = crate::config::Config {
-        listen: vec![format!("127.0.0.1:{port}")],
-        ..Default::default()
-    };
-    let path = dir.join("server.ktav");
-    std::fs::write(&path, ktav::to_string(&config).unwrap()).unwrap();
-    match crate::config::Config::load_with_override(Some(&path)).unwrap() {
-        crate::config::Loaded::FromFile { path, config } => (path, config),
-        crate::config::Loaded::Defaults(config) => (path, config),
-    }
-}
-
-fn test_settings(dir: &std::path::Path) -> Settings {
-    Settings {
-        bridges: vec!["192.0.2.1:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01"
-            .parse()
-            .unwrap()],
-        state_dir: Some(dir.join("state")),
-        ..Default::default()
-    }
-}
-
-fn shutdown_hook(
-    settings: Settings,
-    failure: Option<global_init::BootstrapFailure>,
-) -> Arc<global_init::ShutdownHook> {
-    Arc::new(global_init::ShutdownHook {
-        settings,
-        writer: None,
-        failure,
-        ready: std::sync::Mutex::new(None),
-    })
-}
-
-fn builder(
-    config: crate::config::Config,
-    config_path: std::path::PathBuf,
-    upstream: bool,
-) -> crate::ServerBuilder {
-    Server::builder(config).config_path(config_path).upstream(
-        upstream.then(|| "127.0.0.1:1".to_string()),
-        None,
-        None,
-    )
-}
-
-async fn start_server(
-    config: crate::config::Config,
-    config_path: std::path::PathBuf,
-    settings: Settings,
-    upstream: bool,
-) -> std::result::Result<crate::ServerHandle, ServerError> {
-    global_init::RUN_SERVER_SHUTDOWN
-        .scope(
-            shutdown_hook(settings, None),
-            builder(config, config_path, upstream).start(),
-        )
-        .await
-}
 
 async fn wait_for_status(
     status: &mut tokio::sync::watch::Receiver<ServerStatus>,
@@ -222,8 +118,11 @@ async fn sdk11_server_required_dns_readiness_reports_udp_tcp_addresses() {
     assert_slots_free().await;
 }
 
-/// One full run through the SDK API: ready, in-cycle slot ownership, and
-/// ожидание реального блокирующего работника при graceful shutdown.
+/// One full run through the SDK API: ready, in-cycle slot ownership, and a
+/// bounded stop. A parked registry worker spawned via the free wrappers during
+/// the run is foreign to the run's worker group, so neither start nor shutdown
+/// waits for it; the run's own group workers are still joined by the producer
+/// choreography, and the process registry is drained explicitly at the end.
 async fn run_once(dir: &std::path::Path, port: u16, upstream: bool) -> (Slots, anyhow::Result<()>) {
     let (config_path, config) = test_config(dir, port);
     let settings = test_settings(dir);
@@ -242,33 +141,22 @@ async fn run_once(dir: &std::path::Path, port: u16, upstream: bool) -> (Slots, a
         tokio::task::yield_now().await;
     }
 
-    let mut status = handle.subscribe();
-    let mut shutdown = Box::pin(handle.shutdown());
-    assert!(
-        std::future::poll_fn(|cx| {
-            std::task::Poll::Ready(shutdown.as_mut().poll(cx).is_pending())
-        })
+    let status = handle.subscribe();
+    // The parked worker lives in the process registry, not the run group:
+    // shutdown must complete without releasing it first.
+    let result = tokio::time::timeout(Duration::from_secs(30), handle.shutdown())
         .await
-    );
-    let stopping = wait_for_status(&mut status, |status| {
-        matches!(status, ServerStatus::Stopping { .. })
-    })
-    .await;
-    assert!(matches!(stopping, ServerStatus::Stopping { .. }));
-    assert!(
-        std::future::poll_fn(|cx| {
-            std::task::Poll::Ready(shutdown.as_mut().poll(cx).is_pending())
-        })
-        .await,
-        "shutdown must join the registered blocking worker"
-    );
-    release_tx.send(()).unwrap();
-    worker.await.unwrap().unwrap().unwrap();
-    let result = shutdown.await.map_err(ServerError::into_anyhow);
+        .expect("shutdown must not wait for a foreign parked worker")
+        .map_err(ServerError::into_anyhow);
     assert!(matches!(
         status.borrow().clone(),
         ServerStatus::Stopped { .. }
     ));
+    release_tx.send(()).unwrap();
+    worker.await.unwrap().unwrap().unwrap();
+    workers::join_blocking_workers()
+        .await
+        .expect("process registry must drain after releasing the worker");
     (running, result)
 }
 
@@ -426,39 +314,6 @@ async fn sdk11_server_ready_address_completes_socks5_greeting() {
     drop(client);
     handle.shutdown().await.unwrap();
     assert_slots_free().await;
-}
-
-fn assert_running_at(handle: &crate::ServerHandle, port: Option<u16>) {
-    match handle.status() {
-        ServerStatus::Running { listen_addrs } => {
-            assert!(!listen_addrs.is_empty());
-            assert_eq!(listen_addrs[0].ip(), std::net::Ipv4Addr::LOCALHOST);
-            if let Some(port) = port {
-                assert_eq!(listen_addrs[0].port(), port);
-            } else {
-                assert_ne!(
-                    listen_addrs[0].port(),
-                    0,
-                    "port zero must report its bound port"
-                );
-            }
-        }
-        status => panic!("expected Running with actual bound address, got {status:?}"),
-    }
-}
-
-async fn assert_slots_free() {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let current = slots().await;
-            if current == free(current.quarantine) {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("server resources remained retained after shutdown");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -834,8 +689,36 @@ async fn sdk11_server_watch_reports_starting_running_stopping_and_stopped() {
         .await,
         "blocked writer must keep shutdown pending at Stopping"
     );
+    // The hung flush lives in the injected hook writer; `close_store_writer`'s
+    // hook branch closes it directly with the deadline (the run slot is never
+    // occupied here). The close signal bypasses the mutation queue, so shutdown
+    // usually completes clean despite the hung flush; if it does wait, it must
+    // give up at the deadline and report the retained writer. Either way the
+    // hung flush may not hold shutdown longer than the bounded budget.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let outcome = tokio::time::timeout_at(deadline, shutdown)
+        .await
+        .expect("hung flush held shutdown longer than the bounded cleanup budget");
+    if let Err(error) = outcome {
+        let chain = format!("{:#}", error.into_anyhow());
+        assert!(
+            chain.contains("did not finish within the deadline"),
+            "unexpected shutdown error: {chain}"
+        );
+    }
     release_tx.send(()).unwrap();
-    shutdown.await.unwrap();
+    // The released publish leaves a finished job in the process registry;
+    // drain it the way the app would so later runs see a clear registry.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while workers::global_busy_count().await > 0 {
+            let _ =
+                tokio::time::timeout(Duration::from_millis(500), workers::join_blocking_workers())
+                    .await;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("process registry did not drain after releasing the publisher");
     let stopped = wait_for_status(&mut status, |status| {
         matches!(status, ServerStatus::Stopped { .. })
     })
@@ -844,5 +727,7 @@ async fn sdk11_server_watch_reports_starting_running_stopping_and_stopped() {
         stopped,
         ServerStatus::Stopped { listen_addrs } if listen_addrs == running
     ));
+    // The injected writer never occupied the run slot, so once the workers
+    // drain all slots are free again.
     assert_slots_free().await;
 }

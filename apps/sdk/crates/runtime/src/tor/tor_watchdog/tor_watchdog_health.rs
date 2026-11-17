@@ -229,6 +229,11 @@ impl BridgeRefresh {
         self.needed.store(needed, Ordering::Relaxed);
     }
 
+    /// Whether a bridge refresh is currently marked as needed.
+    pub fn is_needed(&self) -> bool {
+        self.needed.load(Ordering::Relaxed)
+    }
+
     /// Wake the refresh waiter if a refresh is currently needed.
     pub fn request(&self) {
         if self.needed.load(Ordering::Relaxed) {

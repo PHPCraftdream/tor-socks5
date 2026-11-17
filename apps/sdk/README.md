@@ -317,6 +317,11 @@ for outcome in &outcomes {
 let flush = close_global().await;
 ```
 
+For a host that wants the watchdogs launched too, `launch_producers` wires the
+bridge-refresh signaling and spawns the bridge manager plus the stale-channel
+and soft-failover watchdogs into a caller-owned `Vec<JoinHandle<()>>` (cancel
+the `CancellationToken`, then join the tasks at shutdown).
+
 For a host with a parent cancellation token, `start_with_parent_token` makes
 the manager's producer token its child. `BridgeManagerHandle::transfer_tasks`
 can move join handles into the host's own task owner; after transfer that owner

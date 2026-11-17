@@ -44,12 +44,13 @@ impl std::error::Error for ProducerFailures {
 
 // После close последняя публикация тоже должна попасть в терминальный join.
 pub(super) async fn join_final_workers() -> Result<()> {
+    // The run waits only on its own run group's workers, not the process registry.
     tokio::time::timeout(
         Duration::from_secs(5),
-        tor_socks5_runtime::workers::join_blocking_workers(),
+        tor_socks5_runtime::workers::join_run_group(),
     )
     .await
-    .map_err(|_| anyhow!("final blocking worker shutdown timed out; process registry retained"))?
+    .map_err(|_| anyhow!("final blocking worker shutdown timed out; run group retained"))?
 }
 
 static RETAINED: Mutex<Option<Arc<ProducerTasks>>> = Mutex::new(None);
@@ -175,11 +176,11 @@ impl ProducerTasks {
                 }
             }
             #[cfg(not(test))]
-            let children_result = tor_socks5_runtime::workers::join_blocking_workers().await;
+            let children_result = tor_socks5_runtime::workers::join_run_group().await;
             #[cfg(test)]
             let children_result = match &self.children {
                 Some(children) => children.join().await,
-                None => tor_socks5_runtime::workers::join_blocking_workers().await,
+                None => tor_socks5_runtime::workers::join_run_group().await,
             };
             if let Err(error) = children_result {
                 self.failure
@@ -282,6 +283,9 @@ mod tests {
     async fn pre_launch_cancellation_retains_parked_maintenance_until_join() {
         use tor_socks5_runtime::test_seams::{ParkedGate, Site, HANG_GUARD};
         let _serial = super::super::owners::TEST_LIFECYCLE.lock().await;
+        // Install a run group so the parked config-load worker lands in the
+        // run-scoped slots and `owner.join` actually waits on it.
+        tor_socks5_runtime::workers::begin_run_group().unwrap();
         let _ = rustls::crypto::ring::default_provider().install_default();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("proxy.ktav");
@@ -306,7 +310,7 @@ mod tests {
         let gate = ParkedGate::arm(Site::MaintenanceConfigLoad, &path);
         let owner = ProducerTasks::retain().unwrap();
         let mut launch = LaunchGuard::new(owner.clone());
-        super::super::bridge_producers::launch(
+        tor_socks5_runtime::bridge_producers::launch_producers(
             handle,
             path,
             &cfg,
@@ -323,10 +327,14 @@ mod tests {
             .unwrap();
         owner.cancel();
         // Post-H9 the maintenance task exits promptly on cancellation without
-        // waiting for the parked config load; the load worker itself stays
-        // registered in the blocking-worker registry, so join must still time
-        // out until the gate is released.
-        assert!(owner.join(Duration::ZERO).await.is_err());
+        // waiting for the parked config load. The load worker runs through
+        // the run-style wrapper, so it stays registered in the process
+        // registry (not the run group); the run-group join completes without
+        // waiting on it, and the parked worker is drained via the registry
+        // join after the gate is released.
+        // A real budget: the maintenance task needs a scheduler turn to observe
+        // the cancellation; the join must still not wait on the parked worker.
+        owner.join(Duration::from_secs(10)).await.unwrap();
         assert!(
             tor_socks5_runtime::workers::global_busy_count().await >= 1,
             "parked blocking config load must stay registered across cancellation"
@@ -334,11 +342,18 @@ mod tests {
         gate.release();
         owner.join(Duration::from_secs(10)).await.unwrap();
         assert!(!owner.has_retained_handle().await);
+        // Join the process registry so the released parked worker is reaped.
+        tor_socks5_runtime::workers::join_blocking_workers()
+            .await
+            .unwrap();
         assert_eq!(
             tor_socks5_runtime::workers::global_busy_count().await,
             0,
             "released worker must be joined and the registry drained"
         );
+        tor_socks5_runtime::workers::end_run_group(Duration::from_secs(10))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

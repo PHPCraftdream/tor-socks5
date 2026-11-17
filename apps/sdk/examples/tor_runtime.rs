@@ -1,12 +1,11 @@
 use std::error::Error;
 use std::io::{self, ErrorKind};
 use std::path::PathBuf;
-use std::time::Duration;
 
 use tor_socks5::config::Config;
 use tor_socks5::runtime::{
-    build_tor_settings_with_pt, close_global, init_global, observation_layer, spawn_tor_watchdog,
-    start, BridgeManagerConfig, ObservationSink, PtBinary, TorHandle,
+    build_tor_settings_with_pt, close_global, init_global, launch_producers, observation_layer,
+    CancellationToken, ObservationSink, PtBinary, TorHandle,
 };
 use tor_socks5::tor::TorTunnel;
 use tracing_subscriber::layer::SubscriberExt;
@@ -44,37 +43,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let tunnel = TorTunnel::bootstrap_with(settings.clone()).await?;
     let handle = TorHandle::new_with_settings(tunnel, &settings);
     let _writer = init_global(&config_path);
-    let manager = start(
+    let token = CancellationToken::new();
+    let mut producers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    launch_producers(
         handle.clone(),
         config_path.clone(),
         &config,
-        observations,
-        BridgeManagerConfig {
-            settings,
-            pt_binary,
-        },
-    );
-    let watchdog = spawn_tor_watchdog(
-        handle.clone(),
-        config_path,
-        config.watchdog,
-        manager.token(),
+        observations.clone(),
+        settings.clone(),
+        pt_binary.clone(),
+        token.clone(),
+        &mut producers,
     );
 
     let signal_result = tokio::signal::ctrl_c().await;
-    manager.shutdown_with_timeout(Duration::from_secs(30)).await;
-    let watchdog_result = watchdog.map(|run| run.join);
-    let watchdog_result = match watchdog_result {
-        Some(join) => Some(join.await),
-        None => None,
-    };
+    token.cancel();
+    for producer in producers {
+        let _ = producer.await;
+    }
     let store_result = close_global().await;
     drop(handle.drain().await);
 
     signal_result?;
-    if let Some(result) = watchdog_result {
-        result?;
-    }
     if let Some(result) = store_result {
         result?;
     }

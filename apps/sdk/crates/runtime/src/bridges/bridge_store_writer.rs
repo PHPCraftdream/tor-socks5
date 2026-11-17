@@ -6,9 +6,12 @@
 //! path in, handle out), [`StoreWriter::apply`] sends one mutation,
 //! [`StoreWriter::close`] stops it and returns the final flush result.
 //! [`init_global`] / [`close_global`] are the process-wide slot on top of
-//! the same actor: at most one live writer per process, and a sequential
-//! restart works — after a close the slot is empty, so the next
-//! [`init_global`] starts a fresh writer, never the closed one. The
+//! the same actor; a separate server-run slot (`init_run` / `close_run`,
+//! `bridge_maintenance/run_writer.rs`) lets the SDK server open its own
+//! writer per run and never touch the app's global writer. [`apply`]
+//! prefers the run writer. Each slot holds at most one live writer and a
+//! sequential restart works — after a close the slot is empty, so the
+//! next init starts a fresh writer, never a closed one. The
 //! publish strategy (production: `BridgeStore::save`, standard retry
 //! backoff) is not configurable through the public API; the injectable
 //! constructor is a test seam (R10).
@@ -850,16 +853,16 @@ async fn try_start_publish(
 ///   second `close_global` gets `None`.
 /// * The closing task empties the slot (`Closing -> Idle`) as soon as the
 ///   close completes, so the slot never keeps referencing a closed writer.
-enum Slot {
-    Idle,
-    Active(StoreWriter),
-    Closing(StoreWriter),
-}
-
+#[path = "bridge_maintenance/run_writer.rs"]
+mod run_writer;
+#[cfg(any(test, feature = "test-seams"))]
+pub use run_writer::run_is_idle;
+use run_writer::Slot;
+/// Run-scoped slot used by the SDK server (one writer per server run).
+pub use run_writer::{close_run, init_run};
 static WRITER: Mutex<Slot> = Mutex::new(Slot::Idle);
 
-/// Serializes the tests that drive the process-global writer slot (each
-/// uses its own tempdir path, but the slot itself is process-global).
+/// Serializes the tests that drive the process-global writer slot.
 #[cfg(test)]
 pub(crate) static GLOBAL_WRITER_TEST_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
@@ -872,10 +875,7 @@ pub(crate) static GLOBAL_WRITER_TEST_LOCK: tokio::sync::Mutex<()> =
 /// the next call starts a fresh writer, so an engine restarted in the same
 /// process does not inherit a dead one.
 ///
-/// Contract (RT-0): at most one live writer per process, and a
-/// sequential restart works — the close empties the slot, so
-/// [`init_global`] after a completed [`close_global`] never hands back
-/// a closed writer.
+/// Contract (RT-0): one live writer per process; the close empties the slot.
 pub fn init_global(config_path: &Path) -> StoreWriter {
     let resolved = BridgeStore::resolve_path(config_path);
     let mut slot = WRITER.lock().unwrap_or_else(|error| error.into_inner());
@@ -967,16 +967,16 @@ pub async fn close_global() -> Option<Result<()>> {
     }
 }
 
-/// Apply a mutation through the single writer when this process has one for
-/// `config_path`; otherwise (CLI subcommands, unit tests) fall back to a
-/// locked whole-file read-modify-write on the blocking pool.
+/// Apply a mutation through the single writer for `config_path` (the
+/// server-run writer takes precedence over the app's global writer);
+/// otherwise fall back to a locked whole-file RMW on the blocking pool.
 pub(crate) async fn apply(
     config_path: &Path,
     apply: impl FnOnce(&mut BridgeStore) + Send + 'static,
 ) -> Result<()> {
     let resolved = BridgeStore::resolve_path(config_path);
-    match global() {
-        Some(writer) if writer.path() == resolved => writer.apply(apply).await,
+    match (run_writer::run_current(), global()) {
+        (Some(w), _) | (None, Some(w)) if w.path() == resolved => w.apply(apply).await,
         _ => crate::workers::run_fallible_blocking(move || {
             #[cfg(any(test, feature = "test-seams"))]
             crate::test_seams::park_if_armed(crate::test_seams::Site::PreAcquire, &resolved);

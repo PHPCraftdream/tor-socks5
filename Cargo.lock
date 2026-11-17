@@ -7311,6 +7311,7 @@ dependencies = [
  "bridge-verify-core",
  "persist-lock",
  "tokio",
+ "tokio-util",
  "tor-socks5-auth",
  "tor-socks5-client-acl",
  "tor-socks5-config",
