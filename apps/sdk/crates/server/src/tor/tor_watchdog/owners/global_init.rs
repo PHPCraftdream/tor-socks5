@@ -81,19 +81,29 @@ pub(super) fn init_store_writer(path: Option<&std::path::Path>) {
     {
         return;
     }
-    tor_socks5_runtime::bridge_store_writer::init_global(path);
+    tor_socks5_runtime::bridge_store_writer::init_run(path);
 }
 
-pub(super) async fn close_store_writer() -> Option<Result<()>> {
+pub(super) async fn close_store_writer(
+    deadline: Option<tokio::time::Instant>,
+) -> Option<Result<()>> {
     #[cfg(test)]
     if let Ok(Some(writer)) = RUN_SERVER_SHUTDOWN.try_with(|hook| hook.writer.clone()) {
-        return Some(writer.close().await);
+        let close = writer.close();
+        return Some(match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, close).await.unwrap_or_else(|_| {
+                Err(anyhow::anyhow!(
+                    "bridge store writer close did not finish within the deadline; writer retained in the closing slot"
+                ))
+            }),
+            None => close.await,
+        });
     }
     #[cfg(test)]
     if RUN_SERVER_STARTUP.try_with(|_| ()).is_ok() {
         return None;
     }
-    tor_socks5_runtime::bridge_store_writer::close_global().await
+    tor_socks5_runtime::bridge_store_writer::close_run(deadline).await
 }
 
 fn cleanup_budget() -> Duration {
@@ -278,15 +288,21 @@ pub(super) async fn recover_startup_all() -> Vec<anyhow::Error> {
     {
         errors.push(error);
     }
+    // Clear a run group retained by an earlier hung shutdown (Ok(()) when none).
+    if let Err(error) = tor_socks5_runtime::workers::end_run_group(Duration::from_secs(5)).await {
+        errors.push(error);
+    }
     errors
 }
 
 /// Close a writer left by an earlier run after its retained owners recovered.
 pub(super) async fn close_orphaned_store_writer() -> Option<Result<()>> {
-    // Startup recovery only owns the process-global orphan. A test-scoped
-    // shutdown hook may provide this run's writer, which must stay open until
-    // server shutdown (and may deliberately be blocked to test Stopping).
-    tor_socks5_runtime::bridge_store_writer::close_global().await
+    // Bounded so startup cannot hang on a stuck flush; the writer stays in
+    // its closing slot on timeout and late flushes still land.
+    tor_socks5_runtime::bridge_store_writer::close_run(Some(
+        Instant::now() + Duration::from_secs(5),
+    ))
+    .await
 }
 
 /// Ожидает задачу запуска или восстанавливает её после сигнала завершения.

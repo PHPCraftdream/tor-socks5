@@ -94,6 +94,27 @@ async fn run_server_inner(
     shutdown: impl std::future::Future<Output = ()>,
     writer_started: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
+    tor_socks5_runtime::workers::begin_run_group()?;
+    let result = run_server_body(set_stage, on_ready, args, shutdown, writer_started).await;
+    match tor_socks5_runtime::workers::end_run_group(Duration::from_secs(5)).await {
+        Ok(()) => result,
+        Err(group_error) => match result {
+            Ok(()) => Err(group_error),
+            Err(primary) => {
+                warn!(error = %group_error, "run blocking workers outlived the shutdown budget");
+                Err(primary)
+            }
+        },
+    }
+}
+
+async fn run_server_body(
+    set_stage: &mut impl FnMut(crate::api::ServerStage),
+    on_ready: &mut impl FnMut(Vec<std::net::SocketAddr>),
+    args: ServerArgs,
+    shutdown: impl std::future::Future<Output = ()>,
+    writer_started: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
     set_stage(crate::api::ServerStage::Recovery);
     let startup_cancellation = CancellationToken::new();
     let shutdown = async {
@@ -286,7 +307,8 @@ async fn run_server_inner(
             let Some(tor) = global_init::wait_startup(&mut shutdown, init.wait(), || async {
                 init.cancel();
                 global_init::stop_startup().await?;
-                if let Some(result) = global_init::close_store_writer().await {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                if let Some(result) = global_init::close_store_writer(Some(deadline)).await {
                     result?;
                 }
                 Ok(())
@@ -648,8 +670,10 @@ async fn run_server_inner(
         // its actor task, so a publish that only recovered after the last
         // mutation is not silently lost when the runtime tears down. With
         // Writer закрывается после ограниченного ожидания производителей.
-        // Если задача ещё сохранена, её поздние обновления могут быть отклонены.
-        if let Some(Err(error)) = global_init::close_store_writer().await {
+        // Close is bounded: on timeout the writer stays retained in its
+        // closing slot and late flushes still land.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        if let Some(Err(error)) = global_init::close_store_writer(Some(deadline)).await {
             warn!(error = %error, "bridge health store had unpublished updates at shutdown");
             shutdown_errors.push(error);
         }

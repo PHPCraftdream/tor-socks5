@@ -442,3 +442,168 @@ mod pre_policy_tests {
 #[cfg(test)]
 #[path = "restart_tests.rs"]
 mod restart_tests;
+
+#[cfg(test)]
+#[path = "isolation_tests.rs"]
+mod isolation_tests;
+
+// Helpers shared by the restart and isolation suites below.
+use crate::server::handlers::HandlerTasks;
+use crate::server::{global_init, producers};
+use crate::{Server, ServerError, ServerStatus};
+use tor_socks5_runtime::{bridge_store_writer, workers};
+
+use super::storage::quarantine_held;
+
+#[derive(Debug, PartialEq)]
+struct Slots {
+    settings: bool,
+    global_init: bool,
+    producers: bool,
+    handlers: bool,
+    registry: bool,
+    writer: bool,
+    workers_busy: usize,
+    quarantine: usize,
+}
+
+async fn slots() -> Slots {
+    Slots {
+        settings: global_init::startup_snapshot(false).0,
+        global_init: global_init::startup_snapshot(true).0,
+        producers: producers::ProducerTasks::is_retained(),
+        handlers: HandlerTasks::retained().is_some(),
+        registry: OwnerRegistry::is_retained(),
+        // The server owns the run slot (init_run/close_run); the app's global
+        // writer slot is covered by isolation_tests.
+        writer: !bridge_store_writer::run_is_idle(),
+        workers_busy: workers::global_busy_count().await,
+        quarantine: quarantine_held(),
+    }
+}
+
+fn free(quarantine: usize) -> Slots {
+    Slots {
+        settings: false,
+        global_init: false,
+        producers: false,
+        handlers: false,
+        registry: false,
+        writer: false,
+        workers_busy: 0,
+        quarantine,
+    }
+}
+
+async fn assert_slots_free() {
+    let mut last = None;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            // Reap finished registry slots (as the app's join would) so late
+            // worker exits from the previous run do not mask a clear state.
+            if workers::global_busy_count().await > 0 {
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    workers::join_blocking_workers(),
+                )
+                .await;
+            }
+            let current = slots().await;
+            if current == free(current.quarantine) {
+                return;
+            }
+            last = Some(current);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "server resources remained retained after shutdown: {:?}",
+            last
+        )
+    });
+}
+
+fn test_config(
+    dir: &std::path::Path,
+    port: u16,
+) -> (Option<std::path::PathBuf>, crate::config::Config) {
+    let config = crate::config::Config {
+        listen: vec![format!("127.0.0.1:{port}")],
+        ..Default::default()
+    };
+    let path = dir.join("server.ktav");
+    std::fs::write(&path, ktav::to_string(&config).unwrap()).unwrap();
+    match crate::config::Config::load_with_override(Some(&path)).unwrap() {
+        crate::config::Loaded::FromFile { path, config } => (Some(path), config),
+        crate::config::Loaded::Defaults(config) => (None, config),
+    }
+}
+
+fn test_settings(dir: &std::path::Path) -> Settings {
+    Settings {
+        bridges: vec!["192.0.2.1:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01"
+            .parse()
+            .unwrap()],
+        state_dir: Some(dir.join("state")),
+        ..Default::default()
+    }
+}
+
+fn shutdown_hook(
+    settings: Settings,
+    failure: Option<global_init::BootstrapFailure>,
+) -> Arc<global_init::ShutdownHook> {
+    Arc::new(global_init::ShutdownHook {
+        settings,
+        writer: None,
+        failure,
+        ready: std::sync::Mutex::new(None),
+    })
+}
+
+fn builder(
+    config: crate::config::Config,
+    config_path: Option<std::path::PathBuf>,
+    upstream: bool,
+) -> crate::ServerBuilder {
+    Server::builder(config).config_path(config_path).upstream(
+        upstream.then(|| "127.0.0.1:1".to_string()),
+        None,
+        None,
+    )
+}
+
+async fn start_server(
+    config: crate::config::Config,
+    config_path: Option<std::path::PathBuf>,
+    settings: Settings,
+    upstream: bool,
+) -> std::result::Result<crate::ServerHandle, ServerError> {
+    global_init::RUN_SERVER_SHUTDOWN
+        .scope(
+            shutdown_hook(settings, None),
+            builder(config, config_path, upstream).start(),
+        )
+        .await
+}
+
+fn assert_running_at(handle: &crate::ServerHandle, port: Option<u16>) {
+    match handle.status() {
+        ServerStatus::Running { listen_addrs } => {
+            assert!(!listen_addrs.is_empty());
+            assert_eq!(listen_addrs[0].ip(), std::net::Ipv4Addr::LOCALHOST);
+            if let Some(port) = port {
+                assert_eq!(listen_addrs[0].port(), port);
+            } else {
+                assert_ne!(
+                    listen_addrs[0].port(),
+                    0,
+                    "port zero must report its bound port"
+                );
+            }
+        }
+        status => panic!("expected Running with actual bound address, got {status:?}"),
+    }
+}

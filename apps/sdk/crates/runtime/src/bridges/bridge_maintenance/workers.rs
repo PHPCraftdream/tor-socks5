@@ -1,5 +1,8 @@
 use std::sync::{Arc, LazyLock, Mutex};
 
+#[path = "run_workers.rs"]
+mod run_workers;
+
 // The registry may retain 64 active jobs plus 64 overflow-failure slots (128 slots max);
 // the separate report buffer retains up to 128 more failures.
 const BLOCKING_WORKER_LIMIT: usize = 64;
@@ -469,13 +472,36 @@ pub async fn global_busy_count() -> usize {
     busy
 }
 
-// Отмена ожидания не удаляет дескрипторы и сохранённые ошибки.
+/// Join every worker of the process registry (kept for CLI/app use and
+/// recovery). The server instead joins only its own run group via
+/// [`run_workers::end_run_group`].
 pub async fn join_blocking_workers() -> anyhow::Result<()> {
     #[cfg(any(test, feature = "test-seams"))]
     if let Ok(registry) = TEST_WORKERS.try_with(Arc::clone) {
         return registry.0.join().await;
     }
     BLOCKING_WORKERS.join().await
+}
+
+/// Join only the current server run's blocking-worker group. A no-op when
+/// no run group is installed. Under test seams the task-local test registry
+/// stands in for the run group, so injected workers stay observable.
+pub async fn join_run_group() -> anyhow::Result<()> {
+    #[cfg(any(test, feature = "test-seams"))]
+    if let Ok(registry) = TEST_WORKERS.try_with(Arc::clone) {
+        return registry.0.join().await;
+    }
+    run_workers::join_run_group().await
+}
+
+/// Install this run's blocking-worker group; refuses a second install.
+pub fn begin_run_group() -> anyhow::Result<()> {
+    run_workers::begin_run_group()
+}
+
+/// Join and remove the run group within `budget` (Ok(()) with no group).
+pub async fn end_run_group(budget: std::time::Duration) -> anyhow::Result<()> {
+    run_workers::end_run_group(budget).await
 }
 
 pub(crate) async fn spawn_tracked_blocking<T: Send + 'static>(
@@ -485,7 +511,9 @@ pub(crate) async fn spawn_tracked_blocking<T: Send + 'static>(
     if let Ok(registry) = TEST_WORKERS.try_with(Arc::clone) {
         return registry.0.spawn(work, None).await;
     }
-    BLOCKING_WORKERS.spawn(work, None).await
+    BLOCKING_WORKERS
+        .spawn(work, run_workers::current().as_deref())
+        .await
 }
 
 pub(crate) async fn run_tracked_blocking<T: Send + 'static>(
@@ -505,7 +533,9 @@ pub(crate) async fn spawn_blocking_with_failure<T: Send + 'static>(
     if let Ok(registry) = TEST_WORKERS.try_with(Arc::clone) {
         return registry.0.spawn_with_failure(work, None).await;
     }
-    BLOCKING_WORKERS.spawn_with_failure(work, None).await
+    BLOCKING_WORKERS
+        .spawn_with_failure(work, run_workers::current().as_deref())
+        .await
 }
 
 pub async fn run_fallible_blocking<T: Send + 'static>(
@@ -524,7 +554,9 @@ pub(crate) async fn spawn_fallible_blocking<T: Send + 'static>(
     if let Ok(registry) = TEST_WORKERS.try_with(Arc::clone) {
         return registry.0.spawn_fallible(work, None).await;
     }
-    BLOCKING_WORKERS.spawn_fallible(work, None).await
+    BLOCKING_WORKERS
+        .spawn_fallible(work, run_workers::current().as_deref())
+        .await
 }
 
 /// Группа ожидает только свои задачи; корневой реестр сохраняет их при отмене.
