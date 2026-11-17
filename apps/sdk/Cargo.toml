@@ -33,7 +33,7 @@ dns = ["tor", "acl", "dep:tor-socks5-dns"]
 # the guard-event observation layer; SDK-9 — the Tor client (settings from
 # config, the PT entry point, the TorHandle surface, watchdog status, conn
 # health). Links Arti — patch-kit needed (see README).
-runtime = ["tor", "config", "bridges", "dep:tor-socks5-runtime"]
+runtime = ["tor", "config", "bridges", "dep:tor-socks5-runtime", "dep:tokio-util"]
 # Busybox pluggable-transport dispatch for an embedding host.
 pt = ["runtime", "tor-socks5-runtime/pt"]
 # Embedded SOCKS5 server. Links Arti — patch-kit needed (see README).
@@ -70,6 +70,7 @@ tor-socks5-dns = { path = "../../packages/dns-server", version = "0.2.0", option
 tor-socks5-onion = { path = "crates/onion", version = "0.2.0", optional = true }
 tor-socks5-runtime = { path = "crates/runtime", version = "0.2.0", optional = true }
 tor-socks5-server = { path = "crates/server", version = "0.2.0", optional = true, default-features = false }
+tokio-util = { workspace = true, optional = true }
 
 # The surface test wires `runtime::observation_layer` into a real
 # subscriber — the same wiring the proxy binary does.

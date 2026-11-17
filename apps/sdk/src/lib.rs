@@ -208,6 +208,13 @@ pub mod runtime {
         BridgeManagerStatus, FetchBridgesError, FetchBridgesOutcome, FetchBridgesParams,
     };
 
+    pub use ::tokio_util::sync::CancellationToken;
+    /// Shared producer launch for embedding hosts: wires the bridge-refresh
+    /// signaling (recovery notifier, `set_needed(auto_fetch &&
+    /// preferred_missing)`) and spawns the bridge manager plus the
+    /// stale-channel/soft-failover watchdogs into a caller-owned task vector.
+    pub use ::tor_socks5_runtime::bridge_producers::launch_producers;
+
     pub use ::tor_socks5_runtime::host::bind_child_processes_to_self;
     /// Host-process initialisation for an embedding application:
     /// [`bind_child_processes_to_self`] (on Windows, put spawned children —

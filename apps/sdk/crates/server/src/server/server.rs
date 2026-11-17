@@ -31,9 +31,7 @@ use crate::upstream::RelayRemote::{Tor, Upstream};
 #[cfg(test)]
 use tor_socks5_runtime::arti_observability::ObservationSink;
 use tor_socks5_runtime::conn_health::ConnHealthCounters;
-use tor_socks5_runtime::tor_watchdog::{
-    spawn_bridge_failover_watchdog, spawn_tor_watchdog, TorHandle,
-};
+use tor_socks5_runtime::tor_watchdog::TorHandle;
 
 /// Maximum concurrent SOCKS5 connections. Each may run an Argon2id verify
 /// (~5 MiB working memory, 2 passes), so unbounded spawns risk resource
@@ -327,14 +325,6 @@ async fn run_server_body(
             // both without re-distribution. Cheap to clone (one
             // `Arc<RwLock<_>>` + two atomics).
             let handle = TorHandle::new_with_settings(tor, &settings);
-            obs_sink.set_recovery_notifier(handle.bridge_refresh().recovery());
-            handle.bridge_refresh().set_needed(
-                cfg.bridges.auto_fetch
-                    && tor_socks5_runtime::bridge_maintenance::preferred_missing(
-                        &cfg,
-                        &settings.bridges,
-                    ),
-            );
 
             let template = if settings.pre_endpoint.is_some() {
                 Ok(settings.clone())
@@ -351,7 +341,7 @@ async fn run_server_body(
             init.complete_handoff()?;
             if global_init::launch_background() {
                 let mut launch = producers::LaunchGuard::new(producer_owner.clone());
-                bridge_producers::launch(
+                tor_socks5_runtime::bridge_producers::launch_producers(
                     handle.clone(),
                     config_path.clone(),
                     &cfg,
@@ -946,9 +936,6 @@ async fn handle_client_with_connector<C: TorConnector + Send>(
     }
     Ok(())
 }
-
-#[path = "../fetch/bridge_producers.rs"]
-mod bridge_producers;
 
 #[path = "../tor/tor_watchdog/owners/producers.rs"]
 mod producers;

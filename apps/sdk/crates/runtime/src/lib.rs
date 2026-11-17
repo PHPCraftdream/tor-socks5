@@ -44,6 +44,9 @@ pub mod host;
 #[path = "bridge_manager/bridge_manager.rs"]
 pub mod bridge_manager;
 
+#[path = "bridge_manager/bridge_producers.rs"]
+pub mod bridge_producers;
+
 #[path = "tor/conn_health.rs"]
 pub mod conn_health;
 
