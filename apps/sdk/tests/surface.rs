@@ -460,8 +460,8 @@ fn runtime_bridge_manager_surface() {
     }
     assert_start_signatures(assert_start_signature, assert_parent_token_start_signature);
     fn assert_clone_send_sync<T: Clone + Send + Sync + 'static>(_: &T) {}
-    fn expect_shutdown(handle: BridgeManagerHandle) -> impl Future<Output = ()> {
-        handle.shutdown()
+    fn expect_shutdown(handle: BridgeManagerHandle) -> impl Future {
+        handle.shutdown_with_timeout(std::time::Duration::from_secs(1))
     }
     fn assert_bridge_manager_methods(handle: &BridgeManagerHandle) {
         let _: BridgeManagerStatus = handle.status();

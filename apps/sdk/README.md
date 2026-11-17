@@ -283,7 +283,10 @@ use tor_socks5::runtime::{close_global, start, ObservationSink};
 
 let manager = start(handle, Some(config_path), &cfg, sink, settings);
 println!("running: {:?}", manager.status().producers);
-manager.shutdown().await;
+let outcomes = manager.shutdown_with_timeout(std::time::Duration::from_secs(30)).await;
+for outcome in &outcomes {
+    println!("{outcome:?}");
+}
 let flush = close_global().await;
 ```
 
