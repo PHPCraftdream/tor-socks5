@@ -15,6 +15,8 @@ use proxy_config::{Config, IdentityKey, OnionServiceEntry};
 use tor_keymgr::KeyMgr;
 use tracing::{error, info, warn};
 
+use zeroize::Zeroizing;
+
 use super::store;
 
 /// The identity of one entry as settled in the keystore, before anything is
@@ -88,15 +90,15 @@ fn settle(
     let (keypair, new_key) = match &entry.key {
         Some(key) => {
             let bytes = store::decode_key(key.as_str())?;
-            let keypair = store::parse_identity_file(&bytes, &nick)
+            let keypair = store::parse_identity_file(&bytes, &nick, keystore_dir)
                 .context("the key in the onion services file is not a valid identity key")?;
             (keypair, None)
         }
         None => {
             let bytes = match store::identity_file(keystore_dir, &nick) {
-                Some(file) => {
-                    std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?
-                }
+                Some(file) => Zeroizing::new(
+                    std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?,
+                ),
                 None => {
                     if let Some(address) = &entry.address {
                         return Err(SettlementError::Internal(anyhow::anyhow!(
@@ -109,10 +111,13 @@ fn settle(
                     store::generate(keymgr, &nick, false)?;
                     let file = store::identity_file(keystore_dir, &nick)
                         .context("the generated identity file")?;
-                    std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?
+                    Zeroizing::new(
+                        std::fs::read(&file)
+                            .with_context(|| format!("reading {}", file.display()))?,
+                    )
                 }
             };
-            let keypair = store::parse_identity_file(&bytes, &nick)
+            let keypair = store::parse_identity_file(&bytes, &nick, keystore_dir)
                 .context("the identity key in the keystore is not valid")?;
             (keypair, Some(store::encode_key(&bytes)))
         }
@@ -423,15 +428,15 @@ fn warn_preparation_failure(nickname: &str, failure: PreparationFailure) {
 /// Test helper only (R10): never in default/full, exposed to dependent
 /// crates' tests only behind the `test-seams` feature.
 #[cfg(any(test, feature = "test-seams"))]
-pub fn fresh_identity(nickname: &str) -> (String, String) {
+pub fn fresh_identity(nickname: &str, staging_parent: &Path) -> (String, String) {
     use tor_hscrypto::pk::HsIdKeypair;
     use tor_llcrypto::pk::ed25519::ExpandedKeypair;
 
     let generated = crate::address::generate();
-    let expanded = ExpandedKeypair::from_secret_key_bytes(generated.to_expanded_bytes())
+    let expanded = ExpandedKeypair::from_secret_key_bytes(*generated.to_expanded_bytes())
         .expect("expanded keypair");
     let keypair = HsIdKeypair::from(expanded);
     let nick = store::nickname(nickname).expect("nickname");
-    let bytes = store::identity_file_bytes(keypair, &nick).expect("key file bytes");
+    let bytes = store::identity_file_bytes(keypair, &nick, staging_parent).expect("key file bytes");
     (store::encode_key(&bytes), generated.address().to_owned())
 }

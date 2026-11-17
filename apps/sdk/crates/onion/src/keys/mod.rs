@@ -19,8 +19,8 @@
 
 pub mod identity;
 pub mod ops;
-pub mod specifier;
-pub mod store;
+pub(crate) mod specifier;
+pub(crate) mod store;
 
 #[cfg(test)]
 pub(crate) use identity::ensure;
@@ -29,11 +29,14 @@ pub use ops::{
     create_service, export_identity, identity_exists, import_identity, list_services,
     remove_service, show_service, NewIdentity, Recorded,
 };
+pub use store::{address, address_of, decode_key, encode_key, lock, nickname, KeysError};
+
+#[cfg(any(test, feature = "test-seams"))]
 pub use specifier::{HsIdKeypairSpecifier, HsIdPublicKeySpecifier};
+#[cfg(any(test, feature = "test-seams"))]
 pub use store::{
-    address, address_of, decode_key, encode_key, exists, generate, identity_file,
-    identity_file_bytes, insert, lock, lock_with, nickname, open, parse_identity_file, remove_all,
-    write_secret_file, KeysError,
+    generate, identity_file, identity_file_bytes, insert, lock_with, open, parse_identity_file,
+    remove_all, write_secret_file,
 };
 
 #[cfg(any(test, feature = "test-seams"))]

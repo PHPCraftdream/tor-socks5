@@ -17,6 +17,7 @@ use proxy_config::{Config, IdentityKey, OnionServiceEntry, OnionServicePort};
 use tor_hscrypto::pk::HsIdKeypair;
 use tor_llcrypto::pk::ed25519::ExpandedKeypair;
 use tor_persist::hsnickname::HsNickname;
+use zeroize::Zeroizing;
 
 use super::store::{self, KeysError};
 
@@ -36,9 +37,10 @@ pub struct Recorded {
 pub enum NewIdentity<'a> {
     /// A fresh random key: [`crate::address::generate`].
     Random,
-    /// A key the caller provides: the closure is invoked only after the
-    /// replace check, under the keystore lock, and may print progress (this
-    /// is how a CLI keeps its vanity-search output alive during the search).
+    /// A key the caller provides: the closure is invoked before the keystore
+    /// lock is taken (it may run minutes for a vanity search) and may print
+    /// progress (this is how a CLI keeps its vanity-search output alive
+    /// during the search).
     Supplied(&'a mut dyn FnMut() -> anyhow::Result<crate::address::Keypair>),
 }
 
@@ -72,6 +74,10 @@ pub fn identity_exists(
 /// ports. `force` replaces an existing identity (the old address is lost).
 /// The keystore copy of the key is dropped: the file is the source, and the
 /// next launch writes the key it holds back into the keystore.
+///
+/// The identity (possibly a minutes-long vanity search) is generated BEFORE
+/// the keystore lock is taken; the replace check runs both before it and
+/// again under the lock.
 pub fn create_service(
     config_path: &Path,
     keystore_dir: &Path,
@@ -81,20 +87,23 @@ pub fn create_service(
     identity: NewIdentity,
 ) -> Result<Recorded, KeysError> {
     let nick = store::nickname(nick)?;
-    let _lock = store::lock(keystore_dir)?;
     if identity_exists(config_path, keystore_dir, &nick)? && !force {
         return Err(KeysError::IdentityExists(nick.to_string()));
     }
-
     let generated = match identity {
         NewIdentity::Random => crate::address::generate(),
         NewIdentity::Supplied(source) => source()?,
     };
     let key = hs_keypair(&generated)?;
+    // Only the short tail runs under the lock: re-check under it, then
+    // compute and record.
+    let _lock = store::lock(keystore_dir)?;
+    if identity_exists(config_path, keystore_dir, &nick)? && !force {
+        return Err(KeysError::IdentityExists(nick.to_string()));
+    }
     let address = store::address_of(&key);
-    let bytes = store::identity_file_bytes(key, &nick)?;
-    let ports_enabled = ports.is_some();
-    record_identity(config_path, keystore_dir, &nick, &bytes, &address, ports)?;
+    let bytes = store::identity_file_bytes(key, &nick, keystore_dir)?;
+    let ports_enabled = record_identity(config_path, keystore_dir, &nick, &bytes, &address, ports)?;
     Ok(Recorded {
         address,
         ports_enabled,
@@ -132,11 +141,10 @@ pub fn export_identity(
     let Some(key) = service.key else {
         return Err(KeysError::NoKey(nick.to_string()));
     };
-    if out.exists() && !force {
-        return Err(KeysError::ExportExists(out.display().to_string()));
-    }
+    // No exists() pre-check: `write_secret_file` refuses an existing path
+    // atomically (dangling symlinks included) unless `force`.
     let bytes = store::decode_key(key.as_str())?;
-    store::write_secret_file(out, &bytes)?;
+    store::write_secret_file(out, &bytes, force)?;
     Ok(())
 }
 
@@ -155,18 +163,15 @@ pub fn import_identity(
     force: bool,
 ) -> Result<Recorded, KeysError> {
     let nick = store::nickname(nick)?;
-    let bytes = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
-    let key = store::parse_identity_file(&bytes, &nick)?;
+    let bytes =
+        Zeroizing::new(std::fs::read(file).with_context(|| format!("reading {}", file.display()))?);
+    let key = store::parse_identity_file(&bytes, &nick, keystore_dir)?;
     let _lock = store::lock(keystore_dir)?;
     if identity_exists(config_path, keystore_dir, &nick)? && !force {
         return Err(KeysError::IdentityExists(nick.to_string()));
     }
     let address = store::address_of(&key);
-    // Counted BEFORE the write, against the file as it is now: an existing
-    // service with ports stays enabled.
-    let ports_enabled = ports.is_some()
-        || show_service(config_path, nick.as_ref()).is_ok_and(|entry| !entry.ports.is_empty());
-    record_identity(config_path, keystore_dir, &nick, &bytes, &address, ports)?;
+    let ports_enabled = record_identity(config_path, keystore_dir, &nick, &bytes, &address, ports)?;
     Ok(Recorded {
         address,
         ports_enabled,
@@ -204,7 +209,7 @@ pub fn remove_service(
 /// The keystore keypair of a generated or searched key, checked against the
 /// address the generator computed.
 fn hs_keypair(generated: &crate::address::Keypair) -> Result<HsIdKeypair, KeysError> {
-    let expanded = ExpandedKeypair::from_secret_key_bytes(generated.to_expanded_bytes())
+    let expanded = ExpandedKeypair::from_secret_key_bytes(*generated.to_expanded_bytes())
         .context("invalid expanded secret key")?;
     let key = HsIdKeypair::from(expanded);
     if store::address_of(&key) != generated.address() {
@@ -215,7 +220,7 @@ fn hs_keypair(generated: &crate::address::Keypair) -> Result<HsIdKeypair, KeysEr
 
 /// Record `key_bytes` (a keystore key file) as the identity of `nick` and
 /// drop the keystore's copy. See [`create_service`] for the ports/enabled
-/// rule.
+/// rule. Returns whether the entry ended up enabled (its state as written).
 fn record_identity(
     config_path: &Path,
     keystore_dir: &Path,
@@ -223,11 +228,11 @@ fn record_identity(
     key_bytes: &[u8],
     address: &str,
     ports: Option<Vec<OnionServicePort>>,
-) -> Result<(), KeysError> {
+) -> Result<bool, KeysError> {
     let key = IdentityKey::new(store::encode_key(key_bytes)).map_err(anyhow::Error::msg)?;
     let name = nick.to_string();
     let address = address.to_owned();
-    Config::update_onion_services(config_path, |services| {
+    let ports_enabled = Config::update_onion_services(config_path, |services| {
         let service = services.iter_mut().find(|entry| entry.nickname == name);
         match service {
             Some(entry) => {
@@ -237,20 +242,25 @@ fn record_identity(
                     entry.ports = ports;
                     entry.enabled = true;
                 }
+                Ok(entry.enabled && !entry.ports.is_empty())
             }
-            None => services.push(OnionServiceEntry {
-                nickname: name,
-                enabled: ports.is_some(),
-                address: Some(address.clone()),
-                key: Some(key),
-                circuit_hops: DEFAULT_CIRCUIT_HOPS,
-                ports: ports.unwrap_or_default(),
-            }),
+            None => {
+                let entry = OnionServiceEntry {
+                    nickname: name,
+                    enabled: ports.is_some(),
+                    address: Some(address.clone()),
+                    key: Some(key),
+                    circuit_hops: DEFAULT_CIRCUIT_HOPS,
+                    ports: ports.unwrap_or_default(),
+                };
+                let enabled = entry.enabled && !entry.ports.is_empty();
+                services.push(entry);
+                Ok(enabled)
+            }
         }
-        Ok(())
     })?;
     forget_keystore_copy(keystore_dir, nick)?;
-    Ok(())
+    Ok(ports_enabled)
 }
 
 /// Drop the keystore's copy of `nick`: the file is the source, and the next

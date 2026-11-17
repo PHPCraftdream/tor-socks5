@@ -45,7 +45,7 @@ fn the_soft_limit_warning_starts_above_ten_services() {
 #[test]
 fn build_config_accepts_valid_nickname() {
     let nick = keys::nickname("svc-one").expect("nickname");
-    let config = build_config(nick).expect("config");
+    let config = serve::build_config(nick).expect("config");
     assert_eq!(config.nickname().to_string(), "svc-one");
     // `enabled` defaults to true, so arti will actually start it.
     assert!(config.enabled());
@@ -111,8 +111,8 @@ fn a_launchable_identity_is_prepared_and_the_file_completed() {
 #[test]
 fn an_address_the_key_does_not_give_keeps_the_service_from_starting() {
     let (_tmp, config, keystore) = temp_config();
-    let (key, _address) = keys::fresh_identity("web");
-    let (_other_key, other_address) = keys::fresh_identity("web");
+    let (key, _address) = keys::fresh_identity("web", _tmp.path());
+    let (_other_key, other_address) = keys::fresh_identity("web", _tmp.path());
     let mut entry = service("web");
     entry.key = Some(proxy_config::IdentityKey::new(key).expect("key text"));
     entry.address = Some(other_address);
