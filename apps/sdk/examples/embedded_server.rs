@@ -12,11 +12,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Config::default()
     };
 
-    let server = Server::builder(config)
+    let mut signal_error = None;
+    let shutdown = async {
+        signal_error = tokio::signal::ctrl_c().await.err();
+    };
+    let result = Server::builder(config)
         .upstream(Some("127.0.0.1:9050".into()), None, None)
-        .start()
-        .await?;
-    tokio::signal::ctrl_c().await?;
-    server.shutdown().await?;
+        .run_until(shutdown)
+        .await;
+    result?;
+    if let Some(error) = signal_error {
+        return Err(error.into());
+    }
     Ok(())
 }

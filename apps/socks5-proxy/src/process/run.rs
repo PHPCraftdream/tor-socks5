@@ -4,14 +4,12 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use tokio::sync::watch;
-use tokio_util::sync::CancellationToken;
 use tracing_appender::non_blocking::WorkerGuard;
 
 use super::children::bind_child_processes_to_self;
 use super::logging::{init_tracing, install_crypto_provider};
 use crate::config::{Config, Loaded};
-use tor_socks5_server::{DnsStartupPolicy, Server, ServerError, ServerStatus};
+use tor_socks5_server::{DnsStartupPolicy, Server, ServerError};
 
 /// Process-wide state that must outlive the server run.
 pub(crate) struct ServerProcess {
@@ -59,10 +57,8 @@ pub(crate) async fn run_server_process(
         Loaded::Defaults(config) => (None, config),
     };
     let process = init_server_process(&config);
-    tokio::pin!(shutdown);
-    let token = CancellationToken::new();
 
-    let start = Server::builder(config)
+    Server::builder(config)
         .config_path(config_path)
         .observation_sink(process.obs_sink.clone())
         .upstream(upstream_addr, upstream_user, upstream_pass)
@@ -70,61 +66,7 @@ pub(crate) async fn run_server_process(
         // Keep the CLI's legacy non-fatal DNS listener behavior. Embedded SDK
         // callers default to requiring DNS bind readiness.
         .dns_startup_policy(DnsStartupPolicy::Background)
-        .cancellation_token(token.clone())
-        .start();
-    tokio::pin!(start);
-
-    // Once the signal arrives, cancel startup but keep polling the same start
-    // future to completion. This joins startup cleanup and preserves cleanup
-    // failures instead of dropping the future with work still running.
-    let mut shutdown_requested = false;
-    let mut started = None;
-    tokio::select! {
-        biased;
-        () = &mut shutdown => {
-            shutdown_requested = true;
-            token.cancel();
-        }
-        result = &mut start => started = Some(result),
-    }
-    let started = match started {
-        Some(result) => result,
-        None => start.await,
-    };
-
-    let handle = match started {
-        Ok(handle) => handle,
-        Err(ServerError::Cancelled) if shutdown_requested => return Ok(()),
-        Err(error) => return Err(error.into_anyhow()),
-    };
-
-    if shutdown_requested {
-        return handle.shutdown().await.map_err(ServerError::into_anyhow);
-    }
-
-    let mut status = handle.subscribe();
-    let shutdown_requested = tokio::select! {
-        biased;
-        () = &mut shutdown => true,
-        _ = wait_for_terminal(&mut status) => false,
-    };
-    if shutdown_requested {
-        handle.shutdown().await.map_err(ServerError::into_anyhow)
-    } else {
-        handle.wait().await.map_err(ServerError::into_anyhow)
-    }
-}
-
-async fn wait_for_terminal(status: &mut watch::Receiver<ServerStatus>) {
-    loop {
-        if matches!(
-            status.borrow_and_update().clone(),
-            ServerStatus::Stopped { .. }
-        ) {
-            return;
-        }
-        if status.changed().await.is_err() {
-            return;
-        }
-    }
+        .run_until(shutdown)
+        .await
+        .map_err(ServerError::into_anyhow)
 }
