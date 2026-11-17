@@ -10,18 +10,6 @@ fn action() -> BridgesAction {
     }
 }
 
-#[test]
-fn sdk14_pool_validation_rejects_unsupported_pool() {
-    assert!(reject_unsupported_pool(&None, "bridges fetch").is_ok());
-
-    let pool = Some("127.0.0.1:1080".parse::<Socks5Endpoint>().unwrap().into());
-    let error = reject_unsupported_pool(&pool, "bridges fetch global pre_proxies").unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "bridges fetch global pre_proxies proxy pool is not supported here; remove it"
-    );
-}
-
 #[tokio::test]
 async fn fetch_rejects_pre_before_network_startup() {
     let dir = tempfile::tempdir().unwrap();
@@ -45,10 +33,12 @@ async fn fetch_rejects_pre_before_network_startup() {
 
     FETCH_BOUNDARY
         .scope(std::cell::Cell::new(false), async {
+            // H10: the SDK rejects `pre_proxies` with the typed error and
+            // the CLI propagates it; no CLI-side pool check remains.
             let error = cmd_bridges(action(), Some(&path)).await.unwrap_err();
             assert_eq!(
                 error.to_string(),
-                "bridges fetch global pre_proxies proxy pool is not supported here; remove it"
+                "bridges fetch global pre_proxies proxy pool is not supported; remove it"
             );
             FETCH_BOUNDARY.with(|hit| assert!(!hit.get()));
 

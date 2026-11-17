@@ -56,6 +56,7 @@ const ALLOWED_RUNTIME_ITEMS: &[&str] = &[
     "bridge_manager::BridgeManagerConfig",
     "bridge_manager::BridgeManagerHandle",
     "bridge_manager::BridgeManagerStatus",
+    "bridge_manager::FetchBridgesError",
     "bridge_manager::FetchBridgesOutcome",
     "bridge_manager::FetchBridgesParams",
 ];
