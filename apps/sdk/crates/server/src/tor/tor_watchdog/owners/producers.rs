@@ -321,11 +321,23 @@ mod tests {
             .await
             .unwrap();
         owner.cancel();
+        // Post-H9 the maintenance task exits promptly on cancellation without
+        // waiting for the parked config load; the load worker itself stays
+        // registered in the blocking-worker registry, so join must still time
+        // out until the gate is released.
         assert!(owner.join(Duration::ZERO).await.is_err());
-        assert!(owner.has_retained_handle().await);
+        assert!(
+            tor_socks5_runtime::workers::global_busy_count().await >= 1,
+            "parked blocking config load must stay registered across cancellation"
+        );
         gate.release();
         owner.join(Duration::from_secs(10)).await.unwrap();
         assert!(!owner.has_retained_handle().await);
+        assert_eq!(
+            tor_socks5_runtime::workers::global_busy_count().await,
+            0,
+            "released worker must be joined and the registry drained"
+        );
     }
 
     #[tokio::test]
