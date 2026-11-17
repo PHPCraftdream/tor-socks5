@@ -53,14 +53,14 @@ async fn concurrent_cli_transaction_waits_out_the_locked_publish_and_both_surviv
             .expect("CLI bridge line parses");
     let path = config_path(dir.path());
     seed_store(&path, &b);
-    let store_path = BridgeStore::resolve_path(Some(&path));
+    let store_path = BridgeStore::resolve_path(&path);
 
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let (published_tx, published_rx) = std::sync::mpsc::channel::<()>();
     let published_rx = Arc::new(Mutex::new(published_rx));
     let release = Arc::new((Mutex::new(false), Condvar::new()));
     let writer = StoreWriter::spawn(
-        BridgeStore::resolve_path(Some(&path)),
+        BridgeStore::resolve_path(&path),
         gated_publisher(started_tx, published_tx, release.clone()),
         INITIAL_BACKOFF,
     );
@@ -83,7 +83,7 @@ async fn concurrent_cli_transaction_waits_out_the_locked_publish_and_both_surviv
     let cli_path = path.clone();
     let cli_bridge_for_cli = cli_bridge.clone();
     let cli_task = tokio::spawn(async move {
-        let out = crate::bridge_store_writer::apply(Some(cli_path.as_ref()), move |s| {
+        let out = crate::bridge_store_writer::apply(cli_path.as_ref(), move |s| {
             s.note_source_at(&cli_bridge_for_cli, "cli", OffsetDateTime::now_utc())
         })
         .await;
@@ -202,7 +202,7 @@ mod priority {
     async fn busy_store_lock_rejects_unapplied_mutation_for_retry() {
         let dir = tempfile::tempdir().expect("tempdir");
         let bridge = test_bridge();
-        let path = BridgeStore::resolve_path(Some(&config_path(dir.path())));
+        let path = BridgeStore::resolve_path(&config_path(dir.path()));
         let (release_lock, holder) = hold_store_lock(path.clone()).await;
         let writer = spawn_with_lock_wait(
             path.clone(),
@@ -257,7 +257,7 @@ mod priority {
         registry
             .scope(async {
                 let dir = tempfile::tempdir().expect("tempdir");
-                let path = BridgeStore::resolve_path(Some(&config_path(dir.path())));
+                let path = BridgeStore::resolve_path(&config_path(dir.path()));
                 let (release_lock, holder) = hold_store_lock(path.clone()).await;
                 let (load_started_tx, load_started_rx) = oneshot::channel();
                 let writer = spawn_with_load_started(
@@ -348,7 +348,7 @@ mod priority {
         const MUTATIONS: u32 = 12;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = config_path(dir.path());
-        let writer = StoreWriter::open(Some(&path));
+        let writer = StoreWriter::open(&path);
         let (started_tx, started_rx) = oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let first_bridge = test_bridge();

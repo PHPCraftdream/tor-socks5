@@ -53,9 +53,16 @@ pub(crate) async fn run_server_process(
     no_upstream: bool,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
+    // The server requires a config path (D-H1): sibling files (users
+    // registry, bridge store, DNS cache) resolve from it. With built-in
+    // defaults, pin the CLI's conventional config file in the current
+    // directory so nothing lands in unexpected places.
     let (config_path, config) = match Config::load_with_override(config_override.as_deref())? {
-        Loaded::FromFile { path, config } => (Some(path), config),
-        Loaded::Defaults(config) => (None, config),
+        Loaded::FromFile { path, config } => (path, config),
+        Loaded::Defaults(config) => (
+            std::env::current_dir()?.join(crate::service::DEFAULT_CONFIG_FILE),
+            config,
+        ),
     };
     let process = init_server_process(&config);
 

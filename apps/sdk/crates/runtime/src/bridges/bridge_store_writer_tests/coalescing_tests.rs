@@ -13,7 +13,7 @@ async fn concurrent_updates_are_applied_additively_and_sequentially() {
     seed_store(&path, &b);
 
     let writer = StoreWriter::spawn(
-        BridgeStore::resolve_path(Some(&path)),
+        BridgeStore::resolve_path(&path),
         Arc::new(|s| s.save()),
         INITIAL_BACKOFF,
     );
@@ -71,11 +71,7 @@ async fn mutations_are_coalesced_while_a_publish_is_in_flight() {
         }
         s.save()
     });
-    let writer = StoreWriter::spawn(
-        BridgeStore::resolve_path(Some(&path)),
-        publisher,
-        INITIAL_BACKOFF,
-    );
+    let writer = StoreWriter::spawn(BridgeStore::resolve_path(&path), publisher, INITIAL_BACKOFF);
 
     for i in 0..10u32 {
         let b = b.clone();
@@ -176,11 +172,7 @@ async fn publish_snapshots_are_copy_on_write() {
         }
         s.save()
     });
-    let writer = StoreWriter::spawn(
-        BridgeStore::resolve_path(Some(&path)),
-        publisher,
-        INITIAL_BACKOFF,
-    );
+    let writer = StoreWriter::spawn(BridgeStore::resolve_path(&path), publisher, INITIAL_BACKOFF);
 
     // Mutation A: the job deep-copies (the actor keeps its own Arc, so
     // make_mut is unconditional), stores the copy back, and the publisher
@@ -284,11 +276,7 @@ async fn mutation_during_in_flight_publish_does_not_block_the_async_worker() {
         }
         s.save()
     });
-    let writer = StoreWriter::spawn(
-        BridgeStore::resolve_path(Some(&path)),
-        publisher,
-        INITIAL_BACKOFF,
-    );
+    let writer = StoreWriter::spawn(BridgeStore::resolve_path(&path), publisher, INITIAL_BACKOFF);
 
     // Mutation A triggers publish #1 and leaves it blocked on the gate, so
     // the actor's snapshot Arc is shared once mutation B lands — the only

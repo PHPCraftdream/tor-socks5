@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn resolve_path_uses_config_dir_and_stem() {
-    let p = BridgeStore::resolve_path(Some(Path::new("/etc/tor-socks5.ktav")));
+    let p = BridgeStore::resolve_path(Path::new("/etc/tor-socks5.ktav"));
     assert_eq!(
         p.file_name().unwrap().to_string_lossy(),
         "tor-socks5.alive-bridges.log"

@@ -26,21 +26,15 @@ pub(crate) fn dns_client_access(cfg: &Config) -> AllowedClients {
 /// Resolve the DNS-cache file path from the main config path. Mirrors
 /// `UsersConfig::resolve_path` (auth) and `BridgeStore::resolve_path`
 /// (bridge-store): same directory, same file stem, fixed `.dns-cache`
-/// suffix. Falls back to `./tor-socks5.dns-cache` when the config came
-/// from built-in defaults (no path on disk), so the cache still lands
-/// somewhere writable instead of silently never persisting.
-pub(crate) fn dns_cache_path(config_path: Option<&Path>) -> PathBuf {
-    match config_path {
-        Some(cfg) => {
-            let dir = cfg.parent().unwrap_or_else(|| Path::new("."));
-            let stem = cfg
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "tor-socks5".to_string());
-            dir.join(format!("{stem}.dns-cache"))
-        }
-        None => PathBuf::from("tor-socks5.dns-cache"),
-    }
+/// suffix. The config path is required (D-H1); a path without a parent
+/// directory resolves under `.`.
+pub(crate) fn dns_cache_path(config_path: &Path) -> PathBuf {
+    let dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = config_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "tor-socks5".to_string());
+    dir.join(format!("{stem}.dns-cache"))
 }
 
 /// Convert operator-configured DoH providers into the dns-server crate's
@@ -159,12 +153,17 @@ mod tests {
             "{}.dns-cache",
             cfg.file_stem().unwrap().to_string_lossy()
         ));
-        assert_eq!(dns_cache_path(Some(cfg)), expected);
+        assert_eq!(dns_cache_path(cfg), expected);
     }
 
     #[test]
-    fn dns_cache_path_defaults_without_config() {
-        assert_eq!(dns_cache_path(None), PathBuf::from("tor-socks5.dns-cache"));
+    fn dns_cache_path_without_parent_resolves_under_current_directory() {
+        // The config path is required (D-H1); a bare file name lands next to
+        // it, i.e. under "." — there is no hidden default location.
+        assert_eq!(
+            dns_cache_path(Path::new("tor-socks5.ktav")),
+            PathBuf::from("tor-socks5.dns-cache")
+        );
     }
 
     #[test]

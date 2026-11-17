@@ -66,7 +66,7 @@ pub use owner_settings::{restricted_owner_settings, validate_owner_routes};
 /// PT resolution follows [`PtBinary::Environment`]; embedding hosts that
 /// cannot dispatch PT mode themselves pass a different policy through
 /// [`build_tor_settings_with_pt`].
-pub async fn build_tor_settings(cfg: &Config, config_path: Option<&Path>) -> Result<Settings> {
+pub async fn build_tor_settings(cfg: &Config, config_path: &Path) -> Result<Settings> {
     build_tor_settings_with_pt(cfg, config_path, PtBinary::Environment).await
 }
 
@@ -75,7 +75,7 @@ pub async fn build_tor_settings(cfg: &Config, config_path: Option<&Path>) -> Res
 /// updates, pruning) is identical.
 pub async fn build_tor_settings_with_pt(
     cfg: &Config,
-    config_path: Option<&Path>,
+    config_path: &Path,
     pt: PtBinary,
 ) -> Result<Settings> {
     build_tor_settings_inner(cfg, config_path, &[], pt).await
@@ -84,7 +84,7 @@ pub async fn build_tor_settings_with_pt(
 #[cfg(test)]
 pub(crate) async fn build_tor_settings_preserving_live(
     cfg: &Config,
-    config_path: Option<&Path>,
+    config_path: &Path,
     live: &[BridgeLine],
 ) -> Result<Settings> {
     build_tor_settings_preserving_live_with_pt(cfg, config_path, live, PtBinary::Environment).await
@@ -92,7 +92,7 @@ pub(crate) async fn build_tor_settings_preserving_live(
 
 pub(crate) async fn build_tor_settings_preserving_live_with_pt(
     cfg: &Config,
-    config_path: Option<&Path>,
+    config_path: &Path,
     live: &[BridgeLine],
     pt: PtBinary,
 ) -> Result<Settings> {
@@ -101,7 +101,7 @@ pub(crate) async fn build_tor_settings_preserving_live_with_pt(
 
 async fn build_tor_settings_inner(
     cfg: &Config,
-    config_path: Option<&Path>,
+    config_path: &Path,
     live: &[BridgeLine],
     pt: PtBinary,
 ) -> Result<Settings> {
@@ -272,8 +272,8 @@ async fn build_tor_settings_inner(
         None
     };
 
-    // Keep arti's state/cache app-local (next to the config when we have a
-    // path, else `./arti-data`). Shared OS-default arti dirs persist a guard
+    // Keep arti's state/cache app-local (next to the config file). Shared
+    // OS-default arti dirs persist a guard
     // sample / cached consensus across runs that can shadow our bridges.
     let arti_base = arti_base_dir(config_path);
 
@@ -295,23 +295,21 @@ async fn build_tor_settings_inner(
 }
 
 /// The arti state base dir `build_tor_settings` hands to arti: next to the
-/// config file when we have a path, else `./arti-data`. Extracted so the
+/// config file. Extracted so the
 /// background circuit-verify task (`bridge_verifier.rs`) derives the live
 /// client's cache dir (`base.join("cache")`, per `arti_wrapper::build_config`)
 /// from the same logic and cannot drift from the actually-running client.
-pub fn arti_base_dir(config_path: Option<&Path>) -> std::path::PathBuf {
-    match config_path.and_then(Path::parent) {
-        Some(dir) if !dir.as_os_str().is_empty() => dir.join("arti-data"),
-        _ => std::path::PathBuf::from("arti-data"),
-    }
+pub fn arti_base_dir(config_path: &Path) -> std::path::PathBuf {
+    config_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("arti-data")
 }
 
 /// Arti's native keystore for a config: `<arti base>/state/keystore` (arti
-/// pins it under its state dir). The one place the onion CLI tools and the
-/// server's onion host derive it from, so both resolve the same keys.
-pub fn arti_keystore_dir(config_path: Option<&Path>) -> std::path::PathBuf {
-    arti_base_dir(config_path).join("state").join("keystore")
-}
+/// pins it under its state dir). Re-exported from `proxy_config` (H13:
+/// Tor-free) so the facade path keeps working.
+pub use proxy_config::arti_keystore_dir;
 
 /// Narrow the startup pool to the configured preferred transport, if any.
 ///
@@ -448,10 +446,7 @@ fn retain_and_rank_alive(alive: &mut Vec<(BridgeLine, Duration)>, ranked: &[Brid
 /// health store falls back to the first
 /// bounded slice; the caller performs a full probe only when that slice
 /// produces no reachable bridge.
-fn select_active_probe_bridges(
-    configured: &[BridgeLine],
-    config_path: Option<&Path>,
-) -> Vec<BridgeLine> {
+fn select_active_probe_bridges(configured: &[BridgeLine], config_path: &Path) -> Vec<BridgeLine> {
     if configured.len() <= MAX_ACTIVE_BRIDGES {
         return configured.to_vec();
     }
@@ -508,7 +503,7 @@ fn fallback_probe_pool(
 /// could not be read (publish failures are the writer's retry problem).
 /// Best-effort: never fails the bootstrap.
 pub(crate) async fn update_health_and_prune(
-    config_path: Option<&Path>,
+    config_path: &Path,
     probed: &[BridgeLine],
     alive: &[(BridgeLine, Duration)],
     cfg: &Config,
@@ -581,24 +576,20 @@ pub(crate) async fn update_health_and_prune(
         .map(|lock| lock.into_inner().unwrap())
         .unwrap_or_default();
     if !pruned.is_empty() {
-        if let Some(path) = config_path {
-            let path = path.to_path_buf();
-            let log_path = path.clone();
-            let dead = pruned.clone();
-            match crate::workers::run_fallible_blocking(move || {
-                prune_bridges_from_config(&path, &dead)
-            })
+        let path = config_path.to_path_buf();
+        let log_path = path.clone();
+        let dead = pruned.clone();
+        match crate::workers::run_fallible_blocking(move || prune_bridges_from_config(&path, &dead))
             .await
-            {
-                Ok(Ok(n)) if n > 0 => info!(
-                    removed = n,
-                    path = %log_path.display(),
-                    "removed dead bridges (reached max_fails) from config"
-                ),
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => warn!(error = %e, "could not prune dead bridges from config"),
-                Err(e) => warn!(error = %e, "config prune task failed"),
-            }
+        {
+            Ok(Ok(n)) if n > 0 => info!(
+                removed = n,
+                path = %log_path.display(),
+                "removed dead bridges (reached max_fails) from config"
+            ),
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => warn!(error = %e, "could not prune dead bridges from config"),
+            Err(e) => warn!(error = %e, "config prune task failed"),
         }
     }
 
@@ -863,7 +854,10 @@ mod tests {
         let bridges: Vec<BridgeLine> = (0..5)
             .map(|i| obfs4_line(&format!("10.0.0.{i}:443")))
             .collect();
-        assert_eq!(select_active_probe_bridges(&bridges, None), bridges);
+        assert_eq!(
+            select_active_probe_bridges(&bridges, Path::new("tor-socks5.ktav")),
+            bridges
+        );
     }
 
     #[test]
@@ -875,7 +869,7 @@ mod tests {
         // install: the health store loads empty, so this falls back to the
         // first `MAX_ACTIVE_BRIDGES` bridges in configured order.
         let missing_config = Path::new("/nonexistent/does-not-exist/tor-socks5.ktav");
-        let active = select_active_probe_bridges(&bridges, Some(missing_config));
+        let active = select_active_probe_bridges(&bridges, missing_config);
         assert_eq!(active.len(), MAX_ACTIVE_BRIDGES);
         assert_eq!(active, bridges[..MAX_ACTIVE_BRIDGES]);
     }

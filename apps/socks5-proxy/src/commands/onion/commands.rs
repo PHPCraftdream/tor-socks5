@@ -106,7 +106,7 @@ struct Target {
 impl Target {
     fn new(config_path: Option<&Path>) -> Self {
         let config = Config::resolve_path(config_path);
-        let keystore = store::keystore_dir(Some(&config));
+        let keystore = proxy_config::arti_keystore_dir(&config);
         Self { config, keystore }
     }
 
@@ -460,7 +460,7 @@ mod tests {
     fn a_key_left_in_the_keystore_counts_as_an_existing_identity() {
         let (_tmp, config) = temp_setup();
         let nick = store::nickname("old").expect("nickname");
-        let dir = store::keystore_dir(Some(&config));
+        let dir = proxy_config::arti_keystore_dir(&config);
         let keymgr = store::open(&dir).expect("keystore");
         store::generate(&keymgr, &nick, false).expect("generate");
         drop(keymgr);

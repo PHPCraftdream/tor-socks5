@@ -28,7 +28,7 @@ async fn handled_publish_failures_recover_worker_capacity() {
     let writer = registry
         .scope(async {
             let writer = StoreWriter::spawn(
-                BridgeStore::resolve_path(Some(&path)),
+                BridgeStore::resolve_path(&path),
                 publisher,
                 Duration::from_secs(1),
             );
@@ -65,7 +65,7 @@ async fn publish_failure_retains_absorbed_updates_until_next_op() {
 
     let calls = Arc::new(AtomicUsize::new(0));
     let writer = StoreWriter::spawn(
-        BridgeStore::resolve_path(Some(&path)),
+        BridgeStore::resolve_path(&path),
         fail_first_publisher(calls.clone()),
         INITIAL_BACKOFF,
     );
@@ -126,7 +126,7 @@ async fn backoff_gates_publish_attempts_under_a_continuous_mutation_stream() {
 
     let calls = Arc::new(AtomicUsize::new(0));
     let writer = StoreWriter::spawn(
-        BridgeStore::resolve_path(Some(&path)),
+        BridgeStore::resolve_path(&path),
         fail_first_publisher(calls.clone()),
         Duration::from_secs(1),
     );
@@ -182,7 +182,7 @@ async fn close_flushes_absorbed_updates_before_the_retry_deadline() {
 
     let calls = Arc::new(AtomicUsize::new(0));
     let writer = StoreWriter::spawn(
-        BridgeStore::resolve_path(Some(&path)),
+        BridgeStore::resolve_path(&path),
         fail_first_publisher(calls.clone()),
         Duration::from_secs(1),
     );
@@ -236,7 +236,7 @@ async fn close_reports_a_persistent_publish_failure() {
     seed_store(&path, &b);
 
     let writer = StoreWriter::spawn(
-        BridgeStore::resolve_path(Some(&path)),
+        BridgeStore::resolve_path(&path),
         Arc::new(|_s: &BridgeStore| Err(anyhow!("disk is full"))),
         INITIAL_BACKOFF,
     );
@@ -271,7 +271,7 @@ async fn publish_failure_is_retried_by_the_backoff_timer() {
 
     let calls = Arc::new(AtomicUsize::new(0));
     let writer = StoreWriter::spawn(
-        BridgeStore::resolve_path(Some(&path)),
+        BridgeStore::resolve_path(&path),
         fail_first_publisher(calls.clone()),
         Duration::from_secs(1),
     );

@@ -11,7 +11,7 @@ async fn cancelled_drain_keeps_promotion_worker_owned() {
     cfg.bridges.transport = "webtunnel".into();
     cfg.write(&path).unwrap();
     let candidate: BridgeLine = "webtunnel [2001:db8::1]:443 0123456789ABCDEF0123456789ABCDEF01234567 url=https://example.com/bridge".parse().unwrap();
-    let pool_path = CandidatePool::resolve_path(Some(&path));
+    let pool_path = CandidatePool::resolve_path(&path);
     let mut pool = CandidatePool::load(pool_path.clone()).unwrap();
     assert_eq!(pool.merge([candidate.clone()], &HashSet::new()), 1);
     pool.save().unwrap();
@@ -30,14 +30,7 @@ async fn cancelled_drain_keeps_promotion_worker_owned() {
                         }
                     })
                 });
-                drain_with(
-                    Some(&drain_path),
-                    1,
-                    None,
-                    &probe,
-                    &AdmissionWorkers::default(),
-                )
-                .await
+                drain_with(&drain_path, 1, None, &probe, &AdmissionWorkers::default()).await
             })
             .await
     });

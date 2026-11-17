@@ -104,7 +104,7 @@ fn main() -> Result<()> {
     );
     println!(
         "next to a config at cfg/myapp.ktav the registry is: {}",
-        UsersConfig::resolve_path(Some(Path::new("cfg/myapp.ktav"))).display()
+        UsersConfig::resolve_path(Path::new("cfg/myapp.ktav")).display()
     );
     fs::remove_file(&path)?;
     Ok(())

@@ -38,12 +38,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 async fn run(config: Config, config_path: PathBuf, pt: PtBinary) -> Result<(), Box<dyn Error>> {
-    let settings = build_tor_settings_with_pt(&config, Some(&config_path), pt).await?;
+    let settings = build_tor_settings_with_pt(&config, &config_path, pt).await?;
     let tunnel = TorTunnel::bootstrap_with(settings.clone()).await?;
     let handle = TorHandle::new_with_settings(tunnel, &settings);
     let host_config = OnionHostConfig::new(
         handle.clone(),
-        tor_socks5::runtime::arti_keystore_dir(Some(&config_path)),
+        tor_socks5::runtime::arti_keystore_dir(&config_path),
         Default::default(),
     )
     .with_entries(config.onion_services)

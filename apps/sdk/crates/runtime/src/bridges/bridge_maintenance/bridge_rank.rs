@@ -166,7 +166,7 @@ fn take_best<I: Ord>(items: Vec<I>, limit: usize) -> Vec<I> {
 /// way.
 pub(crate) fn candidates_with_health(
     cfg: &Config,
-    config_path: Option<&std::path::Path>,
+    config_path: &std::path::Path,
 ) -> Vec<(BridgeLine, Health)> {
     let parsed = match cfg.bridges.parsed() {
         Ok(p) => p.bridges,
@@ -476,7 +476,7 @@ mod tests {
 
         let seeded = bridge(OBFS4_A);
         let t0 = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
-        let mut store = BridgeStore::load(BridgeStore::resolve_path(Some(config_path.as_path())))
+        let mut store = BridgeStore::load(BridgeStore::resolve_path(config_path.as_path()))
             .expect("load fresh store");
         store.note_probe_round(
             std::slice::from_ref(&seeded),
@@ -503,10 +503,10 @@ mod tests {
         );
         store.save().expect("seed save");
 
-        let candidates = candidates_with_health(&cfg, Some(config_path.as_path()));
+        let candidates = candidates_with_health(&cfg, config_path.as_path());
         assert_eq!(candidates.len(), 2, "both configured bridges are listed");
 
-        let reloaded = BridgeStore::load(BridgeStore::resolve_path(Some(config_path.as_path())))
+        let reloaded = BridgeStore::load(BridgeStore::resolve_path(config_path.as_path()))
             .expect("reload store");
         for (b, health) in &candidates {
             assert_eq!(health.tcp_fails, reloaded.tcp_fails(b), "tcp_fails for {b}");

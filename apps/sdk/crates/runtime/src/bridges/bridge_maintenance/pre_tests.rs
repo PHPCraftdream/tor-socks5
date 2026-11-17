@@ -137,7 +137,7 @@ async fn pre_refresh_and_heal_relaunch_through_same_proxy() {
         )];
         let path = dir.path().join("proxy.ktav");
         cfg.write(&path).unwrap();
-        let mut active = crate::tor_setup::build_tor_settings(&cfg, Some(&path))
+        let mut active = crate::tor_setup::build_tor_settings(&cfg, &path)
             .await
             .unwrap();
         // Bootstrap использует отдельный адрес и идентичность от проверяемого кандидата.
@@ -162,7 +162,7 @@ async fn pre_refresh_and_heal_relaunch_through_same_proxy() {
             async {
                 let result = refresh(
                     &handle,
-                    Some(&path),
+                    &path,
                     &observations,
                     &mut active,
                     &mut next_recovery,
@@ -175,7 +175,7 @@ async fn pre_refresh_and_heal_relaunch_through_same_proxy() {
                 let ready = crate::tor_watchdog::route_bridge_count(
                     &tor,
                     std::slice::from_ref(&bridge),
-                    Some(&path),
+                    &path,
                 )
                 .await;
                 assert_eq!(ready, 0);
@@ -195,7 +195,7 @@ async fn pre_refresh_and_heal_relaunch_through_same_proxy() {
         let quiet_proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let quiet_endpoint = quiet_proxy.local_addr().unwrap().to_string();
         cfg.pre_proxies = Some(quiet_endpoint.parse::<Socks5Endpoint>().unwrap().into());
-        let mut active = crate::tor_setup::build_tor_settings(&cfg, Some(isolated.path()))
+        let mut active = crate::tor_setup::build_tor_settings(&cfg, isolated.path())
             .await
             .unwrap();
         let tor = arti_wrapper::TorTunnel::create_unbootstrapped_with(active.clone()).unwrap();
@@ -203,7 +203,7 @@ async fn pre_refresh_and_heal_relaunch_through_same_proxy() {
         cfg.bridges.use_seeds = true;
         assert!(refresh_pre(
             &handle,
-            Some(dir.path()),
+            dir.path(),
             &mut active,
             &cfg,
             &tor,
@@ -216,7 +216,7 @@ async fn pre_refresh_and_heal_relaunch_through_same_proxy() {
         cfg.pre_proxies = None;
         assert!(refresh_pre(
             &handle,
-            Some(dir.path()),
+            dir.path(),
             &mut active,
             &cfg,
             &tor,
@@ -230,7 +230,7 @@ async fn pre_refresh_and_heal_relaunch_through_same_proxy() {
         ));
         assert!(refresh_pre(
             &handle,
-            Some(dir.path()),
+            dir.path(),
             &mut active,
             &cfg,
             &tor,
@@ -270,7 +270,7 @@ async fn refresh_activates_selected_route_and_preserves_credentials() {
             .into(),
     );
     cfg.write(&path).unwrap();
-    let mut active = crate::tor_setup::build_tor_settings(&cfg, Some(&path))
+    let mut active = crate::tor_setup::build_tor_settings(&cfg, &path)
         .await
         .unwrap();
     active.bridges = vec!["8.8.8.8:443 1111111111111111111111111111111111111111"
@@ -286,7 +286,7 @@ async fn refresh_activates_selected_route_and_preserves_credentials() {
             probe.clone(),
             refresh(
                 &handle,
-                Some(&path),
+                &path,
                 &ObservationSink::new(),
                 &mut active,
                 &mut next,
@@ -337,7 +337,7 @@ async fn failed_pre_refresh_delays_recovery_notification() {
     cfg.bridges.lines = vec!["8.8.8.8:443 1111111111111111111111111111111111111111".into()];
     cfg.pre_proxies = Some("127.0.0.1:1080".parse::<Socks5Endpoint>().unwrap().into());
     cfg.write(&path).unwrap();
-    let active = crate::tor_setup::build_tor_settings(&cfg, Some(&path))
+    let active = crate::tor_setup::build_tor_settings(&cfg, &path)
         .await
         .unwrap();
     let handle = TorHandle::new(
@@ -356,7 +356,7 @@ async fn failed_pre_refresh_delays_recovery_notification() {
         PRE_PROBE.sync_scope(probe.clone(), || {
             spawn(
                 handle.clone(),
-                Some(path),
+                path,
                 0,
                 ObservationSink::new(),
                 active,
@@ -399,7 +399,7 @@ async fn invalid_reload_fails_before_readiness() {
             .unwrap()
             .into(),
     );
-    let mut active = crate::tor_setup::build_tor_settings(&cfg, Some(&path))
+    let mut active = crate::tor_setup::build_tor_settings(&cfg, &path)
         .await
         .unwrap();
     let tor = arti_wrapper::TorTunnel::create_unbootstrapped_with(active.clone()).unwrap();
@@ -452,7 +452,7 @@ async fn invalid_reload_fails_before_readiness() {
                 probe.clone(),
                 refresh(
                     &handle,
-                    Some(&path),
+                    &path,
                     &ObservationSink::new(),
                     &mut active,
                     &mut next,

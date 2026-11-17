@@ -217,21 +217,21 @@ pub(super) fn format_iso(t: OffsetDateTime) -> String {
 }
 
 impl BridgeStore {
-    /// Resolve the on-disk path of the store given the config path. When
-    /// the config came from defaults we fall back to
-    /// `./tor-socks5.alive-bridges.log`.
-    pub fn resolve_path(config_path: Option<&Path>) -> PathBuf {
-        match config_path {
-            Some(cfg) => {
-                let dir = cfg.parent().unwrap_or_else(|| Path::new("."));
-                let stem = cfg
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "tor-socks5".to_string());
-                dir.join(format!("{stem}.alive-bridges.log"))
-            }
-            None => PathBuf::from("tor-socks5.alive-bridges.log"),
-        }
+    /// Resolve the on-disk path of the store given the main config
+    /// path: same directory, same stem, fixed `.alive-bridges.log`
+    /// suffix. There is deliberately no fallback: callers without a
+    /// config path must fail upstream instead of deriving a write path
+    /// from the current directory.
+    pub fn resolve_path(config_path: &Path) -> PathBuf {
+        let dir = config_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let stem = config_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "tor-socks5".to_string());
+        dir.join(format!("{stem}.alive-bridges.log"))
     }
 
     /// Read the store from disk, silently ignoring malformed entries.

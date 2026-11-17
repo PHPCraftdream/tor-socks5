@@ -62,7 +62,7 @@ fn concurrent_store_writers_do_not_lose_each_others_updates() {
         bridges_cfg: BridgesConfig::default(),
         resolver_policy: bridge_probe::ResolverPolicy::default(),
     };
-    let store_path = BridgeStore::resolve_path(Some(cfg_path.as_path()));
+    let store_path = BridgeStore::resolve_path(cfg_path.as_path());
 
     let parse = |ip: &str, fp: &str, url: &str| {
         format!("webtunnel {ip}:443 {fp} url={url}")
@@ -249,7 +249,7 @@ fn failed_circuit_verify_batch_advances_the_due_queue() {
         bridges_cfg: BridgesConfig::default(),
         resolver_policy: bridge_probe::ResolverPolicy::default(),
     };
-    let store_path = BridgeStore::resolve_path(Some(cfg_path.as_path()));
+    let store_path = BridgeStore::resolve_path(cfg_path.as_path());
 
     let parse = |ip: &str, fp: &str, url: &str| {
         format!("webtunnel {ip}:443 {fp} url={url}")
@@ -631,7 +631,7 @@ fn persist_and_rank_probe_ranks_alive_by_stability() {
     // Seed the store file: channel history for ch2 (2x) and ch1 (1x), a long
     // reachability history for okbig (10 probe rounds), nothing for the
     // tied pair.
-    let store_path = BridgeStore::resolve_path(Some(cfg_path.as_path()));
+    let store_path = BridgeStore::resolve_path(cfg_path.as_path());
     {
         let mut store = BridgeStore::load(store_path.clone()).expect("load empty store");
         let now = time::OffsetDateTime::now_utc();

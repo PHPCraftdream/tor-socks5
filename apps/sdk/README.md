@@ -241,7 +241,7 @@ let manager_config = BridgeManagerConfig {
     settings,
     pt_binary: PtBinary::Explicit(pt_path),
 };
-let manager = start(handle, Some(config_path), &cfg, sink, manager_config);
+let manager = start(handle, config_path, &cfg, sink, manager_config);
 ```
 
 The facade intentionally retains these health counters, failure
@@ -275,7 +275,7 @@ use tracing_subscriber::layer::SubscriberExt;
 // Start the process-wide writer (one live instance per process; after a
 // close, the next init starts a fresh writer, never the closed one).
 // `config_path` is the main config; the store is its sibling file.
-let writer = init_global(Some(config_path));
+let writer = init_global(&config_path);
 
 let sink = ObservationSink::new();
 tracing_subscriber::registry()
@@ -308,7 +308,7 @@ closing the bridge-store writer:
 ```rust
 use tor_socks5::runtime::{close_global, start, ObservationSink};
 
-let manager = start(handle, Some(config_path), &cfg, sink, settings);
+let manager = start(handle, config_path, &cfg, sink, settings);
 println!("running: {:?}", manager.status().producers);
 let outcomes = manager.shutdown_with_timeout(std::time::Duration::from_secs(30)).await;
 for outcome in &outcomes {
@@ -331,9 +331,10 @@ candidate pool from configured HTTPS sources and, unless `probe` is `false`,
 probes candidates and promotes reachable ones into the working config. The
 application keeps config loading, validation, tracing and printing; the result
 is `Result<FetchBridgesOutcome { added, promoted, pool_len }, FetchBridgesError>`.
-`FetchBridgesError` variants: `NoConfigFile` (passing `None` is an error — the
-SDK never creates a default config file; run the server once or pass an
-explicit path), `PreProxies` (a global `pre_proxies` pool is rejected by the
+`FetchBridgesError` variants: `NoConfigFile` (`config_path` is required; a
+path to a nonexistent config file errors before any file I/O — the SDK never
+creates a default config file; run the server once or pass an explicit path),
+`PreProxies` (a global `pre_proxies` pool is rejected by the
 SDK itself: fetching runs over the host network and cannot honour it),
 `NoBridgeSources`, `Cancelled`, and `Other` (everything else, with the root
 cause as `source()`). `FetchBridgesParams.pt_binary` (a `PtBinary` policy)
@@ -373,6 +374,12 @@ let cfg = Config {
     ..Config::default()
 };
 let server = Server::builder(cfg)
+    // Required: sibling files (users registry, bridge store, DNS cache,
+    // keystore) are resolved from this path; startup fails with
+    // `ServerError::Config` when it is missing, and nothing is written to
+    // the current directory. The supplied config is a startup snapshot:
+    // it is read once and never re-read live.
+    .config_path(std::path::PathBuf::from("tor-socks5.ktav"))
     .dns_startup_policy(tor_socks5::server::DnsStartupPolicy::Required)
     .upstream(Some("127.0.0.1:9050".into()), None, None)
     .start()
@@ -381,6 +388,10 @@ server.shutdown().await?;
 # Ok(())
 # }
 ```
+
+When the users file next to the config is absent, the server logs a warning at
+startup and accepts anonymous SOCKS5 clients (an existing-but-empty file logs
+an informational line instead).
 
 The embedded-server contract is one live server per process: await
 `shutdown()` before starting another; sequential restart is supported. Embedded

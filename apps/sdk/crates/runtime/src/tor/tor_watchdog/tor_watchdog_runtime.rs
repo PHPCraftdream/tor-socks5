@@ -276,7 +276,7 @@ pub(super) fn signal_budget_available(signals_sent: u32) -> bool {
 /// bridge-store writer.
 pub fn spawn_bridge_failover_watchdog(
     handle: TorHandle,
-    config_path: Option<PathBuf>,
+    config_path: PathBuf,
     cfg: WatchdogConfig,
     token: CancellationToken,
 ) -> Option<tokio::task::JoinHandle<()>> {
@@ -333,7 +333,7 @@ pub fn spawn_bridge_failover_watchdog(
                 continue;
             };
 
-            let cfg = match Config::load_with_override(config_path.as_deref()) {
+            let cfg = match Config::load_with_override(Some(config_path.as_path())) {
                 Ok(loaded) => loaded.into_config(),
                 Err(e) => {
                     warn!(error = %e, "soft-failover: could not reload config");
@@ -342,7 +342,7 @@ pub fn spawn_bridge_failover_watchdog(
             };
 
             let active = handle.active_bridges();
-            let candidates: Vec<_> = candidates_with_health(&cfg, config_path.as_deref())
+            let candidates: Vec<_> = candidates_with_health(&cfg, config_path.as_path())
                 .into_iter()
                 .filter(|(bridge, _)| active.contains(bridge))
                 .collect();
@@ -466,7 +466,7 @@ pub(super) fn healthiest(candidates: &[(BridgeLine, Health)]) -> Option<Health> 
 /// bridge-store writer.
 pub fn spawn_tor_watchdog(
     handle: TorHandle,
-    config_path: Option<PathBuf>,
+    config_path: PathBuf,
     cfg: WatchdogConfig,
     token: CancellationToken,
 ) -> Option<WatchdogRun> {
@@ -592,8 +592,7 @@ pub fn spawn_tor_watchdog(
                     continue;
                 };
                 let alive =
-                    route_bridge_count(&tor, &handle.active_bridges(), config_path.as_deref())
-                        .await;
+                    route_bridge_count(&tor, &handle.active_bridges(), config_path.as_path()).await;
                 if alive == 0 {
                     continue;
                 }
@@ -844,7 +843,7 @@ pub(super) async fn verify_usable(tor: &TorTunnel, target: Option<(String, u16)>
 pub(crate) async fn route_bridge_count(
     tor: &TorTunnel,
     bridges: &[BridgeLine],
-    path: Option<&Path>,
+    path: &Path,
 ) -> usize {
     match tor.configured_pre_endpoint() {
         Some(Some(_)) => {
@@ -864,7 +863,7 @@ pub(crate) async fn route_bridge_count(
 /// on-disk health store. Best-effort: a
 /// missing/unreadable store yields 0 (the watchdog then declines to fire,
 /// leaving the bridge-maintenance loop to repopulate it).
-pub(super) fn live_bridge_count(config_path: Option<&Path>) -> usize {
+pub(super) fn live_bridge_count(config_path: &Path) -> usize {
     let path = BridgeStore::resolve_path(config_path);
     match BridgeStore::load(path) {
         Ok(store) => store.alive_count(),

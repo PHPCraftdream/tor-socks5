@@ -36,7 +36,7 @@ async fn apply_falls_back_to_inline_write_without_a_global_writer() {
     seed_store(&config_path, &b);
 
     let b1 = b.clone();
-    apply(Some(config_path.as_ref()), move |s| {
+    apply(config_path.as_ref(), move |s| {
         s.note_channel_success_at(&b1, OffsetDateTime::now_utc())
     })
     .await
@@ -60,7 +60,7 @@ async fn external_cli_write_between_angel_mutations_survives() {
     seed_store(&path, &b);
 
     let writer = StoreWriter::spawn(
-        BridgeStore::resolve_path(Some(&path)),
+        BridgeStore::resolve_path(&path),
         Arc::new(|s| s.save()),
         INITIAL_BACKOFF,
     );
@@ -122,7 +122,7 @@ async fn external_cli_write_after_successful_retry_survives() {
 
     let calls = Arc::new(AtomicUsize::new(0));
     let writer = StoreWriter::spawn(
-        BridgeStore::resolve_path(Some(&path)),
+        BridgeStore::resolve_path(&path),
         fail_first_publisher(calls.clone()),
         Duration::from_secs(1),
     );
@@ -192,9 +192,9 @@ async fn init_close_init_gets_a_fresh_live_writer() {
     // Clear any writer a panicked predecessor may have left behind.
     drop(close_global().await);
 
-    let first = init_global(Some(path.as_path()));
+    let first = init_global(path.as_path());
     // Re-init without close returns the existing writer, not a second one.
-    let again = init_global(Some(path.as_path()));
+    let again = init_global(path.as_path());
     assert!(
         Arc::ptr_eq(&first.actor, &again.actor),
         "re-init without close must return the existing writer"
@@ -216,7 +216,7 @@ async fn init_close_init_gets_a_fresh_live_writer() {
     );
 
     // Re-init after close must NOT hand back the closed writer.
-    let second = init_global(Some(path.as_path()));
+    let second = init_global(path.as_path());
     assert!(
         !Arc::ptr_eq(&first.actor, &second.actor),
         "init after close must start a fresh writer"
@@ -256,7 +256,7 @@ async fn open_starts_a_live_writer_and_close_reports_the_flush_result() {
     let path = config_path(dir.path());
     seed_store(&path, &b);
 
-    let writer = StoreWriter::open(Some(path.as_path()));
+    let writer = StoreWriter::open(path.as_path());
     let b1 = b.clone();
     writer
         .apply(move |s| s.note_channel_success_at(&b1, OffsetDateTime::now_utc()))

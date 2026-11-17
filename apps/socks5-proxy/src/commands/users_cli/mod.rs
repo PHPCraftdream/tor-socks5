@@ -115,7 +115,7 @@ pub fn run(
     prompt: &mut dyn PasswordPrompt,
 ) -> Result<()> {
     let config_path = crate::config::Config::resolve_path(config_path);
-    let users_path = UsersConfig::resolve_path(Some(&config_path));
+    let users_path = UsersConfig::resolve_path(&config_path);
     match action {
         UsersAction::Add {
             name,

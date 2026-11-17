@@ -297,8 +297,8 @@ fn runtime_module_tor_client_surface() {
     let counters = ConnHealthCounters::default();
     let _: PendingConnectionGuard = counters.record_started();
 
-    let _: fn(Option<&Path>) -> PathBuf = tor_socks5::runtime::arti_base_dir;
-    let _: fn(Option<&Path>) -> PathBuf = tor_socks5::runtime::arti_keystore_dir;
+    let _: fn(&Path) -> PathBuf = tor_socks5::runtime::arti_base_dir;
+    let _: fn(&Path) -> PathBuf = tor_socks5::runtime::arti_keystore_dir;
     let _: fn(&tor_socks5::runtime::TorError, &TorHealth) =
         tor_socks5::runtime::classify_and_record;
     // The token type is not re-exported by the facade: pinned generically.
@@ -308,32 +308,26 @@ fn runtime_module_tor_client_surface() {
     }
     expect_conn_health_spawn(tor_socks5::runtime::spawn_conn_health_logger);
     let _ = tor_socks5::runtime::run_conn_health_logger;
-    let _: fn(Option<&Path>) -> tor_socks5::runtime::StoreWriter = tor_socks5::runtime::init_global;
+    let _: fn(&Path) -> tor_socks5::runtime::StoreWriter = tor_socks5::runtime::init_global;
     fn expect_close_global<F: Future>(_f: fn() -> F) {}
     expect_close_global(tor_socks5::runtime::close_global);
     // The error side of these futures is `anyhow::Error`, which the facade
     // does not re-export; the `Ok` payload is pinned instead.
-    fn expect_tor_settings<'a>(
-        cfg: &'a Config,
-        config_path: Option<&'a Path>,
-    ) -> impl Future + use<'a> {
+    fn expect_tor_settings<'a>(cfg: &'a Config, config_path: &'a Path) -> impl Future + use<'a> {
         tor_socks5::runtime::build_tor_settings(cfg, config_path)
     }
     fn expect_tor_settings_with_pt<'a>(
         cfg: &'a Config,
-        config_path: Option<&'a Path>,
+        config_path: &'a Path,
         pt: PtBinary,
     ) -> impl Future + use<'a> {
         tor_socks5::runtime::build_tor_settings_with_pt(cfg, config_path, pt)
     }
     let _ = (expect_tor_settings, expect_tor_settings_with_pt);
-    fn expect_tor_watchdog<H, C>(
-        _f: fn(H, Option<PathBuf>, WatchdogConfig, C) -> Option<WatchdogRun>,
-    ) {
-    }
+    fn expect_tor_watchdog<H, C>(_f: fn(H, PathBuf, WatchdogConfig, C) -> Option<WatchdogRun>) {}
     expect_tor_watchdog(tor_socks5::runtime::spawn_tor_watchdog);
     fn expect_failover_watchdog<H, C>(
-        _f: fn(H, Option<PathBuf>, WatchdogConfig, C) -> Option<tokio::task::JoinHandle<()>>,
+        _f: fn(H, PathBuf, WatchdogConfig, C) -> Option<tokio::task::JoinHandle<()>>,
     ) {
     }
     expect_failover_watchdog(tor_socks5::runtime::spawn_bridge_failover_watchdog);
@@ -383,7 +377,7 @@ fn runtime_facade_source_has_no_nested_module_reexports_or_globs() {
 #[test]
 fn runtime_bridge_manager_surface() {
     use std::future::Future;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use tor_socks5::config::Config;
     use tor_socks5::runtime::{
@@ -414,7 +408,7 @@ fn runtime_bridge_manager_surface() {
     );
     fn expect_fetch<'a>(
         cfg: &'a Config,
-        config_path: Option<&'a Path>,
+        config_path: &'a Path,
         params: FetchBridgesParams,
     ) -> impl Future + use<'a> {
         fetch_bridges(cfg, config_path, params)
@@ -433,7 +427,7 @@ fn runtime_bridge_manager_surface() {
             settings: tor_socks5::tor::Settings::default(),
             pt_binary: PtBinary::Environment,
         };
-        tor_socks5::runtime::start(handle, None, cfg, observations, config)
+        tor_socks5::runtime::start(handle, PathBuf::new(), cfg, observations, config)
     }
     fn assert_parent_token_start_signature(
         manager: &BridgeManagerHandle,
@@ -444,7 +438,7 @@ fn runtime_bridge_manager_surface() {
     ) -> BridgeManagerHandle {
         tor_socks5::runtime::start_with_parent_token(
             handle,
-            None,
+            PathBuf::new(),
             cfg,
             observations,
             config,
@@ -637,8 +631,10 @@ fn server_builder_setters_surface() {
     use tor_socks5::runtime::ObservationSink;
     use tor_socks5::server::{PtBinary, Server, ServerBuilder, ServerStatus};
 
+    // H13/D-H1: the config path is required (PathBuf, not Option); the
+    // supplied config is a startup snapshot, read once and never re-read live.
     let builder = Server::builder(Config::default())
-        .config_path(Option::<PathBuf>::None)
+        .config_path(PathBuf::from("tor-socks5.ktav"))
         .observation_sink(ObservationSink::new())
         .no_upstream(true)
         // H11: the PT policy setter consumes the builder's `PtBinary`.

@@ -110,7 +110,7 @@ fn activate(
 /// else the current process executable.
 pub fn spawn(
     handle: TorHandle,
-    config_path: Option<PathBuf>,
+    config_path: PathBuf,
     interval_mins: u64,
     observations: ObservationSink,
     mut active: Settings,
@@ -168,7 +168,7 @@ pub fn spawn(
             }
             let cycle: futures::future::BoxFuture<'_, Result<()>> = Box::pin(refresh_with_pt(
                 &handle,
-                config_path.as_deref(),
+                config_path.as_path(),
                 &observations,
                 &mut active,
                 &mut next_recovery,
@@ -217,17 +217,14 @@ pub fn spawn(
 /// `Config::load_with_override` does blocking file I/O (config read plus
 /// reader-side stale-temp cleanup); run it on Tokio's blocking pool so it
 /// cannot stall an async worker (TS19-01).
-pub(crate) async fn load_config_off_worker(path: Option<&Path>) -> Result<Config> {
-    let path = path.map(Path::to_path_buf);
+pub(crate) async fn load_config_off_worker(path: &Path) -> Result<Config> {
+    let path = path.to_path_buf();
     crate::workers::run_fallible_blocking(move || {
         #[cfg(any(test, feature = "test-seams"))]
         crate::test_seams::note_task_context(crate::test_seams::Site::MaintenanceConfigLoad);
         #[cfg(any(test, feature = "test-seams"))]
-        if let Some(path) = path.as_deref() {
-            crate::test_seams::park_if_armed(crate::test_seams::Site::MaintenanceConfigLoad, path);
-        }
-        crate::config::Config::load_with_override(path.as_deref())
-            .map(|loaded| loaded.into_config())
+        crate::test_seams::park_if_armed(crate::test_seams::Site::MaintenanceConfigLoad, &path);
+        crate::config::Config::load_with_override(Some(&path)).map(|loaded| loaded.into_config())
     })
     .await
     .map_err(|e| anyhow::anyhow!("config load task failed: {e}"))?
@@ -236,7 +233,7 @@ pub(crate) async fn load_config_off_worker(path: Option<&Path>) -> Result<Config
 #[cfg(test)]
 async fn refresh(
     handle: &TorHandle,
-    path: Option<&Path>,
+    path: &Path,
     observations: &ObservationSink,
     active: &mut Settings,
     next_recovery: &mut Instant,
@@ -256,7 +253,7 @@ async fn refresh(
 
 async fn refresh_with_pt(
     handle: &TorHandle,
-    path: Option<&Path>,
+    path: &Path,
     observations: &ObservationSink,
     active: &mut Settings,
     next_recovery: &mut Instant,
@@ -343,7 +340,7 @@ async fn refresh_with_pt(
             }
         };
         if added > 0 {
-            let latest = Config::load_with_override(path)?.into_config();
+            let latest = Config::load_with_override(Some(path))?.into_config();
             usable = refresh_routes_with_pt(
                 handle,
                 path,
@@ -365,7 +362,7 @@ async fn refresh_with_pt(
 #[cfg(test)]
 async fn refresh_pre(
     handle: &TorHandle,
-    path: Option<&Path>,
+    path: &Path,
     active: &mut Settings,
     cfg: &Config,
     tor: &arti_wrapper::TorTunnel,
@@ -385,7 +382,7 @@ async fn refresh_pre(
 
 async fn refresh_pre_with_pt(
     handle: &TorHandle,
-    path: Option<&Path>,
+    path: &Path,
     active: &mut Settings,
     cfg: &Config,
     tor: &arti_wrapper::TorTunnel,
@@ -447,7 +444,7 @@ pub(crate) async fn pre_channel_ready(tor: &arti_wrapper::TorTunnel, bridge: &Br
 
 fn refresh_routes_with_pt<'a>(
     handle: &'a TorHandle,
-    path: Option<&'a Path>,
+    path: &'a Path,
     observations: &'a ObservationSink,
     active: &'a mut Settings,
     policy: (&'a Config, &'a crate::pt::PtBinary),
@@ -470,7 +467,8 @@ fn refresh_routes_with_pt<'a>(
         let configured_clone = configured.clone();
         let counts = std::sync::Arc::new(std::sync::Mutex::new(None));
         let counts_closure = counts.clone();
-        crate::bridge_store_writer::apply(path, move |store| {
+        let path = path.to_path_buf();
+        crate::bridge_store_writer::apply(&path, move |store| {
             *counts_closure.lock().unwrap() = Some(observations.drain_into_store(
                 store,
                 &configured_clone,
@@ -501,7 +499,7 @@ fn refresh_routes_with_pt<'a>(
         };
         match crate::tor_setup::build_tor_settings_preserving_live_with_pt(
             cfg,
-            path,
+            &path,
             live,
             pt_binary.clone(),
         )
@@ -519,7 +517,7 @@ fn refresh_routes_with_pt<'a>(
                 if !channel_probe::authenticate_fallback(
                     tor,
                     cfg,
-                    path,
+                    &path,
                     active,
                     &mut selected,
                     channel_cursor,
@@ -624,8 +622,7 @@ mod tests {
         let gate = ParkedGate::arm(Site::MaintenanceConfigLoad, &path);
         let registry = Arc::new(crate::workers::TestWorkers::default());
         let owner = registry.clone();
-        let outer =
-            tokio::spawn(async move { owner.scope(load_config_off_worker(Some(&path))).await });
+        let outer = tokio::spawn(async move { owner.scope(load_config_off_worker(&path)).await });
         let wait = gate.clone();
         tokio::task::spawn_blocking(move || wait.wait_parked(HANG_GUARD))
             .await

@@ -116,7 +116,7 @@ pub use ::tor_socks5_onion as onion;
 /// use tracing_subscriber::layer::SubscriberExt;
 /// use tracing_subscriber::util::SubscriberInitExt;
 ///
-/// let _writer = init_global(Some(std::path::Path::new("tor-socks5.ktav")));
+/// let _writer = init_global(std::path::Path::new("tor-socks5.ktav"));
 /// let sink = ObservationSink::new();
 /// let fmt_layer = tracing_subscriber::fmt::layer();
 /// tracing_subscriber::registry()

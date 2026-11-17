@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let config = Config::load_with_override(Some(&config_path))?.into_config();
     let outcome = fetch_bridges(
         &config,
-        Some(&config_path),
+        &config_path,
         FetchBridgesParams {
             timeout: Duration::from_secs(60),
             count: 3,

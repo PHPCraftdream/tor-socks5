@@ -63,7 +63,7 @@ const WARM_BRIDGE_TIMEOUT: Duration = Duration::from_secs(15);
 /// the handle and closes the bridge-store writer.
 pub fn spawn_bridge_warmer(
     handle: TorHandle,
-    config_path: Option<PathBuf>,
+    config_path: PathBuf,
     cfg: WarmPoolConfig,
     token: CancellationToken,
 ) -> Option<tokio::task::JoinHandle<()>> {
@@ -104,7 +104,7 @@ pub fn spawn_bridge_warmer(
                 continue;
             };
 
-            let cfg = match Config::load_with_override(config_path.as_deref()) {
+            let cfg = match Config::load_with_override(Some(config_path.as_path())) {
                 Ok(loaded) => loaded.into_config(),
                 Err(e) => {
                     warn!(error = %e, "warm-pool: could not reload config");
@@ -113,7 +113,7 @@ pub fn spawn_bridge_warmer(
             };
 
             let active = handle.active_bridges();
-            let candidates: Vec<_> = candidates_with_health(&cfg, config_path.as_deref())
+            let candidates: Vec<_> = candidates_with_health(&cfg, config_path.as_path())
                 .into_iter()
                 .filter(|(bridge, _)| active.contains(bridge))
                 .collect();
@@ -178,7 +178,7 @@ pub fn spawn_bridge_warmer(
             // dead (same convention as android's `persist_warm_results`, which
             // records successes and retirements only).
             if !warmed.is_empty() {
-                persist_warm_successes(config_path.as_deref(), warmed).await;
+                persist_warm_successes(&config_path, warmed).await;
             }
         }
     }))
@@ -187,7 +187,7 @@ pub fn spawn_bridge_warmer(
 /// Record channel-warm successes through the single writer (best-effort:
 /// a load failure is only logged; publish failures are the writer's
 /// retry problem).
-async fn persist_warm_successes(config_path: Option<&Path>, warmed: Vec<BridgeLine>) {
+async fn persist_warm_successes(config_path: &Path, warmed: Vec<BridgeLine>) {
     let result = crate::bridge_store_writer::apply(config_path, move |store| {
         let now = OffsetDateTime::now_utc();
         for bridge in &warmed {
@@ -225,19 +225,19 @@ mod tests {
         let warmed_bridge = bridge(OBFS4_A);
 
         // Seed the store BEFORE initializing the global writer.
-        let mut store = BridgeStore::load(BridgeStore::resolve_path(Some(config_path.as_path())))
+        let mut store = BridgeStore::load(BridgeStore::resolve_path(config_path.as_path()))
             .expect("fresh store loads");
         store.note_source_at(&warmed_bridge, "test", OffsetDateTime::now_utc());
         store.save().expect("seed save");
 
-        let _writer = crate::bridge_store_writer::init_global(Some(config_path.as_path()));
+        let _writer = crate::bridge_store_writer::init_global(config_path.as_path());
 
         let mut tasks = Vec::new();
         for _ in 0..16 {
             let config_path = config_path.clone();
             let warmed = warmed_bridge.clone();
             tasks.push(tokio::spawn(async move {
-                persist_warm_successes(Some(config_path.as_path()), vec![warmed]).await;
+                persist_warm_successes(config_path.as_path(), vec![warmed]).await;
             }));
         }
         for task in tasks {
@@ -251,7 +251,7 @@ mod tests {
         // (on this single-threaded test runtime) actually gets to run.
         let mut count = 0;
         for _ in 0..5000 {
-            count = BridgeStore::load(BridgeStore::resolve_path(Some(config_path.as_path())))
+            count = BridgeStore::load(BridgeStore::resolve_path(config_path.as_path()))
                 .expect("reload store")
                 .channel_ok_count(&warmed_bridge);
             if count == 16 {

@@ -11,7 +11,7 @@ use crate::api::DnsStartupPolicy;
 /// the Windows-service case, synthesised from the installed image path).
 pub(crate) struct ServerArgs {
     pub config: crate::config::Config,
-    pub config_path: Option<std::path::PathBuf>,
+    pub config_path: std::path::PathBuf,
     pub obs_sink: tor_socks5_runtime::arti_observability::ObservationSink,
     pub upstream_addr: Option<String>,
     pub upstream_user: Option<String>,
@@ -207,10 +207,10 @@ mod tests {
         })
     }
 
-    fn test_args(config: crate::config::Config) -> ServerArgs {
+    fn test_args(config: crate::config::Config, config_path: std::path::PathBuf) -> ServerArgs {
         ServerArgs {
             config,
-            config_path: None,
+            config_path,
             obs_sink: tor_socks5_runtime::arti_observability::ObservationSink::new(),
             upstream_addr: Some("127.0.0.1:1".to_owned()),
             upstream_user: None,
@@ -224,6 +224,10 @@ mod tests {
     #[tokio::test]
     async fn unexpected_accept_exit_is_reported_after_normal_cleanup() {
         let _serial = super::super::owners::TEST_LIFECYCLE.lock().await;
+        // The config path is required (D-H1) and anchors on-disk state; keep
+        // all file I/O inside a tempdir, never in the current directory.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("server.ktav");
         let config = crate::config::Config {
             listen: vec!["127.0.0.1:0".to_owned()],
             ..Default::default()
@@ -238,7 +242,7 @@ mod tests {
                 super::super::FORCE_ACCEPT_LOOP_EXIT.scope(
                     true,
                     run_server_with_callbacks(
-                        test_args(config),
+                        test_args(config, config_path),
                         std::future::pending(),
                         move |stage| {
                             stage_tx.send_replace(stage);
@@ -288,6 +292,7 @@ mod tests {
             listen: vec!["127.0.0.1:0".to_owned()],
             ..Default::default()
         })
+        .config_path(dir.path().join("server.ktav"))
         .cancellation_token(parent.clone());
         let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel();
         *CLEANUP_FAILED_RUN_STARTED

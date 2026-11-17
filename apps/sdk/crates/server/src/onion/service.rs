@@ -4,20 +4,13 @@
 //! path to the host. The launch choreography, the launch logs, the keystore
 //! lock and the status snapshot all live in the library crate.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use proxy_config::{Config, OnionServiceEntry};
 use tokio_util::sync::CancellationToken;
 
 use tor_socks5_onion::host::OnionHostConfig;
 use tor_socks5_runtime::tor_watchdog::TorHandle;
-
-/// Arti's native keystore (`<arti base>/state/keystore`), the same directory
-/// the onion CLI tools use: the identity from the onion services file must
-/// land where arti reads it, or arti mints a different address.
-fn keystore_dir(config_path: Option<&Path>) -> PathBuf {
-    tor_socks5_runtime::tor_setup::arti_keystore_dir(config_path)
-}
 
 /// Spawn the onion-service host producer if any configured service is
 /// enabled. Appends the producer's join handle to `producers` (cancelled and
@@ -29,7 +22,7 @@ fn keystore_dir(config_path: Option<&Path>) -> PathBuf {
 pub(crate) fn spawn_services(
     handle: TorHandle,
     entries: &[OnionServiceEntry],
-    config_path: Option<&Path>,
+    config_path: &Path,
     token: CancellationToken,
     producers: &mut Vec<tokio::task::JoinHandle<()>>,
 ) {
@@ -42,7 +35,7 @@ pub(crate) fn spawn_services(
         return;
     }
 
-    let config_path = config_path.map(Path::to_path_buf);
+    let config_path = config_path.to_path_buf();
     let refresh_config_path = config_path.clone();
     let producer_token = token.clone();
     producers.push(tokio::spawn(async move {
@@ -51,7 +44,7 @@ pub(crate) fn spawn_services(
         // the original config snapshot; the host rechecks key identity under
         // its keystore lock before preparing any service.
         let entries = match tor_socks5_runtime::workers::run_fallible_blocking(move || {
-            refreshed_enabled_entries(refresh_config_path.as_deref(), &enabled)
+            refreshed_enabled_entries(&refresh_config_path, &enabled)
         })
         .await
         {
@@ -68,9 +61,13 @@ pub(crate) fn spawn_services(
             return;
         }
 
-        let host_config = OnionHostConfig::new(handle, keystore_dir(config_path.as_deref()), token)
-            .with_entries(entries)
-            .with_config_path(config_path);
+        let host_config = OnionHostConfig::new(
+            handle,
+            tor_socks5_runtime::tor_setup::arti_keystore_dir(&config_path),
+            token,
+        )
+        .with_entries(entries)
+        .with_config_path(Some(config_path));
         let mut host = AbortOnDropHandle::new(
             tor_socks5_onion::host::OnionHost::new(host_config)
                 .start()
@@ -101,41 +98,31 @@ impl<T> Drop for AbortOnDropHandle<T> {
     }
 }
 
-/// snapshot's enabled nicknames as an allowlist. `None` retains the legacy
-/// snapshot-only behavior until config-path handling is addressed by H13.
+/// snapshot's enabled nicknames as an allowlist.
 fn refreshed_enabled_entries(
-    config_path: Option<&Path>,
+    config_path: &Path,
     snapshot: &[OnionServiceEntry],
 ) -> anyhow::Result<Vec<OnionServiceEntry>> {
-    match config_path {
-        Some(path) => {
-            let current = Config::read_onion_services(path)?;
-            Ok(snapshot
+    let current = Config::read_onion_services(config_path)?;
+    Ok(snapshot
+        .iter()
+        .filter(|entry| entry.enabled)
+        .filter_map(|entry| {
+            let refreshed = current
                 .iter()
-                .filter(|entry| entry.enabled)
-                .filter_map(|entry| {
-                    let refreshed = current
-                        .iter()
-                        .find(|current| current.nickname == entry.nickname);
-                    match refreshed {
-                        Some(current) if current.enabled => Some(current.clone()),
-                        Some(_) | None => {
-                            tracing::warn!(
-                                nickname = %entry.nickname,
-                                "onion service was removed or disabled during startup; not launched"
-                            );
-                            None
-                        }
-                    }
-                })
-                .collect())
-        }
-        None => Ok(snapshot
-            .iter()
-            .filter(|entry| entry.enabled)
-            .cloned()
-            .collect()),
-    }
+                .find(|current| current.nickname == entry.nickname);
+            match refreshed {
+                Some(current) if current.enabled => Some(current.clone()),
+                Some(_) | None => {
+                    tracing::warn!(
+                        nickname = %entry.nickname,
+                        "onion service was removed or disabled during startup; not launched"
+                    );
+                    None
+                }
+            }
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -208,8 +195,8 @@ mod tests {
         let new_address = create_enabled(&config, &keystore, "svc", true);
         create_enabled(&config, &keystore, "late", true);
         let current = stored(&config);
-        let refreshed = super::refreshed_enabled_entries(Some(&config), &snapshot)
-            .expect("refresh after bootstrap");
+        let refreshed =
+            super::refreshed_enabled_entries(&config, &snapshot).expect("refresh after bootstrap");
 
         assert_eq!(refreshed.len(), 1, "only the snapshot name is retained");
         assert_eq!(
@@ -248,8 +235,8 @@ mod tests {
         let snapshot = stored(&config);
 
         keys::remove_service(&config, &keystore, "svc").expect("remove service");
-        let refreshed = super::refreshed_enabled_entries(Some(&config), &snapshot)
-            .expect("refresh after bootstrap");
+        let refreshed =
+            super::refreshed_enabled_entries(&config, &snapshot).expect("refresh after bootstrap");
         assert!(refreshed.is_empty(), "removed service is not relaunched");
         assert!(keys::prepare_all(Some(&config), &keystore, &refreshed).is_empty());
         assert!(stored(&config).is_empty());
@@ -272,7 +259,7 @@ mod tests {
         .expect("create disabled service");
         let snapshot = stored(&config);
 
-        let refreshed = super::refreshed_enabled_entries(Some(&config), &snapshot)
+        let refreshed = super::refreshed_enabled_entries(&config, &snapshot)
             .expect("refresh unchanged services file");
 
         assert_eq!(refreshed.len(), 1);
@@ -304,22 +291,18 @@ mod tests {
         std::fs::write(Config::onion_path(&config), "services: [ { nickname: [")
             .expect("write invalid file");
 
-        assert!(super::refreshed_enabled_entries(Some(&config), &snapshot).is_err());
+        assert!(super::refreshed_enabled_entries(&config, &snapshot).is_err());
     }
 
     #[test]
     fn keystore_dir_is_arti_native_keystore_under_state() {
         let cfg = Path::new("conf").join("tor-socks5.ktav");
         assert_eq!(
-            super::keystore_dir(Some(&cfg)),
+            tor_socks5_runtime::tor_setup::arti_keystore_dir(&cfg),
             Path::new("conf")
                 .join("arti-data")
                 .join("state")
                 .join("keystore")
-        );
-        assert_eq!(
-            super::keystore_dir(None),
-            Path::new("arti-data").join("state").join("keystore")
         );
     }
 }

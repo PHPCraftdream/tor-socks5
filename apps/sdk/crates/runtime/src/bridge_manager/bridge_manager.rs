@@ -35,7 +35,9 @@
 //! probe-and-promote, and merge into the config. The CLI wrapper keeps
 //! config loading, tracing/crypto installation and printing; the typed
 //! [`FetchBridgesError`] covers the pre-flight rejections (`NoConfigFile`,
-//! `PreProxies`, `NoBridgeSources`) and `Cancelled`.
+//! `PreProxies`, `NoBridgeSources`) and `Cancelled`. `config_path` is
+//! required (D-H1): the type enforces it, and a path to a nonexistent
+//! config is the typed `NoConfigFile` error.
 //!
 //! # Cancel-safety
 //!
@@ -242,7 +244,7 @@ fn panic_message(join_error: tokio::task::JoinError) -> String {
 /// is retained for later maintenance rebuilds and verifier admission checks.
 pub fn start(
     handle: TorHandle,
-    config_path: Option<PathBuf>,
+    config_path: PathBuf,
     cfg: &Config,
     observations: ObservationSink,
     config: impl Into<BridgeManagerConfig>,
@@ -262,7 +264,7 @@ pub fn start(
 /// the producer tasks until they are transferred or shut down.
 pub fn start_with_parent_token(
     handle: TorHandle,
-    config_path: Option<PathBuf>,
+    config_path: PathBuf,
     cfg: &Config,
     observations: ObservationSink,
     config: impl Into<BridgeManagerConfig>,
@@ -280,7 +282,7 @@ pub fn start_with_parent_token(
 
 fn start_with_token(
     handle: TorHandle,
-    config_path: Option<PathBuf>,
+    config_path: PathBuf,
     cfg: &Config,
     observations: ObservationSink,
     config: BridgeManagerConfig,
@@ -382,7 +384,8 @@ pub struct FetchBridgesParams {
 /// and cancellation get their own variants; everything else is wrapped.
 #[derive(Debug)]
 pub enum FetchBridgesError {
-    /// `config_path` was `None`; the SDK never creates a default file.
+    /// The config file at the required path does not exist; the SDK never
+    /// creates a default file.
     NoConfigFile,
     /// A global `pre_proxies` pool is configured; remove it (the fetch
     /// cannot honour it — it runs over the host network).
@@ -447,21 +450,22 @@ pub struct FetchBridgesOutcome {
 /// is kept: it lets arti's reactor release the PT children and the state-dir
 /// lock before the process exits or a follow-up bootstrap begins.
 ///
-/// Synchronous pre-flight checks run first, before any file or network I/O:
-/// `config_path: None` → [`FetchBridgesError::NoConfigFile`] (the SDK never
-/// creates a default config file), then `pre_proxies` → `PreProxies`, then
-/// empty `sources` → `NoBridgeSources`.
+/// Synchronous pre-flight checks run first, before any file or network I/O
+/// beyond the existence check of the config file itself: a nonexistent
+/// config → [`FetchBridgesError::NoConfigFile`] (the SDK never creates a
+/// default config file), then `pre_proxies` → `PreProxies`, then empty
+/// `sources` → `NoBridgeSources`.
 ///
 /// Cancel-safety: see the module docs.
 pub async fn fetch_bridges(
     cfg: &Config,
-    config_path: Option<&std::path::Path>,
+    config_path: &std::path::Path,
     params: FetchBridgesParams,
 ) -> Result<FetchBridgesOutcome, FetchBridgesError> {
-    // Pre-flight: synchronous, no I/O, cheapest/most specific rejection
-    // first. `None` is rejected before any load that could create a
-    // default config file.
-    if config_path.is_none() {
+    // Pre-flight: synchronous, cheapest/most specific rejection first. A
+    // missing config file is rejected before any load that could create a
+    // default config file (the only I/O here is the existence check).
+    if !config_path.is_file() {
         return Err(FetchBridgesError::NoConfigFile);
     }
     if cfg.pre_proxies.is_some() {

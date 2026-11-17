@@ -22,13 +22,13 @@ fn config_path(dir: &Path) -> PathBuf {
 
 fn seed_store(config_path: &Path, bridge: &BridgeLine) {
     let mut store =
-        BridgeStore::load(BridgeStore::resolve_path(Some(config_path))).expect("fresh store loads");
+        BridgeStore::load(BridgeStore::resolve_path(config_path)).expect("fresh store loads");
     store.note_source_at(bridge, "test", OffsetDateTime::now_utc());
     store.save().expect("seed save");
 }
 
 fn reload(config_path: &Path) -> BridgeStore {
-    BridgeStore::load(BridgeStore::resolve_path(Some(config_path))).expect("reload store")
+    BridgeStore::load(BridgeStore::resolve_path(config_path)).expect("reload store")
 }
 
 fn leftover_tmp_files(dir: &Path) -> Vec<std::fs::DirEntry> {

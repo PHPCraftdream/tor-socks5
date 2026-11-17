@@ -296,7 +296,7 @@ mod tests {
                 .into(),
         );
         cfg.write(&path).unwrap();
-        let settings = tor_socks5_runtime::tor_setup::build_tor_settings(&cfg, Some(&path))
+        let settings = tor_socks5_runtime::tor_setup::build_tor_settings(&cfg, &path)
             .await
             .unwrap();
         let tunnel = arti_wrapper::TorTunnel::create_unbootstrapped_with(settings.clone()).unwrap();
@@ -308,7 +308,7 @@ mod tests {
         let mut launch = LaunchGuard::new(owner.clone());
         super::super::bridge_producers::launch(
             handle,
-            Some(path),
+            path,
             &cfg,
             tor_socks5_runtime::arti_observability::ObservationSink::new(),
             settings,

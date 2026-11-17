@@ -341,7 +341,7 @@ impl StoreWriter {
     /// keep the single process-wide writer; `open` is for code that
     /// owns the handle explicitly. See the type-level note on running
     /// more than one writer per store path.
-    pub fn open(config_path: Option<&Path>) -> Self {
+    pub fn open(config_path: &Path) -> Self {
         let resolved = BridgeStore::resolve_path(config_path);
         Self::spawn_writer_inner(
             resolved,
@@ -876,7 +876,7 @@ pub(crate) static GLOBAL_WRITER_TEST_LOCK: tokio::sync::Mutex<()> =
 /// sequential restart works — the close empties the slot, so
 /// [`init_global`] after a completed [`close_global`] never hands back
 /// a closed writer.
-pub fn init_global(config_path: Option<&Path>) -> StoreWriter {
+pub fn init_global(config_path: &Path) -> StoreWriter {
     let resolved = BridgeStore::resolve_path(config_path);
     let mut slot = WRITER.lock().unwrap_or_else(|error| error.into_inner());
     let writer = match &*slot {
@@ -971,7 +971,7 @@ pub async fn close_global() -> Option<Result<()>> {
 /// `config_path`; otherwise (CLI subcommands, unit tests) fall back to a
 /// locked whole-file read-modify-write on the blocking pool.
 pub(crate) async fn apply(
-    config_path: Option<&Path>,
+    config_path: &Path,
     apply: impl FnOnce(&mut BridgeStore) + Send + 'static,
 ) -> Result<()> {
     let resolved = BridgeStore::resolve_path(config_path);

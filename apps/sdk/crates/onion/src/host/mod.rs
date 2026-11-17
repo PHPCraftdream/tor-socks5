@@ -150,10 +150,13 @@ fn beyond_soft_limit(enabled: usize) -> bool {
 
 /// Everything the host needs to run the configured onion services.
 ///
-/// The keystore directory ([`OnionHostConfig::keystore_dir`]) and the onion
-/// services file location ([`OnionHostConfig::config_path`]) are explicit:
-/// the caller decides where they live (the CLI derives both from its config
-/// path; an embedding host may choose anything).
+/// The keystore directory ([`OnionHostConfig::keystore_dir`]) is explicit:
+/// the caller supplies it, and the host verifies it against the running
+/// client's state dir when known (a foreign dir would mean keys written
+/// there are never read by arti). The onion services file location
+/// ([`OnionHostConfig::config_path`]) is also explicit: the caller decides
+/// where they live (the CLI derives both from its config path; an
+/// embedding host may choose anything).
 pub struct OnionHostConfig {
     /// The live Tor client handle; read per launch attempt.
     pub handle: TorHandle,
@@ -162,7 +165,9 @@ pub struct OnionHostConfig {
     /// Where the onion services file lives, as today; `None` means built-in
     /// defaults (no file to complete).
     pub config_path: Option<PathBuf>,
-    /// The Arti native keystore directory (explicit; never derived here).
+    /// The Arti native keystore directory. Explicit; never derived here.
+    /// The caller supplies it; the host verifies it against the running
+    /// client's state dir when known (see [`validate_keystore_dir`]).
     pub keystore_dir: PathBuf,
     /// The cancellation token: cancels the producer, the managers and every
     /// task they spawned.
@@ -355,6 +360,14 @@ async fn run_services(config: OnionHostConfig, tracker: StatusTracker) {
         return;
     }
 
+    // Before touching the keystore: a dir the running client would never
+    // read fails every service up front.
+    if let Err(error) = validate_keystore_dir(handle.state_dir(), &keystore_dir) {
+        tracker.set_all(ServiceFailure::KeystoreMismatch);
+        error!(%error, "onion services not started: keystore directory mismatch");
+        return;
+    }
+
     #[cfg(test)]
     let lock_probe = test_hooks
         .as_ref()
@@ -544,6 +557,33 @@ async fn acquire_keystore_lock(
             () = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
     }
+}
+
+/// Canonicalize a path, falling back to the raw path when canonicalization
+/// fails (e.g. the dir does not exist), so comparison behaves the same for
+/// non-existing dirs.
+fn canonicalized(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Check `keystore_dir` against the running client's state dir. `None`
+/// (state dir unknown) passes — nothing can be checked. Pure; no I/O the
+/// caller cannot predict beyond canonicalization of the two paths.
+fn validate_keystore_dir(state_dir: Option<&Path>, keystore_dir: &Path) -> Result<(), String> {
+    let Some(state) = state_dir else {
+        return Ok(());
+    };
+    let expected = canonicalized(&state.join("keystore"));
+    let configured = canonicalized(keystore_dir);
+    if configured == expected {
+        return Ok(());
+    }
+    Err(format!(
+        "keystore_dir {} does not match the running client's keystore {}; \
+         keys written there would never be read by arti",
+        configured.display(),
+        expected.display()
+    ))
 }
 
 fn probe_keystore_lock(dir: &Path) -> LockProbe {

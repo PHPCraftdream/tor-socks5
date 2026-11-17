@@ -72,7 +72,7 @@ pub(super) fn server_ready() {
     });
 }
 
-pub(super) fn init_store_writer(path: Option<&std::path::Path>) {
+pub(super) fn init_store_writer(path: &std::path::Path) {
     #[cfg(test)]
     if RUN_SERVER_STARTUP.try_with(|_| ()).is_ok()
         || RUN_SERVER_SHUTDOWN
@@ -112,7 +112,7 @@ pub(super) struct SettingsInit {
 impl SettingsInit {
     pub(super) fn start(
         cfg: crate::config::Config,
-        path: Option<std::path::PathBuf>,
+        path: std::path::PathBuf,
         cancellation: CancellationToken,
         pt: tor_socks5_runtime::pt::PtBinary,
     ) -> Result<Arc<Self>> {
@@ -151,8 +151,7 @@ impl SettingsInit {
         #[cfg(any(test, feature = "test-seams"))]
         let observer = tor_socks5_runtime::test_seams::sdk14_pt_observer();
         let build = async move {
-            tor_socks5_runtime::tor_setup::build_tor_settings_with_pt(&cfg, path.as_deref(), pt)
-                .await
+            tor_socks5_runtime::tor_setup::build_tor_settings_with_pt(&cfg, &path, pt).await
         };
         #[cfg(any(test, feature = "test-seams"))]
         let stage: std::pin::Pin<
@@ -690,7 +689,7 @@ mod tests {
             .scope(hook, async {
                 SettingsInit::start(
                     crate::config::Config::default(),
-                    None,
+                    std::path::PathBuf::new(),
                     cancellation.clone(),
                     tor_socks5_runtime::pt::PtBinary::Environment,
                 )
@@ -727,7 +726,7 @@ mod tests {
             .scope(hook, async {
                 SettingsInit::start(
                     crate::config::Config::default(),
-                    None,
+                    std::path::PathBuf::new(),
                     cancellation.clone(),
                     tor_socks5_runtime::pt::PtBinary::Environment,
                 )
