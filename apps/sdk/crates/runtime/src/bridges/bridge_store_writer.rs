@@ -67,14 +67,20 @@
 //!   per-path advisory lock ([`persist_lock::PathLock`], sibling
 //!   `<store>.lock` file) from the load that reads the file through the
 //!   publish that writes it. The clean-state re-read alone cannot heal an
-//!   overlap: a CLI transaction that loads while an angel publish is in
-//!   flight saves a snapshot the angel's rename buries permanently. With
-//!   the lock, the CLI waits out the angel's dirty window (including
+//!   overlap: a CLI transaction that loads while an actor publish is in
+//!   flight saves a snapshot the actor's rename buries permanently. With
+//!   the lock, the CLI waits out the actor's dirty window (including
 //!   backoff retries) and then mutates the published state, so both sides'
 //!   mutations survive. The actor acquires the lock inside its clean-load
-//!   `spawn_blocking` job (never on an async worker) and releases it as soon
-//!   as a publish succeeds with no tail mutations.
-//! * Shutdown is explicit: [`StoreWriter::close`] sends a close op, waits
+//!   `spawn_blocking` job with a bounded wait (never on an async worker) and
+//!   releases it as soon as a publish succeeds with no tail mutations. A
+//!   busy acquisition rejects the unapplied mutation so its caller can retry.
+//! * A close signal uses a separate channel and is selected ahead of queued
+//!   mutations. It interrupts the actor's wait for a clean-load blocking job;
+//!   queued mutations are applied before shutdown when a snapshot is loaded,
+//!   and rejected when closing would require another load. The blocking job
+//!   remains independently registered; a late-acquired lock is dropped with it.
+//! * Shutdown is explicit: [`StoreWriter::close`] sends a close signal, waits
 //!   for any in-flight publish (and one coalesced follow-up), performs a
 //!   final flush if the snapshot is still dirty — regardless of the backoff
 //!   deadline — and resolves with the flush result. Server shutdown calls
@@ -144,9 +150,6 @@ enum Op {
         apply: MutateFn,
         ack: oneshot::Sender<Result<()>>,
     },
-    Close {
-        reply: oneshot::Sender<Result<()>>,
-    },
 }
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -171,8 +174,10 @@ struct ActorState {
 ///
 /// * [`StoreWriter::apply`] — one mutation; resolves `Ok` once it is
 ///   absorbed into the actor's snapshot (a failed disk publish is the
-///   actor's retry problem), `Err` when the on-disk snapshot could not
-///   be loaded or the mutation job panicked (the mutation did not land).
+///   actor's retry problem), `Err` when the snapshot could not be loaded,
+///   the bounded store lock is busy, or the mutation job panicked. In the
+///   first two cases the closure was not run and the caller may retry it;
+///   a panicking mutation's private copy is discarded.
 /// * [`StoreWriter::close`] — stop: wait for the in-flight publish,
 ///   flush a dirty snapshot regardless of the retry backoff, join the
 ///   actor and return the final flush result (`Err` on a failed final
@@ -187,6 +192,7 @@ struct ActorState {
 #[derive(Clone)]
 pub struct StoreWriter {
     tx: mpsc::Sender<Op>,
+    close_tx: mpsc::Sender<oneshot::Sender<Result<()>>>,
     path: PathBuf,
     /// Дескриптор остаётся в ячейке до завершения ожидания, даже при отмене close.
     actor: Arc<tokio::sync::Mutex<ActorState>>,
@@ -262,11 +268,10 @@ impl StoreWriter {
     /// mutation has been absorbed into the owner's in-memory snapshot —
     /// a failed disk publish is the writer's retry problem, not the
     /// caller's. Resolves `Err` when the on-disk snapshot could not be
-    /// loaded, in which case the closure was NOT run (a caller draining a
-    /// queue keeps its items), or when the closure panicked mid-apply; on
-    /// a panic the snapshot's state is unknown, so it is dropped (the next
-    /// op reloads from disk) and the caller must assume the mutation did
-    /// not land.
+    /// loaded or the bounded store lock is busy; in either case the
+    /// closure was NOT run, so the caller can retry the mutation. A
+    /// mutation closure panic also resolves `Err`; its private copy is
+    /// discarded and the previously acknowledged snapshot is retained.
     pub async fn apply(&self, apply: impl FnOnce(&mut BridgeStore) + Send + 'static) -> Result<()> {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.tx
@@ -283,10 +288,13 @@ impl StoreWriter {
 
     /// Ask the actor to stop: wait for any in-flight publish, flush the
     /// snapshot if it is still dirty (even before the backoff deadline),
-    /// then join the actor task. Вызывающие сериализованы одним mutex. После постановки Close
-    /// отмена ожидания ответа или handle сохраняет исходный результат актора.
-    /// Первый завершивший join получает результат; последующие получают `Ok`.
-    /// Возвращает `Err` при ошибке финальной записи или гибели актора.
+    /// then join the actor task. The close signal bypasses the mutation
+    /// queue, including while a clean-load lock acquisition is waiting.
+    /// Callers are serialized by one mutex. Once Close is sent, cancellation
+    /// of this future leaves the actor handle in the slot; a later call joins
+    /// it and observes the retained outcome. The first completed join gets
+    /// the result; subsequent calls get `Ok(())`. Returns `Err` if the final
+    /// write fails or the actor dies.
     pub async fn close(&self) -> Result<()> {
         let mut state = self.actor.lock().await;
         if state.handle.is_none() {
@@ -295,8 +303,8 @@ impl StoreWriter {
         let mut result = Ok(());
         if !state.close_requested {
             let (reply_tx, reply_rx) = oneshot::channel();
-            if self.tx.send(Op::Close { reply: reply_tx }).await.is_ok() {
-                // Между успешной отправкой и фиксацией нет точки отмены.
+            if self.close_tx.send(reply_tx).await.is_ok() {
+                // There is no cancellation point between sending Close and recording it.
                 state.close_requested = true;
                 result = match reply_rx.await {
                     Ok(reply) => reply,
@@ -335,7 +343,13 @@ impl StoreWriter {
     /// more than one writer per store path.
     pub fn open(config_path: Option<&Path>) -> Self {
         let resolved = BridgeStore::resolve_path(config_path);
-        Self::spawn_writer(resolved, Arc::new(|store| store.save()), INITIAL_BACKOFF)
+        Self::spawn_writer_inner(
+            resolved,
+            Arc::new(|store| store.save()),
+            INITIAL_BACKOFF,
+            CLI_LOCK_WAIT,
+            None,
+        )
     }
 
     /// Test seam (R10): a custom publisher and initial backoff, for the
@@ -345,11 +359,18 @@ impl StoreWriter {
     /// constructor does not exist outside test builds.
     #[cfg(any(test, feature = "test-seams"))]
     pub fn spawn(path: PathBuf, publish: Publisher, initial_backoff: Duration) -> Self {
-        Self::spawn_writer(path, publish, initial_backoff)
+        Self::spawn_writer_inner(path, publish, initial_backoff, CLI_LOCK_WAIT, None)
     }
 
-    fn spawn_writer(path: PathBuf, publish: Publisher, initial_backoff: Duration) -> Self {
+    fn spawn_writer_inner(
+        path: PathBuf,
+        publish: Publisher,
+        initial_backoff: Duration,
+        lock_wait: Duration,
+        mut load_started: Option<oneshot::Sender<()>>,
+    ) -> Self {
         let (tx, mut rx) = mpsc::channel::<Op>(64);
+        let (close_tx, mut close_rx) = mpsc::channel::<oneshot::Sender<Result<()>>>(1);
         let actor_path = path.clone();
         let retirements: RetirementLog = Arc::default();
         #[cfg(test)]
@@ -376,14 +397,33 @@ impl StoreWriter {
 
             loop {
                 if closing {
-                    // Wait for any in-flight publish, letting a coalesced
-                    // tail fire its follow-up, then flush what is left.
+                    rx.close();
+                    if store.is_none() {
+                        reject_queued_mutations(&mut rx);
+                    } else {
+                        while let Ok(op) = rx.try_recv() {
+                            match op {
+                                Op::Mutate { apply, ack } => {
+                                    absorb_mutation(
+                                        apply,
+                                        ack,
+                                        &mut store,
+                                        &mut retry,
+                                        &mut publishing,
+                                        &mut mutations_since_publish,
+                                        &publish,
+                                        &done_tx,
+                                        &retirements,
+                                        &path,
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    }
                     while publishing {
                         match done_rx.recv().await {
                             Some(res) => {
-                                // The in-flight publish just reported in;
-                                // try_start_publish only sets this back to
-                                // true if it actually starts a follow-up.
                                 publishing = false;
                                 absorb_publish_result(
                                     res,
@@ -405,6 +445,9 @@ impl StoreWriter {
                             }
                             None => publishing = false,
                         }
+                    }
+                    if store.is_none() {
+                        reject_queued_mutations(&mut rx);
                     }
                     let outcome = if retry.dirty {
                         match store.clone() {
@@ -440,10 +483,6 @@ impl StoreWriter {
                         Ok(())
                     };
                     for reply in close_replies.drain(..) {
-                        // anyhow::Error is not Clone, and `outcome` is still
-                        // needed below for the actor's own return value, so
-                        // every extra close() caller gets a reformatted copy
-                        // built from a borrow, not the original.
                         let reply_result: Result<()> = match &outcome {
                             Ok(()) => Ok(()),
                             Err(error) => Err(anyhow!("{error:#}")),
@@ -464,10 +503,52 @@ impl StoreWriter {
                     break outcome;
                 }
 
-                // Only arm the retry branch while there is unpublished work.
                 let retry_at = if retry.dirty { retry.retry_at } else { None };
                 tokio::select! {
-                    op = rx.recv(), if !closing => match op {
+                    biased;
+                    // Close wins; completion precedes mutations to prevent queue starvation.
+                    close = close_rx.recv(), if !closing => {
+                        if let Some(reply) = close {
+                            close_replies.push(reply);
+                        }
+                        rx.close();
+                        if store.is_none() {
+                            reject_queued_mutations(&mut rx);
+                        }
+                        closing = true;
+                    }
+                    Some(res) = done_rx.recv(), if publishing => {
+                        publishing = false;
+                        absorb_publish_result(
+                            res,
+                            &mut retry,
+                            &mut store,
+                            &mut lock,
+                            &mut mutations_since_publish,
+                            &retirements,
+                        );
+                        try_start_publish(
+                            &mut publishing,
+                            &mut retry,
+                            &store,
+                            &mut mutations_since_publish,
+                            &publish,
+                            &done_tx,
+                        ).await;
+                    }
+                    _ = tokio::time::sleep_until(retry_at.unwrap_or_else(tokio::time::Instant::now)), if retry.dirty && retry_at.is_some() && !publishing && !closing => {
+                        // The gate inside try_start_publish re-checks the
+                        // deadline; this handler just offers the attempt.
+                        try_start_publish(
+                            &mut publishing,
+                            &mut retry,
+                            &store,
+                            &mut mutations_since_publish,
+                            &publish,
+                            &done_tx,
+                        ).await;
+                    }
+                    op = rx.recv(), if !closing || store.is_some() => match op {
                         None => {
                             // All senders dropped without an explicit Close
                             // (test-only path): run the same drain/flush flow.
@@ -481,23 +562,43 @@ impl StoreWriter {
                             // blocking pool; ops buffer in the channel.
                             if store.is_none() {
                                 let load_path = path.clone();
-                                match crate::workers::run_fallible_blocking(move || {
-                                    let lock = PathLock::acquire(&load_path)?;
+                                let load_started = load_started.take();
+                                let load = crate::workers::run_fallible_blocking(move || {
+                                    if let Some(started) = load_started {
+                                        let _ = started.send(());
+                                    }
+                                    let lock = PathLock::acquire_bounded(&load_path, lock_wait)?;
                                     let store = BridgeStore::load(load_path.clone())?;
                                     Ok::<(PathLock, BridgeStore), anyhow::Error>((lock, store))
-                                })
-                                .await
-                                {
+                                });
+                                // Cancelling this receiver does not cancel the registered blocking job.
+                                // Its eventual (lock, store) result is dropped if no receiver remains.
+                                let loaded = tokio::select! {
+                                    biased;
+                                    close = close_rx.recv() => {
+                                        if let Some(reply) = close {
+                                            close_replies.push(reply);
+                                        }
+                                        rx.close();
+                                        let _ = ack.send(Err(anyhow!(
+                                            "bridge store writer is closing before applying the mutation"
+                                        )));
+                                        closing = true;
+                                        continue;
+                                    }
+                                    result = load => result,
+                                };
+                                match loaded {
                                     Ok(Ok((acquired, loaded))) => {
                                         lock = Some(acquired);
                                         store = Some(Arc::new(loaded));
                                     }
                                     Ok(Err(error)) => {
                                         // Never apply to, or publish from, a
-                                        // snapshot we failed to load. The lock
-                                        // guard dies inside the job on this
-                                        // path, so the file stays writable.
-                                        warn!(error = %error, path = %path.display(), "bridge health store unreadable; keeping the caller's data queued");
+                                        // snapshot we failed to load. A busy
+                                        // lock is also unapplied; the caller
+                                        // can retry with its mutation intact.
+                                        warn!(error = %error, path = %path.display(), "bridge health store unavailable; keeping the caller's data queued");
                                         let _ = ack.send(Err(error));
                                         continue;
                                     }
@@ -510,110 +611,12 @@ impl StoreWriter {
                                     }
                                 }
                             }
-                            // Move the "deep-clone, then mutate" step off
-                            // the async worker: the actor keeps its own
-                            // handle to the snapshot, so `Arc::make_mut`
-                            // inside the job always deep-copies the whole
-                            // store (O(S)) — that copy must not stall this
-                            // worker thread. Keep the actor's own Arc alive
-                            // while the job runs: the closure gets a cheap
-                            // Arc clone, so a panicking closure destroys
-                            // only its private copy. The actor's `store` is
-                            // never moved out, so a panic cannot discard
-                            // earlier acknowledged mutations riding in the
-                            // retained snapshot (TS5-06 regression guard).
-                            let cloned = store.clone().expect("store loaded above");
-                            match crate::workers::run_tracked_blocking(move || {
-                                let mut owned = cloned;
-                                apply(Arc::make_mut(&mut owned));
-                                owned
-                            })
-                            .await
-                            {
-                                Ok(owned) => {
-                                    // TS6-04: swap the new snapshot in; retire
-                                    // the OLD Arc on the blocking pool instead
-                                    // of dropping it inline here. If no publish
-                                    // job holds a clone right now (e.g. during
-                                    // retry backoff), this actor's `store` was
-                                    // the last strong reference and an inline
-                                    // drop would deallocate the whole
-                                    // BridgeStore map on this async worker.
-                                    drop_off_worker(store.replace(owned), Arc::clone(&retirements));
-                                    // Acknowledge the absorption before
-                                    // publishing: the disk write is this
-                                    // actor's problem now.
-                                    let _ = ack.send(Ok(()));
-                                    retry.dirty = true;
-                                    mutations_since_publish += 1;
-                                    // Publish now, unless a publish is already
-                                    // in flight (the tail rides along) or a
-                                    // backoff retry is pending (the timer
-                                    // governs retries).
-                                    try_start_publish(
-                                        &mut publishing,
-                                        &mut retry,
-                                        &store,
-                                        &mut mutations_since_publish,
-                                        &publish,
-                                        &done_tx,
-                                    ).await;
-                                }
-                                Err(join_error) => {
-                                    // The closure panicked mid-apply and its
-                                    // private deep copy is gone, but the
-                                    // actor never handed over its own Arc:
-                                    // `store` still holds the last good
-                                    // snapshot, including all earlier
-                                    // acknowledged mutations and any
-                                    // retained-but-unpublished ones. Nothing
-                                    // to restore. This op's ack reports only
-                                    // that THIS mutation did not land;
-                                    // retry/dirty/publish bookkeeping is
-                                    // untouched, so the pending backoff
-                                    // retry still publishes the retained
-                                    // snapshot.
-                                    warn!(
-                                        error = %join_error,
-                                        path = %path.display(),
-                                        "bridge health store mutation task panicked",
-                                    );
-                                    let _ = ack.send(Err(anyhow!(
-                                        "bridge health store mutation task panicked: {join_error}"
-                                    )));
-                                    continue;
-                                }
-                            }
-                        }
-                        Some(Op::Close { reply }) => {
-                            close_replies.push(reply);
-                            closing = true;
+                            absorb_mutation(
+                                apply, ack, &mut store, &mut retry, &mut publishing,
+                                &mut mutations_since_publish, &publish, &done_tx, &retirements, &path,
+                            ).await;
                         }
                     },
-                    Some(res) = done_rx.recv(), if publishing => {
-                        // The in-flight publish just reported in;
-                        // try_start_publish only sets this back to true if
-                        // it actually starts a follow-up.
-                        publishing = false;
-                        absorb_publish_result(
-                            res,
-                            &mut retry,
-                            &mut store,
-                            &mut lock,
-                            &mut mutations_since_publish,
-                            &retirements,
-                        );
-                        // A tail absorbed during the save gets its own
-                        // coalesced publish immediately (backoff was reset).
-                        try_start_publish(
-                            &mut publishing,
-                            &mut retry,
-                            &store,
-                            &mut mutations_since_publish,
-                            &publish,
-                            &done_tx,
-                        ).await;
-                    }
                     _ = tokio::time::sleep_until(retry_at.unwrap_or_else(tokio::time::Instant::now)), if retry.dirty && retry_at.is_some() && !publishing && !closing => {
                         // The gate inside try_start_publish re-checks the
                         // deadline; this handler just offers the attempt.
@@ -640,6 +643,7 @@ impl StoreWriter {
         let handle = tokio::spawn(actor);
         Self {
             tx,
+            close_tx,
             path,
             actor: Arc::new(tokio::sync::Mutex::new(ActorState {
                 handle: Some(handle),
@@ -647,6 +651,72 @@ impl StoreWriter {
             })),
             #[cfg(test)]
             retirements,
+        }
+    }
+}
+
+/// Apply one mutation to the loaded snapshot off the async worker, ack it,
+/// and offer a publish. A panicking closure destroys only its private copy
+/// (TS5-06): `store` keeps all earlier acknowledged mutations.
+#[allow(clippy::too_many_arguments)]
+async fn absorb_mutation(
+    apply: MutateFn,
+    ack: oneshot::Sender<Result<()>>,
+    store: &mut Option<Arc<BridgeStore>>,
+    retry: &mut RetryState,
+    publishing: &mut bool,
+    mutations_since_publish: &mut u32,
+    publish: &Publisher,
+    done_tx: &mpsc::Sender<crate::workers::Delivery<()>>,
+    retirements: &RetirementLog,
+    path: &Path,
+) {
+    let cloned = store.clone().expect("loaded snapshot is present");
+    match crate::workers::run_tracked_blocking(move || {
+        let mut owned = cloned;
+        apply(Arc::make_mut(&mut owned));
+        owned
+    })
+    .await
+    {
+        Ok(owned) => {
+            // TS6-04: retire the old Arc on the blocking pool, not inline.
+            drop_off_worker(store.replace(owned), Arc::clone(retirements));
+            // Ack the absorption before publishing: the disk write is the actor's problem now.
+            let _ = ack.send(Ok(()));
+            retry.dirty = true;
+            *mutations_since_publish += 1;
+            try_start_publish(
+                publishing,
+                retry,
+                store,
+                mutations_since_publish,
+                publish,
+                done_tx,
+            )
+            .await;
+        }
+        Err(join_error) => {
+            warn!(
+                error = %join_error,
+                path = %path.display(),
+                "bridge health store mutation task panicked",
+            );
+            let _ = ack.send(Err(anyhow!(
+                "bridge health store mutation task panicked: {join_error}"
+            )));
+        }
+    }
+}
+
+fn reject_queued_mutations(rx: &mut mpsc::Receiver<Op>) {
+    while let Ok(op) = rx.try_recv() {
+        match op {
+            Op::Mutate { ack, .. } => {
+                let _ = ack.send(Err(anyhow!(
+                    "bridge store writer is closing before applying the mutation"
+                )));
+            }
         }
     }
 }

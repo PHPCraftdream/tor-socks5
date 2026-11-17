@@ -1,12 +1,17 @@
 use std::sync::{Arc, LazyLock, Mutex};
 
-// Неполученные ошибки занимают ячейки до терминального join.
+// The registry may retain 64 active jobs plus 64 overflow-failure slots (128 slots max);
+// the separate report buffer retains up to 128 more failures.
 const BLOCKING_WORKER_LIMIT: usize = 64;
+const FAILURE_REPORT_LIMIT: usize = 128;
+const WORKER_SLOT_LIMIT: usize = BLOCKING_WORKER_LIMIT * 2;
+const RETAINED_FAILURE_LIMIT: usize = FAILURE_REPORT_LIMIT + BLOCKING_WORKER_LIMIT;
+type WorkerFailure = Arc<Mutex<Option<anyhow::Error>>>;
 pub type WorkerSlot = Arc<tokio::sync::Mutex<WorkerState>>;
 #[derive(Default)]
 pub struct WorkerState {
     handle: Option<tokio::task::JoinHandle<()>>,
-    failure: Arc<Mutex<Option<anyhow::Error>>>,
+    failure: WorkerFailure,
 }
 #[derive(Debug)]
 pub struct WorkerFailures(Vec<anyhow::Error>);
@@ -25,11 +30,7 @@ impl WorkerFailures {
 }
 impl std::fmt::Display for WorkerFailures {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "verifier blocking workers failed ({})",
-            self.errors().len()
-        )
+        write!(f, "blocking workers failed ({})", self.errors().len())
     }
 }
 impl std::error::Error for WorkerFailures {
@@ -40,6 +41,7 @@ impl std::error::Error for WorkerFailures {
 #[derive(Default)]
 struct WorkerRegistry {
     slots: Mutex<Vec<WorkerSlot>>,
+    reports: Mutex<Vec<WorkerFailure>>,
 }
 #[cfg(any(test, feature = "test-seams"))]
 thread_local! { static CURRENT_SLOT: std::cell::RefCell<Option<WorkerSlot>> = const { std::cell::RefCell::new(None) }; }
@@ -77,14 +79,11 @@ pub(crate) fn share_error(error: anyhow::Error) -> (anyhow::Error, anyhow::Error
 }
 pub(crate) struct Delivery<T> {
     result: anyhow::Result<T>,
-    failure: Arc<Mutex<Option<anyhow::Error>>>,
+    failure: WorkerFailure,
     acknowledge: bool,
 }
 impl<T> Delivery<T> {
-    pub(crate) fn new(
-        result: anyhow::Result<T>,
-        failure: Arc<Mutex<Option<anyhow::Error>>>,
-    ) -> Self {
+    pub(crate) fn new(result: anyhow::Result<T>, failure: WorkerFailure) -> Self {
         let result = result.map_err(|error| {
             let (retained, returned) = share_error(error);
             record_failure(&failure, retained);
@@ -96,10 +95,7 @@ impl<T> Delivery<T> {
             acknowledge: true,
         }
     }
-    pub(crate) fn panic(
-        result: anyhow::Result<T>,
-        failure: Arc<Mutex<Option<anyhow::Error>>>,
-    ) -> Self {
+    pub(crate) fn panic(result: anyhow::Result<T>, failure: WorkerFailure) -> Self {
         let mut delivery = Self::new(result, failure);
         delivery.acknowledge = false;
         delivery
@@ -145,10 +141,11 @@ pub(crate) fn record_failure(failure: &Mutex<Option<anyhow::Error>>, error: anyh
 static BLOCKING_WORKERS: LazyLock<WorkerRegistry> = LazyLock::new(WorkerRegistry::default);
 
 impl WorkerRegistry {
-    async fn reap(&self, slots: Vec<WorkerSlot>, finished_only: bool) {
-        Self::reap_slots(slots, finished_only).await;
-    }
-    async fn reap_slots(slots: Vec<WorkerSlot>, finished_only: bool) {
+    async fn reap_slots(
+        slots: Vec<WorkerSlot>,
+        finished_only: bool,
+        reports: Option<&Mutex<Vec<WorkerFailure>>>,
+    ) {
         for slot in slots {
             let mut handle = if finished_only {
                 match slot.try_lock() {
@@ -168,23 +165,61 @@ impl WorkerRegistry {
                     record_failure(&handle.failure, anyhow::Error::new(error));
                 }
             }
+            if let Some(reports) = reports {
+                Self::report_failure(&mut handle, reports);
+            }
         }
+    }
+    fn report_failure(state: &mut WorkerState, reports: &Mutex<Vec<WorkerFailure>>) {
+        let failure = Arc::clone(&state.failure);
+        let error = failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(ToString::to_string);
+        let Some(error) = error else {
+            return;
+        };
+        let mut reports = reports.lock().unwrap_or_else(|e| e.into_inner());
+        reports.retain(|failure| failure.lock().unwrap_or_else(|e| e.into_inner()).is_some());
+        if reports.len() >= FAILURE_REPORT_LIMIT {
+            tracing::warn!(
+                error = %error,
+                capacity = FAILURE_REPORT_LIMIT,
+                "blocking worker failure report buffer full; retaining failure in its slot"
+            );
+            return;
+        }
+        tracing::warn!(error = %error, "blocking worker failed; retaining it for registry join");
+        reports.push(failure);
+        state.failure = Arc::new(Mutex::new(None));
     }
     fn snapshot(&self) -> anyhow::Result<Vec<WorkerSlot>> {
         Ok(self
             .slots
             .lock()
-            .map_err(|_| anyhow::anyhow!("verifier registry poisoned"))?
+            .map_err(|_| anyhow::anyhow!("blocking worker registry poisoned"))?
             .clone())
     }
+    /// cancel-safe: yes — cancellation leaves unfinished workers and uncollected failures in the registry.
     async fn join(&self) -> anyhow::Result<()> {
         let slots = self.snapshot()?;
-        self.reap(slots.clone(), false).await;
+        Self::reap_slots(slots.clone(), false, Some(&self.reports)).await;
         let mut states = Vec::new();
         for slot in &slots {
             states.push(slot.lock().await);
         }
         let mut errors = Vec::new();
+        for failure in self
+            .reports
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            if let Some(error) = failure.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                errors.push(error);
+            }
+        }
         for state in states {
             if let Some(error) = state
                 .failure
@@ -241,16 +276,45 @@ impl WorkerRegistry {
         self.spawn_with_failure(move |_| work(), group).await
     }
 
+    /// cancel-safe: yes — reaped failures stay registered, and no new worker is added before the await completes.
     async fn spawn_with_failure<T: Send + 'static>(
         &self,
-        work: impl FnOnce(Arc<Mutex<Option<anyhow::Error>>>) -> T + Send + 'static,
+        work: impl FnOnce(WorkerFailure) -> T + Send + 'static,
         group: Option<&AdmissionWorkers>,
     ) -> anyhow::Result<tokio::sync::oneshot::Receiver<T>> {
-        self.reap(self.snapshot()?, true).await;
+        Self::reap_slots(self.snapshot()?, true, Some(&self.reports)).await;
         let mut slots = self
             .slots
             .lock()
-            .map_err(|_| anyhow::anyhow!("verifier registry poisoned"))?;
+            .map_err(|_| anyhow::anyhow!("blocking worker registry poisoned"))?;
+        let active = slots
+            .iter()
+            .filter(|slot| match slot.try_lock() {
+                Ok(state) => state.handle.is_some(),
+                Err(_) => true,
+            })
+            .count();
+        let report_count = {
+            let mut reports = self.reports.lock().unwrap_or_else(|e| e.into_inner());
+            reports.retain(|failure| failure.lock().unwrap_or_else(|e| e.into_inner()).is_some());
+            reports.len()
+        };
+        let retained_failures = slots
+            .iter()
+            .filter(|slot| {
+                slot.try_lock().is_ok_and(|state| {
+                    state.handle.is_none()
+                        && state
+                            .failure
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .is_some()
+                })
+            })
+            .count();
+        if report_count.saturating_add(retained_failures) >= RETAINED_FAILURE_LIMIT {
+            anyhow::bail!("blocking worker failure capacity full; join workers to collect reports");
+        }
         let vacant = slots.iter().position(|slot| {
             slot.try_lock().is_ok_and(|state| {
                 state.handle.is_none()
@@ -261,8 +325,11 @@ impl WorkerRegistry {
                         .is_none()
             })
         });
-        if vacant.is_none() && slots.len() >= BLOCKING_WORKER_LIMIT {
-            anyhow::bail!("verifier blocking worker registry full");
+        if active >= BLOCKING_WORKER_LIMIT {
+            anyhow::bail!("blocking worker registry full");
+        }
+        if vacant.is_none() && slots.len() >= WORKER_SLOT_LIMIT {
+            anyhow::bail!("blocking worker registry full; join workers to collect failures");
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
         let span = tracing::Span::current();
@@ -280,7 +347,7 @@ impl WorkerRegistry {
             };
             let _ = tx.send(work(failure));
         });
-        slot.try_lock().expect("новая ячейка свободна").handle = Some(worker);
+        slot.try_lock().expect("new slot is unlocked").handle = Some(worker);
         if let Some(index) = vacant {
             slots[index] = slot.clone();
         } else {
@@ -360,8 +427,8 @@ impl TestWorkers {
     }
 }
 
-/// Занятые ячейки процессного реестра: несобранный поток или несданная ошибка.
-/// Ноль после остановки сервера означает, что реестр свободен для следующего запуска.
+/// Occupied registry slots: unfinished workers, overflow failures, or unacknowledged errors.
+/// Zero after server shutdown means the registry is clear for the next run.
 #[cfg(any(test, feature = "test-seams"))]
 pub async fn global_busy_count() -> usize {
     let mut busy = 0;
@@ -374,6 +441,14 @@ pub async fn global_busy_count() -> usize {
             .is_some();
         busy += usize::from(state.handle.is_some() || failed);
     }
+    let reports = BLOCKING_WORKERS
+        .reports
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    busy += reports
+        .iter()
+        .filter(|failure| failure.lock().unwrap_or_else(|e| e.into_inner()).is_some())
+        .count();
     busy
 }
 
@@ -407,7 +482,7 @@ pub(crate) async fn run_tracked_blocking<T: Send + 'static>(
 }
 
 pub(crate) async fn spawn_blocking_with_failure<T: Send + 'static>(
-    work: impl FnOnce(Arc<Mutex<Option<anyhow::Error>>>) -> T + Send + 'static,
+    work: impl FnOnce(WorkerFailure) -> T + Send + 'static,
 ) -> anyhow::Result<tokio::sync::oneshot::Receiver<T>> {
     #[cfg(any(test, feature = "test-seams"))]
     if let Ok(registry) = TEST_WORKERS.try_with(Arc::clone) {
@@ -455,7 +530,7 @@ impl AdmissionWorkers {
         let worker = tokio::spawn(async move {
             match handle.await {
                 Ok(Ok(_)) => {}
-                Ok(Err(error)) => tracing::warn!(%error, "circuit-verify: admission worker failed"),
+                Ok(Err(error)) => tracing::warn!(%error, "admission worker failed"),
                 Err(error) => panic!("admission worker failed: {error}"),
             }
         });
@@ -474,7 +549,7 @@ impl AdmissionWorkers {
     /// Отмена ожидания не отделяет задачи от корневого владельца.
     pub(crate) async fn join_all(&self) {
         let slots = self.slots.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        WorkerRegistry::reap_slots(slots, false).await;
+        WorkerRegistry::reap_slots(slots, false, None).await;
     }
 }
 
@@ -547,39 +622,117 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retained_failures_exhaust_capacity_until_join() {
+    async fn completed_panics_release_active_capacity() {
         let registry = WorkerRegistry::default();
-        for index in 0..BLOCKING_WORKER_LIMIT {
+        for _ in 0..BLOCKING_WORKER_LIMIT + 1 {
+            let rx = registry
+                .spawn(|| panic!("blocking task panic"), None)
+                .await
+                .unwrap();
+            assert!(rx.await.is_err());
+            WorkerRegistry::reap_slots(
+                registry.snapshot().unwrap(),
+                false,
+                Some(&registry.reports),
+            )
+            .await;
+        }
+        let rx = registry.spawn(|| 42, None).await.unwrap();
+        assert_eq!(rx.await.unwrap(), 42);
+        let error = registry.join().await.unwrap_err();
+        let failures = error.downcast_ref::<WorkerFailures>().unwrap().errors();
+        assert_eq!(failures.len(), BLOCKING_WORKER_LIMIT + 1);
+        assert!(failures.iter().all(|error| {
+            error
+                .downcast_ref::<tokio::task::JoinError>()
+                .is_some_and(tokio::task::JoinError::is_panic)
+        }));
+        registry.join().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn report_buffer_overflow_is_bounded_and_lossless() {
+        let registry = WorkerRegistry::default();
+        for index in 0..RETAINED_FAILURE_LIMIT {
             let rx = registry
                 .spawn_fallible(
-                    move || Err::<(), _>(anyhow::anyhow!("failure {index}")),
+                    move || Err::<(), _>(anyhow::anyhow!("overflow {index}")),
                     None,
                 )
                 .await
                 .unwrap();
             drop(rx);
-        }
-        registry.reap(registry.snapshot().unwrap(), false).await;
-        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = executed.clone();
-        assert!(registry
-            .spawn(
-                move || flag.store(true, std::sync::atomic::Ordering::SeqCst),
-                None
+            WorkerRegistry::reap_slots(
+                registry.snapshot().unwrap(),
+                false,
+                Some(&registry.reports),
             )
+            .await;
+        }
+        assert_eq!(registry.reports.lock().unwrap().len(), FAILURE_REPORT_LIMIT);
+        let slots = registry.snapshot().unwrap();
+        assert!(slots.len() <= WORKER_SLOT_LIMIT);
+        let report_failures = registry
+            .reports
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|failure| failure.lock().unwrap().is_some())
+            .count();
+        let slot_failures = {
+            let mut count = 0;
+            for slot in &slots {
+                if slot.lock().await.failure.lock().unwrap().is_some() {
+                    count += 1;
+                }
+            }
+            count
+        };
+        assert_eq!(slot_failures, BLOCKING_WORKER_LIMIT);
+        assert_eq!(
+            report_failures + slot_failures,
+            RETAINED_FAILURE_LIMIT,
+            "every failed worker must be retained in a report or overflow slot"
+        );
+        let admission_error = registry
+            .spawn(|| (), None)
             .await
-            .is_err());
-        assert!(!executed.load(std::sync::atomic::Ordering::SeqCst));
+            .expect_err("admission must stop when retained failure capacity is full");
+        assert!(admission_error
+            .to_string()
+            .contains("failure capacity full"));
+
         let error = registry.join().await.unwrap_err();
         let failures = error.downcast_ref::<WorkerFailures>().unwrap().errors();
-        assert_eq!(failures.len(), BLOCKING_WORKER_LIMIT);
-        for index in 0..BLOCKING_WORKER_LIMIT {
+        assert_eq!(failures.len(), RETAINED_FAILURE_LIMIT);
+        for index in 0..RETAINED_FAILURE_LIMIT {
             assert!(failures
                 .iter()
-                .any(|error| error.to_string() == format!("failure {index}")));
+                .any(|error| error.to_string() == format!("overflow {index}")));
         }
-        let rx = registry.spawn(|| 42, None).await.unwrap();
+
+        let rx = registry
+            .spawn(|| 42, None)
+            .await
+            .expect("admission recovers after collecting retained failures");
         assert_eq!(rx.await.unwrap(), 42);
+        registry.join().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn acknowledged_report_is_cleared_before_join() {
+        let registry = WorkerRegistry::default();
+        let rx = registry
+            .spawn_fallible(|| Err::<(), _>(anyhow::Error::new(Marker)), None)
+            .await
+            .unwrap();
+        let slots = registry.snapshot().unwrap();
+        WorkerRegistry::reap_slots(slots, false, Some(&registry.reports)).await;
+        assert_marker(&rx.await.unwrap().unwrap_err());
+        assert!(registry.reports.lock().unwrap()[0]
+            .lock()
+            .unwrap()
+            .is_none());
         registry.join().await.unwrap();
     }
 
@@ -615,7 +768,8 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert_marker(&result);
-        registry.reap(registry.snapshot().unwrap(), false).await;
+        WorkerRegistry::reap_slots(registry.snapshot().unwrap(), false, Some(&registry.reports))
+            .await;
         let rx = registry.spawn(|| (), None).await.unwrap();
         rx.await.unwrap();
         registry.join().await.unwrap();
@@ -695,7 +849,8 @@ mod tests {
             .spawn_fallible(|| Err::<(), _>(anyhow::Error::new(Marker)), None)
             .await
             .unwrap();
-        registry.reap(registry.snapshot().unwrap(), false).await;
+        WorkerRegistry::reap_slots(registry.snapshot().unwrap(), false, Some(&registry.reports))
+            .await;
         drop(rx);
         assert_marker(&registry.join().await.unwrap_err());
     }
@@ -726,9 +881,12 @@ mod tests {
             .unwrap();
         assert_eq!(rx.await.unwrap(), 42);
         let own = group.slots.lock().unwrap().clone();
-        tokio::time::timeout(Duration::from_secs(1), registry.reap(own, false))
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            WorkerRegistry::reap_slots(own, false, None),
+        )
+        .await
+        .unwrap();
         drop(locked);
         release.send(()).unwrap();
         registry.join().await.unwrap();
@@ -745,7 +903,7 @@ mod tests {
                 .run(move || {
                     let _ = started.send(());
                     let _ = gate.recv();
-                    panic!("проверка дочерней задачи");
+                    panic!("child task panic");
                 })
                 .await
         });
@@ -764,7 +922,10 @@ mod tests {
     #[tokio::test]
     async fn panic_survives_cancelled_join() {
         let registry = WorkerRegistry::default();
-        let rx = registry.spawn(|| panic!("проверка"), None).await.unwrap();
+        let rx = registry
+            .spawn(|| panic!("blocking task panic"), None)
+            .await
+            .unwrap();
         assert!(rx.await.is_err());
         let (release, gate) = std::sync::mpsc::channel();
         registry
