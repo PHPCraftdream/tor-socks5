@@ -13,6 +13,15 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    // Host-process initialisation (R1): the host installs the crypto provider
+    // and composes its own log subscriber; the SDK never does this on its own.
+    tor_socks5::install_crypto_provider();
+    let log = tor_socks5::config::LogConfig {
+        default: "info".to_owned(),
+        targets: Default::default(),
+        ..Default::default()
+    };
+    let (log_layer, _guard) = tor_socks5::runtime::log_layer(&log);
     let mut args = std::env::args_os().skip(1);
     let config_path = required(&mut args, "CONFIG_PATH")?;
     let pt_path = required(&mut args, "PT_BINARY")?;
@@ -23,7 +32,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let config = Config::load_with_override(Some(&config_path))?.into_config();
     let observations = ObservationSink::new();
     tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer())
+        .with(log_layer)
         .with(observation_layer(&observations))
         .try_init()?;
 

@@ -6,8 +6,9 @@ use std::path::PathBuf;
 use anyhow::Result;
 use tracing_appender::non_blocking::WorkerGuard;
 
-use super::children::bind_child_processes_to_self;
-use super::logging::{init_tracing, install_crypto_provider};
+use tor_socks5_runtime::host::{bind_child_processes_to_self, install_crypto_provider};
+
+use super::logging::init_tracing;
 use crate::config::{Config, Loaded};
 use tor_socks5_server::{DnsStartupPolicy, Server, ServerError};
 

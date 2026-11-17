@@ -34,6 +34,8 @@ dns = ["tor", "acl", "dep:tor-socks5-dns"]
 # config, the PT entry point, the TorHandle surface, watchdog status, conn
 # health). Links Arti — patch-kit needed (see README).
 runtime = ["tor", "config", "bridges", "dep:tor-socks5-runtime"]
+# Busybox pluggable-transport dispatch for an embedding host.
+pt = ["runtime", "tor-socks5-runtime/pt"]
 # Embedded SOCKS5 server. Links Arti — patch-kit needed (see README).
 server = ["runtime", "onion-service", "dep:tor-socks5-server", "tor-socks5-server/onion-service"]
 # Tor-free onion address and vanity core (the CLI uses the same crate).
@@ -50,7 +52,7 @@ onion-host = ["dep:tor-socks5-onion", "tor-socks5-onion/host"]
 # an explicit argument; printing, prompting and confirmations stay with the
 # application.
 onion-keys = ["dep:tor-socks5-onion", "tor-socks5-onion/keys"]
-full = ["socks5", "auth", "config", "bridges", "route", "tor", "fetch", "dns", "onion", "onion-keys", "onion-service", "onion-host", "runtime", "server"]
+full = ["socks5", "auth", "config", "bridges", "route", "tor", "fetch", "dns", "onion", "onion-keys", "onion-service", "onion-host", "runtime", "server", "pt"]
 
 [dependencies]
 persist-lock = { path = "../../packages/persist-lock", version = "0.2.0" }
