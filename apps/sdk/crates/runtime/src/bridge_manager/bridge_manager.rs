@@ -302,7 +302,7 @@ fn start_with_token(
         );
         producers.push((
             "maintenance",
-            crate::bridge_maintenance::spawn_with_pt(
+            crate::bridge_maintenance::spawn(
                 handle,
                 config_path,
                 cfg.bridges.recheck_interval_mins,
@@ -315,7 +315,7 @@ fn start_with_token(
     } else {
         producers.push((
             "maintenance",
-            crate::bridge_maintenance::spawn_with_pt(
+            crate::bridge_maintenance::spawn(
                 handle.clone(),
                 config_path.clone(),
                 cfg.bridges.recheck_interval_mins,
@@ -335,7 +335,7 @@ fn start_with_token(
         }
         producers.push((
             "verifier",
-            crate::bridge_verifier::spawn_bridge_circuit_verifier_with_pt(
+            crate::bridge_verifier::spawn_bridge_circuit_verifier(
                 config_path,
                 handle,
                 pt_binary,
@@ -541,7 +541,7 @@ pub async fn fetch_bridges(
                 _ = params.cancel.cancelled() => {
                     return Err(FetchBridgesError::Cancelled);
                 }
-                promoted = crate::fetch_merge::drain_pool_with_pt(
+                promoted = crate::fetch_merge::drain_pool(
                     config_path,
                     params.count,
                     Some(&tor),

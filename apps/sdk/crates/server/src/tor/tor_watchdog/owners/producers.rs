@@ -312,6 +312,7 @@ mod tests {
             &cfg,
             tor_socks5_runtime::arti_observability::ObservationSink::new(),
             settings,
+            tor_socks5_runtime::pt::PtBinary::Environment,
             owner.token(),
             &mut launch.handles,
         );

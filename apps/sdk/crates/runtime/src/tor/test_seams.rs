@@ -275,3 +275,25 @@ pub fn ran_on_thread(site: Site) -> Option<std::thread::ThreadId> {
         .get(&site)
         .copied()
 }
+
+/// SDK14 PT-resolution observer plumbing for cross-crate tests (the
+/// embedded server): capture the channel installed by
+/// [`sdk14_pt_scope`] in the current task, the same way the runtime
+/// producers capture it before spawning their workers.
+pub fn sdk14_pt_observer() -> Option<(
+    &'static str,
+    tokio::sync::mpsc::Sender<(&'static str, std::path::PathBuf)>,
+)> {
+    crate::pt::sdk14_observer()
+}
+
+/// Run `fut` with the SDK14 PT-resolution observer installed under
+/// `label`: every `PtBinary` resolution performed inside reports its
+/// resulting path through `tx` as `(label, path)`.
+pub fn sdk14_pt_scope<F: std::future::Future>(
+    label: &'static str,
+    tx: tokio::sync::mpsc::Sender<(&'static str, std::path::PathBuf)>,
+    fut: F,
+) -> impl std::future::Future<Output = F::Output> {
+    crate::pt::SDK14_PT_OBSERVER.scope((label, tx), fut)
+}

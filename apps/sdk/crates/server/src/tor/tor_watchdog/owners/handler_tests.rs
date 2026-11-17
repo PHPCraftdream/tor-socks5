@@ -82,6 +82,7 @@ async fn run_server_reports_final_flush_worker_panic() {
                     upstream_user: None,
                     upstream_pass: None,
                     no_upstream: false,
+                    pt_binary: tor_socks5_runtime::pt::PtBinary::Environment,
                     dns_startup_policy: crate::api::DnsStartupPolicy::Required,
                 };
                 let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -181,6 +182,7 @@ async fn parked_server_startup(global: bool) {
         upstream_user: None,
         upstream_pass: None,
         no_upstream: false,
+        pt_binary: tor_socks5_runtime::pt::PtBinary::Environment,
         dns_startup_policy: crate::api::DnsStartupPolicy::Required,
     };
     let mut server = AbortOnDrop(tokio::spawn(

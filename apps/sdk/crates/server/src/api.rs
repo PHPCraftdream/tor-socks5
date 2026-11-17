@@ -17,6 +17,7 @@ use crate::server::ServerArgs;
 pub use crate::config::Config;
 /// Observation sink accepted by the embedded server API.
 pub use tor_socks5_runtime::arti_observability::ObservationSink;
+pub use tor_socks5_runtime::pt::PtBinary;
 
 static SERVER_RUNNING: AtomicBool = AtomicBool::new(false);
 type ListenAddrs = Arc<StdMutex<Vec<SocketAddr>>>;
@@ -209,6 +210,7 @@ impl Server {
             upstream_user: None,
             upstream_pass: None,
             no_upstream: false,
+            pt_binary: PtBinary::default(),
             dns_startup_policy: DnsStartupPolicy::default(),
             cancellation_token: CancellationToken::new(),
             status,
@@ -226,6 +228,7 @@ pub struct ServerBuilder {
     upstream_user: Option<String>,
     upstream_pass: Option<String>,
     no_upstream: bool,
+    pt_binary: PtBinary,
     dns_startup_policy: DnsStartupPolicy,
     cancellation_token: CancellationToken,
     status: watch::Sender<ServerStatus>,
@@ -258,6 +261,20 @@ impl ServerBuilder {
         self.upstream_addr = address;
         self.upstream_user = username;
         self.upstream_pass = password;
+        self
+    }
+
+    /// Choose the pluggable-transport executable policy for every Tor client
+    /// this server builds (main client settings init, the restricted owner
+    /// settings template, and the bridge producer manager). The default
+    /// [`PtBinary::Environment`] resolves the documented `TOR_PT_BINARY`
+    /// override, else the current process executable, which must itself
+    /// dispatch PT mode; embedding hosts without such a dispatch (e.g. a
+    /// cdylib) must pass [`PtBinary::Explicit`] pointing at their own
+    /// PT-capable binary. `fetch_bridges` is unaffected: it always uses the
+    /// `Environment` policy.
+    pub fn pt_binary(mut self, pt: PtBinary) -> Self {
+        self.pt_binary = pt;
         self
     }
 
@@ -409,6 +426,7 @@ impl ServerBuilder {
             upstream_user: self.upstream_user,
             upstream_pass: self.upstream_pass,
             no_upstream: self.no_upstream,
+            pt_binary: self.pt_binary,
             dns_startup_policy: self.dns_startup_policy,
         };
 
@@ -770,6 +788,18 @@ fn take_result(result: &Arc<StdMutex<Option<ServerError>>>) -> Option<ServerErro
 mod tests {
     use super::*;
     use std::error::Error as _;
+
+    /// H11: the builder records the PT policy (default `Environment`) and
+    /// threads it into the startup arguments the worker consumes.
+    #[test]
+    fn pt_binary_builder_defaults_to_environment_and_is_settable() {
+        let build = |pt| Server::builder(Config::default()).pt_binary(pt);
+        let default = build(PtBinary::Environment);
+        assert_eq!(default.pt_binary, PtBinary::Environment);
+        let helper = std::path::PathBuf::from("host-pt-helper");
+        let explicit = build(PtBinary::Explicit(helper.clone()));
+        assert_eq!(explicit.pt_binary, PtBinary::Explicit(helper));
+    }
 
     #[test]
     fn server_error_formatting_does_not_duplicate_primary_chain() {

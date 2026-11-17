@@ -145,9 +145,17 @@ async fn run_server_inner(
     // back to the legacy NO_AUTH path.
     let users_path = UsersConfig::resolve_path(config_path.as_deref());
     let users = UsersConfig::load(&users_path).context("loading users registry")?;
-    tor_socks5_runtime::tor_setup::validate_owner_routes(&cfg, &users, config_path.as_deref())?;
-    let owner_template =
-        tor_socks5_runtime::tor_setup::restricted_owner_settings(&cfg, config_path.as_deref());
+    tor_socks5_runtime::tor_setup::validate_owner_routes(
+        &cfg,
+        &users,
+        config_path.as_deref(),
+        &args.pt_binary,
+    )?;
+    let owner_template = tor_socks5_runtime::tor_setup::restricted_owner_settings(
+        &cfg,
+        config_path.as_deref(),
+        &args.pt_binary,
+    );
     validate_account_routes(
         &users,
         cfg.pre_proxies.as_ref(),
@@ -253,6 +261,7 @@ async fn run_server_inner(
                 cfg.clone(),
                 config_path.clone(),
                 startup_cancellation.clone(),
+                args.pt_binary.clone(),
             )?;
             let Some(settings) = global_init::wait_startup(
                 &mut shutdown,
@@ -335,6 +344,7 @@ async fn run_server_inner(
                     &cfg,
                     obs_sink.clone(),
                     settings,
+                    args.pt_binary.clone(),
                     producer_token.clone(),
                     &mut launch.handles,
                 );

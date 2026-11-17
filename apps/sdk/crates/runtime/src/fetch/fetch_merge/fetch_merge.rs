@@ -348,15 +348,11 @@ fn channel_checker(
 /// is the cold-start path, where no live tunnel exists yet to warm through.
 ///
 /// cancel-safe: NO — probes the network and writes the pool + config.
+/// Drains the candidate pool with the given PT policy: probing bridges
+/// that need a pluggable transport runs with a Tor client pointed at the
+/// executable chosen here. `PtBinary::Environment` resolves the documented
+/// `TOR_PT_BINARY` override, else the current process executable.
 pub async fn drain_pool(
-    config_path: Option<&Path>,
-    target: usize,
-    tor: Option<&TorTunnel>,
-) -> Result<usize> {
-    drain_pool_with_pt(config_path, target, tor, crate::pt::PtBinary::Environment).await
-}
-
-pub(crate) async fn drain_pool_with_pt(
     config_path: Option<&Path>,
     target: usize,
     tor: Option<&TorTunnel>,
@@ -715,8 +711,7 @@ pub(crate) async fn top_up_working_with_pt(
     if target == 0 {
         return Ok(0);
     }
-    let mut promoted =
-        drain_pool_with_pt(config_path, target, Some(tor), pt_binary.clone()).await?;
+    let mut promoted = drain_pool(config_path, target, Some(tor), pt_binary.clone()).await?;
     if promoted < target && !cfg.bridges.sources.is_empty() {
         info!(
             have = promoted,
@@ -724,14 +719,13 @@ pub(crate) async fn top_up_working_with_pt(
             "pool short — refreshing candidates from sources over Tor"
         );
         refresh_candidate_pool(tor, cfg, config_path, REFRESH_FETCH_TIMEOUT).await?;
-        promoted +=
-            drain_pool_with_pt(config_path, target - promoted, Some(tor), pt_binary).await?;
+        promoted += drain_pool(config_path, target - promoted, Some(tor), pt_binary).await?;
     }
     Ok(promoted)
 }
 
 /// Test convenience wrapper for the cfg-taking `drain_pool_with` (H10:
-/// production loads the config once in `drain_pool_with_pt`; tests mirror
+/// production loads the config once in `drain_pool`; tests mirror
 /// that by loading here and passing the `Config` down).
 #[cfg(test)]
 pub(crate) async fn drain_with(

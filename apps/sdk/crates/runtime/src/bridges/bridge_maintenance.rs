@@ -104,26 +104,11 @@ fn activate(
     Ok(())
 }
 
+/// Spawns the maintenance producer with the given PT policy: the policy is
+/// reused for every later owner-settings rebuild this task performs.
+/// `PtBinary::Environment` resolves the documented `TOR_PT_BINARY` override,
+/// else the current process executable.
 pub fn spawn(
-    handle: TorHandle,
-    config_path: Option<PathBuf>,
-    interval_mins: u64,
-    observations: ObservationSink,
-    active: Settings,
-    token: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    spawn_with_pt(
-        handle,
-        config_path,
-        interval_mins,
-        observations,
-        active,
-        crate::pt::PtBinary::Environment,
-        token,
-    )
-}
-
-pub(crate) fn spawn_with_pt(
     handle: TorHandle,
     config_path: Option<PathBuf>,
     interval_mins: u64,
@@ -418,7 +403,7 @@ async fn refresh_pre_with_pt(
     if cfg.upstream.enabled {
         anyhow::bail!("pre endpoint is incompatible with upstream");
     }
-    let validated = crate::tor_setup::restricted_owner_settings_with_pt(cfg, path, pt_binary)?;
+    let validated = crate::tor_setup::restricted_owner_settings(cfg, path, pt_binary)?;
     let mut selected = active.clone();
     selected.bridges = validated.bridges;
     use futures::StreamExt;
