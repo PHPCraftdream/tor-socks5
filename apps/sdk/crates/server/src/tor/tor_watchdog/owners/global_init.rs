@@ -22,6 +22,12 @@ pub(super) struct StartupHook {
             std::sync::mpsc::Receiver<()>,
         )>,
     >,
+    pub async_gate: StdMutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
 }
 
 #[cfg(test)]
@@ -99,6 +105,7 @@ fn cleanup_budget() -> Duration {
 }
 
 pub(super) struct SettingsInit {
+    cancel: CancellationToken,
     handle: Mutex<Option<JoinHandle<Result<Settings>>>>,
 }
 
@@ -106,47 +113,77 @@ impl SettingsInit {
     pub(super) fn start(
         cfg: crate::config::Config,
         path: Option<std::path::PathBuf>,
+        cancellation: CancellationToken,
     ) -> Result<Arc<Self>> {
         #[cfg(test)]
         if let Ok(hook) = RUN_SERVER_STARTUP.try_with(Arc::clone) {
-            return Self::start_job(move || {
-                if !hook.park_global {
-                    let (entered, release) = hook.gate.lock().unwrap().take().unwrap();
+            let stage: std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<Settings>> + Send>,
+            > = if hook.park_global {
+                let settings = hook.settings.clone();
+                Box::pin(std::future::ready(Ok(settings)))
+            } else if let Some((entered, release)) = hook.async_gate.lock().unwrap().take() {
+                let settings = hook.settings.clone();
+                Box::pin(async move {
+                    let _ = entered.send(());
+                    release.await.context("settings startup test gate closed")?;
+                    Ok(settings)
+                })
+            } else {
+                let (entered, release) = hook.gate.lock().unwrap().take().unwrap();
+                let settings = hook.settings.clone();
+                Box::pin(async move {
                     let _ = entered.send(());
                     let _ = release.recv();
-                }
-                Ok(hook.settings.clone())
-            });
+                    Ok(settings)
+                })
+            };
+            return Self::start_job(cancellation, stage);
         }
         #[cfg(test)]
         if let Ok(settings) = RUN_SERVER_SHUTDOWN.try_with(|hook| hook.settings.clone()) {
-            return Self::start_job(move || Ok(settings));
+            return Self::start_job(cancellation, std::future::ready(Ok(settings)));
         }
-        let runtime = tokio::runtime::Handle::current();
-        Self::start_job(move || {
-            runtime.block_on(tor_socks5_runtime::tor_setup::build_tor_settings(
-                &cfg,
-                path.as_deref(),
-            ))
-        })
+        let stage = async move {
+            tor_socks5_runtime::tor_setup::build_tor_settings(&cfg, path.as_deref()).await
+        };
+        Self::start_job(cancellation, stage)
     }
 
-    fn start_job(job: impl FnOnce() -> Result<Settings> + Send + 'static) -> Result<Arc<Self>> {
+    fn start_job<F>(cancellation: CancellationToken, stage: F) -> Result<Arc<Self>>
+    where
+        F: std::future::Future<Output = Result<Settings>> + Send + 'static,
+    {
         let mut root = SETTINGS
             .lock()
-            .map_err(|_| anyhow!("хранилище настроек повреждено"))?;
+            .map_err(|_| anyhow!("settings registry is poisoned"))?;
         if root.is_some() {
-            bail!("предыдущая подготовка настроек ещё сохраняется");
+            bail!("previous settings preparation is still retained");
         }
         let init = Arc::new(Self {
+            cancel: cancellation.child_token(),
             handle: Mutex::new(None),
         });
-        let mut slot = init.handle.try_lock().expect("новый слот свободен");
+        let mut slot = init.handle.try_lock().expect("new slot is free");
         *root = Some(init.clone());
-        // Задача продолжает опрос подготовки, пока не завершатся её вложенные операции.
-        *slot = Some(tokio::task::spawn_blocking(job));
+        let cancel = init.cancel.clone();
+        let runtime = tokio::runtime::Handle::current();
+        *slot = Some(tokio::task::spawn_blocking(move || {
+            runtime.block_on(async move {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => Err(anyhow::Error::new(StartupFailure::cancelled())),
+                    result = stage => result,
+                }
+            })
+        }));
         drop(slot);
         Ok(init)
+    }
+
+    #[cfg(test)]
+    pub(super) fn cancel(&self) {
+        self.cancel.cancel();
     }
 
     /// cancel-safe: да — дескриптор остаётся в корневом слоте при отмене ожидания.
@@ -177,21 +214,30 @@ impl SettingsInit {
     pub(super) async fn recover(deadline: Instant) -> Result<()> {
         let init = SETTINGS
             .lock()
-            .map_err(|_| anyhow!("хранилище настроек повреждено"))?
+            .map_err(|_| anyhow!("settings registry is poisoned"))?
             .clone();
         let Some(init) = init else {
             return Ok(());
         };
+        init.cancel.cancel();
         let mut slot = tokio::time::timeout_at(deadline, init.handle.lock())
             .await
-            .context("истёк срок ожидания подготовки настроек")?;
+            .context("settings preparation recovery timed out")?;
         if let Some(handle) = slot.as_mut() {
             let result = tokio::time::timeout_at(deadline, handle)
                 .await
-                .context("истёк срок ожидания подготовки настроек")?;
+                .context("settings preparation recovery timed out")?;
             slot.take();
             init.release()?;
-            result.context("задача подготовки настроек завершилась аварийно")??;
+            let result = result.context("settings preparation task failed")?;
+            if let Err(error) = result {
+                let cancelled = error
+                    .downcast_ref::<StartupFailure>()
+                    .is_some_and(StartupFailure::is_cancelled);
+                if !cancelled {
+                    return Err(error);
+                }
+            }
         } else {
             init.release()?;
         }
@@ -200,12 +246,15 @@ impl SettingsInit {
 }
 
 pub(super) async fn recover_startup() -> Result<()> {
-    let mut errors = recover_startup_all().await;
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.remove(0))
+    aggregate_errors(recover_startup_all().await)
+}
+
+fn aggregate_errors(errors: impl IntoIterator<Item = anyhow::Error>) -> Result<()> {
+    let mut failures = super::producers::ProducerFailures::default();
+    for error in errors {
+        failures.push(error);
     }
+    failures.into_result()
 }
 
 /// Recover every retained startup/runtime owner, preserving each failure so
@@ -260,24 +309,107 @@ where
     };
     match outcome {
         None => {
-            cleanup().await?;
-            Ok(None)
+            let cleanup = cleanup().await.err();
+            let primary = StartupPrimary::Cancelled;
+            let failure = match cleanup {
+                Some(cleanup) => StartupFailure::with_cleanup(primary, cleanup),
+                None => StartupFailure::cancelled(),
+            };
+            Err(anyhow::Error::new(failure))
         }
         Some(result) => result.map(Some),
     }
 }
 
 pub(super) async fn stop_startup() -> Result<()> {
-    // Подготовка настроек и запуск Tor делят пять секунд; восстановление
-    // производителей имеет отдельные пять секунд (всего не более десяти).
+    // Settings and global init share five seconds; producer recovery has its own budget.
     let deadline = Instant::now() + cleanup_budget();
     let settings = SettingsInit::recover(deadline).await;
     let global = GlobalInit::recover(deadline).await;
     let producers = super::producers::ProducerTasks::recover().await;
-    settings?;
-    global?;
-    producers
+    let mut errors = Vec::new();
+    if let Err(error) = settings {
+        errors.push(error);
+    }
+    if let Err(error) = global {
+        errors.push(error);
+    }
+    if let Err(error) = producers {
+        errors.push(error);
+    }
+    aggregate_errors(errors)
 }
+#[derive(Debug)]
+pub(super) enum StartupPrimary {
+    Cancelled,
+    Error(anyhow::Error),
+}
+
+/// Keeps the primary startup result separate from every cleanup failure.
+#[derive(Debug)]
+pub(super) struct StartupFailure {
+    pub(super) primary: StartupPrimary,
+    pub(super) cleanup: Option<anyhow::Error>,
+}
+
+impl StartupFailure {
+    pub(super) fn cancelled() -> Self {
+        Self {
+            primary: StartupPrimary::Cancelled,
+            cleanup: None,
+        }
+    }
+
+    pub(super) fn with_cleanup(primary: StartupPrimary, cleanup: anyhow::Error) -> Self {
+        Self {
+            primary,
+            cleanup: Some(cleanup),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn cleanup_error(&self) -> Option<&anyhow::Error> {
+        self.cleanup.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(super) fn primary(&self) -> &StartupPrimary {
+        &self.primary
+    }
+
+    pub(super) fn is_cancelled(&self) -> bool {
+        matches!(self.primary, StartupPrimary::Cancelled)
+    }
+}
+
+impl std::fmt::Display for StartupFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.primary {
+            StartupPrimary::Cancelled => f.write_str("server startup cancelled"),
+            StartupPrimary::Error(_) => f.write_str("server startup failed"),
+        }
+    }
+}
+
+impl std::error::Error for StartupFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.primary {
+            StartupPrimary::Cancelled => None,
+            StartupPrimary::Error(primary) => Some(primary.as_ref()),
+        }
+    }
+}
+
+fn global_init_failure(primary: StartupPrimary, cleanup: Result<()>) -> anyhow::Error {
+    match cleanup {
+        Ok(()) => match primary {
+            StartupPrimary::Cancelled => anyhow::Error::new(StartupFailure::cancelled()),
+            StartupPrimary::Error(error) => error,
+        },
+        Err(cleanup) => anyhow::Error::new(StartupFailure::with_cleanup(primary, cleanup)),
+    }
+}
+
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(300);
 
 struct Constructed {
@@ -410,10 +542,17 @@ impl GlobalInit {
             }
         };
         if let Err(error) = constructed.outcome {
-            *self.tunnel.try_lock().expect("слот запуска свободен") = Some(constructed.tunnel);
+            *self.tunnel.try_lock().expect("startup slot is free") = Some(constructed.tunnel);
             drop(slot);
-            Self::recover(Instant::now() + cleanup_budget()).await?;
-            return Err(error);
+            let primary = if error.is::<ConstructorCancelled>() {
+                StartupPrimary::Cancelled
+            } else {
+                StartupPrimary::Error(error)
+            };
+            return Err(global_init_failure(
+                primary,
+                Self::recover(Instant::now() + cleanup_budget()).await,
+            ));
         }
         *self.tunnel.try_lock().expect("слот запуска свободен") = Some(constructed.tunnel.clone());
         Ok(constructed.tunnel)
@@ -459,12 +598,11 @@ impl GlobalInit {
         if let Some(handle) = slot.as_mut() {
             let result = tokio::time::timeout_at(deadline, handle)
                 .await
-                .context("истёк срок ожидания запуска глобального Tor")?;
+                .context("global Tor startup timed out")?;
             slot.take();
-            match result.context("задача запуска Tor завершилась аварийно")?
-            {
+            match result.context("global Tor startup task failed")? {
                 Ok(constructed) => {
-                    *init.tunnel.try_lock().expect("слот запуска свободен") =
+                    *init.tunnel.try_lock().expect("startup slot is free") =
                         Some(constructed.tunnel);
                 }
                 Err(error) if error.is::<ConstructorCancelled>() => {}
@@ -517,17 +655,58 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn shutdown_during_settings_retains_blocked_job() {
+    async fn settings_init_select_observes_cancellation() {
+        let _lifecycle = super::super::owners::TEST_LIFECYCLE.lock().await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let hook = Arc::new(StartupHook {
+            settings: Settings::default(),
+            park_global: false,
+            gate: StdMutex::new(None),
+            async_gate: StdMutex::new(Some((entered_tx, release_rx))),
+        });
+        let cancellation = CancellationToken::new();
+        let init = RUN_SERVER_STARTUP
+            .scope(hook, async {
+                SettingsInit::start(crate::config::Config::default(), None, cancellation.clone())
+            })
+            .await
+            .unwrap();
+        entered_rx.await.unwrap();
+
+        cancellation.cancel();
+        let failure = init
+            .wait()
+            .await
+            .expect_err("cancellation returns an error");
+        let failure = failure.downcast_ref::<StartupFailure>().unwrap();
+        assert!(failure.is_cancelled());
+        assert!(failure.cleanup_error().is_none());
+        drop(release_tx);
+        assert!(SETTINGS.lock().unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_during_blocked_settings_retains_job_and_cleanup_timeout() {
         let _lifecycle = super::super::owners::TEST_LIFECYCLE.lock().await;
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let init = SettingsInit::start_job(move || {
-            let _ = entered_tx.send(());
-            let _ = release_rx.recv();
-            Ok(Settings::default())
-        })
-        .unwrap();
-        entered_rx.await.unwrap();
+        let hook = Arc::new(StartupHook {
+            settings: Settings::default(),
+            park_global: false,
+            gate: StdMutex::new(Some((entered_tx, release_rx))),
+            async_gate: StdMutex::new(None),
+        });
+        let cancellation = CancellationToken::new();
+        let init = RUN_SERVER_STARTUP
+            .scope(hook, async {
+                SettingsInit::start(crate::config::Config::default(), None, cancellation.clone())
+            })
+            .await
+            .unwrap();
+        tokio::task::spawn_blocking(move || entered_rx.blocking_recv().unwrap())
+            .await
+            .unwrap();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let mut shutdown = Box::pin(async {
             let _ = shutdown_rx.await;
@@ -536,22 +715,51 @@ mod tests {
         let result = tokio::time::timeout(
             Duration::from_secs(1),
             wait_startup(&mut shutdown, init.wait(), || {
-                SettingsInit::recover(Instant::now() + Duration::ZERO)
+                init.cancel();
+                SettingsInit::recover(Instant::now() + Duration::from_millis(20))
             }),
         )
-        .await;
+        .await
+        .unwrap();
         let retained = SETTINGS
             .lock()
             .unwrap()
             .as_ref()
             .is_some_and(|root| Arc::ptr_eq(root, &init));
+
+        let failure = result.expect_err("shutdown returns an error");
+        let failure = failure.downcast_ref::<StartupFailure>().unwrap();
+        assert!(failure.is_cancelled());
+        assert!(failure
+            .cleanup_error()
+            .unwrap()
+            .to_string()
+            .contains("settings preparation recovery timed out"));
+        assert!(retained, "timed-out blocking work must remain retained");
+
         release_tx.send(()).unwrap();
         SettingsInit::recover(Instant::now() + Duration::from_secs(5))
             .await
             .unwrap();
-        assert!(result.expect("shutdown was ignored").is_err());
-        assert!(retained);
         assert!(SETTINGS.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn global_init_preserves_primary_when_cleanup_fails() {
+        let primary = anyhow!("bootstrap failure").context("bootstrap context");
+        let cleanup = anyhow!("cleanup timed out");
+        let error = global_init_failure(StartupPrimary::Error(primary), Err(cleanup));
+        let failure = error.downcast_ref::<StartupFailure>().unwrap();
+        let StartupPrimary::Error(primary) = failure.primary() else {
+            panic!("cleanup failure replaced the primary bootstrap error");
+        };
+        let primary_chain = format!("{primary:#}");
+        assert_eq!(primary_chain.matches("bootstrap context").count(), 1);
+        assert_eq!(primary_chain.matches("bootstrap failure").count(), 1);
+        assert_eq!(
+            failure.cleanup_error().unwrap().to_string(),
+            "cleanup timed out"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -592,7 +800,13 @@ mod tests {
         GlobalInit::recover(Instant::now() + Duration::from_secs(5))
             .await
             .unwrap();
-        assert!(result.expect("shutdown was ignored").is_err());
+        let failure = result
+            .expect("shutdown was ignored")
+            .err()
+            .expect("shutdown returns an error");
+        assert!(failure
+            .downcast_ref::<StartupFailure>()
+            .is_some_and(StartupFailure::is_cancelled));
         assert!(cancelled && retained);
         assert!(RETAINED.lock().unwrap().is_none());
     }

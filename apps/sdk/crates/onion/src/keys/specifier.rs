@@ -45,6 +45,7 @@ impl HsIdKeypairSpecifier {
     }
 
     /// The nickname this specifier names.
+    #[allow(dead_code)] // crate-internal API; used by dependent crates' tests
     pub fn nickname(&self) -> &HsNickname {
         &self.nickname
     }

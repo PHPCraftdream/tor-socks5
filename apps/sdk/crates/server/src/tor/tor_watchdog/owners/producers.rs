@@ -329,6 +329,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn producer_failures_format_the_first_anyhow_chain_once() {
+        let mut failures = ProducerFailures::default();
+        failures.push(
+            anyhow!("root failure")
+                .context("inner context")
+                .context("outer context"),
+        );
+        let error = failures.into_result().unwrap_err();
+        let formatted = format!("{error:#}");
+
+        assert_eq!(formatted.matches("outer context").count(), 1);
+        assert_eq!(formatted.matches("inner context").count(), 1);
+        assert_eq!(formatted.matches("root failure").count(), 1);
+    }
+
+    #[tokio::test]
     async fn cancelled_join_preserves_outer_and_distinct_child_failures() {
         use std::error::Error as _;
         let owner = owner();
