@@ -69,6 +69,21 @@ const IDENTITY_FILE_PREFIX: &str = "ks_hs_id.";
 /// Extension the Arti native keystore uses for expanded ed25519 keypairs.
 const EXPANDED_PRIVATE_EXT: &str = "ed25519_expanded_private";
 
+/// Create `dir` (and missing parents) owner-only on Unix. The staging parent is
+/// the keystore directory, which Arti's permission check requires to be private;
+/// a default-mode `create_dir_all` here would make the later `open` refuse it.
+fn ensure_private_dir(dir: &Path) -> Result<(), KeysError> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir).context("creating the staging parent")?;
+    Ok(())
+}
+
 /// Parse and validate a service nickname.
 pub fn nickname(s: &str) -> Result<HsNickname, KeysError> {
     HsNickname::new(s.to_owned()).map_err(KeysError::InvalidNickname)
@@ -209,7 +224,7 @@ pub fn parse_identity_file(
 ) -> Result<HsIdKeypair, KeysError> {
     // The caller chose the staging parent (the keystore dir): create it when
     // it does not exist yet.
-    std::fs::create_dir_all(staging_parent).context("creating the staging parent")?;
+    ensure_private_dir(staging_parent)?;
     let staging = tempfile::tempdir_in(staging_parent).context("creating a staging keystore")?;
     // Throwaway directory we just created: its parent must not fail the
     // permission check.
@@ -242,7 +257,7 @@ pub fn identity_file_bytes(
     nick: &HsNickname,
     staging_parent: &Path,
 ) -> Result<Zeroizing<Vec<u8>>, KeysError> {
-    std::fs::create_dir_all(staging_parent).context("creating the staging parent")?;
+    ensure_private_dir(staging_parent)?;
     let staging = tempfile::tempdir_in(staging_parent).context("creating a staging keystore")?;
     let store = ArtiNativeKeystore::from_path_and_mistrust(
         staging.path(),
