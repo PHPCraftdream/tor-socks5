@@ -168,6 +168,20 @@ class Routing(unittest.TestCase):
         with self.assertRaises(p.MappingError):
             self.route("Cargo.toml", blobs={"Cargo.toml": ("[workspace]\nresolver='1'", "[workspace]\nresolver='2'")})
 
+    def test_profile_package_override_mapping(self):
+        graph = lock_graph()
+        old = "[profile.dev.package.resocks5-net]\nopt-level = 1\n"
+        new = "[profile.dev.package.resocks5-net]\nopt-level = 3\n"
+        self.assertEqual(p.manifest_seeds(old, new, graph), {"sdk"})
+        self.assertEqual(p.manifest_seeds("", new, graph), {"sdk"})
+        for bad_old, bad_new in (
+                ("[profile.release]\nlto = 'thin'\n", "[profile.release]\nlto = 'fat'\n"),
+                ("[profile.dev]\nopt-level = 0\n", "[profile.dev]\nopt-level = 1\n"),
+                ("", '[profile.dev.package."*"]\nopt-level = 3\n'),
+                ("", "[profile.dev.package.not-in-graph]\nopt-level = 3\n")):
+            with self.subTest(change=bad_new), self.assertRaisesRegex(p.MappingError, "missing mapping"):
+                p.manifest_seeds(bad_old, bad_new, graph)
+
     def test_workspace_member_addition_mapping(self):
         old = '[workspace]\nresolver = "2"\nmembers = ["packages/*", "apps/*"]\n'
         new = old.replace('"apps/*"]', '"apps/*", "vendor/tor-ptmgr"]')
