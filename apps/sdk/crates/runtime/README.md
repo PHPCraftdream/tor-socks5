@@ -109,7 +109,10 @@ receiving owner.
 
 The watchdog producers (`spawn_tor_watchdog`,
 `spawn_bridge_failover_watchdog`) belong to the server tree, not to this
-manager; a host composes them alongside. Shutdown order for a correct
+manager; for embedders, `bridge_producers::launch_producers` wires the
+bridge-refresh signaling (recovery notifier, `set_needed(auto_fetch &&
+preferred_missing)`) and spawns the manager plus both watchdogs into a
+caller-owned task vector. Shutdown order for a correct
 restart: `shutdown()` first, then `bridge_store_writer::close_global`.
 
 Restart contract (plan decision D5): one live manager per process — the

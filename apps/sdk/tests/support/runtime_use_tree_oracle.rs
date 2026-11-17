@@ -59,6 +59,7 @@ const ALLOWED_RUNTIME_ITEMS: &[&str] = &[
     "bridge_manager::FetchBridgesError",
     "bridge_manager::FetchBridgesOutcome",
     "bridge_manager::FetchBridgesParams",
+    "bridge_producers::launch_producers",
 ];
 
 /// Check the actual runtime facade block against explicit leaves and the

@@ -306,7 +306,7 @@ mod tests {
         let gate = ParkedGate::arm(Site::MaintenanceConfigLoad, &path);
         let owner = ProducerTasks::retain().unwrap();
         let mut launch = LaunchGuard::new(owner.clone());
-        super::super::bridge_producers::launch(
+        tor_socks5_runtime::bridge_producers::launch_producers(
             handle,
             Some(path),
             &cfg,
