@@ -39,25 +39,41 @@ fn restricted_owner_settings_are_network_free_and_reject_incompatible_options() 
     let mut cfg = pre_config();
     cfg.warm_pool.enabled = false;
     cfg.upstream.enabled = true;
-    let settings = crate::tor_setup::restricted_owner_settings(&cfg, None).unwrap();
+    let settings =
+        crate::tor_setup::restricted_owner_settings(&cfg, None, &crate::pt::PtBinary::Environment)
+            .unwrap();
     assert_eq!(settings.bridges, cfg.bridges.parsed().unwrap().bridges);
     assert!(settings.pre_endpoint.is_none());
     assert!(settings.pt_binary.is_none());
     assert!(settings.extra_pt_protocols.is_empty());
 
     cfg.bridges.use_seeds = true;
-    assert!(crate::tor_setup::restricted_owner_settings(&cfg, None).is_err());
+    assert!(crate::tor_setup::restricted_owner_settings(
+        &cfg,
+        None,
+        &crate::pt::PtBinary::Environment,
+    )
+    .is_err());
     cfg.bridges.use_seeds = false;
     cfg.dns_server.enabled = true;
-    assert!(crate::tor_setup::restricted_owner_settings(&cfg, None).is_err());
+    assert!(crate::tor_setup::restricted_owner_settings(
+        &cfg,
+        None,
+        &crate::pt::PtBinary::Environment,
+    )
+    .is_err());
     cfg.dns_server.enabled = false;
     cfg.bridges
         .lines
         .push("unknownpt 8.8.4.4:443 2222222222222222222222222222222222222222 cert=AAA".into());
-    assert!(crate::tor_setup::restricted_owner_settings(&cfg, None)
-        .unwrap_err()
-        .to_string()
-        .contains("unknown protocols"));
+    assert!(crate::tor_setup::restricted_owner_settings(
+        &cfg,
+        None,
+        &crate::pt::PtBinary::Environment,
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("unknown protocols"));
 
     cfg = pre_config();
     cfg.bridges.lines.extend([
@@ -65,7 +81,9 @@ fn restricted_owner_settings_are_network_free_and_reject_incompatible_options() 
         "webtunnel 8.8.8.8:443 3333333333333333333333333333333333333333 url=https://example.com/x ver=0.0.3".into(),
     ]);
     let expected = cfg.bridges.parsed().unwrap().bridges;
-    let settings = crate::tor_setup::restricted_owner_settings(&cfg, None).unwrap();
+    let settings =
+        crate::tor_setup::restricted_owner_settings(&cfg, None, &crate::pt::PtBinary::Environment)
+            .unwrap();
     assert_eq!(settings.bridges, expected);
     assert!(settings.pre_endpoint.is_none());
     assert!(settings.stock_pt_proxy);

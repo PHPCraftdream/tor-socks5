@@ -42,7 +42,7 @@ pub enum PtBinary {
     Explicit(std::path::PathBuf),
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seams"))]
 tokio::task_local! {
     pub(crate) static SDK14_PT_OBSERVER: (
         &'static str,
@@ -50,7 +50,7 @@ tokio::task_local! {
     );
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn sdk14_report_resolution(path: &std::path::Path) {
     let _ = SDK14_PT_OBSERVER.try_with(|(name, sender)| {
         sender
@@ -59,7 +59,7 @@ pub(crate) fn sdk14_report_resolution(path: &std::path::Path) {
     });
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn sdk14_observer() -> Option<(
     &'static str,
     tokio::sync::mpsc::Sender<(&'static str, std::path::PathBuf)>,
@@ -87,7 +87,7 @@ pub(crate) fn resolve_pt_binary(pt: &PtBinary) -> anyhow::Result<std::path::Path
     use anyhow::Context;
     match pt {
         PtBinary::Explicit(path) => {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-seams"))]
             sdk14_report_resolution(path);
             Ok(path.clone())
         }
@@ -96,14 +96,14 @@ pub(crate) fn resolve_pt_binary(pt: &PtBinary) -> anyhow::Result<std::path::Path
                 pt_binary_override_from(std::env::var_os("TOR_PT_BINARY").as_deref())
             {
                 tracing::info!(path = %path.display(), "using TOR_PT_BINARY override as PT binary");
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-seams"))]
                 sdk14_report_resolution(&path);
                 return Ok(path);
             }
 
             let exe = std::env::current_exe().context("resolving current_exe for PT")?;
             tracing::info!(path = %exe.display(), "using own binary as PT (busybox dispatch)");
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-seams"))]
             sdk14_report_resolution(&exe);
             Ok(exe)
         }

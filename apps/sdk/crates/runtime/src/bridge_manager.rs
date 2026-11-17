@@ -225,7 +225,7 @@ fn start_with_token(
         );
         producers.push((
             "maintenance",
-            crate::bridge_maintenance::spawn_with_pt(
+            crate::bridge_maintenance::spawn(
                 handle,
                 config_path,
                 cfg.bridges.recheck_interval_mins,
@@ -238,7 +238,7 @@ fn start_with_token(
     } else {
         producers.push((
             "maintenance",
-            crate::bridge_maintenance::spawn_with_pt(
+            crate::bridge_maintenance::spawn(
                 handle.clone(),
                 config_path.clone(),
                 cfg.bridges.recheck_interval_mins,
@@ -258,7 +258,7 @@ fn start_with_token(
         }
         producers.push((
             "verifier",
-            crate::bridge_verifier::spawn_bridge_circuit_verifier_with_pt(
+            crate::bridge_verifier::spawn_bridge_circuit_verifier(
                 config_path,
                 handle,
                 pt_binary,
@@ -358,8 +358,13 @@ pub async fn fetch_bridges(
             pool_len: pool.len(),
         }
     } else {
-        let promoted =
-            crate::fetch_merge::drain_pool(config_path, params.count, Some(&tor)).await?;
+        let promoted = crate::fetch_merge::drain_pool(
+            config_path,
+            params.count,
+            Some(&tor),
+            crate::pt::PtBinary::Environment,
+        )
+        .await?;
         // The probing fetch never read the pool afterwards, so a failure to
         // load it here must not fail the command; the length is informational.
         let pool_len = match crate::candidate_pool::CandidatePool::load(

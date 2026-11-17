@@ -625,16 +625,20 @@ fn server_builder_setters_surface() {
 
     use tor_socks5::config::Config;
     use tor_socks5::runtime::ObservationSink;
-    use tor_socks5::server::{Server, ServerBuilder, ServerStatus};
+    use tor_socks5::server::{PtBinary, Server, ServerBuilder, ServerStatus};
 
     let builder = Server::builder(Config::default())
         .config_path(Option::<PathBuf>::None)
         .observation_sink(ObservationSink::new())
-        .no_upstream(true);
+        .no_upstream(true)
+        // H11: the PT policy setter consumes the builder's `PtBinary`.
+        .pt_binary(PtBinary::Environment);
     // `CancellationToken` is not re-exported through the facade; pin the
     // setter's type by inference instead of naming the token type.
     fn expect_cancellation_token<B, T>(_f: fn(B, T) -> B) {}
     expect_cancellation_token(ServerBuilder::cancellation_token);
+    expect_cancellation_token(ServerBuilder::pt_binary);
+    assert_eq!(type_name::<PtBinary>(), "tor_socks5_runtime::pt::PtBinary");
     let _: tokio::sync::watch::Receiver<ServerStatus> = builder.subscribe();
 }
 

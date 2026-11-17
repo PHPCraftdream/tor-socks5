@@ -59,7 +59,6 @@ fn settings_for_config(cfg: &Config) -> Settings {
 
 #[path = "tor_watchdog/owner_settings.rs"]
 mod owner_settings;
-pub(crate) use owner_settings::restricted_owner_settings_with_pt;
 pub use owner_settings::{restricted_owner_settings, validate_owner_routes};
 
 /// Parse the configured bridges, probe them for reachability, persist the
@@ -109,8 +108,7 @@ async fn build_tor_settings_inner(
 ) -> Result<Settings> {
     if let Some(pool) = cfg.pre_proxies.as_ref() {
         let endpoint = owner_settings::select_anchor(pool).await?;
-        let mut settings =
-            owner_settings::restricted_owner_settings_with_pt(cfg, config_path, &pt)?;
+        let mut settings = owner_settings::restricted_owner_settings(cfg, config_path, &pt)?;
         settings.pre_endpoint = Some(arti_wrapper::Socks5PreEndpoint::from_pool_member(endpoint));
         return Ok(settings);
     }

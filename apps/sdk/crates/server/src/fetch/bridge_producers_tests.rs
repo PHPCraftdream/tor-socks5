@@ -37,6 +37,7 @@ async fn sdk11_server_bridge_tasks_are_directly_owned_by_producer_vec() {
         &cfg,
         tor_socks5_runtime::arti_observability::ObservationSink::new(),
         settings,
+        tor_socks5_runtime::pt::PtBinary::Environment,
         token.clone(),
         &mut tasks,
     );
@@ -80,6 +81,7 @@ async fn producer_boundaries_remain_guarded() {
                     &cfg,
                     tor_socks5_runtime::arti_observability::ObservationSink::new(),
                     settings.clone(),
+                    tor_socks5_runtime::pt::PtBinary::Environment,
                     CancellationToken::new(),
                     &mut producers,
                 );
@@ -99,6 +101,7 @@ async fn producer_boundaries_remain_guarded() {
                     &cfg,
                     tor_socks5_runtime::arti_observability::ObservationSink::new(),
                     default_settings,
+                    tor_socks5_runtime::pt::PtBinary::Environment,
                     CancellationToken::new(),
                     &mut producers,
                 );
@@ -111,6 +114,7 @@ async fn producer_boundaries_remain_guarded() {
                 let _handle = tor_socks5_runtime::bridge_verifier::spawn_bridge_circuit_verifier(
                     Some(path.clone()),
                     handle.clone(),
+                    tor_socks5_runtime::pt::PtBinary::Environment,
                     CancellationToken::new(),
                 );
             }))

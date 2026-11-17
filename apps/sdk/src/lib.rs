@@ -206,7 +206,7 @@ pub mod runtime {
 #[cfg(feature = "server")]
 pub mod server {
     pub use ::tor_socks5_server::{
-        DnsStartupPolicy, Server, ServerBuilder, ServerError, ServerHandle, ServerStage,
+        DnsStartupPolicy, PtBinary, Server, ServerBuilder, ServerError, ServerHandle, ServerStage,
         ServerStatus,
     };
 }

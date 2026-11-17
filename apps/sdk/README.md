@@ -301,15 +301,20 @@ candidate pool from configured HTTPS sources and, unless `probe` is `false`,
 probes candidates and promotes reachable ones into the working config. The
 application keeps config loading, validation, tracing and printing; the result
 is `FetchBridgesOutcome { added, promoted, pool_len }`. It is not cancel-safe:
-cancellation aborts the run mid-way and skips the trailing 200 ms sleep.
+cancellation aborts the run mid-way and skips the trailing 200 ms sleep. Its
+PT policy is always `PtBinary::Environment` (the `TOR_PT_BINARY` override, else
+the current executable); it does not accept one.
 
 ## Embedded SOCKS5 server (`server` feature)
 
 With `server`, `tor_socks5::server` exposes `Server`, `ServerBuilder`,
-`ServerHandle`, `ServerError`, `ServerStage`, `ServerStatus` and
-`DnsStartupPolicy`. The builder accepts the
+`ServerHandle`, `ServerError`, `ServerStage`, `ServerStatus`,
+`DnsStartupPolicy` and `PtBinary`. The builder accepts the
 facade's `config::Config`; for upstream SOCKS5 egress, configure it explicitly
-with `.upstream(Some(address), username, password)`. Starting the server does
+with `.upstream(Some(address), username, password)`. `.pt_binary(PtBinary)`
+chooses the pluggable-transport policy (default `Environment`) for every Tor
+client the server builds: the main settings init, the restricted owner
+settings template, and the bridge producer manager. Starting the server does
 not connect to or validate the upstream proxy; that proxy must already be
 available when client connections need egress. `ServerBuilder::run_until`
 drives startup and serving until a supplied shutdown future resolves, then
