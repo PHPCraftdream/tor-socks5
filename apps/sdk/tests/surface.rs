@@ -383,7 +383,8 @@ fn runtime_bridge_manager_surface() {
     use tor_socks5::config::Config;
     use tor_socks5::runtime::{
         fetch_bridges, BridgeManagerConfig, BridgeManagerHandle, BridgeManagerStatus,
-        FetchBridgesOutcome, FetchBridgesParams, ObservationSink, PtBinary, TorHandle,
+        FetchBridgesError, FetchBridgesOutcome, FetchBridgesParams, ObservationSink, PtBinary,
+        TorHandle,
     };
 
     assert_eq!(
@@ -393,6 +394,10 @@ fn runtime_bridge_manager_surface() {
     assert_eq!(
         type_name::<BridgeManagerStatus>(),
         "tor_socks5_runtime::bridge_manager::BridgeManagerStatus"
+    );
+    assert_eq!(
+        type_name::<FetchBridgesError>(),
+        "tor_socks5_runtime::bridge_manager::FetchBridgesError"
     );
     assert_eq!(
         type_name::<FetchBridgesParams>(),

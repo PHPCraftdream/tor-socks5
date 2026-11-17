@@ -196,7 +196,7 @@ pub mod runtime {
     /// `bridges fetch` core.
     pub use ::tor_socks5_runtime::bridge_manager::{
         fetch_bridges, start, start_with_parent_token, BridgeManagerConfig, BridgeManagerHandle,
-        BridgeManagerStatus, FetchBridgesOutcome, FetchBridgesParams,
+        BridgeManagerStatus, FetchBridgesError, FetchBridgesOutcome, FetchBridgesParams,
     };
 }
 

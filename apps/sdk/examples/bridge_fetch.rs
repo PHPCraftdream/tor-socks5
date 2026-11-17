@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use tor_socks5::config::Config;
-use tor_socks5::runtime::{fetch_bridges, FetchBridgesParams};
+use tor_socks5::runtime::{fetch_bridges, FetchBridgesParams, PtBinary};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -24,6 +24,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             timeout: Duration::from_secs(60),
             count: 3,
             probe: false,
+            // A host that cannot be re-spawned as a PT dispatcher must pass
+            // `PtBinary::Explicit` instead (see the runtime `pt` docs).
+            pt_binary: PtBinary::Environment,
             cancel: Default::default(),
         },
     )

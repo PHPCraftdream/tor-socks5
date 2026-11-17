@@ -32,18 +32,29 @@
 //! bootstrap Tor from the configured bridges (built-in seeds as fallback),
 //! refresh the candidate pool from the configured HTTPS sources, optionally
 //! probe-and-promote, and merge into the config. The CLI wrapper keeps
-//! config loading, `reject_unsupported_pool`, tracing/crypto installation
-//! and printing.
+//! config loading, tracing/crypto installation and printing; the typed
+//! [`FetchBridgesError`] covers the pre-flight rejections (`NoConfigFile`,
+//! `PreProxies`, `NoBridgeSources`) and `Cancelled`.
 //!
 //! # Cancel-safety
 //!
 //! Not cancel-safe, like the code it moved from: `TorTunnel::bootstrap_with`
-//! has no cancellation point, and `fetch_merge::refresh_candidate_pool` /
-//! `fetch_merge::drain_pool` perform network I/O and file writes that are
-//! aborted mid-way by cancellation (the cross-process pool-lock registry
-//! remains registered afterwards, per `fetch_merge`'s own docs). On
-//! cancellation [`fetch_bridges`] returns an error and skips the trailing
-//! 200 ms post-drop sleep.
+//! has no cancellation point inside arti, and
+//! `fetch_merge::refresh_candidate_pool` / `fetch_merge::drain_pool`
+//! perform network I/O and file writes that are aborted mid-way by
+//! cancellation (the cross-process pool-lock registry remains registered
+//! afterwards, per `fetch_merge`'s own docs). Cancellation is observed at
+//! every stage: pre-flight (immediate `Cancelled`, before any I/O), the
+//! settings build, the bootstrap, the pool refresh and the drain (each
+//! raced against `params.cancel.cancelled()`).
+//!
+//! Once the tunnel exists, ANY error or cancellation drops the tunnel and
+//! then runs the trailing 200 ms post-drop sleep — the cleanup tail is
+//! deliberately NOT cancellable, so arti's reactor releases the PT children
+//! and the state-dir lock before the next bootstrap. A cancellation during
+//! (or before) the *final* pause after a successful fetch skips the rest of
+//! the pause but never loses the already-recorded outcome: the call still
+//! returns `Ok`.
 //!
 //! R1/R2/R3/R4/R5: no new statics, config in / handle out, tasks owned by
 //! the handle, status via `tokio::sync::watch`, `tracing` only.
@@ -51,7 +62,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use arti_wrapper::TorTunnel;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -291,8 +302,63 @@ pub struct FetchBridgesParams {
     /// `false` fills the pool without probing/promoting (the CLI's
     /// `--dry-run`/`--no-probe` modes).
     pub probe: bool,
+    /// PT executable policy used for the bootstrap settings and the
+    /// admission/drain checks.
+    pub pt_binary: crate::pt::PtBinary,
     /// Cancellation for the fetch. See the module docs for cancel-safety.
     pub cancel: CancellationToken,
+}
+
+/// Typed error for [`fetch_bridges`]: the synchronous pre-flight rejections
+/// and cancellation get their own variants; everything else is wrapped.
+#[derive(Debug)]
+pub enum FetchBridgesError {
+    /// `config_path` was `None`; the SDK never creates a default file.
+    NoConfigFile,
+    /// A global `pre_proxies` pool is configured; remove it (the fetch
+    /// cannot honour it — it runs over the host network).
+    PreProxies,
+    /// No bridge sources configured — nothing to fetch.
+    NoBridgeSources,
+    /// The fetch was cancelled (see the module docs for cancel-safety).
+    Cancelled,
+    /// Any other failure, with its root cause.
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for FetchBridgesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoConfigFile => {
+                write!(f, "no config file found; run the server once to create defaults")
+            }
+            Self::PreProxies => write!(
+                f,
+                "bridges fetch global pre_proxies proxy pool is not supported; remove it"
+            ),
+            Self::NoBridgeSources => write!(
+                f,
+                "no bridge sources configured in the `sources` list of the bridges file — nothing to fetch"
+            ),
+            Self::Cancelled => write!(f, "bridge fetch cancelled"),
+            Self::Other(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for FetchBridgesError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Other(error) => Some(error.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+impl From<anyhow::Error> for FetchBridgesError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Other(error)
+    }
 }
 
 /// Outcome of [`fetch_bridges`].
@@ -312,421 +378,158 @@ pub struct FetchBridgesOutcome {
 /// is kept: it lets arti's reactor release the PT children and the state-dir
 /// lock before the process exits or a follow-up bootstrap begins.
 ///
-/// The "no config file found" and `reject_unsupported_pool` checks stay at
-/// the CLI; the "no bridge sources configured" check lives here.
+/// Synchronous pre-flight checks run first, before any file or network I/O:
+/// `config_path: None` → [`FetchBridgesError::NoConfigFile`] (the SDK never
+/// creates a default config file), then `pre_proxies` → `PreProxies`, then
+/// empty `sources` → `NoBridgeSources`.
 ///
 /// Cancel-safety: see the module docs.
 pub async fn fetch_bridges(
     cfg: &Config,
     config_path: Option<&std::path::Path>,
     params: FetchBridgesParams,
-) -> Result<FetchBridgesOutcome> {
+) -> Result<FetchBridgesOutcome, FetchBridgesError> {
+    // Pre-flight: synchronous, no I/O, cheapest/most specific rejection
+    // first. `None` is rejected before any load that could create a
+    // default config file.
+    if config_path.is_none() {
+        return Err(FetchBridgesError::NoConfigFile);
+    }
+    if cfg.pre_proxies.is_some() {
+        return Err(FetchBridgesError::PreProxies);
+    }
     if cfg.bridges.sources.is_empty() {
-        bail!("no bridge sources configured in the `sources` list of the bridges file — nothing to fetch");
+        return Err(FetchBridgesError::NoBridgeSources);
+    }
+    if params.cancel.is_cancelled() {
+        return Err(FetchBridgesError::Cancelled);
     }
 
-    let settings = crate::tor_setup::build_tor_settings(cfg, config_path).await?;
-    info!(
-        count = settings.bridges.len(),
-        "bootstrapping Tor to fetch fresh bridges"
-    );
-    let tor = TorTunnel::bootstrap_with(settings)
-        .await
-        .context("failed to bootstrap Tor for bridge fetching")?;
-
-    let added = tokio::select! {
-        biased;
-        _ = params.cancel.cancelled() => {
-            bail!("bridge fetch cancelled");
-        }
-        added = crate::fetch_merge::refresh_candidate_pool(
-            &tor,
-            cfg,
-            config_path,
-            params.timeout,
-        ) => added?,
-    };
-
-    let outcome = if !params.probe {
-        let pool = crate::candidate_pool::CandidatePool::load(
-            crate::candidate_pool::CandidatePool::resolve_path(config_path),
-        )
-        .context("loading candidate pool")?;
-        FetchBridgesOutcome {
-            added,
-            promoted: None,
-            pool_len: pool.len(),
-        }
-    } else {
-        let promoted =
-            crate::fetch_merge::drain_pool(config_path, params.count, Some(&tor)).await?;
-        // The probing fetch never read the pool afterwards, so a failure to
-        // load it here must not fail the command; the length is informational.
-        let pool_len = match crate::candidate_pool::CandidatePool::load(
-            crate::candidate_pool::CandidatePool::resolve_path(config_path),
-        ) {
-            Ok(pool) => pool.len(),
-            Err(error) => {
-                tracing::warn!(%error, "candidate pool not readable after the drain; pool_len reported as 0");
-                0
+    let result: Result<FetchBridgesOutcome, FetchBridgesError> = async {
+        // Settings build and bootstrap are each cancellation points: the
+        // token wins over the in-flight future. Neither has created the
+        // tunnel yet, so no cleanup tail runs for them.
+        let settings = tokio::select! {
+            biased;
+            _ = params.cancel.cancelled() => {
+                return Err(FetchBridgesError::Cancelled);
+            }
+            settings = crate::tor_setup::build_tor_settings_with_pt(
+                cfg,
+                config_path,
+                params.pt_binary.clone(),
+            ) => {
+                settings.map_err(FetchBridgesError::Other)?
             }
         };
-        FetchBridgesOutcome {
-            added,
-            promoted: Some(promoted),
-            pool_len,
-        }
-    };
+        info!(
+            count = settings.bridges.len(),
+            "bootstrapping Tor to fetch fresh bridges"
+        );
+        let tor = tokio::select! {
+            biased;
+            _ = params.cancel.cancelled() => {
+                return Err(FetchBridgesError::Cancelled);
+            }
+            tor = TorTunnel::bootstrap_with(settings) => {
+                tor.context("failed to bootstrap Tor for bridge fetching")
+                    .map_err(FetchBridgesError::Other)?
+            }
+        };
 
-    drop(tor);
-    tokio::select! {
-        biased;
-        _ = params.cancel.cancelled() => {
-            bail!("bridge fetch cancelled");
+        // From here on the tunnel exists: any error or cancellation drops
+        // it, then runs the 200 ms cleanup tail before returning.
+        let work = async {
+            let added = tokio::select! {
+                biased;
+                _ = params.cancel.cancelled() => {
+                    return Err(FetchBridgesError::Cancelled);
+                }
+                added = crate::fetch_merge::refresh_candidate_pool(
+                    &tor,
+                    cfg,
+                    config_path,
+                    params.timeout,
+                ) => {
+                    added.map_err(FetchBridgesError::Other)?
+                }
+            };
+
+            if !params.probe {
+                let pool = crate::candidate_pool::CandidatePool::load(
+                    crate::candidate_pool::CandidatePool::resolve_path(config_path),
+                )
+                .context("loading candidate pool")?;
+                return Ok(FetchBridgesOutcome {
+                    added,
+                    promoted: None,
+                    pool_len: pool.len(),
+                });
+            }
+
+            let promoted = tokio::select! {
+                biased;
+                _ = params.cancel.cancelled() => {
+                    return Err(FetchBridgesError::Cancelled);
+                }
+                promoted = crate::fetch_merge::drain_pool_with_pt(
+                    config_path,
+                    params.count,
+                    Some(&tor),
+                    params.pt_binary,
+                ) => {
+                    promoted.map_err(FetchBridgesError::Other)?
+                }
+            };
+            // A failed pool read here must not fail the command; the length
+            // is informational only.
+            let pool_len = match crate::candidate_pool::CandidatePool::load(
+                crate::candidate_pool::CandidatePool::resolve_path(config_path),
+            ) {
+                Ok(pool) => pool.len(),
+                Err(error) => {
+                    tracing::warn!(%error, "candidate pool not readable after the drain; pool_len reported as 0");
+                    0
+                }
+            };
+            Ok(FetchBridgesOutcome {
+                added,
+                promoted: Some(promoted),
+                pool_len,
+            })
+        };
+
+        match work.await {
+            Ok(outcome) => {
+                drop(tor);
+                Ok(outcome)
+            }
+            Err(error) => {
+                drop(tor);
+                // The cleanup tail is deliberately NOT cancellable: it lets
+                // arti's reactor release the PT children and state-dir lock.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Err(error)
+            }
         }
-        _ = tokio::time::sleep(Duration::from_millis(200)) => {},
     }
-    Ok(outcome)
+    .await;
+
+    // Final pause: a cancellation during (or before) it must never lose the
+    // already-recorded outcome — skip the rest of the pause, return `Ok`.
+    match result {
+        Ok(outcome) => {
+            tokio::select! {
+                biased;
+                _ = params.cancel.cancelled() => {},
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {},
+            }
+            Ok(outcome)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn empty_sources_bails_before_any_tor_or_io() {
-        // The default config carries the built-in sources, so clear them.
-        let mut cfg = Config::default();
-        cfg.bridges.sources.clear();
-        let error = fetch_bridges(
-            &cfg,
-            None,
-            FetchBridgesParams {
-                timeout: Duration::from_secs(1),
-                count: 1,
-                probe: true,
-                cancel: CancellationToken::new(),
-            },
-        )
-        .await
-        .expect_err("no sources configured");
-        assert_eq!(
-            error.to_string(),
-            "no bridge sources configured in the `sources` list of the bridges file — nothing to fetch"
-        );
-    }
-
-    #[tokio::test]
-    async fn shutdown_sets_cancelled_and_reports_producers() {
-        let token = CancellationToken::new();
-        let (status_tx, status_rx) = watch::channel(BridgeManagerStatus {
-            producers: vec!["maintenance".into()],
-            cancelled: false,
-        });
-        let handle = BridgeManagerHandle {
-            token: token.clone(),
-            status_tx,
-            status_rx,
-            handles: Vec::new(),
-            tasks_transferred: false,
-        };
-        assert_eq!(handle.status().producers, vec!["maintenance".to_string()]);
-        assert!(!handle.status().cancelled);
-        assert!(!token.is_cancelled());
-
-        handle.shutdown().await;
-        assert!(token.is_cancelled());
-    }
-
-    #[tokio::test]
-    async fn drop_cancels_token_without_blocking() {
-        let (status_tx, status_rx) = watch::channel(BridgeManagerStatus {
-            producers: Vec::new(),
-            cancelled: false,
-        });
-        let token = CancellationToken::new();
-        let handle = BridgeManagerHandle {
-            token: token.clone(),
-            status_tx,
-            status_rx,
-            handles: Vec::new(),
-            tasks_transferred: false,
-        };
-        drop(handle);
-        assert!(token.is_cancelled());
-    }
-
-    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
-
-    impl Drop for DropSignal {
-        fn drop(&mut self) {
-            if let Some(signal) = self.0.take() {
-                let _ = signal.send(());
-            }
-        }
-    }
-
-    async fn guarded_task(
-        wait_for: Option<CancellationToken>,
-    ) -> (JoinHandle<()>, tokio::sync::oneshot::Receiver<()>) {
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
-        let handle = tokio::spawn(async move {
-            let _guard = DropSignal(Some(dropped_tx));
-            let _ = started_tx.send(());
-            match wait_for {
-                Some(token) => token.cancelled().await,
-                None => std::future::pending::<()>().await,
-            }
-        });
-        started_rx.await.expect("task reached its pending point");
-        (handle, dropped_rx)
-    }
-
-    fn test_manager(token: CancellationToken, handles: Vec<JoinHandle<()>>) -> BridgeManagerHandle {
-        let (status_tx, status_rx) = watch::channel(BridgeManagerStatus {
-            producers: Vec::new(),
-            cancelled: false,
-        });
-        BridgeManagerHandle {
-            token,
-            status_tx,
-            status_rx,
-            handles,
-            tasks_transferred: false,
-        }
-    }
-
-    #[tokio::test]
-    async fn sdk14_dropping_manager_aborts_pending_tasks() {
-        let (task, dropped) = guarded_task(None).await;
-        drop(test_manager(CancellationToken::new(), vec![task]));
-        tokio::time::timeout(Duration::from_secs(10), dropped)
-            .await
-            .expect("manager drop aborts its pending task within 10s")
-            .expect("aborted task dropped its guard");
-    }
-
-    #[tokio::test]
-    async fn sdk14_cancelling_polled_shutdown_aborts_pending_tasks() {
-        use std::future::Future;
-
-        let (task, dropped) = guarded_task(None).await;
-        let token = CancellationToken::new();
-        let mut shutdown = Box::pin(test_manager(token.clone(), vec![task]).shutdown());
-        std::future::poll_fn(|cx| match shutdown.as_mut().poll(cx) {
-            std::task::Poll::Pending => std::task::Poll::Ready(()),
-            std::task::Poll::Ready(()) => panic!("shutdown unexpectedly completed"),
-        })
-        .await;
-        assert!(token.is_cancelled());
-        drop(shutdown);
-        tokio::time::timeout(Duration::from_secs(10), dropped)
-            .await
-            .expect("cancelled shutdown aborts its pending task within 10s")
-            .expect("cancelled shutdown aborted its task");
-    }
-
-    // Synthetic handles and tokens cover transfer and token-tree behavior;
-    // this does not exercise start_with_parent_token's production wiring.
-    #[tokio::test]
-    async fn sdk14_synthetic_child_cancellation_does_not_cancel_parent() {
-        let parent = CancellationToken::new();
-        let child = parent.child_token();
-        test_manager(child.clone(), Vec::new()).shutdown().await;
-        assert!(child.is_cancelled());
-        assert!(!parent.is_cancelled());
-    }
-
-    #[tokio::test]
-    async fn sdk14_transferred_synthetic_task_lives_until_parent_cancellation() {
-        let parent = CancellationToken::new();
-        let child = parent.child_token();
-        let (task, mut dropped) = guarded_task(Some(child.clone())).await;
-        let manager = test_manager(child.clone(), vec![task]);
-        let mut destination = Vec::new();
-        manager.transfer_tasks(&mut destination);
-
-        assert_eq!(destination.len(), 1);
-        assert!(!destination[0].is_finished());
-        assert!(matches!(
-            dropped.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-        ));
-
-        parent.cancel();
-        assert!(child.is_cancelled());
-        for task in destination {
-            task.await.expect("cooperatively cancelled task completed");
-        }
-        dropped
-            .await
-            .expect("task completed after parent cancellation");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn sdk14_manager_explicit_pt_reaches_maintenance_and_verifier() {
-        use std::sync::Once;
-
-        static CRYPTO_PROVIDER: Once = Once::new();
-        CRYPTO_PROVIDER.call_once(|| {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-        });
-
-        let dir = tempfile::tempdir().expect("temporary config directory");
-        let config_path = dir.path().join("proxy.ktav");
-        let bridge: bridge_line::BridgeLine =
-            "obfs4 8.8.8.8:443 1414141414141414141414141414141414141414 cert=AAA"
-                .parse()
-                .expect("valid public obfs4 bridge");
-        let mut cfg = Config::default();
-        cfg.bridges.lines = vec![bridge.to_string()];
-        cfg.bridges.sources.clear();
-        cfg.bridges.use_seeds = false;
-        cfg.bridges.auto_fetch = false;
-        cfg.bridges.recheck_interval_mins = 0;
-        cfg.warm_pool.enabled = false;
-        cfg.write(&config_path).expect("write isolated config");
-        cfg.write_bridges(&config_path)
-            .expect("write isolated bridge lines");
-
-        let expected_pt = dir.path().join("explicit-host-pt");
-        assert_ne!(
-            expected_pt,
-            std::env::current_exe().expect("current executable")
-        );
-        let state_dir = dir.path().join("client-state");
-        let initial_settings = arti_wrapper::Settings {
-            state_dir: Some(state_dir.clone()),
-            bridges: vec![bridge.clone()],
-            pt_binary: Some(expected_pt.clone()),
-            ..Default::default()
-        };
-        let tunnel = TorTunnel::create_unbootstrapped_with(arti_wrapper::Settings {
-            state_dir: Some(state_dir),
-            ..Default::default()
-        })
-        .expect("create transport-free unbootstrapped tunnel");
-        let handle = crate::tor_watchdog::TorHandle::new_with_settings(tunnel, &initial_settings);
-
-        let store_path = bridge_store::BridgeStore::resolve_path(Some(&config_path));
-        let mut store = bridge_store::BridgeStore::load(store_path).expect("load bridge store");
-        let now = time::OffsetDateTime::now_utc();
-        let alive = [(bridge.clone(), Duration::from_millis(1))];
-        store.note_probe_round(
-            std::slice::from_ref(&bridge),
-            &alive,
-            now,
-            Duration::ZERO,
-            u32::MAX,
-            u32::MAX,
-        );
-        store.note_channel_success_at(&bridge, now);
-        store
-            .save()
-            .expect("seed channel-proven verifier candidate");
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let manager = crate::pt::SDK14_PT_OBSERVER
-            .scope(("manager", tx), async {
-                start(
-                    handle,
-                    Some(config_path),
-                    &cfg,
-                    ObservationSink::default(),
-                    BridgeManagerConfig {
-                        settings: initial_settings,
-                        pt_binary: crate::pt::PtBinary::Explicit(expected_pt.clone()),
-                    },
-                )
-            })
-            .await;
-
-        let mut observed = Vec::new();
-        tokio::time::timeout(Duration::from_secs(3600), async {
-            while !observed.iter().any(|(role, _)| *role == "maintenance")
-                || !observed.iter().any(|(role, _)| *role == "verifier")
-            {
-                observed.push(rx.recv().await.expect("producer PT resolution report"));
-            }
-        })
-        .await
-        .expect("maintenance and >30-minute verifier tick report within one hour");
-
-        manager.shutdown().await;
-        for (role, path) in observed {
-            assert!(matches!(role, "maintenance" | "verifier"));
-            assert_eq!(path, expected_pt, "{role} must retain manager PT policy");
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn sdk14_manager_explicit_pt_reaches_maintenance_after_transport_free_start() {
-        use std::sync::Once;
-
-        static CRYPTO_PROVIDER: Once = Once::new();
-        CRYPTO_PROVIDER.call_once(|| {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-        });
-
-        let dir = tempfile::tempdir().expect("temporary config directory");
-        let config_path = dir.path().join("proxy.ktav");
-        let bridge: bridge_line::BridgeLine =
-            "obfs4 8.8.8.8:443 1414141414141414141414141414141414141414 cert=AAA"
-                .parse()
-                .expect("valid public obfs4 bridge");
-        let mut cfg = Config::default();
-        cfg.bridges.lines = vec![bridge.to_string()];
-        cfg.bridges.sources.clear();
-        cfg.bridges.use_seeds = false;
-        cfg.bridges.auto_fetch = false;
-        cfg.bridges.recheck_interval_mins = 0;
-        cfg.warm_pool.enabled = false;
-        cfg.write(&config_path).expect("write isolated config");
-        cfg.write_bridges(&config_path)
-            .expect("write isolated bridge lines");
-
-        let expected_pt = dir.path().join("explicit-host-pt");
-        let state_dir = dir.path().join("client-state");
-        let initial_settings = arti_wrapper::Settings {
-            state_dir: Some(state_dir.clone()),
-            bridges: Vec::new(),
-            pt_binary: None,
-            ..Default::default()
-        };
-        let tunnel = TorTunnel::create_unbootstrapped_with(arti_wrapper::Settings {
-            state_dir: Some(state_dir),
-            ..Default::default()
-        })
-        .expect("create transport-free unbootstrapped tunnel");
-        let handle = crate::tor_watchdog::TorHandle::new_with_settings(tunnel, &initial_settings);
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let manager = crate::pt::SDK14_PT_OBSERVER
-            .scope(("manager", tx), async {
-                start(
-                    handle,
-                    Some(config_path),
-                    &cfg,
-                    ObservationSink::default(),
-                    BridgeManagerConfig {
-                        settings: initial_settings,
-                        pt_binary: crate::pt::PtBinary::Explicit(expected_pt.clone()),
-                    },
-                )
-            })
-            .await;
-
-        let mut observed = Vec::new();
-        tokio::time::timeout(Duration::from_secs(3600), async {
-            while !observed.iter().any(|(role, _)| *role == "maintenance") {
-                observed.push(rx.recv().await.expect("maintenance PT resolution report"));
-            }
-        })
-        .await
-        .expect("maintenance PT resolution report within one hour");
-
-        manager.shutdown().await;
-        assert_eq!(observed, vec![("maintenance", expected_pt)]);
-    }
-}
+#[path = "bridge_manager/tests.rs"]
+mod tests;
