@@ -45,7 +45,7 @@ fn the_soft_limit_warning_starts_above_ten_services() {
 #[test]
 fn build_config_accepts_valid_nickname() {
     let nick = keys::nickname("svc-one").expect("nickname");
-    let config = build_config(nick).expect("config");
+    let config = serve::build_config(nick).expect("config");
     assert_eq!(config.nickname().to_string(), "svc-one");
     // `enabled` defaults to true, so arti will actually start it.
     assert!(config.enabled());
