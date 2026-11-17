@@ -305,12 +305,16 @@ cancellation aborts the run mid-way and skips the trailing 200 ms sleep.
 
 ## Embedded SOCKS5 server (`server` feature)
 
-With `server`, `tor_socks5::server` exposes only `Server`, `ServerBuilder`,
-`ServerHandle`, `ServerError` and `ServerStatus`. The builder accepts the
+With `server`, `tor_socks5::server` exposes `Server`, `ServerBuilder`,
+`ServerHandle`, `ServerError`, `ServerStage`, `ServerStatus` and
+`DnsStartupPolicy`. The builder accepts the
 facade's `config::Config`; for upstream SOCKS5 egress, configure it explicitly
 with `.upstream(Some(address), username, password)`. Starting the server does
 not connect to or validate the upstream proxy; that proxy must already be
-available when client connections need egress.
+available when client connections need egress. `ServerBuilder::run_until`
+drives startup and serving until a supplied shutdown future resolves, then
+requests shutdown through a server-owned child token and awaits cleanup. It
+never cancels a caller-owned parent token.
 
 ```rust,no_run
 use tor_socks5::config::Config;
