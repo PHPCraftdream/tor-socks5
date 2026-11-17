@@ -41,7 +41,7 @@ mod config {
 #[path = "host/mod.rs"]
 pub mod host;
 
-#[path = "bridge_manager.rs"]
+#[path = "bridge_manager/bridge_manager.rs"]
 pub mod bridge_manager;
 
 #[path = "tor/conn_health.rs"]

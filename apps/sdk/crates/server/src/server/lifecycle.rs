@@ -17,6 +17,7 @@ pub(crate) struct ServerArgs {
     pub upstream_user: Option<String>,
     pub upstream_pass: Option<String>,
     pub no_upstream: bool,
+    pub pt_binary: tor_socks5_runtime::pt::PtBinary,
     pub dns_startup_policy: DnsStartupPolicy,
 }
 
@@ -223,6 +224,7 @@ mod tests {
             upstream_user: None,
             upstream_pass: None,
             no_upstream: false,
+            pt_binary: tor_socks5_runtime::pt::PtBinary::Environment,
             dns_startup_policy: DnsStartupPolicy::Required,
         }
     }

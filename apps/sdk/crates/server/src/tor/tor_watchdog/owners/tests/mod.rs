@@ -440,6 +440,9 @@ mod pre_policy_tests {
 }
 
 #[cfg(test)]
+mod pt_policy_tests;
+
+#[cfg(test)]
 #[path = "restart_tests.rs"]
 mod restart_tests;
 

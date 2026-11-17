@@ -360,6 +360,7 @@ async fn failed_pre_refresh_delays_recovery_notification() {
                 0,
                 ObservationSink::new(),
                 active,
+                crate::pt::PtBinary::Environment,
                 token.clone(),
             )
         })

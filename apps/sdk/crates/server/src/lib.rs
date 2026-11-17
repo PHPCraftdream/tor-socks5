@@ -25,6 +25,7 @@ mod startup;
 mod upstream;
 
 pub use api::{
-    DnsStartupPolicy, Server, ServerBuilder, ServerError, ServerHandle, ServerStage, ServerStatus,
+    DnsStartupPolicy, PtBinary, Server, ServerBuilder, ServerError, ServerHandle, ServerStage,
+    ServerStatus,
 };
 pub use config::Config;

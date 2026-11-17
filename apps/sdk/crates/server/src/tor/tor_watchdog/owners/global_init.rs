@@ -124,6 +124,7 @@ impl SettingsInit {
         cfg: crate::config::Config,
         path: Option<std::path::PathBuf>,
         cancellation: CancellationToken,
+        pt: tor_socks5_runtime::pt::PtBinary,
     ) -> Result<Arc<Self>> {
         #[cfg(test)]
         if let Ok(hook) = RUN_SERVER_STARTUP.try_with(Arc::clone) {
@@ -154,9 +155,28 @@ impl SettingsInit {
         if let Ok(settings) = RUN_SERVER_SHUTDOWN.try_with(|hook| hook.settings.clone()) {
             return Self::start_job(cancellation, std::future::ready(Ok(settings)));
         }
-        let stage = async move {
-            tor_socks5_runtime::tor_setup::build_tor_settings(&cfg, path.as_deref()).await
+        // Build the main Tor client with the server's PT policy (H11) and
+        // report the resolution through the SDK14 observer when a cross-crate
+        // test installed one (see `test_seams::sdk14_pt_scope`).
+        #[cfg(any(test, feature = "test-seams"))]
+        let observer = tor_socks5_runtime::test_seams::sdk14_pt_observer();
+        let build = async move {
+            tor_socks5_runtime::tor_setup::build_tor_settings_with_pt(&cfg, path.as_deref(), pt)
+                .await
         };
+        #[cfg(any(test, feature = "test-seams"))]
+        let stage: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Settings>> + Send>,
+        > = match observer {
+            Some((_, tx)) => Box::pin(tor_socks5_runtime::test_seams::sdk14_pt_scope(
+                "server-settings-init",
+                tx,
+                build,
+            )),
+            None => Box::pin(build),
+        };
+        #[cfg(not(any(test, feature = "test-seams")))]
+        let stage = build;
         Self::start_job(cancellation, stage)
     }
 
@@ -684,7 +704,12 @@ mod tests {
         let cancellation = CancellationToken::new();
         let init = RUN_SERVER_STARTUP
             .scope(hook, async {
-                SettingsInit::start(crate::config::Config::default(), None, cancellation.clone())
+                SettingsInit::start(
+                    crate::config::Config::default(),
+                    None,
+                    cancellation.clone(),
+                    tor_socks5_runtime::pt::PtBinary::Environment,
+                )
             })
             .await
             .unwrap();
@@ -716,7 +741,12 @@ mod tests {
         let cancellation = CancellationToken::new();
         let init = RUN_SERVER_STARTUP
             .scope(hook, async {
-                SettingsInit::start(crate::config::Config::default(), None, cancellation.clone())
+                SettingsInit::start(
+                    crate::config::Config::default(),
+                    None,
+                    cancellation.clone(),
+                    tor_socks5_runtime::pt::PtBinary::Environment,
+                )
             })
             .await
             .unwrap();

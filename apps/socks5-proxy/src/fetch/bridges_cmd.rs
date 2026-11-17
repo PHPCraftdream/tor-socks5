@@ -22,13 +22,6 @@ tokio::task_local! {
     static FETCH_BOUNDARY: std::cell::Cell<bool>;
 }
 
-fn reject_unsupported_pool(setting: &Option<proxy_config::ProxyPool>, scope: &str) -> Result<()> {
-    if setting.is_some() {
-        bail!("{scope} proxy pool is not supported here; remove it");
-    }
-    Ok(())
-}
-
 /// cancel-safe: NO — bootstraps Tor, performs network I/O, writes config.
 pub(crate) async fn cmd_bridges(
     action: BridgesAction,
@@ -49,10 +42,15 @@ pub(crate) async fn cmd_bridges(
         }
     };
     let cfg = loaded.into_config();
-    reject_unsupported_pool(&cfg.pre_proxies, "bridges fetch global pre_proxies")?;
 
+    // H10: trip only when the SDK's synchronous pre-flight (see
+    // `fetch_bridges`) would pass, so tests still exercise the typed
+    // `NoConfigFile`/`PreProxies`/no-sources errors before the mock stop.
     #[cfg(test)]
-    if FETCH_BOUNDARY.try_with(|hit| hit.set(true)).is_ok() {
+    if cfg.pre_proxies.is_none()
+        && !cfg.bridges.sources.is_empty()
+        && FETCH_BOUNDARY.try_with(|hit| hit.set(true)).is_ok()
+    {
         bail!("test stopped before fetch startup");
     }
     let _log_guard = init_tracing(&cfg);
@@ -60,8 +58,10 @@ pub(crate) async fn cmd_bridges(
 
     // The core of the command lives in the runtime (`fetch_bridges`,
     // SDK-8): bootstrap Tor, refresh the candidate pool, optionally probe
-    // and promote. The "no bridge sources configured" check, the trailing
-    // 200 ms post-drop sleep and the bootstrapping info log moved with it.
+    // and promote. The "no config file found" (typed `NoConfigFile`),
+    // `pre_proxies` and "no bridge sources configured" checks live there
+    // too, along with the trailing 200 ms post-drop sleep and the
+    // bootstrapping info log; the SDK errors propagate via `?`.
     let outcome = fetch_bridges(
         &cfg,
         Some(&config_path),
@@ -69,6 +69,10 @@ pub(crate) async fn cmd_bridges(
             timeout: Duration::from_secs(timeout_secs),
             count,
             probe: !(dry_run || no_probe),
+            // The binary is its own PT dispatcher (busybox style), so the
+            // default environment resolution is correct here; a global
+            // `pre_proxies` pool is rejected by the SDK with a typed error.
+            pt_binary: tor_socks5_runtime::pt::PtBinary::Environment,
             cancel: CancellationToken::new(),
         },
     )

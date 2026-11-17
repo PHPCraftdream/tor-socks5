@@ -94,11 +94,13 @@ receiving owner.
   the core of the CLI's `bridges fetch` command: bootstrap Tor from the
   configured bridges (built-in seeds as fallback), refresh the candidate
   pool from the configured HTTPS sources, optionally probe-and-promote
-  (`FetchBridgesParams { timeout, count, probe, cancel }`), and merge into
-  the config; returns `FetchBridgesOutcome { added, promoted, pool_len }`.
-  Not cancel-safe: cancellation aborts network I/O and file writes mid-way
-  and skips the trailing 200 ms post-drop sleep. The CLI wrapper retains
-  config loading, `reject_unsupported_pool` validation, tracing/crypto
+  (`FetchBridgesParams { timeout, count, probe, pt_binary, cancel }`), and
+  merge into the config; returns `FetchBridgesOutcome { added, promoted,
+  pool_len }` or the typed `FetchBridgesError` (`NoConfigFile`,
+  `PreProxies`, `NoBridgeSources`, `Cancelled`, `Other`). Not cancel-safe:
+  cancellation is observed at every stage but aborts network I/O and file
+  writes mid-way; once the tunnel exists, the 200 ms cleanup tail still
+  runs. The CLI wrapper retains config loading, tracing/crypto
   installation and printing. The facade surface checker is deliberately not
   Rust name resolution: it parses a bounded subset of public `use` trees
   (ASCII identifiers, `::`, aliases, nested brace groups, `self`, and globs),

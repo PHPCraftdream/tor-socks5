@@ -348,20 +348,26 @@ fn channel_checker(
 /// is the cold-start path, where no live tunnel exists yet to warm through.
 ///
 /// cancel-safe: NO — probes the network and writes the pool + config.
+/// Drains the candidate pool with the given PT policy: probing bridges
+/// that need a pluggable transport runs with a Tor client pointed at the
+/// executable chosen here. `PtBinary::Environment` resolves the documented
+/// `TOR_PT_BINARY` override, else the current process executable.
 pub async fn drain_pool(
-    config_path: Option<&Path>,
-    target: usize,
-    tor: Option<&TorTunnel>,
-) -> Result<usize> {
-    drain_pool_with_pt(config_path, target, tor, crate::pt::PtBinary::Environment).await
-}
-
-pub(crate) async fn drain_pool_with_pt(
     config_path: Option<&Path>,
     target: usize,
     tor: Option<&TorTunnel>,
     pt_binary: crate::pt::PtBinary,
 ) -> Result<usize> {
+    // Cheap guards first: no target or no config path means no drain, and
+    // the path check must come before the config load (which would create a
+    // default file when `config_path` is `None`).
+    if target == 0 {
+        return Ok(0);
+    }
+    let Some(_) = config_path else {
+        return Ok(0);
+    };
+    let cfg = Config::load_with_override(config_path)?.into_config();
     let admission_config = config_path.map(Path::to_path_buf);
     // One registry per drain: it owns every verification worker the
     // admission decision outlives, and `drain_pool_with` joins them after
@@ -369,7 +375,6 @@ pub(crate) async fn drain_pool_with_pt(
     let workers = std::sync::Arc::new(crate::workers::AdmissionWorkers::default());
     let checker: Option<ChannelCheck<'static>> =
         tor.map(|tor| channel_checker(tor, admission_config, workers.clone(), pt_binary.clone()));
-    let cfg = Config::load_with_override(config_path)?.into_config();
     let policy = bridge_probe::ResolverPolicy {
         doh_enabled: cfg.dns.doh_enabled,
         system_fallback: cfg.dns.system_fallback,
@@ -383,10 +388,19 @@ pub(crate) async fn drain_pool_with_pt(
                 .outcome
         })
     });
-    drain_pool_with(config_path, target, checker.as_ref(), &probe, &workers).await
+    drain_pool_with(
+        &cfg,
+        config_path,
+        target,
+        checker.as_ref(),
+        &probe,
+        &workers,
+    )
+    .await
 }
 
 async fn drain_pool_with(
+    cfg: &Config,
     config_path: Option<&Path>,
     target: usize,
     checker: Option<&ChannelCheck<'_>>,
@@ -399,7 +413,6 @@ async fn drain_pool_with(
     let Some(path) = config_path else {
         return Ok(0);
     };
-    let cfg = Config::load_with_override(Some(path))?.into_config();
     let pool_path = CandidatePool::resolve_path(config_path);
     // Test-only forcing point: park before the acquisition (blocking pool —
     // never block a worker on the gate).
@@ -429,7 +442,9 @@ async fn drain_pool_with(
     // that confirm, and attempted-deferred ones are rotated behind the rest
     // of the queue, so the pool still steadily advances across drains
     // rather than re-probing a dead or indefinitely deferred head.
-    let max_attempts = target.saturating_mul(50).min(MAX_DRAIN_ATTEMPTS);
+    // H10: the drain budget is a hard cap; a large `target` never scales
+    // the probe count beyond it.
+    let max_attempts = MAX_DRAIN_ATTEMPTS;
     let batch_size = max_attempts.min(pool.len());
     let mut batch = pool.take_transport(batch_size, cfg.bridges.preferred_transport());
     shuffle(&mut batch);
@@ -696,8 +711,7 @@ pub(crate) async fn top_up_working_with_pt(
     if target == 0 {
         return Ok(0);
     }
-    let mut promoted =
-        drain_pool_with_pt(config_path, target, Some(tor), pt_binary.clone()).await?;
+    let mut promoted = drain_pool(config_path, target, Some(tor), pt_binary.clone()).await?;
     if promoted < target && !cfg.bridges.sources.is_empty() {
         info!(
             have = promoted,
@@ -705,10 +719,24 @@ pub(crate) async fn top_up_working_with_pt(
             "pool short — refreshing candidates from sources over Tor"
         );
         refresh_candidate_pool(tor, cfg, config_path, REFRESH_FETCH_TIMEOUT).await?;
-        promoted +=
-            drain_pool_with_pt(config_path, target - promoted, Some(tor), pt_binary).await?;
+        promoted += drain_pool(config_path, target - promoted, Some(tor), pt_binary).await?;
     }
     Ok(promoted)
+}
+
+/// Test convenience wrapper for the cfg-taking `drain_pool_with` (H10:
+/// production loads the config once in `drain_pool`; tests mirror
+/// that by loading here and passing the `Config` down).
+#[cfg(test)]
+pub(crate) async fn drain_with(
+    config_path: Option<&Path>,
+    target: usize,
+    checker: Option<&ChannelCheck<'_>>,
+    probe: &ProbeCheck<'_>,
+    workers: &crate::workers::AdmissionWorkers,
+) -> Result<usize> {
+    let cfg = Config::load_with_override(config_path)?.into_config();
+    drain_pool_with(&cfg, config_path, target, checker, probe, workers).await
 }
 
 #[cfg(test)]

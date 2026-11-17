@@ -1,11 +1,13 @@
 use super::*;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn launch(
     handle: TorHandle,
     config_path: Option<std::path::PathBuf>,
     cfg: &Config,
     obs_sink: tor_socks5_runtime::arti_observability::ObservationSink,
     settings: arti_wrapper::Settings,
+    pt_binary: tor_socks5_runtime::pt::PtBinary,
     producer_token: CancellationToken,
     producers: &mut Vec<tokio::task::JoinHandle<()>>,
 ) {
@@ -17,7 +19,10 @@ pub(super) fn launch(
         config_path.clone(),
         cfg,
         obs_sink,
-        settings.clone(),
+        tor_socks5_runtime::bridge_manager::BridgeManagerConfig {
+            settings: settings.clone(),
+            pt_binary,
+        },
         producer_token.clone(),
     );
     manager.transfer_tasks(producers);

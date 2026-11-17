@@ -318,45 +318,89 @@ fn restricted_owner_template_and_alternate_validation() {
     let users = UsersConfig {
         users: vec![user(true, Some(endpoint()), None)],
     };
-    let settings = tor_socks5_runtime::tor_setup::validate_owner_routes(&cfg, &users, None)
-        .unwrap()
-        .unwrap();
+    let settings = tor_socks5_runtime::tor_setup::validate_owner_routes(
+        &cfg,
+        &users,
+        None,
+        &tor_socks5_runtime::pt::PtBinary::Environment,
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(settings.bridges.len(), 1);
     assert!(settings.pre_endpoint.is_none());
     assert!(settings.pt_binary.is_none());
     assert!(settings.extra_pt_protocols.is_empty());
     cfg.bridges.use_seeds = true;
-    assert!(tor_socks5_runtime::tor_setup::validate_owner_routes(&cfg, &users, None).is_err());
+    assert!(tor_socks5_runtime::tor_setup::validate_owner_routes(
+        &cfg,
+        &users,
+        None,
+        &tor_socks5_runtime::pt::PtBinary::Environment,
+    )
+    .is_err());
     cfg.bridges.use_seeds = false;
     cfg.bridges.auto_fetch = true;
-    assert!(tor_socks5_runtime::tor_setup::restricted_owner_settings(&cfg, None).is_err());
+    assert!(tor_socks5_runtime::tor_setup::restricted_owner_settings(
+        &cfg,
+        None,
+        &tor_socks5_runtime::pt::PtBinary::Environment,
+    )
+    .is_err());
     cfg.bridges.auto_fetch = false;
     cfg.warm_pool.enabled = true;
-    assert!(tor_socks5_runtime::tor_setup::restricted_owner_settings(&cfg, None).is_err());
+    assert!(tor_socks5_runtime::tor_setup::restricted_owner_settings(
+        &cfg,
+        None,
+        &tor_socks5_runtime::pt::PtBinary::Environment,
+    )
+    .is_err());
     cfg.warm_pool.enabled = false;
     cfg.dns_server.enabled = true;
-    assert!(tor_socks5_runtime::tor_setup::restricted_owner_settings(&cfg, None).is_err());
+    assert!(tor_socks5_runtime::tor_setup::restricted_owner_settings(
+        &cfg,
+        None,
+        &tor_socks5_runtime::pt::PtBinary::Environment,
+    )
+    .is_err());
     cfg.dns_server.enabled = false;
     cfg.upstream.enabled = true;
-    assert!(tor_socks5_runtime::tor_setup::restricted_owner_settings(&cfg, None).is_ok());
+    assert!(tor_socks5_runtime::tor_setup::restricted_owner_settings(
+        &cfg,
+        None,
+        &tor_socks5_runtime::pt::PtBinary::Environment,
+    )
+    .is_ok());
     assert!(validate_account_routes(&users, None, None, false, true).is_err());
     assert!(validate_account_routes(&users, None, None, false, false).is_ok());
     cfg.upstream.enabled = false;
     cfg.bridges.lines.push(
         "unknownpt 1.2.3.4:443 ABCDEF0123456789ABCDEF0123456789ABCDEF01 cert=AAA iat-mode=0".into(),
     );
-    assert!(tor_socks5_runtime::tor_setup::restricted_owner_settings(&cfg, None).is_err());
+    assert!(tor_socks5_runtime::tor_setup::restricted_owner_settings(
+        &cfg,
+        None,
+        &tor_socks5_runtime::pt::PtBinary::Environment,
+    )
+    .is_err());
     cfg.bridges.lines.clear();
-    assert!(tor_socks5_runtime::tor_setup::restricted_owner_settings(&cfg, None).is_err());
+    assert!(tor_socks5_runtime::tor_setup::restricted_owner_settings(
+        &cfg,
+        None,
+        &tor_socks5_runtime::pt::PtBinary::Environment,
+    )
+    .is_err());
     cfg.pre_proxies = Some(global_pool());
     let direct = UsersConfig {
         users: vec![user(true, Some(PoolOverride::Disabled), None)],
     };
-    assert!(
-        tor_socks5_runtime::tor_setup::validate_owner_routes(&cfg, &direct, None)
-            .unwrap()
-            .is_none()
-    );
+    assert!(tor_socks5_runtime::tor_setup::validate_owner_routes(
+        &cfg,
+        &direct,
+        None,
+        &tor_socks5_runtime::pt::PtBinary::Environment,
+    )
+    .unwrap()
+    .is_none());
 }
 
 #[test]
@@ -373,9 +417,14 @@ fn account_pre_stock_pt_template_uses_current_executable() {
     let users = UsersConfig {
         users: vec![user(true, Some(endpoint()), None)],
     };
-    let settings = tor_socks5_runtime::tor_setup::validate_owner_routes(&cfg, &users, None)
-        .unwrap()
-        .unwrap();
+    let settings = tor_socks5_runtime::tor_setup::validate_owner_routes(
+        &cfg,
+        &users,
+        None,
+        &tor_socks5_runtime::pt::PtBinary::Environment,
+    )
+    .unwrap()
+    .unwrap();
     assert!(settings.pre_endpoint.is_none());
     assert!(settings.stock_pt_proxy);
     assert_eq!(settings.pt_binary, Some(std::env::current_exe().unwrap()));

@@ -172,15 +172,12 @@ fn admission_verification(
 /// and the whole task after cancellation — no longer waits for it or
 /// persists its results); the blocking-worker group is joined by the owner
 /// before the bridge-store writer closes, so nothing is orphaned.
+///
+/// Spawns the circuit verifier with the given PT policy: the policy is
+/// reused for every later owner-settings rebuild the verification path
+/// performs. `PtBinary::Environment` resolves the documented
+/// `TOR_PT_BINARY` override, else the current process executable.
 pub fn spawn_bridge_circuit_verifier(
-    config_path: Option<PathBuf>,
-    handle: crate::tor_watchdog::TorHandle,
-    token: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    spawn_bridge_circuit_verifier_with_pt(config_path, handle, PtBinary::Environment, token)
-}
-
-pub(crate) fn spawn_bridge_circuit_verifier_with_pt(
     config_path: Option<PathBuf>,
     handle: crate::tor_watchdog::TorHandle,
     pt_binary: PtBinary,
