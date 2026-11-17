@@ -20,8 +20,11 @@
 //!      ├─ settles every service's identity first, in one batch
 //!      │  (one rewrite of the onion services file for the whole launch)
 //!      └─ managers JoinSet (one manager per service that may start)
-//!         └─ per-manager children JoinSet (slot holder, serving, status logger)
-//!            └─ rendezvous JoinSet → forwarding JoinSets
+//!         └─ per-manager children JoinSet (supervised serving + status
+//!            logger; a failure relaunches the service) and a slot-holder
+//!            JoinSet
+//!            └─ handshake JoinSet (rend.accept only) → accepted-circuit
+//!               channel → circuit JoinSet → forwarding JoinSets
 //! ```
 //!
 //! Each JoinSet owns its children: aborting a parent drops its set and aborts
@@ -29,8 +32,14 @@
 //! children before the parent returns. Managers hold one of at most MAX_STARTING
 //! launch slots from just before launch until terminal status, the 90 s slot
 //! cap, or shutdown; retry/backoff is 30 s doubling to 5 min, ±20% spread.
-//! The request-serving task forwards rendezvous streams to local TCP targets
-//! (≤512 process-wide), while the status logger releases the launch slot.
+//! Serving is supervised: rendezvous handshakes run behind a 32-slot accept
+//! gate (held only for `rend.accept()`), each accepted circuit gets its own
+//! long-lived task, stream permits are per-service first then global
+//! (≤512 process-wide, fairly divided per service), arti enforces a 256
+//! per-circuit stream cap, and the manager relaunches a service whose
+//! serving tasks fail or report `Broken`. Forwarding carries a 5-minute
+//! idle timeout, and the local target is connected before the client stream
+//! is accepted (connect-before-accept).
 //!
 //! The watchdog heals the Tor client *in place* (it never rebuilds the
 //! `TorClient`), so services launched once survive heals; we still read the
@@ -70,12 +79,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
 use proxy_config::OnionServiceEntry;
-use safelog::DisplayRedacted as _;
 use tokio_util::sync::CancellationToken;
 use tor_socks5_runtime::tor_watchdog::TorHandle;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::keys;
 use keys::PreparationFailure;
@@ -110,12 +117,6 @@ enum LockProbe {
 
 pub use status::{OnionHostStatus, ServiceFailure, ServiceState, ServiceStatus};
 
-/// Delay before the first relaunch attempt after a failed launch; doubles
-/// up to [`RETRY_DELAY_MAX`] and stays there for the process' lifetime.
-const RETRY_DELAY_INITIAL: Duration = Duration::from_secs(30);
-/// Upper bound on the launch retry backoff.
-const RETRY_DELAY_MAX: Duration = Duration::from_secs(300);
-
 /// Spread a retry delay by ±20%, so many failed services do not retry in
 /// lockstep. Uniform in [0.8×, 1.2×); bytes from the OS RNG (`getrandom`,
 /// already a direct dependency). On RNG failure the delay is unchanged.
@@ -138,14 +139,6 @@ fn spread_millis(millis: u64, unit: u64) -> u64 {
     let scaled = u128::from(millis) * (80 + step);
     u64::try_from(scaled / 100).unwrap_or(u64::MAX)
 }
-
-/// Poll interval while waiting for the service's `.onion` address to become
-/// available (arti finds or generates the identity key asynchronously).
-const ADDRESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
-/// Total budget for the address wait. Descriptor publication takes much
-/// longer than this; the address itself (keystore lookup/generation) should
-/// appear within seconds.
-const ADDRESS_WAIT_LIMIT: Duration = Duration::from_secs(120);
 
 /// Above this many enabled services the setup is beyond what is known to
 /// work through a small bridge pool: a warning is logged, nothing is refused.
@@ -455,6 +448,9 @@ async fn run_services(config: OnionHostConfig, tracker: StatusTracker) {
     // Gradual start: managers spawn in services-file order and the gate
     // hands freed slots out FIFO, so services launch in file order.
     let gate = start_gate::StartGate::new();
+    // The global stream budget, divided fairly among the enabled services
+    // (each manager gets its share; see `serve::per_service_stream_cap`).
+    let stream_cap = serve::per_service_stream_cap(entries.len());
     let global_streams = Arc::new(tokio::sync::Semaphore::new(
         serve::MAX_TOTAL_CONCURRENT_STREAMS,
     ));
@@ -481,11 +477,12 @@ async fn run_services(config: OnionHostConfig, tracker: StatusTracker) {
         let serve_started = test_hooks
             .as_ref()
             .and_then(|hooks| hooks.serve_started.clone());
-        managers.spawn(service_manager(
+        managers.spawn(serve::service_manager(
             handle.clone(),
             service.entry,
             expected_address,
             gate.clone(),
+            stream_cap,
             global_streams.clone(),
             token.clone(),
             tracker.clone(),
@@ -609,302 +606,6 @@ fn service_failure(failure: PreparationFailure) -> ServiceFailure {
         PreparationFailure::AddressMismatch => ServiceFailure::AddressMismatch,
         PreparationFailure::KeystoreUnavailable => ServiceFailure::KeystoreUnavailable,
         PreparationFailure::Internal => ServiceFailure::Internal,
-    }
-}
-
-/// Launch (and if necessary relaunch) one service, then keep it alive until
-/// shutdown. Holding the `Arc<RunningOnionService>` here is what keeps the
-/// service published. Each launch attempt waits for a `start_gate` slot and
-/// holds it until the service reports a terminal status, the 90 s slot cap,
-/// or shutdown; retries sleep an exponentially growing, ±20%-spread backoff.
-/// cancel-safe: yes — cancellation while waiting drops only local guards or
-/// owned child tasks; after launch the service and children are joined before
-/// return, and retries begin only after a completed failed launch attempt.
-#[allow(clippy::too_many_arguments)]
-async fn service_manager(
-    handle: TorHandle,
-    entry: OnionServiceEntry,
-    expected_address: String,
-    gate: start_gate::StartGate,
-    global_streams: Arc<tokio::sync::Semaphore>,
-    token: CancellationToken,
-    tracker: StatusTracker,
-    #[cfg(test)] service_launched: Option<Arc<ServiceLaunchedHook>>,
-    #[cfg(test)] serve_started: Option<Arc<ServeStartedHook>>,
-) {
-    let nick = entry.nickname.clone();
-    if token.is_cancelled() {
-        mark_stopped(&tracker, &nick);
-        return;
-    }
-    let nick_hs = match keys::nickname(&nick) {
-        Ok(nick) => nick,
-        Err(error) => {
-            tracker.set(
-                &nick,
-                ServiceState {
-                    status: ServiceStatus::Failed,
-                    failure: Some(ServiceFailure::InvalidNickname),
-                },
-            );
-            error!(nickname = %nick, %error, "invalid onion service nickname; service not started");
-            return;
-        }
-    };
-    let config = match build_config(nick_hs) {
-        Ok(config) => config,
-        Err(error) => {
-            tracker.set(
-                &nick,
-                ServiceState {
-                    status: ServiceStatus::Failed,
-                    failure: Some(ServiceFailure::InvalidConfig),
-                },
-            );
-            error!(nickname = %nick, %error, "invalid onion service configuration; service not started");
-            return;
-        }
-    };
-    let ports = serve::port_map(&entry.ports);
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(serve::MAX_CONCURRENT_STREAMS));
-
-    let mut delay = RETRY_DELAY_INITIAL;
-    loop {
-        tracker.set(
-            &nick,
-            ServiceState {
-                status: ServiceStatus::WaitingForSlot,
-                failure: None,
-            },
-        );
-        // Snapshot the current tunnel; `None` only while shutting down. The
-        // watchdog heals the client in place, so a launch that succeeded
-        // never needs repeating after a heal.
-        let tunnel = tokio::select! {
-            biased;
-            () = token.cancelled() => {
-                mark_stopped(&tracker, &nick);
-                return;
-            }
-            tunnel = handle.tunnel() => tunnel,
-        };
-        let Some(tunnel) = tunnel else {
-            debug!(nickname = %nick, "onion service launch aborted: Tor is shutting down");
-            mark_stopped(&tracker, &nick);
-            return;
-        };
-
-        // Gradual start: hold one of at most MAX_STARTING launch slots from
-        // just before the launch until the service reports a terminal
-        // status, the 90 s slot cap elapses, or shutdown. Released before
-        // the retry backoff sleeps.
-        {
-            let Some(slot) = gate.acquire(&token).await else {
-                debug!(nickname = %nick, "onion service launch aborted: shutting down while waiting for a launch slot");
-                mark_stopped(&tracker, &nick);
-                return;
-            };
-            if token.is_cancelled() {
-                mark_stopped(&tracker, &nick);
-                return;
-            }
-            match tunnel.raw().launch_onion_service(config.clone()) {
-                Ok(Some((service, rend_requests))) => {
-                    #[cfg(test)]
-                    if let Some(on_launch) = &service_launched {
-                        on_launch(&service);
-                    }
-                    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-                    // The slot is released by its own task (terminal status,
-                    // the 90 s cap, or shutdown) while this manager continues
-                    // with the address wait and the serving tasks.
-                    let mut children = tokio::task::JoinSet::new();
-                    children.spawn(slot.hold_until_started(started_rx, token.clone()));
-                    match wait_for_address(&service, &token, &nick).await {
-                        AddressWait::Available(address) => {
-                            let actual_address = address.display_unredacted().to_string();
-                            if actual_address != expected_address {
-                                children.shutdown().await;
-                                drop(rend_requests);
-                                drop(service);
-                                error!(
-                                    nickname = %nick,
-                                    expected_address = %expected_address,
-                                    actual_address = %actual_address,
-                                    "launched onion service address does not match prepared identity; service not served"
-                                );
-                                tracker.set(
-                                    &nick,
-                                    ServiceState {
-                                        status: ServiceStatus::Failed,
-                                        failure: Some(ServiceFailure::AddressMismatch),
-                                    },
-                                );
-                                return;
-                            }
-                            tracker.set(
-                                &nick,
-                                ServiceState {
-                                    status: ServiceStatus::Bootstrapping,
-                                    failure: None,
-                                },
-                            );
-                            info!(
-                                nickname = %nick,
-                                address = %address.display_unredacted(),
-                                "onion service address available: onion service starting"
-                            );
-                            // Serving loop and status logger run as independent tasks;
-                            // both exit on cancellation. The manager keeps this first
-                            // clone alive; dropping the last clone would unpublish the
-                            // service.
-                            #[cfg(test)]
-                            if let Some(on_serve) = &serve_started {
-                                on_serve();
-                            }
-                            children.spawn(serve::serve_service(
-                                service.clone(),
-                                rend_requests,
-                                ports,
-                                semaphore,
-                                global_streams.clone(),
-                                token.clone(),
-                            ));
-                            children.spawn(serve::log_status_events(
-                                service.status_events(),
-                                nick.clone(),
-                                address.display_unredacted().to_string(),
-                                started_tx,
-                                tracker.clone(),
-                                token.clone(),
-                            ));
-                            token.cancelled().await;
-                            join_logged(
-                                &mut children,
-                                "onion service child task ended with a join error",
-                            )
-                            .await;
-                            info!(nickname = %nick, "onion service stopped");
-                            mark_stopped(&tracker, &nick);
-                            return;
-                        }
-                        // Shutdown (cancellation) while waiting: the manager
-                        // returns without the "onion service stopped" log
-                        // line; the status is still `Stopped`, because
-                        // shutdown is the cause.
-                        AddressWait::Cancelled => {
-                            // Dropping the task releases its StartSlot.
-                            children.shutdown().await;
-                            mark_stopped(&tracker, &nick);
-                            return;
-                        }
-                        AddressWait::TimedOut => {
-                            // Dropping the task releases its StartSlot.
-                            children.shutdown().await;
-                            tracker.set(
-                                &nick,
-                                ServiceState {
-                                    status: ServiceStatus::Failed,
-                                    failure: Some(ServiceFailure::AddressUnavailable {
-                                        limit: ADDRESS_WAIT_LIMIT,
-                                    }),
-                                },
-                            );
-                            return;
-                        }
-                    }
-                }
-                // `enabled` defaults to true in our built config; `None` means
-                // arti refused to start the service at all.
-                Ok(None) => {
-                    tracker.set(
-                        &nick,
-                        ServiceState {
-                            status: ServiceStatus::Failed,
-                            failure: Some(ServiceFailure::RejectedByTorClient),
-                        },
-                    );
-                    error!(nickname = %nick, "onion service was rejected by the Tor client (disabled configuration); not retried");
-                    return;
-                }
-                Err(error) => {
-                    error!(
-                        nickname = %nick,
-                        %error,
-                        retry_in = ?delay,
-                        "failed to launch onion service; retrying"
-                    );
-                }
-            }
-        }
-
-        tokio::select! {
-            biased;
-            () = token.cancelled() => {
-                mark_stopped(&tracker, &nick);
-                return;
-            }
-            () = tokio::time::sleep(backoff_spread(delay)) => {}
-        }
-        delay = (delay * 2).min(RETRY_DELAY_MAX);
-    }
-}
-
-/// Mark one service `Stopped` (the manager returned: shutdown/cancellation).
-fn mark_stopped(tracker: &StatusTracker, nick: &str) {
-    tracker.set(
-        nick,
-        ServiceState {
-            status: ServiceStatus::Stopped,
-            failure: None,
-        },
-    );
-}
-
-/// Build arti's config for a (pre-validated) nickname.
-fn build_config(nick: tor_hsservice::HsNickname) -> Result<tor_hsservice::OnionServiceConfig> {
-    tor_hsservice::config::OnionServiceConfigBuilder::default()
-        .nickname(nick)
-        .build()
-        .context("building the onion service configuration")
-}
-
-/// The outcome of waiting for the `.onion` address.
-enum AddressWait {
-    /// The address is available.
-    Available(tor_hscrypto::pk::HsId),
-    /// The token fired while waiting.
-    Cancelled,
-    /// [`ADDRESS_WAIT_LIMIT`] elapsed without an address.
-    TimedOut,
-}
-
-/// Poll for the service's `.onion` address, bounded by [`ADDRESS_WAIT_LIMIT`].
-/// cancel-safe: yes — this future only polls `onion_address()` and a timer;
-/// cancellation leaves the service owned by its caller.
-async fn wait_for_address(
-    service: &Arc<tor_hsservice::RunningOnionService>,
-    token: &CancellationToken,
-    nick: &str,
-) -> AddressWait {
-    let deadline = tokio::time::Instant::now() + ADDRESS_WAIT_LIMIT;
-    loop {
-        if let Some(address) = service.onion_address() {
-            return AddressWait::Available(address);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            error!(
-                nickname = %nick,
-                waited = ?ADDRESS_WAIT_LIMIT,
-                "onion service address never became available"
-            );
-            return AddressWait::TimedOut;
-        }
-        tokio::select! {
-            biased;
-            () = token.cancelled() => return AddressWait::Cancelled,
-            () = tokio::time::sleep(ADDRESS_POLL_INTERVAL) => {}
-        }
     }
 }
 

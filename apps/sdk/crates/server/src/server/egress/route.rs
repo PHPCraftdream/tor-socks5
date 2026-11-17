@@ -8,6 +8,8 @@ use auth::UsersConfig;
 use proxy_config::{PoolOverride, ProxyPool, Socks5Endpoint};
 
 /// Tor clients that can run next to the main one, one per extra pre endpoint.
+/// Shared limit: `server::owners::MAX_OWNERS` and the owners' storage slots
+/// derive from this constant.
 pub(crate) const MAX_PRE_OWNERS: usize = 15;
 
 /// Client-side description of a pre pool member for the Tor client.

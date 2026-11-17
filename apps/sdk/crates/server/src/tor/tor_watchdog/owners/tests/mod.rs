@@ -71,13 +71,46 @@ async fn readiness_follows_the_state_of_the_owner() {
         "a failed owner is not ready"
     );
     entry.state.lock().await.failed = false;
+    entry
+        .ready
+        .store(true, std::sync::atomic::Ordering::Release);
     assert!(registry.is_ready(&pre).await);
     let busy = entry.state.lock().await;
     assert!(
-        !registry.is_ready(&pre).await,
-        "an owner being worked on is not ready"
+        registry.is_ready(&pre).await,
+        "readiness is answered even while the state lock is held"
     );
     drop(busy);
+}
+
+/// `is_ready` must not depend on the entry state lock: it answers via the
+/// atomic readiness flag even while a selection holds the entry locked.
+#[tokio::test]
+async fn is_ready_answers_while_an_entry_state_lock_is_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Arc::new(registry(dir.path()));
+    let pre = endpoint("adopted");
+    let mut settings = registry.settings.as_ref().unwrap().clone();
+    settings.state_dir = Some(dir.path().join("adopted"));
+    let tunnel = TorTunnel::create_unbootstrapped_with(settings).unwrap();
+    registry.adopt_started(pre.clone(), tunnel, false).await;
+    assert!(registry.is_ready(&Some(pre.clone())).await);
+    let entry = registry
+        .state
+        .lock()
+        .await
+        .entries
+        .iter()
+        .find(|entry| entry.pre == Some(pre.clone()))
+        .cloned()
+        .unwrap();
+    let guard = entry.state.lock().await;
+    assert!(
+        registry.is_ready(&Some(pre)).await,
+        "readiness must not depend on the entry state lock"
+    );
+    drop(guard);
+    registry.close().await.unwrap();
 }
 
 #[tokio::test]
