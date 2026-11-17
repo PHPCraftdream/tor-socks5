@@ -88,10 +88,18 @@ async fn run_server_reports_final_flush_worker_panic() {
                     .await
                 });
                 let trigger = async {
-                    ready_rx.await.expect("сервер не достиг основного цикла");
-                    shutdown_tx.send(()).unwrap();
+                    let reached = ready_rx.await.is_ok();
+                    if reached {
+                        shutdown_tx.send(()).unwrap();
+                    }
+                    reached
                 };
-                let (result, ()) = tokio::join!(server, trigger);
+                let (result, reached) = tokio::join!(server, trigger);
+                assert!(
+                    reached,
+                    "сервер не достиг основного цикла: {:#?}",
+                    result.as_ref().err()
+                );
                 let errors = result
                     .unwrap_err()
                     .downcast::<super::super::producers::ProducerFailures>()
