@@ -25,6 +25,50 @@ struct Settled {
     new_key: Option<String>,
 }
 
+/// A typed outcome that prevents identity preparation from launching a service.
+/// These reasons contain no key material; detailed causes are kept out of logs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PreparationFailure {
+    /// The configured nickname is not a valid Tor hidden-service nickname.
+    #[error("onion service nickname is invalid")]
+    InvalidNickname,
+    /// The enabled snapshot entry no longer exists in the onion services file.
+    #[error("onion service is no longer in the onion services file")]
+    EntryMissingFromFile,
+    /// The entry's key changed after the host read its configuration snapshot.
+    #[error("onion service identity changed after configuration was loaded")]
+    IdentityChanged,
+    /// The configured address is not derived from the configured key.
+    #[error("onion service address does not match its identity key")]
+    AddressMismatch,
+    /// The onion keystore could not be opened.
+    #[error("the onion keystore is unavailable")]
+    KeystoreUnavailable,
+    /// An unexpected preparation or persistence error occurred.
+    #[error("internal onion service preparation failure")]
+    Internal,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SettlementError {
+    #[error("onion service nickname is invalid")]
+    InvalidNickname,
+    #[error("service {nickname:?}: the onion services file states the address {stated}, but its key gives {actual}")]
+    AddressMismatch {
+        nickname: String,
+        stated: String,
+        actual: String,
+    },
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+impl From<store::KeysError> for SettlementError {
+    fn from(error: store::KeysError) -> Self {
+        Self::Internal(anyhow::Error::new(error))
+    }
+}
+
 /// Settle the identity of `entry` in the keystore at `keystore_dir`: take its
 /// key from the onion services file's data, or adopt/generate one in the
 /// keystore, check the stated address against the key and make the keystore
@@ -38,8 +82,8 @@ fn settle(
     keymgr: &KeyMgr,
     keystore_dir: &Path,
     entry: &OnionServiceEntry,
-) -> Result<Settled, store::KeysError> {
-    let nick = store::nickname(&entry.nickname)?;
+) -> Result<Settled, SettlementError> {
+    let nick = store::nickname(&entry.nickname).map_err(|_| SettlementError::InvalidNickname)?;
 
     let (keypair, new_key) = match &entry.key {
         Some(key) => {
@@ -55,13 +99,12 @@ fn settle(
                 }
                 None => {
                     if let Some(address) = &entry.address {
-                        return Err(anyhow::anyhow!(
+                        return Err(SettlementError::Internal(anyhow::anyhow!(
                             "service {:?} states the address {address} but has no key: \
                              add its key to the onion services file, or remove the address \
                              to get a new one",
                             entry.nickname
-                        )
-                        .into());
+                        )));
                     }
                     store::generate(keymgr, &nick, false)?;
                     let file = store::identity_file(keystore_dir, &nick)
@@ -78,16 +121,24 @@ fn settle(
     let address = store::address_of(&keypair);
     if let Some(stated) = &entry.address {
         if *stated != address {
-            return Err(anyhow::anyhow!(
-                "service {:?}: the onion services file states the address {stated}, \
-                 but its key gives {address}",
-                entry.nickname
-            )
-            .into());
+            return Err(SettlementError::AddressMismatch {
+                nickname: entry.nickname.clone(),
+                stated: stated.clone(),
+                actual: address,
+            });
         }
     }
     // The keystore is the copy arti reads: bring it to the file's key.
-    if store::address(keymgr, &nick)?.as_deref() != Some(address.as_str()) {
+    let old_address = store::address(keymgr, &nick)?;
+    if old_address.as_deref() != Some(address.as_str()) {
+        if let Some(old_address) = old_address {
+            warn!(
+                nickname = %entry.nickname,
+                old_address = %old_address,
+                new_address = %address,
+                "replacing onion service identity in the keystore"
+            );
+        }
         store::insert(keymgr, keypair, &nick, true)?;
     }
     Ok(Settled { address, new_key })
@@ -119,11 +170,12 @@ fn apply_settlement(
 /// address that its key does not give, or an address without any key to
 /// check it against. `config_path` is where the onion services file belongs
 /// to; without it (built-in defaults) there is no file to complete.
-pub fn ensure(
+#[cfg(test)]
+pub(crate) fn ensure(
     config_path: Option<&Path>,
     keystore_dir: &Path,
     entry: &OnionServiceEntry,
-) -> Result<String, store::KeysError> {
+) -> Result<String, SettlementError> {
     let keymgr = store::open(keystore_dir)?;
     let settled = settle(&keymgr, keystore_dir, entry)?;
     if settled.new_key.is_some() || entry.address.is_none() {
@@ -139,6 +191,7 @@ pub fn ensure(
 
 /// Complete the file's entry of `nickname`: its `address`, and its `key` when
 /// one was just created.
+#[cfg(test)]
 fn record(
     config_path: Option<&Path>,
     nickname: &str,
@@ -154,64 +207,142 @@ fn record(
     Ok(())
 }
 
-/// One service handed to the launch phase: `address` is `None` when the
-/// service must not start; the reason is logged (never any key material).
+/// One service handed to the launch phase: its `entry` reflects the current
+/// services file when one is configured; `address` is `None` if it must not
+/// start, and `failure` contains the typed preparation reason when available.
 pub struct PreparedService {
-    /// The entry as it was handed over (never modified).
+    /// The resolved service entry (current file entry when a path is set).
     pub entry: OnionServiceEntry,
-    /// The service's address, or `None` when it must not start.
+    /// This service's settled address, or `None` when it must not start.
     pub address: Option<String>,
+    /// Why identity preparation refused the service, if it was refused.
+    pub failure: Option<PreparationFailure>,
 }
 
-/// Settle the identities of all `entries` (in order) and record everything
-/// that must be recorded in ONE `update_onion_services` write. Never panics
-/// on per-service failure: a service whose identity cannot be settled or
-/// recorded is skipped (logged) without affecting the others.
+/// Settle the identities of all snapshot-enabled `entries`. When a config
+/// path is available, its current contents are read before the keystore is
+/// opened; only entries still present with the same key are considered, and
+/// all other fields (including ports and `enabled`) come from that current
+/// file. Without a path, retain the legacy snapshot-only behavior.
+///
+/// Settlements and any required file updates are performed as one batch.
 pub fn prepare_all(
     config_path: Option<&Path>,
     keystore_dir: &Path,
     entries: &[OnionServiceEntry],
 ) -> Vec<PreparedService> {
-    // One keystore for the whole batch; without it nothing can be settled.
+    // Read first, before opening or settling any keystore identity. The host
+    // calls this under its externally-held keystore lock.
+    let current_file = config_path.map(Config::read_onion_services);
+    let mut prepared = Vec::with_capacity(entries.len());
+    let mut candidates = Vec::new();
+
+    for snapshot in entries {
+        if !snapshot.enabled {
+            prepared.push(PreparedService {
+                entry: snapshot.clone(),
+                address: None,
+                failure: None,
+            });
+            continue;
+        }
+
+        let current = match &current_file {
+            None => snapshot.clone(),
+            Some(Err(error)) => {
+                error!(%error, "the current onion services file could not be read");
+                let failure = PreparationFailure::Internal;
+                warn_preparation_failure(&snapshot.nickname, failure);
+                prepared.push(PreparedService {
+                    entry: snapshot.clone(),
+                    address: None,
+                    failure: Some(failure),
+                });
+                continue;
+            }
+            Some(Ok(services)) => {
+                let Some(current) = services
+                    .iter()
+                    .find(|service| service.nickname == snapshot.nickname)
+                else {
+                    let failure = PreparationFailure::EntryMissingFromFile;
+                    warn_preparation_failure(&snapshot.nickname, failure);
+                    prepared.push(PreparedService {
+                        entry: snapshot.clone(),
+                        address: None,
+                        failure: Some(failure),
+                    });
+                    continue;
+                };
+                if !current.enabled {
+                    prepared.push(PreparedService {
+                        entry: current.clone(),
+                        address: None,
+                        failure: None,
+                    });
+                    continue;
+                }
+                if current.enabled && current.key != snapshot.key {
+                    let failure = PreparationFailure::IdentityChanged;
+                    warn_preparation_failure(&current.nickname, failure);
+                    prepared.push(PreparedService {
+                        entry: current.clone(),
+                        address: None,
+                        failure: Some(failure),
+                    });
+                    continue;
+                }
+                current.clone()
+            }
+        };
+
+        let index = prepared.len();
+        prepared.push(PreparedService {
+            entry: current.clone(),
+            address: None,
+            failure: None,
+        });
+        candidates.push((index, current));
+    }
+
+    if candidates.is_empty() {
+        return prepared;
+    }
+
+    // One keystore for the whole batch; if it cannot be opened, type the
+    // failure for each otherwise-eligible service.
     let keymgr = match store::open(keystore_dir) {
         Ok(keymgr) => keymgr,
-        Err(error) => {
-            error!(
-                %error,
-                "onion services not started: the onion keystore cannot be opened"
-            );
-            return entries
-                .iter()
-                .cloned()
-                .map(|entry| PreparedService {
-                    entry,
-                    address: None,
-                })
-                .collect();
+        Err(_) => {
+            for (index, _) in candidates {
+                let failure = PreparationFailure::KeystoreUnavailable;
+                warn_preparation_failure(&prepared[index].entry.nickname, failure);
+                prepared[index].failure = Some(failure);
+            }
+            return prepared;
         }
     };
 
-    // Settle every identity in order; one unusable service does not stop the
-    // others.
-    let mut settled: Vec<Option<Settled>> = Vec::with_capacity(entries.len());
+    let mut settled: Vec<Option<Settled>> = std::iter::repeat_with(|| None)
+        .take(prepared.len())
+        .collect();
     let mut to_record = Vec::new();
-    for (idx, entry) in entries.iter().enumerate() {
-        match settle(&keymgr, keystore_dir, entry) {
+    for (idx, entry) in candidates {
+        match settle(&keymgr, keystore_dir, &entry) {
             Ok(one) => {
-                // Same rule as the single-service form: record when a key
-                // was created or the entry lacks its address.
                 if one.new_key.is_some() || entry.address.is_none() {
                     to_record.push(idx);
                 }
-                settled.push(Some(one));
+                settled[idx] = Some(one);
             }
             Err(error) => {
-                error!(
-                    nickname = %entry.nickname,
-                    error = %format!("{error:#}"),
-                    "onion service identity is not usable; service not started"
-                );
-                settled.push(None);
+                let failure = match error {
+                    SettlementError::InvalidNickname => PreparationFailure::InvalidNickname,
+                    SettlementError::AddressMismatch { .. } => PreparationFailure::AddressMismatch,
+                    SettlementError::Internal(_) => PreparationFailure::Internal,
+                };
+                warn_preparation_failure(&entry.nickname, failure);
+                prepared[idx].failure = Some(failure);
             }
         }
     }
@@ -223,7 +354,7 @@ pub fn prepare_all(
             Some(Config::update_onion_services(config_path, |services| {
                 let mut vanished = Vec::new();
                 for &idx in &to_record {
-                    let entry = &entries[idx];
+                    let entry = &prepared[idx].entry;
                     let one = settled[idx]
                         .as_ref()
                         .expect("every recorded entry is settled");
@@ -235,8 +366,6 @@ pub fn prepare_all(
                     )
                     .is_err()
                     {
-                        // An entry no longer in the file cannot be completed;
-                        // the others still are.
                         vanished.push(entry.nickname.clone());
                     }
                 }
@@ -247,52 +376,46 @@ pub fn prepare_all(
     };
     let (vanished, write_failed) = match write {
         None => (Vec::new(), false),
-        Some(Ok(vanished)) => {
-            for nickname in &vanished {
-                warn!(
-                    nickname = %nickname,
-                    "onion service is no longer in the onion services file; service not started"
-                );
-            }
-            (vanished, false)
-        }
+        Some(Ok(vanished)) => (vanished, false),
         Some(Err(error)) => {
             error!(%error, "the onion services file could not be updated");
             (Vec::new(), true)
         }
     };
 
-    let mut prepared = Vec::with_capacity(entries.len());
-    for (idx, entry) in entries.iter().enumerate() {
-        let address = settled[idx].as_ref().and_then(|one| {
-            // The write failed wholesale: an entry with a new key must not
-            // start — its key and address would exist nowhere in the file.
-            // The others start: their key is already in the file (only the
-            // address was missing, and it derives from the key), or their
-            // entry was already complete.
-            if write_failed && one.new_key.is_some() {
-                error!(
-                    nickname = %entry.nickname,
-                    "its new key could not be recorded in the onion services file; service not started"
-                );
-                return None;
-            }
-            if !write_failed && vanished.contains(&entry.nickname) {
-                return None; // already logged when the write succeeded
-            }
-            info!(
-                nickname = %entry.nickname,
-                %one.address,
-                "onion service: identity ready (the onion services file holds its key)"
-            );
-            Some(one.address.clone())
-        });
-        prepared.push(PreparedService {
-            entry: entry.clone(),
-            address,
-        });
+    for (idx, one) in settled.into_iter().enumerate() {
+        let Some(one) = one else {
+            continue;
+        };
+        let entry = &prepared[idx].entry;
+        if vanished.contains(&entry.nickname) {
+            let failure = PreparationFailure::EntryMissingFromFile;
+            warn_preparation_failure(&entry.nickname, failure);
+            prepared[idx].failure = Some(failure);
+            continue;
+        }
+        if write_failed && one.new_key.is_some() {
+            let failure = PreparationFailure::Internal;
+            warn_preparation_failure(&entry.nickname, failure);
+            prepared[idx].failure = Some(failure);
+            continue;
+        }
+        info!(
+            nickname = %entry.nickname,
+            address = %one.address,
+            "onion service: identity ready (the onion services file holds its key)"
+        );
+        prepared[idx].address = Some(one.address);
     }
     prepared
+}
+
+fn warn_preparation_failure(nickname: &str, failure: PreparationFailure) {
+    warn!(
+        nickname,
+        %failure,
+        "onion service identity is not usable; service not started"
+    );
 }
 
 /// A fresh identity as the services file stores it: (key text, address).

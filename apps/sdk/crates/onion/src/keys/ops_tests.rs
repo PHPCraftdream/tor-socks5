@@ -308,7 +308,7 @@ fn an_address_that_does_not_match_the_key_is_refused() {
 // --- identity settlement (ensure / prepare_all) ---
 
 fn ensure(t: &Temp, service: &OnionServiceEntry) -> anyhow::Result<String> {
-    identity::ensure(Some(&t.config), &t.keystore, service).map_err(anyhow::Error::new)
+    super::ensure(Some(&t.config), &t.keystore, service).map_err(anyhow::Error::new)
 }
 
 #[test]
@@ -344,8 +344,12 @@ fn a_stated_address_that_the_key_does_not_give_is_refused() {
     service.address = Some(other_address);
     Config::write_onion_services(&t.config, std::slice::from_ref(&service)).expect("write");
 
-    let error = ensure(&t, &service).expect_err("refused");
-    assert!(format!("{error:#}").contains("its key gives"), "{error:#}");
+    let prepared = identity::prepare_all(Some(&t.config), &t.keystore, &[service]);
+    assert_eq!(prepared[0].address, None);
+    assert_eq!(
+        prepared[0].failure,
+        Some(identity::PreparationFailure::AddressMismatch)
+    );
     assert_eq!(keystore_address(&t, "web"), None, "keystore untouched");
 }
 
@@ -412,7 +416,10 @@ fn an_address_without_any_key_is_refused_and_nothing_is_generated() {
     Config::write_onion_services(&t.config, std::slice::from_ref(&service)).expect("write");
 
     let error = ensure(&t, &service).expect_err("refused");
-    assert!(format!("{error:#}").contains("has no key"), "{error:#}");
+    assert!(
+        format!("{error:#}").contains("states the address"),
+        "{error:#}"
+    );
     assert_eq!(keystore_address(&t, "web"), None);
 }
 
@@ -492,6 +499,10 @@ fn one_unusable_service_does_not_stop_the_others() {
 
     // The middle service is refused and publishes nothing; the others start.
     assert_eq!(prepared[1].address, None);
+    assert_eq!(
+        prepared[1].failure,
+        Some(identity::PreparationFailure::AddressMismatch)
+    );
     assert_eq!(keystore_address(&t, "middle"), None);
     for (idx, nickname) in [(0, "before"), (2, "after")] {
         let address = prepared[idx].address.as_ref().expect("the service starts");
@@ -517,10 +528,104 @@ fn one_unusable_service_does_not_stop_the_others() {
 }
 
 #[test]
+fn changed_key_in_current_file_is_rejected_without_settling_it() {
+    let t = temp();
+    let mut snapshot = entry("mutable");
+    let (old_key, _) = identity::fresh_identity("mutable");
+    snapshot.key = Some(IdentityKey::new(old_key).expect("snapshot key"));
+    let mut current = snapshot.clone();
+    let (new_key, new_address) = identity::fresh_identity("mutable");
+    current.key = Some(IdentityKey::new(new_key).expect("new file key"));
+    current.address = Some(new_address);
+    current.ports[0].target = "127.0.0.1:9090".to_owned();
+    Config::write_onion_services(&t.config, &[current.clone()]).expect("write current file");
+
+    let prepared = identity::prepare_all(Some(&t.config), &t.keystore, &[snapshot]);
+
+    assert_eq!(prepared[0].address, None);
+    assert_eq!(
+        prepared[0].failure,
+        Some(identity::PreparationFailure::IdentityChanged)
+    );
+    assert_eq!(
+        prepared[0].entry, current,
+        "current entry is returned intact"
+    );
+    assert_eq!(
+        keystore_address(&t, "mutable"),
+        None,
+        "changed key is not settled"
+    );
+}
+
+#[test]
+fn current_file_port_settings_win_and_disabled_services_stay_disabled() {
+    let t = temp();
+    let mut snapshot = entry("live");
+    snapshot.ports[0].target = "127.0.0.1:8080".to_owned();
+    let mut current = snapshot.clone();
+    current.ports[0].target = "127.0.0.1:8181".to_owned();
+    let disabled = entry("disabled");
+    let mut current_disabled = disabled.clone();
+    current_disabled.enabled = false;
+    Config::write_onion_services(&t.config, &[current.clone(), current_disabled.clone()])
+        .expect("write current file");
+
+    let prepared = identity::prepare_all(Some(&t.config), &t.keystore, &[snapshot, disabled]);
+
+    assert_eq!(prepared[0].entry, current);
+    assert!(prepared[0].address.is_some());
+    assert_eq!(prepared[1].entry, current_disabled);
+    assert_eq!(prepared[1].address, None);
+    assert_eq!(prepared[1].failure, None);
+    assert_eq!(keystore_address(&t, "disabled"), None);
+}
+
+#[test]
+fn enabled_snapshot_entry_missing_current_key_fails_without_adopting_stale_keystore_key() {
+    let t = temp();
+    let mut snapshot = entry("removed-key");
+    let (snapshot_key, snapshot_address) = identity::fresh_identity("removed-key");
+    snapshot.key = Some(IdentityKey::new(snapshot_key).expect("snapshot key"));
+    snapshot.address = Some(snapshot_address);
+    let nick = store::nickname("removed-key").expect("nickname");
+    let keymgr = store::open(&t.keystore).expect("keystore");
+    store::generate(&keymgr, &nick, false).expect("leave stale identity");
+    let stale_address = store::address(&keymgr, &nick)
+        .expect("address read")
+        .expect("stale key exists");
+    drop(keymgr);
+    let mut current = snapshot.clone();
+    current.key = None;
+    current.address = None;
+    Config::write_onion_services(&t.config, &[current.clone()]).expect("write current file");
+
+    let prepared = identity::prepare_all(Some(&t.config), &t.keystore, &[snapshot]);
+
+    assert_eq!(prepared[0].address, None);
+    assert_eq!(
+        prepared[0].failure,
+        Some(identity::PreparationFailure::IdentityChanged)
+    );
+    assert_eq!(prepared[0].entry, current);
+    assert_eq!(
+        keystore_address(&t, "removed-key").as_deref(),
+        Some(stale_address.as_str())
+    );
+}
+
+#[test]
 fn a_service_missing_from_the_file_does_not_start_but_the_others_do() {
     let t = temp();
     let present = entry("present");
     let stale = entry("stale");
+    let stale_nick = store::nickname("stale").expect("stale nickname");
+    let keymgr = store::open(&t.keystore).expect("keystore");
+    store::generate(&keymgr, &stale_nick, false).expect("stale key");
+    let stale_address = store::address(&keymgr, &stale_nick)
+        .expect("stale address")
+        .expect("stale identity");
+    drop(keymgr);
     Config::write_onion_services(&t.config, std::slice::from_ref(&present)).expect("write");
 
     let prepared = identity::prepare_all(Some(&t.config), &t.keystore, &[present, stale]);
@@ -537,6 +642,15 @@ fn a_service_missing_from_the_file_does_not_start_but_the_others_do() {
         prepared[1].address, None,
         "the stale service does not start"
     );
+    assert_eq!(
+        prepared[1].failure,
+        Some(identity::PreparationFailure::EntryMissingFromFile)
+    );
+    assert_eq!(
+        keystore_address(&t, "stale").as_deref(),
+        Some(stale_address.as_str()),
+        "stale key remains untouched"
+    );
     // Only `present` is in the file, completed; the stale entry is not
     // appended.
     let file = stored(&t);
@@ -547,54 +661,48 @@ fn a_service_missing_from_the_file_does_not_start_but_the_others_do() {
 }
 
 #[test]
-fn a_failed_file_write_starts_only_services_whose_entry_was_complete() {
+fn a_malformed_current_file_prevents_identity_settlement() {
     let t = temp();
-    let (key, address) = identity::fresh_identity("whole");
+    let (fresh_key, _fresh_address) = identity::fresh_identity("fresh");
+    let mut fresh = entry("fresh");
+    fresh.key = Some(IdentityKey::new(fresh_key).expect("fresh key"));
+    let (whole_key, _whole_address) = identity::fresh_identity("whole");
     let mut whole = entry("whole");
-    whole.key = Some(IdentityKey::new(key).expect("key text"));
-    whole.address = Some(address.clone());
-    // Garbage instead of the onion services file: the whole write fails.
+    whole.key = Some(IdentityKey::new(whole_key).expect("whole key"));
+    whole.address = Some(identity::fresh_identity("whole").1);
     std::fs::write(Config::onion_path(&t.config), "not a ktav document").expect("write garbage");
 
-    let prepared = identity::prepare_all(Some(&t.config), &t.keystore, &[entry("fresh"), whole]);
+    let prepared = identity::prepare_all(Some(&t.config), &t.keystore, &[fresh, whole]);
 
-    // `fresh` settled before the write: its generated key is in the
-    // keystore, but it does not start — its new key is recorded nowhere.
     assert_eq!(prepared[0].address, None);
-    assert!(
-        keystore_address(&t, "fresh").is_some(),
-        "the key was still placed into the keystore by settlement"
-    );
-    // `whole` starts: its entry was already complete.
-    assert_eq!(prepared[1].address.as_deref(), Some(address.as_str()));
     assert_eq!(
-        keystore_address(&t, "whole").as_deref(),
-        Some(address.as_str())
+        prepared[0].failure,
+        Some(identity::PreparationFailure::Internal)
     );
+    assert_eq!(prepared[1].address, None);
+    assert_eq!(
+        prepared[1].failure,
+        Some(identity::PreparationFailure::Internal)
+    );
+    assert_eq!(keystore_address(&t, "fresh"), None);
+    assert_eq!(keystore_address(&t, "whole"), None);
 }
 
 #[test]
-fn a_keyed_service_missing_only_its_address_starts_even_when_the_write_fails() {
+fn a_keystore_open_failure_is_typed() {
     let t = temp();
-    let (key, _address) = identity::fresh_identity("keyed");
-    let mut keyed = entry("keyed");
-    keyed.key = Some(IdentityKey::new(key.clone()).expect("key text"));
-    std::fs::write(Config::onion_path(&t.config), "not a ktav document").expect("write garbage");
+    let snapshot = entry("unavailable");
+    Config::write_onion_services(&t.config, std::slice::from_ref(&snapshot)).expect("write");
+    let keystore_file = t.dir.path().join("not-a-directory");
+    std::fs::write(&keystore_file, b"not a directory").expect("create file");
 
-    let prepared = identity::prepare_all(Some(&t.config), &t.keystore, &[keyed, entry("fresh")]);
+    let prepared = identity::prepare_all(Some(&t.config), &keystore_file, &[snapshot]);
 
-    // The keyed service starts: the failed write hides nothing, its address
-    // derives from the key its entry already carries.
-    let address = prepared[0]
-        .address
-        .as_ref()
-        .expect("the keyed service starts");
-    let bytes = store::decode_key(key.as_str()).expect("base64");
-    let nick = store::nickname("keyed").expect("nickname");
-    let keypair = store::parse_identity_file(&bytes, &nick).expect("key file");
-    assert_eq!(address, &store::address_of(&keypair));
-    // The keyless service does not start: its new key could not be recorded.
-    assert_eq!(prepared[1].address, None);
+    assert_eq!(prepared[0].address, None);
+    assert_eq!(
+        prepared[0].failure,
+        Some(identity::PreparationFailure::KeystoreUnavailable)
+    );
 }
 
 // --- key specifier paths ---

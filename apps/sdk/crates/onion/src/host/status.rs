@@ -4,7 +4,7 @@
 //! see the latest state).
 //!
 //! R2/R4 semantics: updates never block and never queue — [`StatusTracker`]
-//! uses `send_replace`, so a update works even with zero receivers, and a
+//! uses `send_modify`, so an update works even with zero receivers, and a
 //! receiver's `changed()` only ever reports "the snapshot changed".
 
 use std::collections::BTreeMap;
@@ -15,8 +15,8 @@ use tokio::sync::watch;
 ///
 /// A service that could not start at all (identity settlement failed, or it
 /// never got as far as a manager) appears with [`ServiceStatus::Failed`];
-/// its [`ServiceState::failure`] says why when a single typed reason fits,
-/// and is `None` when it does not (see [`ServiceFailure`]).
+/// cancellation before startup appears as [`ServiceStatus::Stopped`].
+/// [`ServiceState::failure`] records a typed reason where available.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OnionHostStatus {
     /// One entry per enabled service, keyed by its nickname.
@@ -60,11 +60,8 @@ pub struct ServiceState {
     pub failure: Option<ServiceFailure>,
 }
 
-/// Typed failure reasons. Deliberately incomplete: several real failure
-/// paths (identity settlement refused by the keystore, the services file
-/// could not be updated, the entry vanished from the file) have no single
-/// stable typed reason — those arrive as `Failed` with `failure: None` and
-/// the human-readable cause is in the log (never any key material).
+/// Typed failure reasons reported for a service that could not be hosted.
+/// Human-readable detail stays in the log, never key material.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ServiceFailure {
     /// The configured nickname is not a valid Tor hidden-service nickname.
@@ -83,6 +80,21 @@ pub enum ServiceFailure {
         /// The total wait budget that elapsed.
         limit: std::time::Duration,
     },
+    /// The service's entry disappeared from the current onion services file.
+    #[error("the onion service is no longer in the onion services file")]
+    EntryMissingFromFile,
+    /// The service's identity key changed after the host loaded its snapshot.
+    #[error("the onion service identity changed after configuration was loaded")]
+    IdentityChanged,
+    /// Identity preparation or host worker failed unexpectedly.
+    #[error("internal onion service host failure")]
+    Internal,
+    /// The configured `.onion` address does not match the address Arti launched.
+    #[error("launched onion service address does not match the configured address")]
+    AddressMismatch,
+    /// The onion keystore could not be opened for identity preparation.
+    #[error("the onion keystore is unavailable")]
+    KeystoreUnavailable,
     /// Another process holds the onion keystore lock, so nothing was hosted.
     #[error("the onion keystore lock is held elsewhere")]
     KeystoreLockHeld,
@@ -126,8 +138,8 @@ impl StatusTracker {
         });
     }
 
-    /// Mark every service as `Failed` with `failure` (used when the whole
-    /// host could not start, e.g. the keystore lock is held elsewhere).
+    /// Mark every service as `Failed` with `failure` when a host-wide error
+    /// prevents preparation or hosting.
     pub(crate) fn set_all(&self, failure: ServiceFailure) {
         self.sender.send_modify(|status| {
             for state in status.services.values_mut() {
