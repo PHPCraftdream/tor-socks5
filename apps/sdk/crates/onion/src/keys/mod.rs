@@ -22,7 +22,9 @@ pub mod ops;
 pub mod specifier;
 pub mod store;
 
-pub use identity::{ensure, prepare_all, PreparedService};
+#[cfg(test)]
+pub(crate) use identity::ensure;
+pub use identity::{prepare_all, PreparationFailure, PreparedService};
 pub use ops::{
     create_service, export_identity, identity_exists, import_identity, list_services,
     remove_service, show_service, NewIdentity, Recorded,

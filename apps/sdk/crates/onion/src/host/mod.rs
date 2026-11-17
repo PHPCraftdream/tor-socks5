@@ -57,8 +57,8 @@
 //! host_handle.shutdown().await;
 //! ```
 
-pub mod forward;
-pub mod serve;
+pub(crate) mod forward;
+pub(crate) mod serve;
 pub(crate) mod start_gate;
 pub mod status;
 
@@ -66,7 +66,7 @@ pub mod status;
 #[path = "ownership_tests.rs"]
 mod ownership_tests;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -75,11 +75,38 @@ use proxy_config::OnionServiceEntry;
 use safelog::DisplayRedacted as _;
 use tokio_util::sync::CancellationToken;
 use tor_socks5_runtime::tor_watchdog::TorHandle;
-use tor_socks5_runtime::workers::run_fallible_blocking;
 use tracing::{debug, error, info, warn};
 
 use crate::keys;
+use keys::PreparationFailure;
 use status::StatusTracker;
+
+// Used directly in non-test builds or via the cfg(test) HostTestHooks fields.
+#[allow(dead_code)]
+type PrepareAllHook =
+    dyn Fn(Option<&Path>, &Path, &[OnionServiceEntry]) -> Vec<keys::PreparedService> + Send + Sync;
+#[allow(dead_code)]
+type LockProbeHook = dyn Fn(&Path) -> LockProbe + Send + Sync;
+#[allow(dead_code)]
+type ServiceLaunchedHook = dyn Fn(&Arc<tor_hsservice::RunningOnionService>) + Send + Sync;
+#[allow(dead_code)]
+type ServeStartedHook = dyn Fn() + Send + Sync;
+
+#[cfg(test)]
+#[derive(Default)]
+struct HostTestHooks {
+    lock_probe: Option<Arc<LockProbeHook>>,
+    prepare_all: Option<Arc<PrepareAllHook>>,
+    lock_wait: Option<Duration>,
+    service_launched: Option<Arc<ServiceLaunchedHook>>,
+    serve_started: Option<Arc<ServeStartedHook>>,
+}
+
+enum LockProbe {
+    Acquired(persist_lock::PathLock),
+    Busy,
+    Unavailable,
+}
 
 pub use status::{OnionHostStatus, ServiceFailure, ServiceState, ServiceStatus};
 
@@ -147,6 +174,8 @@ pub struct OnionHostConfig {
     /// The cancellation token: cancels the producer, the managers and every
     /// task they spawned.
     pub token: CancellationToken,
+    #[cfg(test)]
+    test_hooks: Option<HostTestHooks>,
 }
 
 impl OnionHostConfig {
@@ -159,6 +188,8 @@ impl OnionHostConfig {
             config_path: None,
             keystore_dir,
             token,
+            #[cfg(test)]
+            test_hooks: None,
         }
     }
 
@@ -227,6 +258,8 @@ impl OnionHost {
                 config_path: config.config_path,
                 keystore_dir: config.keystore_dir,
                 token: token.clone(),
+                #[cfg(test)]
+                test_hooks: config.test_hooks,
             };
             let tracker_clone = tracker.clone();
             let join = tokio::spawn(run_services(run_config, tracker_clone));
@@ -311,6 +344,8 @@ impl Drop for OnionHostHandle {
 
 /// Producer task body: acquire the keystore lock (held for the services'
 /// lifetime), then run one manager task per service until shutdown.
+/// cancel-safe: yes — lock probes do not wait on the OS lock; cancellation
+/// drops a pending probe and is observed during async retry sleeps.
 async fn run_services(config: OnionHostConfig, tracker: StatusTracker) {
     let OnionHostConfig {
         handle,
@@ -318,88 +353,236 @@ async fn run_services(config: OnionHostConfig, tracker: StatusTracker) {
         config_path,
         keystore_dir,
         token,
+        #[cfg(test)]
+        test_hooks,
     } = config;
 
-    // The lock acquisition blocks (file lock + poll loop), so it runs on the
-    // blocking pool; the guard then moves into this task and lives until the
-    // task ends — i.e. until shutdown cancels the managers and they are
-    // joined below. Failing to get it is NOT fatal: the proxy keeps running
-    // without onion services.
-    let dir = keystore_dir.clone();
-    let lock = run_fallible_blocking(move || keys::lock(&dir).map_err(anyhow::Error::new)).await;
+    if token.is_cancelled() {
+        mark_entries_stopped(&tracker, &entries);
+        return;
+    }
+
+    #[cfg(test)]
+    let lock_probe = test_hooks
+        .as_ref()
+        .and_then(|hooks| hooks.lock_probe.clone())
+        .unwrap_or_else(|| Arc::new(probe_keystore_lock));
+    #[cfg(not(test))]
+    let lock_probe: Arc<LockProbeHook> = Arc::new(probe_keystore_lock);
+    #[cfg(test)]
+    let lock_wait = test_hooks
+        .as_ref()
+        .and_then(|hooks| hooks.lock_wait)
+        .unwrap_or(persist_lock::CLI_LOCK_WAIT);
+    #[cfg(not(test))]
+    let lock_wait = persist_lock::CLI_LOCK_WAIT;
+    let lock = acquire_keystore_lock(&keystore_dir, &token, lock_probe, lock_wait).await;
     let _lock = match lock {
-        Ok(Ok(guard)) => Some(guard),
-        Ok(Err(error)) => {
+        LockResult::Acquired(guard) => guard,
+        LockResult::Cancelled => {
+            mark_entries_stopped(&tracker, &entries);
+            return;
+        }
+        LockResult::Busy => {
             tracker.set_all(ServiceFailure::KeystoreLockHeld);
             error!(
-                %error,
                 "onion services not started: the onion keystore lock is held \
                  elsewhere (a tor-socks5 onion command or another server instance?)"
             );
             return;
         }
-        Err(error) => {
-            mark_all_failed(&tracker, &entries);
+        LockResult::Unavailable => {
+            tracker.set_all(ServiceFailure::KeystoreUnavailable);
+            error!("onion services not started: the onion keystore lock is unavailable");
+            return;
+        }
+        LockResult::Internal(error) => {
+            tracker.set_all(ServiceFailure::Internal);
             error!(%error, "onion services not started: lock task panicked");
             return;
         }
     };
 
-    // All identities are settled before any manager spawns, in ONE rewrite
-    // of the onion services file (see `keys::prepare_all`); the file and
-    // keystore work blocks, so it runs on the blocking pool. A join error is
-    // NOT fatal: the proxy keeps running without onion services.
-    let prepared = match tokio::task::spawn_blocking(move || {
-        keys::prepare_all(config_path.as_deref(), &keystore_dir, &entries)
+    // Preparation mutates the keystore and may update the services file, so
+    // once started it must finish; cancellation is checked before and after.
+    if token.is_cancelled() {
+        mark_entries_stopped(&tracker, &entries);
+        return;
+    }
+    let preparation_token = token.clone();
+    let preparation_entries = entries.clone();
+    #[cfg(test)]
+    let preparation_hook: Option<Arc<PrepareAllHook>> = test_hooks
+        .as_ref()
+        .and_then(|hooks| hooks.prepare_all.clone());
+    #[cfg(not(test))]
+    let preparation_hook: Option<Arc<PrepareAllHook>> = None;
+    let prepared = tokio::task::spawn_blocking(move || {
+        if preparation_token.is_cancelled() {
+            return None;
+        }
+        if let Some(prepare) = preparation_hook {
+            return Some(prepare(
+                config_path.as_deref(),
+                &keystore_dir,
+                &preparation_entries,
+            ));
+        }
+        Some(keys::prepare_all(
+            config_path.as_deref(),
+            &keystore_dir,
+            &preparation_entries,
+        ))
     })
-    .await
-    {
-        Ok(prepared) => prepared,
+    .await;
+    let prepared = match prepared {
+        Ok(Some(prepared)) => prepared,
+        Ok(None) => {
+            mark_entries_stopped(&tracker, &entries);
+            return;
+        }
         Err(error) => {
-            error!(
-                %error,
-                "onion services not started: the identity batch task panicked"
-            );
+            error!(%error, "onion services not started: the identity batch task panicked");
+            tracker.set_all(ServiceFailure::Internal);
             return;
         }
     };
+    if token.is_cancelled() {
+        mark_prepared_stopped(&tracker, &prepared);
+        return;
+    }
 
     // Gradual start: managers spawn in services-file order and the gate
     // hands freed slots out FIFO, so services launch in file order.
     let gate = start_gate::StartGate::new();
-    // One process-wide cap on forwarded streams, across ALL services
-    // together; each service adds its own per-service cap (see `serve`).
     let global_streams = Arc::new(tokio::sync::Semaphore::new(
         serve::MAX_TOTAL_CONCURRENT_STREAMS,
     ));
-    // One manager per service that may start; a failing service must not
-    // affect the others (the ones that may not start are already logged).
     let mut managers = tokio::task::JoinSet::new();
     for service in prepared {
-        if service.address.is_none() {
-            // The service never starts: its identity could not be settled or
-            // recorded (the concrete cause is logged by `prepare_all`, never
-            // any key material) — no single typed reason fits, so the status
-            // is `Failed` with `failure: None`.
-            mark_failed(&tracker, &service.entry);
+        if token.is_cancelled() {
+            mark_service_stopped(&tracker, &service.entry.nickname);
             continue;
         }
+        let Some(expected_address) = service.address else {
+            let (status, failure) = if service.entry.enabled {
+                (ServiceStatus::Failed, service.failure.map(service_failure))
+            } else {
+                (ServiceStatus::Stopped, None)
+            };
+            tracker.set(&service.entry.nickname, ServiceState { status, failure });
+            continue;
+        };
+        #[cfg(test)]
+        let service_launched = test_hooks
+            .as_ref()
+            .and_then(|hooks| hooks.service_launched.clone());
+        #[cfg(test)]
+        let serve_started = test_hooks
+            .as_ref()
+            .and_then(|hooks| hooks.serve_started.clone());
         managers.spawn(service_manager(
             handle.clone(),
             service.entry,
+            expected_address,
             gate.clone(),
             global_streams.clone(),
             token.clone(),
             tracker.clone(),
+            #[cfg(test)]
+            service_launched,
+            #[cfg(test)]
+            serve_started,
         ));
     }
-    // Join the managers so the keystore lock guard is only dropped after
-    // every service stopped. Managers exit promptly on cancellation.
     join_logged(
         &mut managers,
         "onion service manager task ended with a join error",
     )
     .await;
+}
+
+/// Outcome of an asynchronous, nonblocking keystore-lock probe.
+enum LockResult {
+    Acquired(persist_lock::PathLock),
+    Busy,
+    Unavailable,
+    Cancelled,
+    Internal(anyhow::Error),
+}
+
+/// Repeated zero-duration probes keep cancellation responsive without leaving
+/// a blocking worker parked behind a held cross-process lock.
+/// cancel-safe: yes — cancellation is checked before each probe and during the
+/// asynchronous retry delay; the current zero-wait probe is joined to completion.
+async fn acquire_keystore_lock(
+    dir: &Path,
+    token: &CancellationToken,
+    probe: Arc<dyn Fn(&Path) -> LockProbe + Send + Sync>,
+    wait: Duration,
+) -> LockResult {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        if token.is_cancelled() {
+            return LockResult::Cancelled;
+        }
+        let dir = dir.to_path_buf();
+        let probe = Arc::clone(&probe);
+        let result = tokio::task::spawn_blocking(move || probe(&dir)).await;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => return LockResult::Internal(anyhow::Error::new(error)),
+        };
+        match result {
+            LockProbe::Acquired(guard) => return LockResult::Acquired(guard),
+            LockProbe::Unavailable => return LockResult::Unavailable,
+            LockProbe::Busy if tokio::time::Instant::now() >= deadline => {
+                return LockResult::Busy;
+            }
+            LockProbe::Busy => {}
+        }
+        tokio::select! {
+            biased;
+            () = token.cancelled() => return LockResult::Cancelled,
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
+}
+
+fn probe_keystore_lock(dir: &Path) -> LockProbe {
+    match persist_lock::PathLock::acquire_bounded(dir, Duration::ZERO) {
+        Ok(guard) => LockProbe::Acquired(guard),
+        Err(error)
+            if error
+                .chain()
+                .any(|cause| cause.to_string().contains(" is busy:")) =>
+        {
+            LockProbe::Busy
+        }
+        Err(_) => LockProbe::Unavailable,
+    }
+}
+
+fn mark_service_stopped(tracker: &StatusTracker, nickname: &str) {
+    tracker.set(
+        nickname,
+        ServiceState {
+            status: ServiceStatus::Stopped,
+            failure: None,
+        },
+    );
+}
+
+fn mark_entries_stopped(tracker: &StatusTracker, entries: &[OnionServiceEntry]) {
+    for entry in entries {
+        mark_service_stopped(tracker, &entry.nickname);
+    }
+}
+
+fn mark_prepared_stopped(tracker: &StatusTracker, prepared: &[keys::PreparedService]) {
+    for service in prepared {
+        mark_service_stopped(tracker, &service.entry.nickname);
+    }
 }
 
 /// Join every child task and log unexpected join failures. Cancelled joins
@@ -418,22 +601,14 @@ pub(crate) async fn join_logged(set: &mut tokio::task::JoinSet<()>, message: &'s
     }
 }
 
-/// Mark one service `Failed` without a typed failure (see
-/// [`ServiceFailure`]: no single reason fits the settlement paths).
-fn mark_failed(tracker: &StatusTracker, entry: &OnionServiceEntry) {
-    tracker.set(
-        &entry.nickname,
-        ServiceState {
-            status: ServiceStatus::Failed,
-            failure: None,
-        },
-    );
-}
-
-/// Mark every service `Failed` without a typed failure.
-fn mark_all_failed(tracker: &StatusTracker, entries: &[OnionServiceEntry]) {
-    for entry in entries {
-        mark_failed(tracker, entry);
+fn service_failure(failure: PreparationFailure) -> ServiceFailure {
+    match failure {
+        PreparationFailure::InvalidNickname => ServiceFailure::InvalidNickname,
+        PreparationFailure::EntryMissingFromFile => ServiceFailure::EntryMissingFromFile,
+        PreparationFailure::IdentityChanged => ServiceFailure::IdentityChanged,
+        PreparationFailure::AddressMismatch => ServiceFailure::AddressMismatch,
+        PreparationFailure::KeystoreUnavailable => ServiceFailure::KeystoreUnavailable,
+        PreparationFailure::Internal => ServiceFailure::Internal,
     }
 }
 
@@ -442,15 +617,26 @@ fn mark_all_failed(tracker: &StatusTracker, entries: &[OnionServiceEntry]) {
 /// service published. Each launch attempt waits for a `start_gate` slot and
 /// holds it until the service reports a terminal status, the 90 s slot cap,
 /// or shutdown; retries sleep an exponentially growing, ±20%-spread backoff.
+/// cancel-safe: yes — cancellation while waiting drops only local guards or
+/// owned child tasks; after launch the service and children are joined before
+/// return, and retries begin only after a completed failed launch attempt.
+#[allow(clippy::too_many_arguments)]
 async fn service_manager(
     handle: TorHandle,
     entry: OnionServiceEntry,
+    expected_address: String,
     gate: start_gate::StartGate,
     global_streams: Arc<tokio::sync::Semaphore>,
     token: CancellationToken,
     tracker: StatusTracker,
+    #[cfg(test)] service_launched: Option<Arc<ServiceLaunchedHook>>,
+    #[cfg(test)] serve_started: Option<Arc<ServeStartedHook>>,
 ) {
     let nick = entry.nickname.clone();
+    if token.is_cancelled() {
+        mark_stopped(&tracker, &nick);
+        return;
+    }
     let nick_hs = match keys::nickname(&nick) {
         Ok(nick) => nick,
         Err(error) => {
@@ -518,8 +704,16 @@ async fn service_manager(
                 mark_stopped(&tracker, &nick);
                 return;
             };
+            if token.is_cancelled() {
+                mark_stopped(&tracker, &nick);
+                return;
+            }
             match tunnel.raw().launch_onion_service(config.clone()) {
                 Ok(Some((service, rend_requests))) => {
+                    #[cfg(test)]
+                    if let Some(on_launch) = &service_launched {
+                        on_launch(&service);
+                    }
                     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
                     // The slot is released by its own task (terminal status,
                     // the 90 s cap, or shutdown) while this manager continues
@@ -528,6 +722,26 @@ async fn service_manager(
                     children.spawn(slot.hold_until_started(started_rx, token.clone()));
                     match wait_for_address(&service, &token, &nick).await {
                         AddressWait::Available(address) => {
+                            let actual_address = address.display_unredacted().to_string();
+                            if actual_address != expected_address {
+                                children.shutdown().await;
+                                drop(rend_requests);
+                                drop(service);
+                                error!(
+                                    nickname = %nick,
+                                    expected_address = %expected_address,
+                                    actual_address = %actual_address,
+                                    "launched onion service address does not match prepared identity; service not served"
+                                );
+                                tracker.set(
+                                    &nick,
+                                    ServiceState {
+                                        status: ServiceStatus::Failed,
+                                        failure: Some(ServiceFailure::AddressMismatch),
+                                    },
+                                );
+                                return;
+                            }
                             tracker.set(
                                 &nick,
                                 ServiceState {
@@ -544,6 +758,10 @@ async fn service_manager(
                             // both exit on cancellation. The manager keeps this first
                             // clone alive; dropping the last clone would unpublish the
                             // service.
+                            #[cfg(test)]
+                            if let Some(on_serve) = &serve_started {
+                                on_serve();
+                            }
                             children.spawn(serve::serve_service(
                                 service.clone(),
                                 rend_requests,
@@ -575,13 +793,13 @@ async fn service_manager(
                         // line; the status is still `Stopped`, because
                         // shutdown is the cause.
                         AddressWait::Cancelled => {
-                            // hold_until_started only waits and owns a StartSlot; aborting it drops the slot and releases its permit.
+                            // Dropping the task releases its StartSlot.
                             children.shutdown().await;
                             mark_stopped(&tracker, &nick);
                             return;
                         }
                         AddressWait::TimedOut => {
-                            // hold_until_started only waits and owns a StartSlot; aborting it drops the slot and releases its permit.
+                            // Dropping the task releases its StartSlot.
                             children.shutdown().await;
                             tracker.set(
                                 &nick,
@@ -592,7 +810,7 @@ async fn service_manager(
                                     }),
                                 },
                             );
-                            return; // started_tx drops; the slot task unwinds at its cap
+                            return;
                         }
                     }
                 }
@@ -661,8 +879,9 @@ enum AddressWait {
     TimedOut,
 }
 
-/// Poll for the service's `.onion` address, bounded by
-/// [`ADDRESS_WAIT_LIMIT`].
+/// Poll for the service's `.onion` address, bounded by [`ADDRESS_WAIT_LIMIT`].
+/// cancel-safe: yes — this future only polls `onion_address()` and a timer;
+/// cancellation leaves the service owned by its caller.
 async fn wait_for_address(
     service: &Arc<tor_hsservice::RunningOnionService>,
     token: &CancellationToken,
@@ -690,220 +909,4 @@ async fn wait_for_address(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Retry-spread scaling (pure, no runtime).
-    #[test]
-    fn the_spread_stays_within_twenty_percent() {
-        assert_eq!(spread_millis(30_000, 0), 24_000);
-        // u64::MAX % 40 == 15 → step 15 → factor 0.95.
-        assert_eq!(spread_millis(30_000, u64::MAX), 28_500);
-        assert_eq!(spread_millis(300_000, 0), 240_000);
-
-        // Monotone non-decreasing across the 40-step period.
-        let mut previous = spread_millis(30_000, 0);
-        for unit in 1..40u64 {
-            let current = spread_millis(30_000, unit);
-            assert!(current >= previous, "spread regressed at unit {unit}");
-            previous = current;
-        }
-
-        // Real samples: the unit comes from the OS RNG, so only bounds and
-        // variety are asserted — no wall-clock anywhere.
-        let mut distinct = std::collections::HashSet::new();
-        for _ in 0..50 {
-            let delay = backoff_spread(Duration::from_secs(30));
-            assert!(
-                delay >= Duration::from_secs(24),
-                "below the -20% floor: {delay:?}"
-            );
-            assert!(
-                delay < Duration::from_secs(36),
-                "above the +20% ceiling: {delay:?}"
-            );
-            distinct.insert(delay);
-        }
-        assert!(distinct.len() >= 2, "the spread produces variety");
-    }
-
-    #[test]
-    fn the_soft_limit_warning_starts_above_ten_services() {
-        assert!(!beyond_soft_limit(1));
-        assert!(!beyond_soft_limit(10));
-        assert!(beyond_soft_limit(11));
-        assert!(beyond_soft_limit(100));
-    }
-
-    #[test]
-    fn build_config_accepts_valid_nickname() {
-        let nick = keys::nickname("svc-one").expect("nickname");
-        let config = build_config(nick).expect("config");
-        assert_eq!(config.nickname().to_string(), "svc-one");
-        // `enabled` defaults to true, so arti will actually start it.
-        assert!(config.enabled());
-    }
-
-    #[test]
-    fn invalid_nickname_is_rejected_before_launch() {
-        let entry = OnionServiceEntry {
-            nickname: "not a nickname".to_owned(),
-            enabled: true,
-            address: None,
-            key: None,
-            circuit_hops: 4,
-            ports: Vec::new(),
-        };
-        // The manager returns without launching when the nickname is invalid;
-        // validate that path directly via the keys helper it uses.
-        assert!(keys::nickname(&entry.nickname).is_err());
-    }
-
-    fn service(nickname: &str) -> OnionServiceEntry {
-        OnionServiceEntry {
-            nickname: nickname.to_owned(),
-            enabled: true,
-            address: None,
-            key: None,
-            circuit_hops: 4,
-            ports: vec![proxy_config::OnionServicePort {
-                onion_port: 80,
-                target: "127.0.0.1:8080".to_owned(),
-            }],
-        }
-    }
-
-    fn temp_config() -> (tempfile::TempDir, PathBuf, PathBuf) {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let config = dir.path().join("tor-socks5.ktav");
-        let keystore = dir.path().join("keystore");
-        (dir, config, keystore)
-    }
-
-    fn keystore_address(keystore: &std::path::Path, nickname: &str) -> Option<String> {
-        let keymgr = keys::store::open(keystore).expect("keystore");
-        keys::store::address(&keymgr, &keys::nickname(nickname).expect("nickname"))
-            .expect("address")
-    }
-
-    #[test]
-    fn a_launchable_identity_is_prepared_and_the_file_completed() {
-        let (_tmp, config, keystore) = temp_config();
-        let entry = service("web");
-        proxy_config::Config::write_onion_services(&config, std::slice::from_ref(&entry))
-            .expect("write");
-
-        let prepared = keys::prepare_all(Some(&config), &keystore, &[entry]);
-        let address = prepared[0].address.clone().expect("the service may start");
-
-        let stored = proxy_config::Config::read_onion_services(&config).expect("read");
-        assert_eq!(stored[0].address.as_deref(), Some(address.as_str()));
-        assert!(stored[0].key.is_some(), "the new key is recorded");
-        assert_eq!(keystore_address(&keystore, "web"), Some(address));
-    }
-
-    #[test]
-    fn an_address_the_key_does_not_give_keeps_the_service_from_starting() {
-        let (_tmp, config, keystore) = temp_config();
-        let (key, _address) = keys::fresh_identity("web");
-        let (_other_key, other_address) = keys::fresh_identity("web");
-        let mut entry = service("web");
-        entry.key = Some(proxy_config::IdentityKey::new(key).expect("key text"));
-        entry.address = Some(other_address);
-        proxy_config::Config::write_onion_services(&config, std::slice::from_ref(&entry))
-            .expect("write");
-
-        let prepared = keys::prepare_all(Some(&config), &keystore, &[entry]);
-        assert_eq!(prepared[0].address, None);
-        assert_eq!(
-            keystore_address(&keystore, "web"),
-            None,
-            "nothing was published"
-        );
-    }
-
-    #[test]
-    fn a_key_that_is_not_an_identity_keeps_the_service_from_starting() {
-        let (_tmp, config, keystore) = temp_config();
-        let mut entry = service("web");
-        entry.key = Some(
-            proxy_config::IdentityKey::new(keys::store::encode_key(b"not a key"))
-                .expect("key text"),
-        );
-        proxy_config::Config::write_onion_services(&config, std::slice::from_ref(&entry))
-            .expect("write");
-
-        let prepared = keys::prepare_all(Some(&config), &keystore, &[entry]);
-        assert_eq!(prepared[0].address, None);
-    }
-
-    // --- New host-API regression tests (deterministic, no wall-clock). ---
-
-    /// Install rustls's process-wide `CryptoProvider` exactly once for this
-    /// test binary (copied verbatim from
-    /// `tor_watchdog_tests.rs`): a fresh `state_dir` reaches further into
-    /// arti's directory-manager setup, and that path expects a crypto
-    /// provider to already be installed. `install_default()` errors if
-    /// called twice in the same process, so the error is discarded.
-    fn ensure_crypto_provider() {
-        static INIT: std::sync::Once = std::sync::Once::new();
-        INIT.call_once(|| {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-        });
-    }
-
-    fn test_handle(state_dir: &std::path::Path) -> TorHandle {
-        ensure_crypto_provider();
-        // A fresh tempdir `state_dir` (owned by the caller so it outlives the
-        // tunnel): `None` would fall back to arti's shared per-user OS
-        // location, which is flaky on CI.
-        let settings = arti_wrapper::Settings {
-            state_dir: Some(state_dir.to_path_buf()),
-            ..Default::default()
-        };
-        let tor = arti_wrapper::TorTunnel::create_unbootstrapped_with(settings)
-            .expect("unbootstrapped tunnel");
-        TorHandle::new(tor)
-    }
-
-    fn disabled_entry() -> OnionServiceEntry {
-        let mut entry = service("off");
-        entry.enabled = false;
-        entry
-    }
-
-    /// With no enabled entries the producer exits immediately (it never
-    /// touches the blocking pool) and the status stays empty. This runs on
-    /// the default `#[tokio::test]` flavor (current-thread): `tokio::spawn`
-    /// works there, and the safe path is that zero enabled entries keep the
-    /// producer off the blocking pool entirely.
-    #[tokio::test]
-    async fn a_host_without_enabled_services_starts_and_shuts_down() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let keystore = std::env::temp_dir().join("tor-socks5-onion-host-empty-test");
-        let config =
-            OnionHostConfig::new(test_handle(dir.path()), keystore, CancellationToken::new())
-                .with_entries(vec![disabled_entry()]);
-        let host_handle = OnionHost::new(config).start();
-        assert!(
-            host_handle.status().services.is_empty(),
-            "no enabled services, empty status"
-        );
-        host_handle.shutdown().await;
-    }
-
-    /// Dropping the handle cancels the token (the Drop contract: never
-    /// blocks, no async).
-    #[tokio::test]
-    async fn dropping_the_handle_cancels_the_token() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let keystore = std::env::temp_dir().join("tor-socks5-onion-host-drop-test");
-        let config =
-            OnionHostConfig::new(test_handle(dir.path()), keystore, CancellationToken::new());
-        let host_handle = OnionHost::new(config).start();
-        let token = host_handle.token().clone();
-        assert!(!token.is_cancelled());
-        std::mem::drop(host_handle);
-        assert!(token.is_cancelled(), "Drop cancelled the token");
-    }
-}
+mod tests;
