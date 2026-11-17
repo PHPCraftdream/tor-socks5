@@ -130,6 +130,21 @@ fn combine_cleanup_errors(
     }
 }
 
+/// End the run's blocking-worker group; a primary run error wins over a
+/// group-join error (which is then only logged).
+pub(crate) async fn finish_run_group(result: Result<()>) -> Result<()> {
+    match tor_socks5_runtime::workers::end_run_group(std::time::Duration::from_secs(5)).await {
+        Ok(()) => result,
+        Err(group_error) => match result {
+            Ok(()) => Err(group_error),
+            Err(primary) => {
+                tracing::warn!(error = %group_error, "run blocking workers outlived the shutdown budget");
+                Err(primary)
+            }
+        },
+    }
+}
+
 pub(crate) async fn cleanup_failed_run(writer_started: bool) -> Result<()> {
     #[cfg(test)]
     if let Some(notice) = CLEANUP_FAILED_RUN_STARTED

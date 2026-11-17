@@ -96,16 +96,7 @@ async fn run_server_inner(
 ) -> Result<()> {
     tor_socks5_runtime::workers::begin_run_group()?;
     let result = run_server_body(set_stage, on_ready, args, shutdown, writer_started).await;
-    match tor_socks5_runtime::workers::end_run_group(Duration::from_secs(5)).await {
-        Ok(()) => result,
-        Err(group_error) => match result {
-            Ok(()) => Err(group_error),
-            Err(primary) => {
-                warn!(error = %group_error, "run blocking workers outlived the shutdown budget");
-                Err(primary)
-            }
-        },
-    }
+    lifecycle::finish_run_group(result).await
 }
 
 async fn run_server_body(
