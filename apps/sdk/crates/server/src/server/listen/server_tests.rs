@@ -1,5 +1,95 @@
 use super::*;
 
+/// Test-only choreography mirroring the real producer shutdown sequence.
+async fn shutdown_producers(
+    token: CancellationToken,
+    producers: Vec<tokio::task::JoinHandle<()>>,
+    drain: impl std::future::Future<Output = ()>,
+    budget: Duration,
+) -> bool {
+    let owner = crate::server::producers::ProducerTasks::for_test(token);
+    let mut launch = crate::server::producers::LaunchGuard::new(owner.clone());
+    launch.handles = producers;
+    launch.commit();
+    owner.cancel();
+    let deadline = tokio::time::Instant::now() + budget;
+    let joined = match tokio::time::timeout_at(deadline, drain).await {
+        Ok(()) => owner
+            .join(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .await
+            .is_ok(),
+        Err(_) => false,
+    };
+    if !joined {
+        assert!(owner.has_retained_handle().await);
+        owner.abort();
+        owner
+            .join(Duration::from_secs(5))
+            .await
+            .expect("прерванные тестовые задачи должны завершиться");
+    }
+    joined
+}
+
+#[test]
+fn enabled_onion_services_with_upstream_emit_an_explicit_warning() {
+    use std::sync::Mutex;
+
+    struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let output = Arc::clone(&logs);
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_target(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || LogBuffer(Arc::clone(&output)))
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let mut cfg = crate::config::Config::default();
+    cfg.onion_services.push(proxy_config::OnionServiceEntry {
+        nickname: "web".into(),
+        enabled: true,
+        address: None,
+        key: None,
+        circuit_hops: 4,
+        ports: vec![proxy_config::OnionServicePort {
+            onion_port: 80,
+            target: "127.0.0.1:8080".into(),
+        }],
+    });
+    crate::startup::warn_enabled_onion_services_with_upstream(&cfg);
+    let logged = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(
+        logged.contains(
+            "onion services are configured but are not started with upstream SOCKS5 egress"
+        ),
+        "expected explicit upstream warning, got: {logged}"
+    );
+    assert!(
+        logged.contains("enabled=1"),
+        "expected the enabled count: {logged}"
+    );
+
+    logs.lock().unwrap().clear();
+    cfg.onion_services[0].enabled = false;
+    crate::startup::warn_enabled_onion_services_with_upstream(&cfg);
+    assert!(
+        logs.lock().unwrap().is_empty(),
+        "disabled services must not warn"
+    );
+}
+
 #[tokio::test]
 async fn shutdown_is_polled_before_validating_config() {
     let _serial = owners::TEST_LIFECYCLE.lock().await;

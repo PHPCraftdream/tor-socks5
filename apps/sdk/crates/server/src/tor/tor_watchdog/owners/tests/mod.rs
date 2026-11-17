@@ -423,7 +423,7 @@ async fn close_reports_constructed_outcome_failure_after_teardown() {
 
 #[cfg(test)]
 mod pre_policy_tests {
-    use super::super::super::validate_pre_compatibility;
+    use crate::startup::validate_pre_compatibility;
 
     #[test]
     fn rejects_independent_egress_only_with_global_pre() {

@@ -1,6 +1,8 @@
 //! The shared SOCKS5/HTTP CONNECT listener runtime: egress selection, the accept loop, and
 //! the per-connection handler.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -93,6 +95,11 @@ async fn run_server_inner(
     writer_started: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
     set_stage(crate::api::ServerStage::Recovery);
+    let startup_cancellation = CancellationToken::new();
+    let shutdown = async {
+        shutdown.await;
+        startup_cancellation.cancel();
+    };
     tokio::pin!(shutdown);
     let recovery = global_init::recover_startup();
     tokio::pin!(recovery);
@@ -130,7 +137,7 @@ async fn run_server_inner(
 
     info!(%source, "loaded configuration");
     if let Some(path) = &config_path {
-        crate::startup::ensure_bridges_file(&cfg, path);
+        crate::startup::ensure_bridges_file(&cfg, path).await;
     }
 
     // Load the users registry (sits next to the main config). The file
@@ -208,6 +215,7 @@ async fn run_server_inner(
                 true,
             )?;
             set_stage(crate::api::ServerStage::Startup);
+            warn_enabled_onion_services_with_upstream(&cfg);
             info!(
                 upstream = %up.address(),
                 auth = up.has_auth(),
@@ -241,7 +249,11 @@ async fn run_server_inner(
                     "onion_services.circuit_hops={service_circuit_hops} reduces anonymity: server onion circuits are {chain}. Intended for censorship circumvention, not anonymity."
                 );
             }
-            let preparation = global_init::SettingsInit::start(cfg.clone(), config_path.clone())?;
+            let preparation = global_init::SettingsInit::start(
+                cfg.clone(),
+                config_path.clone(),
+                startup_cancellation.clone(),
+            )?;
             let Some(settings) = global_init::wait_startup(
                 &mut shutdown,
                 preparation.wait(),
@@ -280,6 +292,8 @@ async fn run_server_inner(
                 Ok(())
             })
             .await
+            // The input error's already-contextualized primary is retained in
+            // StartupFailure::Error; the stage is added at the lifecycle API.
             .context("failed to bootstrap Tor")?
             else {
                 return Ok(());
@@ -535,7 +549,8 @@ async fn run_server_inner(
     let mut handler_reap = tokio::time::interval(Duration::from_secs(1));
     let mut accept_loops = futures::stream::FuturesUnordered::new();
     for listener in listeners {
-        accept_loops.push(handlers.clone().accept_loop_tracked(
+        accept_loops.push(accept_loop_future(
+            handlers.clone(),
             listener,
             egress.clone(),
             auth_state.clone(),
@@ -552,12 +567,14 @@ async fn run_server_inner(
     set_stage(crate::api::ServerStage::Runtime);
     global_init::server_ready();
     on_ready(actual_addresses.clone());
+    let mut accept_loop_exited = false;
     loop {
         tokio::select! {
             biased;
             () = &mut shutdown => break,
             _ = handler_reap.tick() => handlers.reap().await,
             _ = accept_loops.next(), if !accept_loops.is_empty() => {
+                accept_loop_exited = true;
                 warn!("accept loop exited unexpectedly");
                 break;
             }
@@ -570,7 +587,8 @@ async fn run_server_inner(
                             on_ready(actual_addresses.clone());
                         }
                     }
-                    accept_loops.push(handlers.clone().accept_loop_tracked(
+                    accept_loops.push(accept_loop_future(
+                        handlers.clone(),
                         listener,
                         egress.clone(),
                         auth_state.clone(),
@@ -644,49 +662,16 @@ async fn run_server_inner(
             shutdown_errors.push(error);
         }
     }
-    shutdown_errors.into_result()?;
+    let shutdown_result = shutdown_errors.into_result();
+    if accept_loop_exited {
+        return Err(match shutdown_result {
+            Ok(()) => anyhow!("accept loop exited unexpectedly"),
+            Err(cleanup) => cleanup.context("accept loop exited unexpectedly"),
+        });
+    }
+    shutdown_result?;
     info!("bye");
     Ok(())
-}
-
-fn validate_pre_compatibility(pre: bool, dns: bool, onion: bool, upstream: bool) -> Result<()> {
-    if pre && (dns || onion || upstream) {
-        bail!(
-            "global pre_proxies cannot be combined with DNS listener, enabled onion services, or upstream egress"
-        );
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-async fn shutdown_producers(
-    token: CancellationToken,
-    producers: Vec<tokio::task::JoinHandle<()>>,
-    drain: impl std::future::Future<Output = ()>,
-    budget: Duration,
-) -> bool {
-    let owner = producers::ProducerTasks::for_test(token);
-    let mut launch = producers::LaunchGuard::new(owner.clone());
-    launch.handles = producers;
-    launch.commit();
-    owner.cancel();
-    let deadline = tokio::time::Instant::now() + budget;
-    let joined = match tokio::time::timeout_at(deadline, drain).await {
-        Ok(()) => owner
-            .join(deadline.saturating_duration_since(tokio::time::Instant::now()))
-            .await
-            .is_ok(),
-        Err(_) => false,
-    };
-    if !joined {
-        assert!(owner.has_retained_handle().await);
-        owner.abort();
-        owner
-            .join(Duration::from_secs(5))
-            .await
-            .expect("прерванные тестовые задачи должны завершиться");
-    }
-    joined
 }
 
 // Логика выбора upstream-egress ("CLI поверх конфига") живёт в своём
@@ -694,10 +679,35 @@ async fn shutdown_producers(
 use crate::upstream::pick_upstream;
 
 use crate::startup::{
-    classify_conn_failure, STAGE_CONNECT_TOR, STAGE_CONNECT_UPSTREAM, STAGE_HANDSHAKE, STAGE_RELAY,
+    classify_conn_failure, validate_pre_compatibility, warn_enabled_onion_services_with_upstream,
+    STAGE_CONNECT_TOR, STAGE_CONNECT_UPSTREAM, STAGE_HANDSHAKE, STAGE_RELAY,
 };
 #[cfg(test)]
 pub(crate) use tor_socks5_runtime::conn_health::{ConnErrorKind, ConnStage};
+
+#[cfg(test)]
+tokio::task_local! {
+    static FORCE_ACCEPT_LOOP_EXIT: bool;
+}
+
+fn accept_loop_future(
+    handlers: Arc<handlers::HandlerTasks>,
+    listener: TcpListener,
+    egress: Egress,
+    auth: Option<Arc<AuthState>>,
+    permits: Arc<tokio::sync::Semaphore>,
+    tracking: handlers::ConnectionTracking,
+    security: SecurityConfig,
+) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    #[cfg(test)]
+    if FORCE_ACCEPT_LOOP_EXIT
+        .try_with(|force| *force)
+        .unwrap_or(false)
+    {
+        return Box::pin(async {});
+    }
+    Box::pin(handlers.accept_loop_tracked(listener, egress, auth, permits, tracking, security))
+}
 
 /// cancel-safe: NO — partial protocol replies/prefix writes/relay are terminal;
 /// dropping this handler closes its owned client and egress, with no replay.

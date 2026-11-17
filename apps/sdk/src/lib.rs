@@ -201,11 +201,12 @@ pub mod runtime {
 }
 
 /// Embedded SOCKS5/HTTP CONNECT server API (`tor-socks5-server`), curated to
-/// the builder, running handle, status and error types. Requires `server`;
+/// the builder, running handle, lifecycle stage/status and error types. Requires `server`;
 /// the same feature also enables the `runtime` and `onion-service` features.
 #[cfg(feature = "server")]
 pub mod server {
     pub use ::tor_socks5_server::{
-        DnsStartupPolicy, Server, ServerBuilder, ServerError, ServerHandle, ServerStatus,
+        DnsStartupPolicy, Server, ServerBuilder, ServerError, ServerHandle, ServerStage,
+        ServerStatus,
     };
 }
