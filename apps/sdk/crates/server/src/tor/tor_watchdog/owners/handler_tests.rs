@@ -152,6 +152,7 @@ async fn parked_server_startup(global: bool) {
         settings,
         park_global: global,
         gate: std::sync::Mutex::new(Some((entered_tx, release_rx))),
+        async_gate: std::sync::Mutex::new(None),
     });
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let (config_path, config) =
@@ -192,10 +193,18 @@ async fn parked_server_startup(global: bool) {
         matches!(entered, Ok(Ok(()))),
         "сервер не достиг ожидаемой стадии"
     );
-    assert!(result
-        .expect("сервер проигнорировал завершение")
-        .expect("задача сервера прервана")
-        .is_err());
+    let failure = result
+        .expect("server ignored shutdown")
+        .expect("server task was aborted")
+        .expect_err("startup cancellation must be reported");
+    let failure = failure
+        .downcast_ref::<super::super::global_init::StartupFailure>()
+        .expect("startup cancellation must remain typed");
+    assert!(matches!(
+        failure.primary(),
+        super::super::global_init::StartupPrimary::Cancelled
+    ));
+    assert!(failure.cleanup_error().is_some());
     assert!(snapshot.0, "корень незавершённой задачи потерян");
     if global {
         assert!(snapshot.1, "запуск Tor не отменён");
