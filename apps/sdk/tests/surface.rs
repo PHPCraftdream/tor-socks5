@@ -146,7 +146,7 @@ fn dns_module() {
 #[cfg(feature = "onion")]
 #[test]
 fn onion_module() {
-    use tor_socks5::onion::vanity::{SearchOptions, SearchOutcome, VanityTarget};
+    use tor_socks5::onion::vanity::{SearchOptions, SearchOutcome, VanityError, VanityTarget};
 
     assert_eq!(
         type_name::<tor_socks5::onion::address::Keypair>(),
@@ -154,7 +154,8 @@ fn onion_module() {
     );
     let _: fn(&str) -> Result<[u8; 32], tor_socks5::onion::address::ParseError> =
         tor_socks5::onion::address::parse_onion_address;
-    let _: fn(&VanityTarget, &SearchOptions) -> SearchOutcome = tor_socks5::onion::vanity::search;
+    let _: fn(&VanityTarget, &SearchOptions) -> Result<SearchOutcome, VanityError> =
+        tor_socks5::onion::vanity::search;
 }
 
 /// The keys are available without the `onion` feature too: `onion-keys`

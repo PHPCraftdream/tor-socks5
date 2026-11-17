@@ -25,12 +25,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                 time_limit: Some(Duration::from_secs(2)),
                 ..SearchOptions::default()
             };
-            match search(&target, &options) {
+            match search(&target, &options)? {
                 SearchOutcome::Found(keypair) => {
                     println!("{}", keypair.address());
                 }
                 SearchOutcome::TimedOut { attempts } => {
                     println!("no match within the 2-second search budget ({attempts} attempts)");
+                }
+                SearchOutcome::Panicked { attempts } => {
+                    println!("a search worker panicked ({attempts} attempts)");
                 }
                 SearchOutcome::Cancelled { attempts } => {
                     println!("search cancelled ({attempts} attempts)");
