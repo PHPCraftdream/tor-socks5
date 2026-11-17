@@ -30,7 +30,7 @@ async fn cancelled_drain_keeps_promotion_worker_owned() {
                         }
                     })
                 });
-                drain_pool_with(
+                drain_with(
                     Some(&drain_path),
                     1,
                     None,

@@ -330,8 +330,25 @@ Tor from configured bridges (built-in seeds as fallback), refreshes the
 candidate pool from configured HTTPS sources and, unless `probe` is `false`,
 probes candidates and promotes reachable ones into the working config. The
 application keeps config loading, validation, tracing and printing; the result
-is `FetchBridgesOutcome { added, promoted, pool_len }`. It is not cancel-safe:
-cancellation aborts the run mid-way and skips the trailing 200 ms sleep.
+is `Result<FetchBridgesOutcome { added, promoted, pool_len }, FetchBridgesError>`.
+`FetchBridgesError` variants: `NoConfigFile` (passing `None` is an error — the
+SDK never creates a default config file; run the server once or pass an
+explicit path), `PreProxies` (a global `pre_proxies` pool is rejected by the
+SDK itself: fetching runs over the host network and cannot honour it),
+`NoBridgeSources`, `Cancelled`, and `Other` (everything else, with the root
+cause as `source()`). `FetchBridgesParams.pt_binary` (a `PtBinary` policy)
+is used for the bootstrap settings and the admission/drain checks; hosts that
+cannot be re-spawned as a PT dispatcher must pass `PtBinary::Explicit`.
+
+It is not cancel-safe: cancellation is observed at every stage (pre-flight,
+settings build, bootstrap, pool refresh, drain) and returns
+`FetchBridgesError::Cancelled`. Once the Tor tunnel exists, any error or
+cancellation drops the tunnel and then runs the trailing 200 ms cleanup sleep
+before returning — that tail is deliberately not cancellable, so arti's
+reactor releases the PT children and the state-dir lock. A cancellation
+during (or before) the final pause after a *successful* fetch skips the rest
+of the pause but never loses the already-recorded outcome: the call still
+returns `Ok`.
 
 ## Embedded SOCKS5 server (`server` feature)
 
