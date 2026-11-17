@@ -398,6 +398,18 @@ def manifest_seeds(old, new, graph):
                 if {graph.packages[i]["name"] for i in found} != names:
                     raise MappingError("missing mapping: patch отсутствует в текущем графе (возможно удалён)")
                 seeds |= found
+        elif key == "profile":
+            # Only per-package overrides map to a package; any other profile
+            # change (lto, opt-level of the whole profile, ...) stays fail-closed.
+            for name in changed_keys(a.get(key, {}), b.get(key, {})):
+                pa, pb = a.get(key, {}).get(name, {}), b.get(key, {}).get(name, {})
+                if not isinstance(pa, dict) or not isinstance(pb, dict) or changed_keys(pa, pb) - {"package"}:
+                    raise MappingError("missing mapping: profile." + name)
+                names = changed_keys(pa.get("package", {}), pb.get("package", {}))
+                found = graph.named(names)
+                if {graph.packages[i]["name"] for i in found} != names:
+                    raise MappingError("missing mapping: профиль пакета отсутствует в текущем графе: profile." + name)
+                seeds |= found
         else:
             raise MappingError("missing mapping: Cargo.toml: " + key)
     return seeds
