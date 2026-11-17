@@ -178,8 +178,48 @@ async fn shutdown_sets_cancelled_and_reports_producers() {
     assert!(!handle.status().cancelled);
     assert!(!token.is_cancelled());
 
-    handle.shutdown().await;
+    let status_rx = handle.subscribe();
+    let outcomes = handle.shutdown_with_timeout(Duration::from_secs(5)).await;
+    assert!(outcomes.iter().all(|o| o.outcome.is_ok()));
     assert!(token.is_cancelled());
+    // H9.8: cancellation must also be visible via the status receiver.
+    assert!(status_rx.borrow().cancelled);
+}
+
+#[tokio::test]
+async fn shutdown_reports_panicking_producer() {
+    let task = tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        panic!("producer exploded");
+    });
+    let manager = test_manager(CancellationToken::new(), vec![("bad", task)]);
+    let outcomes = manager.shutdown_with_timeout(Duration::from_secs(5)).await;
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].producer, "bad");
+    assert_eq!(
+        outcomes[0].outcome.as_ref().unwrap_err(),
+        "producer exploded"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_with_timeout_bounds_hung_producer() {
+    let task = tokio::spawn(async {
+        // Does not respond to cancellation at all.
+        std::future::pending::<()>().await;
+    });
+    let manager = test_manager(CancellationToken::new(), vec![("hung", task)]);
+    let started = std::time::Instant::now();
+    let outcomes = manager
+        .shutdown_with_timeout(Duration::from_millis(200))
+        .await;
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].producer, "hung");
+    assert_eq!(
+        outcomes[0].outcome.as_ref().unwrap_err(),
+        "shutdown budget exceeded"
+    );
 }
 
 #[tokio::test]
@@ -227,7 +267,10 @@ async fn guarded_task(
     (handle, dropped_rx)
 }
 
-fn test_manager(token: CancellationToken, handles: Vec<JoinHandle<()>>) -> BridgeManagerHandle {
+fn test_manager(
+    token: CancellationToken,
+    handles: Vec<(&str, JoinHandle<()>)>,
+) -> BridgeManagerHandle {
     let (status_tx, status_rx) = watch::channel(BridgeManagerStatus {
         producers: Vec::new(),
         cancelled: false,
@@ -236,7 +279,10 @@ fn test_manager(token: CancellationToken, handles: Vec<JoinHandle<()>>) -> Bridg
         token,
         status_tx,
         status_rx,
-        handles,
+        handles: handles
+            .into_iter()
+            .map(|(name, handle)| (name.to_string(), handle))
+            .collect(),
         tasks_transferred: false,
     }
 }
@@ -244,7 +290,7 @@ fn test_manager(token: CancellationToken, handles: Vec<JoinHandle<()>>) -> Bridg
 #[tokio::test]
 async fn sdk14_dropping_manager_aborts_pending_tasks() {
     let (task, dropped) = guarded_task(None).await;
-    drop(test_manager(CancellationToken::new(), vec![task]));
+    drop(test_manager(CancellationToken::new(), vec![("task", task)]));
     tokio::time::timeout(Duration::from_secs(10), dropped)
         .await
         .expect("manager drop aborts its pending task within 10s")
@@ -257,10 +303,13 @@ async fn sdk14_cancelling_polled_shutdown_aborts_pending_tasks() {
 
     let (task, dropped) = guarded_task(None).await;
     let token = CancellationToken::new();
-    let mut shutdown = Box::pin(test_manager(token.clone(), vec![task]).shutdown());
+    let mut shutdown = Box::pin(
+        test_manager(token.clone(), vec![("task", task)])
+            .shutdown_with_timeout(Duration::from_secs(30)),
+    );
     std::future::poll_fn(|cx| match shutdown.as_mut().poll(cx) {
         std::task::Poll::Pending => std::task::Poll::Ready(()),
-        std::task::Poll::Ready(()) => panic!("shutdown unexpectedly completed"),
+        std::task::Poll::Ready(_) => panic!("shutdown unexpectedly completed"),
     })
     .await;
     assert!(token.is_cancelled());
@@ -277,7 +326,9 @@ async fn sdk14_cancelling_polled_shutdown_aborts_pending_tasks() {
 async fn sdk14_synthetic_child_cancellation_does_not_cancel_parent() {
     let parent = CancellationToken::new();
     let child = parent.child_token();
-    test_manager(child.clone(), Vec::new()).shutdown().await;
+    test_manager(child.clone(), Vec::new())
+        .shutdown_with_timeout(Duration::from_secs(5))
+        .await;
     assert!(child.is_cancelled());
     assert!(!parent.is_cancelled());
 }
@@ -287,7 +338,7 @@ async fn sdk14_transferred_synthetic_task_lives_until_parent_cancellation() {
     let parent = CancellationToken::new();
     let child = parent.child_token();
     let (task, mut dropped) = guarded_task(Some(child.clone())).await;
-    let manager = test_manager(child.clone(), vec![task]);
+    let manager = test_manager(child.clone(), vec![("task", task)]);
     let mut destination = Vec::new();
     manager.transfer_tasks(&mut destination);
 
@@ -397,7 +448,7 @@ async fn sdk14_manager_explicit_pt_reaches_maintenance_and_verifier() {
     .await
     .expect("maintenance and >30-minute verifier tick report within one hour");
 
-    manager.shutdown().await;
+    manager.shutdown_with_timeout(Duration::from_secs(30)).await;
     for (role, path) in observed {
         assert!(matches!(role, "maintenance" | "verifier"));
         assert_eq!(path, expected_pt, "{role} must retain manager PT policy");
@@ -470,6 +521,6 @@ async fn sdk14_manager_explicit_pt_reaches_maintenance_after_transport_free_star
     .await
     .expect("maintenance PT resolution report within one hour");
 
-    manager.shutdown().await;
+    manager.shutdown_with_timeout(Duration::from_secs(30)).await;
     assert_eq!(observed, vec![("maintenance", expected_pt)]);
 }

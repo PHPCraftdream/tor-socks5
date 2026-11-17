@@ -405,7 +405,7 @@ async fn invalid_reload_fails_before_readiness() {
     let handle = TorHandle::new(tor);
     let original = active.bridges.clone();
     for (case, expected) in [
-        (0, "изменение pre требует перезапуска"),
+        (0, "pre endpoint change requires a restart"),
         (
             1,
             "pre_proxies requires bridges.use_seeds and bridges.auto_fetch to be disabled",
@@ -415,12 +415,12 @@ async fn invalid_reload_fails_before_readiness() {
             "pre_proxies does not support pluggable transport bridges with unknown protocols",
         ),
         (3, "pre_proxies is incompatible with warm_pool.enabled"),
-        (4, "pre несовместим с upstream"),
+        (4, "pre endpoint is incompatible with upstream"),
         (
             5,
             "pre_proxies requires bridges.use_seeds and bridges.auto_fetch to be disabled",
         ),
-        (6, "изменение pre требует перезапуска"),
+        (6, "pre endpoint change requires a restart"),
     ] {
         let mut changed = cfg.clone();
         match case {

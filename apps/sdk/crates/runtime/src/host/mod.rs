@@ -1,10 +1,41 @@
-//! Process lifetime safety net: [`bind_child_processes_to_self`] is called
-//! once at startup. On Windows it puts our process into a Job Object with
-//! `KILL_ON_JOB_CLOSE`, so every child arti spawns (the lyrebird PT) is
-//! destroyed when we exit — clean exit, panic, `taskkill /F`, OS shutdown,
-//! all the same. This is the safety net for unclean termination.
+//! Host-side process initialization helpers for an embedding application.
+//!
+//! These are the pieces the *host* drives explicitly, in order, before any
+//! Tor client is built; the SDK itself never installs process-wide state on
+//! its own (R1):
+//!
+//! 1. [`install_crypto_provider`] — rustls 0.23 requires an explicit
+//!    process-wide crypto provider; without it arti's TLS (and the fresh
+//!    empty `state_dir` bootstrap path) fails.
+//! 2. [`bind_child_processes_to_self`] — OS-level guarantee that spawned
+//!    children (the lyrebird PT) do not outlive the host process.
+//!
+//! Logging is composed separately: `host::logging::log_layer` builds the
+//! fmt layer from a [`LogConfig`](proxy_config::LogConfig) for the host's
+//! own tracing registry.
+
+pub mod logging;
+
+/// Install the process-wide rustls crypto provider.
+///
+/// rustls 0.23 requires picking a process-wide crypto provider explicitly;
+/// arti's TLS — and a fresh empty `state_dir` bootstrap path — fails without
+/// it. Call this **once**, before any Tor client is built. The host calls it
+/// explicitly: the SDK never installs process state on its own (R1).
+pub fn install_crypto_provider() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("CryptoProvider must be installed exactly once");
+}
 
 /// Install OS-level guarantees that our child processes do not outlive us.
+///
+/// Outside Windows this is a documented no-op (no `prctl` `PR_SET_PDEATHSIG`
+/// yet). On Windows it puts the process in a `KILL_ON_JOB_CLOSE` Job Object,
+/// so spawned children (the lyrebird PT) die with the process — clean exit,
+/// panic, `taskkill /F`, OS shutdown, all the same. This is the safety net
+/// for unclean termination.
+///
 /// Safe to call multiple times; failures are logged and tolerated (the
 /// proxy still runs, we just lose the safety net on hard termination).
 #[cfg(windows)]
@@ -69,8 +100,9 @@ pub fn bind_child_processes_to_self() {
     }
 }
 
+/// Outside Windows this is a documented no-op (no `prctl` `PR_SET_PDEATHSIG`
+/// yet): child processes are not guaranteed to die with the host process.
+// TODO: prctl(PR_SET_PDEATHSIG) on Linux, posix_spawn flags elsewhere.
+// Not currently a supported target.
 #[cfg(not(windows))]
-pub fn bind_child_processes_to_self() {
-    // TODO: prctl(PR_SET_PDEATHSIG) on Linux, posix_spawn flags elsewhere.
-    // Not currently a supported target.
-}
+pub fn bind_child_processes_to_self() {}

@@ -270,9 +270,10 @@ pub(super) fn signal_budget_available(signals_sent: u32) -> bool {
 /// `[watchdog]` config section and one interval, since both read the same
 /// health data on the same cadence.
 ///
-/// Shutdown: the `token` is selected against before every tick, so no new check
-/// starts after cancellation; the check already in flight runs to completion
-/// and the caller joins the handle before closing the bridge-store writer.
+/// Shutdown: the `token` is selected against before every tick and against
+/// each in-flight network stage (`tunnel()`/`heal`), so cancellation cuts a
+/// hung stage off promptly; the caller joins the handle before closing the
+/// bridge-store writer.
 pub fn spawn_bridge_failover_watchdog(
     handle: TorHandle,
     config_path: Option<PathBuf>,
@@ -322,7 +323,12 @@ pub fn spawn_bridge_failover_watchdog(
                 _ = ticker.tick() => {},
             }
 
-            let Some(tor) = handle.tunnel().await else {
+            let tor = tokio::select! {
+                biased;
+                _ = token.cancelled() => break,
+                tor = handle.tunnel() => tor,
+            };
+            let Some(tor) = tor else {
                 // Slot drained (shutdown in progress) — nothing to signal.
                 continue;
             };
@@ -454,9 +460,10 @@ pub(super) fn healthiest(candidates: &[(BridgeLine, Health)]) -> Option<Health> 
 /// on failure; each returns its join handle so shutdown can join it after
 /// cancellation).
 ///
-/// Shutdown: the `token` is selected against before every tick, so no new check
-/// starts after cancellation; the check already in flight runs to completion
-/// and the caller joins the handle before closing the bridge-store writer.
+/// Shutdown: the `token` is selected against before every tick and against
+/// each in-flight network stage (`tunnel()`/`heal`), so cancellation cuts a
+/// hung stage off promptly; the caller joins the handle before closing the
+/// bridge-store writer.
 pub fn spawn_tor_watchdog(
     handle: TorHandle,
     config_path: Option<PathBuf>,
@@ -576,7 +583,12 @@ pub fn spawn_tor_watchdog(
                 }
                 // Канал pre может быть повторно использован и не доказывает свежую достижимость.
                 // Его наличие лишь разрешает попытку сброса при остальных условиях.
-                let Some(tor) = handle.tunnel().await else {
+                let tor = tokio::select! {
+                    biased;
+                    _ = token.cancelled() => break,
+                    tor = handle.tunnel() => tor,
+                };
+                let Some(tor) = tor else {
                     continue;
                 };
                 let alive =
@@ -665,14 +677,23 @@ pub fn spawn_tor_watchdog(
                 );
 
                 let canary_target = handle.health().last_success_target();
-                let Some(tor) = handle.tunnel().await else {
+                let tor = tokio::select! {
+                    biased;
+                    _ = token.cancelled() => break,
+                    tor = handle.tunnel() => tor,
+                };
+                let Some(tor) = tor else {
                     // Slot already drained (shutdown in progress) — nothing to
                     // heal. Leave the cooldown/failure counters untouched, same
                     // as the signature-gate decline above: this is not a failed
                     // attempt, just nothing to do.
                     continue;
                 };
-                let heal_result = heal(&tor, canary_target).await;
+                let heal_result = tokio::select! {
+                    biased;
+                    _ = token.cancelled() => break,
+                    result = heal(&tor, canary_target) => result,
+                };
                 match &heal_result {
                     HealResult::Healed => {
                         last_rebuild = Some(Instant::now());

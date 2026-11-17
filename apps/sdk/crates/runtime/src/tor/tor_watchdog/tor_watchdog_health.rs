@@ -281,6 +281,10 @@ impl BridgeRefresh {
 
 impl TorHandle {
     /// Wrap the bootstrapped tunnel. The handle is cheap to clone.
+    ///
+    /// Production producers should use [`new_with_settings`]; a handle built
+    /// here tracks no active bridges, so bridge producers
+    /// (verifier/warmer/failover) see an empty set.
     pub fn new(tor: TorTunnel) -> Self {
         Self {
             slot: Arc::new(RwLock::new(Some(tor))),
@@ -361,6 +365,31 @@ impl TorHandle {
 mod sdk14_tests {
     use super::*;
     use std::sync::Once;
+
+    #[tokio::test]
+    async fn new_leaves_active_bridges_empty_while_new_with_settings_seeds_them() {
+        static CRYPTO_PROVIDER: Once = Once::new();
+        CRYPTO_PROVIDER.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let bridge: BridgeLine = "192.0.2.14:443 1414141414141414141414141414141414141414"
+            .parse()
+            .unwrap();
+        let settings = arti_wrapper::Settings {
+            state_dir: Some(dir.path().to_path_buf()),
+            bridges: vec![bridge.clone()],
+            ..Default::default()
+        };
+        let tunnel = TorTunnel::create_unbootstrapped_with(settings.clone()).unwrap();
+
+        assert!(TorHandle::new(tunnel.clone()).active_bridges().is_empty());
+        assert_eq!(
+            TorHandle::new_with_settings(tunnel, &settings).active_bridges(),
+            vec![bridge]
+        );
+    }
 
     #[tokio::test]
     async fn sdk14_new_with_settings_initializes_active_bridges_and_verifier_candidates() {

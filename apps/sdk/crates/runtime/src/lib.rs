@@ -31,9 +31,17 @@ pub mod bridge_warmer;
 #[path = "bridges/candidate_pool.rs"]
 pub mod candidate_pool;
 
-mod config;
+/// Compatibility re-export: the Ktav config schema lives in the
+/// `proxy-config` workspace crate. Inline module keeps the historical
+/// `crate::config` path.
+mod config {
+    pub use ::proxy_config::*;
+}
 
-#[path = "bridge_manager.rs"]
+#[path = "host/mod.rs"]
+pub mod host;
+
+#[path = "bridge_manager/bridge_manager.rs"]
 pub mod bridge_manager;
 
 #[path = "tor/conn_health.rs"]

@@ -22,8 +22,9 @@
 //! `spawn_bridge_failover_watchdog`) belong to the server tree, not to this
 //! manager; a host composes them alongside.
 //!
-//! Shutdown order for a correct restart: [`BridgeManagerHandle::shutdown`]
-//! first (it awaits every producer so in-flight store writes land), then
+//! Shutdown order for a correct restart:
+//! [`BridgeManagerHandle::shutdown_with_timeout`] first (it awaits every
+//! producer so in-flight store writes land), then
 //! `bridge_store_writer::close_global`.
 //!
 //! # Fetching bridges
@@ -66,8 +67,9 @@ use anyhow::{Context, Result};
 use arti_wrapper::TorTunnel;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::arti_observability::ObservationSink;
 use crate::config::Config;
@@ -105,6 +107,17 @@ pub struct BridgeManagerStatus {
     pub cancelled: bool,
 }
 
+/// Per-producer shutdown result reported by
+/// [`BridgeManagerHandle::shutdown_with_timeout`].
+#[derive(Debug)]
+pub struct ProducerShutdownOutcome {
+    /// Producer name (e.g. `"maintenance"`).
+    pub producer: String,
+    /// `Ok(())` when the producer finished; `Err` carries the panic message
+    /// or `"shutdown budget exceeded"` when the task did not finish in time.
+    pub outcome: Result<(), String>,
+}
+
 /// Handle owning the producers started by [`start`] (R3).
 /// Dropping the handle cancels the token and aborts owned tasks unless their
 /// join handles have been transferred to another owner.
@@ -112,7 +125,7 @@ pub struct BridgeManagerHandle {
     token: CancellationToken,
     status_tx: watch::Sender<BridgeManagerStatus>,
     status_rx: watch::Receiver<BridgeManagerStatus>,
-    handles: Vec<JoinHandle<()>>,
+    handles: Vec<(String, JoinHandle<()>)>,
     tasks_transferred: bool,
 }
 
@@ -121,7 +134,7 @@ impl Drop for BridgeManagerHandle {
         if !self.tasks_transferred {
             self.token.cancel();
             self.status_tx.send_modify(|s| s.cancelled = true);
-            for handle in &self.handles {
+            for (_, handle) in &self.handles {
                 handle.abort();
             }
         }
@@ -144,19 +157,52 @@ impl BridgeManagerHandle {
         self.status_rx.clone()
     }
 
-    /// Cancel the token and await every producer JoinHandle, so in-flight
-    /// work (probe batches, store writes) lands before the caller closes the
-    /// bridge-store writer.
+    /// Cancel the token and await every producer JoinHandle within `budget`,
+    /// so in-flight work (probe batches, store writes) lands before the caller
+    /// closes the bridge-store writer.
+    ///
+    /// Budget semantics: the total time spent joining never exceeds `budget`
+    /// (plus scheduling slack). The remaining budget is shared across
+    /// producers in order; a hung producer consumes the rest, and any task
+    /// that does not finish in time is aborted and reported as
+    /// `Err("shutdown budget exceeded")`. A producer task that panicked is
+    /// reported as `Err(panic message)` and logged at `warn!`, so panics are
+    /// never silently lost.
     ///
     /// Cancel-safe: no. Cancelling this future drops the handle, aborting any
     /// remaining producer tasks without awaiting their completion.
-    pub async fn shutdown(mut self) {
+    pub async fn shutdown_with_timeout(mut self, budget: Duration) -> Vec<ProducerShutdownOutcome> {
         self.status_tx.send_modify(|s| s.cancelled = true);
         self.token.cancel();
-        for handle in &mut self.handles {
-            let _ = handle.await;
+
+        let deadline = Instant::now() + budget;
+        let mut outcomes = Vec::with_capacity(self.handles.len());
+        for (producer, handle) in self.handles.iter_mut() {
+            let producer = &**producer;
+            let result = if Instant::now() < deadline {
+                match tokio::time::timeout_at(deadline, &mut *handle).await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(join_error)) => {
+                        let message = panic_message(join_error);
+                        warn!(producer = %producer, message = %message, "producer task panicked during shutdown");
+                        Err(message)
+                    }
+                    Err(_) => {
+                        warn!(producer = %producer, "producer did not shut down within the budget; aborted");
+                        Err("shutdown budget exceeded".to_string())
+                    }
+                }
+            } else {
+                handle.abort();
+                warn!(producer = %producer, "producer did not shut down within the budget; aborted");
+                Err("shutdown budget exceeded".to_string())
+            };
+            outcomes.push(ProducerShutdownOutcome {
+                producer: producer.to_string(),
+                outcome: result,
+            });
         }
-        self.handles.clear();
+        outcomes
     }
 
     /// Transfer producer tasks to `destination` and disable cancellation on
@@ -164,7 +210,27 @@ impl BridgeManagerHandle {
     /// aborting every transferred task and must arrange their cancellation.
     pub fn transfer_tasks(mut self, destination: &mut Vec<JoinHandle<()>>) {
         self.tasks_transferred = true;
-        destination.extend(std::mem::take(&mut self.handles));
+        destination.extend(
+            std::mem::take(&mut self.handles)
+                .into_iter()
+                .map(|(_, handle)| handle),
+        );
+    }
+}
+
+/// Extract a human-readable message from a `JoinError` panic payload.
+fn panic_message(join_error: tokio::task::JoinError) -> String {
+    if join_error.is_panic() {
+        let payload = join_error.into_panic();
+        if let Some(message) = payload.downcast_ref::<&str>() {
+            (*message).to_string()
+        } else if let Ok(message) = payload.downcast::<String>() {
+            *message
+        } else {
+            "unknown panic payload".to_string()
+        }
+    } else {
+        join_error.to_string()
     }
 }
 
@@ -286,7 +352,10 @@ fn start_with_token(
         token,
         status_tx,
         status_rx,
-        handles: producers.into_iter().map(|(_, handle)| handle).collect(),
+        handles: producers
+            .into_iter()
+            .map(|(name, handle)| (name.to_string(), handle))
+            .collect(),
         tasks_transferred: false,
     }
 }
@@ -531,5 +600,5 @@ pub async fn fetch_bridges(
 }
 
 #[cfg(test)]
-#[path = "bridge_manager/tests.rs"]
+#[path = "tests.rs"]
 mod tests;

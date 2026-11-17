@@ -171,7 +171,7 @@ pub(crate) fn candidates_with_health(
     let parsed = match cfg.bridges.parsed() {
         Ok(p) => p.bridges,
         Err(e) => {
-            warn!(error = %e, "warm-pool: config has invalid bridges");
+            warn!(error = %e, "config has invalid bridges");
             return Vec::new();
         }
     };
@@ -183,7 +183,7 @@ pub(crate) fn candidates_with_health(
     let store = match BridgeStore::load(store_path) {
         Ok(s) => Some(s),
         Err(e) => {
-            warn!(error = %e, "warm-pool: could not load bridge health store");
+            warn!(error = %e, "could not load bridge health store");
             None
         }
     };

@@ -301,8 +301,13 @@ fn runtime_module_tor_client_surface() {
     let _: fn(Option<&Path>) -> PathBuf = tor_socks5::runtime::arti_keystore_dir;
     let _: fn(&tor_socks5::runtime::TorError, &TorHealth) =
         tor_socks5::runtime::classify_and_record;
-    let _: fn(ConnHealthCounters, ConnHealthConfig) -> Option<tokio::task::JoinHandle<()>> =
-        tor_socks5::runtime::spawn_conn_health_logger;
+    // The token type is not re-exported by the facade: pinned generically.
+    fn expect_conn_health_spawn<T>(
+        _f: fn(ConnHealthCounters, ConnHealthConfig, T) -> Option<tokio::task::JoinHandle<()>>,
+    ) {
+    }
+    expect_conn_health_spawn(tor_socks5::runtime::spawn_conn_health_logger);
+    let _ = tor_socks5::runtime::run_conn_health_logger;
     let _: fn(Option<&Path>) -> tor_socks5::runtime::StoreWriter = tor_socks5::runtime::init_global;
     fn expect_close_global<F: Future>(_f: fn() -> F) {}
     expect_close_global(tor_socks5::runtime::close_global);
@@ -460,8 +465,8 @@ fn runtime_bridge_manager_surface() {
     }
     assert_start_signatures(assert_start_signature, assert_parent_token_start_signature);
     fn assert_clone_send_sync<T: Clone + Send + Sync + 'static>(_: &T) {}
-    fn expect_shutdown(handle: BridgeManagerHandle) -> impl Future<Output = ()> {
-        handle.shutdown()
+    fn expect_shutdown(handle: BridgeManagerHandle) -> impl Future {
+        handle.shutdown_with_timeout(std::time::Duration::from_secs(1))
     }
     fn assert_bridge_manager_methods(handle: &BridgeManagerHandle) {
         let _: BridgeManagerStatus = handle.status();

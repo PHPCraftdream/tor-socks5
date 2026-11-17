@@ -18,6 +18,7 @@
 //! | [`dns`] | `tor-socks5-dns` | `dns` |
 //! | [`onion`] | `tor-socks5-onion` | `onion`, `onion-keys`, `onion-host` |
 //! | [`runtime`] | `tor-socks5-runtime` — the curated SDK-7/8/9 surfaces, not the whole crate | `runtime` |
+//! | [`pt`] | `tor-socks5-runtime` — managed-transport PT dispatch | `pt` |
 //! | [`server`] | `tor-socks5-server` — the curated embedded server API | `server` |
 //!
 //! The `tor` feature (and `fetch`, `dns`, `runtime`, `server`, `onion-service`,
@@ -69,6 +70,13 @@ pub use ::arti_wrapper as tor;
 /// Fetching bridge lists over Tor or directly (`bridge-fetcher`).
 #[cfg(feature = "fetch")]
 pub use ::bridge_fetcher as fetch;
+
+/// Install the process-wide rustls crypto provider. rustls 0.23 requires an
+/// explicit provider; call this once, before any Tor client bootstraps —
+/// a fresh state dir fails its TLS setup without it. The SDK never installs
+/// process state on its own (R1): the host does.
+#[cfg(feature = "runtime")]
+pub use ::tor_socks5_runtime::host::install_crypto_provider;
 
 /// A local DNS resolver that asks over Tor (`tor-socks5-dns`).
 #[cfg(feature = "dns")]
@@ -134,8 +142,9 @@ pub use ::tor_socks5_onion as onion;
 ///   [`runtime::classify_and_record`] are exported at the same flat level.
 /// - [`runtime::ConnHealthCounters`], [`runtime::ConnHealthSnapshot`],
 ///   [`runtime::PendingConnectionGuard`], [`runtime::ConnStage`],
-///   [`runtime::ConnErrorKind`], and [`runtime::spawn_conn_health_logger`]
-///   expose connection-health counters and windowed snapshots.
+///   [`runtime::ConnErrorKind`], [`runtime::spawn_conn_health_logger`], and
+///   [`runtime::run_conn_health_logger`] expose connection-health counters and
+///   windowed snapshots.
 ///
 /// These functions take [`runtime::WatchdogConfig`] and
 /// [`runtime::ConnHealthConfig`] where applicable. [`runtime::TorError`] is
@@ -163,8 +172,8 @@ pub mod runtime {
     pub use ::proxy_config::{ConnHealthConfig, WatchdogConfig};
     /// Connection-health counters and their periodic logger.
     pub use ::tor_socks5_runtime::conn_health::{
-        spawn_conn_health_logger, ConnErrorKind, ConnHealthCounters, ConnHealthSnapshot, ConnStage,
-        PendingConnectionGuard,
+        run_conn_health_logger, spawn_conn_health_logger, ConnErrorKind, ConnHealthCounters,
+        ConnHealthSnapshot, ConnStage, PendingConnectionGuard,
     };
     /// Pluggable-transport executable policy.
     pub use ::tor_socks5_runtime::pt::PtBinary;
@@ -198,6 +207,24 @@ pub mod runtime {
         fetch_bridges, start, start_with_parent_token, BridgeManagerConfig, BridgeManagerHandle,
         BridgeManagerStatus, FetchBridgesError, FetchBridgesOutcome, FetchBridgesParams,
     };
+
+    pub use ::tor_socks5_runtime::host::bind_child_processes_to_self;
+    /// Host-process initialisation for an embedding application:
+    /// [`bind_child_processes_to_self`] (on Windows, put spawned children —
+    /// the lyrebird PT — in a `KILL_ON_JOB_CLOSE` Job Object so they die
+    /// with the host process; a documented no-op elsewhere) and [`log_layer`]
+    /// (build the tracing fmt layer from a [`LogConfig`](crate::config::LogConfig)
+    /// together with its non-blocking writer's guard, without installing a
+    /// global subscriber).
+    pub use ::tor_socks5_runtime::host::logging::log_layer;
+}
+
+/// Pluggable-transport dispatch for an embedding host: when arti spawns
+/// this process as a managed transport, run the in-process lyrebird PT
+/// loop. See [`pt::run_if_managed_transport`].
+#[cfg(feature = "pt")]
+pub mod pt {
+    pub use ::tor_socks5_runtime::pt::run_if_managed_transport;
 }
 
 /// Embedded SOCKS5/HTTP CONNECT server API (`tor-socks5-server`), curated to

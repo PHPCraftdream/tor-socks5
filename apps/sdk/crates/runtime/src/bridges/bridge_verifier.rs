@@ -166,10 +166,12 @@ fn admission_verification(
 /// `spawn_bridge_maintenance`) and checks only start one interval in.
 ///
 /// Shutdown: the `token` is selected against before every tick, so no new
-/// verification batch starts after cancellation; a batch already in flight (a
-/// non-cancellable `spawn_blocking` job) runs to completion and its results are
-/// persisted before the caller joins the handle and closes the bridge-store
-/// writer.
+/// verification batch starts after cancellation. The tick body also selects
+/// on the token while its blocking verification job runs (`spawn_tracked_blocking`
+/// has no abort API, so the job itself finishes on its own, but the tick —
+/// and the whole task after cancellation — no longer waits for it or
+/// persists its results); the blocking-worker group is joined by the owner
+/// before the bridge-store writer closes, so nothing is orphaned.
 pub fn spawn_bridge_circuit_verifier(
     config_path: Option<PathBuf>,
     handle: crate::tor_watchdog::TorHandle,
@@ -203,6 +205,7 @@ pub(crate) fn spawn_bridge_circuit_verifier_with_pt(
                 config_path.as_deref(),
                 &handle.active_bridges(),
                 pt_binary.clone(),
+                &token,
             )
             .await;
         }
@@ -220,13 +223,15 @@ pub(crate) fn spawn_bridge_circuit_verifier_with_pt(
 /// One tick: pick the due batch, verify it, persist the results.
 #[cfg(test)]
 pub(crate) async fn run_circuit_verify_tick(config_path: Option<&Path>, active: &[BridgeLine]) {
-    run_circuit_verify_tick_with_pt(config_path, active, PtBinary::Environment).await;
+    let token = tokio_util::sync::CancellationToken::new();
+    run_circuit_verify_tick_with_pt(config_path, active, PtBinary::Environment, &token).await;
 }
 
 pub(crate) async fn run_circuit_verify_tick_with_pt(
     config_path: Option<&Path>,
     active: &[BridgeLine],
     pt_policy: PtBinary,
+    token: &CancellationToken,
 ) {
     let store_path = BridgeStore::resolve_path(config_path);
     // Blocking file read (incl. reader-side stale-temp cleanup) must not run
@@ -291,8 +296,23 @@ pub(crate) async fn run_circuit_verify_tick_with_pt(
     // snapshot below is always taken from the client that is actually
     // running. Must stay in sync — hence the shared helper.
     let live_cache_dir = crate::tor_setup::arti_base_dir(config_path).join("cache");
-    let scratch_base =
-        std::env::temp_dir().join(format!("torsocks5-circuit-verify-{}", std::process::id()));
+    // Per-batch unique scratch directory (H9.4): created here, moved into
+    // the blocking job below. `TempDir` cleans up on drop — including when
+    // the (never-abortable) job finishes after cancellation — so the old
+    // pid-shared `temp_dir()/torsocks5-circuit-verify-{pid}` path and its
+    // manual removal are gone. Creating it here (not inside the job) also
+    // means the directory exists before `verify_bridges_sequential` writes
+    // its PT kill marker into it.
+    let scratch_base = match tempfile::Builder::new()
+        .prefix("torsocks5-circuit-verify-")
+        .tempdir()
+    {
+        Ok(dir) => dir,
+        Err(error) => {
+            warn!(%error, "circuit-verify: could not create scratch directory");
+            return;
+        }
+    };
 
     // `verify_bridges_sequential` blocks its calling thread (it builds and
     // drives its own throwaway per-bridge tokio runtimes internally), so it
@@ -301,7 +321,7 @@ pub(crate) async fn run_circuit_verify_tick_with_pt(
         let mut results = Vec::new();
         verify_bridges_sequential(
             &live_cache_dir,
-            &scratch_base,
+            scratch_base.path(),
             due,
             pt_binary,
             CIRCUIT_VERIFY_BOOTSTRAP_TIMEOUT,
@@ -309,7 +329,7 @@ pub(crate) async fn run_circuit_verify_tick_with_pt(
             None,
             |bridge, result| results.push((bridge.clone(), result.is_ok())),
         );
-        let _ = std::fs::remove_dir_all(&scratch_base);
+        // `scratch_base` (the `TempDir`) drops here: cleanup is its job now.
         results
     })
     .await
@@ -320,12 +340,24 @@ pub(crate) async fn run_circuit_verify_tick_with_pt(
             return;
         }
     };
-    let results = match results_rx.await {
-        Ok(results) => results,
-        Err(error) => {
-            warn!(%error, "circuit-verify: verifier worker failed");
+    let results = tokio::select! {
+        biased;
+        // Cancellation must cut off the whole verification batch (up to
+        // CIRCUIT_VERIFY_BATCH × (bootstrap + probe) minutes). The tracked
+        // blocking job has no abort API and finishes on its own in the
+        // worker group (joined at shutdown before the store writer closes);
+        // we simply stop waiting for it and skip persisting its results.
+        _ = token.cancelled() => {
+            info!("circuit-verify: tick cancelled during verification; results discarded");
             return;
         }
+        results = results_rx => match results {
+            Ok(results) => results,
+            Err(error) => {
+                warn!(%error, "circuit-verify: verifier worker failed");
+                return;
+            }
+        },
     };
 
     let verified = results.iter().filter(|(_, ok)| *ok).count();
