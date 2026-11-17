@@ -1,7 +1,6 @@
 //! Bridge reachability probing and arti `Settings` construction.
 //!
-//! Shared by the server startup path (crate::server::run_server) and
-//! the `bridges fetch` command (crate::bridges_cmd::cmd_bridges).
+//! Shared by the SDK server startup path and `fetch_bridges`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;

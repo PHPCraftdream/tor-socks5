@@ -59,6 +59,6 @@ tokio = { workspace = true, features = ["test-util"] }
 # The moved tests drive the runtime's test seams (ParkedGate, TestWorkers,
 # FORBID_PRODUCER, ...); R10: the feature is enabled only here.
 tor-socks5-runtime = { path = "../runtime", version = "0.2.0", features = ["test-seams"] }
-# The onion-service shell tests inspect the keystore layout (`identity_file`),
-# which tor-socks5-onion exports only under its own test seams.
+# The onion keys API is narrowed behind `test-seams`; moved tests drive those
+# seams directly (same pattern as the tor-socks5-runtime line above).
 tor-socks5-onion = { path = "../onion", version = "0.2.0", features = ["test-seams"] }

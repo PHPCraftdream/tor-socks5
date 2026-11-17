@@ -42,6 +42,53 @@ pub enum PtBinary {
     Explicit(std::path::PathBuf),
 }
 
+/// Pure decision: is this process running as a managed pluggable transport?
+/// arti (tor-ptmgr) marks managed PT children by setting
+/// `TOR_PT_MANAGED_TRANSPORT_VER`; test via this pure fn, never by mutating
+/// the real env var.
+#[cfg(any(test, feature = "pt"))]
+fn managed_transport_requested(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some()
+}
+
+/// Busybox dispatch for an embedding host: when arti spawns this process as
+/// a managed pluggable transport (`TOR_PT_MANAGED_TRANSPORT_VER` set), run
+/// the in-process lyrebird PT loop — same binary, two modes, no second
+/// executable on disk. Returns `None` when not in PT mode (the host then
+/// carries on with its normal startup).
+///
+/// arti (tor-ptmgr) sets `TOR_PT_EXIT_ON_STDIN_CLOSE=1` on managed PT
+/// children and, per the pluggable-transport spec, signals shutdown by
+/// closing the child's stdin. `ptrs-gesher-lyrebird` 0.6.0+ honours
+/// this itself (fixed upstream: the process now watches stdin and
+/// exits cleanly on EOF when the env var is set) — no workaround
+/// needed here.
+///
+/// The dedicated Tokio runtime is sized generously (32 worker threads) for
+/// the same reason as the proxy-mode runtime: a bursty client (e.g.
+/// Telegram opening dozens of simultaneous connections) drives just as many
+/// concurrent obfs4/webtunnel handshake attempts here, in the PT child. A
+/// small pool risks the same worker-starvation pattern that once stalled
+/// the bridge-descriptor fetch task.
+#[cfg(feature = "pt")]
+pub fn run_if_managed_transport() -> Option<anyhow::Result<()>> {
+    use anyhow::Context;
+
+    if !managed_transport_requested(std::env::var_os("TOR_PT_MANAGED_TRANSPORT_VER").as_deref()) {
+        return None;
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(32)
+        .enable_all()
+        .build()
+        .context("building Tokio runtime for pluggable-transport mode");
+    match rt {
+        Err(e) => Some(Err(e)),
+        Ok(rt) => Some(rt.block_on(lyrebird::run())),
+    }
+}
+
 #[cfg(any(test, feature = "test-seams"))]
 tokio::task_local! {
     pub(crate) static SDK14_PT_OBSERVER: (
@@ -137,6 +184,16 @@ pub(crate) fn extra_pt_protocols(
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    #[test]
+    fn managed_transport_not_requested_when_env_absent() {
+        assert!(!managed_transport_requested(None));
+    }
+
+    #[test]
+    fn managed_transport_requested_when_env_present() {
+        assert!(managed_transport_requested(Some(std::ffi::OsStr::new("1"))));
+    }
 
     #[test]
     fn test_pt_binary_override_from_set() {
