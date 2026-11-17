@@ -246,7 +246,7 @@ fn vanity_prefix_found_end_to_end_through_supplied() {
     };
     let mut mine = || -> anyhow::Result<crate::address::Keypair> {
         match crate::vanity::search(&target, &opts) {
-            crate::vanity::SearchOutcome::Found(keypair) => Ok(keypair),
+            Ok(crate::vanity::SearchOutcome::Found(keypair)) => Ok(keypair),
             outcome => anyhow::bail!("vanity search did not find a key: {:?}", outcome),
         }
     };
@@ -274,7 +274,7 @@ fn vanity_search_timing_out_saves_nothing() {
     };
     let mut mine = || -> anyhow::Result<crate::address::Keypair> {
         match crate::vanity::search(&target, &opts) {
-            crate::vanity::SearchOutcome::Found(keypair) => Ok(keypair),
+            Ok(crate::vanity::SearchOutcome::Found(keypair)) => Ok(keypair),
             _ => anyhow::bail!("vanity search timed out"),
         }
     };

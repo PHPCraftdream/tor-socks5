@@ -7,9 +7,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ::tor_socks5_onion::address::{generate, Keypair};
+use ::tor_socks5_onion::address::Keypair;
 use ::tor_socks5_onion::vanity::{
-    estimate, expected_attempts, search, worker_count, SearchOptions, SearchOutcome, VanityTarget,
+    estimate, expected_attempts, measure_rate, search, worker_count, SearchOptions, SearchOutcome,
+    VanityTarget,
 };
 
 /// Parse a duration: a non-negative number plus unit s|m|h; a bare number
@@ -42,27 +43,7 @@ fn parse_duration(s: &str) -> anyhow::Result<Duration> {
 
 /// Measure attempts/s over ~1s with `threads` worker threads.
 fn warmup_rate(threads: usize) -> Option<f64> {
-    let attempts = Arc::new(AtomicU64::new(0));
-    let stop = Arc::new(AtomicBool::new(false));
-    let mut handles = Vec::new();
-    for _ in 0..threads {
-        let attempts = Arc::clone(&attempts);
-        let stop = Arc::clone(&stop);
-        handles.push(thread::spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
-                let _ = generate();
-                attempts.fetch_add(1, Ordering::Relaxed);
-            }
-        }));
-    }
-    let start = Instant::now();
-    thread::sleep(Duration::from_secs(1));
-    stop.store(true, Ordering::Relaxed);
-    for handle in handles {
-        let _ = handle.join();
-    }
-    let elapsed = start.elapsed().as_secs_f64();
-    (elapsed > 0.0).then(|| attempts.load(Ordering::Relaxed) as f64 / elapsed)
+    measure_rate(threads, Duration::from_secs(1))
 }
 
 /// Spawn a detached thread that sets `cancel` on Ctrl-C.
@@ -149,7 +130,7 @@ pub(crate) fn search_for_cli(
             }
         });
     }
-    let outcome = search(
+    let outcome = match search(
         &target,
         &SearchOptions {
             threads: threads.unwrap_or(0),
@@ -157,7 +138,10 @@ pub(crate) fn search_for_cli(
             cancel: Arc::clone(&cancel),
             progress: Some(Arc::clone(&progress)),
         },
-    );
+    ) {
+        Ok(outcome) => outcome,
+        Err(e) => bail!("vanity search failed to start: {e}"),
+    };
     done.store(true, Ordering::Relaxed);
 
     match outcome {
@@ -172,6 +156,10 @@ pub(crate) fn search_for_cli(
         SearchOutcome::Cancelled { attempts } => {
             eprintln!("vanity search: interrupted by Ctrl-C after {attempts} attempts");
             bail!("vanity search interrupted; no key was saved");
+        }
+        SearchOutcome::Panicked { attempts } => {
+            eprintln!("vanity search: {attempts} attempts before abort");
+            bail!("vanity search aborted: a worker thread panicked");
         }
     }
 }

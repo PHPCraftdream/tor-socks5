@@ -305,7 +305,7 @@ pub fn fresh_identity(nickname: &str) -> (String, String) {
     use tor_llcrypto::pk::ed25519::ExpandedKeypair;
 
     let generated = crate::address::generate();
-    let expanded = ExpandedKeypair::from_secret_key_bytes(generated.to_expanded_bytes())
+    let expanded = ExpandedKeypair::from_secret_key_bytes(*generated.to_expanded_bytes())
         .expect("expanded keypair");
     let keypair = HsIdKeypair::from(expanded);
     let nick = store::nickname(nickname).expect("nickname");
