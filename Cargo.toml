@@ -114,6 +114,14 @@ resocks5-net = { version = "0.5.2", default-features = false }
 lto = "thin"
 codegen-units = 1
 
+# Argon2 password hashing is CPU-bound; unoptimized it makes auth tests slow
+# enough to blow their wall-clock budgets on a loaded machine.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
 [patch.crates-io]
 ## Vendored, locally-fixed forks of upstream crates. We keep the full
 ## source in `vendor/` (see vendor/README.md) and override the crates.io
