@@ -209,7 +209,7 @@ pub fn remove_service(
 /// The keystore keypair of a generated or searched key, checked against the
 /// address the generator computed.
 fn hs_keypair(generated: &crate::address::Keypair) -> Result<HsIdKeypair, KeysError> {
-    let expanded = ExpandedKeypair::from_secret_key_bytes(generated.to_expanded_bytes())
+    let expanded = ExpandedKeypair::from_secret_key_bytes(*generated.to_expanded_bytes())
         .context("invalid expanded secret key")?;
     let key = HsIdKeypair::from(expanded);
     if store::address_of(&key) != generated.address() {

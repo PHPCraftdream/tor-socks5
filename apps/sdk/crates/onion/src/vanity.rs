@@ -14,7 +14,11 @@ use super::address::{generate, Keypair};
 /// longer is unrealistic.
 pub const MAX_PREFIX_LEN: usize = 8;
 
-/// Errors returned by [`VanityTarget::new`].
+/// Upper bound on worker threads: spawn cost and diminishing returns make
+/// more pointless (also caps the executor's chosen thread count).
+pub const MAX_THREADS: usize = 64;
+
+/// Errors returned by [`VanityTarget::new`] and [`search`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum VanityError {
     /// Empty prefix.
@@ -26,6 +30,9 @@ pub enum VanityError {
     /// A character outside the base32 alphabet (a-z, 2-7).
     #[error("invalid character {0:?}: base32 uses a-z and 2-7 (no 0, 1, 8, or 9)")]
     InvalidCharacter(char),
+    /// A worker thread could not be spawned.
+    #[error("failed to spawn vanity worker thread: {0}")]
+    Spawn(String),
 }
 
 /// A validated vanity prefix, precompiled to a bit pattern for fast
@@ -85,22 +92,23 @@ impl VanityTarget {
 }
 
 /// Expected number of key generations to find a prefix of `len` base32
-/// characters: 32^len.
+/// characters: 32^len. Lengths beyond [`MAX_PREFIX_LEN`] are clamped.
 #[must_use]
 pub fn expected_attempts(len: usize) -> u64 {
-    assert!(len <= MAX_PREFIX_LEN, "prefix too long");
+    let len = len.min(MAX_PREFIX_LEN);
     32u64.pow(len as u32)
 }
 
 /// Rough wall-clock estimate for finding a prefix at `rate_per_sec` keys/s.
+/// Non-finite or non-positive rates yield [`Duration::MAX`].
 #[must_use]
 pub fn estimate(prefix_len: usize, rate_per_sec: f64) -> Duration {
     let attempts = expected_attempts(prefix_len);
-    if rate_per_sec <= 0.0 {
+    if rate_per_sec <= 0.0 || rate_per_sec.is_nan() {
         return Duration::MAX;
     }
-    let secs = (attempts as f64 / rate_per_sec).min(u64::MAX as f64);
-    Duration::from_secs_f64(secs)
+    let secs = attempts as f64 / rate_per_sec;
+    Duration::try_from_secs_f64(secs).unwrap_or(Duration::MAX)
 }
 
 /// Configuration for [`search`].
@@ -142,6 +150,11 @@ pub enum SearchOutcome {
         /// Total attempts across all threads.
         attempts: u64,
     },
+    /// A worker thread panicked.
+    Panicked {
+        /// Total attempts across all threads.
+        attempts: u64,
+    },
 }
 
 impl SearchOutcome {
@@ -149,94 +162,195 @@ impl SearchOutcome {
     pub fn attempts(&self) -> u64 {
         match self {
             SearchOutcome::Found(_) => 0,
-            SearchOutcome::TimedOut { attempts } | SearchOutcome::Cancelled { attempts } => {
-                *attempts
-            }
+            SearchOutcome::TimedOut { attempts }
+            | SearchOutcome::Cancelled { attempts }
+            | SearchOutcome::Panicked { attempts } => *attempts,
         }
     }
 }
+
+#[cfg(test)]
+static SPAWN_FAIL: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static WORKER_PANIC: AtomicBool = AtomicBool::new(false);
 
 /// Search for a keypair whose address starts with `target`'s prefix.
 ///
 /// Plain `std::thread` workers share an attempts counter and a stop flag;
 /// the first match stops all other workers.
-#[must_use]
-pub fn search(target: &VanityTarget, opts: &SearchOptions) -> SearchOutcome {
+///
+/// Returns `Err` only when a worker thread could not be spawned; a worker
+/// panic instead yields [`SearchOutcome::Panicked`] after the remaining
+/// workers are joined.
+pub fn search(target: &VanityTarget, opts: &SearchOptions) -> Result<SearchOutcome, VanityError> {
     let threads = worker_count(opts.threads);
     let attempts = Arc::new(AtomicU64::new(0));
     // Local stop flag: set by the finder (and on deadline), ORed with the
     // caller's cancel flag in the worker loop.
     let stop = Arc::new(AtomicBool::new(opts.cancel.load(Ordering::Relaxed)));
-    let deadline = opts.time_limit.map(|d| Instant::now() + d);
+    // checked_add: an over-large time limit must disable the deadline,
+    // not panic.
+    let deadline = opts.time_limit.and_then(|d| Instant::now().checked_add(d));
 
-    let mut handles = Vec::with_capacity(threads);
+    let mut handles: Vec<thread::JoinHandle<Option<Keypair>>> = Vec::with_capacity(threads);
     for _ in 0..threads {
         let target = target.clone();
+        // Test seams are keyed to a sentinel prefix so parallel search
+        // tests are unaffected.
+        #[cfg(test)]
+        let spawn_seam = target.prefix() == "ababa";
+        #[cfg(test)]
+        let panic_seam = target.prefix() == "abab7";
+        #[cfg(test)]
+        if spawn_seam && SPAWN_FAIL.load(Ordering::Relaxed) {
+            stop.store(true, Ordering::Relaxed);
+            for handle in handles {
+                let _ = handle.join();
+            }
+            return Err(VanityError::Spawn("spawn disabled in test".to_owned()));
+        }
+        let target = target.clone();
         let attempts = Arc::clone(&attempts);
-        let stop = Arc::clone(&stop);
+        let worker_stop = Arc::clone(&stop);
         let cancel = Arc::clone(&opts.cancel);
         let progress = opts.progress.clone();
-        handles.push(thread::spawn(move || {
-            let mut local = 0u64;
-            loop {
-                if local.is_multiple_of(64)
-                    && (stop.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed))
-                {
-                    break;
-                }
-                let kp = generate();
-                local += 1;
-                if target.matches(kp.pubkey()) {
-                    stop.store(true, Ordering::Relaxed);
-                    attempts.fetch_add(local, Ordering::Relaxed);
-                    if let Some(p) = &progress {
-                        p.fetch_add(local, Ordering::Relaxed);
+        let spawned = thread::Builder::new()
+            .name("vanity-search".to_owned())
+            .spawn(move || {
+                let mut local = 0u64;
+                loop {
+                    #[cfg(test)]
+                    if panic_seam && WORKER_PANIC.load(Ordering::Relaxed) {
+                        panic!("worker panic seam");
                     }
-                    return Some(kp);
-                }
-                if let Some(deadline) = deadline {
-                    if Instant::now() >= deadline {
-                        stop.store(true, Ordering::Relaxed);
+                    if local.is_multiple_of(64)
+                        && (worker_stop.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed))
+                    {
+                        break;
+                    }
+                    let kp = generate();
+                    local += 1;
+                    if target.matches(kp.pubkey()) {
+                        worker_stop.store(true, Ordering::Relaxed);
                         attempts.fetch_add(local, Ordering::Relaxed);
                         if let Some(p) = &progress {
                             p.fetch_add(local, Ordering::Relaxed);
                         }
-                        return None;
+                        return Some(kp);
+                    }
+                    if let Some(deadline) = deadline {
+                        if Instant::now() >= deadline {
+                            worker_stop.store(true, Ordering::Relaxed);
+                            attempts.fetch_add(local, Ordering::Relaxed);
+                            if let Some(p) = &progress {
+                                p.fetch_add(local, Ordering::Relaxed);
+                            }
+                            return None;
+                        }
                     }
                 }
+                attempts.fetch_add(local, Ordering::Relaxed);
+                if let Some(p) = &progress {
+                    p.fetch_add(local, Ordering::Relaxed);
+                }
+                None
+            });
+        let handle = match spawned {
+            Ok(handle) => handle,
+            Err(err) => {
+                stop.store(true, Ordering::Relaxed);
+                for handle in handles {
+                    let _ = handle.join();
+                }
+                return Err(VanityError::Spawn(err.to_string()));
             }
-            attempts.fetch_add(local, Ordering::Relaxed);
-            if let Some(p) = &progress {
-                p.fetch_add(local, Ordering::Relaxed);
-            }
-            None
-        }));
+        };
+        handles.push(handle);
     }
 
     let mut found = None;
+    let mut panicked = false;
     for handle in handles {
-        if let Ok(Some(kp)) = handle.join() {
-            found = Some(kp);
+        match handle.join() {
+            Ok(Some(kp)) => found = Some(kp),
+            Ok(None) => {}
+            Err(_) => {
+                // A worker panicked: stop the rest, keep joining.
+                panicked = true;
+                stop.store(true, Ordering::Relaxed);
+            }
         }
     }
     let total = attempts.load(Ordering::Relaxed);
     if let Some(kp) = found {
-        return SearchOutcome::Found(kp);
+        return Ok(SearchOutcome::Found(kp));
+    }
+    if panicked {
+        return Ok(SearchOutcome::Panicked { attempts: total });
     }
     if opts.cancel.load(Ordering::Relaxed) {
-        return SearchOutcome::Cancelled { attempts: total };
+        return Ok(SearchOutcome::Cancelled { attempts: total });
     }
-    SearchOutcome::TimedOut { attempts: total }
+    Ok(SearchOutcome::TimedOut { attempts: total })
+}
+
+/// Rough attempts/s measured by running `worker_count(threads)` generation
+/// workers for `duration`.
+#[must_use]
+pub fn measure_rate(threads: usize, duration: Duration) -> Option<f64> {
+    let threads = worker_count(threads);
+    let attempts = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut handles: Vec<thread::JoinHandle<()>> = Vec::with_capacity(threads);
+    for _ in 0..threads {
+        let attempts = Arc::clone(&attempts);
+        let stop = Arc::clone(&stop);
+        let worker_stop = Arc::clone(&stop);
+        let spawned = thread::Builder::new()
+            .name("vanity-rate".to_owned())
+            .spawn(move || {
+                while !worker_stop.load(Ordering::Relaxed) {
+                    let _ = generate();
+                    attempts.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        match spawned {
+            Ok(handle) => handles.push(handle),
+            Err(err) => {
+                stop.store(true, Ordering::Relaxed);
+                for handle in handles {
+                    let _ = handle.join();
+                }
+                eprintln!("failed to spawn rate-measurement worker thread: {err}");
+                return None;
+            }
+        }
+    }
+    let start = Instant::now();
+    thread::sleep(duration);
+    stop.store(true, Ordering::Relaxed);
+    for handle in handles {
+        let _ = handle.join();
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    if elapsed > 0.0 {
+        Some(attempts.load(Ordering::Relaxed) as f64 / elapsed)
+    } else {
+        None
+    }
 }
 
 /// Resolve the configured thread count; 0 means all-but-one core, min 1.
+/// Always clamped to [`MAX_THREADS`].
+#[must_use]
 pub fn worker_count(requested: usize) -> usize {
     if requested > 0 {
-        return requested;
+        return min(requested, MAX_THREADS);
     }
     let cores = thread::available_parallelism().map_or(1, |n| n.get());
-    min(cores.saturating_sub(1).max(1), usize::MAX)
+    min(cores.saturating_sub(1).max(1), MAX_THREADS)
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,13 +416,23 @@ mod tests {
         assert_eq!(expected_attempts(8), 1u64 << 40);
     }
 
+    /// Lengths beyond MAX_PREFIX_LEN are clamped, not asserted on.
+    #[test]
+    fn expected_attempts_clamps_long_input() {
+        assert_eq!(expected_attempts(999), 32u64.pow(8));
+    }
+
     #[test]
     fn estimate_values() {
         // 32 attempts at 32 keys/s = 1 second.
         assert_eq!(estimate(1, 32.0), Duration::from_secs(1));
-        // Zero or negative rate is unbounded.
+        // Zero, negative, or NaN rate is unbounded.
         assert_eq!(estimate(1, 0.0), Duration::MAX);
         assert_eq!(estimate(2, -1.0), Duration::MAX);
+        assert_eq!(estimate(1, f64::NAN), Duration::MAX);
+        // Infinite rate: finite (immediate) estimate, not a panic.
+        let inf = estimate(1, f64::INFINITY);
+        assert!(inf < Duration::MAX);
         assert!(estimate(8, 1e6) > Duration::from_secs(1_000_000));
     }
 
@@ -320,8 +444,7 @@ mod tests {
             time_limit: Some(Duration::from_secs(30)),
             ..Default::default()
         };
-        let outcome = search(&target, &opts);
-        let SearchOutcome::Found(kp) = outcome else {
+        let SearchOutcome::Found(kp) = search(&target, &opts).unwrap() else {
             panic!("1-char prefix must be found quickly");
         };
         assert!(kp.address().starts_with("a"));
@@ -329,6 +452,22 @@ mod tests {
             parse_onion_address(kp.address()).expect("valid address"),
             *kp.pubkey()
         );
+    }
+
+    /// Duration::MAX overflows `Instant::now() + d`; the deadline must be
+    /// disabled instead of panicking.
+    #[test]
+    fn search_survives_overflowing_time_limit() {
+        let target = VanityTarget::new("a").unwrap();
+        let opts = SearchOptions {
+            threads: 1,
+            time_limit: Some(Duration::MAX),
+            ..Default::default()
+        };
+        let SearchOutcome::Found(kp) = search(&target, &opts).unwrap() else {
+            panic!("1-char prefix must be found quickly");
+        };
+        assert!(kp.address().starts_with("a"));
     }
 
     #[test]
@@ -339,8 +478,7 @@ mod tests {
             time_limit: Some(Duration::from_secs(120)),
             ..Default::default()
         };
-        let outcome = search(&target, &opts);
-        let SearchOutcome::Found(kp) = outcome else {
+        let SearchOutcome::Found(kp) = search(&target, &opts).unwrap() else {
             panic!("3-char prefix must be found with 4 threads");
         };
         assert!(kp.address().starts_with("7z2"));
@@ -357,7 +495,7 @@ mod tests {
             time_limit: Some(Duration::from_millis(200)),
             ..Default::default()
         };
-        let outcome = search(&target, &opts);
+        let outcome = search(&target, &opts).unwrap();
         assert!(matches!(outcome, SearchOutcome::TimedOut { attempts } if attempts > 0));
     }
 
@@ -371,7 +509,7 @@ mod tests {
             cancel: Arc::clone(&cancel),
             ..Default::default()
         };
-        let outcome = search(&target, &opts);
+        let outcome = search(&target, &opts).unwrap();
         assert!(matches!(outcome, SearchOutcome::Cancelled { attempts } if attempts == 0));
     }
 
@@ -393,8 +531,40 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
             flag.store(true, Ordering::Relaxed);
         });
-        let outcome = search(&target, &opts);
+        let outcome = search(&target, &opts).unwrap();
         assert!(matches!(outcome, SearchOutcome::Cancelled { .. }));
+    }
+
+    /// The SPAWN_FAIL seam makes every spawn fail; search must return
+    /// Err(VanityError::Spawn) after joining the workers already started.
+    #[test]
+    fn search_reports_spawn_failure() {
+        SPAWN_FAIL.store(true, Ordering::Relaxed);
+        let target = VanityTarget::new("ababa").unwrap();
+        let opts = SearchOptions {
+            threads: 2,
+            time_limit: Some(Duration::from_secs(30)),
+            ..Default::default()
+        };
+        let result = search(&target, &opts);
+        SPAWN_FAIL.store(false, Ordering::Relaxed);
+        assert!(matches!(result, Err(VanityError::Spawn(_))));
+    }
+
+    /// The WORKER_PANIC seam makes workers panic; search must join the
+    /// remaining workers and return Panicked.
+    #[test]
+    fn search_reports_worker_panic() {
+        WORKER_PANIC.store(true, Ordering::Relaxed);
+        let target = VanityTarget::new("abab7").unwrap();
+        let opts = SearchOptions {
+            threads: 2,
+            time_limit: Some(Duration::from_secs(30)),
+            ..Default::default()
+        };
+        let result = search(&target, &opts);
+        WORKER_PANIC.store(false, Ordering::Relaxed);
+        assert!(matches!(result, Ok(SearchOutcome::Panicked { .. })));
     }
 
     #[test]
@@ -402,6 +572,11 @@ mod tests {
         assert_eq!(worker_count(3), 3);
         assert_eq!(worker_count(1), 1);
         assert!(worker_count(0) >= 1);
+    }
+
+    #[test]
+    fn worker_count_clamps_to_max() {
+        assert_eq!(worker_count(usize::MAX), MAX_THREADS);
     }
 
     /// The shared progress counter receives every worker's attempts, also on
@@ -416,11 +591,17 @@ mod tests {
             progress: Some(Arc::clone(&progress)),
             ..Default::default()
         };
-        let outcome = search(&target, &opts);
-        let SearchOutcome::Found(_) = outcome else {
+        let SearchOutcome::Found(_) = search(&target, &opts).unwrap() else {
             panic!("1-char prefix must be found quickly");
         };
         assert!(progress.load(Ordering::Relaxed) >= 1);
+    }
+
+    #[test]
+    fn measure_rate_returns_positive_rate() {
+        let rate = measure_rate(1, Duration::from_millis(100));
+        assert!(rate.is_some());
+        assert!(rate.unwrap() > 0.0);
     }
 
     /// Ignored benchmark: measures attempts/s on one thread by searching an
@@ -436,11 +617,10 @@ mod tests {
             ..Default::default()
         };
         let start = Instant::now();
-        let outcome = search(&target, &opts);
-        let elapsed = start.elapsed();
-        let SearchOutcome::TimedOut { attempts } = outcome else {
+        let SearchOutcome::TimedOut { attempts } = search(&target, &opts).unwrap() else {
             panic!("benchmark assumes a timeout");
         };
+        let elapsed = start.elapsed();
         let rate = attempts as f64 / elapsed.as_secs_f64();
         println!("attempts: {attempts} in {elapsed:?} => {rate:.0} attempts/s (1 thread)");
     }
