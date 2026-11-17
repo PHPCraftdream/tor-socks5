@@ -835,23 +835,10 @@ async fn handle_client_with_connector<C: TorConnector + Send>(
                     req.reply(&mut client, Reply::Forbidden).await.ok();
                     return Ok(());
                 }
-                Err(tor_branch::Failure::Unavailable) => {
-                    req.reply(&mut client, Reply::GeneralFailure).await.ok();
+                Err(failure) => {
+                    req.reply(&mut client, failure.reply()).await.ok();
                     conn_health.record_connect_failed();
-                    return Err(anyhow!("tor tunnel unavailable (shutting down?)")
-                        .context(STAGE_CONNECT_TOR));
-                }
-                Err(tor_branch::Failure::TimedOut(message)) => {
-                    req.reply(&mut client, Reply::GeneralFailure).await.ok();
-                    return Err(anyhow!(message).context(STAGE_CONNECT_TOR));
-                }
-                Err(tor_branch::Failure::Closed) => {
-                    return Err(anyhow!("реестр закрыт").context(STAGE_CONNECT_TOR));
-                }
-                Err(tor_branch::Failure::Connect(error)) => {
-                    req.reply(&mut client, Reply::GeneralFailure).await.ok();
-                    conn_health.record_connect_failed();
-                    return Err(anyhow::Error::new(error).context(STAGE_CONNECT_TOR));
+                    return Err(failure.into_error().context(STAGE_CONNECT_TOR));
                 }
             };
             req.reply(&mut client, Reply::Established).await?;
