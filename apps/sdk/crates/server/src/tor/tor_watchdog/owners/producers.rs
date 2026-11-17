@@ -300,11 +300,14 @@ mod tests {
             .await
             .unwrap();
         let tunnel = arti_wrapper::TorTunnel::create_unbootstrapped_with(settings.clone()).unwrap();
+        // Seed the active-bridge set, as the production launch path does.
+        let handle =
+            tor_socks5_runtime::tor_watchdog::TorHandle::new_with_settings(tunnel, &settings);
         let gate = ParkedGate::arm(Site::MaintenanceConfigLoad, &path);
         let owner = ProducerTasks::retain().unwrap();
         let mut launch = LaunchGuard::new(owner.clone());
         super::super::bridge_producers::launch(
-            tor_socks5_runtime::tor_watchdog::TorHandle::new(tunnel),
+            handle,
             Some(path),
             &cfg,
             tor_socks5_runtime::arti_observability::ObservationSink::new(),

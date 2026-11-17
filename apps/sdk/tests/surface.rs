@@ -167,6 +167,7 @@ fn runtime_module_tor_client_surface() {
     let _ = tor_socks5::runtime::spawn_tor_watchdog;
     let _ = tor_socks5::runtime::spawn_bridge_failover_watchdog;
     let _ = tor_socks5::runtime::classify_and_record;
+    let _ = tor_socks5::runtime::run_conn_health_logger;
     let _ = tor_socks5::runtime::spawn_conn_health_logger;
 
     // These annotations pin the public handle-method signatures without
