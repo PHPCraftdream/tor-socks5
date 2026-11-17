@@ -332,7 +332,9 @@ mod tests {
         // registry (not the run group); the run-group join completes without
         // waiting on it, and the parked worker is drained via the registry
         // join after the gate is released.
-        owner.join(Duration::ZERO).await.unwrap();
+        // A real budget: the maintenance task needs a scheduler turn to observe
+        // the cancellation; the join must still not wait on the parked worker.
+        owner.join(Duration::from_secs(10)).await.unwrap();
         assert!(
             tor_socks5_runtime::workers::global_busy_count().await >= 1,
             "parked blocking config load must stay registered across cancellation"
