@@ -55,7 +55,9 @@ is public now:
 - `conn_health` — `ConnHealthCounters` with windowed
   `ConnHealthSnapshot`s via `snapshot_and_reset()`, the error/stage kinds
   (`ConnErrorKind`, `ConnStage`), the pending-connection guard and the
-  optional periodic logger (`spawn_conn_health_logger`).
+  optional periodic logger (`spawn_conn_health_logger`, which takes a
+  `CancellationToken` and passes it through to the exported
+  `run_conn_health_logger` future).
 
 Restart contract (plan decision D5): what this surface opens is one live Tor
 client per process; sequential stop-then-start works. Concurrent clients or

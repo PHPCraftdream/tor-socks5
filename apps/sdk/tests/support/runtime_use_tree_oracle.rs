@@ -20,6 +20,7 @@ const RUNTIME_CRATE: &str = "tor_socks5_runtime";
 // This is the explicitly curated API: adding an item requires an intentional
 // test update. Module names themselves are discovered from runtime/src/lib.rs.
 const ALLOWED_RUNTIME_ITEMS: &[&str] = &[
+    "conn_health::run_conn_health_logger",
     "conn_health::spawn_conn_health_logger",
     "conn_health::ConnErrorKind",
     "conn_health::ConnHealthCounters",

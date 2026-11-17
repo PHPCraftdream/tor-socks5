@@ -134,8 +134,9 @@ pub use ::tor_socks5_onion as onion;
 ///   [`runtime::classify_and_record`] are exported at the same flat level.
 /// - [`runtime::ConnHealthCounters`], [`runtime::ConnHealthSnapshot`],
 ///   [`runtime::PendingConnectionGuard`], [`runtime::ConnStage`],
-///   [`runtime::ConnErrorKind`], and [`runtime::spawn_conn_health_logger`]
-///   expose connection-health counters and windowed snapshots.
+///   [`runtime::ConnErrorKind`], [`runtime::spawn_conn_health_logger`], and
+///   [`runtime::run_conn_health_logger`] expose connection-health counters and
+///   windowed snapshots.
 ///
 /// These functions take [`runtime::WatchdogConfig`] and
 /// [`runtime::ConnHealthConfig`] where applicable. [`runtime::TorError`] is
@@ -163,8 +164,8 @@ pub mod runtime {
     pub use ::proxy_config::{ConnHealthConfig, WatchdogConfig};
     /// Connection-health counters and their periodic logger.
     pub use ::tor_socks5_runtime::conn_health::{
-        spawn_conn_health_logger, ConnErrorKind, ConnHealthCounters, ConnHealthSnapshot, ConnStage,
-        PendingConnectionGuard,
+        run_conn_health_logger, spawn_conn_health_logger, ConnErrorKind, ConnHealthCounters,
+        ConnHealthSnapshot, ConnStage, PendingConnectionGuard,
     };
     /// Pluggable-transport executable policy.
     pub use ::tor_socks5_runtime::pt::PtBinary;

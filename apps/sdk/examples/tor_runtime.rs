@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::io::{self, ErrorKind};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use tor_socks5::config::Config;
 use tor_socks5::runtime::{
@@ -53,7 +54,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
 
     let signal_result = tokio::signal::ctrl_c().await;
-    manager.shutdown().await;
+    manager.shutdown_with_timeout(Duration::from_secs(30)).await;
     let watchdog_result = watchdog.map(|run| run.join);
     let watchdog_result = match watchdog_result {
         Some(join) => Some(join.await),

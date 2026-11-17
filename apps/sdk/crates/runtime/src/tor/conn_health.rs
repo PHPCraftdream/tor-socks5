@@ -353,15 +353,20 @@ pub fn run_conn_health_logger(
 /// The returned handle owns the logger task and can be awaited or aborted. A
 /// disabled configuration logs synchronously and returns `None`, so callers
 /// do not need a Tokio runtime merely to configure logging.
-/// Production server code should use [`run_conn_health_logger`] directly and
-/// retain that task in its producer owner so cancellation and joining are
+///
+/// `cancellation` is passed through to [`run_conn_health_logger`]: cancelling
+/// it stops the spawned task promptly, so an embedder can shut the logger
+/// down without resorting to `abort()`.
+/// Production server code should prefer [`run_conn_health_logger`] directly
+/// and retain that task in its producer owner so cancellation and joining are
 /// coordinated with the other producers.
 pub fn spawn_conn_health_logger(
     counters: ConnHealthCounters,
     cfg: ConnHealthConfig,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let enabled = cfg.enabled && cfg.interval_secs != 0;
-    let logger = run_conn_health_logger(counters, cfg, tokio_util::sync::CancellationToken::new());
+    let logger = run_conn_health_logger(counters, cfg, cancellation);
     if enabled {
         Some(tokio::spawn(logger))
     } else {
@@ -637,6 +642,7 @@ mod tests {
                 enabled: false,
                 interval_secs: 60,
             },
+            tokio_util::sync::CancellationToken::new(),
         )
         .is_none());
         assert!(spawn_conn_health_logger(
@@ -645,6 +651,7 @@ mod tests {
                 enabled: true,
                 interval_secs: 0,
             },
+            tokio_util::sync::CancellationToken::new(),
         )
         .is_none());
     }

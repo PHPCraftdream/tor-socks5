@@ -40,7 +40,14 @@ use crate::bridge_rank::{candidates_with_health, select_top_n};
 use crate::config::{Config, WarmPoolConfig};
 use crate::tor_watchdog::TorHandle;
 
-/// Spawn the background bridge-warming task as a detached tokio task.
+/// Per-bridge budget for one `warm_bridge` handshake attempt (H9.3): a hung
+/// PT/TCP handshake must not stall the warmer (or shutdown) indefinitely. A
+/// timeout is logged and treated like a failed warm attempt.
+const WARM_BRIDGE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Spawn the background bridge-warming task, owned by the returned
+/// `tokio::task::JoinHandle` (the producer handle the server joins at
+/// shutdown).
 ///
 /// Every `refresh_interval_secs` the task re-reads the configured bridges
 /// and their health from the on-disk store, picks the top `pool_size`
@@ -124,8 +131,21 @@ pub fn spawn_bridge_warmer(
             );
             let mut warmed: Vec<BridgeLine> = Vec::new();
             for bridge in &selected {
-                match tor.warm_bridge(bridge).await {
-                    Ok(true) => {
+                // Cancellation cuts off the in-flight handshake immediately;
+                // `warm_bridge` only opens a throwaway channel, so dropping
+                // its future mid-handshake cannot corrupt any state.
+                let outcome = tokio::select! {
+                    biased;
+                    _ = token.cancelled() => {
+                        // Skip the rest of the batch and the pending store
+                        // write: the writer is joined/closed by the owner
+                        // right after this task at shutdown.
+                        return;
+                    }
+                    res = tokio::time::timeout(WARM_BRIDGE_TIMEOUT, tor.warm_bridge(bridge)) => res,
+                };
+                match outcome {
+                    Ok(Ok(true)) => {
                         info!(bridge = %bridge, "warm-pool: channel warmed");
                         warmed.push(bridge.clone());
                     }
@@ -134,11 +154,19 @@ pub fn spawn_bridge_warmer(
                     // identities; that proves nothing about this bridge
                     // line's own endpoint, so record nothing (and record no
                     // failure either — the check simply did not happen).
-                    Ok(false) => {
+                    Ok(Ok(false)) => {
                         debug!(bridge = %bridge, "warm-pool: channel reused from another endpoint; no channel proof");
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         warn!(bridge = %bridge, error = %e, "warm-pool: failed to warm channel");
+                    }
+                    // Timed out: treat it like a failed warm (the handshake
+                    // may still complete in the background of arti's own
+                    // channel manager, so record no failure).
+                    Err(_elapsed) => {
+                        warn!(bridge = %bridge,
+                            timeout_secs = WARM_BRIDGE_TIMEOUT.as_secs(),
+                            "warm-pool: warm channel attempt timed out");
                     }
                 }
             }
@@ -246,5 +274,14 @@ mod tests {
             .await
             .expect("close runs when a writer is up")
             .expect("global writer closes");
+    }
+
+    #[test]
+    fn warm_bridge_timeout_is_fifteen_seconds() {
+        assert_eq!(
+            WARM_BRIDGE_TIMEOUT,
+            Duration::from_secs(15),
+            "per-bridge warm handshake budget must stay 15s (plan H9.3)"
+        );
     }
 }
