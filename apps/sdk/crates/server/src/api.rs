@@ -96,8 +96,8 @@ pub enum ServerStatus {
 }
 
 /// Typed failures from admission, startup, runtime, cancellation, or task execution.
-/// `Cleanup` retains teardown failures without replacing the primary error's
-/// display text or the original error chain returned to CLI callers.
+/// `Cleanup` retains teardown failures separately from the primary error,
+/// accessible through [`ServerError::cleanup_error`].
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
@@ -105,28 +105,29 @@ pub enum ServerError {
     #[error("server is already running in this process")]
     AlreadyRunning,
     /// Listener binding failed.
-    #[error("{0}")]
-    Bind(#[source] anyhow::Error),
+    #[error(transparent)]
+    Bind(anyhow::Error),
     /// Configuration loading or validation failed.
-    #[error("{0}")]
-    Config(#[source] anyhow::Error),
+    #[error(transparent)]
+    Config(anyhow::Error),
     /// Process-wide startup recovery failed.
-    #[error("{0}")]
-    Recovery(#[source] anyhow::Error),
+    #[error(transparent)]
+    Recovery(anyhow::Error),
     /// Remaining startup, including Tor or egress initialization, failed.
-    #[error("{0}")]
-    Startup(#[source] anyhow::Error),
+    #[error(transparent)]
+    Startup(anyhow::Error),
     /// Serving requests failed.
-    #[error("{0}")]
-    Runtime(#[source] anyhow::Error),
+    #[error(transparent)]
+    Runtime(anyhow::Error),
     /// Startup was cancelled before readiness.
     #[error("server startup cancelled")]
     Cancelled,
     /// A supervised server task failed or panicked.
-    #[error("{0}")]
-    Task(#[source] anyhow::Error),
-    /// Cleanup failed after `error`; formatting and CLI conversion retain the
-    /// primary error while this field exposes the teardown failure. Cleanup
+    #[error(transparent)]
+    Task(anyhow::Error),
+    /// Cleanup retains the primary error as its source, while the cleanup
+    /// failure is available through `cleanup_error`. CLI conversion returns the
+    /// primary error chain.
     /// budgets are stage-specific: Settings/global-init/owner recovery uses
     /// explicit deadlines; producer and handler joins have their own budgets
     /// (normal producer grace is 120 seconds). The final blocking-worker join
@@ -136,9 +137,10 @@ pub enum ServerError {
     /// recovery. `Cleanup` is a secondary-failure wrapper; if secondary cleanup
     /// succeeds, an ordinary shutdown failure may be returned as
     /// `ServerError::Runtime`.
-    #[error("{error}")]
+    #[error("server cleanup also failed")]
     Cleanup {
         /// The error that caused the run to fail.
+        #[source]
         error: Box<ServerError>,
         /// Cleanup failure is retained separately from the primary error.
         cleanup: anyhow::Error,
@@ -272,7 +274,9 @@ impl ServerBuilder {
         self
     }
 
-    /// Use a caller-owned token to request graceful shutdown.
+    /// Use a caller-owned token to request graceful shutdown. The server uses a
+    /// child token: external cancellation propagates to the server, but server
+    /// shutdown and handle drop do not cancel this caller-owned token.
     pub fn cancellation_token(mut self, token: CancellationToken) -> Self {
         self.cancellation_token = token;
         self
@@ -283,6 +287,70 @@ impl ServerBuilder {
     /// coalesced by Tokio's watch channel.
     pub fn subscribe(&self) -> watch::Receiver<ServerStatus> {
         self.status_rx.clone()
+    }
+
+    /// Drives startup and the running server until `shutdown` resolves or the
+    /// server terminates naturally. The same startup future is polled through
+    /// cancellation so its cleanup result is not lost.
+    ///
+    /// cancel-safe: NO — dropping this future requests worker cancellation, but
+    /// does not await the worker's cleanup attempt. Use the returned result to
+    /// observe startup, runtime, and cleanup failures.
+    pub async fn run_until(self, shutdown: impl Future<Output = ()>) -> Result<(), ServerError> {
+        let cancellation = self.cancellation_token.child_token();
+        let start = self.start_inner(Some(cancellation.clone()));
+        tokio::pin!(start);
+        tokio::pin!(shutdown);
+
+        let mut shutdown_requested = false;
+        let started = tokio::select! {
+            biased;
+            () = &mut shutdown => {
+                shutdown_requested = true;
+                cancellation.cancel();
+                None
+            }
+            result = &mut start => Some(result),
+        };
+        let started = match started {
+            Some(result) => result,
+            None => start.await,
+        };
+
+        let handle = match started {
+            Ok(handle) => handle,
+            // A `Cancelled` result here means the caller's own token (or the
+            // shutdown future) requested the stop; `run_until` reports a
+            // requested stop as success, preserving real startup failures.
+            Err(ServerError::Cancelled) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+
+        if shutdown_requested {
+            return match handle.shutdown().await {
+                Err(ServerError::Cancelled) => Ok(()),
+                result => result,
+            };
+        }
+
+        let shutdown_requested = tokio::select! {
+            biased;
+            () = &mut shutdown => true,
+            _ = wait_for_terminal(handle.status.clone()) => false,
+        };
+        if shutdown_requested {
+            match handle.shutdown().await {
+                Err(ServerError::Cancelled) => Ok(()),
+                result => result,
+            }
+        } else {
+            // Terminal state reached through the caller's cancellation token is
+            // a requested stop, not a failure: map it like an awaited shutdown.
+            match handle.wait().await {
+                Err(ServerError::Cancelled) => Ok(()),
+                result => result,
+            }
+        }
     }
 
     /// Start and wait until SOCKS listeners are bound. With the default
@@ -297,8 +365,9 @@ impl ServerBuilder {
     /// is 120 seconds). The final blocking-worker join has a five-second timeout.
     /// Closing the bridge-store writer is awaited without a deadline.
     ///
-    /// Dropping this future cancels the worker; the worker remains supervised
-    /// and holds process admission until cleanup finishes. A startup error is
+    /// Dropping this future cancels the server-owned child token; the caller's
+    /// token passed to `cancellation_token` remains unaffected. The worker remains
+    /// supervised and holds process admission until cleanup finishes. A startup error is
     /// returned only after the worker has finished its cleanup attempt. A
     /// returned handle or `Ok` means cleanup for any prior failure finished,
     /// not that every retained handle was joined; retained handles are
@@ -309,12 +378,23 @@ impl ServerBuilder {
     /// Cancellation before readiness returns [`ServerError::Cancelled`],
     /// unless startup itself produced a more specific error.
     pub fn start(self) -> Pin<Box<dyn Future<Output = Result<ServerHandle, ServerError>> + Send>> {
-        Box::pin(self.start_inner())
+        Box::pin(self.start_inner(None))
     }
 
-    async fn start_inner(self) -> Result<ServerHandle, ServerError> {
-        let reservation = AdmissionReservation::acquire()?;
-        let token = self.cancellation_token;
+    async fn start_inner(
+        self,
+        worker_token: Option<CancellationToken>,
+    ) -> Result<ServerHandle, ServerError> {
+        let reservation = match AdmissionReservation::acquire() {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                self.status.send_replace(ServerStatus::Stopped {
+                    listen_addrs: Vec::new(),
+                });
+                return Err(error);
+            }
+        };
+        let token = worker_token.unwrap_or_else(|| self.cancellation_token.child_token());
         let mut cancel_on_drop = StartCancelGuard(Some(token.clone()));
         let result = Arc::new(StdMutex::new(None));
         let ready_once = Arc::new(AtomicBool::new(false));
@@ -476,7 +556,8 @@ pub struct ServerHandle {
 }
 
 impl ServerHandle {
-    /// Return a clone of the shutdown token.
+    /// Return a clone of the server-owned shutdown token. Cancelling it stops
+    /// this server; cancelling it does not cancel the builder's parent token.
     pub fn token(&self) -> CancellationToken {
         self.cancellation_token.clone()
     }
@@ -495,17 +576,17 @@ impl ServerHandle {
     /// Observe natural server termination and join the worker without
     /// requesting cancellation.
     ///
-    /// cancel-safe: no; dropping this future drops the handle and requests
-    /// cancellation. The worker's cleanup attempt is completed before this
-    /// returns; Settings/global-init/owner recovery uses explicit deadlines;
-    /// producer and handler joins have their own budgets (normal producer grace
-    /// is 120 seconds). The final blocking-worker join has a five-second timeout.
-    /// Closing the bridge-store writer is awaited without a deadline. `Stopped`
+    /// cancel-safe: NO — dropping this future drops the handle and requests
+    /// server cancellation but does not await cleanup. Settings/global-init/owner
+    /// recovery uses explicit deadlines; producer and handler joins have their
+    /// own budgets (normal producer grace is 120 seconds). The final blocking-worker
+    /// join has a five-second timeout. Closing the bridge-store writer is awaited
+    /// without a deadline. `Stopped`
     /// means that attempt completed (successfully or with an error;
     /// `ServerError::Cleanup` preserves a secondary cleanup failure), not that
     /// every task was provably joined.
-    /// The terminal wait is a watch change loop, so cancellation does not
-    /// consume an event or lose the terminal snapshot.
+    /// `Stopped` is returned for both normal and unexpected worker termination;
+    /// an unexpected accept-loop exit is reported as `ServerError::Runtime`.
     pub async fn wait(self) -> Result<(), ServerError> {
         self.join(false).await
     }
@@ -582,7 +663,7 @@ impl Drop for StartCancelGuard {
 }
 
 struct WorkerCompletion {
-    _reservation: AdmissionReservation,
+    reservation: Option<AdmissionReservation>,
     status: watch::Sender<ServerStatus>,
     result: Arc<StdMutex<Option<ServerError>>>,
     listen_addrs: ListenAddrs,
@@ -597,7 +678,7 @@ impl WorkerCompletion {
         listen_addrs: ListenAddrs,
     ) -> Self {
         Self {
-            _reservation: reservation,
+            reservation: Some(reservation),
             status,
             result,
             listen_addrs,
@@ -610,6 +691,7 @@ impl WorkerCompletion {
             .result
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = result;
+        drop(self.reservation.take());
         self.status.send_replace(ServerStatus::Stopped {
             listen_addrs: listen_addrs_snapshot(&self.listen_addrs),
         });
@@ -620,11 +702,17 @@ impl WorkerCompletion {
 impl Drop for WorkerCompletion {
     fn drop(&mut self) {
         if !self.completed {
+            let message = if std::thread::panicking() {
+                "server worker task panicked"
+            } else {
+                "server worker task was dropped before completion"
+            };
             *self
                 .result
                 .lock()
                 .unwrap_or_else(|error| error.into_inner()) =
-                Some(ServerError::Task(anyhow!("server worker task panicked")));
+                Some(ServerError::Task(anyhow!(message)));
+            drop(self.reservation.take());
             self.status.send_replace(ServerStatus::Stopped {
                 listen_addrs: listen_addrs_snapshot(&self.listen_addrs),
             });
@@ -676,4 +764,96 @@ fn take_result(result: &Arc<StdMutex<Option<ServerError>>>) -> Option<ServerErro
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .take()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+
+    #[test]
+    fn server_error_formatting_does_not_duplicate_primary_chain() {
+        let error = ServerError::Startup(anyhow!("primary failure").context("startup context"));
+        let formatted = format!("{error:#}");
+        let cli_error = ServerError::Startup(anyhow!("primary failure").context("startup context"))
+            .into_anyhow();
+        let formatted_anyhow = format!("{cli_error:#}");
+        assert_eq!(formatted.matches("primary failure").count(), 1);
+        assert_eq!(formatted_anyhow.matches("primary failure").count(), 1);
+        assert_eq!(formatted.matches("startup context").count(), 1);
+    }
+
+    #[test]
+    fn completion_drop_during_unwind_retains_panic_message() {
+        let (status, _receiver) = watch::channel(ServerStatus::Starting);
+        let result = Arc::new(StdMutex::new(None));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let result = result.clone();
+            move || {
+                let _completion = WorkerCompletion {
+                    reservation: None,
+                    status,
+                    result,
+                    listen_addrs: Arc::new(StdMutex::new(Vec::new())),
+                    completed: false,
+                };
+                panic!("test panic while completion guard is live");
+            }
+        }));
+        assert!(outcome.is_err());
+        let error = take_result(&result).unwrap();
+        assert!(
+            matches!(error, ServerError::Task(ref error) if error.to_string() == "server worker task panicked")
+        );
+    }
+
+    #[test]
+    fn cleanup_error_keeps_primary_as_source_and_exposes_cleanup_separately() {
+        let error = ServerError::Cleanup {
+            error: Box::new(ServerError::Startup(anyhow!("primary failure"))),
+            cleanup: anyhow!("cleanup failure"),
+        };
+
+        assert_eq!(error.to_string(), "server cleanup also failed");
+        assert_eq!(
+            error.cleanup_error().unwrap().to_string(),
+            "cleanup failure"
+        );
+        assert_eq!(error.source().unwrap().to_string(), "primary failure");
+        assert_eq!(error.stage(), Some(ServerStage::Startup));
+    }
+
+    #[test]
+    fn cleanup_error_formatting_keeps_cleanup_out_of_primary_display() {
+        let primary = ServerError::Cleanup {
+            error: Box::new(ServerError::Startup(anyhow!("primary failure"))),
+            cleanup: anyhow!("cleanup failure"),
+        };
+        let formatted = format!("{primary:#}");
+        assert!(!formatted.contains("primary failure"));
+        assert!(primary.cleanup_error().is_some());
+    }
+
+    #[test]
+    fn completion_drop_reports_runtime_shutdown_as_dropped_not_panicked() {
+        let (status, mut receiver) = watch::channel(ServerStatus::Starting);
+        let result = Arc::new(StdMutex::new(None));
+        let completion = WorkerCompletion {
+            reservation: None,
+            status,
+            result: result.clone(),
+            listen_addrs: Arc::new(StdMutex::new(Vec::new())),
+            completed: false,
+        };
+        drop(completion);
+
+        assert!(matches!(
+            receiver.borrow_and_update().clone(),
+            ServerStatus::Stopped { .. }
+        ));
+        let error = take_result(&result).unwrap();
+        assert!(
+            matches!(error, ServerError::Task(ref error) if error.to_string() == "server worker task was dropped before completion")
+        );
+    }
 }

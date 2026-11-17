@@ -242,20 +242,28 @@ impl WorkerRegistry {
         &self,
         work: impl FnOnce() -> T + Send + 'static,
     ) -> anyhow::Result<T> {
-        self.spawn(work, None)
-            .await?
+        let (rx, slot) = self.spawn_with_failure_slot(move |_| work(), None).await?;
+        let result = rx
             .await
-            .map_err(|error| anyhow::anyhow!("blocking worker result unavailable: {error}"))
+            .map_err(|error| anyhow::anyhow!("blocking worker result unavailable: {error}"));
+        // The worker sent its result and is about to return: join exactly this slot
+        // so it is free on return (a finished-only sweep could race the thread exit).
+        Self::reap_slots(vec![slot], false, Some(&self.reports)).await;
+        result
     }
 
     async fn run_fallible<T: Send + 'static>(
         &self,
         work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
     ) -> anyhow::Result<anyhow::Result<T>> {
-        self.spawn_fallible(work, None)
-            .await?
+        let (rx, slot) = self
+            .spawn_with_failure_slot(move |failure| Delivery::new(work(), failure), None)
+            .await?;
+        let result = FallibleReceiver(rx)
             .await
-            .map_err(|error| anyhow::anyhow!("blocking worker result unavailable: {error}"))
+            .map_err(|error| anyhow::anyhow!("blocking worker result unavailable: {error}"));
+        Self::reap_slots(vec![slot], false, Some(&self.reports)).await;
+        result
     }
     async fn spawn_fallible<T: Send + 'static>(
         &self,
@@ -282,6 +290,15 @@ impl WorkerRegistry {
         work: impl FnOnce(WorkerFailure) -> T + Send + 'static,
         group: Option<&AdmissionWorkers>,
     ) -> anyhow::Result<tokio::sync::oneshot::Receiver<T>> {
+        Ok(self.spawn_with_failure_slot(work, group).await?.0)
+    }
+
+    /// As [`Self::spawn_with_failure`], also returning the worker's slot.
+    async fn spawn_with_failure_slot<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(WorkerFailure) -> T + Send + 'static,
+        group: Option<&AdmissionWorkers>,
+    ) -> anyhow::Result<(tokio::sync::oneshot::Receiver<T>, WorkerSlot)> {
         Self::reap_slots(self.snapshot()?, true, Some(&self.reports)).await;
         let mut slots = self
             .slots
@@ -354,9 +371,9 @@ impl WorkerRegistry {
             slots.push(slot.clone());
         }
         if let Some(group) = group {
-            group.add(slot);
+            group.add(slot.clone());
         }
-        Ok(rx)
+        Ok((rx, slot))
     }
 }
 

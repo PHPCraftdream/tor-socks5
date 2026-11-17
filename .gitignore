@@ -39,3 +39,4 @@
 
 # /wrush task worktrees — always created here, in-tree
 /worktrees/
+/apps/sdk/crates/runtime/tor-socks5.alive-bridges.log*

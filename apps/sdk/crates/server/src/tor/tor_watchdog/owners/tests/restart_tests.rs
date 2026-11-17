@@ -129,30 +129,15 @@ async fn wait_for_status(
     }
 }
 
-async fn start_after_release(
+async fn start_immediately_after_release(
     config: crate::config::Config,
     config_path: Option<std::path::PathBuf>,
     settings: Settings,
     upstream: bool,
 ) -> crate::ServerHandle {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match start_server(
-                config.clone(),
-                config_path.clone(),
-                settings.clone(),
-                upstream,
-            )
-            .await
-            {
-                Ok(handle) => return handle,
-                Err(ServerError::AlreadyRunning) => tokio::task::yield_now().await,
-                Err(error) => panic!("повторный запуск завершился ошибкой: {error}"),
-            }
-        }
-    })
-    .await
-    .expect("admission was not released after terminal status")
+    start_server(config, config_path, settings, upstream)
+        .await
+        .unwrap_or_else(|error| panic!("immediate restart after Stopped failed: {error}"))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -492,11 +477,20 @@ async fn sdk11_server_rejects_concurrent_start_as_already_running() {
     let first_slots = slots().await;
     assert_running_at(&first, None);
 
-    let second = start_server(config.clone(), config_path.clone(), settings.clone(), true).await;
-    let Err(error) = second else {
-        panic!("second start must be rejected while the first server is alive");
+    let rejected_builder = builder(config.clone(), config_path.clone(), true);
+    let rejected_status = rejected_builder.subscribe();
+    let error = match rejected_builder.start().await {
+        Err(error) => error,
+        Ok(handle) => {
+            handle.shutdown().await.unwrap();
+            panic!("second start must be rejected while first server is active");
+        }
     };
     assert!(matches!(&error, ServerError::AlreadyRunning));
+    assert!(matches!(
+        rejected_status.borrow().clone(),
+        ServerStatus::Stopped { .. }
+    ));
     assert_eq!(error.stage(), None);
     assert_eq!(
         slots().await,
@@ -507,7 +501,7 @@ async fn sdk11_server_rejects_concurrent_start_as_already_running() {
     first.shutdown().await.unwrap();
     assert_slots_free().await;
 
-    let retry = start_after_release(config, config_path, settings, true).await;
+    let retry = start_immediately_after_release(config, config_path, settings, true).await;
     assert_running_at(&retry, None);
     retry.shutdown().await.unwrap();
     assert_slots_free().await;
@@ -517,32 +511,31 @@ async fn sdk11_server_rejects_concurrent_start_as_already_running() {
 async fn sdk11_server_wait_pending_does_not_cancel_token() {
     let _serial = TEST_LIFECYCLE.lock().await;
     let _ = rustls::crypto::ring::default_provider().install_default();
-    tokio::time::timeout(Duration::from_secs(120), async {
-        let dir = tempfile::tempdir().unwrap();
-        let (config_path, config) = test_config(dir.path(), 0);
-        let settings = test_settings(dir.path());
-        let handle = start_server(config, config_path, settings, true)
+    let dir = tempfile::tempdir().unwrap();
+    let (config_path, config) = test_config(dir.path(), 0);
+    let settings = test_settings(dir.path());
+    let parent = tokio_util::sync::CancellationToken::new();
+    let cancellation = parent.clone();
+    let handle_future = builder(config.clone(), config_path.clone(), true)
+        .cancellation_token(parent.clone())
+        .start();
+    let handle = global_init::RUN_SERVER_SHUTDOWN
+        .scope(shutdown_hook(settings, None), handle_future)
+        .await
+        .unwrap();
+    let mut wait = Box::pin(handle.wait());
+    assert!(
+        std::future::poll_fn(|cx| { std::task::Poll::Ready(wait.as_mut().poll(cx).is_pending()) })
             .await
-            .unwrap();
-        let token = handle.token();
-        let mut wait = Box::pin(handle.wait());
-        assert!(
-            std::future::poll_fn(|cx| {
-                std::task::Poll::Ready(wait.as_mut().poll(cx).is_pending())
-            })
-            .await
-        );
-        assert!(
-            !token.is_cancelled(),
-            "pending wait must not cancel the server"
-        );
-        token.cancel();
-        wait.await.unwrap();
-        assert!(token.is_cancelled());
-        assert_slots_free().await;
-    })
-    .await
-    .expect("wait lifecycle test timed out");
+    );
+    assert!(
+        !parent.is_cancelled(),
+        "pending wait must not cancel caller's token"
+    );
+    cancellation.cancel();
+    wait.await.unwrap();
+    assert!(parent.is_cancelled());
+    assert_slots_free().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -553,18 +546,129 @@ async fn sdk11_server_precancelled_start_returns_cancelled_and_allows_retry() {
         let dir = tempfile::tempdir().unwrap();
         let (config_path, config) = test_config(dir.path(), 0);
         let settings = test_settings(dir.path());
-        let token = tokio_util::sync::CancellationToken::new();
-        token.cancel();
-
-        let result = builder(config.clone(), config_path.clone(), true)
-            .cancellation_token(token)
-            .start()
+        let pre_cancelled = tokio_util::sync::CancellationToken::new();
+        pre_cancelled.cancel();
+        let pre_cancelled_result = global_init::RUN_SERVER_SHUTDOWN
+            .scope(
+                shutdown_hook(settings.clone(), None),
+                builder(config.clone(), config_path.clone(), true)
+                    .cancellation_token(pre_cancelled.clone())
+                    .start(),
+            )
             .await;
-        assert!(matches!(result, Err(ServerError::Cancelled)));
+        assert!(matches!(pre_cancelled_result, Err(ServerError::Cancelled)));
+        assert!(pre_cancelled.is_cancelled());
 
-        let retry = start_after_release(config, config_path, settings, true).await;
-        assert_running_at(&retry, None);
+        let token = tokio_util::sync::CancellationToken::new();
+        let start_builder =
+            builder(config.clone(), config_path.clone(), true).cancellation_token(token.clone());
+        let mut status = start_builder.subscribe();
+        let mut start = Box::pin(
+            global_init::RUN_SERVER_SHUTDOWN
+                .scope(shutdown_hook(settings.clone(), None), start_builder.start()),
+        );
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(start.as_mut().poll(cx).is_pending())
+            })
+            .await
+        );
+        drop(start);
+        assert!(
+            !token.is_cancelled(),
+            "dropping start must cancel only its child token, not its parent"
+        );
+        let stopped = wait_for_status(&mut status, |status| {
+            matches!(status, ServerStatus::Stopped { .. })
+        })
+        .await;
+        assert!(matches!(stopped, ServerStatus::Stopped { .. }));
+
+        let parent = tokio_util::sync::CancellationToken::new();
+        let run_parent = parent.clone();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let run_builder = builder(config.clone(), config_path.clone(), true)
+            .cancellation_token(run_parent.clone());
+        let mut run_status = run_builder.subscribe();
+        let run_settings = settings.clone();
+        let run_shutdown = global_init::RUN_SERVER_SHUTDOWN.scope(
+            shutdown_hook(run_settings, None),
+            run_builder.run_until(async {
+                let _ = shutdown_rx.await;
+            }),
+        );
+        let run = tokio::spawn(run_shutdown);
+        assert!(matches!(
+            wait_for_status(&mut run_status, |status| matches!(
+                status,
+                ServerStatus::Running { .. }
+            ))
+            .await,
+            ServerStatus::Running { .. }
+        ));
+        shutdown_tx.send(()).unwrap();
+        assert!(matches!(run.await.unwrap(), Ok(())));
+        assert!(
+            !run_parent.is_cancelled(),
+            "run_until shutdown must not cancel the caller's parent token"
+        );
+
+        let retry = start_immediately_after_release(
+            config.clone(),
+            config_path.clone(),
+            settings.clone(),
+            true,
+        )
+        .await;
         retry.shutdown().await.unwrap();
+        assert_slots_free().await;
+
+        // Natural terminal publication through the caller token beats a still-pending
+        // shutdown future; run_until joins and returns the server result.
+        let external = tokio_util::sync::CancellationToken::new();
+        let run_builder =
+            builder(config.clone(), config_path.clone(), true).cancellation_token(external.clone());
+        let mut natural_status = run_builder.subscribe();
+        let (never_tx, never_rx) = tokio::sync::oneshot::channel::<()>();
+        let natural = tokio::spawn(global_init::RUN_SERVER_SHUTDOWN.scope(
+            shutdown_hook(test_settings(dir.path()), None),
+            run_builder.run_until(async {
+                let _ = never_rx.await;
+            }),
+        ));
+        assert!(matches!(
+            wait_for_status(&mut natural_status, |status| matches!(
+                status,
+                ServerStatus::Running { .. }
+            ))
+            .await,
+            ServerStatus::Running { .. }
+        ));
+        external.cancel();
+        let natural_result = natural.await.unwrap();
+        assert!(
+            matches!(natural_result, Ok(())),
+            "natural terminal wait should return the worker result: {natural_result:?}"
+        );
+        assert!(external.is_cancelled());
+        drop(never_tx);
+        assert_slots_free().await;
+
+        // An already-resolved shutdown future during startup is treated as a
+        // clean requested cancellation, while the caller's parent token remains live.
+        let parent = tokio_util::sync::CancellationToken::new();
+        let immediate = builder(config, config_path, true).cancellation_token(parent.clone());
+        let result = global_init::RUN_SERVER_SHUTDOWN
+            .scope(
+                shutdown_hook(test_settings(dir.path()), None),
+                immediate.run_until(std::future::ready(())),
+            )
+            .await;
+        assert!(
+            matches!(result, Ok(())),
+            "requested cancellation alone should map to Ok"
+        );
+        assert!(!parent.is_cancelled());
         assert_slots_free().await;
     })
     .await
@@ -593,7 +697,7 @@ async fn sdk11_server_bind_failure_releases_admission_for_retry() {
     assert_eq!(error.stage(), Some(crate::ServerStage::Bind));
     drop(occupied);
 
-    let handle = start_after_release(config, config_path, settings, true).await;
+    let handle = start_immediately_after_release(config, config_path, settings, true).await;
     assert_running_at(&handle, Some(port));
     handle.shutdown().await.unwrap();
     assert_slots_free().await;
@@ -606,23 +710,43 @@ async fn sdk11_server_handle_drop_cancels_and_allows_retry_after_stopped() {
     let dir = tempfile::tempdir().unwrap();
     let (config_path, config) = test_config(dir.path(), 0);
     let settings = test_settings(dir.path());
-    let handle = start_server(config.clone(), config_path.clone(), settings.clone(), true)
+    let parent = tokio_util::sync::CancellationToken::new();
+    let handle = global_init::RUN_SERVER_SHUTDOWN
+        .scope(
+            shutdown_hook(settings.clone(), None),
+            builder(config.clone(), config_path.clone(), true)
+                .cancellation_token(parent.clone())
+                .start(),
+        )
         .await
         .unwrap();
-    let token = handle.token();
+    let child_token = handle.token();
     let mut status = handle.subscribe();
     assert!(matches!(handle.status(), ServerStatus::Running { .. }));
 
     drop(handle);
-    assert!(token.is_cancelled(), "Drop must cancel synchronously");
+    assert!(
+        child_token.is_cancelled(),
+        "Drop must cancel the server child token"
+    );
+    assert!(
+        !parent.is_cancelled(),
+        "Drop must not cancel the caller's parent token"
+    );
     let stopped = wait_for_status(&mut status, |status| {
         matches!(status, ServerStatus::Stopped { .. })
     })
     .await;
     assert!(matches!(stopped, ServerStatus::Stopped { .. }));
-    assert_slots_free().await;
 
-    let retry = start_after_release(config, config_path, settings, true).await;
+    // Admission is released before Stopped; this single attempt is red before H7.2.
+    let retry = start_immediately_after_release(
+        config.clone(),
+        config_path.clone(),
+        settings.clone(),
+        true,
+    )
+    .await;
     assert_running_at(&retry, None);
     retry.shutdown().await.unwrap();
     assert_slots_free().await;
