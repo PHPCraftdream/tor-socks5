@@ -111,8 +111,8 @@ fn a_launchable_identity_is_prepared_and_the_file_completed() {
 #[test]
 fn an_address_the_key_does_not_give_keeps_the_service_from_starting() {
     let (_tmp, config, keystore) = temp_config();
-    let (key, _address) = keys::fresh_identity("web");
-    let (_other_key, other_address) = keys::fresh_identity("web");
+    let (key, _address) = keys::fresh_identity("web", _tmp.path());
+    let (_other_key, other_address) = keys::fresh_identity("web", _tmp.path());
     let mut entry = service("web");
     entry.key = Some(proxy_config::IdentityKey::new(key).expect("key text"));
     entry.address = Some(other_address);
