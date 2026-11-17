@@ -168,6 +168,7 @@ async fn concurrent_cli_transaction_waits_out_the_locked_publish_and_both_surviv
 mod priority {
     use super::super::super::*;
     use super::super::{config_path, reload, test_bridge};
+    use super::{spawn_with_load_started, spawn_with_lock_wait};
     use persist_lock::PathLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -203,7 +204,7 @@ mod priority {
         let bridge = test_bridge();
         let path = BridgeStore::resolve_path(Some(&config_path(dir.path())));
         let (release_lock, holder) = hold_store_lock(path.clone()).await;
-        let writer = StoreWriter::spawn_with_lock_wait(
+        let writer = spawn_with_lock_wait(
             path.clone(),
             Arc::new(|store| store.save()),
             INITIAL_BACKOFF,
@@ -259,7 +260,7 @@ mod priority {
                 let path = BridgeStore::resolve_path(Some(&config_path(dir.path())));
                 let (release_lock, holder) = hold_store_lock(path.clone()).await;
                 let (load_started_tx, load_started_rx) = oneshot::channel();
-                let writer = StoreWriter::spawn_with_load_started(
+                let writer = spawn_with_load_started(
                     path.clone(),
                     Arc::new(|store| store.save()),
                     INITIAL_BACKOFF,
@@ -408,4 +409,25 @@ mod priority {
         expected.sort();
         assert_eq!(persisted, expected, "all queued mutations reached disk");
     }
+}
+
+/// Test constructors: a bounded lock wait, optionally signalling when the
+/// clean-load job starts.
+fn spawn_with_lock_wait(
+    path: PathBuf,
+    publish: Publisher,
+    initial_backoff: Duration,
+    lock_wait: Duration,
+) -> StoreWriter {
+    StoreWriter::spawn_writer_inner(path, publish, initial_backoff, lock_wait, None)
+}
+
+fn spawn_with_load_started(
+    path: PathBuf,
+    publish: Publisher,
+    initial_backoff: Duration,
+    lock_wait: Duration,
+    started: oneshot::Sender<()>,
+) -> StoreWriter {
+    StoreWriter::spawn_writer_inner(path, publish, initial_backoff, lock_wait, Some(started))
 }

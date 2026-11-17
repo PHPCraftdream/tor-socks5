@@ -79,8 +79,7 @@
 //!   mutations. It interrupts the actor's wait for a clean-load blocking job;
 //!   queued mutations are applied before shutdown when a snapshot is loaded,
 //!   and rejected when closing would require another load. The blocking job
-//!   remains independently registered, and if it later acquires the lock its
-//!   unclaimed result (including the lock) is dropped by the blocking worker.
+//!   remains independently registered; a late-acquired lock is dropped with it.
 //! * Shutdown is explicit: [`StoreWriter::close`] sends a close signal, waits
 //!   for any in-flight publish (and one coalesced follow-up), performs a
 //!   final flush if the snapshot is still dirty — regardless of the backoff
@@ -363,27 +362,6 @@ impl StoreWriter {
         Self::spawn_writer_inner(path, publish, initial_backoff, CLI_LOCK_WAIT, None)
     }
 
-    #[cfg(test)]
-    fn spawn_with_lock_wait(
-        path: PathBuf,
-        publish: Publisher,
-        initial_backoff: Duration,
-        lock_wait: Duration,
-    ) -> Self {
-        Self::spawn_writer_inner(path, publish, initial_backoff, lock_wait, None)
-    }
-
-    #[cfg(test)]
-    fn spawn_with_load_started(
-        path: PathBuf,
-        publish: Publisher,
-        initial_backoff: Duration,
-        lock_wait: Duration,
-        started: oneshot::Sender<()>,
-    ) -> Self {
-        Self::spawn_writer_inner(path, publish, initial_backoff, lock_wait, Some(started))
-    }
-
     fn spawn_writer_inner(
         path: PathBuf,
         publish: Publisher,
@@ -426,43 +404,19 @@ impl StoreWriter {
                         while let Ok(op) = rx.try_recv() {
                             match op {
                                 Op::Mutate { apply, ack } => {
-                                    let cloned = store.clone().expect("loaded snapshot is present");
-                                    match crate::workers::run_tracked_blocking(move || {
-                                        let mut owned = cloned;
-                                        apply(Arc::make_mut(&mut owned));
-                                        owned
-                                    })
-                                    .await
-                                    {
-                                        Ok(owned) => {
-                                            drop_off_worker(
-                                                store.replace(owned),
-                                                Arc::clone(&retirements),
-                                            );
-                                            let _ = ack.send(Ok(()));
-                                            retry.dirty = true;
-                                            mutations_since_publish += 1;
-                                            try_start_publish(
-                                                &mut publishing,
-                                                &mut retry,
-                                                &store,
-                                                &mut mutations_since_publish,
-                                                &publish,
-                                                &done_tx,
-                                            )
-                                            .await;
-                                        }
-                                        Err(join_error) => {
-                                            warn!(
-                                                error = %join_error,
-                                                path = %path.display(),
-                                                "bridge health store mutation task panicked",
-                                            );
-                                            let _ = ack.send(Err(anyhow!(
-                                                "bridge health store mutation task panicked: {join_error}"
-                                            )));
-                                        }
-                                    }
+                                    absorb_mutation(
+                                        apply,
+                                        ack,
+                                        &mut store,
+                                        &mut retry,
+                                        &mut publishing,
+                                        &mut mutations_since_publish,
+                                        &publish,
+                                        &done_tx,
+                                        &retirements,
+                                        &path,
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -657,80 +611,10 @@ impl StoreWriter {
                                     }
                                 }
                             }
-                            // Move the "deep-clone, then mutate" step off
-                            // the async worker: the actor keeps its own
-                            // handle to the snapshot, so `Arc::make_mut`
-                            // inside the job always deep-copies the whole
-                            // store (O(S)) — that copy must not stall this
-                            // worker thread. Keep the actor's own Arc alive
-                            // while the job runs: the closure gets a cheap
-                            // Arc clone, so a panicking closure destroys
-                            // only its private copy. The actor's `store` is
-                            // never moved out, so a panic cannot discard
-                            // earlier acknowledged mutations riding in the
-                            // retained snapshot (TS5-06 regression guard).
-                            let cloned = store.clone().expect("store loaded above");
-                            match crate::workers::run_tracked_blocking(move || {
-                                let mut owned = cloned;
-                                apply(Arc::make_mut(&mut owned));
-                                owned
-                            })
-                            .await
-                            {
-                                Ok(owned) => {
-                                    // TS6-04: swap the new snapshot in; retire
-                                    // the OLD Arc on the blocking pool instead
-                                    // of dropping it inline here. If no publish
-                                    // job holds a clone right now (e.g. during
-                                    // retry backoff), this actor's `store` was
-                                    // the last strong reference and an inline
-                                    // drop would deallocate the whole
-                                    // BridgeStore map on this async worker.
-                                    drop_off_worker(store.replace(owned), Arc::clone(&retirements));
-                                    // Acknowledge the absorption before
-                                    // publishing: the disk write is this
-                                    // actor's problem now.
-                                    let _ = ack.send(Ok(()));
-                                    retry.dirty = true;
-                                    mutations_since_publish += 1;
-                                    // Publish now, unless a publish is already
-                                    // in flight (the tail rides along) or a
-                                    // backoff retry is pending (the timer
-                                    // governs retries).
-                                    try_start_publish(
-                                        &mut publishing,
-                                        &mut retry,
-                                        &store,
-                                        &mut mutations_since_publish,
-                                        &publish,
-                                        &done_tx,
-                                    ).await;
-                                }
-                                Err(join_error) => {
-                                    // The closure panicked mid-apply and its
-                                    // private deep copy is gone, but the
-                                    // actor never handed over its own Arc:
-                                    // `store` still holds the last good
-                                    // snapshot, including all earlier
-                                    // acknowledged mutations and any
-                                    // retained-but-unpublished ones. Nothing
-                                    // to restore. This op's ack reports only
-                                    // that THIS mutation did not land;
-                                    // retry/dirty/publish bookkeeping is
-                                    // untouched, so the pending backoff
-                                    // retry still publishes the retained
-                                    // snapshot.
-                                    warn!(
-                                        error = %join_error,
-                                        path = %path.display(),
-                                        "bridge health store mutation task panicked",
-                                    );
-                                    let _ = ack.send(Err(anyhow!(
-                                        "bridge health store mutation task panicked: {join_error}"
-                                    )));
-                                    continue;
-                                }
-                            }
+                            absorb_mutation(
+                                apply, ack, &mut store, &mut retry, &mut publishing,
+                                &mut mutations_since_publish, &publish, &done_tx, &retirements, &path,
+                            ).await;
                         }
                     },
                     _ = tokio::time::sleep_until(retry_at.unwrap_or_else(tokio::time::Instant::now)), if retry.dirty && retry_at.is_some() && !publishing && !closing => {
@@ -767,6 +651,60 @@ impl StoreWriter {
             })),
             #[cfg(test)]
             retirements,
+        }
+    }
+}
+
+/// Apply one mutation to the loaded snapshot off the async worker, ack it,
+/// and offer a publish. A panicking closure destroys only its private copy
+/// (TS5-06): `store` keeps all earlier acknowledged mutations.
+#[allow(clippy::too_many_arguments)]
+async fn absorb_mutation(
+    apply: MutateFn,
+    ack: oneshot::Sender<Result<()>>,
+    store: &mut Option<Arc<BridgeStore>>,
+    retry: &mut RetryState,
+    publishing: &mut bool,
+    mutations_since_publish: &mut u32,
+    publish: &Publisher,
+    done_tx: &mpsc::Sender<crate::workers::Delivery<()>>,
+    retirements: &RetirementLog,
+    path: &Path,
+) {
+    let cloned = store.clone().expect("loaded snapshot is present");
+    match crate::workers::run_tracked_blocking(move || {
+        let mut owned = cloned;
+        apply(Arc::make_mut(&mut owned));
+        owned
+    })
+    .await
+    {
+        Ok(owned) => {
+            // TS6-04: retire the old Arc on the blocking pool, not inline.
+            drop_off_worker(store.replace(owned), Arc::clone(retirements));
+            // Ack the absorption before publishing: the disk write is the actor's problem now.
+            let _ = ack.send(Ok(()));
+            retry.dirty = true;
+            *mutations_since_publish += 1;
+            try_start_publish(
+                publishing,
+                retry,
+                store,
+                mutations_since_publish,
+                publish,
+                done_tx,
+            )
+            .await;
+        }
+        Err(join_error) => {
+            warn!(
+                error = %join_error,
+                path = %path.display(),
+                "bridge health store mutation task panicked",
+            );
+            let _ = ack.send(Err(anyhow!(
+                "bridge health store mutation task panicked: {join_error}"
+            )));
         }
     }
 }
