@@ -57,6 +57,10 @@ async fn run_server_reports_final_flush_worker_panic() {
                 );
                 writer.apply(|_| {}).await.unwrap();
                 first_rx.await.unwrap();
+                // The publisher signals before it returns its error. Join the
+                // registry so that failure is settled (taken) before the server's
+                // startup join can see it as an unacknowledged worker failure.
+                let _ = registry.join().await;
                 let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
                 let hook = Arc::new(super::super::global_init::ShutdownHook {
                     settings,

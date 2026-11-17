@@ -516,8 +516,10 @@ jobs:
                   if feature is not None:
                       args.extend(("--features", feature))
                   label = "no-default-features" if feature is None else feature
-                  print(f"Checking facade feature: {label}", flush=True)
-                  run("check", *args, "--test", "surface")
+                  print(f"Testing facade feature: {label}", flush=True)
+                  # Executed, not just checked: the surface tests are
+                  # network-free by construction (see apps/sdk/tests/surface.rs).
+                  run("test", *args, "--test", "surface")
                   run("clippy", *args, "--all-targets", "--", "-D", "warnings")
               else:
                   required = entry["required_features"]
@@ -525,6 +527,10 @@ jobs:
                       args.extend(("--features", ",".join(required)))
                   print(f"Checking facade example: {entry['name']}", flush=True)
                   run("check", *args, "--example", entry["name"])
+
+          # The facade's documented API is executable: the `full` aggregate
+          # feature compiles the doctests too (still network-free).
+          run("test", "--doc", "--locked", "-p", "tor-socks5", "--features", "full")
           PY
 
   stress:

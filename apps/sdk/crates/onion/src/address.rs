@@ -36,6 +36,9 @@ pub enum ParseError {
     /// Checksum bytes do not match the recomputed checksum.
     #[error("onion address checksum mismatch")]
     ChecksumMismatch,
+    /// Address does not end in ".onion" (case-insensitive).
+    #[error("onion address is missing the \".onion\" suffix")]
+    MissingSuffix,
 }
 
 /// Encode a 32-byte ed25519 public key as a v3 onion address (with ".onion").
@@ -55,13 +58,12 @@ pub fn onion_address(pubkey: &[u8; 32]) -> String {
 /// Uppercase base32 is accepted and normalized. The ".onion" suffix is
 /// required (case-insensitive).
 pub fn parse_onion_address(addr: &str) -> Result<[u8; 32], ParseError> {
-    let body = match addr
-        .strip_suffix(".onion")
-        .or_else(|| addr.strip_suffix(".ONION"))
-    {
-        Some(body) => body,
-        None => return Err(ParseError::BadLength(addr.len())),
-    };
+    let lower = addr.to_ascii_lowercase();
+    if !lower.ends_with(".onion") {
+        return Err(ParseError::MissingSuffix);
+    }
+    // ".onion" is 6 ASCII chars, so slicing by byte index is safe.
+    let body = &addr[..addr.len() - 6];
     if body.len() != ADDRESS_LEN {
         return Err(ParseError::BadLength(body.len()));
     }
@@ -117,8 +119,8 @@ impl Keypair {
 
     /// Expanded secret key in the Tor `ks_hs_id.ed25519_expanded_private`
     /// layout: clamped scalar (32 bytes) || SHA-512 hash prefix (32 bytes).
-    pub fn to_expanded_bytes(&self) -> [u8; 64] {
-        *self.secret
+    pub fn to_expanded_bytes(&self) -> Zeroizing<[u8; 64]> {
+        Zeroizing::new(*self.secret)
     }
 }
 
@@ -242,9 +244,10 @@ mod tests {
     #[test]
     fn parse_bad_length() {
         let addr = onion_address(&[3u8; 32]);
-        let short = &addr[..addr.len() - 1];
+        // Drop one body char, keeping the suffix: body is 55 chars.
+        let short = format!("{}{}", &addr[0..1], &addr[2..]);
         assert!(matches!(
-            parse_onion_address(short),
+            parse_onion_address(&short),
             Err(ParseError::BadLength(_))
         ));
         let mut long = addr.clone();
@@ -253,12 +256,29 @@ mod tests {
             parse_onion_address(&long),
             Err(ParseError::BadLength(_))
         ));
-        // Missing ".onion" suffix is treated as a bad length.
+    }
+
+    #[test]
+    fn parse_missing_suffix() {
+        let addr = onion_address(&[3u8; 32]);
         let no_suffix = &addr[..ADDRESS_LEN];
-        assert!(matches!(
+        assert_eq!(
             parse_onion_address(no_suffix),
-            Err(ParseError::BadLength(_))
-        ));
+            Err(ParseError::MissingSuffix)
+        );
+    }
+
+    #[test]
+    fn parse_accepts_uppercase_suffix() {
+        let kp = generate_from_seed(&[13u8; 32]);
+        let upper: String = kp
+            .address()
+            .chars()
+            .map(|c| c.to_ascii_uppercase())
+            .collect();
+        // The full address uppercased, suffix included.
+        assert!(upper.ends_with(".ONION"));
+        assert_eq!(parse_onion_address(&upper).unwrap(), *kp.pubkey());
     }
 
     #[test]
@@ -294,7 +314,7 @@ mod tests {
         let kp = generate_from_seed(&[12u8; 32]);
         let dbg = format!("{kp:?}");
         assert!(!dbg.contains("secret"));
-        assert!(!dbg.contains(&format!("{:?}", kp.to_expanded_bytes()[..4].to_vec())));
+        assert!(!dbg.contains(&format!("{:?}", (*kp.to_expanded_bytes())[..4].to_vec())));
         assert!(dbg.contains(kp.address()));
     }
 
@@ -303,7 +323,7 @@ mod tests {
         let a = generate();
         let b = generate();
         assert_ne!(a.pubkey(), b.pubkey());
-        // Zeroized wrapper must zero on drop; check a fresh clone is intact.
+        // 64 bytes = clamped scalar || hash prefix; zeroized on drop.
         assert_eq!(a.to_expanded_bytes().len(), 64);
     }
 
