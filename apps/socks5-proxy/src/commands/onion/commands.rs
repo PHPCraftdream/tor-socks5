@@ -190,15 +190,17 @@ fn cmd_new(
             nick_hs.to_string()
         );
     }
-    // The search runs under the keystore lock: the crate invokes the closure
-    // only after the lock + replace checks inside `create_service`.
+    // The search runs OUTSIDE the keystore lock: it may take minutes and the
+    // lock must not be held that whole time. `create_service` takes the lock
+    // afterwards and re-checks the replace refusal under it.
     let mut pick =
         || vanity::search_for_cli(vanity.as_deref().unwrap_or(""), threads, timeout.as_deref());
     let source = match vanity.as_deref() {
         Some(_) => keys::NewIdentity::Supplied(&mut pick),
         None => keys::NewIdentity::Random,
     };
-    let recorded = keys::create_service(&at.config, &at.keystore, nick, ports, force, source)?;
+    let recorded = keys::create_service(&at.config, &at.keystore, nick, ports, force, source)
+        .map_err(with_hint)?;
     print_recorded(at, &nick_hs, &recorded.address, recorded.ports_enabled);
     Ok(())
 }
@@ -233,7 +235,7 @@ fn cmd_list(at: &Target) -> Result<()> {
 
 fn cmd_show(at: &Target, nick: &str) -> Result<()> {
     let nick_hs = store::nickname(nick)?;
-    let service = keys::show_service(&at.config, nick)?;
+    let service = keys::show_service(&at.config, nick).map_err(with_hint)?;
     println!("nickname: {nick_hs}");
     println!(
         "address:  {}",
@@ -255,7 +257,7 @@ fn cmd_show(at: &Target, nick: &str) -> Result<()> {
 
 fn cmd_export(at: &Target, nick: &str, out: &Path, force: bool) -> Result<()> {
     let nick_hs = store::nickname(nick)?;
-    keys::export_identity(&at.config, nick, out, force)?;
+    keys::export_identity(&at.config, nick, out, force).map_err(with_hint)?;
     println!("exported {} to {}", nick_hs, out.display());
     Ok(())
 }
@@ -273,7 +275,8 @@ fn cmd_import(at: &Target, nick: &str, file: &Path, ports: &[String], force: boo
             nick_hs.to_string()
         );
     }
-    let recorded = keys::import_identity(&at.config, &at.keystore, nick, file, ports, force)?;
+    let recorded = keys::import_identity(&at.config, &at.keystore, nick, file, ports, force)
+        .map_err(with_hint)?;
     println!("imported {} from {}", nick_hs, file.display());
     print_recorded(at, &nick_hs, &recorded.address, recorded.ports_enabled);
     Ok(())
@@ -289,9 +292,28 @@ fn cmd_remove(at: &Target, nick: &str, yes: bool) -> Result<()> {
             nick_hs.to_string()
         );
     }
-    keys::remove_service(&at.config, &at.keystore, nick)?;
+    keys::remove_service(&at.config, &at.keystore, nick).map_err(with_hint)?;
     println!("removed {nick_hs} (the service and its key are deleted)");
     Ok(())
+}
+
+/// The SDK errors carry no CLI wording; this adds the operator hints.
+fn with_hint(error: keys::KeysError) -> anyhow::Error {
+    let hint = match &error {
+        keys::KeysError::IdentityExists(_) => {
+            Some("pass --force to replace it (the old .onion address will be lost)")
+        }
+        keys::KeysError::ExportExists(_) => Some("pass --force to overwrite it"),
+        keys::KeysError::NoKey(_) => {
+            Some("it is created at the first start (or by `onion new --force`)")
+        }
+        _ if error.to_string().contains("keystore lock is busy") => Some("stop tor-socks5 first"),
+        _ => None,
+    };
+    match hint {
+        Some(hint) => anyhow::anyhow!("{error}; {hint}"),
+        None => anyhow::Error::new(error),
+    }
 }
 
 #[cfg(test)]
