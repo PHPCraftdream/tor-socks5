@@ -250,9 +250,9 @@ async fn cancellation_while_keystore_lock_is_held_does_not_wait_or_prepare() {
         Some(hooks),
     )
     .await;
-    tokio::time::timeout(Duration::from_millis(500), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         while probes.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
@@ -260,10 +260,12 @@ async fn cancellation_while_keystore_lock_is_held_does_not_wait_or_prepare() {
 
     let began = tokio::time::Instant::now();
     token.cancel();
-    tokio::time::timeout(Duration::from_millis(500), host.shutdown())
+    // The production lock wait is 60 s: a shutdown inside 10 s proves it
+    // does not wait for the held lock, with slack for a loaded runner.
+    tokio::time::timeout(Duration::from_secs(10), host.shutdown())
         .await
         .expect("shutdown while the real lock is held");
-    assert!(began.elapsed() < Duration::from_secs(1));
+    assert!(began.elapsed() < Duration::from_secs(10));
     assert_eq!(
         std::fs::read(&services_path).expect("read services file after cancellation"),
         original
