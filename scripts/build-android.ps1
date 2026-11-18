@@ -12,11 +12,10 @@ param(
 $RepoRoot = $PSScriptRoot | Split-Path -Parent
 
 if (-not $NdkHome) {
-    if ($env:ANDROID_HOME) {
-        $SdkRoot = $env:ANDROID_HOME
-    } else {
-        $SdkRoot = 'D:\system_artefact\android-sdk'
+    if (-not $env:ANDROID_HOME) {
+        throw 'Set ANDROID_HOME (Android SDK root) or ANDROID_NDK_HOME, or pass -NdkHome'
     }
+    $SdkRoot = $env:ANDROID_HOME
 
     $NdkDir = Join-Path $SdkRoot 'ndk'
     if (-not (Test-Path $NdkDir)) {
