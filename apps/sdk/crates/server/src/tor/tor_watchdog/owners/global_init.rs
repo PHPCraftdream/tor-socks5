@@ -187,12 +187,12 @@ impl SettingsInit {
         // Build the main Tor client with the server's PT policy (H11) and
         // report the resolution through the SDK14 observer when a cross-crate
         // test installed one (see `test_seams::sdk14_pt_scope`).
-        #[cfg(any(test, feature = "test-seams"))]
+        #[cfg(test)]
         let observer = tor_socks5_runtime::test_seams::sdk14_pt_observer();
         let build = async move {
             tor_socks5_runtime::tor_setup::build_tor_settings_with_pt(&cfg, &path, pt).await
         };
-        #[cfg(any(test, feature = "test-seams"))]
+        #[cfg(test)]
         let stage: std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<Settings>> + Send>,
         > = match observer {
@@ -203,7 +203,7 @@ impl SettingsInit {
             )),
             None => Box::pin(build),
         };
-        #[cfg(not(any(test, feature = "test-seams")))]
+        #[cfg(not(test))]
         let stage = build;
         Self::start_job(cancellation, stage)
     }
@@ -249,17 +249,17 @@ impl SettingsInit {
         let mut slot = self.handle.lock().await;
         let result = slot
             .as_mut()
-            .ok_or_else(|| anyhow!("настройки уже получены"))?
+            .ok_or_else(|| anyhow!("settings already taken"))?
             .await;
         slot.take();
         self.release()?;
-        result.context("задача подготовки настроек завершилась аварийно")?
+        result.context("settings preparation task panicked")?
     }
 
     fn release(self: &Arc<Self>) -> Result<()> {
         let mut root = SETTINGS
             .lock()
-            .map_err(|_| anyhow!("хранилище настроек повреждено"))?;
+            .map_err(|_| anyhow!("settings storage is corrupted"))?;
         if root
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, self))
@@ -500,7 +500,7 @@ impl Drop for InitGuard {
 struct ConstructorCancelled;
 impl std::fmt::Display for ConstructorCancelled {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("запуск глобального Tor отменён")
+        f.write_str("global Tor startup cancelled")
     }
 }
 impl std::error::Error for ConstructorCancelled {}
@@ -562,7 +562,7 @@ impl GlobalInit {
                     biased;
                     _ = cancel.cancelled() => Err(anyhow::Error::new(ConstructorCancelled)),
                     result = tokio::time::timeout_at(deadline, tunnel.wait_bootstrapped()) => {
-                        result.context("истёк срок запуска глобального Tor").and_then(|result| result.map_err(anyhow::Error::from))
+                        result.context("global Tor startup timed out").and_then(|result| result.map_err(anyhow::Error::from))
                     }
                 };
                 Ok(Constructed { tunnel, outcome })
@@ -575,9 +575,9 @@ impl GlobalInit {
     ) -> Result<Arc<Self>> {
         let mut root = RETAINED
             .lock()
-            .map_err(|_| anyhow!("хранилище запуска Tor повреждено"))?;
+            .map_err(|_| anyhow!("Tor startup storage is corrupted"))?;
         if root.is_some() {
-            bail!("предыдущий запуск глобального Tor ещё сохраняется");
+            bail!("a previous global Tor startup is still held");
         }
         let init = Arc::new(Self {
             cancel: CancellationToken::new(),
@@ -586,7 +586,7 @@ impl GlobalInit {
             tunnel: Mutex::new(None),
         });
         // Корень устанавливается до запуска; между установкой и сохранением дескриптора нет await.
-        let mut handle = init.handle.try_lock().expect("новый слот свободен");
+        let mut handle = init.handle.try_lock().expect("new slot is free");
         *root = Some(init.clone());
         let cancel = init.cancel.clone();
         *handle = Some(tokio::task::spawn_blocking(move || job(cancel)));
@@ -601,12 +601,11 @@ impl GlobalInit {
         let mut slot = self.handle.lock().await;
         let handle = slot
             .as_mut()
-            .ok_or_else(|| anyhow!("запуск Tor уже завершён"))?;
+            .ok_or_else(|| anyhow!("Tor startup already finished"))?;
         // При отмене ожидания дескриптор остаётся в корневом слоте.
         let result = handle.await;
         slot.take();
-        let constructed = match result.context("задача запуска Tor завершилась аварийно")?
-        {
+        let constructed = match result.context("Tor startup task panicked")? {
             Ok(value) => value,
             Err(error) => {
                 self.release()?;
@@ -626,23 +625,20 @@ impl GlobalInit {
                 Self::recover(Instant::now() + cleanup_budget(hooks)).await,
             ));
         }
-        *self.tunnel.try_lock().expect("слот запуска свободен") = Some(constructed.tunnel.clone());
+        *self.tunnel.try_lock().expect("startup slot is free") = Some(constructed.tunnel.clone());
         Ok(constructed.tunnel)
     }
 
     pub(super) fn complete_handoff(self: &Arc<Self>) -> Result<()> {
         self.release()?;
-        self.tunnel
-            .try_lock()
-            .expect("слот запуска свободен")
-            .take();
+        self.tunnel.try_lock().expect("startup slot is free").take();
         Ok(())
     }
 
     fn release(self: &Arc<Self>) -> Result<()> {
         let mut root = RETAINED
             .lock()
-            .map_err(|_| anyhow!("хранилище запуска Tor повреждено"))?;
+            .map_err(|_| anyhow!("Tor startup storage is corrupted"))?;
         if root
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, self))
@@ -655,7 +651,7 @@ impl GlobalInit {
     pub(super) async fn recover(deadline: Instant) -> Result<()> {
         let init = RETAINED
             .lock()
-            .map_err(|_| anyhow!("хранилище запуска Tor повреждено"))?
+            .map_err(|_| anyhow!("Tor startup storage is corrupted"))?
             .clone();
         let Some(init) = init else {
             return Ok(());
@@ -663,10 +659,10 @@ impl GlobalInit {
         init.cancel.cancel();
         let mut slot = tokio::time::timeout_at(deadline, init.handle.lock())
             .await
-            .context("истёк срок ожидания запуска глобального Tor")?;
+            .context("global Tor startup wait timed out")?;
         let mut cleanup = tokio::time::timeout_at(deadline, init.cleanup.lock())
             .await
-            .context("истёк срок ожидания очистки глобального Tor")?;
+            .context("global Tor cleanup wait timed out")?;
         if let Some(handle) = slot.as_mut() {
             let result = tokio::time::timeout_at(deadline, handle)
                 .await
@@ -687,11 +683,11 @@ impl GlobalInit {
         {
             let mut tunnel = tokio::time::timeout_at(deadline, init.tunnel.lock())
                 .await
-                .context("истёк срок ожидания очистки глобального Tor")?;
+                .context("global Tor cleanup wait timed out")?;
             if let Some(current) = tunnel.as_ref() {
                 tokio::time::timeout_at(deadline, current.shutdown())
                     .await
-                    .context("истёк срок завершения глобального PT")??;
+                    .context("global PT shutdown timed out")??;
             }
             if let Some(current) = tunnel.take() {
                 *cleanup = Some(tokio::task::spawn_blocking(move || drop(current)));
@@ -700,9 +696,9 @@ impl GlobalInit {
         if let Some(handle) = cleanup.as_mut() {
             let result = tokio::time::timeout_at(deadline, handle)
                 .await
-                .context("истёк срок очистки глобального Tor")?;
+                .context("global Tor cleanup timed out")?;
             cleanup.take();
-            result.context("задача очистки глобального Tor завершилась аварийно")?;
+            result.context("global Tor cleanup task panicked")?;
         }
         init.release()?;
         Ok(())
@@ -961,7 +957,7 @@ mod tests {
         let _ = waiter.await;
         drop(guard);
         assert!(init.cancel.is_cancelled());
-        assert!(GlobalInit::start_job(|_| Err(anyhow!("не должен запускаться"))).is_err());
+        assert!(GlobalInit::start_job(|_| Err(anyhow!("must not start"))).is_err());
         assert!(
             GlobalInit::recover(Instant::now() + Duration::from_millis(10))
                 .await

@@ -42,7 +42,7 @@ struct ConstructorCancelled;
 
 impl std::fmt::Display for ConstructorCancelled {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("запуск Tor владельца отменён")
+        f.write_str("owner Tor startup cancelled")
     }
 }
 impl std::error::Error for ConstructorCancelled {}
@@ -148,7 +148,7 @@ impl OwnerRegistry {
     pub(super) async fn select_endpoint(&self, pre: Option<Socks5PreEndpoint>) -> Result<Owner> {
         tokio::select! {
             biased;
-            _ = self.cancel.cancelled() => bail!("реестр закрыт"),
+            _ = self.cancel.cancelled() => bail!("registry is closed"),
             result = self.select_inner(pre) => result,
         }
     }
@@ -306,7 +306,7 @@ impl OwnerRegistry {
             tunnel
                 .wait_bootstrapped()
                 .await
-                .map_err(|_| anyhow!("не удалось запустить Tor владельца"))
+                .map_err(|_| anyhow!("failed to start the owner Tor"))
         });
         tokio::select! {
             biased;
@@ -331,7 +331,7 @@ impl OwnerRegistry {
         {
             let mut state = self.state.lock().await;
             if state.closed || self.cancel.is_cancelled() {
-                bail!("реестр закрыт");
+                bail!("registry is closed");
             }
             if pre == self.global_pre {
                 return Ok(None);
@@ -339,16 +339,16 @@ impl OwnerRegistry {
             let settings = self
                 .settings
                 .as_ref()
-                .ok_or_else(|| anyhow!("шаблон альтернативного владельца недействителен"))?;
+                .ok_or_else(|| anyhow!("alternate owner template is invalid"))?;
             settings.validate_stock_pt_proxy()?;
             if settings.state_dir.is_none() {
-                bail!("нет каталога состояния для альтернативного владельца");
+                bail!("no state directory for the alternate owner");
             }
             if let Some(entry) = state.entries.iter().find(|entry| entry.pre == pre) {
                 Ok(Some(Arc::clone(entry)))
             } else {
                 if state.entries.len() >= CAPACITY - 1 {
-                    bail!("достигнут предел владельцев; требуется перезапуск");
+                    bail!("owner limit reached; restart required");
                 }
                 let entry = Arc::new(Entry {
                     pre,
@@ -380,22 +380,22 @@ impl OwnerRegistry {
         };
         let mut state = entry.state.lock().await;
         if self.cancel.is_cancelled() {
-            bail!("реестр закрыт");
+            bail!("registry is closed");
         }
         if state.failed {
-            bail!("конструктор Tor владельца завершился ошибкой");
+            bail!("owner Tor constructor failed");
         }
         if !state.attempted {
             let mut settings = self
                 .settings
                 .as_ref()
-                .ok_or_else(|| anyhow!("нет шаблона владельца"))?
+                .ok_or_else(|| anyhow!("no owner template"))?
                 .clone();
             settings.pre_endpoint = entry.pre.clone();
             let base = settings
                 .state_dir
                 .clone()
-                .ok_or_else(|| anyhow!("нет каталога состояния"))?;
+                .ok_or_else(|| anyhow!("no state directory"))?;
             let runtime = tokio::runtime::Handle::current();
             let cancel = self.cancel.clone();
             #[cfg(test)]
@@ -415,7 +415,7 @@ impl OwnerRegistry {
                 settings.state_dir = Some(storage.state);
                 settings.cache_dir = Some(storage.cache);
                 let tunnel = TorTunnel::create_unbootstrapped_with(settings)
-                    .map_err(|_| anyhow!("не удалось создать Tor владельца"))?;
+                    .map_err(|_| anyhow!("failed to create the owner Tor"))?;
                 runtime.block_on(async {
                     let outcome = tokio::select! {
                         biased;
@@ -427,8 +427,8 @@ impl OwnerRegistry {
                                 return Ok(());
                             }
                             tunnel.wait_bootstrapped().await
-                                .map_err(|_| anyhow!("не удалось запустить Tor владельца"))
-                        }) => result.map_err(|_| anyhow!("истёк срок запуска Tor владельца")).and_then(|result| result),
+                                .map_err(|_| anyhow!("failed to start the owner Tor"))
+                        }) => result.map_err(|_| anyhow!("owner Tor startup timed out")).and_then(|result| result),
                     };
                     Ok(Constructed {
                         tunnel,
@@ -449,7 +449,7 @@ impl OwnerRegistry {
                     entry
                         .ready
                         .store(false, std::sync::atomic::Ordering::Release);
-                    bail!("конструктор Tor завершился ошибкой");
+                    bail!("Tor constructor failed");
                 }
             };
             state.slot = Some(constructed.slot);
@@ -466,7 +466,7 @@ impl OwnerRegistry {
             entry
                 .ready
                 .store(false, std::sync::atomic::Ordering::Release);
-            bail!("конструктор Tor владельца завершился ошибкой");
+            bail!("owner Tor constructor failed");
         }
         entry
             .ready
@@ -497,9 +497,9 @@ impl OwnerRegistry {
     pub(super) fn retain_for_shutdown(self: &Arc<Self>) -> Result<()> {
         let mut retained = RETAINED
             .lock()
-            .map_err(|_| anyhow!("хранилище реестра повреждено"))?;
+            .map_err(|_| anyhow!("registry storage is corrupted"))?;
         if retained.is_some() {
-            bail!("предыдущий реестр ещё удерживается");
+            bail!("a previous registry is still held");
         }
         *retained = Some(Arc::clone(self));
         Ok(())
@@ -513,7 +513,7 @@ impl OwnerRegistry {
     pub(super) async fn recover_retained_with_deadline(deadline: Instant) -> Result<()> {
         let registry = RETAINED
             .lock()
-            .map_err(|_| anyhow!("хранилище реестра повреждено"))?
+            .map_err(|_| anyhow!("registry storage is corrupted"))?
             .clone();
         if let Some(registry) = registry {
             registry.close_with_deadline(deadline).await?;
@@ -526,11 +526,11 @@ impl OwnerRegistry {
         tokio::time::timeout_at(deadline, self.close())
             .await
             .map_err(|_| {
-                anyhow!("истёк срок закрытия реестра; сохраните реестр для повторного ожидания")
+                anyhow!("registry close timed out; persist the registry to wait again")
             })??;
         let mut retained = RETAINED
             .lock()
-            .map_err(|_| anyhow!("хранилище реестра повреждено"))?;
+            .map_err(|_| anyhow!("registry storage is corrupted"))?;
         if retained
             .as_ref()
             .is_some_and(|registry| std::ptr::eq(registry.as_ref(), self))
@@ -614,7 +614,7 @@ impl OwnerRegistry {
                     tunnel
                         .shutdown()
                         .await
-                        .map_err(|_| anyhow!("ошибка завершения PT"))?;
+                        .map_err(|_| anyhow!("PT shutdown error"))?;
                 }
                 if let Some(tunnel) = state.tunnel.take() {
                     state.teardown = Some(tokio::task::spawn_blocking(move || drop(tunnel)));
@@ -635,7 +635,7 @@ impl OwnerRegistry {
                 tunnel
                     .shutdown()
                     .await
-                    .map_err(|_| anyhow!("ошибка завершения глобального PT"))?;
+                    .map_err(|_| anyhow!("global PT shutdown error"))?;
             }
             Ok::<(), anyhow::Error>(())
         };
@@ -652,7 +652,7 @@ impl OwnerRegistry {
             .close_failed
             .swap(false, std::sync::atomic::Ordering::Relaxed)
         {
-            bail!("задача владельца завершилась ошибкой при закрытии");
+            bail!("owner task failed during shutdown");
         }
         Ok(())
     }
