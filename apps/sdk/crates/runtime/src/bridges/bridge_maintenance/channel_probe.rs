@@ -19,6 +19,42 @@ const CHANNEL_TIMEOUT: Duration = Duration::from_secs(15);
 const ROUND_TIMEOUT: Duration = Duration::from_secs(60);
 const FALLBACK_POOL_SIZE: usize = 8;
 
+/// The fallback bridge-store read does blocking file I/O; run it on the
+/// blocking pool so it cannot stall an async worker (H15/TS19).
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) async fn load_probe_store_off_worker(path: &Path) -> Option<BridgeStore> {
+    load_probe_store_off_worker_inner(crate::test_seams::Site::ProbeStoreLoad, path).await
+}
+
+/// Prod twin of [`load_probe_store_off_worker`].
+#[cfg(not(any(test, feature = "test-seams")))]
+pub(crate) async fn load_probe_store_off_worker(path: &Path) -> Option<BridgeStore> {
+    load_probe_store_off_worker_inner(
+        crate::bridge_maintenance::seam_site::Site::ProbeStoreLoad,
+        path,
+    )
+    .await
+}
+
+async fn load_probe_store_off_worker_inner(
+    #[cfg(any(test, feature = "test-seams"))] site: crate::test_seams::Site,
+    #[cfg(not(any(test, feature = "test-seams")))] site: crate::bridge_maintenance::seam_site::Site,
+    path: &Path,
+) -> Option<BridgeStore> {
+    let store_path = BridgeStore::resolve_path(path);
+    match crate::bridge_maintenance::run_blocking_at(site, store_path, |p| {
+        BridgeStore::load(p.to_path_buf())
+    })
+    .await
+    {
+        Ok(store) => Some(store),
+        Err(error) => {
+            warn!(error = %error, "bridge health store load failed");
+            None
+        }
+    }
+}
+
 fn warm_bridge_proves_channel(result: arti_wrapper::Result<bool>) -> bool {
     matches!(result, Ok(true))
 }
@@ -99,7 +135,7 @@ pub(super) async fn authenticate_fallback(
         return Ok(true);
     }
     let mut configured = cfg.bridges.parsed()?.bridges;
-    if let Ok(store) = BridgeStore::load(BridgeStore::resolve_path(path)) {
+    if let Some(store) = load_probe_store_off_worker(path).await {
         configured.retain(|bridge| {
             !store.is_retired(bridge) && store.circuit_fails(bridge) < cfg.bridges.max_circuit_fails
         });

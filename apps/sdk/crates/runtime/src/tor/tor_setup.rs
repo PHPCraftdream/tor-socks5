@@ -1,7 +1,5 @@
 //! Bridge reachability probing and arti `Settings` construction.
-//!
 //! Shared by the SDK server startup path and `fetch_bridges`.
-
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -14,8 +12,12 @@ use bridge_probe::{bridge_identity, BridgeIdentity};
 use time::OffsetDateTime;
 use tracing::{info, warn};
 
+#[cfg(not(any(test, feature = "test-seams")))]
+use crate::bridge_maintenance::seam_site::Site;
 use crate::config::Config;
 pub(crate) use crate::pt::{extra_pt_protocols, resolve_pt_binary, PtBinary};
+#[cfg(any(test, feature = "test-seams"))]
+use crate::test_seams::Site;
 use bridge_store::BridgeStore;
 use persist_lock::{PathLock, CLI_LOCK_WAIT};
 
@@ -130,7 +132,13 @@ async fn build_tor_settings_inner(
         );
     }
     let mut parsed_bridges = parsed.bridges;
-    if let Ok(store) = BridgeStore::load(BridgeStore::resolve_path(config_path)) {
+    let loaded = crate::bridge_maintenance::run_blocking_at(
+        Site::SetupStoreLoad,
+        BridgeStore::resolve_path(config_path),
+        |path| BridgeStore::load(path.to_path_buf()),
+    )
+    .await;
+    if let Ok(store) = loaded {
         parsed_bridges.retain(|bridge| {
             !store.is_retired(bridge) && store.circuit_fails(bridge) < cfg.bridges.max_circuit_fails
         });
@@ -138,7 +146,7 @@ async fn build_tor_settings_inner(
 
     // Exhaust the preferred pool before considering obfs4 fallback.
     let preferred_bridges = preferred_transport_bridges(&parsed_bridges, cfg);
-    let active_probe_bridges = select_active_probe_bridges(&preferred_bridges, config_path);
+    let active_probe_bridges = select_active_probe_bridges(&preferred_bridges, config_path).await;
     let probing_all_preferred = active_probe_bridges.len() == preferred_bridges.len();
 
     // Everything we attempt this round, for the health store. Starts with
@@ -202,7 +210,13 @@ async fn build_tor_settings_inner(
     // probe the binary's built-in seed bridges so a fresh or stale config
     // can still bootstrap. `auto_fetch` will then replenish the config.
     if alive.is_empty() && live.is_empty() && cfg.bridges.use_seeds {
-        let seeds = crate::seed::seed_bridges(config_path);
+        let seeds = crate::bridge_maintenance::run_blocking_at(
+            Site::SetupSeedLoad,
+            crate::seed::resolve_seed_path(config_path),
+            |path| Ok(crate::seed::seed_bridges_from_seed_file(path)),
+        )
+        .await
+        .unwrap_or_default();
         if !seeds.is_empty() {
             warn!(
                 count = seeds.len(),
@@ -446,7 +460,10 @@ fn retain_and_rank_alive(alive: &mut Vec<(BridgeLine, Duration)>, ranked: &[Brid
 /// health store falls back to the first
 /// bounded slice; the caller performs a full probe only when that slice
 /// produces no reachable bridge.
-fn select_active_probe_bridges(configured: &[BridgeLine], config_path: &Path) -> Vec<BridgeLine> {
+async fn select_active_probe_bridges(
+    configured: &[BridgeLine],
+    config_path: &Path,
+) -> Vec<BridgeLine> {
     if configured.len() <= MAX_ACTIVE_BRIDGES {
         return configured.to_vec();
     }
@@ -454,8 +471,13 @@ fn select_active_probe_bridges(configured: &[BridgeLine], config_path: &Path) ->
         .iter()
         .map(|bridge| (bridge.to_string(), bridge.clone()))
         .collect();
-    let store_path = BridgeStore::resolve_path(config_path);
-    if let Ok(store) = BridgeStore::load(store_path) {
+    let loaded = crate::bridge_maintenance::run_blocking_at(
+        Site::SetupProbeRank,
+        BridgeStore::resolve_path(config_path),
+        |path| BridgeStore::load(path.to_path_buf()),
+    )
+    .await;
+    if let Ok(store) = loaded {
         let ranked: Vec<BridgeLine> = store
             .healthiest_among(configured, MAX_ACTIVE_BRIDGES)
             .into_iter()
@@ -849,19 +871,19 @@ mod tests {
         assert_eq!(preferred_transport_bridges(&bridges, &cfg), bridges);
     }
 
-    #[test]
-    fn select_active_probe_bridges_keeps_small_list_unchanged() {
+    #[tokio::test]
+    async fn select_active_probe_bridges_keeps_small_list_unchanged() {
         let bridges: Vec<BridgeLine> = (0..5)
             .map(|i| obfs4_line(&format!("10.0.0.{i}:443")))
             .collect();
         assert_eq!(
-            select_active_probe_bridges(&bridges, Path::new("tor-socks5.ktav")),
+            select_active_probe_bridges(&bridges, Path::new("tor-socks5.ktav")).await,
             bridges
         );
     }
 
-    #[test]
-    fn select_active_probe_bridges_bounds_large_list_without_a_health_store() {
+    #[tokio::test]
+    async fn select_active_probe_bridges_bounds_large_list_without_a_health_store() {
         let bridges: Vec<BridgeLine> = (0..(MAX_ACTIVE_BRIDGES + 10))
             .map(|i| obfs4_line(&format!("10.0.{}.{}:443", i / 256, i % 256)))
             .collect();
@@ -869,7 +891,7 @@ mod tests {
         // install: the health store loads empty, so this falls back to the
         // first `MAX_ACTIVE_BRIDGES` bridges in configured order.
         let missing_config = Path::new("/nonexistent/does-not-exist/tor-socks5.ktav");
-        let active = select_active_probe_bridges(&bridges, missing_config);
+        let active = select_active_probe_bridges(&bridges, missing_config).await;
         assert_eq!(active.len(), MAX_ACTIVE_BRIDGES);
         assert_eq!(active, bridges[..MAX_ACTIVE_BRIDGES]);
     }

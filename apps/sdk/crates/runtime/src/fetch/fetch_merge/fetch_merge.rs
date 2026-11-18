@@ -350,17 +350,16 @@ fn channel_checker(
 /// that need a pluggable transport runs with a Tor client pointed at the
 /// executable chosen here. `PtBinary::Environment` resolves the documented
 /// `TOR_PT_BINARY` override, else the current process executable.
-pub async fn drain_pool(
+pub(crate) async fn drain_pool(
     config_path: &Path,
     target: usize,
     tor: Option<&TorTunnel>,
     pt_binary: crate::pt::PtBinary,
 ) -> Result<usize> {
-    // Cheap guard first: no target means no drain.
     if target == 0 {
         return Ok(0);
     }
-    let cfg = Config::load_with_override(Some(config_path))?.into_config();
+    let cfg = load_drain_config_off_worker(config_path).await?;
     let admission_config = config_path.to_path_buf();
     // One registry per drain: it owns every verification worker the
     // admission decision outlives, and `drain_pool_with` joins them after
@@ -420,7 +419,9 @@ async fn drain_pool_with(
         .context("locking candidate pool for drain")?;
     // Cloned: the confirm transaction below needs the same path after this
     // snapshot is consumed.
-    let mut pool = CandidatePool::load(pool_path.clone()).context("loading candidate pool")?;
+    let mut pool = load_pool_off_worker(&pool_path)
+        .await
+        .context("loading candidate pool")?;
     if pool.is_empty() {
         return Ok(0);
     }
@@ -714,6 +715,52 @@ pub(crate) async fn top_up_working_with_pt(
         promoted += drain_pool(config_path, target - promoted, Some(tor), pt_binary).await?;
     }
     Ok(promoted)
+}
+
+/// The drain's blocking config reload (H15/TS19): routed through the
+/// seam-aware blocking worker so it never stalls the async thread.
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) async fn load_drain_config_off_worker(path: &Path) -> Result<Config> {
+    crate::bridge_maintenance::run_blocking_at(
+        crate::test_seams::Site::FetchMergeDrainConfigLoad,
+        path.to_path_buf(),
+        |p| Config::load_with_override(Some(p)).map(|loaded| loaded.into_config()),
+    )
+    .await
+}
+
+/// Prod twin of [`load_drain_config_off_worker`].
+#[cfg(not(any(test, feature = "test-seams")))]
+pub(crate) async fn load_drain_config_off_worker(path: &Path) -> Result<Config> {
+    crate::bridge_maintenance::run_blocking_at(
+        crate::bridge_maintenance::seam_site::Site::FetchMergeDrainConfigLoad,
+        path.to_path_buf(),
+        |p| Config::load_with_override(Some(p)).map(|loaded| loaded.into_config()),
+    )
+    .await
+}
+
+/// The drain's blocking candidate-pool load (H15/TS19): also shared by
+/// `bridge_manager::fetch_bridges`' informational pool reads.
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) async fn load_pool_off_worker(path: &Path) -> Result<CandidatePool> {
+    crate::bridge_maintenance::run_blocking_at(
+        crate::test_seams::Site::FetchMergePoolLoad,
+        path.to_path_buf(),
+        |p| CandidatePool::load(p.to_path_buf()),
+    )
+    .await
+}
+
+/// Prod twin of [`load_pool_off_worker`].
+#[cfg(not(any(test, feature = "test-seams")))]
+pub(crate) async fn load_pool_off_worker(path: &Path) -> Result<CandidatePool> {
+    crate::bridge_maintenance::run_blocking_at(
+        crate::bridge_maintenance::seam_site::Site::FetchMergePoolLoad,
+        path.to_path_buf(),
+        |p| CandidatePool::load(p.to_path_buf()),
+    )
+    .await
 }
 
 /// Test convenience wrapper for the cfg-taking `drain_pool_with` (H10:

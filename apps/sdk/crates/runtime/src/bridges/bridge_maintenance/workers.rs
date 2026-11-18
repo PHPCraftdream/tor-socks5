@@ -541,11 +541,6 @@ impl AdmissionWorkers {
             handle: Some(worker),
             ..WorkerState::default()
         }));
-        BLOCKING_WORKERS
-            .slots
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(slot.clone());
         self.add(slot);
     }
 
