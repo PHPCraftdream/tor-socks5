@@ -3,6 +3,7 @@
 //! configured HTTPS sources, probe them, and merge the live newcomers into
 //! the config.
 
+use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
 
@@ -11,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cli::BridgesAction;
 use crate::config::{Config, Loaded};
-use crate::process::{init_tracing, install_crypto_provider};
+use crate::process::{init_tracing, install_crypto_provider, wait_for_signal};
 use tor_socks5::runtime::{fetch_bridges, FetchBridgesParams};
 
 #[cfg(test)]
@@ -62,6 +63,11 @@ pub(crate) async fn cmd_bridges(
     // `pre_proxies` and "no bridge sources configured" checks live there
     // too, along with the trailing 200 ms post-drop sleep and the
     // bootstrapping info log; the SDK errors propagate via `?`.
+    // The first stop signal (Ctrl+C, and Ctrl+Break / SIGTERM where
+    // applicable) cancels the fetch gracefully: the SDK drops the tunnel and
+    // runs its cleanup tail instead of the process dying mid-write.
+    let cancel = CancellationToken::new();
+    let stopper = tokio::spawn(cancel_on_signal(cancel.clone(), wait_for_signal()));
     let outcome = fetch_bridges(
         &cfg,
         &config_path,
@@ -73,10 +79,12 @@ pub(crate) async fn cmd_bridges(
             // default environment resolution is correct here; a global
             // `pre_proxies` pool is rejected by the SDK with a typed error.
             pt_binary: tor_socks5::runtime::PtBinary::Environment,
-            cancel: CancellationToken::new(),
+            cancel,
         },
     )
-    .await?;
+    .await;
+    stopper.abort();
+    let outcome = outcome?;
 
     match outcome.promoted {
         None => println!(
@@ -96,6 +104,13 @@ pub(crate) async fn cmd_bridges(
         ),
     }
     Ok(())
+}
+
+/// Cancels `cancel` once `stop` resolves with the name of the signal seen.
+async fn cancel_on_signal(cancel: CancellationToken, stop: impl Future<Output = &'static str>) {
+    let signal = stop.await;
+    tracing::info!(signal, "stop requested; cancelling the bridge fetch");
+    cancel.cancel();
 }
 
 #[cfg(test)]
