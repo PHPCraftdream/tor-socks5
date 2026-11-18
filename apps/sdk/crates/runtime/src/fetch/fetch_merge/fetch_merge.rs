@@ -20,6 +20,7 @@
 //! `bridges fetch` command.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
 
@@ -704,8 +705,8 @@ pub(crate) async fn top_up_working_with_pt(
     top_up_with(
         cfg,
         target,
-        async |want| drain_pool(config_path, want, Some(tor), pt_binary.clone()).await,
-        async || {
+        |want| drain_pool(config_path, want, Some(tor), pt_binary.clone()),
+        || async move {
             refresh_candidate_pool(tor, cfg, config_path, REFRESH_FETCH_TIMEOUT)
                 .await
                 .map(drop)
@@ -715,12 +716,18 @@ pub(crate) async fn top_up_working_with_pt(
 }
 
 /// The top-up decision logic over injectable drain and refresh legs.
-async fn top_up_with(
+async fn top_up_with<D, DF, R, RF>(
     cfg: &Config,
     target: usize,
-    mut drain: impl AsyncFnMut(usize) -> Result<usize>,
-    refresh: impl AsyncFnOnce() -> Result<()>,
-) -> Result<usize> {
+    mut drain: D,
+    refresh: R,
+) -> Result<usize>
+where
+    D: FnMut(usize) -> DF,
+    DF: Future<Output = Result<usize>>,
+    R: FnOnce() -> RF,
+    RF: Future<Output = Result<()>>,
+{
     if target == 0 {
         return Ok(0);
     }

@@ -252,13 +252,14 @@ async fn scripted_top_up(
     let outcome = top_up_with(
         cfg,
         target,
-        async |want| {
+        |want| {
             asked.push(want);
-            Ok(script.pop_front().expect("no drain left in the script"))
+            let promoted = script.pop_front().expect("no drain left in the script");
+            async move { Ok(promoted) }
         },
-        async || {
+        || {
             refreshes += 1;
-            refresh_result
+            async move { refresh_result }
         },
     )
     .await;
@@ -298,7 +299,9 @@ async fn a_short_pool_refreshes_once_and_drains_only_the_shortfall() {
 /// nothing to fetch from.
 #[tokio::test]
 async fn a_short_pool_without_sources_keeps_what_it_promoted() {
-    let (outcome, asked, refreshes) = scripted_top_up(&Config::default(), 3, &[1], Ok(())).await;
+    let mut cfg = Config::default();
+    cfg.bridges.sources.clear();
+    let (outcome, asked, refreshes) = scripted_top_up(&cfg, 3, &[1], Ok(())).await;
     assert_eq!(outcome.unwrap(), 1);
     assert_eq!(asked, [3]);
     assert_eq!(refreshes, 0);
