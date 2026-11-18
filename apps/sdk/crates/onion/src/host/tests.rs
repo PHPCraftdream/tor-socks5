@@ -486,21 +486,68 @@ async fn dropping_the_handle_cancels_the_token() {
 }
 
 // Keystore-dir validation (pure; no live client, no heavy I/O).
+//
+// The client's `state_dir` is the BASE dir (`<config dir>/arti-data`); arti's
+// native keystore lives at `<base>/state/keystore`, which is exactly what
+// `arti_keystore_dir(config_path)` returns. A regression here makes every
+// onion service fail to start in the real binary ("keystore directory
+// mismatch"), so the matching dir below is built the same way the binary does.
 #[test]
 fn keystore_validation_accepts_the_matching_dir() {
     let tmp = tempfile::tempdir().expect("temp dir");
+    let base = tmp.path().join("arti-data");
+    let keystore = base.join("state").join("keystore");
+    std::fs::create_dir_all(&keystore).expect("keystore dir");
+    assert_eq!(validate_keystore_dir(Some(&base), &keystore), Ok(()));
+}
+
+#[test]
+fn keystore_validation_accepts_the_matching_dir_before_it_exists() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let base = tmp.path().join("arti-data");
+    // Neither side exists yet: both fall back to the same raw path.
     assert_eq!(
-        validate_keystore_dir(Some(tmp.path()), &tmp.path().join("keystore")),
+        validate_keystore_dir(Some(&base), &base.join("state").join("keystore")),
         Ok(())
     );
+}
+
+/// The binary derives the keystore dir with `arti_keystore_dir(config_path)`
+/// and the client's base dir is `<config dir>/arti-data`: the two must agree.
+#[test]
+fn the_binarys_keystore_dir_validates_against_its_base_dir() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let config_path = tmp.path().join("tor-socks5.ktav");
+    let base = tmp.path().join("arti-data");
+    assert_eq!(
+        validate_keystore_dir(Some(&base), &proxy_config::arti_keystore_dir(&config_path)),
+        Ok(())
+    );
+}
+
+#[test]
+fn keystore_validation_rejects_a_dir_that_is_not_under_the_clients_state() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let base = tmp.path().join("arti-data");
+    // `<base>/keystore` is not where arti reads keys (that is `<base>/state/keystore`).
+    let error = validate_keystore_dir(Some(&base), &base.join("keystore"))
+        .expect_err("a keystore outside <base>/state must be rejected");
+    assert!(error.contains("does not match the running client's keystore"));
 }
 
 #[test]
 fn keystore_validation_rejects_a_foreign_dir() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let foreign = tempfile::tempdir().expect("temp dir");
-    let error = validate_keystore_dir(Some(tmp.path()), &foreign.path().join("keystore"))
-        .expect_err("a foreign keystore dir must be rejected");
+    let error = validate_keystore_dir(
+        Some(&tmp.path().join("arti-data")),
+        &foreign
+            .path()
+            .join("arti-data")
+            .join("state")
+            .join("keystore"),
+    )
+    .expect_err("a foreign keystore dir must be rejected");
     assert!(error.contains("does not match the running client's keystore"));
 }
 

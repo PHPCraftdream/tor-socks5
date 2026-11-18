@@ -556,7 +556,7 @@ async fn upstream_setup_stall_releases_permit_at_deadline() {
 /// two-permit cap, two silent clients exhaust the semaphore, and past
 /// the handshake deadline both permits are released again. Removing
 /// either the acquire or the release from `accept_loop` fails this.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn accept_loop_holds_and_releases_an_admission_permit_per_connection() {
     let (addr, permits, server) =
         spawn_test_server_with_upstream("127.0.0.1:1".to_string(), 2).await;
@@ -564,17 +564,17 @@ async fn accept_loop_holds_and_releases_an_admission_permit_per_connection() {
     // each holding one of the two permits.
     let _c1 = tokio::net::TcpStream::connect(addr).await.unwrap();
     let _c2 = tokio::net::TcpStream::connect(addr).await.unwrap();
-    // Bounded by an iteration count, not by a paused-clock timeout: under
-    // `start_paused` a `yield_now` loop keeps the runtime busy, so the clock
-    // would never advance and a timeout could never fire.
-    let mut yields = 0u32;
+    // REAL time while the accept loop picks the sockets up: counting yields
+    // under a paused clock races the kernel delivering the connections (a
+    // yield loop finishes in microseconds) and a paused-clock timeout can
+    // never fire, so neither bound is deterministic.
+    let started = std::time::Instant::now();
     while permits.available_permits() != 0 {
         assert!(
-            yields < 20_000,
+            started.elapsed() < Duration::from_secs(30),
             "both handlers must spawn and take their permits"
         );
-        yields += 1;
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert_eq!(
         permits.available_permits(),
@@ -582,8 +582,9 @@ async fn accept_loop_holds_and_releases_an_admission_permit_per_connection() {
         "two in-flight handlers must hold both permits"
     );
 
-    // The absolute handshake deadline bounds each stuck handler, so both
-    // permits come back once the handlers end.
+    // Only now freeze the clock: the absolute handshake deadline bounds each
+    // stuck handler, so both permits come back once the handlers end.
+    tokio::time::pause();
     tokio::time::sleep(HANDSHAKE_DEADLINE + Duration::from_secs(5)).await;
     let _both = tokio::time::timeout(Duration::from_secs(10), permits.acquire_many_owned(2))
         .await

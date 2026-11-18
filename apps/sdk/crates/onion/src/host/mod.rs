@@ -562,14 +562,17 @@ fn canonicalized(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Check `keystore_dir` against the running client's state dir. `None`
-/// (state dir unknown) passes — nothing can be checked. Pure; no I/O the
-/// caller cannot predict beyond canonicalization of the two paths.
+/// Check `keystore_dir` against the running client's base dir. `None`
+/// (base dir unknown) passes — nothing can be checked. The client's
+/// `Settings::state_dir` is the BASE directory: arti pins its own state under
+/// `<base>/state`, so its native keystore is `<base>/state/keystore` (the path
+/// `arti_keystore_dir` builds). Pure; no I/O the caller cannot predict beyond
+/// canonicalization of the two paths.
 fn validate_keystore_dir(state_dir: Option<&Path>, keystore_dir: &Path) -> Result<(), String> {
-    let Some(state) = state_dir else {
+    let Some(base) = state_dir else {
         return Ok(());
     };
-    let expected = canonicalized(&state.join("keystore"));
+    let expected = canonicalized(&base.join("state").join("keystore"));
     let configured = canonicalized(keystore_dir);
     if configured == expected {
         return Ok(());
