@@ -60,7 +60,7 @@ class External(unittest.TestCase):
                      "targets": [{"kind": [kind]}]} for i, (name, path, kind) in names.items()]
         nodes = [{"id": i, "deps": [{"pkg": d, "name": d, "dep_kinds": [{"kind": None, "target": None}]} for d in deps]} for i, deps in edges.items()]
         self.metadata.write_text(json.dumps({"packages": packages, "workspace_members": list(names), "resolve": {"nodes": nodes}}), encoding="utf-8")
-        for path in ("scripts/testing/ci_planner.py", "scripts/testing/test-affected.sh", ".githooks/pre-push"):
+        for path in ("scripts/testing/ci_planner.py", "scripts/testing/planner_lib/policy.py", "scripts/testing/test-affected.sh", ".githooks/pre-push"):
             target = self.root / path
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(SOURCE / path, target)

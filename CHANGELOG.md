@@ -24,6 +24,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Code-structure rule in CI now covers every code file**: at most 1000 lines per
+  code file (Rust, Python, shell, PowerShell, C and the other code languages; blank
+  lines and comments count) and at most 7 code files directly in a folder (tests are
+  code; documentation, manifests, data files and sub-folders are not counted).
+  `scripts/code-files.sh` is the single definition of "code file"; `vendor/` is exempt.
+  The baselines are gone: the three Python files over the limit (`ci_planner.py`,
+  `test_ci_planner.py`, the installer tests) were split into sub-folders
+  (`scripts/testing/planner_lib/`, `scripts/testing/planner_tests/`,
+  `.github/install/tests/test_install_sh.py` and `test_install_ps.py`), and the lints
+  have their own tests (`scripts/testing/lint_tests/`).
 - **Breaking:** `pre_socks5` / `post_socks5` (config and users registry) are replaced by the array fields `pre_proxies` / `post_proxies`; the old names and single-value form are rejected at load time. `users set-socks5` is now `users set-proxies`
 - **Vendored crates rebased from the Arti 0.43 line to 0.48.0 (arti 2.8.0)**
   (`vendor/`, see its README for the full patch table); `saturating-time`
