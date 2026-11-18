@@ -3,8 +3,8 @@ use super::*;
 use std::sync::Once;
 
 /// Install rustls's process-wide `CryptoProvider` exactly once for this
-/// test binary, mirroring `install_crypto_provider()` in
-/// `apps/socks5-proxy/src/startup.rs` (which real app startup always
+/// test binary, mirroring `host::install_crypto_provider()` in this crate
+/// (which real app startup always
 /// runs before constructing any `TorTunnel`). A genuinely fresh, empty
 /// `state_dir` (see the tempdir-based tests below) reaches further into
 /// arti's directory-manager setup than a dir with pre-existing state

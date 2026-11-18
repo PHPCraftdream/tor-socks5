@@ -141,12 +141,12 @@ fn parse_ipv6_wildcard(token: &str) -> Result<Rule, AllowedClientsError> {
             let prefix = format!("{}0:0", &token[..=colon]);
             let v6: std::net::Ipv6Addr = prefix
                 .parse()
-                .map_err(|_| bad("не является валидным IPv6-префиксом перед IPv4-хвостом"))?;
+                .map_err(|_| bad("not a valid IPv6 prefix before the IPv4 tail"))?;
             let s = v6.segments();
             // Разрешён ТОЛЬКО точный mapped-префикс ::ffff: с нулевыми младшими hextet'ами.
             if s[0..6] != [0, 0, 0, 0, 0, 0xffff] || s[6] != 0 || s[7] != 0 {
                 return Err(bad(
-                    "точечный IPv4-хвост разрешён только в точном mapped-префиксе ::ffff:",
+                    "dotted IPv4 tail is allowed only in the exact mapped prefix ::ffff:",
                 ));
             }
             return parse_ipv4_wildcard(tail);

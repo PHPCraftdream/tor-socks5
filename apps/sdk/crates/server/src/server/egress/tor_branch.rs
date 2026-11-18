@@ -17,8 +17,8 @@ use super::pre_pool;
 use crate::route::{pre_endpoint, TorConnector};
 use tor_socks5_runtime::tor_watchdog::TorHandle;
 
-const TOR_TIMEOUT: &str = "истекло время подключения Tor";
-const OWNER_TIMEOUT: &str = "истекло время подключения владельца";
+const TOR_TIMEOUT: &str = "Tor connection timed out";
+const OWNER_TIMEOUT: &str = "owner connection timed out";
 
 /// What the Tor leg needs to know about one connection.
 pub(super) struct TorLeg<'a> {

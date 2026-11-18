@@ -47,6 +47,6 @@ The library does not load the config file: the host loads `Config` and may pass 
 
 The server implementation tree and `run_server` are internal, not part of the SDK API. At the crate root, the only `#[doc(hidden)]` compatibility export is `reject_unsupported_pool`, used by the binary's `bridges` CLI; it is not the server API.
 
-Behind the default `onion-service` feature, configured onion services are hosted through `tor-socks5-onion`; builds without that feature retain the startup warning when services are configured. The `test-seams` feature is dev-only and is enabled only through consumers' dev-dependencies, never in default/full builds.
+Behind the default `onion-service` feature, configured onion services are hosted through `tor-socks5-onion`; builds without that feature retain the startup warning when services are configured.
 
 The crate is not published: the release artifact is the single `tor-socks5` package, and consumers use its facade by git.

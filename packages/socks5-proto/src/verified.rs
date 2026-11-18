@@ -48,8 +48,8 @@ pub enum VerifiedError {
 impl std::fmt::Display for VerifiedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Handshake(error) => write!(f, "ошибка рукопожатия: {error}"),
-            Self::IdentityMismatch => f.write_str("подтверждение не соответствует запросу"),
+            Self::Handshake(error) => write!(f, "handshake error: {error}"),
+            Self::IdentityMismatch => f.write_str("confirmation does not match the request"),
         }
     }
 }

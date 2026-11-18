@@ -85,7 +85,7 @@ impl CredentialProof {
 }
 
 /// Политика снимка; удерживайте lease до завершения подключения.
-#[must_use = "lease удерживает публикацию до завершения подключения"]
+#[must_use = "the lease holds the publication until the connection is finished"]
 pub struct AdmissionLease {
     _guard: OwnedRwLockReadGuard<()>,
     name: String,
@@ -321,7 +321,7 @@ impl AuthState {
         let path = self
             .users_path
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("путь реестра не задан"))?;
+            .ok_or_else(|| anyhow::anyhow!("registry path is not set"))?;
         let _file_lock = PathLock::acquire(path)?;
         let _gate = self.gate.blocking_write();
         let config = UsersConfig::load(path)?;

@@ -9,8 +9,6 @@ mod config;
 mod config_cmd;
 #[path = "commands/help_cmd.rs"]
 mod help_cmd;
-// Onion helpers: the address/vanity core is not wired into the CLI yet.
-#[allow(dead_code)]
 #[path = "commands/onion/mod.rs"]
 mod onion;
 #[path = "process/mod.rs"]

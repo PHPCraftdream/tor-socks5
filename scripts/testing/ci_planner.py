@@ -52,12 +52,30 @@ SANCTIONED_DEPENDENCY_REMOVALS = frozenset({
     ("apps/sdk/crates/runtime/Cargo.toml", "dev-dependencies", "rustls"),
     # H18: HsNickname comes through tor-socks5-onion (facade re-export).
     ("apps/socks5-proxy/Cargo.toml", "dependencies", "tor-hsservice"),
+    # H20: 7 unused deps removed; bridge-fetcher/bridge-line/tempfile moved
+    # to dev-dependencies (so they are also removed from [dependencies]).
     # SDK-5: onion-service hosting moved to tor-socks5-onion
     # (apps/sdk/crates/onion); the binary no longer links these directly.
     ("apps/socks5-proxy/Cargo.toml", "dependencies", "tor-hscrypto"),
     ("apps/socks5-proxy/Cargo.toml", "dependencies", "safelog"),
     ("apps/socks5-proxy/Cargo.toml", "dependencies", "tor-cell"),
     ("apps/socks5-proxy/Cargo.toml", "dependencies", "tor-proto"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "tor-error"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "serde"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "serde_json"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "indexmap"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "time"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "thiserror"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "getrandom"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "bridge-line"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "bridge-fetcher"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "tempfile"),
+    # H20: server-side deps moved to dev-dependencies (or removed) in the
+    # tor-socks5-server manifest, so they disappear from [dependencies].
+    ("apps/sdk/crates/server/Cargo.toml", "dependencies", "bridge-line"),
+    ("apps/sdk/crates/server/Cargo.toml", "dependencies", "bridge-store"),
+    ("apps/sdk/crates/server/Cargo.toml", "dependencies", "time"),
+    ("apps/sdk/crates/server/Cargo.toml", "dependencies", "tracing-subscriber"),
 })
 
 
