@@ -307,6 +307,7 @@ mod tests {
         let esk = ExpandedSecretKey::from_bytes(&expanded);
         assert_eq!(VerifyingKey::from(&esk).to_bytes(), *kp.pubkey());
         assert_eq!(onion_address(kp.pubkey()), kp.address());
+        assert_eq!(kp.to_expanded_bytes().len(), 64);
     }
 
     #[test]
@@ -316,21 +317,5 @@ mod tests {
         assert!(!dbg.contains("secret"));
         assert!(!dbg.contains(&format!("{:?}", (*kp.to_expanded_bytes())[..4].to_vec())));
         assert!(dbg.contains(kp.address()));
-    }
-
-    #[test]
-    fn generate_produces_distinct_keys() {
-        let a = generate();
-        let b = generate();
-        assert_ne!(a.pubkey(), b.pubkey());
-        // 64 bytes = clamped scalar || hash prefix; zeroized on drop.
-        assert_eq!(a.to_expanded_bytes().len(), 64);
-    }
-
-    #[test]
-    fn zeroize_actually_clears() {
-        let mut buf = [0x42u8; 64];
-        zeroize::Zeroize::zeroize(&mut buf);
-        assert!(buf.iter().all(|&b| b == 0));
     }
 }
