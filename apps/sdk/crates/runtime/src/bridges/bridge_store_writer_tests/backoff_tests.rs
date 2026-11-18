@@ -1,7 +1,7 @@
 use super::super::*;
 use super::{
     config_path, fail_first_publisher, leftover_tmp_files, reload, seed_store, test_bridge,
-    wait_for_calls, wait_for_file_count,
+    wait_calls, wait_settled,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use time::OffsetDateTime;
@@ -64,9 +64,10 @@ async fn publish_failure_retains_absorbed_updates_until_next_op() {
     seed_store(&path, &b);
 
     let calls = Arc::new(AtomicUsize::new(0));
+    let (calls_tx, mut calls_rx) = super::entry_signal();
     let writer = StoreWriter::spawn(
         BridgeStore::resolve_path(&path),
-        fail_first_publisher(calls.clone()),
+        fail_first_publisher(calls.clone(), calls_tx),
         INITIAL_BACKOFF,
     );
     let b1 = b.clone();
@@ -74,7 +75,7 @@ async fn publish_failure_retains_absorbed_updates_until_next_op() {
         .apply(move |s| s.note_channel_success_at(&b1, OffsetDateTime::now_utc()))
         .await
         .expect("absorbed");
-    wait_for_calls(&calls, 1, "failed publish attempted").await;
+    wait_calls(&mut calls_rx, 1, "failed publish attempted").await;
     assert_eq!(
         reload(&path).channel_ok_count(&b),
         0,
@@ -89,9 +90,11 @@ async fn publish_failure_retains_absorbed_updates_until_next_op() {
         .apply(move |s| s.note_channel_success_at(&b2, OffsetDateTime::now_utc()))
         .await
         .expect("absorbed");
-    // Well under the 1s backoff, but enough paused time for the actor to
-    // (not) act on the absorption.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Deterministic negative assertion: the failure armed retry_at = now +
+    // 1s and NOTHING between the failed publish and the apply #2 ack awaits
+    // a tokio timer (oneshot/spawn_blocking awaits do not advance the
+    // paused clock), so 999 virtual ms provably cannot fire the retry.
+    tokio::time::sleep(Duration::from_millis(999)).await;
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
@@ -102,6 +105,9 @@ async fn publish_failure_retains_absorbed_updates_until_next_op() {
         0,
         "absorbed update waits in memory behind the backoff"
     );
+    // Cross the 1s deadline and await the retry via the entry signal.
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    wait_calls(&mut calls_rx, 2, "backoff retry fired").await;
 
     // Closing flushes both retained updates regardless of the deadline.
     let closed = writer.close().await;
@@ -125,9 +131,10 @@ async fn backoff_gates_publish_attempts_under_a_continuous_mutation_stream() {
     seed_store(&path, &b);
 
     let calls = Arc::new(AtomicUsize::new(0));
+    let (calls_tx, mut calls_rx) = super::entry_signal();
     let writer = StoreWriter::spawn(
         BridgeStore::resolve_path(&path),
-        fail_first_publisher(calls.clone()),
+        fail_first_publisher(calls.clone(), calls_tx),
         Duration::from_secs(1),
     );
 
@@ -144,7 +151,7 @@ async fn backoff_gates_publish_attempts_under_a_continuous_mutation_stream() {
         // clock barely moves, staying inside the 1s backoff.
         tokio::time::sleep(Duration::ZERO).await;
     }
-    wait_for_calls(&calls, 1, "first (failing) publish attempted").await;
+    wait_calls(&mut calls_rx, 1, "first (failing) publish attempted").await;
     // Stay under the 1s backoff; paused time only moved milliseconds.
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -157,8 +164,16 @@ async fn backoff_gates_publish_attempts_under_a_continuous_mutation_stream() {
     // publish_failure_is_retried_by_the_backoff_timer). The retry
     // publishes the coalesced snapshot once.
     tokio::time::sleep(Duration::from_secs(2)).await;
-    wait_for_calls(&calls, 2, "backoff retry fired").await;
-    wait_for_file_count(&path, &b, 10, "retry persisted the coalesced snapshot").await;
+    wait_calls(&mut calls_rx, 2, "backoff retry fired").await;
+    // The retry is the first clean publish: awaiting the settle epoch
+    // guarantees the coalesced snapshot is durably on disk.
+    let mut settled = writer.settled_watch();
+    wait_settled(&mut settled, 1, "retry persisted the coalesced snapshot").await;
+    assert_eq!(
+        reload(&path).channel_ok_count(&b),
+        10,
+        "retry persisted the coalesced snapshot"
+    );
     assert!(
         calls.load(Ordering::SeqCst) <= 3,
         "10 mutations must not cost 10 publishes, got {}",
@@ -181,9 +196,10 @@ async fn close_flushes_absorbed_updates_before_the_retry_deadline() {
     seed_store(&path, &b);
 
     let calls = Arc::new(AtomicUsize::new(0));
+    let (calls_tx, mut calls_rx) = super::entry_signal();
     let writer = StoreWriter::spawn(
         BridgeStore::resolve_path(&path),
-        fail_first_publisher(calls.clone()),
+        fail_first_publisher(calls.clone(), calls_tx),
         Duration::from_secs(1),
     );
 
@@ -193,7 +209,7 @@ async fn close_flushes_absorbed_updates_before_the_retry_deadline() {
         .apply(move |s| s.note_channel_success_at(&b1, OffsetDateTime::now_utc()))
         .await
         .expect("absorbed");
-    wait_for_calls(&calls, 1, "first (failing) publish attempted").await;
+    wait_calls(&mut calls_rx, 1, "first (failing) publish attempted").await;
     assert_eq!(reload(&path).channel_ok_count(&b), 0, "file still stale");
 
     // m2 arrives while the backoff is pending: absorbed, no publish.
@@ -270,9 +286,10 @@ async fn publish_failure_is_retried_by_the_backoff_timer() {
     seed_store(&path, &b);
 
     let calls = Arc::new(AtomicUsize::new(0));
+    let (calls_tx, mut calls_rx) = super::entry_signal();
     let writer = StoreWriter::spawn(
         BridgeStore::resolve_path(&path),
-        fail_first_publisher(calls.clone()),
+        fail_first_publisher(calls.clone(), calls_tx),
         Duration::from_secs(1),
     );
     let b1 = b.clone();
@@ -287,17 +304,22 @@ async fn publish_failure_is_retried_by_the_backoff_timer() {
     // robust way to drive paused time here: it fast-forwards the clock
     // AND cooperatively polls the runtime until quiescent at each due
     // timer, so the actor's own `sleep_until` is guaranteed to fire.
-    // The publish itself runs on the blocking pool, so the on-disk
-    // assertion below polls in real time (wait_for_file_count).
     tokio::time::sleep(Duration::from_secs(2)).await;
-    wait_for_calls(&calls, 2, "backoff retry fired").await;
-    wait_for_file_count(
-        &path,
-        &b,
+    wait_calls(&mut calls_rx, 2, "backoff retry fired").await;
+    // Awaiting the settle epoch replaces polling: the retry publish is the
+    // first clean publish, so epoch 1 means it is durably on disk.
+    let mut settled = writer.settled_watch();
+    wait_settled(
+        &mut settled,
         1,
         "backoff timer republished the retained snapshot",
     )
     .await;
+    assert_eq!(
+        reload(&path).channel_ok_count(&b),
+        1,
+        "backoff timer republished the retained snapshot"
+    );
 
     let closed = writer.close().await;
     assert!(closed.is_ok(), "close after a successful retry: {closed:?}");

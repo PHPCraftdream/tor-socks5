@@ -39,42 +39,31 @@ fn leftover_tmp_files(dir: &Path) -> Vec<std::fs::DirEntry> {
         .collect()
 }
 
-/// Poll until the on-disk store reports `expected` channel successes for
-/// `bridge`. Publishes now complete asynchronously (ack precedes the disk
-/// write), so tests wait instead of asserting immediately. Uses a real
-/// (non-async) sleep so paused-clock tests keep their virtual timeline
-/// while the spawn_blocking publisher progresses in real time; yields
-/// each iteration so the actor task (which must be polled to drain
-/// `done_rx` and start a coalesced follow-up publish) actually gets to
-/// run on a single-threaded test runtime, even when the caller has no
-/// other `.await` between triggering the publish and this wait.
-async fn wait_for_file_count(path: &Path, bridge: &BridgeLine, expected: u32, what: &str) {
-    for _ in 0..5000 {
-        if reload(path).channel_ok_count(bridge) == expected {
-            return;
-        }
-        tokio::task::yield_now().await;
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    panic!("store never reached count {expected}: {what}");
+/// Publisher entry signal: a watch bumped AT ENTRY of each publisher
+/// invocation, before any work — so "called / started / blocked on a gate"
+/// semantics are preserved for the gate tests. Watch notifications are real
+/// waker events, so awaiting them is deterministic on the current-thread
+/// test runtime (and works under a paused clock too).
+type CallSignal = tokio::sync::watch::Sender<u64>;
+
+fn entry_signal() -> (CallSignal, tokio::sync::watch::Receiver<u64>) {
+    tokio::sync::watch::channel(0)
 }
 
-/// Poll until the injected publisher has been called `expected` times.
-/// See [`wait_for_file_count`] for why this yields every iteration.
-async fn wait_for_calls(calls: &AtomicUsize, expected: usize, what: &str) {
-    for _ in 0..5000 {
-        if calls.load(Ordering::SeqCst) >= expected {
-            return;
-        }
-        tokio::task::yield_now().await;
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    panic!("publisher never reached {expected} calls: {what}");
+/// Wrap a publisher so each invocation bumps `signal` at entry, then runs
+/// `publisher` unchanged.
+fn with_entry_signal(signal: CallSignal, publisher: Publisher) -> Publisher {
+    Arc::new(move |store: &BridgeStore| {
+        signal.send_modify(|calls| *calls += 1);
+        publisher(store)
+    })
 }
 
-/// Fail-first publisher with a call counter (call 0 errors, rest save).
-fn fail_first_publisher(calls: Arc<AtomicUsize>) -> Publisher {
+/// Fail-first publisher with a call counter (call 0 errors, rest save) and
+/// an entry signal for deterministic waiting.
+fn fail_first_publisher(calls: Arc<AtomicUsize>, signal: CallSignal) -> Publisher {
     Arc::new(move |s: &BridgeStore| {
+        signal.send_modify(|n| *n += 1);
         if calls.fetch_add(1, Ordering::SeqCst) == 0 {
             Err(anyhow!("injected publish failure"))
         } else {
@@ -83,12 +72,25 @@ fn fail_first_publisher(calls: Arc<AtomicUsize>) -> Publisher {
     })
 }
 
-/// Give the actor a few real scheduling turns to retire a publish
-/// completion (drop its snapshot) after the file write has been observed
-/// on disk. Used in wall-clock tests only.
-async fn wait_a_real_moment() {
-    for _ in 0..20 {
-        tokio::task::yield_now().await;
-        std::thread::sleep(Duration::from_millis(2));
+/// Await until the publisher entry signal reached `expected` invocations.
+/// No timeout, no sleep: the current-thread runtime wakes the awaiting test
+/// exactly when the actor/publisher runs.
+async fn wait_calls(rx: &mut tokio::sync::watch::Receiver<u64>, expected: u64, what: &str) {
+    while *rx.borrow_and_update() < expected {
+        rx.changed().await.unwrap_or_else(|_| {
+            panic!("publisher entry signal closed before {expected} calls: {what}")
+        });
+    }
+}
+
+/// Await the writer's settle epoch reaching `expected`: `expected` clean
+/// publishes are durably on disk AND the actor has retired its snapshot
+/// (`store = None`, so the next op re-reads the file). Fully deterministic
+/// replacement for polling the file or sleeping after an ack.
+async fn wait_settled(rx: &mut tokio::sync::watch::Receiver<u64>, expected: u64, what: &str) {
+    while *rx.borrow_and_update() < expected {
+        rx.changed().await.unwrap_or_else(|_| {
+            panic!("writer settle signal closed before epoch {expected}: {what}")
+        });
     }
 }

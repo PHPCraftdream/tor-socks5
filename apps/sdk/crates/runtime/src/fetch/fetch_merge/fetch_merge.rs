@@ -787,3 +787,7 @@ mod source_tests;
 #[cfg(test)]
 #[path = "fetch_merge_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "fetch_merge_refresh_tests.rs"]
+mod refresh_tests;

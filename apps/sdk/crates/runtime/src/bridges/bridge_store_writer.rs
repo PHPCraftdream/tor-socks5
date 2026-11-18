@@ -100,7 +100,6 @@
 //!   stuck retrying a failing publish. Between angel dirty windows the
 //!   lock is free, so sequential CLI usage is unaffected.
 
-use std::any::Any;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -118,35 +117,9 @@ type MutateFn = Box<dyn FnOnce(&mut BridgeStore) + Send>;
 type Publisher = Arc<dyn Fn(&BridgeStore) -> Result<()> + Send + Sync>;
 
 // Payload переходит в реестр без форматирования; актор получает только безопасную ошибку.
-pub(crate) struct PublisherPanic {
-    _payload: Mutex<Box<dyn Any + Send>>,
-}
-impl PublisherPanic {
-    fn new(payload: Box<dyn Any + Send>) -> Self {
-        Self {
-            _payload: Mutex::new(payload),
-        }
-    }
-    #[cfg(test)]
-    fn payload_is<T: Any>(&self, predicate: impl FnOnce(&T) -> bool) -> bool {
-        let payload = self
-            ._payload
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        payload.downcast_ref::<T>().is_some_and(predicate)
-    }
-}
-impl std::fmt::Display for PublisherPanic {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("bridge health store publisher panicked")
-    }
-}
-impl std::fmt::Debug for PublisherPanic {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(self, f)
-    }
-}
-impl std::error::Error for PublisherPanic {}
+#[path = "bridge_store_writer_parts/publisher_panic.rs"]
+mod publisher_panic;
+use publisher_panic::PublisherPanic;
 
 enum Op {
     Mutate {
@@ -157,12 +130,6 @@ enum Op {
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
-
-/// TS6-04 test hook: per-writer log of the threads on which retired
-/// snapshot `Arc`s were actually dropped. Kept per `StoreWriter` (not
-/// process-global) so parallel tests in one binary never observe each
-/// other's retirements. In non-test builds nothing is ever pushed.
-type RetirementLog = Arc<Mutex<Vec<std::thread::ThreadId>>>;
 
 struct ActorState {
     handle: Option<JoinHandle<Result<()>>>,
@@ -205,66 +172,46 @@ pub struct StoreWriter {
     /// async worker.
     #[cfg(test)]
     retirements: RetirementLog,
+    /// Test seam (see `settled_watch`): epoch bumped when a clean publish
+    /// retired the snapshot or a shutdown flush succeeded.
+    /// `#[allow(dead_code)]`: never read outside test/seam builds.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[allow(dead_code)]
+    settled: tokio::sync::watch::Receiver<u64>,
+    /// Test-only: epoch bumped after each retirement drop recorded its
+    /// blocking-pool thread, so tests can await retirements.
+    #[cfg(test)]
+    retire_settled: tokio::sync::watch::Receiver<u64>,
 }
 
-/// Backoff bookkeeping for the retained, unpublished snapshot. Does not
-/// touch the disk itself; the actor calls [`RetryState::record_success`] /
-/// [`RetryState::record_failure`] from both the async publish-completion
-/// path and the synchronous final flush, so the logging and arithmetic stay
-/// in one place.
-struct RetryState {
-    dirty: bool,
-    failed_attempts: u32,
-    retry_at: Option<tokio::time::Instant>,
-    backoff: Duration,
-}
+/// Settle signal type: a real watch sender in test/seam builds, `()` elsewhere.
+#[cfg(any(test, feature = "test-seams"))]
+type SettleSignal = tokio::sync::watch::Sender<u64>;
+#[cfg(not(any(test, feature = "test-seams")))]
+type SettleSignal = ();
 
-impl RetryState {
-    fn new(initial_backoff: Duration) -> Self {
-        Self {
-            dirty: false,
-            failed_attempts: 0,
-            retry_at: None,
-            backoff: initial_backoff,
-        }
-    }
-
-    /// Bookkeeping after a publish succeeded: end any retry streak (logging
-    /// recovery at info) and mark the state clean. The caller drops the
-    /// snapshot so the next op re-reads the file — unless mutations were
-    /// absorbed while the save ran, in which case the caller keeps it dirty.
-    fn record_success(&mut self) {
-        if self.failed_attempts > 0 {
-            info!(
-                attempts = self.failed_attempts + 1,
-                "bridge health store published after retries"
-            );
-        }
-        self.dirty = false;
-        self.failed_attempts = 0;
-        self.retry_at = None;
-        self.backoff = INITIAL_BACKOFF;
-    }
-
-    /// Bookkeeping after a publish failed: retain the dirty snapshot and arm
-    /// the next exponential-backoff retry. The update stays in memory.
-    fn record_failure(&mut self, error: &anyhow::Error) {
-        self.failed_attempts += 1;
-        warn!(
-            error = %error,
-            attempt = self.failed_attempts,
-            retry_in = ?self.backoff,
-            "bridge health store publish failed; update retained in memory and will retry"
-        );
-        self.dirty = true;
-        self.retry_at = Some(tokio::time::Instant::now() + self.backoff);
-        self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
-    }
-}
+/// `#[path]` submodules (plan H19.2): keep this file under the 1000-line limit.
+#[path = "bridge_store_writer_parts/retry_state.rs"]
+mod retry_state;
+use retry_state::RetryState;
+#[path = "bridge_store_writer_parts/retire_off_worker.rs"]
+mod retire_off_worker;
+use retire_off_worker::{drop_off_worker, RetireSignal, RetirementLog};
 
 impl StoreWriter {
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Test seam: receiver of the settle watch. The actor bumps the epoch
+    /// when a clean publish has retired the snapshot (`store = None`, next
+    /// op re-reads the file) and after a successful shutdown flush, so a
+    /// caller awaiting epoch >= N knows N successful clean publishes are
+    /// durably on disk and the actor holds no stale snapshot.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[allow(dead_code)] // only read by tests and test-seams consumers
+    pub(crate) fn settled_watch(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.settled.clone()
     }
 
     /// Apply one mutation through the owner. Resolves `Ok` once the
@@ -380,6 +327,16 @@ impl StoreWriter {
         let actor_retirements = Arc::clone(&retirements);
         #[cfg(any(test, feature = "test-seams"))]
         let registry = crate::workers::test_registry();
+        #[cfg(any(test, feature = "test-seams"))]
+        let (settled_tx, settled_rx) = tokio::sync::watch::channel(0u64);
+        #[cfg(not(any(test, feature = "test-seams")))]
+        let settled_tx = ();
+        #[cfg(test)]
+        let (retire_tx, retire_rx) = tokio::sync::watch::channel(0u64);
+        #[cfg(test)]
+        let retire_tx = Arc::new(retire_tx);
+        #[cfg(not(test))]
+        let retire_tx = Arc::new(());
         let actor = async move {
             let path = actor_path;
             #[cfg(test)]
@@ -417,6 +374,7 @@ impl StoreWriter {
                                         &publish,
                                         &done_tx,
                                         &retirements,
+                                        &retire_tx,
                                         &path,
                                     )
                                     .await;
@@ -435,6 +393,8 @@ impl StoreWriter {
                                     &mut lock,
                                     &mut mutations_since_publish,
                                     &retirements,
+                                    &retire_tx,
+                                    &settled_tx,
                                 );
                                 try_start_publish(
                                     &mut publishing,
@@ -468,6 +428,11 @@ impl StoreWriter {
                                     Ok(()) => {
                                         info!("bridge health store published on shutdown");
                                         retry.record_success();
+                                        // Settle: the final flush is durably on disk.
+                                        #[cfg(any(test, feature = "test-seams"))]
+                                        settled_tx.send_modify(|epoch| *epoch += 1);
+                                        #[cfg(not(any(test, feature = "test-seams")))]
+                                        let _ = &settled_tx;
                                         Ok(())
                                     }
                                     Err(error) => {
@@ -529,6 +494,8 @@ impl StoreWriter {
                             &mut lock,
                             &mut mutations_since_publish,
                             &retirements,
+                            &retire_tx,
+                            &settled_tx,
                         );
                         try_start_publish(
                             &mut publishing,
@@ -616,7 +583,8 @@ impl StoreWriter {
                             }
                             absorb_mutation(
                                 apply, ack, &mut store, &mut retry, &mut publishing,
-                                &mut mutations_since_publish, &publish, &done_tx, &retirements, &path,
+                                &mut mutations_since_publish, &publish, &done_tx,
+                                &retirements, &retire_tx, &path,
                             ).await;
                         }
                     },
@@ -654,6 +622,10 @@ impl StoreWriter {
             })),
             #[cfg(test)]
             retirements,
+            #[cfg(any(test, feature = "test-seams"))]
+            settled: settled_rx,
+            #[cfg(test)]
+            retire_settled: retire_rx,
         }
     }
 }
@@ -672,6 +644,7 @@ async fn absorb_mutation(
     publish: &Publisher,
     done_tx: &mpsc::Sender<crate::workers::Delivery<()>>,
     retirements: &RetirementLog,
+    retire_signal: &RetireSignal,
     path: &Path,
 ) {
     let cloned = store.clone().expect("loaded snapshot is present");
@@ -684,7 +657,11 @@ async fn absorb_mutation(
     {
         Ok(owned) => {
             // TS6-04: retire the old Arc on the blocking pool, not inline.
-            drop_off_worker(store.replace(owned), Arc::clone(retirements));
+            drop_off_worker(
+                store.replace(owned),
+                Arc::clone(retirements),
+                retire_signal.clone(),
+            );
             // Ack the absorption before publishing: the disk write is the actor's problem now.
             let _ = ack.send(Ok(()));
             retry.dirty = true;
@@ -729,6 +706,7 @@ fn reject_queued_mutations(rx: &mut mpsc::Receiver<Op>) {
 /// retry state, dropping the snapshot only when no tail mutations were
 /// absorbed during the save (clean state ⇒ the next op re-reads the file);
 /// on failure retain the snapshot and arm the backoff.
+#[allow(clippy::too_many_arguments)]
 fn absorb_publish_result(
     res: crate::workers::Delivery<()>,
     retry: &mut RetryState,
@@ -736,6 +714,8 @@ fn absorb_publish_result(
     lock: &mut Option<PathLock>,
     mutations_since_publish: &mut u32,
     retirements: &RetirementLog,
+    retire_signal: &RetireSignal,
+    settled: &SettleSignal,
 ) {
     match res.absorb() {
         Ok(()) => {
@@ -747,8 +727,15 @@ fn absorb_publish_result(
                 // file) and release the lock with it — a waiting CLI may now
                 // build on what was just published. Arc drop off-worker;
                 // unlock is a cheap syscall, stays inline.
-                drop_off_worker(store.take(), Arc::clone(retirements));
+                drop_off_worker(store.take(), Arc::clone(retirements), retire_signal.clone());
                 drop(lock.take());
+                // Settle seam: everything published so far is on disk and
+                // the actor's snapshot is retired (next op re-reads the
+                // file), so tests may reload and assert deterministically.
+                #[cfg(any(test, feature = "test-seams"))]
+                settled.send_modify(|epoch| *epoch += 1);
+                #[cfg(not(any(test, feature = "test-seams")))]
+                let _ = settled;
             } else {
                 // Mutations absorbed while the save ran stay dirty; the
                 // caller starts the coalesced follow-up publish (and the
@@ -760,35 +747,6 @@ fn absorb_publish_result(
         Err(error) => retry.record_failure(&error),
     }
     *mutations_since_publish = 0;
-}
-
-/// Retire an old snapshot's `Arc` on the blocking pool instead of dropping
-/// it inline in the actor's `select!` loop: when the actor's handle is the
-/// last strong reference (no mutation job or publish job holds a clone at
-/// that moment), the drop deallocates the whole `BridgeStore` map, and that
-/// free() must not run synchronously on an async worker. Fire-and-forget on
-/// purpose: there is nothing to observe about a plain deallocation and
-/// `Drop` cannot meaningfully fail here, so nobody awaits the handle — the
-/// `JoinHandle` is discarded explicitly because it is `#[must_use]`.
-///
-/// The per-writer [`RetirementLog`] lets `retirement_tests.rs` assert that
-/// each retirement actually runs on a blocking-pool thread, not on the
-/// actor's async worker thread.
-fn drop_off_worker(old: Option<Arc<BridgeStore>>, retirements: RetirementLog) {
-    if let Some(old) = old {
-        drop(tokio::task::spawn_blocking(move || {
-            #[cfg(test)]
-            {
-                retirements
-                    .lock()
-                    .expect("retirement recorder poisoned")
-                    .push(std::thread::current().id());
-            }
-            #[cfg(not(test))]
-            let _ = &retirements;
-            drop(old);
-        }));
-    }
 }
 
 /// Start one publish on the blocking pool, unless one is already in flight,
