@@ -817,6 +817,21 @@ jobs:
                 old_srv.replace('keep-me = "1"\n', 'some-other-unsanctioned = "1"\n'),
                 '[dependencies]\n')
 
+        # H21: the binary links the SDK through the tor-socks5 facade;
+        # the six direct SDK/internal deps are gone from [dependencies].
+        old_h21 = '[dependencies]\n' + ''.join(
+            f'{name} = "0.2"\n' for name in [
+                "arti-wrapper", "auth", "persist-lock", "proxy-config",
+                "tor-socks5-onion", "tor-socks5-runtime"]) + 'keep-me = "1"\n'
+        p.check_removed_dependencies(
+            "apps/socks5-proxy/Cargo.toml", old_h21, '[dependencies]\nkeep-me = "1"\n')
+        # Removing an unsanctioned dependency alongside them is still refused.
+        with self.assertRaisesRegex(p.MappingError, "missing mapping: удалена зависимость пакета"):
+            p.check_removed_dependencies(
+                "apps/socks5-proxy/Cargo.toml",
+                old_h21.replace('keep-me = "1"\n', 'some-unsanctioned-crate = "1"\n'),
+                '[dependencies]\n')
+
     def test_deps1_proxy_dependency_removals(self):
         path = "apps/socks5-proxy/Cargo.toml"
         dependencies = (

@@ -76,6 +76,17 @@ SANCTIONED_DEPENDENCY_REMOVALS = frozenset({
     ("apps/sdk/crates/server/Cargo.toml", "dependencies", "bridge-store"),
     ("apps/sdk/crates/server/Cargo.toml", "dependencies", "time"),
     ("apps/sdk/crates/server/Cargo.toml", "dependencies", "tracing-subscriber"),
+    # H21: the binary now links the SDK through the tor-socks5 facade
+    # (features `pt` + `auth`; `onion-service` maps to facade
+    # `onion-service`/`onion-keys`). persist-lock comes via the facade's
+    # always-on `persist` module; tor-socks5-onion/tor-socks5-runtime remain
+    # only in [dev-dependencies] for the test seams.
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "arti-wrapper"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "auth"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "persist-lock"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "proxy-config"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "tor-socks5-onion"),
+    ("apps/socks5-proxy/Cargo.toml", "dependencies", "tor-socks5-runtime"),
 })
 
 

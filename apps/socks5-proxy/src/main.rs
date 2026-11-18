@@ -55,7 +55,7 @@ fn main() -> Result<()> {
     // transport (TOR_PT_MANAGED_TRANSPORT_VER), run the in-process lyrebird
     // PT loop instead of the proxy. Must run before clap parsing (arti passes
     // argv that would blow up the parser) and must never angelise.
-    if let Some(result) = tor_socks5_runtime::pt::run_if_managed_transport() {
+    if let Some(result) = tor_socks5::pt::run_if_managed_transport() {
         return result;
     }
 
