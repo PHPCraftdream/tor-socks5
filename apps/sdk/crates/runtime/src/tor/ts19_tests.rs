@@ -11,7 +11,8 @@
 use crate::bridge_maintenance::load_config_off_worker;
 use crate::bridge_verifier::run_circuit_verify_tick;
 use crate::config::Config;
-use crate::test_seams::{ran_on_thread, Site};
+use crate::test_seams::{ran_on_thread, worker_done_count, Site};
+use bridge_store::BridgeStore;
 use proxy_config::Socks5Endpoint;
 use std::path::Path;
 
@@ -289,16 +290,14 @@ async fn pre_hint_and_rejected_pt_cannot_bypass_validation() {
 async fn absent_pre_keeps_existing_empty_pool_policy() {
     let dir = tempfile::tempdir().expect("tempdir");
     let cfg_path = dir.path().join("ts19.ktav");
-    for pre in [None::<proxy_config::ProxyPool>] {
-        let mut cfg = pre_config();
-        cfg.pre_proxies = pre;
-        cfg.bridges.lines.clear();
-        let error = build_tor_settings(&cfg, &cfg_path)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("no reachable bridge"), "{error}");
-    }
+    let mut cfg = pre_config();
+    cfg.pre_proxies = None;
+    cfg.bridges.lines.clear();
+    let error = build_tor_settings(&cfg, &cfg_path)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("no reachable bridge"), "{error}");
 }
 
 #[tokio::test]
@@ -311,10 +310,14 @@ async fn config_load_runs_off_the_async_worker() {
     let result = load_config_off_worker(path.as_path()).await;
     assert!(result.is_ok(), "config load failed: {:?}", result.err());
 
-    let ran_on = ran_on_thread(Site::MaintenanceConfigLoad).expect("the load must have run");
+    let ran_on = ran_on_thread(Site::MaintenanceConfigLoad, &path).expect("the load must have run");
     assert_ne!(
         ran_on, caller_thread,
         "config load ran on the caller's async thread"
+    );
+    assert!(
+        worker_done_count(Site::MaintenanceConfigLoad, &path) >= 1,
+        "the blocking worker never reported completion"
     );
 }
 
@@ -324,12 +327,305 @@ async fn circuit_verify_store_load_runs_off_the_async_worker() {
     let path = dir.path().join("missing-store-dir").join("proxy.ktav");
 
     let caller_thread = std::thread::current().id();
-    // Missing file -> empty store -> cheap early return.
-    run_circuit_verify_tick(path.as_path(), &[]).await;
+    // Missing file -> empty store -> cheap early return. The seam records at
+    // the store path the production code resolves from the config path.
+    let store_path = BridgeStore::resolve_path(&path);
+    run_circuit_verify_tick(&path, &[]).await;
 
-    let ran_on = ran_on_thread(Site::CircuitVerifyStoreLoad).expect("the load must have run");
+    let ran_on =
+        ran_on_thread(Site::CircuitVerifyStoreLoad, &store_path).expect("the load must have run");
     assert_ne!(
         ran_on, caller_thread,
         "bridge-store load ran on the caller's async thread"
+    );
+    assert!(
+        worker_done_count(Site::CircuitVerifyStoreLoad, &store_path) >= 1,
+        "the blocking worker never reported completion"
+    );
+}
+
+// --- H15/TS19 chunk 2: tor_setup and watchdog-runtime blocking reads ---
+
+use crate::tor_watchdog::{live_bridge_count_off_worker, load_watchdog_config_off_worker};
+
+/// Startup-probe shortcut: with the SDK14 PT observer installed,
+/// `probe_measured` reports every bridge alive without touching the
+/// network, so `build_tor_settings` runs end-to-end network-free. A drain
+/// task holds the observer receiver open across the await — a PT resolution
+/// send to a closed channel panics.
+async fn with_probe_shortcut(fut: impl std::future::Future<Output = ()>) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(&'static str, std::path::PathBuf)>(1);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    FORBID_STARTUP_PROBE
+        .scope((), crate::test_seams::sdk14_pt_scope("ts19-h15", tx, fut))
+        .await;
+    drain.abort();
+}
+
+#[tokio::test]
+async fn setup_store_load_runs_off_the_async_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ts19.ktav");
+    let mut cfg = pre_config();
+    cfg.pre_proxies = None;
+    let store_path = BridgeStore::resolve_path(&path);
+    let caller_thread = std::thread::current().id();
+    with_probe_shortcut(async {
+        // The store load fires before probing; the result is irrelevant.
+        let _ = build_tor_settings(&cfg, &path).await;
+    })
+    .await;
+    let ran_on = ran_on_thread(Site::SetupStoreLoad, &store_path).expect("the load must have run");
+    assert_ne!(
+        ran_on, caller_thread,
+        "bridge-store load ran on the caller's async thread"
+    );
+    assert!(
+        worker_done_count(Site::SetupStoreLoad, &store_path) >= 1,
+        "the blocking worker never reported completion"
+    );
+}
+
+#[tokio::test]
+async fn setup_seed_load_runs_off_the_async_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ts19.ktav");
+    let seed_path = crate::seed::resolve_seed_path(&path);
+    std::fs::write(
+        &seed_path,
+        "obfs4 8.8.4.4:443 2222222222222222222222222222222222222222 cert=AAA iat-mode=0\n",
+    )
+    .unwrap();
+    let mut cfg = pre_config();
+    cfg.pre_proxies = None;
+    cfg.bridges.lines.clear();
+    cfg.bridges.use_seeds = true;
+    let caller_thread = std::thread::current().id();
+    with_probe_shortcut(async {
+        // No configured bridges: the seeds fallback branch must fire.
+        let _ = build_tor_settings(&cfg, &path).await;
+    })
+    .await;
+    let ran_on = ran_on_thread(Site::SetupSeedLoad, &seed_path).expect("the load must have run");
+    assert_ne!(
+        ran_on, caller_thread,
+        ".seeds read ran on the caller's async thread"
+    );
+    assert!(
+        worker_done_count(Site::SetupSeedLoad, &seed_path) >= 1,
+        "the blocking worker never reported completion"
+    );
+}
+
+#[tokio::test]
+async fn setup_probe_rank_store_load_runs_off_the_async_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ts19.ktav");
+    let mut cfg = pre_config();
+    cfg.pre_proxies = None;
+    // More than MAX_ACTIVE_BRIDGES configured: the ranking store load fires.
+    cfg.bridges.lines = (0..40u16)
+        .map(|i| format!("10.0.0.{i}:443 1111111111111111111111111111111111111111"))
+        .collect();
+    let store_path = BridgeStore::resolve_path(&path);
+    let caller_thread = std::thread::current().id();
+    with_probe_shortcut(async {
+        let _ = build_tor_settings(&cfg, &path).await;
+    })
+    .await;
+    let ran_on = ran_on_thread(Site::SetupProbeRank, &store_path).expect("the load must have run");
+    assert_ne!(
+        ran_on, caller_thread,
+        "probe-ranking store load ran on the caller's async thread"
+    );
+    assert!(
+        worker_done_count(Site::SetupProbeRank, &store_path) >= 1,
+        "the blocking worker never reported completion"
+    );
+}
+
+#[tokio::test]
+async fn watchdog_config_load_runs_off_the_async_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ts19-watchdog.ktav");
+    Config::default().write(&path).unwrap();
+    let caller_thread = std::thread::current().id();
+    let loaded = load_watchdog_config_off_worker(&path).await;
+    assert!(loaded.is_some(), "watchdog config reload failed");
+    let ran_on = ran_on_thread(Site::WatchdogConfigLoad, &path).expect("the load must have run");
+    assert_ne!(
+        ran_on, caller_thread,
+        "watchdog config reload ran on the caller's async thread"
+    );
+    assert!(
+        worker_done_count(Site::WatchdogConfigLoad, &path) >= 1,
+        "the blocking worker never reported completion"
+    );
+}
+
+#[tokio::test]
+async fn watchdog_store_load_runs_off_the_async_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ts19-watchdog-store.ktav");
+    let store_path = BridgeStore::resolve_path(&path);
+    let caller_thread = std::thread::current().id();
+    let count = live_bridge_count_off_worker(&path).await;
+    assert_eq!(count, 0, "no health store exists yet");
+    let ran_on =
+        ran_on_thread(Site::WatchdogStoreLoad, &store_path).expect("the load must have run");
+    assert_ne!(
+        ran_on, caller_thread,
+        "live-bridge store read ran on the caller's async thread"
+    );
+    assert!(
+        worker_done_count(Site::WatchdogStoreLoad, &store_path) >= 1,
+        "the blocking worker never reported completion"
+    );
+}
+
+// --- H15/TS19 chunk 3: maintenance tick, channel probe, warm pool, rank ---
+
+#[tokio::test]
+async fn maintenance_tick_config_load_runs_off_the_async_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ts19-tick.ktav");
+    Config::default().write(&path).unwrap();
+
+    let caller_thread = std::thread::current().id();
+    let result = crate::bridge_maintenance::load_tick_config_off_worker(&path).await;
+    assert!(
+        result.is_ok(),
+        "tick config reload failed: {:?}",
+        result.err()
+    );
+
+    let ran_on =
+        ran_on_thread(Site::MaintenanceTickConfigLoad, &path).expect("the load must have run");
+    assert_ne!(
+        ran_on, caller_thread,
+        "tick config reload ran on the caller's async thread"
+    );
+    assert!(
+        worker_done_count(Site::MaintenanceTickConfigLoad, &path) >= 1,
+        "the blocking worker never reported completion"
+    );
+}
+
+#[tokio::test]
+async fn probe_store_load_runs_off_the_async_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("missing-store-dir").join("ts19-probe.ktav");
+    let store_path = BridgeStore::resolve_path(&path);
+
+    let caller_thread = std::thread::current().id();
+    let store = crate::bridge_maintenance::load_probe_store_off_worker(&path).await;
+    assert!(store.is_some(), "probe fallback store load failed");
+
+    let ran_on = ran_on_thread(Site::ProbeStoreLoad, &store_path).expect("the load must have run");
+    assert_ne!(
+        ran_on, caller_thread,
+        "probe store read ran on the caller's async thread"
+    );
+    assert!(
+        worker_done_count(Site::ProbeStoreLoad, &store_path) >= 1,
+        "the blocking worker never reported completion"
+    );
+}
+
+#[tokio::test]
+async fn warmer_config_load_runs_off_the_async_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ts19-warmer.ktav");
+    Config::default().write(&path).unwrap();
+
+    let caller_thread = std::thread::current().id();
+    let loaded = crate::bridge_warmer::load_warmer_config_off_worker(&path).await;
+    assert!(loaded.is_some(), "warmer config reload failed");
+
+    let ran_on = ran_on_thread(Site::WarmerConfigLoad, &path).expect("the load must have run");
+    assert_ne!(
+        ran_on, caller_thread,
+        "warmer config reload ran on the caller's async thread"
+    );
+    assert!(
+        worker_done_count(Site::WarmerConfigLoad, &path) >= 1,
+        "the blocking worker never reported completion"
+    );
+}
+
+#[tokio::test]
+async fn rank_store_load_runs_off_the_async_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ts19-rank.ktav");
+    let mut cfg = Config::default();
+    cfg.bridges.lines = vec!["8.8.8.8:443 1111111111111111111111111111111111111111".into()];
+    cfg.write(&path).unwrap();
+    let store_path = BridgeStore::resolve_path(&path);
+
+    let caller_thread = std::thread::current().id();
+    let candidates = crate::bridge_rank::candidates_with_health(&cfg, &path).await;
+    assert_eq!(candidates.len(), 1, "the configured bridge must be ranked");
+
+    let ran_on = ran_on_thread(Site::RankStoreLoad, &store_path).expect("the load must have run");
+    assert_ne!(
+        ran_on, caller_thread,
+        "rank store read ran on the caller's async thread"
+    );
+    assert!(
+        worker_done_count(Site::RankStoreLoad, &store_path) >= 1,
+        "the blocking worker never reported completion"
+    );
+}
+
+// --- H15/TS19 chunk 4: fetch_merge drain loads, bridge_manager pool loads ---
+
+#[tokio::test]
+async fn fetch_merge_drain_config_load_runs_off_the_async_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ts19-drain.ktav");
+    Config::default().write(&path).unwrap();
+
+    let caller_thread = std::thread::current().id();
+    let result = crate::fetch_merge::load_drain_config_off_worker(&path).await;
+    assert!(
+        result.is_ok(),
+        "drain config load failed: {:?}",
+        result.err()
+    );
+
+    let ran_on =
+        ran_on_thread(Site::FetchMergeDrainConfigLoad, &path).expect("the load must have run");
+    assert_ne!(
+        ran_on, caller_thread,
+        "drain config load ran on the caller's async thread"
+    );
+    assert!(
+        worker_done_count(Site::FetchMergeDrainConfigLoad, &path) >= 1,
+        "the blocking worker never reported completion"
+    );
+}
+
+#[tokio::test]
+async fn fetch_merge_pool_load_runs_off_the_async_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    // A pool file that does not exist yet: `CandidatePool::load` returns an
+    // empty pool — the seam still records the executing thread.
+    let pool_path =
+        crate::candidate_pool::CandidatePool::resolve_path(&dir.path().join("ts19-pool.ktav"));
+
+    let caller_thread = std::thread::current().id();
+    let pool = crate::fetch_merge::load_pool_off_worker(&pool_path).await;
+    assert!(pool.is_ok(), "pool load failed: {:?}", pool.err());
+    assert!(pool.unwrap().is_empty(), "a missing pool must load empty");
+
+    let ran_on =
+        ran_on_thread(Site::FetchMergePoolLoad, &pool_path).expect("the load must have run");
+    assert_ne!(
+        ran_on, caller_thread,
+        "candidate pool load ran on the caller's async thread"
+    );
+    assert!(
+        worker_done_count(Site::FetchMergePoolLoad, &pool_path) >= 1,
+        "the blocking worker never reported completion"
     );
 }

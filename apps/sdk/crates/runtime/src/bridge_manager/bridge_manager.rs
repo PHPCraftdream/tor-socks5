@@ -529,10 +529,11 @@ pub async fn fetch_bridges(
             };
 
             if !params.probe {
-                let pool = crate::candidate_pool::CandidatePool::load(
-                    crate::candidate_pool::CandidatePool::resolve_path(config_path),
-                )
-                .context("loading candidate pool")?;
+                let pool_path =
+                    crate::candidate_pool::CandidatePool::resolve_path(config_path);
+                let pool = crate::fetch_merge::load_pool_off_worker(&pool_path)
+                    .await
+                    .context("loading candidate pool")?;
                 return Ok(FetchBridgesOutcome {
                     added,
                     promoted: None,
@@ -556,9 +557,11 @@ pub async fn fetch_bridges(
             };
             // A failed pool read here must not fail the command; the length
             // is informational only.
-            let pool_len = match crate::candidate_pool::CandidatePool::load(
-                crate::candidate_pool::CandidatePool::resolve_path(config_path),
-            ) {
+            let pool_len = match crate::fetch_merge::load_pool_off_worker(
+                &crate::candidate_pool::CandidatePool::resolve_path(config_path),
+            )
+            .await
+            {
                 Ok(pool) => pool.len(),
                 Err(error) => {
                     tracing::warn!(%error, "candidate pool not readable after the drain; pool_len reported as 0");

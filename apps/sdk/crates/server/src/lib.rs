@@ -2,6 +2,8 @@
 //! and server configuration; command-line process initialization remains in
 //! the binary.
 
+#![warn(missing_docs)]
+
 mod api;
 mod config;
 

@@ -19,7 +19,6 @@ rust-version.workspace = true
 default = ["onion-service"]
 onion-service = [
     "arti-wrapper/onion-service",
-    "dep:tor-hsservice",
     "dep:tor-socks5-onion",
     "tor-socks5-server/onion-service",
 ]
@@ -35,11 +34,6 @@ tor-socks5-runtime = { path = "../../apps/sdk/crates/runtime", version = "0.2.0"
 tor-socks5-server = { path = "../../apps/sdk/crates/server", version = "0.2.0", default-features = false }
 proxy-config = { path = "../../packages/proxy-config", version = "0.2.0", package = "tor-socks5-config" }
 tor-error.workspace = true
-
-# `commands/onion/commands.rs` builds/validates `HsNickname` values, behind
-# the `onion-service` feature; the launch/serve/status logic itself lives in
-# the tor-socks5-onion crate (its `host` feature, pulled above).
-tor-hsservice = { version = "0.48", optional = true }
 
 service-manager.workspace = true
 serde.workspace = true

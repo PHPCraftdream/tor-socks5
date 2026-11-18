@@ -40,7 +40,7 @@ use tor_socks5::config::Config;
 | `acl` | `acl` | `tor-socks5-client-acl` | |
 | `route` | `route` | `tor-socks5-route-pool` | `acl` |
 | `auth` | `auth` | `tor-socks5-auth` | `acl` |
-| `config` | `config` | `tor-socks5-config` | `acl`, `bridges` |
+| `config` | `config` | `tor-socks5-config` | `acl` |
 | `bridges` | `probe`, `store`, `verify` | `bridge-probe`, `bridge-store`, `bridge-verify-core` | |
 | `tor` | `tor` | `arti-wrapper` | `socks5`, `acl` |
 | `fetch` | `fetch` | `bridge-fetcher` | `tor`, `bridges` |
@@ -48,9 +48,9 @@ use tor_socks5::config::Config;
 | `runtime` | `runtime` (curated flat exports) | `tor-socks5-runtime` | `tor`, `config`, `bridges` |
 | `server` | `server` | `tor-socks5-server` | `runtime`, `onion-service` |
 | `onion` | `onion` | `tor-socks5-onion` | |
-| `onion-keys` | `onion` (keys) | `tor-socks5-onion/keys` | |
+| `onion-keys` | `onion` (keys) | `tor-socks5-onion/keys` | `config` |
 | `onion-service` | | `arti-wrapper/onion-service` | `tor`, `onion-host` |
-| `onion-host` | `onion` (host) | `tor-socks5-onion/host` | |
+| `onion-host` | `onion` (host) | `tor-socks5-onion/host` | `runtime` |
 | `full` | all of the above | | |
 
 `default = ["socks5", "auth", "config", "bridges"]`. The bridge modules work
@@ -95,6 +95,12 @@ let settings = Settings {
 };
 ```
 
+Note: the `tor` module is the whole `arti-wrapper` crate, not a curated
+slice of it. Alongside `TorTunnel` and `Settings`, it therefore re-exports
+the vendored Arti types of the patched forks — `DataStream`,
+`BridgeConfigBuilder`, `ChannelUsage`, `ExternalActivity` — and SDK
+consumers see them through `tor_socks5::tor`.
+
 ## Accounts and config migration
 
 With `auth`, `auth::Registry` edits the users file the way the `users`
@@ -106,7 +112,7 @@ current one.
 ```rust
 use tor_socks5::auth::{Hop, NewUser, Registry, UsersConfig};
 
-let registry = Registry::new(UsersConfig::resolve_path(None));
+let registry = Registry::new(UsersConfig::resolve_path(&config_path));
 registry.add(
     NewUser { name: "alice".into(), ..NewUser::default() },
     "alice-pass",
@@ -157,9 +163,10 @@ keystore: the keystore lock makes concurrent hosting of the same keystore
 fail loudly but non-fatally (status `Failed`/`KeystoreLockHeld`); a
 sequential restart works because a new `start()` reacquires the lock.
 
-```text
-use tor_socks5_onion::host::{OnionHost, OnionHostConfig};
-// handle: the runtime's TorHandle; token: a tokio_util CancellationToken.
+```rust
+use tor_socks5::onion::host::{OnionHost, OnionHostConfig};
+// handle: the runtime's TorHandle; keystore_dir: the Arti native keystore
+// directory; token: a cancellation token (`tor_socks5::runtime::CancellationToken`).
 let host_handle = OnionHost::new(
     OnionHostConfig::new(handle, keystore_dir, token)
         .with_entries(cfg.onion_services)
@@ -287,7 +294,7 @@ tracing_subscriber::registry()
 // the writer's retry problem. At shutdown, stop and get the final
 // flush result:
 writer
-    .apply(|store| store.note_circuit_success_at(&bridge, now))
+    .apply(move |store| store.note_circuit_success_at(&bridge, now))
     .await?;
 let flush = close_global().await; // Some(Ok(())) when a writer was running
 ```

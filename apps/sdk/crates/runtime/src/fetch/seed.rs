@@ -28,7 +28,7 @@ const SEED_SUFFIX: &str = ".seeds";
 
 /// Resolve the seed file path next to the main config (same directory,
 /// same stem, `.seeds` suffix), mirroring `UsersConfig::resolve_path`.
-fn resolve_seed_path(config_path: &Path) -> std::path::PathBuf {
+pub(crate) fn resolve_seed_path(config_path: &Path) -> std::path::PathBuf {
     let dir = config_path.parent().unwrap_or_else(|| Path::new("."));
     let stem = config_path
         .file_stem()
@@ -37,12 +37,10 @@ fn resolve_seed_path(config_path: &Path) -> std::path::PathBuf {
     dir.join(format!("{stem}{SEED_SUFFIX}"))
 }
 
-/// Load seed bridges from the `*.seeds` file next to the config. Returns
-/// an empty vec when the file is absent or contains no parseable lines
-/// (so a missing/typo'd seed can never take down startup).
-pub(crate) fn seed_bridges(config_path: &Path) -> Vec<BridgeLine> {
-    let path = resolve_seed_path(config_path);
-    let Ok(text) = std::fs::read_to_string(&path) else {
+/// Same load with the seed file path already resolved (H15/TS19: the
+/// blocking read runs off the async worker with this path as the seam key).
+pub(crate) fn seed_bridges_from_seed_file(path: &Path) -> Vec<BridgeLine> {
+    let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
     text.lines()
@@ -62,7 +60,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let cfg = dir.join("tor-socks5.ktav");
-        assert!(seed_bridges(&cfg).is_empty());
+        assert!(seed_bridges_from_seed_file(&resolve_seed_path(&cfg)).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -82,7 +80,7 @@ mod tests {
              obfs4 5.6.7.8:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=BBB iat-mode=0\n",
         )
         .unwrap();
-        let seeds = seed_bridges(&cfg);
+        let seeds = seed_bridges_from_seed_file(&resolve_seed_path(&cfg));
         assert_eq!(
             seeds.len(),
             2,

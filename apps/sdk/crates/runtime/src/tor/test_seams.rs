@@ -4,6 +4,8 @@
 //! `cfg(test)` and the `test-seams` feature.
 
 tokio::task_local! {
+    /// Task-local flag marking the observation producer task, so forbidden
+    /// sites can detect (and panic on) producer-side re-entry.
     pub static FORBID_PRODUCER: ();
 }
 
@@ -22,7 +24,9 @@ use std::time::{Duration, Instant};
 /// its load (snapshot pinned, mutation/save not yet run).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Site {
+    /// Just before the gated transaction acquires its lock.
     PreAcquire,
+    /// Just after the gated transaction loaded its snapshot.
     PostLoad,
     /// Inside the admission verifier's blocking worker, right after it
     /// acquired VERIFY_LOCK (see `bridge_verifier::verify_bridges_sequential`).
@@ -42,6 +46,39 @@ pub enum Site {
     /// TS19-01 recorder site: `bridge_verifier::run_circuit_verify_tick`'s
     /// bridge-store load.
     CircuitVerifyStoreLoad,
+    /// H15/TS19 chunk-2 recorder sites: `tor_setup`'s startup-path blocking
+    /// reads (bridge store before the retire/fail retain, the `.seeds`
+    /// fallback file, and the >MAX_ACTIVE_BRIDGES ranking store load) and
+    /// the watchdog runtime's per-tick config reload and live-bridge count.
+    /// Bridge-store load in `tor_setup`'s settings build.
+    SetupStoreLoad,
+    /// `.seeds` fallback file read in `tor_setup`.
+    SetupSeedLoad,
+    /// Ranking store load for the over-limit active-bridge selection.
+    SetupProbeRank,
+    /// Per-tick config reload of the watchdog's soft-failover loop.
+    WatchdogConfigLoad,
+    /// Live-bridge count store load in the watchdog runtime.
+    WatchdogStoreLoad,
+    /// H15/TS19 chunk-3 recorder sites: the maintenance tick's
+    /// post-discovery config reload, the channel-probe fallback store read,
+    /// the warm-pool loop's config reload, and the shared candidate-ranking
+    /// health-store load.
+    /// Maintenance tick's post-discovery config reload.
+    MaintenanceTickConfigLoad,
+    /// Channel-probe fallback store read.
+    ProbeStoreLoad,
+    /// Warm-pool loop config reload.
+    WarmerConfigLoad,
+    /// Shared candidate-ranking health-store load.
+    RankStoreLoad,
+    /// H15/TS19 chunk-4 recorder sites: the drain-path config load and the
+    /// candidate-pool load shared by `fetch_merge` and `bridge_manager`.
+    /// Drain-path config load in `fetch_merge`.
+    FetchMergeDrainConfigLoad,
+    /// Candidate-pool load shared by `fetch_merge` and `bridge_manager`.
+    FetchMergePoolLoad,
+    /// After a pool writer sent the close reply for its transaction.
     WriterCloseReplySent,
 }
 
@@ -89,6 +126,8 @@ impl Clone for ParkedGate {
 }
 
 impl ParkedGate {
+    /// Registers a gate for `(path, site)`; the first transaction reaching
+    /// the site parks until [`ParkedGate::release`] or the hang guard fires.
     pub fn arm(site: Site, path: &Path) -> Self {
         let inner = Arc::new(GateInner {
             state: Mutex::new((false, false)),
@@ -127,6 +166,8 @@ impl ParkedGate {
         assert!(parked, "transaction never reached {:?}", self.key.0);
     }
 
+    /// Worker slot parked inside the admission verifier, if the gate caught
+    /// one (outer Some) — None when the site has not been reached.
     pub fn promotion_slot(&self) -> Option<Option<crate::workers::WorkerSlot>> {
         self.inner
             .promotion_slot
@@ -135,6 +176,7 @@ impl ParkedGate {
             .clone()
     }
 
+    /// Lets the parked transaction continue; the gate must have caught one.
     pub fn release(&self) {
         let mut state = self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
         state.1 = true;
@@ -205,8 +247,6 @@ pub(crate) fn mark_worker_done(site: Site, path: &Path) {
 }
 
 /// How many times a worker marked itself done at this site and path.
-// Consumer arrives with the TS17-02 regression test (next chunk).
-#[allow(dead_code)]
 pub fn worker_done_count(site: Site, path: &Path) -> usize {
     done_registry()
         .lock()
@@ -254,25 +294,25 @@ pub(crate) fn take_failure(site: Site, path: &Path) -> bool {
 /// `spawn_blocking` wraps the closure in a `BlockingTask` future that is
 /// polled as a real task, so a task id is present on the blocking pool as
 /// well as on a worker.
-static RAN_ON_THREAD: OnceLock<Mutex<HashMap<Site, std::thread::ThreadId>>> = OnceLock::new();
+static RAN_ON_THREAD: OnceLock<Mutex<HashMap<GateKey, std::thread::ThreadId>>> = OnceLock::new();
 
 /// Called from inside each blocking-read site; records the executing thread
 /// for `ran_on_thread`.
-pub(crate) fn note_task_context(site: Site) {
+pub(crate) fn note_task_context(site: Site, path: &Path) {
     let mut records = RAN_ON_THREAD
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    records.insert(site, std::thread::current().id());
+    records.insert((site, path.to_path_buf()), std::thread::current().id());
 }
 
 /// The thread that executed the site's blocking read, if recorded yet.
-pub fn ran_on_thread(site: Site) -> Option<std::thread::ThreadId> {
+pub fn ran_on_thread(site: Site, path: &Path) -> Option<std::thread::ThreadId> {
     RAN_ON_THREAD
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .get(&site)
+        .get(&(site, path.to_path_buf()))
         .copied()
 }
 

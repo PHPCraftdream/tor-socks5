@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Result};
 use clap::Subcommand;
 use proxy_config::{Config, OnionServicePort};
-use tor_hsservice::HsNickname;
+use tor_socks5_onion::HsNickname;
 
 use super::vanity;
 use crate::onion::store;

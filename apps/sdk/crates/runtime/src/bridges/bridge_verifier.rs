@@ -235,8 +235,17 @@ pub(crate) async fn run_circuit_verify_tick_with_pt(
     // on an async worker (TS19-01).
     let due_rx = match spawn_fallible_blocking(move || {
         #[cfg(any(test, feature = "test-seams"))]
-        crate::test_seams::note_task_context(crate::test_seams::Site::CircuitVerifyStoreLoad);
-        BridgeStore::load(store_path)
+        crate::test_seams::note_task_context(
+            crate::test_seams::Site::CircuitVerifyStoreLoad,
+            &store_path,
+        );
+        let store = BridgeStore::load(store_path.clone());
+        #[cfg(any(test, feature = "test-seams"))]
+        crate::test_seams::mark_worker_done(
+            crate::test_seams::Site::CircuitVerifyStoreLoad,
+            &store_path,
+        );
+        store
     })
     .await
     {

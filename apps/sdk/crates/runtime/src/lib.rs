@@ -10,6 +10,8 @@
 //! same seams the binary's own tests use. It must never be enabled in
 //! default/full builds.
 
+#![warn(missing_docs)]
+
 #[path = "tor/arti_observability.rs"]
 pub mod arti_observability;
 
@@ -72,5 +74,7 @@ pub mod test_seams;
 #[path = "tor/ts19_tests.rs"]
 mod ts19_tests;
 
+/// Blocking-worker registry shared by bridge maintenance and its tests
+/// (worker-slot accounting, failure reports, test registries).
 #[path = "bridges/bridge_maintenance/workers.rs"]
 pub mod workers;

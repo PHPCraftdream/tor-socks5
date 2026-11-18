@@ -17,7 +17,7 @@
 //! | [`fetch`] | `bridge-fetcher` | `fetch` |
 //! | [`dns`] | `tor-socks5-dns` | `dns` |
 //! | [`onion`] | `tor-socks5-onion` | `onion`, `onion-keys`, `onion-host` |
-//! | [`runtime`] | `tor-socks5-runtime` — the curated SDK-7/8/9 surfaces, not the whole crate | `runtime` |
+//! | [`runtime`] | `tor-socks5-runtime` — the curated runtime surfaces, not the whole crate | `runtime` |
 //! | [`pt`] | `tor-socks5-runtime` — managed-transport PT dispatch | `pt` |
 //! | [`server`] | `tor-socks5-server` — the curated embedded server API | `server` |
 //!
@@ -83,25 +83,41 @@ pub use ::tor_socks5_runtime::host::install_crypto_provider;
 pub use ::dns_server as dns;
 
 /// v3 onion addresses and the vanity prefix search, without Tor
-/// (`tor-socks5-onion`).
+/// (`tor-socks5-onion`) — a curated surface, not the whole crate.
 ///
-/// Behind the `onion-keys` feature the crate also carries the service
+/// Behind the `onion-keys` feature the module also carries the service
 /// identity keys and keystore of the Arti native keystore: `onion::keys`
-/// (`create_service`, `import_identity`, `export_identity`, …), with no Tor
-/// client linked.
+/// (`create_service`, `import_identity`, `export_identity`, …), the
+/// [`onion::HsNickname`] identifier type, and the `config` crate's types the
+/// keystore entry types use — with no Tor client linked.
 ///
-/// Behind the Tor-dependent `onion-host` feature it also carries the hosted
-/// onion-service manager: `onion::host` (`OnionHost`, `OnionHostHandle`,
-/// `OnionHostStatus`), with the keystore directory and services-file path as
-/// explicit arguments and a cancellation token for shutdown.
+/// Behind the Tor-dependent `onion-host` feature (which implies `runtime`)
+/// it also carries the hosted onion-service manager: `onion::host`
+/// (`OnionHost`, `OnionHostHandle`, `OnionHostStatus`), with the keystore
+/// directory and services-file path as explicit arguments and a cancellation
+/// token for shutdown.
 #[cfg(any(feature = "onion", feature = "onion-keys", feature = "onion-host"))]
-pub use ::tor_socks5_onion as onion;
+pub mod onion {
+    /// v3 onion address derivation and parsing.
+    pub use ::tor_socks5_onion::address;
+    /// Hosted onion-service manager (`onion-host`).
+    #[cfg(feature = "onion-host")]
+    pub use ::tor_socks5_onion::host;
+    /// Onion identity keystore management (`onion-keys`).
+    #[cfg(feature = "onion-keys")]
+    pub use ::tor_socks5_onion::keys;
+    /// Vanity prefix search for onion service keypairs.
+    pub use ::tor_socks5_onion::vanity;
+    /// Onion service nickname (`onion-keys`).
+    #[cfg(feature = "onion-keys")]
+    pub use ::tor_socks5_onion::HsNickname;
+}
 
 /// The embedded Tor runtime (`tor-socks5-runtime`, `apps/sdk/crates/runtime`),
 /// curated as a flat surface — this is not the whole crate. It exposes the
 /// selected Tor setup, PT, watchdog, and connection-health APIs, alongside
-/// the bridge-health writer, observation, and manager APIs (SDK-7/8/9). The
-/// embedded server is available through [`server`] (SDK-11).
+/// the bridge-health writer, observation, and manager APIs. The
+/// embedded server is available through [`server`].
 ///
 /// Nothing here installs process state on its own (R1): the bridge-health
 /// writer slot ([`init_global`]/[`close_global`]: one live writer per
@@ -109,7 +125,7 @@ pub use ::tor_socks5_onion as onion;
 /// [`observation_layer`] is a tracing layer for the application's own log
 /// subscriber; the runtime never sets a subscriber.
 ///
-/// **Bridge health and observation (SDK-7):**
+/// **Bridge health and observation:**
 ///
 /// ```no_run
 /// use tor_socks5::runtime::{init_global, observation_layer, ObservationSink};
@@ -125,7 +141,7 @@ pub use ::tor_socks5_onion as onion;
 ///     .init();
 /// ```
 ///
-/// **Tor client (SDK-9):**
+/// **Tor client:**
 ///
 /// - [`runtime::arti_base_dir`] and [`runtime::arti_keystore_dir`],
 ///   [`runtime::build_tor_settings`], and [`runtime::build_tor_settings_with_pt`]
@@ -150,7 +166,7 @@ pub use ::tor_socks5_onion as onion;
 /// [`runtime::ConnHealthConfig`] where applicable. [`runtime::TorError`] is
 /// the error type accepted by [`runtime::classify_and_record`].
 ///
-/// **Bridge manager (SDK-8):**
+/// **Bridge manager:**
 ///
 /// - [`runtime::start`] owns the standalone bridge producers;
 ///   [`runtime::start_with_parent_token`] composes them under a caller's
@@ -199,14 +215,21 @@ pub mod runtime {
         observation_layer, GuardObservabilityLayer, GuardObservation, ObservationSink,
     };
 
-    /// The bridge manager (SDK-8): [`start`] owns the background bridge
-    /// producers (one live manager per process, D5), [`BridgeManagerHandle`]
+    /// The bridge manager: [`start`] owns the background bridge
+    /// producers (one live manager per process), [`BridgeManagerHandle`]
     /// reports status and joins them at shutdown; [`fetch_bridges`] is the
     /// `bridges fetch` core.
     pub use ::tor_socks5_runtime::bridge_manager::{
         fetch_bridges, start, start_with_parent_token, BridgeManagerConfig, BridgeManagerHandle,
         BridgeManagerStatus, FetchBridgesError, FetchBridgesOutcome, FetchBridgesParams,
     };
+
+    /// Bridge-line type accepted by [`TorHandle::active_bridges`],
+    /// [`set_active_bridges`](TorHandle::set_active_bridges), and the
+    /// bridge-store writer `apply` closure.
+    pub use ::bridge_line::BridgeLine;
+    /// Timestamp type in the runtime's public maintenance/status types.
+    pub use ::time::OffsetDateTime;
 
     pub use ::tokio_util::sync::CancellationToken;
     /// Shared producer launch for embedding hosts: wires the bridge-refresh

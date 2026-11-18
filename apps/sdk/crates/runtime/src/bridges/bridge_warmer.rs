@@ -45,6 +45,43 @@ use crate::tor_watchdog::TorHandle;
 /// timeout is logged and treated like a failed warm attempt.
 const WARM_BRIDGE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// The warmer-loop config reload does blocking file I/O; run it on the
+/// blocking pool so it cannot stall an async worker (H15/TS19).
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) async fn load_warmer_config_off_worker(config_path: &Path) -> Option<Config> {
+    load_warmer_config_off_worker_inner(crate::test_seams::Site::WarmerConfigLoad, config_path)
+        .await
+}
+
+/// Prod twin of [`load_warmer_config_off_worker`].
+#[cfg(not(any(test, feature = "test-seams")))]
+pub(crate) async fn load_warmer_config_off_worker(config_path: &Path) -> Option<Config> {
+    load_warmer_config_off_worker_inner(
+        crate::bridge_maintenance::seam_site::Site::WarmerConfigLoad,
+        config_path,
+    )
+    .await
+}
+
+async fn load_warmer_config_off_worker_inner(
+    #[cfg(any(test, feature = "test-seams"))] site: crate::test_seams::Site,
+    #[cfg(not(any(test, feature = "test-seams")))] site: crate::bridge_maintenance::seam_site::Site,
+    config_path: &Path,
+) -> Option<Config> {
+    let path = config_path.to_path_buf();
+    match crate::bridge_maintenance::run_blocking_at(site, path, |p| {
+        crate::config::Config::load_with_override(Some(p)).map(|loaded| loaded.into_config())
+    })
+    .await
+    {
+        Ok(cfg) => Some(cfg),
+        Err(error) => {
+            warn!(error = %error, "warm-pool: could not reload config");
+            None
+        }
+    }
+}
+
 /// Spawn the background bridge-warming task, owned by the returned
 /// `tokio::task::JoinHandle` (the producer handle the server joins at
 /// shutdown).
@@ -104,16 +141,13 @@ pub fn spawn_bridge_warmer(
                 continue;
             };
 
-            let cfg = match Config::load_with_override(Some(config_path.as_path())) {
-                Ok(loaded) => loaded.into_config(),
-                Err(e) => {
-                    warn!(error = %e, "warm-pool: could not reload config");
-                    continue;
-                }
+            let Some(cfg) = load_warmer_config_off_worker(config_path.as_path()).await else {
+                continue;
             };
 
             let active = handle.active_bridges();
             let candidates: Vec<_> = candidates_with_health(&cfg, config_path.as_path())
+                .await
                 .into_iter()
                 .filter(|(bridge, _)| active.contains(bridge))
                 .collect();
