@@ -47,6 +47,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: python -I scripts/testing/test_ci_planner.py
       - run: python -I scripts/testing/test_ci_integration.py
+      - run: python -I scripts/testing/lint_tests/test_structure_lints.py
       - id: plan
         env:
           EVENT: ${{ github.event_name }}
@@ -127,15 +128,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Check first-party Rust files stay under 1000 lines
+      - name: Check first-party code files stay under 1000 lines
         run: sh scripts/check-line-limit.sh
 
   dir-entries:
-    name: First-party directory size (7 entries)
+    name: First-party folder size (7 code files)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Check first-party directories stay at 7 entries or fewer
+      - name: Check first-party folders hold at most 7 code files
         run: sh scripts/check-dir-entries.sh
 
   private-paths:
@@ -294,7 +295,7 @@ jobs:
           bash -n .github/release/publish.sh
         shell: bash
       - name: install.sh offline suite (real POSIX sh as child process)
-        run: python3 -I .github/install/tests/test_install.py ShInstallTests
+        run: python3 -I .github/install/tests/test_install_sh.py ShInstallTests
         shell: bash
       # Live-update: реальная компиляция фикстур (cc/clang) + живой процесс
       # под заменой бинарника (см. running/test_live_update.py)
@@ -357,7 +358,7 @@ jobs:
           }
       # Сьют сам прогоняет установщик под ОБОИМИ движками (powershell + pwsh)
       - name: install.ps1 offline suite (both engines)
-        run: python -I .github/install/tests/test_install.py PowerShellInstallTests
+        run: python -I .github/install/tests/test_install_ps.py PowerShellInstallTests
         shell: pwsh
       # Live-update: compile_windows.ps1 (5.1, отдельный хост на компиляцию)
       # собирает .NET Framework PE; сьют проверяет 2 движка сам
