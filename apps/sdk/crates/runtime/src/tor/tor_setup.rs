@@ -32,7 +32,7 @@ pub(crate) const BRIDGE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// periodically; only the best-known slice participates in the
 /// latency-sensitive startup path. Mirrors `android-ffi`'s
 /// `MAX_ACTIVE_BRIDGES`.
-const MAX_ACTIVE_BRIDGES: usize = 30;
+pub(crate) const MAX_ACTIVE_BRIDGES: usize = 30;
 
 fn settings_for_config(cfg: &Config) -> Settings {
     if cfg.tor.guard_spread > 1 {

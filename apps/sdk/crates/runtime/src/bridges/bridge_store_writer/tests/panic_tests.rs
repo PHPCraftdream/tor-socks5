@@ -1,7 +1,7 @@
 use super::super::*;
 use super::{
-    config_path, fail_first_publisher, leftover_tmp_files, reload, seed_store, test_bridge,
-    wait_for_calls, wait_for_file_count,
+    config_path, entry_signal, fail_first_publisher, leftover_tmp_files, reload, seed_store,
+    test_bridge, wait_calls, wait_settled, with_entry_signal,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use time::OffsetDateTime;
@@ -191,6 +191,7 @@ async fn mutation_panic_rejects_the_ack_and_the_next_mutation_succeeds() {
         INITIAL_BACKOFF,
     );
 
+    let mut settled = writer.settled_watch();
     let result = writer
         .apply(|_s: &mut BridgeStore| panic!("injected mutation panic"))
         .await;
@@ -212,7 +213,12 @@ async fn mutation_panic_rejects_the_ack_and_the_next_mutation_succeeds() {
         .apply(move |s| s.note_channel_success_at(&b1, OffsetDateTime::now_utc()))
         .await
         .expect("actor still alive: next mutation is absorbed");
-    wait_for_file_count(&path, &b, 1, "post-panic mutation published").await;
+    wait_settled(&mut settled, 1, "post-panic mutation published").await;
+    assert_eq!(
+        reload(&path).channel_ok_count(&b),
+        1,
+        "post-panic mutation published"
+    );
 
     let closed = writer.close().await;
     assert!(closed.is_ok(), "close after recovery: {closed:?}");
@@ -236,11 +242,13 @@ async fn panic_after_a_failed_publish_keeps_the_confirmed_mutation() {
     seed_store(&path, &b);
 
     let calls = Arc::new(AtomicUsize::new(0));
+    let (calls_tx, mut calls_rx) = entry_signal();
     let writer = StoreWriter::spawn(
         BridgeStore::resolve_path(&path),
-        fail_first_publisher(calls.clone()),
+        fail_first_publisher(calls.clone(), calls_tx),
         INITIAL_BACKOFF,
     );
+    let mut settled = writer.settled_watch();
 
     // Mutation A: acked (absorbed), publish #1 fails, snapshot retained.
     let b_a = b.clone();
@@ -248,7 +256,7 @@ async fn panic_after_a_failed_publish_keeps_the_confirmed_mutation() {
         .apply(move |s| s.note_channel_success_at(&b_a, OffsetDateTime::now_utc()))
         .await
         .expect("absorbed");
-    wait_for_calls(&calls, 1, "publish #1 attempted and failed").await;
+    wait_calls(&mut calls_rx, 1, "publish #1 attempted and failed").await;
     assert_eq!(
         reload(&path).channel_ok_count(&b),
         0,
@@ -278,14 +286,20 @@ async fn panic_after_a_failed_publish_keeps_the_confirmed_mutation() {
     // `try_start_publish`) and A would be unrecoverable. Prove A survived
     // WITHOUT a reload by letting the backoff retry succeed.
     tokio::time::sleep(Duration::from_secs(2)).await;
-    wait_for_calls(&calls, 2, "the backoff retry fired").await;
-    wait_for_file_count(
-        &path,
-        &b,
+    wait_calls(&mut calls_rx, 2, "the backoff retry fired").await;
+    // The backoff retry is the first clean publish (epoch 1): mutation A is
+    // durably on disk without any reload.
+    wait_settled(
+        &mut settled,
         1,
         "the backoff retry published the retained snapshot: mutation A survived mutation B's panic without a reload",
     )
     .await;
+    assert_eq!(
+        reload(&path).channel_ok_count(&b),
+        1,
+        "the backoff retry published the retained snapshot: mutation A survived mutation B's panic without a reload"
+    );
 
     // The next successful op must build on the surviving state: its
     // publish carries BOTH the retained A and the new C.
@@ -294,20 +308,12 @@ async fn panic_after_a_failed_publish_keeps_the_confirmed_mutation() {
         .apply(move |s| s.note_source_at(&b_c, "after-panic", OffsetDateTime::now_utc()))
         .await
         .expect("absorbed");
-    wait_for_calls(&calls, 3, "mutation C's publish fired").await;
-    // The call counter bumps before save() finishes writing, so poll the
-    // file (see wait_for_file_count) instead of reloading immediately.
-    let mut store = None;
-    for _ in 0..5000 {
-        let reloaded = reload(&path);
-        if reloaded.sources_of(&b).contains(&"after-panic".to_string()) {
-            store = Some(reloaded);
-            break;
-        }
-        tokio::task::yield_now().await;
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    let store = store.expect("mutation C's source must reach disk");
+    wait_calls(&mut calls_rx, 3, "mutation C's publish fired").await;
+    // Mutation C's publish is the second clean publish (the backoff retry
+    // was the first): epoch 2 proves C's write is durably on disk, so one
+    // reload suffices — no polling.
+    wait_settled(&mut settled, 2, "mutation C's source reached disk").await;
+    let store = reload(&path);
     assert_eq!(
         store.channel_ok_count(&b),
         1,
@@ -341,7 +347,8 @@ async fn retries_stay_on_the_backoff_schedule_after_a_panicking_mutation() {
 
     // Fail the first THREE publish calls, succeed from the 4th.
     let calls = Arc::new(AtomicUsize::new(0));
-    let publisher: Publisher = {
+    let (calls_tx, mut calls_rx) = entry_signal();
+    let publisher = with_entry_signal(calls_tx, {
         let counter = calls.clone();
         Arc::new(move |s: &BridgeStore| {
             if counter.fetch_add(1, Ordering::SeqCst) < 3 {
@@ -349,9 +356,10 @@ async fn retries_stay_on_the_backoff_schedule_after_a_panicking_mutation() {
             } else {
                 s.save()
             }
-        })
-    };
+        }) as Publisher
+    });
     let writer = StoreWriter::spawn(BridgeStore::resolve_path(&path), publisher, INITIAL_BACKOFF);
+    let mut settled = writer.settled_watch();
 
     // Mutation A: acked, publish call 1 fails at t≈0, backoff 1s→2s.
     let b_a = b.clone();
@@ -359,7 +367,7 @@ async fn retries_stay_on_the_backoff_schedule_after_a_panicking_mutation() {
         .apply(move |s| s.note_channel_success_at(&b_a, OffsetDateTime::now_utc()))
         .await
         .expect("absorbed");
-    wait_for_calls(&calls, 1, "publish #1 attempted and failed").await;
+    wait_calls(&mut calls_rx, 1, "publish #1 attempted and failed").await;
 
     // Mutation B panics. With the fix, B leaves retry.dirty, retry_at and
     // the retained snapshot exactly as they were before B.
@@ -379,6 +387,7 @@ async fn retries_stay_on_the_backoff_schedule_after_a_panicking_mutation() {
     // busy-loop would either spin without ever publishing or, worse,
     // hammer the publisher).
     tokio::time::sleep(Duration::from_secs(5)).await;
+    wait_calls(&mut calls_rx, 3, "t=3s retry fired").await;
     assert_eq!(
         calls.load(Ordering::SeqCst),
         3,
@@ -387,14 +396,20 @@ async fn retries_stay_on_the_backoff_schedule_after_a_panicking_mutation() {
 
     // t=9s: the t=7s retry is call 4 and SUCCEEDS.
     tokio::time::sleep(Duration::from_secs(4)).await;
-    wait_for_calls(&calls, 4, "the successful retry fired").await;
-    wait_for_file_count(
-        &path,
-        &b,
+    wait_calls(&mut calls_rx, 4, "the successful retry fired").await;
+    // The successful retry is the first clean publish: epoch 1 proves
+    // mutation A is durably on disk.
+    wait_settled(
+        &mut settled,
         1,
         "the successful retry persisted the retained snapshot with mutation A",
     )
     .await;
+    assert_eq!(
+        reload(&path).channel_ok_count(&b),
+        1,
+        "the successful retry persisted the retained snapshot with mutation A"
+    );
 
     // t=11s: a successful publish ends the retry streak; nothing keeps
     // attempting.
@@ -426,9 +441,10 @@ async fn close_after_a_panicking_mutation_flushes_the_retained_snapshot() {
     seed_store(&path, &b);
 
     let calls = Arc::new(AtomicUsize::new(0));
+    let (calls_tx, mut calls_rx) = entry_signal();
     let writer = StoreWriter::spawn(
         BridgeStore::resolve_path(&path),
-        fail_first_publisher(calls.clone()),
+        fail_first_publisher(calls.clone(), calls_tx),
         INITIAL_BACKOFF,
     );
 
@@ -438,7 +454,7 @@ async fn close_after_a_panicking_mutation_flushes_the_retained_snapshot() {
         .apply(move |s| s.note_channel_success_at(&b_a, OffsetDateTime::now_utc()))
         .await
         .expect("absorbed");
-    wait_for_calls(&calls, 1, "publish #1 attempted and failed").await;
+    wait_calls(&mut calls_rx, 1, "publish #1 attempted and failed").await;
 
     // Mutation B panics; its ack rejects.
     let result = writer
@@ -479,13 +495,15 @@ async fn close_after_a_panicking_mutation_reports_a_persistent_failure() {
     seed_store(&path, &b);
 
     let calls = Arc::new(AtomicUsize::new(0));
+    let (calls_tx, mut calls_rx) = entry_signal();
     let counter = calls.clone();
+    let inner: Publisher = Arc::new(move |_s: &BridgeStore| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Err(anyhow!("disk is full"))
+    });
     let writer = StoreWriter::spawn(
         BridgeStore::resolve_path(&path),
-        Arc::new(move |_s: &BridgeStore| {
-            counter.fetch_add(1, Ordering::SeqCst);
-            Err(anyhow!("disk is full"))
-        }),
+        with_entry_signal(calls_tx, inner),
         INITIAL_BACKOFF,
     );
 
@@ -495,7 +513,7 @@ async fn close_after_a_panicking_mutation_reports_a_persistent_failure() {
         .apply(move |s| s.note_channel_success_at(&b_a, OffsetDateTime::now_utc()))
         .await
         .expect("absorbed");
-    wait_for_calls(&calls, 1, "publish #1 attempted and failed").await;
+    wait_calls(&mut calls_rx, 1, "publish #1 attempted and failed").await;
 
     // Mutation B panics; its ack rejects.
     let result = writer

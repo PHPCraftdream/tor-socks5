@@ -1,7 +1,7 @@
 use super::super::*;
 use super::{
-    config_path, leftover_tmp_files, reload, seed_store, test_bridge, wait_for_calls,
-    wait_for_file_count,
+    config_path, entry_signal, leftover_tmp_files, reload, seed_store, test_bridge, wait_calls,
+    wait_settled, with_entry_signal,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use time::OffsetDateTime;
@@ -17,6 +17,7 @@ async fn concurrent_updates_are_applied_additively_and_sequentially() {
         Arc::new(|s| s.save()),
         INITIAL_BACKOFF,
     );
+    let mut settled = writer.settled_watch();
     let seen = Arc::new(Mutex::new(Vec::<u32>::new()));
     let mut tasks = Vec::new();
     for i in 0..8u32 {
@@ -41,8 +42,15 @@ async fn concurrent_updates_are_applied_additively_and_sequentially() {
     counts.sort_unstable();
     assert_eq!(counts, vec![0, 1, 2, 3, 4, 5, 6, 7], "no lost update");
 
-    // Acks precede the disk publish now; wait for the coalesced save.
-    wait_for_file_count(&path, &b, 8, "coalesced publish persisted all 8 updates").await;
+    // Acks precede the disk publish; the single coalesced publish is this
+    // test's first clean publish, so epoch 1 proves all 8 updates are on
+    // disk and the actor retired its snapshot.
+    wait_settled(&mut settled, 1, "coalesced publish persisted all 8 updates").await;
+    assert_eq!(
+        reload(&path).channel_ok_count(&b),
+        8,
+        "coalesced publish persisted all 8 updates"
+    );
     assert!(
         leftover_tmp_files(dir.path()).is_empty(),
         "no leftover temp files"
@@ -57,12 +65,13 @@ async fn mutations_are_coalesced_while_a_publish_is_in_flight() {
     seed_store(&path, &b);
 
     let calls = Arc::new(AtomicUsize::new(0));
+    let (calls_tx, mut calls_rx) = entry_signal();
     let (gate_tx, gate_rx) = oneshot::channel::<()>();
     // The gate receiver is consumed once (blocking_recv takes self), so
     // wrap it for the `Fn` publisher bound.
     let gate = Mutex::new(Some(gate_rx));
     let counter = calls.clone();
-    let publisher: Publisher = Arc::new(move |s: &BridgeStore| {
+    let inner: Publisher = Arc::new(move |s: &BridgeStore| {
         let n = counter.fetch_add(1, Ordering::SeqCst);
         if n == 0 {
             // Hold publish #1 in-flight until the test releases it.
@@ -71,7 +80,12 @@ async fn mutations_are_coalesced_while_a_publish_is_in_flight() {
         }
         s.save()
     });
-    let writer = StoreWriter::spawn(BridgeStore::resolve_path(&path), publisher, INITIAL_BACKOFF);
+    let writer = StoreWriter::spawn(
+        BridgeStore::resolve_path(&path),
+        with_entry_signal(calls_tx, inner),
+        INITIAL_BACKOFF,
+    );
+    let mut settled = writer.settled_watch();
 
     for i in 0..10u32 {
         let b = b.clone();
@@ -83,6 +97,14 @@ async fn mutations_are_coalesced_while_a_publish_is_in_flight() {
             .await
             .expect("each apply acks once absorbed, even with a publish blocked");
     }
+    // Publish #1 has entered (and is parked on the gate): deterministic
+    // before asserting the absorbed count.
+    wait_calls(
+        &mut calls_rx,
+        1,
+        "publish #1 started and is blocked on the gate",
+    )
+    .await;
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
@@ -92,8 +114,15 @@ async fn mutations_are_coalesced_while_a_publish_is_in_flight() {
     // Release publish #1; the completion triggers one coalesced
     // follow-up carrying all 10 mutations.
     gate_tx.send(()).expect("release the publish gate");
-    wait_for_calls(&calls, 2, "coalesced follow-up publish fired").await;
-    wait_for_file_count(&path, &b, 10, "no absorbed update was lost").await;
+    wait_calls(&mut calls_rx, 2, "coalesced follow-up publish fired").await;
+    // The follow-up is the first clean publish (publish #1 completed with
+    // tail mutations and stayed dirty): epoch 1 proves all 10 are on disk.
+    wait_settled(&mut settled, 1, "no absorbed update was lost").await;
+    assert_eq!(
+        reload(&path).channel_ok_count(&b),
+        10,
+        "no absorbed update was lost"
+    );
     assert!(
         calls.load(Ordering::SeqCst) <= 3,
         "10 mutations must coalesce into at most a few publishes, got {}",
@@ -149,6 +178,7 @@ async fn publish_snapshots_are_copy_on_write() {
     seed_store(&path, &b);
 
     let calls = Arc::new(AtomicUsize::new(0));
+    let (entry_tx, mut calls_rx) = entry_signal();
     let snapshots: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
     let addrs: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
     let (gate_tx, gate_rx) = oneshot::channel::<()>();
@@ -157,13 +187,16 @@ async fn publish_snapshots_are_copy_on_write() {
     let gate = Mutex::new(Some(gate_rx));
     let counter = calls.clone();
     let snapshot_addrs = snapshots.clone();
-    let publisher: Publisher = Arc::new(move |s: &BridgeStore| {
-        // Record the snapshot allocation BEFORE bumping the counter, so an
-        // entry always exists by the time the counter shows the call.
+    let inner: Publisher = Arc::new(move |s: &BridgeStore| {
+        // Record the snapshot allocation BEFORE signalling the call, so an
+        // entry always exists by the time the test sees the call.
         snapshot_addrs
             .lock()
             .unwrap()
             .push(s as *const BridgeStore as usize);
+        // Signal AFTER recording: the test reads the snapshot as soon as the
+        // signal shows the call, so the entry must already exist.
+        entry_tx.send_modify(|calls| *calls += 1);
         let n = counter.fetch_add(1, Ordering::SeqCst);
         if n == 0 {
             // Hold publish #1 in-flight until the test releases it.
@@ -172,7 +205,8 @@ async fn publish_snapshots_are_copy_on_write() {
         }
         s.save()
     });
-    let writer = StoreWriter::spawn(BridgeStore::resolve_path(&path), publisher, INITIAL_BACKOFF);
+    let writer = StoreWriter::spawn(BridgeStore::resolve_path(&path), inner, INITIAL_BACKOFF);
+    let mut settled = writer.settled_watch();
 
     // Mutation A: the job deep-copies (the actor keeps its own Arc, so
     // make_mut is unconditional), stores the copy back, and the publisher
@@ -187,7 +221,12 @@ async fn publish_snapshots_are_copy_on_write() {
         .await
         .expect("mutation A absorbed");
     let addr_a = addrs.load(Ordering::SeqCst);
-    wait_for_calls(&calls, 1, "publish #1 started and is blocked on the gate").await;
+    wait_calls(
+        &mut calls_rx,
+        1,
+        "publish #1 started and is blocked on the gate",
+    )
+    .await;
     assert_eq!(
         snapshots.lock().unwrap()[0],
         addr_a,
@@ -214,7 +253,7 @@ async fn publish_snapshots_are_copy_on_write() {
     // Release publish #1; the coalesced follow-up must publish B's
     // allocation with no second copy.
     gate_tx.send(()).expect("release the publish gate");
-    wait_for_calls(&calls, 2, "coalesced follow-up publish fired").await;
+    wait_calls(&mut calls_rx, 2, "coalesced follow-up publish fired").await;
     assert_eq!(
         snapshots.lock().unwrap()[1],
         addr_b,
@@ -236,14 +275,23 @@ async fn publish_snapshots_are_copy_on_write() {
         .await
         .expect("mutation C absorbed");
     let addr_c = addrs.load(Ordering::SeqCst);
-    wait_for_calls(&calls, 3, "quiet mutation triggered its own publish").await;
+    wait_calls(&mut calls_rx, 3, "quiet mutation triggered its own publish").await;
     assert_eq!(
         snapshots.lock().unwrap()[2],
         addr_c,
         "quiet publish again shares the actor's stored allocation"
     );
 
-    wait_for_file_count(&path, &b, 3, "all three publishes persisted").await;
+    // The LAST publish is the only guaranteed-clean one: the follow-up may
+    // complete dirty if mutation C was absorbed while it ran. The final
+    // clean publish carries every mutation, so epoch 1 proves all three
+    // writes are on disk.
+    wait_settled(&mut settled, 1, "all three publishes persisted").await;
+    assert_eq!(
+        reload(&path).channel_ok_count(&b),
+        3,
+        "all three publishes persisted"
+    );
     let closed = writer.close().await;
     assert!(closed.is_ok(), "close after clean publishes: {closed:?}");
     assert!(
@@ -262,13 +310,14 @@ async fn mutation_during_in_flight_publish_does_not_block_the_async_worker() {
     seed_store(&path, &b);
 
     let calls = Arc::new(AtomicUsize::new(0));
+    let (calls_tx, mut calls_rx) = entry_signal();
     let (gate_tx, gate_rx) = oneshot::channel::<()>();
     // The gate receiver is consumed once (blocking_recv takes self), so
     // wrap it for the `Fn` publisher bound (same trick as
     // publish_snapshots_are_copy_on_write).
     let gate = Mutex::new(Some(gate_rx));
     let counter = calls.clone();
-    let publisher: Publisher = Arc::new(move |s: &BridgeStore| {
+    let inner: Publisher = Arc::new(move |s: &BridgeStore| {
         if counter.fetch_add(1, Ordering::SeqCst) == 0 {
             // Hold publish #1 in-flight until the test releases it.
             let held = gate.lock().unwrap().take().expect("gate used once");
@@ -276,7 +325,12 @@ async fn mutation_during_in_flight_publish_does_not_block_the_async_worker() {
         }
         s.save()
     });
-    let writer = StoreWriter::spawn(BridgeStore::resolve_path(&path), publisher, INITIAL_BACKOFF);
+    let writer = StoreWriter::spawn(
+        BridgeStore::resolve_path(&path),
+        with_entry_signal(calls_tx, inner),
+        INITIAL_BACKOFF,
+    );
+    let mut settled = writer.settled_watch();
 
     // Mutation A triggers publish #1 and leaves it blocked on the gate, so
     // the actor's snapshot Arc is shared once mutation B lands — the only
@@ -286,7 +340,12 @@ async fn mutation_during_in_flight_publish_does_not_block_the_async_worker() {
         .apply(move |s| s.note_channel_success_at(&b_a, OffsetDateTime::now_utc()))
         .await
         .expect("mutation A absorbed");
-    wait_for_calls(&calls, 1, "publish #1 started and is blocked on the gate").await;
+    wait_calls(
+        &mut calls_rx,
+        1,
+        "publish #1 started and is blocked on the gate",
+    )
+    .await;
 
     // Mutation B waits for an independent async task to release it.
     let writer_b = writer.clone();
@@ -318,7 +377,13 @@ async fn mutation_during_in_flight_publish_does_not_block_the_async_worker() {
     // Semantics unchanged: B was absorbed (ack above) and rides along in
     // the coalesced follow-up once the gated publish completes.
     gate_tx.send(()).expect("release the publish gate");
-    wait_for_file_count(&path, &b, 2, "both mutations reached disk").await;
+    // The follow-up (carrying both mutations) is the first clean publish.
+    wait_settled(&mut settled, 1, "both mutations reached disk").await;
+    assert_eq!(
+        reload(&path).channel_ok_count(&b),
+        2,
+        "both mutations reached disk"
+    );
     let closed = writer.close().await;
     assert!(closed.is_ok(), "close after clean publishes: {closed:?}");
     assert!(

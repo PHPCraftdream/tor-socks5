@@ -264,6 +264,8 @@ mod tests {
         store.note_source_at(&warmed_bridge, "test", OffsetDateTime::now_utc());
         store.save().expect("seed save");
 
+        // Keep the handle alive for the test's duration (the global slot
+        // holds its own clone either way).
         let _writer = crate::bridge_store_writer::init_global(config_path.as_path());
 
         let mut tasks = Vec::new();
@@ -281,19 +283,19 @@ mod tests {
         // apply() acks as soon as a mutation is absorbed in memory, before
         // the writer's (now offloaded, coalesced) disk publish runs — so the
         // 16th ack landing does not mean the 16th write has hit disk yet.
-        // Poll for it, yielding every iteration so the writer's actor task
-        // (on this single-threaded test runtime) actually gets to run.
-        let mut count = 0;
-        for _ in 0..5000 {
-            count = BridgeStore::load(BridgeStore::resolve_path(config_path.as_path()))
-                .expect("reload store")
-                .channel_ok_count(&warmed_bridge);
-            if count == 16 {
-                break;
-            }
-            tokio::task::yield_now().await;
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        // Clean publishes happen an unknown number of times here (the 16
+        // acks can interleave with publishes into several chains), so the
+        // settle epoch alone cannot prove ALL 16 landed; instead close the
+        // writer deterministically: `close` waits for any in-flight publish
+        // AND flushes a still-dirty snapshot before it joins the actor, so
+        // a successful close guarantees the full state is on disk.
+        crate::bridge_store_writer::close_global()
+            .await
+            .expect("close runs when a writer is up")
+            .expect("global writer closes");
+        let count = BridgeStore::load(BridgeStore::resolve_path(config_path.as_path()))
+            .expect("reload store")
+            .channel_ok_count(&warmed_bridge);
         assert_eq!(count, 16, "no lost update through the single writer");
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .expect("read tempdir")
@@ -302,12 +304,9 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "no leftover temp files");
 
-        // Hand the global slot back: the writer must close cleanly so the
-        // other global-slot test starts from an empty slot.
-        crate::bridge_store_writer::close_global()
-            .await
-            .expect("close runs when a writer is up")
-            .expect("global writer closes");
+        // The global slot is already empty: close_global above both joined
+        // the writer and emptied the slot, so the other global-slot test
+        // starts from a clean state.
     }
 
     #[test]

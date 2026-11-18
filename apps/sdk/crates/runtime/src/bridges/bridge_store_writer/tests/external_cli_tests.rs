@@ -1,7 +1,7 @@
 use super::super::*;
 use super::{
     config_path, fail_first_publisher, leftover_tmp_files, reload, seed_store, test_bridge,
-    wait_a_real_moment, wait_for_calls, wait_for_file_count,
+    wait_calls, wait_settled,
 };
 use bridge_line::BridgeLine;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -64,17 +64,18 @@ async fn external_cli_write_between_angel_mutations_survives() {
         Arc::new(|s| s.save()),
         INITIAL_BACKOFF,
     );
+    let mut settled = writer.settled_watch();
 
-    // Angel mutation #1 publishes cleanly. Acks now precede the disk
-    // write, so wait for the publish to land AND for the actor to retire
-    // the completion (dropping its snapshot) before the external write.
+    // Angel mutation #1 publishes cleanly. Awaiting the settle epoch proves
+    // the write is on disk AND the actor retired its snapshot (next op
+    // re-reads the file) — the old wait_for_file_count + wait_a_real_moment
+    // pair in one deterministic step.
     let b1 = b.clone();
     writer
         .apply(move |s| s.note_channel_success_at(&b1, OffsetDateTime::now_utc()))
         .await
         .expect("absorbed");
-    wait_for_file_count(&path, &b, 1, "first angel mutation published").await;
-    wait_a_real_moment().await;
+    wait_settled(&mut settled, 1, "first angel mutation published").await;
 
     // A separate CLI process (sequential, not concurrent) loads, adds a
     // new bridge and bumps the angel bridge's counter, then saves.
@@ -91,8 +92,13 @@ async fn external_cli_write_between_angel_mutations_survives() {
         .await
         .expect("absorbed");
 
-    wait_for_file_count(&path, &b, 3, "angel's second mutation published").await;
+    wait_settled(&mut settled, 2, "angel's second mutation published").await;
     let store = reload(&path);
+    assert_eq!(
+        store.channel_ok_count(&b),
+        3,
+        "angel's second mutation published"
+    );
     assert_eq!(
         store.channel_ok_count(&b),
         3,
@@ -121,11 +127,13 @@ async fn external_cli_write_after_successful_retry_survives() {
     seed_store(&path, &b);
 
     let calls = Arc::new(AtomicUsize::new(0));
+    let (calls_tx, mut calls_rx) = super::entry_signal();
     let writer = StoreWriter::spawn(
         BridgeStore::resolve_path(&path),
-        fail_first_publisher(calls.clone()),
+        fail_first_publisher(calls.clone(), calls_tx),
         Duration::from_secs(1),
     );
+    let mut settled = writer.settled_watch();
 
     // Angel mutation #1: publish fails, snapshot retained, retry armed.
     let b1 = b.clone();
@@ -137,11 +145,13 @@ async fn external_cli_write_after_successful_retry_survives() {
 
     // Paused clock: sleep fast-forwards AND polls the runtime to
     // quiescence, so the actor's retry fires (see the comment in
-    // publish_failure_is_retried_by_the_backoff_timer); the publish runs
-    // on the blocking pool, hence the real-time polls below.
+    // publish_failure_is_retried_by_the_backoff_timer).
     tokio::time::sleep(Duration::from_secs(2)).await;
-    wait_for_calls(&calls, 2, "retry fired").await;
-    wait_for_file_count(&path, &b, 1, "retry published").await;
+    wait_calls(&mut calls_rx, 2, "retry fired").await;
+    // The retry is the first clean publish; epoch 1 also proves the actor
+    // retired its snapshot before the external write.
+    wait_settled(&mut settled, 1, "retry published").await;
+    assert_eq!(reload(&path).channel_ok_count(&b), 1, "retry published");
 
     // External CLI write lands after the successful retry.
     let mut external = reload(&path);
@@ -156,8 +166,13 @@ async fn external_cli_write_after_successful_retry_survives() {
         .await
         .expect("absorbed");
 
-    wait_for_file_count(&path, &b, 3, "post-retry mutation published").await;
+    wait_settled(&mut settled, 2, "post-retry mutation published").await;
     let store = reload(&path);
+    assert_eq!(
+        store.channel_ok_count(&b),
+        3,
+        "post-retry mutation published"
+    );
     assert_eq!(
         store.channel_ok_count(&b),
         3,
@@ -223,12 +238,18 @@ async fn init_close_init_gets_a_fresh_live_writer() {
     );
 
     // The fresh writer accepts and publishes records end to end.
+    let mut settled = second.settled_watch();
     let b2 = b.clone();
     second
         .apply(move |s| s.note_channel_success_at(&b2, OffsetDateTime::now_utc()))
         .await
         .expect("fresh writer absorbs the mutation");
-    wait_for_file_count(&path, &b, 1, "fresh writer publishes").await;
+    wait_settled(&mut settled, 1, "fresh writer publishes").await;
+    assert_eq!(
+        reload(&path).channel_ok_count(&b),
+        1,
+        "fresh writer publishes"
+    );
 
     // Stopping again empties the slot: a second close reports None.
     close_global()
@@ -257,12 +278,18 @@ async fn open_starts_a_live_writer_and_close_reports_the_flush_result() {
     seed_store(&path, &b);
 
     let writer = StoreWriter::open(path.as_path());
+    let mut settled = writer.settled_watch();
     let b1 = b.clone();
     writer
         .apply(move |s| s.note_channel_success_at(&b1, OffsetDateTime::now_utc()))
         .await
         .expect("open writer absorbs the mutation");
-    wait_for_file_count(&path, &b, 1, "open writer publishes").await;
+    wait_settled(&mut settled, 1, "open writer publishes").await;
+    assert_eq!(
+        reload(&path).channel_ok_count(&b),
+        1,
+        "open writer publishes"
+    );
 
     writer
         .close()

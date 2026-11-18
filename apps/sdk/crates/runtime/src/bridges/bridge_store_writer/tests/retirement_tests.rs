@@ -1,5 +1,5 @@
 use super::super::*;
-use super::{config_path, leftover_tmp_files, seed_store, test_bridge, wait_for_file_count};
+use super::{config_path, leftover_tmp_files, seed_store, test_bridge, wait_settled};
 use time::OffsetDateTime;
 
 /// TS6-04 regression: both retirement sites -- the post-mutation snapshot
@@ -28,6 +28,7 @@ async fn retired_snapshots_are_dropped_off_the_async_worker() {
     // Site 1: the first mutation loads the file, and swapping the mutated
     // snapshot in retires the loaded one (after the mutation job returned,
     // the actor's Arc was its last strong reference).
+    let mut retire_settled = writer.retire_settled.clone();
     let b1 = b.clone();
     writer
         .apply(move |s| s.note_channel_success_at(&b1, OffsetDateTime::now_utc()))
@@ -35,36 +36,32 @@ async fn retired_snapshots_are_dropped_off_the_async_worker() {
         .expect("absorbed");
 
     // Site 2: the publish succeeds with no tail mutations, so
-    // `absorb_publish_result` retires the mutated snapshot. The file write
-    // completes slightly before the actor absorbs the result, so poll.
-    wait_for_file_count(&path, &b, 1, "publish completed").await;
+    // `absorb_publish_result` retires the mutated snapshot.
+    let mut settled = writer.settled_watch();
+    wait_settled(&mut settled, 1, "publish completed cleanly").await;
 
     // Exactly two retirements must be recorded, each on a non-actor
-    // thread. The recorder is per-writer, so no other test can pollute
-    // it. Thread ids are globally unique and never reused, so a
+    // thread. The retire-settle epoch is bumped INSIDE each retirement's
+    // blocking task after its record is pushed, so epoch >= 2 proves both
+    // records are visible — no polling. The recorder is per-writer, so no
+    // other test can pollute it, and thread ids are globally unique, so a
     // blocking-pool thread can never collide with the test's own thread.
-    for _ in 0..5000 {
-        let threads = writer
-            .retirements
-            .lock()
-            .expect("retirement recorder poisoned")
-            .clone();
-        if threads.len() >= 2 {
-            assert!(
-                threads.iter().all(|t| *t != actor_thread),
-                "a retired snapshot was dropped on the actor's async worker \
-                 thread: {threads:?} (actor thread: {actor_thread:?})"
-            );
-            break;
-        }
-        tokio::task::yield_now().await;
-        std::thread::sleep(Duration::from_millis(2));
+    while *retire_settled.borrow_and_update() < 2 {
+        retire_settled
+            .changed()
+            .await
+            .expect("retirement settle signal closed");
     }
     let threads = writer
         .retirements
         .lock()
         .expect("retirement recorder poisoned")
         .clone();
+    assert!(
+        threads.iter().all(|t| *t != actor_thread),
+        "a retired snapshot was dropped on the actor's async worker \
+         thread: {threads:?} (actor thread: {actor_thread:?})"
+    );
     assert_eq!(
         threads.len(),
         2,

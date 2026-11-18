@@ -138,3 +138,7 @@ pub use status::{HealOutcome, WatchdogRun, WatchdogStatus};
 #[cfg(test)]
 #[path = "tor_watchdog_tests.rs"]
 mod tor_watchdog_tests;
+
+#[cfg(test)]
+#[path = "tor_watchdog_orchestration_tests.rs"]
+mod orchestration_tests;
