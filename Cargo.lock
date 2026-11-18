@@ -5484,7 +5484,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
- "tor-error",
  "tor-socks5-auth",
  "tor-socks5-config",
  "tor-socks5-onion",

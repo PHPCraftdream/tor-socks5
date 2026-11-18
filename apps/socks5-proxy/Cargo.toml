@@ -31,7 +31,6 @@ tor-socks5-onion = { path = "../../apps/sdk/crates/onion", version = "0.2.0", op
 tor-socks5-runtime = { path = "../../apps/sdk/crates/runtime", version = "0.2.0", features = ["pt"] }
 tor-socks5-server = { path = "../../apps/sdk/crates/server", version = "0.2.0", default-features = false }
 proxy-config = { path = "../../packages/proxy-config", version = "0.2.0", package = "tor-socks5-config" }
-tor-error.workspace = true
 
 service-manager.workspace = true
 clap.workspace = true
