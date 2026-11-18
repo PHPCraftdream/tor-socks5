@@ -456,32 +456,41 @@ async fn spawn_test_server_with_upstream(
     (addr, permits, handle)
 }
 
-/// Deterministic (clock-free) wait for the server task to take the
-/// permit: the current-thread runtime only makes progress via yields.
+/// Real-time bound for the waits below. They run under a paused clock, so
+/// the bound is wall time (`Instant`), never `tokio::time`.
+const REAL_WAIT: Duration = Duration::from_secs(30);
+
+/// Yields until the server task has taken the permit. Counting yields races
+/// the kernel delivering the accepted socket (a yield loop finishes in
+/// microseconds), so the wait is bounded by real time instead. A yield (not
+/// a clock sleep) keeps the paused clock from auto-advancing while it polls
+/// the I/O driver.
 async fn wait_for_permit_taken(permits: &Arc<tokio::sync::Semaphore>) {
-    for _ in 0..200 {
-        if permits.available_permits() == 0 {
-            return;
-        }
+    let started = std::time::Instant::now();
+    while permits.available_permits() != 0 {
+        assert!(started.elapsed() < REAL_WAIT, "server must hold the permit");
+        std::thread::sleep(Duration::from_millis(1));
         tokio::task::yield_now().await;
     }
-    assert_eq!(
-        permits.available_permits(),
-        0,
-        "server must hold the permit"
-    );
 }
 
 /// Awaits real socket I/O without letting the paused clock auto-advance:
 /// parking on a not-yet-signalled socket would jump the clock to the next
-/// timer and fire a server deadline before the peer's bytes arrive.
+/// timer and fire a server deadline before the peer's bytes arrive. Bounded
+/// by real time so a lost byte fails the test instead of hanging it.
 async fn without_auto_advance<F: std::future::Future>(fut: F) -> F::Output {
     let mut fut = std::pin::pin!(fut);
+    let started = std::time::Instant::now();
     loop {
         tokio::select! {
             r = &mut fut => return r,
             _ = tokio::task::yield_now() => {}
         }
+        assert!(
+            started.elapsed() < REAL_WAIT,
+            "the awaited socket I/O never completed"
+        );
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 

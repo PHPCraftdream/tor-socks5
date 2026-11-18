@@ -159,9 +159,9 @@ async fn phase_shutdown_delayed_write_lands_before_writer_close() {
     };
     // The choreography always cancels first; hold the barrier until it has,
     // so the producer's operation provably spans the cancellation.
-    while !owner.token().is_cancelled() {
-        tokio::task::yield_now().await;
-    }
+    tokio::time::timeout(Duration::from_secs(30), owner.token().cancelled())
+        .await
+        .expect("the choreography must cancel the run");
     barrier.wait().await;
 
     let result = choreography
