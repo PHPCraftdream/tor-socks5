@@ -7,7 +7,7 @@
 //! [`StoreWriter::close`] stops it and returns the final flush result.
 //! [`init_global`] / [`close_global`] are the process-wide slot on top of
 //! the same actor; a separate server-run slot (`init_run` / `close_run`,
-//! `bridge_maintenance/run_writer.rs`) lets the SDK server open its own
+//! `bridge_maintenance/workers/run_writer.rs`) lets the SDK server open its own
 //! writer per run and never touch the app's global writer. [`apply`]
 //! prefers the run writer. Each slot holds at most one live writer and a
 //! sequential restart works — after a close the slot is empty, so the
@@ -853,7 +853,7 @@ async fn try_start_publish(
 ///   second `close_global` gets `None`.
 /// * The closing task empties the slot (`Closing -> Idle`) as soon as the
 ///   close completes, so the slot never keeps referencing a closed writer.
-#[path = "bridge_maintenance/run_writer.rs"]
+#[path = "bridge_maintenance/workers/run_writer.rs"]
 mod run_writer;
 #[cfg(any(test, feature = "test-seams"))]
 pub use run_writer::run_is_idle;

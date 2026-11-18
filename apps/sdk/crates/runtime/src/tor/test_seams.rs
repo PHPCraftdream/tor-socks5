@@ -4,6 +4,8 @@
 //! `cfg(test)` and the `test-seams` feature.
 
 tokio::task_local! {
+    /// Task-local flag marking the observation producer task, so forbidden
+    /// sites can detect (and panic on) producer-side re-entry.
     pub static FORBID_PRODUCER: ();
 }
 
@@ -22,7 +24,9 @@ use std::time::{Duration, Instant};
 /// its load (snapshot pinned, mutation/save not yet run).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Site {
+    /// Just before the gated transaction acquires its lock.
     PreAcquire,
+    /// Just after the gated transaction loaded its snapshot.
     PostLoad,
     /// Inside the admission verifier's blocking worker, right after it
     /// acquired VERIFY_LOCK (see `bridge_verifier::verify_bridges_sequential`).
@@ -46,23 +50,35 @@ pub enum Site {
     /// reads (bridge store before the retire/fail retain, the `.seeds`
     /// fallback file, and the >MAX_ACTIVE_BRIDGES ranking store load) and
     /// the watchdog runtime's per-tick config reload and live-bridge count.
+    /// Bridge-store load in `tor_setup`'s settings build.
     SetupStoreLoad,
+    /// `.seeds` fallback file read in `tor_setup`.
     SetupSeedLoad,
+    /// Ranking store load for the over-limit active-bridge selection.
     SetupProbeRank,
+    /// Per-tick config reload of the watchdog's soft-failover loop.
     WatchdogConfigLoad,
+    /// Live-bridge count store load in the watchdog runtime.
     WatchdogStoreLoad,
     /// H15/TS19 chunk-3 recorder sites: the maintenance tick's
     /// post-discovery config reload, the channel-probe fallback store read,
     /// the warm-pool loop's config reload, and the shared candidate-ranking
     /// health-store load.
+    /// Maintenance tick's post-discovery config reload.
     MaintenanceTickConfigLoad,
+    /// Channel-probe fallback store read.
     ProbeStoreLoad,
+    /// Warm-pool loop config reload.
     WarmerConfigLoad,
+    /// Shared candidate-ranking health-store load.
     RankStoreLoad,
     /// H15/TS19 chunk-4 recorder sites: the drain-path config load and the
     /// candidate-pool load shared by `fetch_merge` and `bridge_manager`.
+    /// Drain-path config load in `fetch_merge`.
     FetchMergeDrainConfigLoad,
+    /// Candidate-pool load shared by `fetch_merge` and `bridge_manager`.
     FetchMergePoolLoad,
+    /// After a pool writer sent the close reply for its transaction.
     WriterCloseReplySent,
 }
 
@@ -110,6 +126,8 @@ impl Clone for ParkedGate {
 }
 
 impl ParkedGate {
+    /// Registers a gate for `(path, site)`; the first transaction reaching
+    /// the site parks until [`ParkedGate::release`] or the hang guard fires.
     pub fn arm(site: Site, path: &Path) -> Self {
         let inner = Arc::new(GateInner {
             state: Mutex::new((false, false)),
@@ -148,6 +166,8 @@ impl ParkedGate {
         assert!(parked, "transaction never reached {:?}", self.key.0);
     }
 
+    /// Worker slot parked inside the admission verifier, if the gate caught
+    /// one (outer Some) — None when the site has not been reached.
     pub fn promotion_slot(&self) -> Option<Option<crate::workers::WorkerSlot>> {
         self.inner
             .promotion_slot
@@ -156,6 +176,7 @@ impl ParkedGate {
             .clone()
     }
 
+    /// Lets the parked transaction continue; the gate must have caught one.
     pub fn release(&self) {
         let mut state = self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
         state.1 = true;

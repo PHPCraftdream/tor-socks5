@@ -170,11 +170,15 @@ pub struct ObservationSink {
 }
 
 impl ObservationSink {
+    /// Creates an empty sink; observations are buffered until a writer drains them.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Registers a weak handle notified when a guard recovery is observed,
+    /// so an external writer can persist the recovery without keeping the
+    /// sink alive.
     pub fn set_recovery_notifier(&self, notifier: &Arc<tokio::sync::Notify>) {
         if let Ok(mut recovery) = self.recovery.lock() {
             *recovery = Some(Arc::downgrade(notifier));

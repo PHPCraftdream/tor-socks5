@@ -1,6 +1,6 @@
 use std::sync::{Arc, LazyLock, Mutex};
 
-#[path = "run_workers.rs"]
+#[path = "workers/run_workers.rs"]
 mod run_workers;
 
 // The registry may retain 64 active jobs plus 64 overflow-failure slots (128 slots max);
@@ -10,12 +10,18 @@ const FAILURE_REPORT_LIMIT: usize = 128;
 const WORKER_SLOT_LIMIT: usize = BLOCKING_WORKER_LIMIT * 2;
 const RETAINED_FAILURE_LIMIT: usize = FAILURE_REPORT_LIMIT + BLOCKING_WORKER_LIMIT;
 type WorkerFailure = Arc<Mutex<Option<anyhow::Error>>>;
+/// Handle to one registered blocking worker: its join handle plus the
+/// slot used to report an unexpected failure.
 pub type WorkerSlot = Arc<tokio::sync::Mutex<WorkerState>>;
+/// Per-slot state: the spawned task handle and the failure captured
+/// before the task ended.
 #[derive(Default)]
 pub struct WorkerState {
     handle: Option<tokio::task::JoinHandle<()>>,
     failure: WorkerFailure,
 }
+/// Errors collected from workers during one blocking run, reported to
+/// the caller once the run group completes.
 #[derive(Debug)]
 pub struct WorkerFailures(Vec<anyhow::Error>);
 impl WorkerFailures {
@@ -24,9 +30,11 @@ impl WorkerFailures {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    /// Consumes the report, returning the raw worker errors.
     pub fn into_errors(self) -> Vec<anyhow::Error> {
         self.0
     }
+    /// The worker errors collected so far.
     pub fn errors(&self) -> &[anyhow::Error] {
         &self.0
     }
@@ -42,7 +50,7 @@ impl std::error::Error for WorkerFailures {
     }
 }
 #[derive(Default)]
-struct WorkerRegistry {
+pub(crate) struct WorkerRegistry {
     slots: Mutex<Vec<WorkerSlot>>,
     reports: Mutex<Vec<WorkerFailure>>,
 }
@@ -120,6 +128,8 @@ impl<T> Delivery<T> {
         self.result
     }
 }
+/// Receiver for a fallible worker result: resolves to the worker's
+/// `Result` (itself possibly an error) or a oneshot receive failure.
 pub struct FallibleReceiver<T>(tokio::sync::oneshot::Receiver<Delivery<T>>);
 impl<T> std::future::Future for FallibleReceiver<T> {
     type Output = Result<anyhow::Result<T>, tokio::sync::oneshot::error::RecvError>;
@@ -380,72 +390,14 @@ impl WorkerRegistry {
     }
 }
 
-// Отдельный реестр исключает влияние параллельных тестов на общий бюджет ожидания.
+/// Task-scoped test registry ([`TestWorkers`]); keeps parallel tests off
+/// the shared blocking-worker budget of this module.
 #[cfg(any(test, feature = "test-seams"))]
-#[derive(Default)]
-pub struct TestWorkers(WorkerRegistry);
-
-#[cfg(any(test, feature = "test-seams"))]
-tokio::task_local! {
-    static TEST_WORKERS: Arc<TestWorkers>;
-}
+#[path = "workers/test_workers.rs"]
+mod test_workers;
 
 #[cfg(any(test, feature = "test-seams"))]
-pub fn test_registry() -> Option<Arc<TestWorkers>> {
-    TEST_WORKERS.try_with(Arc::clone).ok()
-}
-
-#[cfg(any(test, feature = "test-seams"))]
-impl TestWorkers {
-    // Область действует только в текущей задаче, а не в её потомках.
-    pub async fn scope<F: std::future::Future>(self: &Arc<Self>, future: F) -> F::Output {
-        TEST_WORKERS.scope(self.clone(), future).await
-    }
-
-    pub async fn owns_pending(&self, target: &WorkerSlot) -> bool {
-        let owns = self
-            .0
-            .snapshot()
-            .expect("test registry")
-            .iter()
-            .any(|slot| Arc::ptr_eq(slot, target));
-        owns && target
-            .lock()
-            .await
-            .handle
-            .as_ref()
-            .is_some_and(|handle| !handle.is_finished())
-    }
-    pub async fn cleared(&self, target: &WorkerSlot) -> bool {
-        target.lock().await.handle.is_none()
-    }
-
-    pub async fn pending_count(&self) -> usize {
-        let mut count = 0;
-        for slot in self.0.snapshot().expect("test registry") {
-            count += usize::from(slot.lock().await.handle.is_some());
-        }
-        count
-    }
-
-    pub async fn spawn<T: Send + 'static>(
-        &self,
-        work: impl FnOnce() -> T + Send + 'static,
-    ) -> anyhow::Result<tokio::sync::oneshot::Receiver<T>> {
-        self.0.spawn(work, None).await
-    }
-
-    pub async fn spawn_fallible<T: Send + 'static>(
-        &self,
-        work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
-    ) -> anyhow::Result<FallibleReceiver<T>> {
-        self.0.spawn_fallible(work, None).await
-    }
-
-    pub async fn join(&self) -> anyhow::Result<()> {
-        self.0.join().await
-    }
-}
+pub use test_workers::{test_registry, TestWorkers};
 
 /// Occupied registry slots: unfinished workers, overflow failures, or unacknowledged errors.
 /// Zero after server shutdown means the registry is clear for the next run.
@@ -477,7 +429,7 @@ pub async fn global_busy_count() -> usize {
 /// [`run_workers::end_run_group`].
 pub async fn join_blocking_workers() -> anyhow::Result<()> {
     #[cfg(any(test, feature = "test-seams"))]
-    if let Ok(registry) = TEST_WORKERS.try_with(Arc::clone) {
+    if let Ok(registry) = test_workers::TEST_WORKERS.try_with(Arc::clone) {
         return registry.0.join().await;
     }
     BLOCKING_WORKERS.join().await
@@ -488,7 +440,7 @@ pub async fn join_blocking_workers() -> anyhow::Result<()> {
 /// stands in for the run group, so injected workers stay observable.
 pub async fn join_run_group() -> anyhow::Result<()> {
     #[cfg(any(test, feature = "test-seams"))]
-    if let Ok(registry) = TEST_WORKERS.try_with(Arc::clone) {
+    if let Ok(registry) = test_workers::TEST_WORKERS.try_with(Arc::clone) {
         return registry.0.join().await;
     }
     run_workers::join_run_group().await
@@ -508,7 +460,7 @@ pub(crate) async fn spawn_tracked_blocking<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> anyhow::Result<tokio::sync::oneshot::Receiver<T>> {
     #[cfg(any(test, feature = "test-seams"))]
-    if let Ok(registry) = TEST_WORKERS.try_with(Arc::clone) {
+    if let Ok(registry) = test_workers::TEST_WORKERS.try_with(Arc::clone) {
         return registry.0.spawn(work, None).await;
     }
     BLOCKING_WORKERS
@@ -520,7 +472,7 @@ pub(crate) async fn run_tracked_blocking<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> anyhow::Result<T> {
     #[cfg(any(test, feature = "test-seams"))]
-    if let Ok(registry) = TEST_WORKERS.try_with(Arc::clone) {
+    if let Ok(registry) = test_workers::TEST_WORKERS.try_with(Arc::clone) {
         return registry.0.run(work).await;
     }
     BLOCKING_WORKERS.run(work).await
@@ -530,7 +482,7 @@ pub(crate) async fn spawn_blocking_with_failure<T: Send + 'static>(
     work: impl FnOnce(WorkerFailure) -> T + Send + 'static,
 ) -> anyhow::Result<tokio::sync::oneshot::Receiver<T>> {
     #[cfg(any(test, feature = "test-seams"))]
-    if let Ok(registry) = TEST_WORKERS.try_with(Arc::clone) {
+    if let Ok(registry) = test_workers::TEST_WORKERS.try_with(Arc::clone) {
         return registry.0.spawn_with_failure(work, None).await;
     }
     BLOCKING_WORKERS
@@ -538,11 +490,13 @@ pub(crate) async fn spawn_blocking_with_failure<T: Send + 'static>(
         .await
 }
 
+/// Runs blocking `work` on the fallible worker pool: the result is the
+/// worker's own `Result` (or a worker-level error), never a panic unwind.
 pub async fn run_fallible_blocking<T: Send + 'static>(
     work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
 ) -> anyhow::Result<anyhow::Result<T>> {
     #[cfg(any(test, feature = "test-seams"))]
-    if let Ok(registry) = TEST_WORKERS.try_with(Arc::clone) {
+    if let Ok(registry) = test_workers::TEST_WORKERS.try_with(Arc::clone) {
         return registry.0.run_fallible(work).await;
     }
     BLOCKING_WORKERS.run_fallible(work).await
@@ -551,7 +505,7 @@ pub(crate) async fn spawn_fallible_blocking<T: Send + 'static>(
     work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
 ) -> anyhow::Result<FallibleReceiver<T>> {
     #[cfg(any(test, feature = "test-seams"))]
-    if let Ok(registry) = TEST_WORKERS.try_with(Arc::clone) {
+    if let Ok(registry) = test_workers::TEST_WORKERS.try_with(Arc::clone) {
         return registry.0.spawn_fallible(work, None).await;
     }
     BLOCKING_WORKERS
@@ -602,7 +556,7 @@ pub(super) async fn spawn_for_admission<T: Send + 'static>(
     group: &AdmissionWorkers,
 ) -> anyhow::Result<FallibleReceiver<T>> {
     #[cfg(any(test, feature = "test-seams"))]
-    if let Ok(registry) = TEST_WORKERS.try_with(Arc::clone) {
+    if let Ok(registry) = test_workers::TEST_WORKERS.try_with(Arc::clone) {
         return registry.0.spawn_fallible(work, Some(group)).await;
     }
     BLOCKING_WORKERS.spawn_fallible(work, Some(group)).await

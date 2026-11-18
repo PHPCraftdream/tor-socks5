@@ -51,6 +51,8 @@ async fn next_discovery_event<F: Future + ?Sized>(
     }
 }
 
+/// True when the configured preferred transport has no candidate bridge,
+/// i.e. the fetched set cannot serve the preferred transport at all.
 pub fn preferred_missing(cfg: &Config, bridges: &[BridgeLine]) -> bool {
     cfg.bridges.preferred_transport().is_some_and(|transport| {
         !bridges
