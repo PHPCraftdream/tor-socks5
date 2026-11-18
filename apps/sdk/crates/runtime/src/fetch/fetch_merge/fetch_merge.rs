@@ -20,6 +20,7 @@
 //! `bridges fetch` command.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
 
@@ -701,18 +702,44 @@ pub(crate) async fn top_up_working_with_pt(
     target: usize,
     pt_binary: crate::pt::PtBinary,
 ) -> Result<usize> {
+    top_up_with(
+        cfg,
+        target,
+        |want| drain_pool(config_path, want, Some(tor), pt_binary.clone()),
+        || async move {
+            refresh_candidate_pool(tor, cfg, config_path, REFRESH_FETCH_TIMEOUT)
+                .await
+                .map(drop)
+        },
+    )
+    .await
+}
+
+/// The top-up decision logic over injectable drain and refresh legs.
+async fn top_up_with<D, DF, R, RF>(
+    cfg: &Config,
+    target: usize,
+    mut drain: D,
+    refresh: R,
+) -> Result<usize>
+where
+    D: FnMut(usize) -> DF,
+    DF: Future<Output = Result<usize>>,
+    R: FnOnce() -> RF,
+    RF: Future<Output = Result<()>>,
+{
     if target == 0 {
         return Ok(0);
     }
-    let mut promoted = drain_pool(config_path, target, Some(tor), pt_binary.clone()).await?;
+    let mut promoted = drain(target).await?;
     if promoted < target && !cfg.bridges.sources.is_empty() {
         info!(
             have = promoted,
             want = target,
             "pool short — refreshing candidates from sources over Tor"
         );
-        refresh_candidate_pool(tor, cfg, config_path, REFRESH_FETCH_TIMEOUT).await?;
-        promoted += drain_pool(config_path, target - promoted, Some(tor), pt_binary).await?;
+        refresh().await?;
+        promoted += drain(target - promoted).await?;
     }
     Ok(promoted)
 }

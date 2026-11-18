@@ -541,8 +541,8 @@ pub(crate) fn build_config(
 }
 
 /// The outcome of waiting for the `.onion` address.
-enum AddressWait {
-    Available(tor_hscrypto::pk::HsId),
+enum AddressWait<T> {
+    Available(T),
     Cancelled,
     TimedOut,
 }
@@ -554,10 +554,19 @@ async fn wait_for_address(
     service: &Arc<RunningOnionService>,
     token: &CancellationToken,
     nick: &str,
-) -> AddressWait {
+) -> AddressWait<tor_hscrypto::pk::HsId> {
+    wait_for_address_with(|| service.onion_address(), token, nick).await
+}
+
+/// The wait itself, over an injectable address source (the test seam).
+async fn wait_for_address_with<T>(
+    mut poll: impl FnMut() -> Option<T>,
+    token: &CancellationToken,
+    nick: &str,
+) -> AddressWait<T> {
     let deadline = tokio::time::Instant::now() + ADDRESS_WAIT_LIMIT;
     loop {
-        if let Some(address) = service.onion_address() {
+        if let Some(address) = poll() {
             return AddressWait::Available(address);
         }
         if tokio::time::Instant::now() >= deadline {
