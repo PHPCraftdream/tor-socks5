@@ -474,11 +474,11 @@ mod tor_branch;
 mod binding;
 
 #[cfg(test)]
-#[path = "listen/server_listen_tests.rs"]
+#[path = "listen/tests/server_listen_tests.rs"]
 mod listen_tests;
 
 #[cfg(test)]
-#[path = "listen/server_acl_tests.rs"]
+#[path = "listen/tests/server_acl_tests.rs"]
 mod acl_tests;
 #[cfg(test)]
 #[path = "listen/server_tests.rs"]

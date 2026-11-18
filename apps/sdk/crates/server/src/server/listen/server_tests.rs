@@ -716,5 +716,5 @@ fn handshake_deadline_error_is_classified_as_client() {
 #[path = "server_dual_tests.rs"]
 mod dual_port;
 
-#[path = "shutdown_tests/shutdown_tests.rs"]
+#[path = "tests/shutdown_tests.rs"]
 mod shutdown_tests;
