@@ -13,4 +13,4 @@ pub(crate) use logging::init_tracing;
 // crate (`host` module); re-exported here so callers need not know.
 pub(crate) use run::run_server_process;
 pub(crate) use signals::wait_for_signal;
-pub(crate) use tor_socks5_runtime::host::install_crypto_provider;
+pub(crate) use tor_socks5::install_crypto_provider;

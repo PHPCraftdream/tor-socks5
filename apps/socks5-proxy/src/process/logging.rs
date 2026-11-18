@@ -1,11 +1,11 @@
 //! Process-wide logging setup: a thin adapter over the relocated helpers in
-//! `tor_socks5_runtime::host::logging`, shared by the server and the
+//! `tor_socks5::runtime::log_layer`, shared by the server and the
 //! `bridges fetch` command.
 
 use tracing_appender::non_blocking::WorkerGuard;
 
 use crate::config::Config;
-use tor_socks5_runtime::arti_observability::{observation_layer, ObservationSink};
+use tor_socks5::runtime::{observation_layer, ObservationSink};
 
 /// Initialise the global tracing subscriber from the config's log
 /// settings and return the non-blocking writer's [`WorkerGuard`] plus
@@ -26,7 +26,7 @@ use tor_socks5_runtime::arti_observability::{observation_layer, ObservationSink}
 /// [`ObservationSink`] without producing
 /// any log output of its own. The proxy's maintenance loop drains the
 /// sink into the bridge health store; see
-/// tor_socks5_runtime::tor_setup::update_health_and_prune.
+/// tor_socks5::runtime (build_tor_settings) update_health_and_prune.
 ///
 /// `RUST_LOG` overrides the config file's level/target settings for the
 /// fmt layer only; the observability layer's filter is fixed.
@@ -37,7 +37,7 @@ pub(crate) fn init_tracing(cfg: &Config) -> (WorkerGuard, ObservationSink) {
     // Writer resolution, ANSI resolution, the `RUST_LOG`-over-config filter
     // and the `NO_COLOR` propagation to the PT child all live in the runtime
     // crate now (moved verbatim; see `host::logging::log_layer`).
-    let (fmt_layer, guard) = tor_socks5_runtime::host::logging::log_layer(&cfg.log);
+    let (fmt_layer, guard) = tor_socks5::runtime::log_layer(&cfg.log);
 
     // Active health observation: a per-layer filter on `tor_guardmgr=trace`
     // (independent of the user's fmt filter) feeds the observability layer

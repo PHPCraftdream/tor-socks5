@@ -1,5 +1,5 @@
 use super::*;
-use proxy_config::Socks5Endpoint;
+use tor_socks5::config::Socks5Endpoint;
 
 fn action() -> BridgesAction {
     BridgesAction::Fetch {

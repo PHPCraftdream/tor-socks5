@@ -5471,12 +5471,10 @@ name = "socks5-proxy"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "arti-wrapper",
  "bridge-fetcher",
  "clap",
  "criterion",
  "daemonize",
- "persist-lock",
  "ptrs-gesher-bridge-line",
  "rpassword",
  "rustls",
@@ -5484,8 +5482,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
- "tor-socks5-auth",
- "tor-socks5-config",
+ "tor-socks5",
  "tor-socks5-onion",
  "tor-socks5-runtime",
  "tor-socks5-server",

@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ::tor_socks5_onion::address::Keypair;
-use ::tor_socks5_onion::vanity::{
+use tor_socks5::onion::address::Keypair;
+use tor_socks5::onion::vanity::{
     estimate, expected_attempts, measure_rate, search, worker_count, SearchOptions, SearchOutcome,
     VanityTarget,
 };

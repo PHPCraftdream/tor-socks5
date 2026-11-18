@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use anyhow::Result;
 use tracing_appender::non_blocking::WorkerGuard;
 
-use tor_socks5_runtime::host::{bind_child_processes_to_self, install_crypto_provider};
+use tor_socks5::install_crypto_provider;
+use tor_socks5::runtime::bind_child_processes_to_self;
 
 use super::logging::init_tracing;
 use crate::config::{Config, Loaded};
@@ -18,7 +19,7 @@ pub(crate) struct ServerProcess {
     _log_guard: WorkerGuard,
     /// Captures per-guard usability events from arti's tracing layer for
     /// the bridge maintenance loop to drain into the health store.
-    pub(crate) obs_sink: tor_socks5_runtime::arti_observability::ObservationSink,
+    pub(crate) obs_sink: tor_socks5::runtime::ObservationSink,
 }
 
 /// Initialise the process for serving: tracing, rustls provider, Job

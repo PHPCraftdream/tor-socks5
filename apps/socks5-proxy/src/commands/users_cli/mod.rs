@@ -4,9 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use auth::{parse_pool_override, Hop, NewUser, Registry, UsersConfig};
 use clap::Subcommand;
-use persist_lock::CLI_LOCK_WAIT;
+use tor_socks5::auth::{parse_pool_override, Hop, NewUser, Registry, UsersConfig};
+use tor_socks5::persist::CLI_LOCK_WAIT;
 
 /// Test-only override (milliseconds) for the CLI lock wait; `0` uses the
 /// production [`CLI_LOCK_WAIT`]. Lets tests exercise the busy path

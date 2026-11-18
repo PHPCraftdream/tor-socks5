@@ -1,6 +1,6 @@
 use super::*;
-use auth::{compute_hash, verify_hash, User, INIT_SENTINEL};
-use proxy_config::{PoolOverride, Socks5Endpoint};
+use tor_socks5::auth::{compute_hash, verify_hash, User, INIT_SENTINEL};
+use tor_socks5::config::{PoolOverride, Socks5Endpoint};
 
 #[test]
 fn run_uses_effective_config_path() {
@@ -605,7 +605,7 @@ fn set_password_fails_with_busy_error_when_lock_is_held_too_long() {
     let rel_rx_holder = Arc::clone(&rel_rx);
     let holder_path = path.clone();
     let holder = std::thread::spawn(move || {
-        let lock = persist_lock::PathLock::acquire(&holder_path).unwrap();
+        let lock = tor_socks5::persist::PathLock::acquire(&holder_path).unwrap();
         acq_tx.send(()).ok();
         let _ = rel_rx_holder
             .lock()
