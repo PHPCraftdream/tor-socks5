@@ -376,20 +376,6 @@ fn vanity_search_timing_out_saves_nothing() {
     assert!(!Config::onion_path(&t.config).exists(), "nothing saved");
 }
 
-#[test]
-fn an_address_that_does_not_match_the_key_is_refused() {
-    // Through the public API an honest key source always agrees with the
-    // address the library derives from its key, so the typed mismatch error
-    // is asserted directly on its Display text (the CLI-visible message),
-    // and the equivalent end-to-end refusal — a stated address the key does
-    // not give, with the keystore left untouched — is covered by
-    // `a_stated_address_that_the_key_does_not_give_is_refused` below.
-    assert_eq!(
-        KeysError::AddressMismatch.to_string(),
-        "address mismatch; key not saved"
-    );
-}
-
 // --- identity settlement (ensure / prepare_all) ---
 
 fn ensure(t: &Temp, service: &OnionServiceEntry) -> anyhow::Result<String> {

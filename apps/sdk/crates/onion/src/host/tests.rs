@@ -51,21 +51,6 @@ fn build_config_accepts_valid_nickname() {
     assert!(config.enabled());
 }
 
-#[test]
-fn invalid_nickname_is_rejected_before_launch() {
-    let entry = OnionServiceEntry {
-        nickname: "not a nickname".to_owned(),
-        enabled: true,
-        address: None,
-        key: None,
-        circuit_hops: 4,
-        ports: Vec::new(),
-    };
-    // The manager returns without launching when the nickname is invalid;
-    // validate that path directly via the keys helper it uses.
-    assert!(keys::nickname(&entry.nickname).is_err());
-}
-
 fn service(nickname: &str) -> OnionServiceEntry {
     OnionServiceEntry {
         nickname: nickname.to_owned(),

@@ -120,23 +120,38 @@ async fn sdk11_server_required_dns_readiness_reports_udp_tcp_addresses() {
 /// the run is foreign to the run's worker group, so neither start nor shutdown
 /// waits for it; the run's own group workers are still joined by the producer
 /// choreography, and the process registry is drained explicitly at the end.
-async fn run_once(dir: &std::path::Path, port: u16, upstream: bool) -> (Slots, anyhow::Result<()>) {
+async fn run_once(
+    dir: &std::path::Path,
+    port: u16,
+    upstream: bool,
+) -> (Slots, anyhow::Result<()>, u16) {
     let (config_path, config) = test_config(dir, port);
     let settings = test_settings(dir);
     let handle = match start_server(config, config_path, settings, upstream).await {
         Ok(handle) => handle,
-        Err(error) => return (slots().await, Err(error.into_anyhow())),
+        Err(error) => return (slots().await, Err(error.into_anyhow()), 0),
+    };
+    let actual_port = match handle.status() {
+        ServerStatus::Running { listen_addrs } => listen_addrs[0].port(),
+        other => panic!("server did not publish Running: {other:?}"),
     };
     let running = slots().await;
-    assert_running_at(&handle, Some(port));
+    assert_running_at(&handle, (port != 0).then_some(port));
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let worker = tokio::spawn(workers::run_fallible_blocking(move || {
         let _ = release_rx.recv();
         Ok(())
     }));
-    while workers::global_busy_count().await == 0 {
-        tokio::task::yield_now().await;
-    }
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if workers::global_busy_count().await > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("parked worker must register");
 
     let status = handle.subscribe();
     // The parked worker lives in the process registry, not the run group:
@@ -154,17 +169,13 @@ async fn run_once(dir: &std::path::Path, port: u16, upstream: bool) -> (Slots, a
     workers::join_blocking_workers()
         .await
         .expect("process registry must drain after releasing the worker");
-    (running, result)
+    (running, result, actual_port)
 }
 
 async fn restart_twice(upstream: bool) {
     let _serial = TEST_LIFECYCLE.lock().await;
     let _ = rustls::crypto::ring::default_provider().install_default();
     let dir = tempfile::tempdir().unwrap();
-    let port = {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        probe.local_addr().unwrap().port()
-    };
     let quarantine = quarantine_held();
     assert_eq!(slots().await, free(quarantine), "слоты заняты до запуска");
     // Слот писателя и реестр владельцев занимает только Tor-ветка.
@@ -175,10 +186,16 @@ async fn restart_twice(upstream: bool) {
         writer: !upstream,
         ..free(quarantine)
     };
+    let mut restart_port = 0;
     tokio::time::timeout(Duration::from_secs(120), async {
         for run in 1..=2 {
-            let (running, result) = run_once(dir.path(), port, upstream).await;
+            let (running, result, actual_port) = run_once(dir.path(), restart_port, upstream).await;
+            restart_port = actual_port;
             result.unwrap_or_else(|error| panic!("запуск {run} завершился ошибкой: {error:#}"));
+            assert_ne!(
+                actual_port, 0,
+                "запуск {run}: сервер обязан сообщить фактический порт"
+            );
             assert_eq!(running, expected_running, "запуск {run}: слоты в цикле");
             assert_eq!(
                 slots().await,
@@ -703,7 +720,7 @@ async fn sdk11_server_watch_reports_starting_running_stopping_and_stopped() {
             let _ =
                 tokio::time::timeout(Duration::from_millis(500), workers::join_blocking_workers())
                     .await;
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
