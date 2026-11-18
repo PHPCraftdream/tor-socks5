@@ -3,28 +3,29 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use arti_wrapper::PostPools;
 #[cfg(test)]
 use arti_wrapper::TorTunnel;
-use auth::{AuthState, UsersConfig};
+use auth::AuthState;
 use resocks5_net::connect::HostPort;
 use resocks5_net::server::Reply;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{info, warn};
 
-use crate::config::{Config, SecurityConfig};
-use crate::dns_wiring::{convert_custom_doh_providers, convert_dns_overrides, dns_cache_path};
-use crate::route::{resolve_admitted_route, validate_account_routes, validate_post_compatibility};
+use crate::config::SecurityConfig;
+use crate::route::resolve_admitted_route;
 pub(crate) use crate::route::{RealTorConnector, TorConnector};
-use crate::startup::AuthStateVerifier;
+use crate::startup::{
+    classify_conn_failure, AuthStateVerifier, STAGE_CONNECT_TOR, STAGE_CONNECT_UPSTREAM,
+    STAGE_HANDSHAKE, STAGE_RELAY,
+};
 use crate::upstream;
 use crate::upstream::relay;
 use crate::upstream::RelayRemote::{Tor, Upstream};
@@ -56,18 +57,25 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(500);
 /// Застрявшая задача прерывается, а её дескриптор сохраняется до завершения.
 const PRODUCER_JOIN_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Предельное время ожидания фоновых производителей после отмены.
+/// Застрявшая задача прерывается, а её дескриптор сохраняется до завершения.
+/// Tor egress: the live tunnel handle plus the global proxy pools and the
+/// bookkeeping needed to route and shut down Tor-based connections.
+#[derive(Clone)]
+struct TorEgress {
+    handle: TorHandle,
+    global_pre: Option<Arc<proxy_config::ProxyPool>>,
+    global_post: Option<Arc<proxy_config::ProxyPool>>,
+    dns_enabled: bool,
+    registry: Option<Arc<owners::OwnerRegistry>>,
+    pools: Arc<PostPools>,
+}
+
 /// Where accepted connections egress. An enabled upstream SOCKS5 proxy
 /// replaces Tor entirely.
 #[derive(Clone)]
 enum Egress {
-    Tor(
-        TorHandle,
-        Option<Arc<proxy_config::ProxyPool>>,
-        Option<Arc<proxy_config::ProxyPool>>,
-        bool,
-        Option<Arc<owners::OwnerRegistry>>,
-        Arc<PostPools>,
-    ),
+    Tor(TorEgress),
     Upstream(Arc<upstream::Upstream>),
 }
 
@@ -86,628 +94,125 @@ impl Drop for HandlerRunGuard {
 }
 
 async fn run_server_inner(
-    set_stage: &mut impl FnMut(crate::api::ServerStage),
-    on_ready: &mut impl FnMut(Vec<std::net::SocketAddr>),
+    set_stage: &mut (impl FnMut(crate::api::ServerStage) + Send),
+    on_ready: &mut (impl FnMut(Vec<std::net::SocketAddr>) + Send),
     args: ServerArgs,
-    shutdown: impl std::future::Future<Output = ()>,
+    shutdown: impl std::future::Future<Output = ()> + Send,
     writer_started: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
     tor_socks5_runtime::workers::begin_run_group()?;
     let result = run_server_body(set_stage, on_ready, args, shutdown, writer_started).await;
     lifecycle::finish_run_group(result).await
 }
-
 async fn run_server_body(
-    set_stage: &mut impl FnMut(crate::api::ServerStage),
-    on_ready: &mut impl FnMut(Vec<std::net::SocketAddr>),
+    set_stage: &mut (impl FnMut(crate::api::ServerStage) + Send),
+    on_ready: &mut (impl FnMut(Vec<std::net::SocketAddr>) + Send),
     args: ServerArgs,
-    shutdown: impl std::future::Future<Output = ()>,
+    shutdown: impl std::future::Future<Output = ()> + Send,
     writer_started: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
     set_stage(crate::api::ServerStage::Recovery);
     let startup_cancellation = CancellationToken::new();
-    let shutdown = async {
-        shutdown.await;
-        startup_cancellation.cancel();
+    let shutdown = {
+        let startup_cancellation = startup_cancellation.clone();
+        async move {
+            shutdown.await;
+            startup_cancellation.cancel();
+        }
     };
     tokio::pin!(shutdown);
-    let recovery = global_init::recover_startup();
-    tokio::pin!(recovery);
-    let cancelled_during_recovery = tokio::select! {
-        biased;
-        () = &mut shutdown => { recovery.await?; true }
-        result = &mut recovery => { result?; false }
+    let ServerArgs {
+        config,
+        config_path,
+        obs_sink,
+        upstream_addr,
+        upstream_user,
+        upstream_pass,
+        no_upstream,
+        pt_binary,
+        dns_startup_policy,
+        test_hooks,
+    } = args;
+    let mut ctx = phases::RunContext {
+        handler_guard: None,
+        registry_guard: None,
+        producer_guard: None,
+        egress: None,
+        binding: None,
+        actual_addresses: Vec::new(),
+        auth_state: None,
+        owner_template: None,
+        pre_socks: None,
+        post_socks: None,
+        obs_sink,
+        upstream_addr,
+        upstream_user,
+        upstream_pass,
+        no_upstream,
+        pt_binary,
+        dns_startup_policy,
+        hooks: test_hooks,
+        cfg: config,
+        config_path,
+        set_stage,
+        on_ready,
+        writer_started,
+        startup_cancellation,
+        cancelled: false,
+        accept_loop_exited: false,
+        shutdown: shutdown.as_mut(),
     };
-    // A prior failed run may have left its writer behind. It is safe to close
-    // only after all retained owners have recovered successfully.
-    if let Some(result) = global_init::close_orphaned_store_writer().await {
-        result?;
-    }
-    producers::join_final_workers().await?;
-    if cancelled_during_recovery {
+    phases::phase_recovery(&mut ctx).await?;
+    if ctx.cancelled {
         return Ok(());
     }
-    set_stage(crate::api::ServerStage::Config);
-    let cfg = args.config;
-    let config_path = args.config_path;
-    let obs_sink = args.obs_sink;
-    let source = format!("file: {}", config_path.display());
-    let pre_socks = cfg.pre_proxies.clone().map(Arc::new);
-    validate_pre_compatibility(
-        pre_socks.is_some(),
-        cfg.dns_server.enabled,
-        cfg.onion_services.iter().any(|service| service.enabled),
-        false,
-    )?;
-    let post_socks = cfg.post_proxies.clone().map(Arc::new);
-    validate_post_compatibility(post_socks.is_some(), cfg.dns_server.enabled, false)?;
+    phases::phase_validate(&mut ctx).await?;
 
-    info!(%source, "loaded configuration");
-    crate::startup::ensure_bridges_file(&cfg, &config_path).await;
-
-    // Load the users registry (sits next to the main config). A missing file
-    // is warned about once; when absent or empty, the SOCKS5 listener falls
-    // back to the legacy NO_AUTH path.
-    let users_path = UsersConfig::resolve_path(&config_path);
-    if !users_path.exists() {
-        tracing::warn!(
-            path = %users_path.display(),
-            "no users file — SOCKS5 will accept anonymous clients"
-        );
-    }
-    let users = UsersConfig::load(&users_path).context("loading users registry")?;
-    let config_ref = &config_path;
-    tor_socks5_runtime::tor_setup::validate_owner_routes(
-        &cfg,
-        &users,
-        config_ref,
-        &args.pt_binary,
-    )?;
-    let owner_template =
-        tor_socks5_runtime::tor_setup::restricted_owner_settings(&cfg, config_ref, &args.pt_binary);
-    validate_account_routes(
-        &users,
-        cfg.pre_proxies.as_ref(),
-        cfg.post_proxies.as_ref(),
-        cfg.dns_server.enabled,
-        false,
-    )?;
-    let auth_state = if users.users.is_empty() {
-        // A missing file was already warned about above; keep the info line
-        // for an existing-but-empty registry.
-        if users_path.exists() {
-            info!(
-                path = %users_path.display(),
-                "no users configured — SOCKS5 will accept anonymous clients"
-            );
-        }
-        None
-    } else {
-        let state = AuthState::build_persistent(&users, users_path.clone())
-            .context("building auth state")?;
-        info!(
-            path = %users_path.display(),
-            users = state.len(),
-            "SOCKS5 will require USER/PASS authentication"
-        );
-        Some(Arc::new(state))
-    };
-
-    set_stage(crate::api::ServerStage::Bind);
+    (ctx.set_stage)(crate::api::ServerStage::Bind);
+    let listen = ctx.cfg.listen.clone();
+    let mut shutdown = ctx.shutdown.as_mut();
     let binding = tokio::select! {
         biased;
         () = &mut shutdown => return Ok(()),
-        result = binding::bind_listeners(&cfg.listen) => result?,
+        result = binding::bind_listeners(&listen) => result?,
     };
-    let mut actual_addresses = binding
+    let actual_addresses = binding
         .listeners
         .iter()
         .map(TcpListener::local_addr)
         .collect::<std::io::Result<Vec<_>>>()
         .context("getting bound SOCKS5 listener addresses")?;
+    ctx.binding = Some(binding);
+    ctx.actual_addresses = actual_addresses;
 
-    set_stage(crate::api::ServerStage::Config);
+    (ctx.set_stage)(crate::api::ServerStage::Config);
     // Cancellation + join plumbing for the Tor-side background producers.
     // Only the Tor egress spawns producers; the token and the collected
     // join handles stay unused (and empty) on the upstream path. Created
     // here so they outlive the egress match and are reachable from the
     // shutdown path below.
     let producer_owner = producers::ProducerTasks::retain()?;
-    let _producer_guard = producers::RunGuard(producer_owner.clone());
+    ctx.producer_guard = Some(producers::RunGuard(producer_owner.clone()));
     let producer_token = producer_owner.token();
 
-    // Resolve the egress. An enabled upstream SOCKS5 proxy (config or
-    // CLI) takes over entirely and the Tor bootstrap is skipped;
-    // otherwise we bootstrap Tor with the configured bridges as before.
-    let upstream = pick_upstream(
-        &cfg.upstream,
-        args.upstream_addr.as_deref(),
-        args.upstream_user.as_deref(),
-        args.upstream_pass.as_deref(),
-        args.no_upstream,
-    )?;
-    let mut registry_guard = None;
-    let egress = match upstream {
-        Some(up) => {
-            validate_pre_compatibility(pre_socks.is_some(), false, false, true)?;
-            validate_post_compatibility(post_socks.is_some(), false, true)?;
-            validate_account_routes(
-                &users,
-                cfg.pre_proxies.as_ref(),
-                cfg.post_proxies.as_ref(),
-                false,
-                true,
-            )?;
-            set_stage(crate::api::ServerStage::Startup);
-            warn_enabled_onion_services_with_upstream(&cfg);
-            info!(
-                upstream = %up.address(),
-                auth = up.has_auth(),
-                "egress via upstream SOCKS5 proxy — Tor is disabled"
-            );
-            Egress::Upstream(Arc::new(up))
-        }
-        None => {
-            set_stage(crate::api::ServerStage::Startup);
-            if cfg.tor.circuit_hops == 2 {
-                warn!(
-                    "tor.circuit_hops=2 reduces anonymity: onion-service circuits have no middle relay. Ordinary exit circuits stay at 3 hops. Intended for censorship circumvention, not anonymity."
-                );
-            }
-            // Vanguards are compiled out (no `vanguards` feature anywhere in the
-            // workspace), so Disabled mode is always in effect and the per-service
-            // field fully controls the server circuit length.
-            let service_circuit_hops = cfg
-                .onion_services
-                .iter()
-                .find(|svc| svc.enabled)
-                .map(|svc| svc.circuit_hops)
-                .unwrap_or(4);
-            if service_circuit_hops < 4 {
-                let chain = if service_circuit_hops == 2 {
-                    "[bridge, target] (descriptor uploads keep a middle relay)"
-                } else {
-                    "[bridge, middle, target]"
-                };
-                warn!(
-                    "onion_services.circuit_hops={service_circuit_hops} reduces anonymity: server onion circuits are {chain}. Intended for censorship circumvention, not anonymity."
-                );
-            }
-            let preparation = global_init::SettingsInit::start(
-                cfg.clone(),
-                config_path.clone(),
-                startup_cancellation.clone(),
-                args.pt_binary.clone(),
-            )?;
-            let Some(settings) = global_init::wait_startup(
-                &mut shutdown,
-                preparation.wait(),
-                global_init::stop_startup,
-            )
-            .await?
-            else {
-                return Ok(());
-            };
-            if settings.bridges.is_empty() {
-                bail!(
-                    "no bridges configured in {} — add at least one `lines: [ obfs4 ... ]` entry",
-                    Config::bridges_path(&config_path).display()
-                );
-            }
-            let alive = settings.bridges.len();
-            info!(count = alive, "using bridges");
-
-            // Recovery has successfully cleared any writer from an earlier run.
-            // Mark before init so even a panic after installing the process slot
-            // routes through this run's cleanup without closing unrelated writers.
-            writer_started.store(true, std::sync::atomic::Ordering::Release);
-            global_init::init_store_writer(&config_path);
-
-            let init = global_init::GlobalInit::start(settings.clone())?;
-            let _init_guard = global_init::InitGuard(init.clone());
-            let Some(tor) = global_init::wait_startup(&mut shutdown, init.wait(), || async {
-                init.cancel();
-                global_init::stop_startup().await?;
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-                if let Some(result) = global_init::close_store_writer(Some(deadline)).await {
-                    result?;
-                }
-                Ok(())
-            })
-            .await
-            // The input error's already-contextualized primary is retained in
-            // StartupFailure::Error; the stage is added at the lifecycle API.
-            .context("failed to bootstrap Tor")?
-            else {
-                return Ok(());
-            };
-
-            // Single indirection point for the live `TorClient`: the accept
-            // loop and the maintenance loop read the *current* tunnel
-            // through this handle, so a watchdog rebuild becomes visible to
-            // both without re-distribution. Cheap to clone (one
-            // `Arc<RwLock<_>>` + two atomics).
-            let handle = TorHandle::new_with_settings(tor, &settings);
-
-            let template = if settings.pre_endpoint.is_some() {
-                Ok(settings.clone())
-            } else {
-                owner_template
-            };
-            let owners = Arc::new(owners::OwnerRegistry::new_with_template(
-                handle.clone(),
-                settings.pre_endpoint.clone(),
-                template,
-            )?);
-            owners.retain_for_shutdown()?;
-            registry_guard = Some(RegistryRunGuard(owners.clone()));
-            init.complete_handoff()?;
-            if global_init::launch_background() {
-                let mut launch = producers::LaunchGuard::new(producer_owner.clone());
-                tor_socks5_runtime::bridge_producers::launch_producers(
-                    handle.clone(),
-                    config_path.clone(),
-                    &cfg,
-                    obs_sink.clone(),
-                    settings,
-                    args.pt_binary.clone(),
-                    producer_token.clone(),
-                    &mut launch.handles,
-                );
-
-                // Onion services from the config: one more producer (launches
-                // each enabled service, forwards its virtual ports to local
-                // targets, holds the onion keystore lock for their lifetime).
-                // Gated on the `onion-service` feature; a build without it only
-                // warns — missing support is not an error.
-                #[cfg(feature = "onion-service")]
-                crate::onion::service::spawn_services(
-                    handle.clone(),
-                    &cfg.onion_services,
-                    &config_path,
-                    producer_token.clone(),
-                    &mut launch.handles,
-                );
-                #[cfg(not(feature = "onion-service"))]
-                {
-                    let enabled = cfg
-                        .onion_services
-                        .iter()
-                        .filter(|service| service.enabled)
-                        .count();
-                    if enabled > 0 {
-                        warn!(
-                            "built without onion-service support; {enabled} onion service(s) not started"
-                        );
-                    }
-                }
-
-                launch.commit();
-            }
-            Egress::Tor(
-                handle,
-                pre_socks,
-                post_socks,
-                cfg.dns_server.enabled,
-                Some(owners),
-                Arc::new(PostPools::new()),
-            )
-        }
-    };
-
-    // Quarantined post proxies are re-checked in the background so a revived
-    // one returns to rotation; stopped by the same token as the other producers.
-    if let Egress::Tor(handle, pre, _, _, registry, pools) = &egress {
-        let tunnel_source = handle.clone();
-        producer_owner.add(arti_wrapper::spawn_post_prober(
-            pools.clone(),
-            move || {
-                let handle = tunnel_source.clone();
-                async move { handle.tunnel().await }
-            },
-            producer_token.clone(),
-        ));
-        // Pre pool members are Tor clients of their own. Those of the global
-        // pool start in the background, and quarantined ones are probed
-        // directly; both stop with the other producers.
-        if let Some(registry) = registry {
-            producer_owner.add(pre_pool::spawn_prober(
-                registry.clone(),
-                producer_token.clone(),
-            ));
-            if let Some(pool) = pre.as_deref().filter(|pool| pool.len() > 1) {
-                let members = pool.members().iter().map(crate::route::pre_endpoint);
-                if let Some(start) = registry.start_background(members.collect()).await {
-                    producer_owner.add(start);
-                }
-            }
-        }
+    phases::phase_bootstrap(&mut ctx, &producer_owner, &producer_token).await?;
+    if ctx.cancelled {
+        return Ok(());
     }
+    phases::phase_launch_producers(&mut ctx, &producer_owner, &producer_token).await;
 
-    // Optional local DNS listener (opt-in, default OFF). Every DoH exchange
-    // it performs is tunnelled through the live Tor tunnel, so the feature
-    // requires the Tor egress: behind an upstream SOCKS5 proxy the premise
-    // ("client DNS leaves the machine only inside Tor") cannot be honoured,
-    // and refusing to start beats silently leaking plaintext queries.
-    set_stage(crate::api::ServerStage::Config);
-    if cfg.dns_server.enabled {
-        let Egress::Tor(handle, _, _, _, _, _) = &egress else {
-            bail!(
-                "dns_server.enabled requires Tor egress, not an upstream SOCKS5 proxy — \
-                 disable dns_server or remove the upstream"
-            );
-        };
-        let custom = convert_custom_doh_providers(&cfg.dns_server.custom_doh_providers);
-        let pool =
-            dns_server::providers::provider_pool(&custom, cfg.dns_server.disable_builtin_providers);
-        let overrides = convert_dns_overrides(&cfg.dns_server.overrides);
-        let cache_path = dns_cache_path(&config_path);
-        let cache = Arc::new(dns_server::cache::DnsCache::load(&cache_path).await);
-        info!(
-            listen = ?cfg.dns_server.listen,
-            cache = %cache_path.display(),
-            providers = pool.len(),
-            "starting DNS-over-Tor listener"
-        );
-        // One more producer beside the bridge-upkeep tasks: cancelled and
-        // joined by the same shutdown choreography; error exit is not fatal.
-        let dns_listen = cfg.dns_server.listen.clone();
-        let dns_client_access = crate::dns_wiring::dns_client_access(&cfg);
-        let producer_handle = handle.clone();
-        let dns_token = producer_token.clone();
-        let (dns_ready_tx, mut dns_ready_rx) = match args.dns_startup_policy {
-            crate::api::DnsStartupPolicy::Required => {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                (Some(tx), Some(rx))
-            }
-            crate::api::DnsStartupPolicy::Background => (None, None),
-        };
-        producer_owner.add(tokio::spawn(async move {
-            // The inner per-call clone makes the future 'static: the closure
-            // owns its handle, and `tunnel()` snapshots the current slot so a
-            // watchdog rebuild is picked up on the next query.
-            let tunnel = move || {
-                let handle = producer_handle.clone();
-                async move { handle.tunnel().await }
-            };
-            let result = match dns_ready_tx {
-                Some(ready) => {
-                    dns_server::server::run_with_client_access_and_ready(
-                        &dns_listen,
-                        tunnel,
-                        cache,
-                        pool,
-                        overrides,
-                        cache_path,
-                        dns_token,
-                        dns_client_access,
-                        ready,
-                    )
-                    .await
-                }
-                None => {
-                    dns_server::server::run_with_client_access(
-                        &dns_listen,
-                        tunnel,
-                        cache,
-                        pool,
-                        overrides,
-                        cache_path,
-                        dns_token,
-                        dns_client_access,
-                    )
-                    .await
-                }
-            };
-            if let Err(error) = result {
-                error!(%error, "dns server exited");
-            }
-        }));
-        if let Some(mut ready) = dns_ready_rx.take() {
-            set_stage(crate::api::ServerStage::Bind);
-            let result = tokio::select! {
-                biased;
-                result = &mut ready => result,
-                () = &mut shutdown => {
-                    set_stage(crate::api::ServerStage::Cancelled);
-                    bail!("server startup cancelled");
-                }
-            };
-            let dns_addresses = result
-                .map_err(|_| anyhow!("DNS listener exited before reporting startup readiness"))??;
-            actual_addresses.extend(dns_addresses);
-        }
+    (ctx.set_stage)(crate::api::ServerStage::Config);
+    if ctx.cfg.dns_server.enabled {
+        phases::phase_dns(&mut ctx, &producer_owner, &producer_token).await?;
     }
-
-    set_stage(crate::api::ServerStage::Startup);
-    // Periodic connection-health summary: drains a rolling window of
-    // accept-loop counters (attempts, established, errors by kind) into one
-    // structured log line per interval. Pure observation — wired for both
-    // the Tor and upstream egress paths alike. Enabled by default (unlike
-    // `warm_pool`), since it changes nothing about live traffic.
-    let conn_health = ConnHealthCounters::default();
-    producer_owner.add(tokio::spawn(
-        tor_socks5_runtime::conn_health::run_conn_health_logger(
-            conn_health.clone(),
-            cfg.conn_health,
-            producer_token.child_token(),
-        ),
-    ));
-
-    // Skip only local availability failures, visibly; fail fast if none bind
-    // or an unexpected error occurs. Every successful listener shares admission.
-    let retry_addresses = binding
-        .skipped
-        .iter()
-        .filter(|skipped| skipped.error.kind() == std::io::ErrorKind::AddrNotAvailable)
-        .map(|skipped| skipped.address.clone())
-        .collect::<Vec<_>>();
-    let listeners = binding.listeners;
-
-    // One accept loop per listener, polled concurrently. The futures are
-    // kept on this task (FuturesUnordered) rather than spawned per
-    // address: on shutdown the `() = shutdown` branch wins the select and
-    // the whole FuturesUnordered is dropped, dropping every accept loop —
-    // and with it its `TcpListener`, so new accepts stop immediately.
-    // Detached spawned loops would keep accepting through teardown and
-    // need explicit aborts. Every loop runs forever, so `next()` can only
-    // ever complete via shutdown, never `None`.
-    use futures::StreamExt;
-    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
-    // Shared across all listeners so log-correlation conn_ids stay unique.
-    let tracking = handlers::ConnectionTracking {
-        conn_health,
-        next_conn_id: Arc::new(AtomicU64::new(1)),
-    };
-    let handlers = Arc::new(handlers::HandlerTasks::new());
-    handlers.retain()?;
-    let _handler_guard = HandlerRunGuard(handlers.clone());
-    let mut handler_reap = tokio::time::interval(Duration::from_secs(1));
-    let mut accept_loops = futures::stream::FuturesUnordered::new();
-    for listener in listeners {
-        accept_loops.push(accept_loop_future(
-            handlers.clone(),
-            listener,
-            egress.clone(),
-            auth_state.clone(),
-            permits.clone(),
-            tracking.clone(),
-            cfg.security.clone(),
-        ));
-    }
-    let mut retries = retry_addresses
-        .into_iter()
-        .map(|address| binding::retry::retry_address_with(address, TcpListener::bind))
-        .collect::<futures::stream::FuturesUnordered<_>>();
-
-    set_stage(crate::api::ServerStage::Runtime);
-    global_init::server_ready();
-    on_ready(actual_addresses.clone());
-    let mut accept_loop_exited = false;
-    loop {
-        tokio::select! {
-            biased;
-            () = &mut shutdown => break,
-            _ = handler_reap.tick() => handlers.reap().await,
-            _ = accept_loops.next(), if !accept_loops.is_empty() => {
-                accept_loop_exited = true;
-                warn!("accept loop exited unexpectedly");
-                break;
-            }
-            recovered = retries.next(), if !retries.is_empty() => {
-                if let Some((address, listener)) = recovered {
-                    info!(listen_addr = %address, "SOCKS5 proxy listener recovered");
-                    if let Ok(local_addr) = listener.local_addr() {
-                        if !actual_addresses.contains(&local_addr) {
-                            actual_addresses.push(local_addr);
-                            on_ready(actual_addresses.clone());
-                        }
-                    }
-                    accept_loops.push(accept_loop_future(
-                        handlers.clone(),
-                        listener,
-                        egress.clone(),
-                        auth_state.clone(),
-                        permits.clone(),
-                        tracking.clone(),
-                        cfg.security.clone(),
-                    ));
-                }
-            }
-        }
-    }
-    drop(retries);
-    drop(accept_loops);
-    if let Some(guard) = &registry_guard {
-        guard.0.begin_close();
-    }
-    let mut shutdown_errors = producers::ProducerFailures::default();
-    if let Err(error) = handlers.shutdown().await {
-        shutdown_errors.push(error);
-    }
-    // Keep each tunnel rooted until its PT shutdown receipt is observed.
-    // A failed receipt leaves the registry available for recovery.
-    if let Egress::Tor(handle, _, _, _, _, _) = egress {
-        info!("stopping Tor client and pluggable transports");
-        // Join producers before shutting down their shared PT owner.
-        producer_owner.cancel();
-        if let Err(error) = producer_owner.join(PRODUCER_JOIN_TIMEOUT).await {
-            warn!(%error, "producer graceful shutdown failed; aborting");
-            shutdown_errors.push(error);
-            producer_owner.abort();
-            if let Err(error) = producer_owner.join(Duration::from_secs(5)).await {
-                shutdown_errors.push(error);
-            }
-        }
-        let mut registry_closed = true;
-        if let Some(guard) = &registry_guard {
-            if let Err(error) = guard
-                .0
-                .close_with_deadline(tokio::time::Instant::now() + Duration::from_secs(5))
-                .await
-            {
-                registry_closed = false;
-                shutdown_errors.push(error);
-            }
-        }
-        if registry_closed {
-            drop(handle.drain().await);
-        }
-        // Give arti's reactor a brief moment to flush the shutdown.
-        // Empirically this is enough for the state-dir lock to be released
-        // before the next run starts. No longer needed for writer ordering
-        // (the join above now guarantees the producers finished), but kept
-        // for the arti/PT teardown it was introduced for.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        // Wait for the writer last: flush any retained snapshot and join
-        // its actor task, so a publish that only recovered after the last
-        // mutation is not silently lost when the runtime tears down. With
-        // Writer закрывается после ограниченного ожидания производителей.
-        // Close is bounded: on timeout the writer stays retained in its
-        // closing slot and late flushes still land.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        if let Some(Err(error)) = global_init::close_store_writer(Some(deadline)).await {
-            warn!(error = %error, "bridge health store had unpublished updates at shutdown");
-            shutdown_errors.push(error);
-        }
-        if let Err(error) = producers::join_final_workers().await {
-            shutdown_errors.push(error);
-        }
-    } else {
-        producer_owner.cancel();
-        if let Err(error) = producer_owner.join(Duration::from_secs(5)).await {
-            shutdown_errors.push(error);
-        }
-    }
-    let shutdown_result = shutdown_errors.into_result();
-    if accept_loop_exited {
-        return Err(match shutdown_result {
-            Ok(()) => anyhow!("accept loop exited unexpectedly"),
-            Err(cleanup) => cleanup.context("accept loop exited unexpectedly"),
-        });
-    }
-    shutdown_result?;
-    info!("bye");
-    Ok(())
+    let handlers = phases::phase_serve(&mut ctx, &producer_owner, &producer_token).await?;
+    phases::phase_shutdown(&mut ctx, &producer_owner, &handlers).await
 }
 
-// Логика выбора upstream-egress ("CLI поверх конфига") живёт в своём
-// модуле; реэкспорт сохраняет существующие вызовы и видимость через `super::*`.
-use crate::upstream::pick_upstream;
-
-use crate::startup::{
-    classify_conn_failure, validate_pre_compatibility, warn_enabled_onion_services_with_upstream,
-    STAGE_CONNECT_TOR, STAGE_CONNECT_UPSTREAM, STAGE_HANDSHAKE, STAGE_RELAY,
-};
 #[cfg(test)]
 pub(crate) use tor_socks5_runtime::conn_health::{ConnErrorKind, ConnStage};
 
-#[cfg(test)]
-tokio::task_local! {
-    static FORCE_ACCEPT_LOOP_EXIT: bool;
-}
-
+#[allow(clippy::too_many_arguments)]
 fn accept_loop_future(
     handlers: Arc<handlers::HandlerTasks>,
     listener: TcpListener,
@@ -716,12 +221,9 @@ fn accept_loop_future(
     permits: Arc<tokio::sync::Semaphore>,
     tracking: handlers::ConnectionTracking,
     security: SecurityConfig,
+    force_exit: bool,
 ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-    #[cfg(test)]
-    if FORCE_ACCEPT_LOOP_EXIT
-        .try_with(|force| *force)
-        .unwrap_or(false)
-    {
+    if force_exit {
         return Box::pin(async {});
     }
     Box::pin(handlers.accept_loop_tracked(listener, egress, auth, permits, tracking, security))
@@ -738,7 +240,7 @@ async fn handle_client(
     conn_id: u64,
 ) -> Result<()> {
     let pools = match &egress {
-        Egress::Tor(_, _, _, _, _, pools) => Arc::clone(pools),
+        Egress::Tor(tor) => Arc::clone(&tor.pools),
         Egress::Upstream(_) => Arc::new(PostPools::new()),
     };
     handle_client_with_connector(
@@ -826,7 +328,12 @@ async fn handle_client_with_connector<C: TorConnector + Send>(
         return Ok(());
     }
     let (global_pre, global_post, dns, upstream) = match &egress {
-        Egress::Tor(_, pre, post, dns, _, _) => (pre.as_deref(), post.as_deref(), *dns, false),
+        Egress::Tor(tor) => (
+            tor.global_pre.as_deref(),
+            tor.global_post.as_deref(),
+            tor.dns_enabled,
+            false,
+        ),
         Egress::Upstream(_) => (None, None, false, true),
     };
     let route = match resolve_admitted_route(global_pre, global_post, lease.as_ref(), dns, upstream)
@@ -841,10 +348,10 @@ async fn handle_client_with_connector<C: TorConnector + Send>(
     };
 
     match &egress {
-        Egress::Tor(handle, _, _, _, registry, _) => {
+        Egress::Tor(tor) => {
             let leg = tor_branch::TorLeg {
-                handle,
-                registry: registry.as_ref(),
+                handle: &tor.handle,
+                registry: tor.registry.as_ref(),
                 global_pre,
                 pre: route.pre.as_ref(),
                 post: route.post.as_ref(),
@@ -940,6 +447,9 @@ async fn handle_client_with_connector<C: TorConnector + Send>(
     Ok(())
 }
 
+#[path = "phases.rs"]
+mod phases;
+
 #[path = "../tor/tor_watchdog/owners/producers.rs"]
 mod producers;
 
@@ -976,9 +486,7 @@ mod tests;
 
 #[path = "lifecycle.rs"]
 mod lifecycle;
+pub(crate) use global_init::TestRunHooks;
+#[cfg(test)]
+pub(crate) use lifecycle::run_server;
 pub(crate) use lifecycle::{cleanup_failed_run, run_server_with_callbacks, ServerArgs};
-#[cfg(test)]
-pub(crate) use lifecycle::{run_server, scope_run_server_task_locals};
-
-#[cfg(test)]
-use crate::startup::onion_permitted;

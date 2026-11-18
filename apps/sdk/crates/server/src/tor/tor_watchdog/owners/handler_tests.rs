@@ -62,11 +62,16 @@ async fn run_server_reports_final_flush_worker_panic() {
                 // startup join can see it as an unacknowledged worker failure.
                 let _ = registry.join().await;
                 let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-                let hook = Arc::new(super::super::global_init::ShutdownHook {
-                    settings,
-                    writer: Some(writer),
-                    failure: None,
-                    ready: std::sync::Mutex::new(Some(ready_tx)),
+                let hooks = Arc::new(super::super::global_init::TestRunHooks {
+                    startup: None,
+                    shutdown: Some(super::super::global_init::ShutdownHooks {
+                        settings,
+                        writer: Some(writer),
+                        failure: None,
+                        ready: std::sync::Mutex::new(Some(ready_tx)),
+                        launch_background: false,
+                    }),
+                    force_accept_loop_exit: false,
                 });
                 let (_config_path, config) =
                     match crate::config::Config::load_with_override(Some(&path)).unwrap() {
@@ -84,14 +89,15 @@ async fn run_server_reports_final_flush_worker_panic() {
                     no_upstream: false,
                     pt_binary: tor_socks5_runtime::pt::PtBinary::Environment,
                     dns_startup_policy: crate::api::DnsStartupPolicy::Required,
+                    test_hooks: Some(hooks),
                 };
                 let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-                let server = super::super::global_init::RUN_SERVER_SHUTDOWN.scope(hook, async {
+                let server = async {
                     super::super::run_server(args, async {
                         let _ = shutdown_rx.await;
                     })
                     .await
-                });
+                };
                 let trigger = async {
                     let reached = ready_rx.await.is_ok();
                     if reached {
@@ -161,11 +167,15 @@ async fn parked_server_startup(global: bool) {
     };
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let hook = Arc::new(super::super::global_init::StartupHook {
-        settings,
-        park_global: global,
-        gate: std::sync::Mutex::new(Some((entered_tx, release_rx))),
-        async_gate: std::sync::Mutex::new(None),
+    let hooks = Arc::new(super::super::global_init::TestRunHooks {
+        startup: Some(super::super::global_init::StartupHooks {
+            settings,
+            park_global: global,
+            gate: std::sync::Mutex::new(Some((entered_tx, release_rx))),
+            async_gate: std::sync::Mutex::new(None),
+        }),
+        shutdown: None,
+        force_accept_loop_exit: false,
     });
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let config_path = path.clone();
@@ -184,19 +194,19 @@ async fn parked_server_startup(global: bool) {
         no_upstream: false,
         pt_binary: tor_socks5_runtime::pt::PtBinary::Environment,
         dns_startup_policy: crate::api::DnsStartupPolicy::Required,
+        test_hooks: Some(hooks),
     };
-    let mut server = AbortOnDrop(tokio::spawn(
-        super::super::global_init::RUN_SERVER_STARTUP.scope(hook, async move {
-            super::super::run_server(args, async {
-                let _ = shutdown_rx.await;
-            })
-            .await
-        }),
-    ));
+    let mut server = AbortOnDrop(tokio::spawn(async move {
+        super::super::run_server(args, async {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    }));
     let entered = tokio::time::timeout(Duration::from_secs(10), entered_rx).await;
     let _ = shutdown_tx.send(());
     let result = tokio::time::timeout(Duration::from_secs(2), &mut server.0).await;
-    let snapshot = super::super::global_init::startup_snapshot(global);
+    let retained = super::super::global_init::startup_retained(global);
+    let global_cancelled = global && super::super::global_init::global_cancelled();
     if result.is_err() {
         server.0.abort();
         let _ = (&mut server.0).await;
@@ -219,12 +229,15 @@ async fn parked_server_startup(global: bool) {
         super::super::global_init::StartupPrimary::Cancelled
     ));
     assert!(failure.cleanup_error().is_some());
-    assert!(snapshot.0, "корень незавершённой задачи потерян");
+    assert!(retained, "корень незавершённой задачи потерян");
     if global {
-        assert!(snapshot.1, "запуск Tor не отменён");
+        assert!(global_cancelled, "запуск Tor не отменён");
     }
     recovery.unwrap();
-    assert!(!super::super::global_init::startup_snapshot(global).0);
+    assert!(
+        !super::super::global_init::startup_retained(global),
+        "startup registry must be clean after recovery"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -270,7 +283,14 @@ async fn tracked_handler_shutdown_joins_pending_owner_constructor() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let mut accept = AbortOnDrop(tokio::spawn(handlers.clone().accept_loop_tracked(
-            listener, Egress::Tor(handle, None, None, false, Some(registry.clone()), Arc::new(arti_wrapper::PostPools::new())),
+            listener, Egress::Tor(super::super::TorEgress {
+                handle,
+                global_pre: None,
+                global_post: None,
+                dns_enabled: false,
+                registry: Some(registry.clone()),
+                pools: Arc::new(arti_wrapper::PostPools::new()),
+            }),
             Some(auth), permits.clone(), super::super::handlers::ConnectionTracking {
                 conn_health: ConnHealthCounters::default(),
                 next_conn_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
@@ -392,14 +412,14 @@ async fn request(
         .unwrap();
     let mut handler = AbortOnDrop(tokio::spawn(handle_client_with_connector(
         server,
-        Egress::Tor(
+        Egress::Tor(super::super::TorEgress {
             handle,
-            global_pre.map(Arc::new),
-            None,
-            false,
-            Some(registry),
-            Arc::new(arti_wrapper::PostPools::new()),
-        ),
+            global_pre: global_pre.map(Arc::new),
+            global_post: None,
+            dns_enabled: false,
+            registry: Some(registry),
+            pools: Arc::new(arti_wrapper::PostPools::new()),
+        }),
         Some(auth),
         ConnHealthCounters::default(),
         false,
@@ -742,14 +762,14 @@ async fn start_handler<C: TorConnector + Send + 'static>(
         .unwrap();
     let handler = AbortOnDrop(tokio::spawn(handle_client_with_connector(
         server,
-        Egress::Tor(
+        Egress::Tor(super::super::TorEgress {
             handle,
-            None,
-            None,
-            false,
-            Some(registry),
-            Arc::new(arti_wrapper::PostPools::new()),
-        ),
+            global_pre: None,
+            global_post: None,
+            dns_enabled: false,
+            registry: Some(registry),
+            pools: Arc::new(arti_wrapper::PostPools::new()),
+        }),
         Some(auth),
         ConnHealthCounters::default(),
         false,

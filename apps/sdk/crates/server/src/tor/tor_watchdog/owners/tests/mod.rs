@@ -472,8 +472,8 @@ struct Slots {
 
 async fn slots() -> Slots {
     Slots {
-        settings: global_init::startup_snapshot(false).0,
-        global_init: global_init::startup_snapshot(true).0,
+        settings: global_init::settings_retained(),
+        global_init: global_init::global_retained(),
         producers: producers::ProducerTasks::is_retained(),
         handlers: HandlerTasks::retained().is_some(),
         registry: OwnerRegistry::is_retained(),
@@ -554,12 +554,17 @@ fn test_settings(dir: &std::path::Path) -> Settings {
 fn shutdown_hook(
     settings: Settings,
     failure: Option<global_init::BootstrapFailure>,
-) -> Arc<global_init::ShutdownHook> {
-    Arc::new(global_init::ShutdownHook {
-        settings,
-        writer: None,
-        failure,
-        ready: std::sync::Mutex::new(None),
+) -> Arc<global_init::TestRunHooks> {
+    Arc::new(global_init::TestRunHooks {
+        startup: None,
+        shutdown: Some(global_init::ShutdownHooks {
+            settings,
+            writer: None,
+            failure,
+            ready: std::sync::Mutex::new(None),
+            launch_background: false,
+        }),
+        force_accept_loop_exit: false,
     })
 }
 
@@ -581,11 +586,9 @@ async fn start_server(
     settings: Settings,
     upstream: bool,
 ) -> std::result::Result<crate::ServerHandle, ServerError> {
-    global_init::RUN_SERVER_SHUTDOWN
-        .scope(
-            shutdown_hook(settings, None),
-            builder(config, config_path, upstream).start(),
-        )
+    builder(config, config_path, upstream)
+        .test_hooks(shutdown_hook(settings, None))
+        .start()
         .await
 }
 

@@ -19,6 +19,9 @@ pub(crate) struct ServerArgs {
     pub no_upstream: bool,
     pub pt_binary: tor_socks5_runtime::pt::PtBinary,
     pub dns_startup_policy: DnsStartupPolicy,
+    /// Injectable test seam; always `None` outside test builds (the hook
+    /// type is an empty struct there), so production behaviour is unchanged.
+    pub test_hooks: Option<Arc<super::global_init::TestRunHooks>>,
 }
 
 /// Run the proxy until `shutdown` resolves. The stop future is supplied by
@@ -27,7 +30,7 @@ pub(crate) struct ServerArgs {
 #[cfg(test)]
 pub(crate) async fn run_server(
     args: ServerArgs,
-    shutdown: impl std::future::Future<Output = ()>,
+    shutdown: impl std::future::Future<Output = ()> + Send,
 ) -> Result<()> {
     let writer_started = AtomicBool::new(false);
     super::run_server_inner(&mut |_| {}, &mut |_| {}, args, shutdown, &writer_started).await
@@ -44,11 +47,12 @@ static CLEANUP_FAILED_RUN_STARTED: std::sync::Mutex<Option<tokio::sync::oneshot:
 
 pub(crate) async fn run_server_with_callbacks(
     args: ServerArgs,
-    shutdown: impl std::future::Future<Output = ()>,
-    mut set_stage: impl FnMut(crate::api::ServerStage),
-    mut on_ready: impl FnMut(Vec<std::net::SocketAddr>),
+    shutdown: impl std::future::Future<Output = ()> + Send,
+    mut set_stage: impl FnMut(crate::api::ServerStage) + Send,
+    mut on_ready: impl FnMut(Vec<std::net::SocketAddr>) + Send,
     writer_started: Arc<AtomicBool>,
 ) -> std::result::Result<(), RunFailure> {
+    let hooks = args.test_hooks.clone();
     let result = super::run_server_inner(
         &mut set_stage,
         &mut on_ready,
@@ -63,9 +67,10 @@ pub(crate) async fn run_server_with_callbacks(
         if let Some(stage) = startup_stage {
             set_stage(stage);
         }
-        let run_cleanup = cleanup_failed_run(writer_started.load(Ordering::Acquire))
-            .await
-            .err();
+        let run_cleanup =
+            cleanup_failed_run(writer_started.load(Ordering::Acquire), hooks.as_deref())
+                .await
+                .err();
         let cleanup = combine_cleanup_errors(startup_cleanup, run_cleanup);
         return Err(RunFailure { primary, cleanup });
     }
@@ -145,7 +150,10 @@ pub(crate) async fn finish_run_group(result: Result<()>) -> Result<()> {
     }
 }
 
-pub(crate) async fn cleanup_failed_run(writer_started: bool) -> Result<()> {
+pub(crate) async fn cleanup_failed_run(
+    writer_started: bool,
+    hooks: Option<&global_init::TestRunHooks>,
+) -> Result<()> {
     #[cfg(test)]
     if let Some(notice) = CLEANUP_FAILED_RUN_STARTED
         .lock()
@@ -161,7 +169,9 @@ pub(crate) async fn cleanup_failed_run(writer_started: bool) -> Result<()> {
     }
     if writer_started {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        if let Some(Err(error)) = super::global_init::close_store_writer(Some(deadline)).await {
+        if let Some(Err(error)) =
+            super::global_init::close_store_writer(Some(deadline), hooks).await
+        {
             failures.push(error);
         }
     }
@@ -179,58 +189,29 @@ pub(crate) async fn cleanup_failed_run(writer_started: bool) -> Result<()> {
 }
 
 #[cfg(test)]
-pub(crate) fn scope_run_server_task_locals<F>(
-    future: F,
-) -> impl std::future::Future<Output = F::Output>
-where
-    F: std::future::Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    let startup = super::global_init::RUN_SERVER_STARTUP
-        .try_with(Arc::clone)
-        .ok();
-    let shutdown = super::global_init::RUN_SERVER_SHUTDOWN
-        .try_with(Arc::clone)
-        .ok();
-    async move {
-        match (startup, shutdown) {
-            (Some(startup), Some(shutdown)) => {
-                super::global_init::RUN_SERVER_STARTUP
-                    .scope(
-                        startup,
-                        super::global_init::RUN_SERVER_SHUTDOWN.scope(shutdown, future),
-                    )
-                    .await
-            }
-            (Some(startup), None) => {
-                super::global_init::RUN_SERVER_STARTUP
-                    .scope(startup, future)
-                    .await
-            }
-            (None, Some(shutdown)) => {
-                super::global_init::RUN_SERVER_SHUTDOWN
-                    .scope(shutdown, future)
-                    .await
-            }
-            (None, None) => future.await,
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::global_init::{ShutdownHooks, StartupHooks, TestRunHooks};
 
-    fn test_shutdown_hook() -> Arc<global_init::ShutdownHook> {
-        Arc::new(global_init::ShutdownHook {
-            settings: arti_wrapper::Settings::default(),
-            writer: None,
-            failure: None,
-            ready: std::sync::Mutex::new(None),
+    fn shutdown_hooks(force_accept_loop_exit: bool) -> Arc<TestRunHooks> {
+        Arc::new(TestRunHooks {
+            startup: None,
+            shutdown: Some(ShutdownHooks {
+                settings: arti_wrapper::Settings::default(),
+                writer: None,
+                failure: None,
+                ready: std::sync::Mutex::new(None),
+                launch_background: false,
+            }),
+            force_accept_loop_exit,
         })
     }
 
-    fn test_args(config: crate::config::Config, config_path: std::path::PathBuf) -> ServerArgs {
+    fn test_args(
+        config: crate::config::Config,
+        config_path: std::path::PathBuf,
+        test_hooks: Option<Arc<TestRunHooks>>,
+    ) -> ServerArgs {
         ServerArgs {
             config,
             config_path,
@@ -241,6 +222,7 @@ mod tests {
             no_upstream: false,
             pt_binary: tor_socks5_runtime::pt::PtBinary::Environment,
             dns_startup_policy: DnsStartupPolicy::Required,
+            test_hooks,
         }
     }
 
@@ -259,23 +241,16 @@ mod tests {
         let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ready_callback = ready.clone();
         let writer_started = Arc::new(AtomicBool::new(false));
-        let result = global_init::RUN_SERVER_SHUTDOWN
-            .scope(
-                test_shutdown_hook(),
-                super::super::FORCE_ACCEPT_LOOP_EXIT.scope(
-                    true,
-                    run_server_with_callbacks(
-                        test_args(config, config_path),
-                        std::future::pending(),
-                        move |stage| {
-                            stage_tx.send_replace(stage);
-                        },
-                        move |_| ready_callback.store(true, Ordering::Release),
-                        writer_started,
-                    ),
-                ),
-            )
-            .await;
+        let result = run_server_with_callbacks(
+            test_args(config, config_path, Some(shutdown_hooks(true))),
+            std::future::pending(),
+            move |stage| {
+                stage_tx.send_replace(stage);
+            },
+            move |_| ready_callback.store(true, Ordering::Release),
+            writer_started,
+        )
+        .await;
         let failure = result.expect_err("unexpected accept exit must fail the run");
         assert!(
             ready.load(Ordering::Acquire),
@@ -304,11 +279,21 @@ mod tests {
         };
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let hook = Arc::new(global_init::StartupHook {
-            settings,
-            park_global,
-            gate: std::sync::Mutex::new(Some((entered_tx, release_rx))),
-            async_gate: std::sync::Mutex::new(None),
+        let hooks = Arc::new(TestRunHooks {
+            startup: Some(StartupHooks {
+                settings,
+                park_global,
+                gate: std::sync::Mutex::new(Some((entered_tx, release_rx))),
+                async_gate: std::sync::Mutex::new(None),
+            }),
+            shutdown: Some(ShutdownHooks {
+                settings: arti_wrapper::Settings::default(),
+                writer: None,
+                failure: None,
+                ready: std::sync::Mutex::new(None),
+                launch_background: false,
+            }),
+            force_accept_loop_exit: false,
         });
         let parent = tokio_util::sync::CancellationToken::new();
         let builder = crate::Server::builder(crate::config::Config {
@@ -316,16 +301,13 @@ mod tests {
             ..Default::default()
         })
         .config_path(dir.path().join("server.ktav"))
-        .cancellation_token(parent.clone());
+        .cancellation_token(parent.clone())
+        .test_hooks(hooks);
         let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel();
         *CLEANUP_FAILED_RUN_STARTED
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(cleanup_tx);
-        let shutdown = test_shutdown_hook();
-        let mut start = Box::pin(global_init::RUN_SERVER_STARTUP.scope(
-            hook,
-            global_init::RUN_SERVER_SHUTDOWN.scope(shutdown, builder.start()),
-        ));
+        let mut start = Box::pin(builder.start());
         tokio::select! {
             entered = entered_rx => entered.expect("startup stage entered"),
             result = &mut start => panic!("startup unexpectedly completed before its gate: {}", match result { Ok(_) => "Ok(handle)".to_owned(), Err(error) => format!("Err({error})") }),

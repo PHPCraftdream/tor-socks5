@@ -1,8 +1,10 @@
 //! H11 acceptance: the server's PT policy reaches the production settings
 //! builders (`restricted_owner_settings` for the owner template and
 //! `build_tor_settings_with_pt` inside `SettingsInit`). The network stages
-//! of startup are parked by the `RUN_SERVER_STARTUP` gate, so this is not an
-//! end-to-end Tor test — but the settings resolutions observed here run the
+//! of startup are parked by the injectable `TestRunHooks` seam: the test
+//! installs a `StartupHooks` gate (via `test_hooks`) that parks `run_server`
+//! after the settings are resolved and waits for the test's release signal, so
+//! this is not an end-to-end Tor test — but the settings resolutions observed here run the
 //! real production code paths.
 
 use super::*;
@@ -18,7 +20,8 @@ impl<T> Drop for AbortOnDrop<T> {
 }
 
 /// Runs the real `run_server` startup with the settings stage parked by the
-/// `RUN_SERVER_STARTUP` gate and asserts the SDK14 PT observer saw `expected`
+/// `StartupHooks` gate installed through `test_hooks` (`TestRunHooks`) and
+/// asserts the SDK14 PT observer saw `expected`
 /// resolved under the given policy before the gate was reached.
 async fn parked_startup_reports_pt(pt: tor_socks5_runtime::pt::PtBinary) {
     let _serial = TEST_LIFECYCLE.lock().await;
@@ -53,11 +56,15 @@ async fn parked_startup_reports_pt(pt: tor_socks5_runtime::pt::PtBinary) {
     };
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let hook = Arc::new(global_init::StartupHook {
-        settings,
-        park_global: false,
-        gate: std::sync::Mutex::new(Some((entered_tx, release_rx))),
-        async_gate: std::sync::Mutex::new(None),
+    let hooks = Arc::new(global_init::TestRunHooks {
+        startup: Some(global_init::StartupHooks {
+            settings,
+            park_global: false,
+            gate: std::sync::Mutex::new(Some((entered_tx, release_rx))),
+            async_gate: std::sync::Mutex::new(None),
+        }),
+        shutdown: None,
+        force_accept_loop_exit: false,
     });
     // The config is passed in memory; the path only anchors the users-registry
     // resolution. The template stage must be constructible from it — this is
@@ -73,36 +80,33 @@ async fn parked_startup_reports_pt(pt: tor_socks5_runtime::pt::PtBinary) {
         "the parked template config must resolve a PT binary: {:?}",
         template.err()
     );
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let args = ServerArgs {
-        config: cfg,
-        config_path: config_path.clone(),
-        obs_sink: tor_socks5_runtime::arti_observability::ObservationSink::new(),
-        upstream_addr: None,
-        upstream_user: None,
-        upstream_pass: None,
-        no_upstream: false,
-        pt_binary: pt,
-        dns_startup_policy: crate::api::DnsStartupPolicy::Required,
-    };
-    let expected = match &args.pt_binary {
+    let expected = match &pt {
         tor_socks5_runtime::pt::PtBinary::Explicit(path) => path.clone(),
         tor_socks5_runtime::pt::PtBinary::Environment => std::env::current_exe().unwrap(),
     };
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let (pt_tx, mut pt_rx) = tokio::sync::mpsc::channel(8);
-    let mut server = AbortOnDrop(tokio::spawn(global_init::RUN_SERVER_STARTUP.scope(
-        hook,
-        async move {
-            tor_socks5_runtime::test_seams::sdk14_pt_scope("server", pt_tx, async move {
-                run_server(args, async {
-                    let _ = shutdown_rx.await;
-                })
-                .await
+    let mut server = AbortOnDrop(tokio::spawn(async move {
+        let args = ServerArgs {
+            config: cfg,
+            config_path,
+            obs_sink: tor_socks5_runtime::arti_observability::ObservationSink::new(),
+            upstream_addr: None,
+            upstream_user: None,
+            upstream_pass: None,
+            no_upstream: false,
+            pt_binary: pt,
+            dns_startup_policy: crate::api::DnsStartupPolicy::Required,
+            test_hooks: Some(hooks),
+        };
+        tor_socks5_runtime::test_seams::sdk14_pt_scope("server", pt_tx, async move {
+            run_server(args, async {
+                let _ = shutdown_rx.await;
             })
             .await
-        },
-    )));
+        })
+        .await
+    }));
     let entered = tokio::time::timeout(Duration::from_secs(10), entered_rx).await;
     assert!(
         matches!(entered, Ok(Ok(()))),
@@ -127,7 +131,7 @@ async fn parked_startup_reports_pt(pt: tor_socks5_runtime::pt::PtBinary) {
     let _ = release_tx.send(());
     global_init::recover_startup().await.unwrap();
     assert!(
-        !global_init::startup_snapshot(false).0,
+        !global_init::settings_retained(),
         "startup registry must be clean after recovery"
     );
 }

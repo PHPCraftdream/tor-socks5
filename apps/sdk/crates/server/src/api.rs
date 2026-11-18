@@ -213,6 +213,7 @@ impl Server {
             pt_binary: PtBinary::default(),
             dns_startup_policy: DnsStartupPolicy::default(),
             cancellation_token: CancellationToken::new(),
+            test_hooks: None,
             status,
             status_rx,
         }
@@ -231,6 +232,8 @@ pub struct ServerBuilder {
     pt_binary: PtBinary,
     dns_startup_policy: DnsStartupPolicy,
     cancellation_token: CancellationToken,
+    /// Test-only seam (`ServerBuilder::test_hooks`); never set in production.
+    test_hooks: Option<std::sync::Arc<crate::server::TestRunHooks>>,
     status: watch::Sender<ServerStatus>,
     status_rx: watch::Receiver<ServerStatus>,
 }
@@ -302,6 +305,14 @@ impl ServerBuilder {
     /// shutdown and handle drop do not cancel this caller-owned token.
     pub fn cancellation_token(mut self, token: CancellationToken) -> Self {
         self.cancellation_token = token;
+        self
+    }
+
+    /// Test-only: inject the run hooks (fake Tor settings, injected store
+    /// writer, forced accept-loop exit). Invisible outside test builds.
+    #[cfg(test)]
+    pub(crate) fn test_hooks(mut self, hooks: std::sync::Arc<crate::server::TestRunHooks>) -> Self {
+        self.test_hooks = Some(hooks);
         self
     }
 
@@ -444,10 +455,12 @@ impl ServerBuilder {
             no_upstream: self.no_upstream,
             pt_binary: self.pt_binary,
             dns_startup_policy: self.dns_startup_policy,
+            test_hooks: self.test_hooks.clone(),
         };
 
         let worker_status = self.status.clone();
         let status_rx = self.status_rx;
+        let panic_test_hooks = self.test_hooks.clone();
         let worker_result = result.clone();
         let worker_ready = ready_once.clone();
         let worker_addrs = listen_addrs.clone();
@@ -513,8 +526,11 @@ impl ServerBuilder {
                 }
                 Err(_) => {
                     let primary = ServerError::Task(anyhow!("server worker panicked"));
-                    match crate::server::cleanup_failed_run(writer_started.load(Ordering::Acquire))
-                        .await
+                    match crate::server::cleanup_failed_run(
+                        writer_started.load(Ordering::Acquire),
+                        panic_test_hooks.as_deref(),
+                    )
+                    .await
                     {
                         Ok(()) => Err(primary),
                         Err(cleanup) => Err(ServerError::Cleanup {
@@ -526,9 +542,6 @@ impl ServerBuilder {
             };
             completion.finish(run.err());
         };
-
-        #[cfg(test)]
-        let worker = crate::server::scope_run_server_task_locals(worker);
 
         // Keep the handler's deeply nested future layout out of the public API's host crate.
         let worker: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(worker);

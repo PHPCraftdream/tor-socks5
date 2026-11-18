@@ -2,6 +2,7 @@ use super::*;
 use crate::config::{AllowedClients, ClientAccessConfig, SecurityConfig};
 use futures::StreamExt;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::AsyncReadExt;
 
 /// cancel-safe: NO — partial wire I/O is not resumable; the test's outer

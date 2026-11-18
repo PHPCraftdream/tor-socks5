@@ -1,5 +1,5 @@
 // D5: один живой экземпляр на процесс, последовательный перезапуск работает.
-// Сеть Tor подменена хуком `RUN_SERVER_SHUTDOWN` (туннель не загружается), всё
+// Сеть Tor подменена тестовыми хуками (туннель не загружается), всё
 // остальное — SDK `Server::builder`: привязка портов, процессные слоты, остановка.
 
 use super::*;
@@ -64,13 +64,10 @@ async fn sdk11_server_dns_bind_failure_is_required_and_releases_slots() {
     assert!(error.to_string().contains("DNS listener"));
     assert_slots_free().await;
 
-    let background = global_init::RUN_SERVER_SHUTDOWN
-        .scope(
-            shutdown_hook(test_settings(dir.path()), None),
-            builder(config.clone(), config_path.clone(), false)
-                .dns_startup_policy(crate::DnsStartupPolicy::Background)
-                .start(),
-        )
+    let background = builder(config.clone(), config_path.clone(), false)
+        .dns_startup_policy(crate::DnsStartupPolicy::Background)
+        .test_hooks(shutdown_hook(test_settings(dir.path()), None))
+        .start()
         .await
         .expect("background DNS bind failure must remain non-fatal");
     assert!(matches!(background.status(), ServerStatus::Running { .. }));
@@ -210,11 +207,9 @@ async fn start_server_with_failure(
     settings: Settings,
     failure: global_init::BootstrapFailure,
 ) -> std::result::Result<crate::ServerHandle, ServerError> {
-    global_init::RUN_SERVER_SHUTDOWN
-        .scope(
-            shutdown_hook(settings, Some(failure)),
-            builder(config, config_path, false).start(),
-        )
+    builder(config, config_path, false)
+        .test_hooks(shutdown_hook(settings, Some(failure)))
+        .start()
         .await
 }
 
@@ -368,11 +363,10 @@ async fn sdk11_server_wait_pending_does_not_cancel_token() {
     let settings = test_settings(dir.path());
     let parent = tokio_util::sync::CancellationToken::new();
     let cancellation = parent.clone();
-    let handle_future = builder(config.clone(), config_path.clone(), true)
+    let handle = builder(config.clone(), config_path.clone(), true)
         .cancellation_token(parent.clone())
-        .start();
-    let handle = global_init::RUN_SERVER_SHUTDOWN
-        .scope(shutdown_hook(settings, None), handle_future)
+        .test_hooks(shutdown_hook(settings, None))
+        .start()
         .await
         .unwrap();
     let mut wait = Box::pin(handle.wait());
@@ -400,25 +394,20 @@ async fn sdk11_server_precancelled_start_returns_cancelled_and_allows_retry() {
         let settings = test_settings(dir.path());
         let pre_cancelled = tokio_util::sync::CancellationToken::new();
         pre_cancelled.cancel();
-        let pre_cancelled_result = global_init::RUN_SERVER_SHUTDOWN
-            .scope(
-                shutdown_hook(settings.clone(), None),
-                builder(config.clone(), config_path.clone(), true)
-                    .cancellation_token(pre_cancelled.clone())
-                    .start(),
-            )
+        let pre_cancelled_result = builder(config.clone(), config_path.clone(), true)
+            .cancellation_token(pre_cancelled.clone())
+            .test_hooks(shutdown_hook(settings.clone(), None))
+            .start()
             .await;
         assert!(matches!(pre_cancelled_result, Err(ServerError::Cancelled)));
         assert!(pre_cancelled.is_cancelled());
 
         let token = tokio_util::sync::CancellationToken::new();
-        let start_builder =
-            builder(config.clone(), config_path.clone(), true).cancellation_token(token.clone());
+        let start_builder = builder(config.clone(), config_path.clone(), true)
+            .cancellation_token(token.clone())
+            .test_hooks(shutdown_hook(settings.clone(), None));
         let mut status = start_builder.subscribe();
-        let mut start = Box::pin(
-            global_init::RUN_SERVER_SHUTDOWN
-                .scope(shutdown_hook(settings.clone(), None), start_builder.start()),
-        );
+        let mut start = Box::pin(start_builder.start());
         assert!(
             std::future::poll_fn(|cx| {
                 std::task::Poll::Ready(start.as_mut().poll(cx).is_pending())
@@ -443,12 +432,11 @@ async fn sdk11_server_precancelled_start_returns_cancelled_and_allows_retry() {
             .cancellation_token(run_parent.clone());
         let mut run_status = run_builder.subscribe();
         let run_settings = settings.clone();
-        let run_shutdown = global_init::RUN_SERVER_SHUTDOWN.scope(
-            shutdown_hook(run_settings, None),
-            run_builder.run_until(async {
+        let run_shutdown = run_builder
+            .test_hooks(shutdown_hook(run_settings, None))
+            .run_until(async {
                 let _ = shutdown_rx.await;
-            }),
-        );
+            });
         let run = tokio::spawn(run_shutdown);
         assert!(matches!(
             wait_for_status(&mut run_status, |status| matches!(
@@ -482,12 +470,13 @@ async fn sdk11_server_precancelled_start_returns_cancelled_and_allows_retry() {
             builder(config.clone(), config_path.clone(), true).cancellation_token(external.clone());
         let mut natural_status = run_builder.subscribe();
         let (never_tx, never_rx) = tokio::sync::oneshot::channel::<()>();
-        let natural = tokio::spawn(global_init::RUN_SERVER_SHUTDOWN.scope(
-            shutdown_hook(test_settings(dir.path()), None),
-            run_builder.run_until(async {
-                let _ = never_rx.await;
-            }),
-        ));
+        let natural = tokio::spawn(
+            run_builder
+                .test_hooks(shutdown_hook(test_settings(dir.path()), None))
+                .run_until(async {
+                    let _ = never_rx.await;
+                }),
+        );
         assert!(matches!(
             wait_for_status(&mut natural_status, |status| matches!(
                 status,
@@ -510,11 +499,9 @@ async fn sdk11_server_precancelled_start_returns_cancelled_and_allows_retry() {
         // clean requested cancellation, while the caller's parent token remains live.
         let parent = tokio_util::sync::CancellationToken::new();
         let immediate = builder(config, config_path, true).cancellation_token(parent.clone());
-        let result = global_init::RUN_SERVER_SHUTDOWN
-            .scope(
-                shutdown_hook(test_settings(dir.path()), None),
-                immediate.run_until(std::future::ready(())),
-            )
+        let result = immediate
+            .test_hooks(shutdown_hook(test_settings(dir.path()), None))
+            .run_until(std::future::ready(()))
             .await;
         assert!(
             matches!(result, Ok(())),
@@ -563,13 +550,10 @@ async fn sdk11_server_handle_drop_cancels_and_allows_retry_after_stopped() {
     let (config_path, config) = test_config(dir.path(), 0);
     let settings = test_settings(dir.path());
     let parent = tokio_util::sync::CancellationToken::new();
-    let handle = global_init::RUN_SERVER_SHUTDOWN
-        .scope(
-            shutdown_hook(settings.clone(), None),
-            builder(config.clone(), config_path.clone(), true)
-                .cancellation_token(parent.clone())
-                .start(),
-        )
+    let handle = builder(config.clone(), config_path.clone(), true)
+        .cancellation_token(parent.clone())
+        .test_hooks(shutdown_hook(settings.clone(), None))
+        .start()
         .await
         .unwrap();
     let child_token = handle.token();
@@ -631,15 +615,20 @@ async fn sdk11_server_watch_reports_starting_running_stopping_and_stopped() {
         .upstream(None, None, None);
     let mut status = builder.subscribe();
     assert_eq!(status.borrow().clone(), ServerStatus::Starting);
-    let hook = Arc::new(global_init::ShutdownHook {
-        settings: test_settings(dir.path()),
-        writer: Some(writer.clone()),
-        failure: None,
-        ready: std::sync::Mutex::new(None),
+    let hooks = Arc::new(global_init::TestRunHooks {
+        startup: None,
+        shutdown: Some(global_init::ShutdownHooks {
+            settings: test_settings(dir.path()),
+            writer: Some(writer.clone()),
+            failure: None,
+            ready: std::sync::Mutex::new(None),
+            launch_background: false,
+        }),
+        force_accept_loop_exit: false,
     });
     let handle = match tokio::time::timeout(
         Duration::from_secs(10),
-        global_init::RUN_SERVER_SHUTDOWN.scope(hook, builder.start()),
+        builder.test_hooks(hooks).start(),
     )
     .await
     {

@@ -83,23 +83,6 @@ impl socks5_proto::ProofVerifier for AuthStateVerifier {
     }
 }
 
-/// Decide whether a `.onion` connection is allowed for this request.
-///
-/// * No authenticator (anonymous proxy) → allowed: there is no account
-///   to gate on.
-/// * Authenticated → allowed iff the named account carries
-///   `allowed_onion` (and is still enabled).
-/// * Auth required but no account on the request (should not happen for
-///   a completed handshake) → denied, fail-closed.
-#[cfg(test)]
-pub(crate) fn onion_permitted(auth: Option<&auth::AuthState>, authed_user: Option<&str>) -> bool {
-    match (auth, authed_user) {
-        (None, _) => true,
-        (Some(state), Some(name)) => state.allowed_onion(name),
-        (Some(_), None) => false,
-    }
-}
-
 /// Internal, stable context tags `handle_client` attaches to each stage.
 /// Classification string-matches ONLY these — never arbitrary error message
 /// text (message text is not a stable classification key).

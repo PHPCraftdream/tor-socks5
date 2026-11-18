@@ -11,9 +11,23 @@ use tokio_util::sync::CancellationToken;
 static RETAINED: StdMutex<Option<Arc<GlobalInit>>> = StdMutex::new(None);
 static SETTINGS: StdMutex<Option<Arc<SettingsInit>>> = StdMutex::new(None);
 
+/// Injectable test seam replacing the old task-local hooks. Only tests
+/// construct it; production runs pass `None` and keep the real paths.
+/// The startup and shutdown halves are independent Options so a test that
+/// needs one half does not switch the other half to fake behaviour.
+#[cfg(test)]
+pub(crate) struct TestRunHooks {
+    pub startup: Option<StartupHooks>,
+    pub shutdown: Option<ShutdownHooks>,
+    pub force_accept_loop_exit: bool,
+}
+
+#[cfg(not(test))]
+pub(crate) struct TestRunHooks;
+
 // Подменяет сетевые этапы запуска; проверка не является сквозным тестом Tor.
 #[cfg(test)]
-pub(super) struct StartupHook {
+pub(crate) struct StartupHooks {
     pub settings: Settings,
     pub park_global: bool,
     pub gate: StdMutex<
@@ -31,54 +45,56 @@ pub(super) struct StartupHook {
 }
 
 #[cfg(test)]
-tokio::task_local! {
-    pub(super) static RUN_SERVER_STARTUP: Arc<StartupHook>;
-    pub(super) static RUN_SERVER_SHUTDOWN: Arc<ShutdownHook>;
-}
-
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum BootstrapFailure {
+pub(crate) enum BootstrapFailure {
     Error,
     Panic,
 }
 
 #[cfg(test)]
-pub(super) struct ShutdownHook {
+pub(crate) struct ShutdownHooks {
     pub settings: Settings,
     /// `None` отдаёт запись настоящему процессному слоту `WRITER`.
     pub writer: Option<tor_socks5_runtime::bridge_store_writer::StoreWriter>,
     pub failure: Option<BootstrapFailure>,
     pub ready: StdMutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// Fake-Tor runs that must still launch the real background producers.
+    pub launch_background: bool,
 }
 
-pub(super) fn launch_background() -> bool {
-    #[cfg(test)]
-    {
-        RUN_SERVER_SHUTDOWN.try_with(|_| ()).is_err()
-    }
+pub(super) fn launch_background(hooks: Option<&TestRunHooks>) -> bool {
     #[cfg(not(test))]
+    let _ = hooks;
+    #[cfg(test)]
+    if let Some(shutdown) = hooks.and_then(|hooks| hooks.shutdown.as_ref()) {
+        return shutdown.launch_background;
+    }
+    true
+}
+
+pub(super) fn server_ready(hooks: Option<&TestRunHooks>) {
+    #[cfg(not(test))]
+    let _ = hooks;
+    #[cfg(test)]
+    if let Some(ready) = hooks
+        .and_then(|hooks| hooks.shutdown.as_ref())
+        .and_then(|shutdown| shutdown.ready.lock().unwrap().take())
     {
-        true
+        let _ = ready.send(());
     }
 }
 
-pub(super) fn server_ready() {
+pub(super) fn init_store_writer(path: &std::path::Path, hooks: Option<&TestRunHooks>) {
+    #[cfg(not(test))]
+    let _ = hooks;
     #[cfg(test)]
-    let _ = RUN_SERVER_SHUTDOWN.try_with(|hook| {
-        if let Some(ready) = hook.ready.lock().unwrap().take() {
-            let _ = ready.send(());
-        }
-    });
-}
-
-pub(super) fn init_store_writer(path: &std::path::Path) {
-    #[cfg(test)]
-    if RUN_SERVER_STARTUP.try_with(|_| ()).is_ok()
-        || RUN_SERVER_SHUTDOWN
-            .try_with(|hook| hook.writer.is_some())
-            .unwrap_or(false)
-    {
+    if hooks.is_some_and(|hooks| {
+        hooks.startup.is_some()
+            || hooks
+                .shutdown
+                .as_ref()
+                .is_some_and(|shutdown| shutdown.writer.is_some())
+    }) {
         return;
     }
     tor_socks5_runtime::bridge_store_writer::init_run(path);
@@ -86,9 +102,15 @@ pub(super) fn init_store_writer(path: &std::path::Path) {
 
 pub(super) async fn close_store_writer(
     deadline: Option<tokio::time::Instant>,
+    hooks: Option<&TestRunHooks>,
 ) -> Option<Result<()>> {
+    #[cfg(not(test))]
+    let _ = hooks;
     #[cfg(test)]
-    if let Ok(Some(writer)) = RUN_SERVER_SHUTDOWN.try_with(|hook| hook.writer.clone()) {
+    if let Some(writer) = hooks
+        .and_then(|hooks| hooks.shutdown.as_ref())
+        .and_then(|shutdown| shutdown.writer.clone())
+    {
         let close = writer.close();
         return Some(match deadline {
             Some(deadline) => tokio::time::timeout_at(deadline, close).await.unwrap_or_else(|_| {
@@ -100,15 +122,17 @@ pub(super) async fn close_store_writer(
         });
     }
     #[cfg(test)]
-    if RUN_SERVER_STARTUP.try_with(|_| ()).is_ok() {
+    if hooks.is_some_and(|hooks| hooks.startup.is_some()) {
         return None;
     }
     tor_socks5_runtime::bridge_store_writer::close_run(deadline).await
 }
 
-fn cleanup_budget() -> Duration {
+fn cleanup_budget(hooks: Option<&TestRunHooks>) -> Duration {
+    #[cfg(not(test))]
+    let _ = hooks;
     #[cfg(test)]
-    if RUN_SERVER_STARTUP.try_with(|_| ()).is_ok() {
+    if hooks.is_some_and(|hooks| hooks.startup.is_some()) {
         return Duration::from_millis(20);
     }
     Duration::from_secs(5)
@@ -125,16 +149,19 @@ impl SettingsInit {
         path: std::path::PathBuf,
         cancellation: CancellationToken,
         pt: tor_socks5_runtime::pt::PtBinary,
+        hooks: Option<&TestRunHooks>,
     ) -> Result<Arc<Self>> {
+        #[cfg(not(test))]
+        let _ = hooks;
         #[cfg(test)]
-        if let Ok(hook) = RUN_SERVER_STARTUP.try_with(Arc::clone) {
+        if let Some(hook) = hooks.and_then(|hooks| hooks.startup.as_ref()) {
+            // All test state is cloned/taken before the 'static stage future.
+            let settings = hook.settings.clone();
             let stage: std::pin::Pin<
                 Box<dyn std::future::Future<Output = Result<Settings>> + Send>,
             > = if hook.park_global {
-                let settings = hook.settings.clone();
                 Box::pin(std::future::ready(Ok(settings)))
             } else if let Some((entered, release)) = hook.async_gate.lock().unwrap().take() {
-                let settings = hook.settings.clone();
                 Box::pin(async move {
                     let _ = entered.send(());
                     release.await.context("settings startup test gate closed")?;
@@ -142,7 +169,6 @@ impl SettingsInit {
                 })
             } else {
                 let (entered, release) = hook.gate.lock().unwrap().take().unwrap();
-                let settings = hook.settings.clone();
                 Box::pin(async move {
                     let _ = entered.send(());
                     let _ = release.recv();
@@ -152,7 +178,10 @@ impl SettingsInit {
             return Self::start_job(cancellation, stage);
         }
         #[cfg(test)]
-        if let Ok(settings) = RUN_SERVER_SHUTDOWN.try_with(|hook| hook.settings.clone()) {
+        if let Some(settings) = hooks
+            .and_then(|hooks| hooks.shutdown.as_ref())
+            .map(|hook| hook.settings.clone())
+        {
             return Self::start_job(cancellation, std::future::ready(Ok(settings)));
         }
         // Build the main Tor client with the server's PT policy (H11) and
@@ -356,9 +385,9 @@ where
     }
 }
 
-pub(super) async fn stop_startup() -> Result<()> {
+pub(super) async fn stop_startup(hooks: Option<&TestRunHooks>) -> Result<()> {
     // Settings and global init share five seconds; producer recovery has its own budget.
-    let deadline = Instant::now() + cleanup_budget();
+    let deadline = Instant::now() + cleanup_budget(hooks);
     let settings = SettingsInit::recover(deadline).await;
     let global = GlobalInit::recover(deadline).await;
     let producers = super::producers::ProducerTasks::recover().await;
@@ -481,22 +510,28 @@ impl GlobalInit {
         self.cancel.cancel();
     }
 
-    pub(super) fn start(settings: Settings) -> Result<Arc<Self>> {
+    pub(super) fn start(settings: Settings, hooks: Option<&TestRunHooks>) -> Result<Arc<Self>> {
+        #[cfg(not(test))]
+        let _ = hooks;
         #[cfg(test)]
-        if let Ok(Some(failure)) = RUN_SERVER_SHUTDOWN.try_with(|hook| hook.failure) {
+        if let Some(failure) = hooks
+            .and_then(|hooks| hooks.shutdown.as_ref())
+            .and_then(|hook| hook.failure)
+        {
             return Self::start_job(move |_| match failure {
                 BootstrapFailure::Error => Err(anyhow!("sdk11 synthetic bootstrap failure")),
                 BootstrapFailure::Panic => panic!("sdk11 synthetic bootstrap panic"),
             });
         }
         #[cfg(test)]
-        if let Ok(hook) = RUN_SERVER_STARTUP.try_with(Arc::clone) {
+        if let Some(hook) = hooks.and_then(|hooks| hooks.startup.as_ref()) {
             if hook.park_global {
+                let gate = hook.gate.lock().unwrap().take().unwrap();
                 let runtime = tokio::runtime::Handle::current();
                 return Self::start_job(move |_cancel| {
                     let _entered = runtime.enter();
                     let tunnel = TorTunnel::create_unbootstrapped_with(settings)?;
-                    let (entered, release) = hook.gate.lock().unwrap().take().unwrap();
+                    let (entered, release) = gate;
                     let _ = entered.send(());
                     let _ = release.recv();
                     Ok(Constructed {
@@ -507,7 +542,7 @@ impl GlobalInit {
             }
         }
         #[cfg(test)]
-        if RUN_SERVER_SHUTDOWN.try_with(|_| ()).is_ok() {
+        if hooks.and_then(|hooks| hooks.shutdown.as_ref()).is_some() {
             let runtime = tokio::runtime::Handle::current();
             return Self::start_job(move |_| {
                 let _entered = runtime.enter();
@@ -560,7 +595,9 @@ impl GlobalInit {
     }
 
     /// cancel-safe: да — дескриптор остаётся в корневом слоте при отмене ожидания.
-    pub(super) async fn wait(self: &Arc<Self>) -> Result<TorTunnel> {
+    pub(super) async fn wait(self: &Arc<Self>, hooks: Option<&TestRunHooks>) -> Result<TorTunnel> {
+        #[cfg(not(test))]
+        let _ = hooks;
         let mut slot = self.handle.lock().await;
         let handle = slot
             .as_mut()
@@ -586,7 +623,7 @@ impl GlobalInit {
             };
             return Err(global_init_failure(
                 primary,
-                Self::recover(Instant::now() + cleanup_budget()).await,
+                Self::recover(Instant::now() + cleanup_budget(hooks)).await,
             ));
         }
         *self.tunnel.try_lock().expect("слот запуска свободен") = Some(constructed.tunnel.clone());
@@ -673,16 +710,33 @@ impl GlobalInit {
 }
 
 #[cfg(test)]
-pub(super) fn startup_snapshot(global: bool) -> (bool, bool) {
+pub(super) fn settings_retained() -> bool {
+    SETTINGS.lock().unwrap().is_some()
+}
+
+#[cfg(test)]
+pub(super) fn global_retained() -> bool {
+    RETAINED.lock().unwrap().is_some()
+}
+
+/// Startup registry snapshot: which half (`false` = settings, `true` = global)
+/// still retains a root, plus whether the global root observed cancellation.
+#[cfg(test)]
+pub(super) fn startup_retained(global: bool) -> bool {
     if global {
-        let root = RETAINED.lock().unwrap();
-        (
-            root.is_some(),
-            root.as_ref().is_some_and(|init| init.cancel.is_cancelled()),
-        )
+        global_retained()
     } else {
-        (SETTINGS.lock().unwrap().is_some(), false)
+        settings_retained()
     }
+}
+
+#[cfg(test)]
+pub(super) fn global_cancelled() -> bool {
+    RETAINED
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|init| init.cancel.is_cancelled())
 }
 
 #[cfg(test)]
@@ -694,24 +748,25 @@ mod tests {
         let _lifecycle = super::super::owners::TEST_LIFECYCLE.lock().await;
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        let hook = Arc::new(StartupHook {
-            settings: Settings::default(),
-            park_global: false,
-            gate: StdMutex::new(None),
-            async_gate: StdMutex::new(Some((entered_tx, release_rx))),
-        });
+        let hooks = TestRunHooks {
+            startup: Some(StartupHooks {
+                settings: Settings::default(),
+                park_global: false,
+                gate: StdMutex::new(None),
+                async_gate: StdMutex::new(Some((entered_tx, release_rx))),
+            }),
+            shutdown: None,
+            force_accept_loop_exit: false,
+        };
         let cancellation = CancellationToken::new();
-        let init = RUN_SERVER_STARTUP
-            .scope(hook, async {
-                SettingsInit::start(
-                    crate::config::Config::default(),
-                    std::path::PathBuf::new(),
-                    cancellation.clone(),
-                    tor_socks5_runtime::pt::PtBinary::Environment,
-                )
-            })
-            .await
-            .unwrap();
+        let init = SettingsInit::start(
+            crate::config::Config::default(),
+            std::path::PathBuf::new(),
+            cancellation.clone(),
+            tor_socks5_runtime::pt::PtBinary::Environment,
+            Some(&hooks),
+        )
+        .unwrap();
         entered_rx.await.unwrap();
 
         cancellation.cancel();
@@ -731,24 +786,25 @@ mod tests {
         let _lifecycle = super::super::owners::TEST_LIFECYCLE.lock().await;
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let hook = Arc::new(StartupHook {
-            settings: Settings::default(),
-            park_global: false,
-            gate: StdMutex::new(Some((entered_tx, release_rx))),
-            async_gate: StdMutex::new(None),
-        });
+        let hooks = TestRunHooks {
+            startup: Some(StartupHooks {
+                settings: Settings::default(),
+                park_global: false,
+                gate: StdMutex::new(Some((entered_tx, release_rx))),
+                async_gate: StdMutex::new(None),
+            }),
+            shutdown: None,
+            force_accept_loop_exit: false,
+        };
         let cancellation = CancellationToken::new();
-        let init = RUN_SERVER_STARTUP
-            .scope(hook, async {
-                SettingsInit::start(
-                    crate::config::Config::default(),
-                    std::path::PathBuf::new(),
-                    cancellation.clone(),
-                    tor_socks5_runtime::pt::PtBinary::Environment,
-                )
-            })
-            .await
-            .unwrap();
+        let init = SettingsInit::start(
+            crate::config::Config::default(),
+            std::path::PathBuf::new(),
+            cancellation.clone(),
+            tor_socks5_runtime::pt::PtBinary::Environment,
+            Some(&hooks),
+        )
+        .unwrap();
         tokio::task::spawn_blocking(move || entered_rx.blocking_recv().unwrap())
             .await
             .unwrap();
@@ -828,7 +884,7 @@ mod tests {
         shutdown_tx.send(()).unwrap();
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            wait_startup(&mut shutdown, init.wait(), || async {
+            wait_startup(&mut shutdown, init.wait(None), || async {
                 init.cancel();
                 GlobalInit::recover(Instant::now() + Duration::ZERO).await
             }),
@@ -868,7 +924,7 @@ mod tests {
             })
         })
         .unwrap();
-        let tunnel = init.wait().await.unwrap();
+        let tunnel = init.wait(None).await.unwrap();
         assert!(RETAINED
             .lock()
             .unwrap()
@@ -899,7 +955,7 @@ mod tests {
             .unwrap();
         let waiter = tokio::spawn({
             let init = init.clone();
-            async move { init.wait().await }
+            async move { init.wait(None).await }
         });
         waiter.abort();
         let _ = waiter.await;
