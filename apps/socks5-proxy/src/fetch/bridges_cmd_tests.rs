@@ -50,3 +50,23 @@ async fn fetch_rejects_pre_before_network_startup() {
         })
         .await;
 }
+
+/// ROLLBACK THAT FAILS THIS: handing `fetch_bridges` a token nothing cancels
+/// (the previous `CancellationToken::new()`) means a stop signal never
+/// reaches the fetch; here the token stays live after the signal resolves.
+#[tokio::test]
+async fn a_stop_signal_cancels_the_fetch_token() {
+    let cancel = CancellationToken::new();
+    let (signal, stop) = tokio::sync::oneshot::channel::<()>();
+    let stopper = tokio::spawn(cancel_on_signal(cancel.clone(), async move {
+        stop.await.ok();
+        "test signal"
+    }));
+    tokio::task::yield_now().await;
+    assert!(!cancel.is_cancelled(), "nothing was signalled yet");
+    signal.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(30), cancel.cancelled())
+        .await
+        .expect("the signal must cancel the fetch token");
+    stopper.await.unwrap();
+}
