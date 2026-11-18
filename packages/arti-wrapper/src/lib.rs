@@ -399,7 +399,7 @@ impl TorTunnel {
     pub fn terminate_all_channels(&self) -> Result<()> {
         let chanmgr = self.inner.chanmgr().map_err(TorError::ChanMgrUnavailable)?;
         chanmgr.terminate_all_channels();
-        tracing::debug!(target: "arti_wrapper::channel_reset", "вызвано завершение каналов");
+        tracing::debug!(target: "arti_wrapper::channel_reset", "channel termination triggered");
         Ok(())
     }
 

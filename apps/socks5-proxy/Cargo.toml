@@ -26,8 +26,6 @@ onion-service = [
 [dependencies]
 arti-wrapper = { path = "../../packages/arti-wrapper", version = "0.2.0" }
 auth = { path = "../../packages/auth", version = "0.2.0", package = "tor-socks5-auth" }
-bridge-line.workspace = true
-bridge-fetcher = { path = "../../packages/bridge-fetcher", version = "0.2.0" }
 persist-lock = { path = "../../packages/persist-lock", version = "0.2.0" }
 tor-socks5-onion = { path = "../../apps/sdk/crates/onion", version = "0.2.0", optional = true, features = ["keys", "host"] }
 tor-socks5-runtime = { path = "../../apps/sdk/crates/runtime", version = "0.2.0", features = ["pt"] }
@@ -36,11 +34,6 @@ proxy-config = { path = "../../packages/proxy-config", version = "0.2.0", packag
 tor-error.workspace = true
 
 service-manager.workspace = true
-serde.workspace = true
-serde_json = "1"
-tempfile = { workspace = true }
-indexmap.workspace = true
-time.workspace = true
 clap.workspace = true
 rpassword.workspace = true
 
@@ -49,14 +42,15 @@ tokio.workspace = true
 tokio-util.workspace = true
 
 anyhow.workspace = true
-thiserror.workspace = true
-getrandom.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+bridge-line.workspace = true
+bridge-fetcher = { path = "../../packages/bridge-fetcher", version = "0.2.0" }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tor-socks5-runtime = { path = "../../apps/sdk/crates/runtime", version = "0.2.0", features = ["test-seams"] }
 # `fresh_identity` (R10: the test-seams feature is enabled only by a

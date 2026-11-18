@@ -33,9 +33,9 @@ fn is_link(metadata: &fs::Metadata) -> bool {
 
 fn require_directory(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
-        .map_err(|_| anyhow!("не удалось проверить каталог хранилища"))?;
+        .map_err(|_| anyhow!("failed to verify the owner-storage directory"))?;
     if is_link(&metadata) || !metadata.is_dir() {
-        bail!("недопустимый каталог хранилища");
+        bail!("invalid owner-storage directory");
     }
     Ok(())
 }
@@ -60,22 +60,22 @@ pub(super) fn acquire_with_quarantine(
 ) -> Result<Storage> {
     let mut locks = quarantine
         .lock()
-        .map_err(|_| anyhow!("карантин блокировок повреждён"))?;
+        .map_err(|_| anyhow!("lock quarantine is corrupted"))?;
     if locks.len() >= LIMIT {
-        bail!("исчерпан процессный предел хранилищ владельцев; требуется перезапуск");
+        bail!("process-wide owner-storage limit exhausted; restart required");
     }
     let root = base.join("owners-v1");
-    fs::create_dir_all(&root).map_err(|_| anyhow!("не удалось создать пространство владельцев"))?;
+    fs::create_dir_all(&root).map_err(|_| anyhow!("failed to create the owners space"))?;
     require_directory(&root)?;
     for slot in 1..=LIMIT {
         let lock_path = root.join(format!("{slot}.lock"));
         match fs::symlink_metadata(&lock_path) {
             Ok(metadata) if is_link(&metadata) || !metadata.is_file() => {
-                bail!("недопустимый файл блокировки владельца");
+                bail!("invalid owner lock file");
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => bail!("не удалось проверить блокировку владельца"),
+            Err(_) => bail!("failed to verify the owner lock"),
         }
         let lock = OpenOptions::new()
             .read(true)
@@ -83,12 +83,12 @@ pub(super) fn acquire_with_quarantine(
             .create(true)
             .truncate(false)
             .open(lock_path)
-            .map_err(|_| anyhow!("не удалось открыть блокировку владельца"))?;
+            .map_err(|_| anyhow!("failed to open the owner lock"))?;
         match lock.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => continue,
             Err(std::fs::TryLockError::Error(_)) => {
-                bail!("не удалось заблокировать хранилище владельца")
+                bail!("failed to lock the owner storage")
             }
         }
         // Arti не предоставляет join: даже при ошибке блокировка хранится до выхода процесса.
@@ -101,25 +101,23 @@ pub(super) fn acquire_with_quarantine(
                     .write(true)
                     .create_new(true)
                     .open(state.join(".owner-format"))
-                    .map_err(|_| anyhow!("не удалось создать маркер хранилища"))?;
+                    .map_err(|_| anyhow!("failed to create the storage marker"))?;
                 marker
                     .write_all(MARKER)
-                    .map_err(|_| anyhow!("не удалось записать маркер хранилища"))?;
+                    .map_err(|_| anyhow!("failed to write the storage marker"))?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(_) => bail!("не удалось создать хранилище владельца"),
+            Err(_) => bail!("failed to create the owner storage"),
         }
         require_directory(&state)?;
         let marker_path = state.join(".owner-format");
         let metadata = fs::symlink_metadata(&marker_path)
-            .map_err(|_| anyhow!("неизвестный формат хранилища владельца"))?;
+            .map_err(|_| anyhow!("unknown owner-storage format"))?;
         if is_link(&metadata)
             || !metadata.is_file()
-            || fs::read(marker_path)
-                .map_err(|_| anyhow!("неизвестный формат хранилища владельца"))?
-                != MARKER
+            || fs::read(marker_path).map_err(|_| anyhow!("unknown owner-storage format"))? != MARKER
         {
-            bail!("неизвестный формат хранилища владельца");
+            bail!("unknown owner-storage format");
         }
         // Только известные подкаталоги Arti очищаются до создания нового клиента.
         // Карантин гарантирует отсутствие пользователей слота от прежнего процесса.
@@ -128,22 +126,20 @@ pub(super) fn acquire_with_quarantine(
             match fs::symlink_metadata(&path) {
                 Ok(metadata) => {
                     if is_link(&metadata) || !metadata.is_dir() {
-                        bail!("недопустимый подкаталог хранилища");
+                        bail!("invalid owner-storage subdirectory");
                     }
                     fs::remove_dir_all(&path)
-                        .map_err(|_| anyhow!("не удалось очистить хранилище владельца"))?;
+                        .map_err(|_| anyhow!("failed to clean the owner storage"))?;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => bail!("не удалось проверить подкаталог хранилища"),
+                Err(_) => bail!("failed to verify the owner-storage subdirectory"),
             }
         }
         let cache = state.join("cache");
-        fs::create_dir(&cache).map_err(|_| anyhow!("не удалось создать кэш владельца"))?;
+        fs::create_dir(&cache).map_err(|_| anyhow!("failed to create the owner cache"))?;
         return Ok(Storage { slot, state, cache });
     }
-    bail!(
-        "нет свободных хранилищ владельцев; требуется завершить другие процессы или перезапустить процесс"
-    )
+    bail!("no free owner storages; stop other processes or restart")
 }
 
 #[cfg(test)]

@@ -45,7 +45,7 @@ const _: fn() = || {
 
 /// A configured upstream SOCKS5 proxy used as the egress.
 #[derive(Clone)]
-pub struct Upstream {
+pub(crate) struct Upstream {
     address: String,
     /// `Some((user, pass))` to authenticate via RFC 1929, `None` for an
     /// unauthenticated upstream.
@@ -67,7 +67,7 @@ impl std::fmt::Debug for Upstream {
 }
 
 impl Upstream {
-    pub fn new(address: String, credentials: Option<(String, String)>) -> Self {
+    pub(crate) fn new(address: String, credentials: Option<(String, String)>) -> Self {
         let proxy = HostPort::parse(&address).map(|hp| match &credentials {
             Some((user, pass)) => ProxyConfig::socks5(hp.host, hp.port).with_auth(user, pass),
             None => ProxyConfig::socks5(hp.host, hp.port),
@@ -79,11 +79,11 @@ impl Upstream {
         }
     }
 
-    pub fn address(&self) -> &str {
+    pub(crate) fn address(&self) -> &str {
         &self.address
     }
 
-    pub fn has_auth(&self) -> bool {
+    pub(crate) fn has_auth(&self) -> bool {
         self.credentials.is_some()
     }
 
@@ -98,7 +98,7 @@ impl Upstream {
     /// handshake (with optional auth) and a CONNECT to `(host, port)`.
     /// On success the returned stream is positioned at the start of the
     /// tunnelled data and can be relayed directly to the client.
-    pub async fn connect(&self, host: &str, port: u16) -> Result<AnyUpstream> {
+    pub(crate) async fn connect(&self, host: &str, port: u16) -> Result<AnyUpstream> {
         let Some(proxy) = &self.proxy else {
             bail!(
                 "upstream address {:?} is not a valid host:port pair",
