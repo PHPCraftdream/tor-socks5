@@ -107,13 +107,21 @@ pub enum ConnStage {
 /// reset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ConnHealthSnapshot {
+    /// Connections accepted in the window.
     pub started: u64,
+    /// CONNECT requests that established an egress circuit.
     pub connect_ok: u64,
+    /// CONNECT requests that failed before data flowed.
     pub connect_failed: u64,
+    /// Relayed connections that closed cleanly.
     pub relay_closed: u64,
+    /// Relayed connections closed by a relay-side error.
     pub relay_errors: u64,
+    /// Failures attributable to the SOCKS client.
     pub client_errors: u64,
+    /// Failures attributable to Tor (circuit/dir errors).
     pub tor_errors: u64,
+    /// Failures with no recognized stage tag in the error chain.
     pub other_errors: u64,
     /// Gauge of currently in-flight connections — read but never reset by
     /// [`ConnHealthCounters::snapshot_and_reset`].

@@ -46,10 +46,13 @@ static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Dedup key shared with the config, fetcher and health store.
 pub type Key = BridgeIdentity;
 
+/// Computes the dedup [`Key`] for a bridge line.
 pub fn key_of(b: &BridgeLine) -> Key {
     bridge_identity(b)
 }
 
+/// On-disk candidate pool: the persisted bridge list plus in-memory dedup
+/// state used by merge/exclude/prioritize transactions.
 #[derive(Debug)]
 pub struct CandidatePool {
     path: PathBuf,
@@ -200,6 +203,8 @@ impl CandidatePool {
         taken
     }
 
+    /// Orders the pool so `fresh` (matching `transport`) come first,
+    /// keeping dedup keys consistent with merge/exclude.
     pub fn prioritize(&mut self, fresh: &[BridgeLine], transport: Option<&str>) {
         // The full dedup key ([`key_of`]) must match merge/exclude: a
         // shortened key would mark a stale variant of a relay as fresh
@@ -261,11 +266,13 @@ impl CandidatePool {
         count
     }
 
+    /// Number of candidate bridges currently held.
     #[must_use]
     pub fn len(&self) -> usize {
         self.bridges.len()
     }
 
+    /// True when the pool holds no candidates.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.bridges.is_empty()

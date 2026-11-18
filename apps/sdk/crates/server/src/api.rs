@@ -191,10 +191,10 @@ impl ServerError {
 /// Entry point for configuring and starting one process-local server.
 ///
 /// There may be only one live server per process; after its worker has fully
-/// stopped, another start is supported (D5). A returned handle or `Ok` means
+/// stopped, another start is supported. A returned handle or `Ok` means
 /// cleanup for any prior failure finished, not that every retained handle was
 /// joined; retained handles are recovered by the next start. Owner storage has a process-life
-/// quarantine limit of 15 slots (QUARANTINE15); repeated runs that use that
+/// quarantine limit of 15 slots; repeated runs that use that
 /// storage can exhaust those slots before process exit.
 pub struct Server;
 
@@ -395,8 +395,8 @@ impl ServerBuilder {
     /// returned handle or `Ok` means cleanup for any prior failure finished,
     /// not that every retained handle was joined; retained handles are
     /// recovered by the next start. The returned handle represents one
-    /// process-local server (D5); owner storage can use one of its 15
-    /// process-lifetime quarantine slots (QUARANTINE15).
+    /// process-local server; owner storage can use one of its 15
+    /// process-lifetime quarantine slots.
     ///
     /// Cancellation before readiness returns [`ServerError::Cancelled`],
     /// unless startup itself produced a more specific error.

@@ -23,7 +23,9 @@ socks5 = ["dep:tor-socks5-proto"]
 acl = ["dep:tor-socks5-client-acl"]
 route = ["acl", "dep:tor-socks5-route-pool"]
 auth = ["acl", "dep:tor-socks5-auth"]
-config = ["acl", "bridges", "dep:tor-socks5-config"]
+# H18: `config` no longer implies `bridges` — config must not pull the
+# SQLite-backed bridge-verify-core.
+config = ["acl", "dep:tor-socks5-config"]
 bridges = ["dep:bridge-probe", "dep:bridge-store", "dep:bridge-verify-core"]
 tor = ["socks5", "acl", "dep:arti-wrapper"]
 fetch = ["tor", "bridges", "dep:bridge-fetcher"]
@@ -33,25 +35,25 @@ dns = ["tor", "acl", "dep:tor-socks5-dns"]
 # the guard-event observation layer; SDK-9 — the Tor client (settings from
 # config, the PT entry point, the TorHandle surface, watchdog status, conn
 # health). Links Arti — patch-kit needed (see README).
-runtime = ["tor", "config", "bridges", "dep:tor-socks5-runtime", "dep:tokio-util"]
+runtime = ["tor", "config", "bridges", "dep:tor-socks5-runtime", "dep:tokio-util", "dep:bridge-line", "dep:time"]
 # Busybox pluggable-transport dispatch for an embedding host.
 pt = ["runtime", "tor-socks5-runtime/pt"]
 # Embedded SOCKS5 server. Links Arti — patch-kit needed (see README).
 server = ["runtime", "onion-service", "dep:tor-socks5-server", "tor-socks5-server/onion-service"]
 # Tor-free onion address and vanity core (the CLI uses the same crate).
 onion = ["dep:tor-socks5-onion"]
-# Server-side onion services (the CLI enables the same feature): hosting
-# through the tor-socks5-onion `host` feature plus the tunnel side.
-onion-service = ["tor", "arti-wrapper/onion-service", "onion-host"]
+# Server-side onion services: the full hosting stack (`onion-host`, hence
+# `runtime` and `tor`) plus arti's onion-service support on wrapper/server.
+onion-service = ["onion-host", "arti-wrapper/onion-service", "tor-socks5-server?/onion-service"]
 # Hosted onion services (SDK-5): the server-side launch/serve/status
-# choreography in tor-socks5-onion's Tor-dependent `host` feature. Links
-# Arti — patch-kit needed (see README).
-onion-host = ["dep:tor-socks5-onion", "tor-socks5-onion/host"]
+# choreography in tor-socks5-onion's Tor-dependent `host` feature. H18:
+# implies `runtime` — `OnionHostConfig` takes the runtime's `TorHandle` and
+# the facade's `CancellationToken`. Links Arti — patch-kit needed (see README).
+onion-host = ["runtime", "dep:tor-socks5-onion", "tor-socks5-onion/host"]
 # Onion service identity keys via the Arti native keystore (tor-keymgr +
-# tor-hscrypto only: no Tor client, no patch-kit). The keystore directory is
-# an explicit argument; printing, prompting and confirmations stay with the
-# application.
-onion-keys = ["dep:tor-socks5-onion", "tor-socks5-onion/keys"]
+# tor-hscrypto only: no Tor client, no patch-kit). H18: implies `config` —
+# the keystore entry types come from the config crate — but not `bridges`.
+onion-keys = ["config", "dep:tor-socks5-onion", "tor-socks5-onion/keys"]
 full = ["socks5", "auth", "config", "bridges", "route", "tor", "fetch", "dns", "onion", "onion-keys", "onion-service", "onion-host", "runtime", "server", "pt"]
 
 [dependencies]
@@ -71,6 +73,8 @@ tor-socks5-onion = { path = "crates/onion", version = "0.2.0", optional = true }
 tor-socks5-runtime = { path = "crates/runtime", version = "0.2.0", optional = true }
 tor-socks5-server = { path = "crates/server", version = "0.2.0", optional = true, default-features = false }
 tokio-util = { workspace = true, optional = true }
+bridge-line = { workspace = true, optional = true }
+time = { workspace = true, optional = true }
 
 # The surface test wires `runtime::observation_layer` into a real
 # subscriber — the same wiring the proxy binary does.
