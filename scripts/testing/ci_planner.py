@@ -15,6 +15,10 @@ from pathlib import Path
 _HERE = str(Path(__file__).resolve().parent)
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
+# Байткод соседнего пакета не должен появляться в проверяемом рабочем дереве:
+# планировщик запускается и в чужих репозиториях-фикстурах, где он стал бы
+# «изменённым путём».
+sys.dont_write_bytecode = True
 
 from planner_lib.policy import (  # noqa: E402
     contract_capability,
