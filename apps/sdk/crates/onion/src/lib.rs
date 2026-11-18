@@ -28,6 +28,11 @@
 pub mod address;
 pub mod vanity;
 
+/// Onion service nickname (`HsNickname` from tor-persist): the identifier
+/// used by the keystore APIs and the host.
+#[cfg(feature = "keys")]
+pub use ::tor_persist::hsnickname::HsNickname;
+
 #[cfg(feature = "keys")]
 pub mod keys;
 

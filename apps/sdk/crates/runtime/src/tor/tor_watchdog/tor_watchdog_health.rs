@@ -54,6 +54,8 @@ impl TorHealth {
         }
     }
 
+    /// True when the last recorded success is newer than `window`; used to
+    /// decide whether Tor still looks responsive.
     pub fn successful_within(&self, window: Duration) -> bool {
         self.last_success_instant
             .lock()

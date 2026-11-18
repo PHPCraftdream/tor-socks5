@@ -176,9 +176,15 @@ fn onion_keys_module() {
         "tor_socks5_onion::keys::ops::NewIdentity<'_>"
     );
 
+    assert_eq!(
+        type_name::<tor_socks5::onion::HsNickname>(),
+        "tor_persist::hsnickname::HsNickname"
+    );
+
     // list/show keep their entry types internal to the caller (the entry type
-    // comes from the config crate, which `onion-keys` does not expose), so
-    // they are pinned by argument shape and `Ok`/`Vec` shape.
+    // comes from the config crate — implied by `onion-keys`, exposed as the
+    // facade's `config` module — but the entry type itself is not surfaced),
+    // so they are pinned by argument shape and `Ok`/`Vec` shape.
     fn expect_list<R, E>(_f: fn(&Path) -> Result<Vec<R>, E>) {}
     expect_list(keys::list_services);
     fn expect_show<R, E>(_f: fn(&Path, &str) -> Result<R, E>) {}
@@ -237,6 +243,19 @@ fn shared_types_are_not_duplicated() {
     }
     .post_proxies;
     same(&from_acl, &from_auth);
+}
+
+#[cfg(feature = "runtime")]
+#[test]
+fn runtime_module_reexport_types_surface() {
+    assert_eq!(
+        type_name::<tor_socks5::runtime::BridgeLine>(),
+        "bridge_line::BridgeLine"
+    );
+    assert_eq!(
+        type_name::<tor_socks5::runtime::OffsetDateTime>(),
+        "time::offset_date_time::OffsetDateTime"
+    );
 }
 
 #[cfg(feature = "runtime")]
@@ -555,7 +574,8 @@ fn onion_host_module() {
 /// The hosted-onion-service handle and config builders (SDK-5): the
 /// `TorHandle` and `CancellationToken` argument types stay internal to the
 /// onion crate here (`onion-host` alone does not expose them), so they are
-/// pinned through inference.
+/// pinned through inference. H18: `onion-host` implies `runtime`, so the
+/// argument types are the facade's `runtime` re-exports.
 #[cfg(feature = "onion-host")]
 #[test]
 fn onion_host_config_and_handle_surface() {
@@ -617,6 +637,45 @@ fn server_surface_signatures() {
     }
     fn assert_handle_channels_pointer(_f: fn(&ServerHandle)) {}
     assert_handle_channels_pointer(assert_handle_channels);
+}
+
+/// `onion-host` implies `runtime`: the host config takes the runtime's
+/// `TorHandle` and the facade's `CancellationToken`.
+#[cfg(feature = "onion-host")]
+#[test]
+fn onion_host_implies_runtime() {
+    use std::path::PathBuf;
+
+    use tor_socks5::onion::host::OnionHostConfig;
+
+    fn probe(handle: tor_socks5::runtime::TorHandle) -> OnionHostConfig {
+        OnionHostConfig::new(
+            handle,
+            PathBuf::new(),
+            tor_socks5::runtime::CancellationToken::new(),
+        )
+    }
+    let _ = probe;
+}
+
+/// `onion-keys` implies `config` (the keystore entry types come from the
+/// config crate), but not `bridges`.
+#[cfg(feature = "onion-keys")]
+#[test]
+fn onion_keys_implies_config() {
+    let _: tor_socks5::config::Config = Default::default();
+}
+
+/// `config` does not imply `bridges`: the SQLite-backed bridge-verify-core
+/// must not link into a config-only consumer.
+#[test]
+fn config_feature_does_not_pull_sqlite() {
+    let manifest = include_str!("../Cargo.toml");
+    let config_line = manifest
+        .lines()
+        .find(|l| l.starts_with("config = ["))
+        .expect("config feature line");
+    assert!(!config_line.contains("bridges"), "{config_line}");
 }
 
 /// The embedded-server builder configuration chain (SDK-11): every builder

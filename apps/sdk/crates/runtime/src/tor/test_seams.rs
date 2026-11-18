@@ -4,6 +4,8 @@
 //! `cfg(test)` and the `test-seams` feature.
 
 tokio::task_local! {
+    /// Task-local flag marking the observation producer task, so forbidden
+    /// sites can detect (and panic on) producer-side re-entry.
     pub static FORBID_PRODUCER: ();
 }
 
@@ -22,7 +24,9 @@ use std::time::{Duration, Instant};
 /// its load (snapshot pinned, mutation/save not yet run).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Site {
+    /// Just before the gated transaction acquires its lock.
     PreAcquire,
+    /// Just after the gated transaction loaded its snapshot.
     PostLoad,
     /// Inside the admission verifier's blocking worker, right after it
     /// acquired VERIFY_LOCK (see `bridge_verifier::verify_bridges_sequential`).
@@ -42,6 +46,7 @@ pub enum Site {
     /// TS19-01 recorder site: `bridge_verifier::run_circuit_verify_tick`'s
     /// bridge-store load.
     CircuitVerifyStoreLoad,
+    /// After a pool writer sent the close reply for its transaction.
     WriterCloseReplySent,
 }
 
@@ -89,6 +94,8 @@ impl Clone for ParkedGate {
 }
 
 impl ParkedGate {
+    /// Registers a gate for `(path, site)`; the first transaction reaching
+    /// the site parks until [`ParkedGate::release`] or the hang guard fires.
     pub fn arm(site: Site, path: &Path) -> Self {
         let inner = Arc::new(GateInner {
             state: Mutex::new((false, false)),
@@ -127,6 +134,8 @@ impl ParkedGate {
         assert!(parked, "transaction never reached {:?}", self.key.0);
     }
 
+    /// Worker slot parked inside the admission verifier, if the gate caught
+    /// one (outer Some) — None when the site has not been reached.
     pub fn promotion_slot(&self) -> Option<Option<crate::workers::WorkerSlot>> {
         self.inner
             .promotion_slot
@@ -135,6 +144,7 @@ impl ParkedGate {
             .clone()
     }
 
+    /// Lets the parked transaction continue; the gate must have caught one.
     pub fn release(&self) {
         let mut state = self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
         state.1 = true;

@@ -779,6 +779,14 @@ jobs:
         with self.assertRaisesRegex(p.MappingError, "missing mapping: удалена зависимость пакета"):
             p.check_removed_dependencies("apps/socks5-proxy/Cargo.toml", new_sdk5, '[dependencies]\n')
 
+        # H18: HsNickname comes through tor-socks5-onion (facade re-export).
+        old_h18 = '[dependencies]\ntor-hsservice = "0.48"\n'
+        p.check_removed_dependencies("apps/socks5-proxy/Cargo.toml", old_h18, '[dependencies]\n')
+        # An unsanctioned removal from the same manifest is refused.
+        with self.assertRaisesRegex(p.MappingError, "missing mapping: удалена зависимость пакета"):
+            p.check_removed_dependencies(
+                "apps/socks5-proxy/Cargo.toml", old_h18, '[dependencies]\ntor-keymgr = "0.48"\n')
+
     def test_deps1_proxy_dependency_removals(self):
         path = "apps/socks5-proxy/Cargo.toml"
         dependencies = (
