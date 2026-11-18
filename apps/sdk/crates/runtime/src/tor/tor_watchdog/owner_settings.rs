@@ -355,4 +355,87 @@ mod tests {
         assert!(settings.stock_pt_proxy);
         assert_eq!(rx.recv().await, Some(("owner-settings", exe)));
     }
+
+    const ALIVE: &[u8] = &[5, 0];
+    const NOT_A_PROXY: &[u8] = b"HT";
+
+    /// A loopback proxy that answers every SOCKS5 greeting with `reply`.
+    async fn fake_proxy(
+        reply: &'static [u8],
+    ) -> (proxy_config::Socks5Endpoint, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string().parse().unwrap();
+        let task = tokio::spawn(async move {
+            while let Ok((mut peer, _)) = listener.accept().await {
+                let mut greeting = [0u8; 8];
+                let _ = peer.read(&mut greeting).await;
+                let _ = peer.write_all(reply).await;
+                let _ = peer.shutdown().await;
+            }
+        });
+        (endpoint, task)
+    }
+
+    /// ROLLBACK THAT FAILS THIS: dropping the `sole_member` shortcut sends
+    /// the only member through the probe, which never gets an answer from a
+    /// listener that does not accept, so the call fails.
+    #[tokio::test]
+    async fn a_sole_member_is_taken_without_a_probe() {
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let member: proxy_config::Socks5Endpoint =
+            silent.local_addr().unwrap().to_string().parse().unwrap();
+        let pool = proxy_config::ProxyPool::new(vec![member.clone()]).unwrap();
+        assert_eq!(select_anchor(&pool).await.unwrap(), &member);
+    }
+
+    /// ROLLBACK THAT FAILS THIS: taking the first member without probing, or
+    /// the last answering member (`rposition`), picks the wrong endpoint.
+    #[tokio::test]
+    async fn the_first_answering_member_in_configuration_order_is_the_anchor() {
+        let (dead, _dead) = fake_proxy(NOT_A_PROXY).await;
+        let (first, _first) = fake_proxy(ALIVE).await;
+        let (second, _second) = fake_proxy(ALIVE).await;
+        let pool = proxy_config::ProxyPool::new(vec![dead, first.clone(), second]).unwrap();
+        assert_eq!(select_anchor(&pool).await.unwrap(), &first);
+    }
+
+    /// ROLLBACK THAT FAILS THIS: falling back to the first member when none
+    /// answers hides a pool that is down as a later bootstrap failure.
+    #[tokio::test]
+    async fn a_pool_where_no_member_answers_is_an_error() {
+        let (first, _first) = fake_proxy(NOT_A_PROXY).await;
+        let (second, _second) = fake_proxy(NOT_A_PROXY).await;
+        let pool = proxy_config::ProxyPool::new(vec![first, second]).unwrap();
+        let error = select_anchor(&pool).await.unwrap_err();
+        assert!(
+            error.to_string().contains("no pre_proxies member answered"),
+            "{error}"
+        );
+    }
+
+    /// The production settings builder bootstraps the main client through
+    /// the probed anchor, not through the first configured member.
+    ///
+    /// ROLLBACK THAT FAILS THIS: setting `pre_endpoint` from the first pool
+    /// member (or not setting it) fails the endpoint comparison.
+    #[tokio::test]
+    async fn the_settings_builder_uses_the_selected_anchor_as_the_pre_endpoint() {
+        let (dead, _dead) = fake_proxy(NOT_A_PROXY).await;
+        let (alive, _alive) = fake_proxy(ALIVE).await;
+        let mut cfg = Config::default();
+        cfg.bridges.use_seeds = false;
+        cfg.bridges.auto_fetch = false;
+        cfg.warm_pool.enabled = false;
+        cfg.bridges.lines = vec!["8.8.8.8:443 1111111111111111111111111111111111111111".into()];
+        cfg.pre_proxies = Some(proxy_config::ProxyPool::new(vec![dead, alive.clone()]).unwrap());
+        let settings =
+            crate::tor_setup::build_tor_settings(&cfg, std::path::Path::new("tor-socks5.ktav"))
+                .await
+                .unwrap();
+        assert!(
+            settings.pre_endpoint
+                == Some(arti_wrapper::Socks5PreEndpoint::from_pool_member(&alive))
+        );
+    }
 }

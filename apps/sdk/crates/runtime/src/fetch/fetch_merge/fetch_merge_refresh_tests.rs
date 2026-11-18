@@ -235,17 +235,92 @@ async fn top_up_short_pool_exhausts_sources_and_never_touches_the_config() {
     );
 }
 
+/// Drives `top_up_with` with scripted drain results; returns the outcome,
+/// the `want` of every drain call and the number of refresh calls.
+async fn scripted_top_up(
+    cfg: &Config,
+    target: usize,
+    drains: &[usize],
+    refresh_result: Result<()>,
+) -> (Result<usize>, Vec<usize>, usize) {
+    let mut script = drains
+        .iter()
+        .copied()
+        .collect::<std::collections::VecDeque<_>>();
+    let mut asked = Vec::new();
+    let mut refreshes = 0;
+    let outcome = top_up_with(
+        cfg,
+        target,
+        async |want| {
+            asked.push(want);
+            Ok(script.pop_front().expect("no drain left in the script"))
+        },
+        async || {
+            refreshes += 1;
+            refresh_result
+        },
+    )
+    .await;
+    (outcome, asked, refreshes)
+}
+
+fn config_with_a_source() -> Config {
+    let mut cfg = Config::default();
+    cfg.bridges.sources = vec![source("pool", "http://127.0.0.1:1/bridges.txt")];
+    cfg
+}
+
+/// ROLLBACK THAT FAILS THIS: dropping the `promoted < target` guard refreshes
+/// (a network fetch over Tor) even though the pool already covered the need.
+#[tokio::test]
+async fn a_pool_that_covers_the_target_never_refreshes() {
+    let (outcome, asked, refreshes) =
+        scripted_top_up(&config_with_a_source(), 3, &[3], Ok(())).await;
+    assert_eq!(outcome.unwrap(), 3);
+    assert_eq!(asked, [3]);
+    assert_eq!(refreshes, 0);
+}
+
+/// ROLLBACK THAT FAILS THIS: asking the second drain for `target` instead of
+/// the remaining shortfall, or not adding the first drain's promotions, breaks
+/// the asked list or the total.
+#[tokio::test]
+async fn a_short_pool_refreshes_once_and_drains_only_the_shortfall() {
+    let (outcome, asked, refreshes) =
+        scripted_top_up(&config_with_a_source(), 3, &[1, 2], Ok(())).await;
+    assert_eq!(outcome.unwrap(), 3);
+    assert_eq!(asked, [3, 2]);
+    assert_eq!(refreshes, 1);
+}
+
+/// ROLLBACK THAT FAILS THIS: dropping the sources check refreshes with
+/// nothing to fetch from.
+#[tokio::test]
+async fn a_short_pool_without_sources_keeps_what_it_promoted() {
+    let (outcome, asked, refreshes) = scripted_top_up(&Config::default(), 3, &[1], Ok(())).await;
+    assert_eq!(outcome.unwrap(), 1);
+    assert_eq!(asked, [3]);
+    assert_eq!(refreshes, 0);
+}
+
+/// ROLLBACK THAT FAILS THIS: swallowing the refresh error drains again after
+/// a failed refresh and returns Ok.
+#[tokio::test]
+async fn a_failed_refresh_aborts_the_top_up_before_the_second_drain() {
+    let (outcome, asked, refreshes) = scripted_top_up(
+        &config_with_a_source(),
+        3,
+        &[1],
+        Err(anyhow::anyhow!("refresh failed")),
+    )
+    .await;
+    assert!(outcome.is_err());
+    assert_eq!(asked, [3]);
+    assert_eq!(refreshes, 1);
+}
+
 // Not covered here, with reasons (H19.3 sub-items unreachable offline):
-// - "the pool already covers the target" promotion through
-//   `top_up_working_with_pt`: `top_up` always drains with the REAL channel
-//   checker (`TorTunnel::warm_bridge`), which cannot succeed on an
-//   unbootstrapped tunnel, and the TCP probe is not injectable on that
-//   path — so no promotion can be simulated offline. The TCP-only
-//   fallback-admission behaviour (`drain_pool_with` with `checker: None`)
-//   is already covered by `fetch_merge_tests::
-//   tcp_ok_with_no_channel_check_falls_back_to_tcp_only`, and the full
-//   promote/shed cycle by `successful_drain_promotes_sheds_and_a_repeat_
-//   drain_sees_nothing`.
 // - the end-to-end `config_stale` migration during a successful refresh:
 //   it only runs after a fetch that returned bridges, impossible over an
 //   unbootstrapped tunnel. `migrate_legacy_source` itself (URL rewrite +

@@ -438,3 +438,63 @@ async fn a_cancelled_manager_stops_without_launching() {
     );
     manager.await.expect("manager task does not panic");
 }
+
+/// ROLLBACK THAT FAILS THIS: returning after a fixed number of polls, or
+/// polling less often than `ADDRESS_POLL_INTERVAL`, changes the elapsed
+/// virtual time or the call count.
+#[tokio::test(start_paused = true)]
+async fn the_address_is_returned_on_the_poll_that_finds_it() {
+    let token = CancellationToken::new();
+    let started = tokio::time::Instant::now();
+    let mut calls = 0;
+    let outcome = wait_for_address_with(
+        || {
+            calls += 1;
+            (calls == 4).then_some("address")
+        },
+        &token,
+        "svc",
+    )
+    .await;
+    assert!(matches!(outcome, AddressWait::Available("address")));
+    assert_eq!(calls, 4);
+    assert_eq!(started.elapsed(), 3 * ADDRESS_POLL_INTERVAL);
+}
+
+/// ROLLBACK THAT FAILS THIS: dropping the deadline check makes the wait
+/// endless; the outer timeout then fires first and the test fails.
+#[tokio::test(start_paused = true)]
+async fn an_address_that_never_appears_times_out_at_the_limit() {
+    let token = CancellationToken::new();
+    let started = tokio::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        ADDRESS_WAIT_LIMIT * 2,
+        wait_for_address_with(|| None::<()>, &token, "svc"),
+    )
+    .await
+    .expect("the wait is bounded by its own limit");
+    assert!(matches!(outcome, AddressWait::TimedOut));
+    let waited = started.elapsed();
+    assert!(waited >= ADDRESS_WAIT_LIMIT, "{waited:?}");
+    assert!(
+        waited <= ADDRESS_WAIT_LIMIT + ADDRESS_POLL_INTERVAL,
+        "{waited:?}"
+    );
+}
+
+/// ROLLBACK THAT FAILS THIS: dropping the cancellation arm leaves the wait
+/// running to the limit, so it ends as `TimedOut` instead of `Cancelled`.
+#[tokio::test(start_paused = true)]
+async fn cancellation_ends_the_address_wait_early() {
+    let token = CancellationToken::new();
+    let waiter = {
+        let token = token.clone();
+        tokio::spawn(async move { wait_for_address_with(|| None::<()>, &token, "svc").await })
+    };
+    tokio::time::sleep(5 * ADDRESS_POLL_INTERVAL).await;
+    let cancelled_at = tokio::time::Instant::now();
+    token.cancel();
+    let outcome = waiter.await.expect("join");
+    assert!(matches!(outcome, AddressWait::Cancelled));
+    assert!(cancelled_at.elapsed() < ADDRESS_POLL_INTERVAL);
+}

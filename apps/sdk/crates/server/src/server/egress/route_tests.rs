@@ -308,6 +308,102 @@ fn account_pre_is_independent_of_global_pre() {
     assert!(validate_account_routes(&users, None, None, false, false).is_ok());
 }
 
+fn owner_template_config() -> crate::config::Config {
+    let mut cfg = crate::config::Config::default();
+    cfg.bridges.use_seeds = false;
+    cfg.bridges.auto_fetch = false;
+    cfg.warm_pool.enabled = false;
+    cfg.bridges.lines = vec!["8.8.8.8:443 1111111111111111111111111111111111111111".into()];
+    cfg
+}
+
+fn needs_owner_template(cfg: &crate::config::Config, users: Vec<User>) -> bool {
+    tor_socks5_runtime::tor_setup::validate_owner_routes(
+        cfg,
+        &UsersConfig { users },
+        std::path::Path::new("tor-socks5.ktav"),
+        &tor_socks5_runtime::pt::PtBinary::Environment,
+    )
+    .unwrap()
+    .is_some()
+}
+
+/// The owner template is built only for an ENABLED account whose effective
+/// pre pool differs from the global one and is not direct.
+///
+/// ROLLBACK THAT FAILS THIS: dropping the `is_enabled` filter fails the
+/// disabled-account case; dropping the `effective != global` comparison
+/// fails the inherited and identical-pool cases; dropping the
+/// `effective.is_some()` guard fails the direct-route case; replacing `any`
+/// with a check of the first account fails the last case.
+#[test]
+fn owner_template_is_needed_only_for_an_enabled_account_with_a_differing_pool() {
+    let mut cfg = owner_template_config();
+    cfg.pre_proxies = Some(global_pool());
+    let other = PoolOverride::Pool(pool("127.0.0.1:1081"));
+
+    assert!(!needs_owner_template(&cfg, vec![]));
+    assert!(!needs_owner_template(&cfg, vec![user(true, None, None)]));
+    assert!(!needs_owner_template(
+        &cfg,
+        vec![user(true, Some(endpoint()), None)]
+    ));
+    assert!(!needs_owner_template(
+        &cfg,
+        vec![user(false, Some(other.clone()), None)]
+    ));
+    assert!(!needs_owner_template(
+        &cfg,
+        vec![user(true, Some(PoolOverride::Disabled), None)]
+    ));
+    assert!(needs_owner_template(
+        &cfg,
+        vec![user(true, Some(other.clone()), None)]
+    ));
+    assert!(needs_owner_template(
+        &cfg,
+        vec![
+            user(true, None, None),
+            user(false, Some(other.clone()), None),
+            user(true, Some(other.clone()), None),
+        ]
+    ));
+
+    // Without a global pool any enabled account pool is a difference.
+    cfg.pre_proxies = None;
+    assert!(needs_owner_template(
+        &cfg,
+        vec![user(true, Some(other), None)]
+    ));
+    assert!(!needs_owner_template(&cfg, vec![user(true, None, None)]));
+}
+
+/// A differing account pool with a config the template cannot serve is an
+/// error, not a silent fallback to the global route.
+///
+/// ROLLBACK THAT FAILS THIS: swallowing the template error (`.ok()`) turns
+/// the error into `Ok(None)`.
+#[test]
+fn owner_template_errors_are_not_swallowed() {
+    let mut cfg = owner_template_config();
+    cfg.pre_proxies = Some(global_pool());
+    cfg.dns_server.enabled = true;
+    let users = UsersConfig {
+        users: vec![user(
+            true,
+            Some(PoolOverride::Pool(pool("127.0.0.1:1081"))),
+            None,
+        )],
+    };
+    assert!(tor_socks5_runtime::tor_setup::validate_owner_routes(
+        &cfg,
+        &users,
+        std::path::Path::new("tor-socks5.ktav"),
+        &tor_socks5_runtime::pt::PtBinary::Environment,
+    )
+    .is_err());
+}
+
 #[test]
 fn restricted_owner_template_and_alternate_validation() {
     let mut cfg = crate::config::Config::default();
