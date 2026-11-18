@@ -63,7 +63,10 @@ fn config_fixture(dir: &tempfile::TempDir, cfg: &Config) -> std::path::PathBuf {
 #[tokio::test]
 async fn refresh_without_sources_is_a_no_op() {
     let dir = tempfile::tempdir().unwrap();
-    let cfg = Config::default();
+    // The default config carries the built-in sources: clear them, or this
+    // test would fetch from the real network.
+    let mut cfg = Config::default();
+    cfg.bridges.sources.clear();
     let path = config_fixture(&dir, &cfg);
     let pool_path = CandidatePool::resolve_path(&path);
     let tor = unbootstrapped_tunnel(&dir);
@@ -182,7 +185,10 @@ async fn top_up_zero_target_is_a_no_op() {
 #[tokio::test]
 async fn top_up_with_empty_pool_and_no_sources_skips_the_refresh_leg() {
     let dir = tempfile::tempdir().unwrap();
-    let cfg = Config::default();
+    // The default config carries the built-in sources: clear them, or this
+    // test would fetch from the real network.
+    let mut cfg = Config::default();
+    cfg.bridges.sources.clear();
     let path = config_fixture(&dir, &cfg);
     let config_before = std::fs::read(&path).unwrap();
     let tor = unbootstrapped_tunnel(&dir);

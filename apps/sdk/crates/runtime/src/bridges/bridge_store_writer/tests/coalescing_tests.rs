@@ -178,7 +178,7 @@ async fn publish_snapshots_are_copy_on_write() {
     seed_store(&path, &b);
 
     let calls = Arc::new(AtomicUsize::new(0));
-    let (calls_tx, mut calls_rx) = entry_signal();
+    let (entry_tx, mut calls_rx) = entry_signal();
     let snapshots: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
     let addrs: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
     let (gate_tx, gate_rx) = oneshot::channel::<()>();
@@ -188,12 +188,15 @@ async fn publish_snapshots_are_copy_on_write() {
     let counter = calls.clone();
     let snapshot_addrs = snapshots.clone();
     let inner: Publisher = Arc::new(move |s: &BridgeStore| {
-        // Record the snapshot allocation BEFORE bumping the counter, so an
-        // entry always exists by the time the counter shows the call.
+        // Record the snapshot allocation BEFORE signalling the call, so an
+        // entry always exists by the time the test sees the call.
         snapshot_addrs
             .lock()
             .unwrap()
             .push(s as *const BridgeStore as usize);
+        // Signal AFTER recording: the test reads the snapshot as soon as the
+        // signal shows the call, so the entry must already exist.
+        entry_tx.send_modify(|calls| *calls += 1);
         let n = counter.fetch_add(1, Ordering::SeqCst);
         if n == 0 {
             // Hold publish #1 in-flight until the test releases it.
@@ -202,11 +205,7 @@ async fn publish_snapshots_are_copy_on_write() {
         }
         s.save()
     });
-    let writer = StoreWriter::spawn(
-        BridgeStore::resolve_path(&path),
-        with_entry_signal(calls_tx, inner),
-        INITIAL_BACKOFF,
-    );
+    let writer = StoreWriter::spawn(BridgeStore::resolve_path(&path), inner, INITIAL_BACKOFF);
     let mut settled = writer.settled_watch();
 
     // Mutation A: the job deep-copies (the actor keeps its own Arc, so
