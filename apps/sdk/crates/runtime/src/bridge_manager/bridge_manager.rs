@@ -10,7 +10,7 @@
 //!   bridge-health writer slot. RT-0 is executed: the slot is resettable,
 //!   and `init_global` after a *completed* `close_global` starts a fresh
 //!   live writer, so a sequential stop → start restart works (covered by
-//!   `bridge_store_writer_tests/external_cli_tests.rs`). Caveat: while a
+//!   `bridge_store_writer/tests/external_cli_tests.rs`). Caveat: while a
 //!   close is still in flight, `init_global` hands back the writer being
 //!   closed — await `close_global` before restarting.
 //! - `workers::BLOCKING_WORKERS` — the process-wide blocking-worker

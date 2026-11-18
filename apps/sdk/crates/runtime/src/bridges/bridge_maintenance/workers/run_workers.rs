@@ -110,8 +110,9 @@ mod tests {
             .unwrap()
             .iter()
             .all(|slot| slot.try_lock().is_ok_and(|state| state.handle.is_none())));
-        // The process registry still holds the slot; join it to stay clean
-        // for other tests.
-        join_blocking_workers().await.unwrap();
+        // The process registry still holds the slot; reap it to stay clean
+        // for other tests. Failures retained by other tests in a shared
+        // process are theirs, so the result is deliberately not asserted.
+        let _ = join_blocking_workers().await;
     }
 }

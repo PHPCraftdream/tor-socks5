@@ -117,7 +117,7 @@ type MutateFn = Box<dyn FnOnce(&mut BridgeStore) + Send>;
 type Publisher = Arc<dyn Fn(&BridgeStore) -> Result<()> + Send + Sync>;
 
 // Payload переходит в реестр без форматирования; актор получает только безопасную ошибку.
-#[path = "bridge_store_writer_parts/publisher_panic.rs"]
+#[path = "bridge_store_writer/publisher_panic.rs"]
 mod publisher_panic;
 use publisher_panic::PublisherPanic;
 
@@ -191,10 +191,10 @@ type SettleSignal = tokio::sync::watch::Sender<u64>;
 type SettleSignal = ();
 
 /// `#[path]` submodules (plan H19.2): keep this file under the 1000-line limit.
-#[path = "bridge_store_writer_parts/retry_state.rs"]
+#[path = "bridge_store_writer/retry_state.rs"]
 mod retry_state;
 use retry_state::RetryState;
-#[path = "bridge_store_writer_parts/retire_off_worker.rs"]
+#[path = "bridge_store_writer/retire_off_worker.rs"]
 mod retire_off_worker;
 use retire_off_worker::{drop_off_worker, RetireSignal, RetirementLog};
 
@@ -954,5 +954,5 @@ pub(crate) async fn apply(
 }
 
 #[cfg(test)]
-#[path = "bridge_store_writer_tests/mod.rs"]
+#[path = "bridge_store_writer/tests/mod.rs"]
 mod tests;
