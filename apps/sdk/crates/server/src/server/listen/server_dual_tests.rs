@@ -1,4 +1,5 @@
 use super::*;
+use crate::startup::AuthStateVerifier;
 use proxy_config::Socks5Endpoint;
 
 // -- same-port consumer migration ------------------------------------------
@@ -784,7 +785,14 @@ async fn tor_handler_enforces_global_pre_before_connector_after_reload() {
                     let calls = Arc::new(AtomicUsize::new(0));
                     let connector = ParkedTorConnector { observed: Some(observed_tx), release: Some(release_rx), calls: calls.clone() };
                     let mut handler = AbortHandler(tokio::spawn(handle_client_with_connector(
-                        server, Egress::Tor(tor.clone(), Some(Arc::new(pre_pool.clone())), Some(Arc::new(global_post_pool.clone())), false, None, Arc::new(arti_wrapper::PostPools::new())),
+                        server, Egress::Tor(super::TorEgress {
+                            handle: tor.clone(),
+                            global_pre: Some(Arc::new(pre_pool.clone())),
+                            global_post: Some(Arc::new(global_post_pool.clone())),
+                            dns_enabled: false,
+                            registry: None,
+                            pools: Arc::new(arti_wrapper::PostPools::new()),
+                        }),
                         Some(state), ConnHealthCounters::default(), false, 1, connector,
                     )));
                     if http {
@@ -849,7 +857,14 @@ async fn tor_handler_routes_and_releases_admission_on_error_or_cancel() {
                     let calls = Arc::new(AtomicUsize::new(0));
                     let connector = ParkedTorConnector { observed: Some(observed_tx), release: Some(release_rx), calls: calls.clone() };
                     let mut handler = AbortHandler(tokio::spawn(handle_client_with_connector(
-                        server, Egress::Tor(tor.clone(), None, Some(Arc::new(global)), false, None, Arc::new(arti_wrapper::PostPools::new())),
+                        server, Egress::Tor(super::TorEgress {
+                            handle: tor.clone(),
+                            global_pre: None,
+                            global_post: Some(Arc::new(global)),
+                            dns_enabled: false,
+                            registry: None,
+                            pools: Arc::new(arti_wrapper::PostPools::new()),
+                        }),
                         Some(state.clone()), ConnHealthCounters::default(), false, 1, connector,
                     )));
                     if http {

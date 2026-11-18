@@ -3,6 +3,8 @@
 //! полный SOCKS5 roundtrip.
 
 use super::*;
+use auth::UsersConfig;
+use std::sync::atomic::AtomicU64;
 
 use crate::config::{AllowedClients, ClientAccessConfig, SecurityConfig};
 use std::net::SocketAddr;
