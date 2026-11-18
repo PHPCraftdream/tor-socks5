@@ -148,11 +148,8 @@ async fn run_server_reports_final_flush_worker_panic() {
 async fn parked_server_startup(global: bool) {
     let _serial = TEST_LIFECYCLE.lock().await;
     let dir = tempfile::tempdir().unwrap();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
     let mut cfg = crate::config::Config {
-        listen: vec![address.to_string()],
+        listen: vec!["127.0.0.1:0".to_string()],
         ..Default::default()
     };
     cfg.log.ansi = true;
@@ -948,10 +945,10 @@ async fn production_handler_reload_waits_through_alternate_dial() {
             })
             .await;
             drop(admission);
+            tokio::time::sleep(Duration::from_millis(5)).await;
             if queued {
                 break;
             }
-            tokio::task::yield_now().await;
         }
         assert!(!reload.0.is_finished());
         release_tx.send(()).unwrap();

@@ -208,8 +208,8 @@ mod tests {
 
     #[test]
     fn bridges_file_is_created_once_and_never_overwritten() {
-        let dir = std::env::temp_dir().join(format!("tor-socks5-ensure-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
         let config_path = dir.join("tor-socks5.ktav");
         let mut cfg = Config::default();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -225,7 +225,6 @@ mod tests {
         assert!(!runtime.block_on(ensure_bridges_file(&cfg, &config_path)));
         let text = std::fs::read_to_string(&bridges_path).unwrap();
         assert!(!text.contains("min_alive: 99"), "{text}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

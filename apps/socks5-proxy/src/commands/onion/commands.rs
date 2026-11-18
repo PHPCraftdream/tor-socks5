@@ -15,12 +15,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 use clap::Subcommand;
-use proxy_config::{Config, OnionServicePort};
-use tor_socks5_onion::HsNickname;
+use tor_socks5::config::{Config, OnionServicePort};
+use tor_socks5::onion::HsNickname;
 
 use super::vanity;
 use crate::onion::store;
-use ::tor_socks5_onion::keys;
+use tor_socks5::onion::keys;
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum OnionAction {
@@ -106,7 +106,7 @@ struct Target {
 impl Target {
     fn new(config_path: Option<&Path>) -> Self {
         let config = Config::resolve_path(config_path);
-        let keystore = proxy_config::arti_keystore_dir(&config);
+        let keystore = tor_socks5::config::arti_keystore_dir(&config);
         Self { config, keystore }
     }
 
@@ -319,7 +319,7 @@ fn with_hint(error: keys::KeysError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proxy_config::OnionServiceEntry;
+    use tor_socks5::config::OnionServiceEntry;
 
     /// A fresh temp dir + a main config path inside it (the config file
     /// itself never has to exist: only its directory and stem are used).
@@ -460,7 +460,7 @@ mod tests {
     fn a_key_left_in_the_keystore_counts_as_an_existing_identity() {
         let (_tmp, config) = temp_setup();
         let nick = store::nickname("old").expect("nickname");
-        let dir = proxy_config::arti_keystore_dir(&config);
+        let dir = tor_socks5::config::arti_keystore_dir(&config);
         let keymgr = store::open(&dir).expect("keystore");
         store::generate(&keymgr, &nick, false).expect("generate");
         drop(keymgr);

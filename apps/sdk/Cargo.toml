@@ -30,11 +30,9 @@ bridges = ["dep:bridge-probe", "dep:bridge-store", "dep:bridge-verify-core"]
 tor = ["socks5", "acl", "dep:arti-wrapper"]
 fetch = ["tor", "bridges", "dep:bridge-fetcher"]
 dns = ["tor", "acl", "dep:tor-socks5-dns"]
-# Embedded Tor runtime APIs, opened step by step
-# (docs/plans/sdk-coverage-plan.md): SDK-7 — the bridge-health writer and
-# the guard-event observation layer; SDK-9 — the Tor client (settings from
-# config, the PT entry point, the TorHandle surface, watchdog status, conn
-# health). Links Arti — patch-kit needed (see README).
+# Embedded Tor runtime APIs: the bridge-health writer and guard-event
+# observation layer, the Tor client (settings, PT entry point, TorHandle,
+# watchdog status, conn health). Links Arti — patch-kit needed (see README).
 runtime = ["tor", "config", "bridges", "dep:tor-socks5-runtime", "dep:tokio-util", "dep:bridge-line", "dep:time"]
 # Busybox pluggable-transport dispatch for an embedding host.
 pt = ["runtime", "tor-socks5-runtime/pt"]

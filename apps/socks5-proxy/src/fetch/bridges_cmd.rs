@@ -12,10 +12,10 @@ use tokio_util::sync::CancellationToken;
 use crate::cli::BridgesAction;
 use crate::config::{Config, Loaded};
 use crate::process::{init_tracing, install_crypto_provider};
-use tor_socks5_runtime::bridge_manager::{fetch_bridges, FetchBridgesParams};
+use tor_socks5::runtime::{fetch_bridges, FetchBridgesParams};
 
 #[cfg(test)]
-use tor_socks5_runtime::tor_setup::build_tor_settings;
+use tor_socks5::runtime::build_tor_settings;
 
 #[cfg(test)]
 tokio::task_local! {
@@ -72,7 +72,7 @@ pub(crate) async fn cmd_bridges(
             // The binary is its own PT dispatcher (busybox style), so the
             // default environment resolution is correct here; a global
             // `pre_proxies` pool is rejected by the SDK with a typed error.
-            pt_binary: tor_socks5_runtime::pt::PtBinary::Environment,
+            pt_binary: tor_socks5::runtime::PtBinary::Environment,
             cancel: CancellationToken::new(),
         },
     )

@@ -9,8 +9,6 @@ mod config;
 mod config_cmd;
 #[path = "commands/help_cmd.rs"]
 mod help_cmd;
-// Onion helpers: the address/vanity core is not wired into the CLI yet.
-#[allow(dead_code)]
 #[path = "commands/onion/mod.rs"]
 mod onion;
 #[path = "process/mod.rs"]
@@ -57,7 +55,7 @@ fn main() -> Result<()> {
     // transport (TOR_PT_MANAGED_TRANSPORT_VER), run the in-process lyrebird
     // PT loop instead of the proxy. Must run before clap parsing (arti passes
     // argv that would blow up the parser) and must never angelise.
-    if let Some(result) = tor_socks5_runtime::pt::run_if_managed_transport() {
+    if let Some(result) = tor_socks5::pt::run_if_managed_transport() {
         return result;
     }
 

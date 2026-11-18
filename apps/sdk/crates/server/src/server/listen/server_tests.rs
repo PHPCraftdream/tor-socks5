@@ -110,11 +110,10 @@ use crate::config::UpstreamConfig;
 use crate::config::{AllowedClients, ClientAccessConfig, SecurityConfig};
 use resocks5_net::server::ServerError;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
 
 use bridge_line::BridgeLine;
 use bridge_store::BridgeStore;
@@ -214,77 +213,6 @@ fn pick_upstream_rejects_malformed_address_at_startup() {
     assert!(pick_upstream(&cfg, None, None, None, false)
         .unwrap()
         .is_some());
-}
-
-#[test]
-fn accept_error_backoff_is_sane() {
-    assert!(ACCEPT_ERROR_BACKOFF > Duration::ZERO);
-    assert!(ACCEPT_ERROR_BACKOFF <= Duration::from_secs(5));
-}
-
-#[tokio::test]
-async fn accept_loop_respects_concurrency_cap() {
-    // Two facts to prove deterministically: (1) the cap lets exactly
-    // two tasks run concurrently, and (2) it refuses a third while two
-    // permits are held. No real-time sleep — synchronization is explicit.
-    let permits = Arc::new(tokio::sync::Semaphore::new(2));
-    let active = Arc::new(AtomicUsize::new(0));
-    let max_seen = Arc::new(AtomicUsize::new(0));
-    // Barrier sized to the cap: the two permit-holders rendezvous here,
-    // which can only happen if they are simultaneously in-flight. We
-    // spawn exactly two tasks so every barrier participant is a holder
-    // (a third task would block on the barrier forever).
-    let barrier = Arc::new(tokio::sync::Barrier::new(2));
-
-    let mut handles = Vec::new();
-    for _ in 0..2 {
-        let permits = permits.clone();
-        let active = active.clone();
-        let max_seen = max_seen.clone();
-        let barrier = barrier.clone();
-        handles.push(tokio::spawn(async move {
-            let permit = permits.acquire_owned().await.unwrap();
-            let count = active.fetch_add(1, Ordering::SeqCst) + 1;
-            // Track the maximum concurrent count via CAS.
-            loop {
-                let current = max_seen.load(Ordering::SeqCst);
-                if count <= current
-                    || max_seen
-                        .compare_exchange(current, count, Ordering::SeqCst, Ordering::SeqCst)
-                        .is_ok()
-                {
-                    break;
-                }
-            }
-            // Both holders meet here, proving concurrent in-flight.
-            barrier.wait().await;
-            active.fetch_sub(1, Ordering::SeqCst);
-            drop(permit);
-        }));
-    }
-
-    for h in handles {
-        h.await.unwrap();
-    }
-    assert_eq!(
-        max_seen.load(Ordering::SeqCst),
-        2,
-        "the cap must allow exactly two tasks to run concurrently"
-    );
-
-    // Cap enforcement: with two permits held, a third must be refused;
-    // releasing one must free a slot.
-    let p1 = permits.clone().acquire_owned().await.unwrap();
-    let _p2 = permits.clone().acquire_owned().await.unwrap();
-    assert!(
-        permits.clone().try_acquire_owned().is_err(),
-        "a third concurrent permit must be refused by the cap of 2"
-    );
-    drop(p1);
-    assert!(
-        permits.try_acquire_owned().is_ok(),
-        "releasing a permit must free a slot"
-    );
 }
 
 // -- classify_conn_failure -------------------------------------------------
@@ -486,19 +414,21 @@ fn same_reset_different_stage_classifies_differently() {
 // -- absolute handshake deadline ------------------------------------------
 
 /// Server-under-test driving the REAL `accept_loop` over a loopback
-/// listener, with a one-permit semaphore so a single stuck handshake is
-/// observable as `available_permits() == 0`.
+/// listener, with a caller-chosen permit cap so the number of in-flight
+/// handlers is observable via `available_permits() == 0`.
 async fn spawn_test_server() -> (
     std::net::SocketAddr,
     Arc<tokio::sync::Semaphore>,
     tokio::task::JoinHandle<()>,
 ) {
-    spawn_test_server_with_upstream("127.0.0.1:1".to_string()).await
+    spawn_test_server_with_upstream("127.0.0.1:1".to_string(), 1).await
 }
 
-/// Like `spawn_test_server`, but with a caller-chosen egress upstream.
+/// Like `spawn_test_server`, but with a caller-chosen egress upstream
+/// and permit cap.
 async fn spawn_test_server_with_upstream(
     upstream_addr: String,
+    cap: usize,
 ) -> (
     std::net::SocketAddr,
     Arc<tokio::sync::Semaphore>,
@@ -506,7 +436,7 @@ async fn spawn_test_server_with_upstream(
 ) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let permits = Arc::new(tokio::sync::Semaphore::new(1));
+    let permits = Arc::new(tokio::sync::Semaphore::new(cap));
     // The egress never gets used: the deadline always fires first.
     let egress = Egress::Upstream(Arc::new(upstream::Upstream::new(upstream_addr, None)));
     let handle = tokio::spawn(accept_loop(
@@ -577,7 +507,7 @@ async fn upstream_setup_stall_releases_permit_at_deadline() {
         std::future::pending::<()>().await;
     });
 
-    let (addr, permits, server) = spawn_test_server_with_upstream(upstream_addr).await;
+    let (addr, permits, server) = spawn_test_server_with_upstream(upstream_addr, 1).await;
 
     // Drive a real client through a complete SOCKS5 handshake; the
     // server then parks in the upstream setup, holding the permit.
@@ -619,6 +549,47 @@ async fn upstream_setup_stall_releases_permit_at_deadline() {
         .expect("permit must be released by the upstream setup deadline");
     server.abort();
     upstream.abort();
+}
+
+/// The production accept loop must hold one admission permit per
+/// in-flight connection and return it when the handler ends: with a
+/// two-permit cap, two silent clients exhaust the semaphore, and past
+/// the handshake deadline both permits are released again. Removing
+/// either the acquire or the release from `accept_loop` fails this.
+#[tokio::test(start_paused = true)]
+async fn accept_loop_holds_and_releases_an_admission_permit_per_connection() {
+    let (addr, permits, server) =
+        spawn_test_server_with_upstream("127.0.0.1:1".to_string(), 2).await;
+    // Two silent clients: the server spawns a handler per connection,
+    // each holding one of the two permits.
+    let _c1 = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let _c2 = tokio::net::TcpStream::connect(addr).await.unwrap();
+    // Bounded by an iteration count, not by a paused-clock timeout: under
+    // `start_paused` a `yield_now` loop keeps the runtime busy, so the clock
+    // would never advance and a timeout could never fire.
+    let mut yields = 0u32;
+    while permits.available_permits() != 0 {
+        assert!(
+            yields < 20_000,
+            "both handlers must spawn and take their permits"
+        );
+        yields += 1;
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        permits.available_permits(),
+        0,
+        "two in-flight handlers must hold both permits"
+    );
+
+    // The absolute handshake deadline bounds each stuck handler, so both
+    // permits come back once the handlers end.
+    tokio::time::sleep(HANDSHAKE_DEADLINE + Duration::from_secs(5)).await;
+    let _both = tokio::time::timeout(Duration::from_secs(10), permits.acquire_many_owned(2))
+        .await
+        .expect("both permits must be released after the handshake deadline")
+        .expect("semaphore not closed");
+    server.abort();
 }
 
 #[tokio::test(start_paused = true)]

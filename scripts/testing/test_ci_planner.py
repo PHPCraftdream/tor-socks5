@@ -755,8 +755,8 @@ jobs:
             f'{name} = "{ver}"\n' for name, ver in [
                 ("data-encoding", "2.11.0"), ("ed25519-dalek", "2.2.0"), ("sha2", "0.10.9"),
                 ("sha3", "0.10.9"), ("zeroize", "1.9.1"), ("fs-mistrust", "0.16"),
-                ("tor-keymgr", "0.48"), ("tor-llcrypto", "0.48"), ("tempfile", "3")])
-        new_sdk4 = '[dependencies]\ntempfile = "3"\n'
+                ("tor-keymgr", "0.48"), ("tor-llcrypto", "0.48"), ("some-unsanctioned-crate", "1")])
+        new_sdk4 = '[dependencies]\nsome-unsanctioned-crate = "1"\n'
         p.check_removed_dependencies("apps/socks5-proxy/Cargo.toml", old_sdk4, new_sdk4)
         # An unsanctioned removal from the same manifest is refused.
         with self.assertRaisesRegex(p.MappingError, "missing mapping: удалена зависимость пакета"):
@@ -772,8 +772,8 @@ jobs:
         old_sdk5 = '[dependencies]\n' + ''.join(
             f'{name} = "{ver}"\n' for name, ver in [
                 ("tor-hscrypto", "0.48"), ("safelog", "0.4"), ("tor-cell", "0.48"),
-                ("tor-proto", "0.48"), ("tempfile", "3")])
-        new_sdk5 = '[dependencies]\ntempfile = "3"\n'
+                ("tor-proto", "0.48"), ("some-unsanctioned-crate", "1")])
+        new_sdk5 = '[dependencies]\nsome-unsanctioned-crate = "1"\n'
         p.check_removed_dependencies("apps/socks5-proxy/Cargo.toml", old_sdk5, new_sdk5)
         # An unsanctioned removal from the same manifest is refused.
         with self.assertRaisesRegex(p.MappingError, "missing mapping: удалена зависимость пакета"):
@@ -786,6 +786,51 @@ jobs:
         # Removing an unsanctioned dependency alongside it is still refused.
         with self.assertRaisesRegex(p.MappingError, "missing mapping: удалена зависимость пакета"):
             p.check_removed_dependencies("apps/socks5-proxy/Cargo.toml", old_h18, '[dependencies]\n')
+
+        # H20: 7 unused deps removed; bridge-fetcher/bridge-line/tempfile
+        # moved to dev-dependencies (removed from [dependencies]).
+        old_h20 = '[dependencies]\n' + ''.join(
+            f'{name} = "{ver}"\n' for name, ver in [
+                ("tor-error", "0.48"), ("serde", "1"), ("serde_json", "1"),
+                ("indexmap", "2"), ("time", "0.3"), ("thiserror", "2"),
+                ("getrandom", "0.3"), ("bridge-line", "0.2"),
+                ("bridge-fetcher", "0.2"), ("tempfile", "3")]) + 'keep-me = "1"\n'
+        new_h20 = '[dependencies]\nkeep-me = "1"\n'
+        p.check_removed_dependencies("apps/socks5-proxy/Cargo.toml", old_h20, new_h20)
+        # Removing an unsanctioned dependency alongside them is still refused.
+        with self.assertRaisesRegex(p.MappingError, "missing mapping: удалена зависимость пакета"):
+            p.check_removed_dependencies(
+                "apps/socks5-proxy/Cargo.toml",
+                old_h20.replace('keep-me = "1"\n', 'some-unsanctioned-crate = "1"\n'),
+                '[dependencies]\n')
+
+        # H20 (server): bridge-line/bridge-store/time/tracing-subscriber no
+        # longer live in [dependencies] of the tor-socks5-server manifest.
+        old_srv = '[dependencies]\nbridge-line = "0.2"\nbridge-store = "0.2"\n' \
+                  'time = "0.3"\ntracing-subscriber = "0.3"\nkeep-me = "1"\n'
+        p.check_removed_dependencies(
+            "apps/sdk/crates/server/Cargo.toml", old_srv, '[dependencies]\nkeep-me = "1"\n')
+        # Removing an unsanctioned dependency alongside them is still refused.
+        with self.assertRaisesRegex(p.MappingError, "missing mapping: удалена зависимость пакета"):
+            p.check_removed_dependencies(
+                "apps/sdk/crates/server/Cargo.toml",
+                old_srv.replace('keep-me = "1"\n', 'some-other-unsanctioned = "1"\n'),
+                '[dependencies]\n')
+
+        # H21: the binary links the SDK through the tor-socks5 facade;
+        # the six direct SDK/internal deps are gone from [dependencies].
+        old_h21 = '[dependencies]\n' + ''.join(
+            f'{name} = "0.2"\n' for name in [
+                "arti-wrapper", "auth", "persist-lock", "proxy-config",
+                "tor-socks5-onion", "tor-socks5-runtime"]) + 'keep-me = "1"\n'
+        p.check_removed_dependencies(
+            "apps/socks5-proxy/Cargo.toml", old_h21, '[dependencies]\nkeep-me = "1"\n')
+        # Removing an unsanctioned dependency alongside them is still refused.
+        with self.assertRaisesRegex(p.MappingError, "missing mapping: удалена зависимость пакета"):
+            p.check_removed_dependencies(
+                "apps/socks5-proxy/Cargo.toml",
+                old_h21.replace('keep-me = "1"\n', 'some-unsanctioned-crate = "1"\n'),
+                '[dependencies]\n')
 
     def test_deps1_proxy_dependency_removals(self):
         path = "apps/socks5-proxy/Cargo.toml"
@@ -814,7 +859,7 @@ jobs:
                 with self.assertRaisesRegex(p.MappingError, "missing mapping: удалена зависимость пакета"):
                     p.check_removed_dependencies(path, old_table, f'[{table}]\n')
 
-        retained = '[dependencies]\nbridge-fetcher = "1"\n'
+        retained = '[dependencies]\nsome-unsanctioned-crate = "1"\n'
         with self.assertRaisesRegex(p.MappingError, "missing mapping: удалена зависимость пакета"):
             p.check_removed_dependencies(path, retained, '[dependencies]\n')
 

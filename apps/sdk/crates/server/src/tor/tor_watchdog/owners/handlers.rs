@@ -76,9 +76,9 @@ impl HandlerTasks {
     pub(super) fn retain(self: &Arc<Self>) -> Result<()> {
         let mut retained = RETAINED_HANDLERS
             .lock()
-            .map_err(|_| anyhow!("хранилище обработчиков повреждено"))?;
+            .map_err(|_| anyhow!("handler storage is corrupted"))?;
         if retained.is_some() {
-            bail!("предыдущие обработчики ещё удерживаются");
+            bail!("previous handlers are still held");
         }
         *retained = Some(self.clone());
         Ok(())
@@ -92,7 +92,7 @@ impl HandlerTasks {
     pub(super) async fn recover() -> Result<()> {
         let retained = RETAINED_HANDLERS
             .lock()
-            .map_err(|_| anyhow!("хранилище обработчиков повреждено"))?
+            .map_err(|_| anyhow!("handler storage is corrupted"))?
             .clone();
         if let Some(tasks) = retained {
             tasks.shutdown().await?;
@@ -111,10 +111,10 @@ impl HandlerTasks {
             }
         })
         .await
-        .map_err(|_| anyhow!("истёк срок завершения обработчиков"))?;
+        .map_err(|_| anyhow!("handler shutdown timed out"))?;
         let mut retained = RETAINED_HANDLERS
             .lock()
-            .map_err(|_| anyhow!("хранилище обработчиков повреждено"))?;
+            .map_err(|_| anyhow!("handler storage is corrupted"))?;
         if retained
             .as_ref()
             .is_some_and(|tasks| std::ptr::eq(tasks.as_ref(), self))
