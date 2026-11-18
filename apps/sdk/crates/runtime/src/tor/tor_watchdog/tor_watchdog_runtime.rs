@@ -1,4 +1,8 @@
 use super::*;
+#[cfg(not(any(test, feature = "test-seams")))]
+use crate::bridge_maintenance::seam_site::Site;
+#[cfg(any(test, feature = "test-seams"))]
+use crate::test_seams::Site;
 
 /// Budget for the post-termination usability check: how long [`heal`] waits
 /// for the live client to actually carry traffic again after
@@ -333,16 +337,13 @@ pub fn spawn_bridge_failover_watchdog(
                 continue;
             };
 
-            let cfg = match Config::load_with_override(Some(config_path.as_path())) {
-                Ok(loaded) => loaded.into_config(),
-                Err(e) => {
-                    warn!(error = %e, "soft-failover: could not reload config");
-                    continue;
-                }
+            let Some(cfg) = load_watchdog_config_off_worker(&config_path).await else {
+                continue;
             };
 
             let active = handle.active_bridges();
             let candidates: Vec<_> = candidates_with_health(&cfg, config_path.as_path())
+                .await
                 .into_iter()
                 .filter(|(bridge, _)| active.contains(bridge))
                 .collect();
@@ -854,21 +855,44 @@ pub(crate) async fn route_bridge_count(
             }
             0
         }
-        Some(None) | None => live_bridge_count(path),
+        Some(None) | None => live_bridge_count_off_worker(path).await,
+    }
+}
+
+/// Per-tick config reload for the soft-failover loop, off the async worker
+/// (H15/TS19): `Config::load_with_override` is a blocking file read.
+/// Best-effort: `None` when the reload failed (the tick then skips).
+pub(crate) async fn load_watchdog_config_off_worker(path: &Path) -> Option<Config> {
+    let path = path.to_path_buf();
+    match crate::bridge_maintenance::run_blocking_at(Site::WatchdogConfigLoad, path, |path| {
+        Config::load_with_override(Some(path)).map(|loaded| loaded.into_config())
+    })
+    .await
+    {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            warn!(error = %e, "soft-failover: could not reload config");
+            None
+        }
     }
 }
 
 /// Number of bridges with proven reachability (`BridgeStore::alive_count`:
-/// answered a probe, no failure since, not retired), read straight off the
-/// on-disk health store. Best-effort: a
-/// missing/unreadable store yields 0 (the watchdog then declines to fire,
-/// leaving the bridge-maintenance loop to repopulate it).
-pub(super) fn live_bridge_count(config_path: &Path) -> usize {
+/// answered a probe, no failure since, not retired), read off the on-disk
+/// health store on the blocking pool (H15/TS19): `route_bridge_count` runs
+/// on async paths. Best-effort: a missing/unreadable store yields 0 (the
+/// watchdog then declines to fire, leaving the bridge-maintenance loop to
+/// repopulate it).
+pub(crate) async fn live_bridge_count_off_worker(config_path: &Path) -> usize {
     let path = BridgeStore::resolve_path(config_path);
-    match BridgeStore::load(path) {
-        Ok(store) => store.alive_count(),
-        Err(_) => 0,
-    }
+    crate::bridge_maintenance::run_blocking_at(Site::WatchdogStoreLoad, path, |path| {
+        match BridgeStore::load(path.to_path_buf()) {
+            Ok(store) => Ok(store.alive_count()),
+            Err(_) => Ok(0),
+        }
+    })
+    .await
+    .unwrap_or(0)
 }
 
 /// Current wall-clock time in Unix seconds. `SystemTime` rather than

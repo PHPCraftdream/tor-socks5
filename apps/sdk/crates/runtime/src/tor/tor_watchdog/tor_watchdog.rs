@@ -125,8 +125,11 @@ mod runtime;
 #[path = "tor_watchdog_status.rs"]
 mod status;
 
-#[allow(unused_imports)]
 pub use health::{classify_and_record, BridgeRefresh, TorHandle, TorHealth};
+// Off-worker seams used only by cfg(test) ts19_tests; cfg(test)-only gate
+// avoids unused-import warnings in a test-seams (non-test) lib build.
+#[cfg(test)]
+pub(crate) use runtime::{live_bridge_count_off_worker, load_watchdog_config_off_worker};
 #[cfg(test)]
 pub(crate) use runtime::{route_bridge_count, test_heal};
 pub use runtime::{spawn_bridge_failover_watchdog, spawn_tor_watchdog};

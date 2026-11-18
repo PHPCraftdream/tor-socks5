@@ -21,6 +21,12 @@ use crate::tor_watchdog::TorHandle;
 #[path = "bridge_maintenance/channel_probe.rs"]
 mod channel_probe;
 
+/// Test access to the channel-probe fallback store read (H15/TS19).
+/// Consumers live in cfg(test) ts19_tests, so gate on cfg(test) only:
+/// a test-seams lib build (no cfg(test)) would warn on an unused import.
+#[cfg(test)]
+pub(crate) use channel_probe::load_probe_store_off_worker;
+
 const CONNECTION_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const RECOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -221,10 +227,14 @@ pub(crate) async fn load_config_off_worker(path: &Path) -> Result<Config> {
     let path = path.to_path_buf();
     crate::workers::run_fallible_blocking(move || {
         #[cfg(any(test, feature = "test-seams"))]
-        crate::test_seams::note_task_context(crate::test_seams::Site::MaintenanceConfigLoad);
+        crate::test_seams::note_task_context(crate::test_seams::Site::MaintenanceConfigLoad, &path);
         #[cfg(any(test, feature = "test-seams"))]
         crate::test_seams::park_if_armed(crate::test_seams::Site::MaintenanceConfigLoad, &path);
-        crate::config::Config::load_with_override(Some(&path)).map(|loaded| loaded.into_config())
+        let loaded =
+            crate::config::Config::load_with_override(Some(&path)).map(|l| l.into_config());
+        #[cfg(any(test, feature = "test-seams"))]
+        crate::test_seams::mark_worker_done(crate::test_seams::Site::MaintenanceConfigLoad, &path);
+        loaded
     })
     .await
     .map_err(|e| anyhow::anyhow!("config load task failed: {e}"))?
@@ -340,7 +350,7 @@ async fn refresh_with_pt(
             }
         };
         if added > 0 {
-            let latest = Config::load_with_override(Some(path))?.into_config();
+            let latest = load_tick_config_off_worker(path).await?;
             usable = refresh_routes_with_pt(
                 handle,
                 path,
@@ -883,4 +893,86 @@ mod deficit_tests {
         // More usable than required → never goes negative.
         assert_eq!(compute_deficit(8, 40), 0);
     }
+}
+
+// --- H15/TS19 seam-aware blocking helper (moved here from `workers.rs`,
+// which was over the 1000-line file gate; this module is visible to every
+// former caller via `crate::bridge_maintenance`) ---
+
+/// Prod stand-in for [`crate::test_seams::Site`] (which compiles away
+/// outside test builds): keeps the seam-aware blocking helper's call sites
+/// shape-stable across both configurations.
+#[cfg(not(any(test, feature = "test-seams")))]
+pub(crate) mod seam_site {
+    #[derive(Clone, Copy)]
+    pub(crate) enum Site {
+        SetupStoreLoad,
+        SetupSeedLoad,
+        SetupProbeRank,
+        WatchdogConfigLoad,
+        WatchdogStoreLoad,
+        MaintenanceTickConfigLoad,
+        ProbeStoreLoad,
+        WarmerConfigLoad,
+        RankStoreLoad,
+        FetchMergeDrainConfigLoad,
+        FetchMergePoolLoad,
+    }
+}
+
+/// Run a blocking file read via [`workers::run_fallible_blocking`] (H15/TS19):
+/// the closure records its executing thread at `site` and marks the worker
+/// done after `op` finished, so a test can prove the read left the async worker.
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) async fn run_blocking_at<T: Send + 'static>(
+    site: crate::test_seams::Site,
+    path: std::path::PathBuf,
+    op: impl FnOnce(&Path) -> anyhow::Result<T> + Send + 'static,
+) -> Result<T> {
+    crate::workers::run_fallible_blocking(move || {
+        crate::test_seams::note_task_context(site, &path);
+        let loaded = op(&path);
+        crate::test_seams::mark_worker_done(site, &path);
+        loaded
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("blocking read task failed: {e}"))?
+}
+
+/// Prod twin of [`run_blocking_at`]: identical blocking behavior, no seams.
+#[cfg(not(any(test, feature = "test-seams")))]
+pub(crate) async fn run_blocking_at<T: Send + 'static>(
+    _site: seam_site::Site,
+    path: std::path::PathBuf,
+    op: impl FnOnce(&Path) -> anyhow::Result<T> + Send + 'static,
+) -> Result<T> {
+    crate::workers::run_fallible_blocking(move || op(&path))
+        .await
+        .map_err(|e| anyhow::anyhow!("blocking read task failed: {e}"))?
+}
+
+/// Post-discovery config reload inside the maintenance tick: a blocking
+/// file read that must not stall the async worker (H15/TS19).
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) async fn load_tick_config_off_worker(path: &Path) -> Result<Config> {
+    load_tick_config_off_worker_inner(crate::test_seams::Site::MaintenanceTickConfigLoad, path)
+        .await
+}
+
+/// Prod twin of [`load_tick_config_off_worker`].
+#[cfg(not(any(test, feature = "test-seams")))]
+pub(crate) async fn load_tick_config_off_worker(path: &Path) -> Result<Config> {
+    load_tick_config_off_worker_inner(seam_site::Site::MaintenanceTickConfigLoad, path).await
+}
+
+async fn load_tick_config_off_worker_inner(
+    #[cfg(any(test, feature = "test-seams"))] site: crate::test_seams::Site,
+    #[cfg(not(any(test, feature = "test-seams")))] site: seam_site::Site,
+    path: &Path,
+) -> Result<Config> {
+    let path = path.to_path_buf();
+    run_blocking_at(site, path, |p| {
+        crate::config::Config::load_with_override(Some(p)).map(|loaded| loaded.into_config())
+    })
+    .await
 }

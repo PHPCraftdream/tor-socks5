@@ -164,7 +164,29 @@ fn take_best<I: Ord>(items: Vec<I>, limit: usize) -> Vec<I> {
 /// the exact same candidate-gathering logic this module's own warming loop
 /// uses, rather than re-reading `BridgeStore` a second, subtly different
 /// way.
-pub(crate) fn candidates_with_health(
+#[cfg(any(test, feature = "test-seams"))]
+async fn load_rank_store_off_worker(
+    site: crate::test_seams::Site,
+    store_path: std::path::PathBuf,
+) -> anyhow::Result<BridgeStore> {
+    crate::bridge_maintenance::run_blocking_at(site, store_path, |p| {
+        BridgeStore::load(p.to_path_buf())
+    })
+    .await
+}
+
+#[cfg(not(any(test, feature = "test-seams")))]
+async fn load_rank_store_off_worker(
+    site: crate::bridge_maintenance::seam_site::Site,
+    store_path: std::path::PathBuf,
+) -> anyhow::Result<BridgeStore> {
+    crate::bridge_maintenance::run_blocking_at(site, store_path, |p| {
+        BridgeStore::load(p.to_path_buf())
+    })
+    .await
+}
+
+pub(crate) async fn candidates_with_health(
     cfg: &Config,
     config_path: &std::path::Path,
 ) -> Vec<(BridgeLine, Health)> {
@@ -179,8 +201,18 @@ pub(crate) fn candidates_with_health(
         return Vec::new();
     }
 
+    // The store load does blocking file I/O: run it on the blocking pool
+    // (H15/TS19) rather than stalling the caller's async worker.
     let store_path = BridgeStore::resolve_path(config_path);
-    let store = match BridgeStore::load(store_path) {
+    let store = match load_rank_store_off_worker(
+        #[cfg(any(test, feature = "test-seams"))]
+        crate::test_seams::Site::RankStoreLoad,
+        #[cfg(not(any(test, feature = "test-seams")))]
+        crate::bridge_maintenance::seam_site::Site::RankStoreLoad,
+        store_path,
+    )
+    .await
+    {
         Ok(s) => Some(s),
         Err(e) => {
             warn!(error = %e, "could not load bridge health store");
@@ -466,8 +498,8 @@ mod tests {
     /// the store's individual getters report — the single-lookup snapshot it
     /// now reads replaced five separate keyed lookups per bridge — and an
     /// unseeded bridge must stay all-zero with `cobs: None`.
-    #[test]
-    fn candidates_with_health_matches_individual_getters() {
+    #[tokio::test]
+    async fn candidates_with_health_matches_individual_getters() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config_path = dir.path().join("tor-socks5.ktav");
         let mut cfg = Config::default();
@@ -503,7 +535,7 @@ mod tests {
         );
         store.save().expect("seed save");
 
-        let candidates = candidates_with_health(&cfg, config_path.as_path());
+        let candidates = candidates_with_health(&cfg, config_path.as_path()).await;
         assert_eq!(candidates.len(), 2, "both configured bridges are listed");
 
         let reloaded = BridgeStore::load(BridgeStore::resolve_path(config_path.as_path()))
