@@ -1,6 +1,6 @@
 use std::sync::{Arc, LazyLock, Mutex};
 
-#[path = "run_workers.rs"]
+#[path = "workers/run_workers.rs"]
 mod run_workers;
 
 // The registry may retain 64 active jobs plus 64 overflow-failure slots (128 slots max);
@@ -393,7 +393,7 @@ impl WorkerRegistry {
 /// Task-scoped test registry ([`TestWorkers`]); keeps parallel tests off
 /// the shared blocking-worker budget of this module.
 #[cfg(any(test, feature = "test-seams"))]
-#[path = "test_workers.rs"]
+#[path = "workers/test_workers.rs"]
 mod test_workers;
 
 #[cfg(any(test, feature = "test-seams"))]
