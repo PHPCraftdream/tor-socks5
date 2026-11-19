@@ -194,6 +194,35 @@ beyond keeping the Tor state directory between runs. If a service stays
 degraded or broken: wait (uploads retry automatically), check the logs for
 the failing HsDir uploads, and restart the server if it does not settle.
 
+### Reading the startup log
+
+Every line below carries the service `nickname`; times are in seconds.
+
+- `onion service got a launch slot` — `waited_s` in the queue for one of the
+  4 launch slots and `slots_in_use`.
+- `onion service address available: onion service starting` —
+  `address_after_s` since the launch.
+- `onion service bootstrapping`, `reachable`, `reachable but degraded`,
+  `unreachable, attempting recovery` — `since_launch_s`, the `previous` state
+  and, for the degraded ones, `problem`: how many descriptor uploads failed
+  and how (timed out, fatal).
+- `onion service launch slot released` — `reason` (`status`: the service
+  reported one; `cap`: it held the slot for the whole 90 s without a status;
+  `shutdown`) and `held_s`.
+- `onion service: failed to complete rendezvous handshake` — `error` with the
+  whole chain of causes and `handshake_s`; successful handshakes log
+  `handshake_s` at `debug`.
+- `onion services starting` (at most every 15 s while some service has no
+  status yet) and `onion services: every service has reported a status` — the
+  number of services per state, and for the final line the median and the
+  slowest time to the first status.
+
+A service reports its first status only after its descriptor uploads have
+finished or given up. Arti retries each HsDir upload for up to **5 minutes**
+(a constant inside Arti), so when even one of the service's HsDirs does not
+answer, the first status comes at least 300 s after the launch. The detail
+per HsDir is Arti's own log: run with `RUST_LOG=info,tor_hsservice=debug`.
+
 ## Circuit length
 
 Each entry of the services file accepts `circuit_hops` — the total number of
