@@ -25,6 +25,7 @@ const START_SLOT_TIMEOUT: Duration = Duration::from_secs(90);
 #[derive(Clone)]
 pub(crate) struct StartGate {
     permits: Arc<tokio::sync::Semaphore>,
+    slots: usize,
 }
 
 impl StartGate {
@@ -35,7 +36,13 @@ impl StartGate {
     fn with_slots(slots: usize) -> Self {
         Self {
             permits: Arc::new(tokio::sync::Semaphore::new(slots)),
+            slots,
         }
+    }
+
+    /// Slots held right now (for the launch log lines).
+    pub(crate) fn in_use(&self) -> usize {
+        self.slots.saturating_sub(self.permits.available_permits())
     }
 
     /// Wait for a launch slot; `None` on shutdown or a closed semaphore.
@@ -51,9 +58,13 @@ impl StartGate {
             () = token.cancelled() => None,
             permit = self.permits.clone().acquire_owned() => {
                 // A closed semaphore gives no slot either.
-                permit.ok().map(|permit| StartSlot {
-                    _permit: permit,
-                    deadline: tokio::time::Instant::now() + START_SLOT_TIMEOUT,
+                permit.ok().map(|permit| {
+                    let acquired_at = tokio::time::Instant::now();
+                    StartSlot {
+                        _permit: permit,
+                        acquired_at,
+                        deadline: acquired_at + START_SLOT_TIMEOUT,
+                    }
                 })
             }
         }
@@ -65,19 +76,42 @@ impl StartGate {
     }
 }
 
+/// Why a launch slot was given back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SlotRelease {
+    /// The service reported a terminal status (or its status task is gone).
+    Status,
+    /// The slot cap elapsed with no terminal status.
+    Cap,
+    /// Shutdown.
+    Shutdown,
+}
+
+impl SlotRelease {
+    /// The value of the `reason` log field.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::Cap => "cap",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
 /// One launch slot; dropping it releases the permit back to the gate.
 pub(crate) struct StartSlot {
     // Kept (never read) for its Drop: dropping the slot releases the permit.
     _permit: tokio::sync::OwnedSemaphorePermit,
+    acquired_at: tokio::time::Instant,
     deadline: tokio::time::Instant,
 }
 
 impl StartSlot {
     /// Hold the slot until the service first reports started (`started`
     /// fires or its sender drops), the slot cap elapses, or shutdown — then
-    /// return, dropping `self` and releasing the slot for the next service.
-    /// The token is taken by value so the future stays `'static` when
-    /// spawned.
+    /// return why and for how long it was held, dropping `self` and releasing
+    /// the slot for the next service. The token is taken by value so the
+    /// future stays `'static` when spawned.
     ///
     /// cancel-safe: dropping the future (or the returned slot being dropped)
     /// releases the slot.
@@ -85,17 +119,16 @@ impl StartSlot {
         self,
         started: tokio::sync::oneshot::Receiver<()>,
         token: CancellationToken,
-    ) {
-        tokio::select! {
+    ) -> (SlotRelease, Duration) {
+        let reason = tokio::select! {
             biased;
-            () = token.cancelled() => {}
-            result = started => {
-                // Ok: the service first reported a terminal status; Err:
-                // the status task is gone. Either way the launch is over.
-                let _ = result;
-            }
-            () = tokio::time::sleep_until(self.deadline) => {}
-        }
+            () = token.cancelled() => SlotRelease::Shutdown,
+            // Ok: the service first reported a terminal status; Err: the
+            // status task is gone. Either way the launch is over.
+            _ = started => SlotRelease::Status,
+            () = tokio::time::sleep_until(self.deadline) => SlotRelease::Cap,
+        };
+        (reason, self.acquired_at.elapsed())
     }
 }
 
@@ -247,5 +280,63 @@ mod tests {
         );
         waiter.await.expect("waiter task joins");
         drop((two, three, four));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn in_use_counts_the_held_slots() {
+        let gate = StartGate::new();
+        assert_eq!(gate.in_use(), 0);
+        let token = CancellationToken::new();
+        let one = gate.acquire(&token).await.expect("slot 1");
+        let two = gate.acquire(&token).await.expect("slot 2");
+        assert_eq!(gate.in_use(), 2);
+        drop(one);
+        assert_eq!(gate.in_use(), 1);
+        drop(two);
+        assert_eq!(gate.in_use(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_terminal_status_is_reported_as_the_release_reason_with_the_hold_time() {
+        let gate = StartGate::with_slots(1);
+        let token = CancellationToken::new();
+        let slot = gate.acquire(&token).await.expect("slot");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let holder = tokio::spawn(slot.hold_until_started(started_rx, token.clone()));
+
+        tokio::time::advance(Duration::from_secs(7)).await;
+        started_tx.send(()).expect("the holder still listens");
+        let (reason, held) = holder.await.expect("holder task joins");
+        assert_eq!(reason, SlotRelease::Status);
+        assert_eq!(held, Duration::from_secs(7));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_cap_is_reported_as_the_release_reason_with_the_full_hold() {
+        let gate = StartGate::with_slots(1);
+        let token = CancellationToken::new();
+        let slot = gate.acquire(&token).await.expect("slot");
+        let (_never_tx, started_rx) = tokio::sync::oneshot::channel::<()>(); // never sent
+        let holder = tokio::spawn(slot.hold_until_started(started_rx, token.clone()));
+
+        let (reason, held) = holder.await.expect("holder task joins");
+        assert_eq!(reason, SlotRelease::Cap);
+        assert_eq!(held, START_SLOT_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_is_reported_as_the_release_reason() {
+        let gate = StartGate::with_slots(1);
+        let token = CancellationToken::new();
+        let slot = gate.acquire(&token).await.expect("slot");
+        let (_never_tx, started_rx) = tokio::sync::oneshot::channel::<()>(); // never sent
+        let holder = tokio::spawn(slot.hold_until_started(started_rx, token.clone()));
+
+        token.cancel();
+        let (reason, _held) = holder.await.expect("holder task joins");
+        assert_eq!(reason, SlotRelease::Shutdown);
+        assert_eq!(SlotRelease::Shutdown.as_str(), "shutdown");
+        assert_eq!(SlotRelease::Status.as_str(), "status");
+        assert_eq!(SlotRelease::Cap.as_str(), "cap");
     }
 }

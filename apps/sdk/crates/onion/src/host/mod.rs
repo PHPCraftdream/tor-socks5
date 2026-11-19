@@ -501,11 +501,69 @@ async fn run_services(config: OnionHostConfig, tracker: StatusTracker) {
             serve_started,
         ));
     }
+    let startup_report = tokio::spawn(report_startup(tracker.subscribe(), token.clone()));
     join_logged(
         &mut managers,
         "onion service manager task ended with a join error",
     )
     .await;
+    startup_report.abort();
+}
+
+/// Log the startup progress and its outcome: a progress line (at most every
+/// 15 s) while services still wait for a status, then one final line with the
+/// tally and the time to the first status. Event-driven (no timers); ends
+/// after the final line, at shutdown, or when the tracker is gone.
+async fn report_startup(
+    mut statuses: tokio::sync::watch::Receiver<status::OnionHostStatus>,
+    token: CancellationToken,
+) {
+    let started = tokio::time::Instant::now();
+    let mut report = status::StartupReport::new(started);
+    loop {
+        let snapshot = statuses.borrow_and_update().clone();
+        match report.observe(&snapshot, tokio::time::Instant::now()) {
+            Some(status::StartupLine::Progress { elapsed, tally }) => info!(
+                elapsed_s = status::secs(elapsed),
+                waiting = tally.waiting,
+                bootstrapping = tally.bootstrapping,
+                running = tally.running,
+                degraded = tally.degraded,
+                unreachable = tally.unreachable,
+                broken = tally.broken,
+                "onion services starting"
+            ),
+            Some(status::StartupLine::Done {
+                elapsed,
+                tally,
+                median,
+                slowest,
+            }) => {
+                info!(
+                    elapsed_s = status::secs(elapsed),
+                    median_first_status_s = status::secs(median),
+                    slowest_first_status_s = status::secs(slowest),
+                    running = tally.running,
+                    degraded = tally.degraded,
+                    unreachable = tally.unreachable,
+                    broken = tally.broken,
+                    ended = tally.ended,
+                    "onion services: every service has reported a status"
+                );
+                return;
+            }
+            None => {}
+        }
+        tokio::select! {
+            biased;
+            () = token.cancelled() => return,
+            changed = statuses.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// Outcome of an asynchronous, nonblocking keystore-lock probe.

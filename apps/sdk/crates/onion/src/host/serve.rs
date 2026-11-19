@@ -34,10 +34,12 @@ use tor_cell::relaycell::msg::{Connected, End, EndReason};
 use tor_hsservice::{RendRequest, RunningOnionService, StreamRequest};
 use tor_proto::stream::IncomingStreamRequest;
 use tor_socks5_runtime::tor_watchdog::TorHandle;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn, Instrument as _};
 
 use super::start_gate;
-use super::status::{ServiceState, ServiceStatus, StatusTracker};
+use super::status::{
+    error_chain, problem_summary, secs, secs_since, ServiceState, ServiceStatus, StatusTracker,
+};
 use super::ServiceFailure;
 use crate::keys;
 
@@ -204,13 +206,16 @@ pub(crate) async fn serve_service(
             }
             requests = accepted_rx.recv() => match requests {
                 Some(requests) => {
-                    circuits.spawn(serve_stream_requests(
-                        requests,
-                        targets.clone(),
-                        semaphore.clone(),
-                        global.clone(),
-                        children_token.clone(),
-                    ));
+                    circuits.spawn(
+                        serve_stream_requests(
+                            requests,
+                            targets.clone(),
+                            semaphore.clone(),
+                            global.clone(),
+                            children_token.clone(),
+                        )
+                        .in_current_span(),
+                    );
                 }
                 // Closes only when every handshake task is gone (shutdown);
                 // the cancelled arm above ends the loop.
@@ -221,26 +226,38 @@ pub(crate) async fn serve_service(
                     let gate = accept_gate.clone();
                     let token = children_token.clone();
                     let accepted_tx = accepted_tx.clone();
-                    handshakes.spawn(async move {
-                        let Some(permit) = gate.acquire(&token).await else { return };
-                        let accepted = tokio::select! {
-                            biased;
-                            () = token.cancelled() => return,
-                            accepted = rend.accept() => accepted,
-                        };
-                        // The slot is held only for the handshake itself.
-                        drop(permit);
-                        match accepted {
-                            Ok(requests) => {
-                                // A closed channel means the supervisor is
-                                // shutting down.
-                                let _ = accepted_tx.send(Box::pin(requests)).await;
-                            }
-                            Err(error) => {
-                                warn!(%error, "onion service: failed to complete rendezvous handshake");
+                    handshakes.spawn(
+                        async move {
+                            let Some(permit) = gate.acquire(&token).await else { return };
+                            let began = tokio::time::Instant::now();
+                            let accepted = tokio::select! {
+                                biased;
+                                () = token.cancelled() => return,
+                                accepted = rend.accept() => accepted,
+                            };
+                            // The slot is held only for the handshake itself.
+                            drop(permit);
+                            match accepted {
+                                Ok(requests) => {
+                                    debug!(
+                                        handshake_s = secs_since(began),
+                                        "onion service: rendezvous handshake completed"
+                                    );
+                                    // A closed channel means the supervisor is
+                                    // shutting down.
+                                    let _ = accepted_tx.send(Box::pin(requests)).await;
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        error = %error_chain(&error),
+                                        handshake_s = secs_since(began),
+                                        "onion service: failed to complete rendezvous handshake"
+                                    );
+                                }
                             }
                         }
-                    });
+                        .in_current_span(),
+                    );
                 }
                 None => {
                     debug!("onion service rendezvous stream ended");
@@ -391,11 +408,14 @@ async fn handle_stream_request(
 /// degraded; every transition is published to `tracker`). `started` fires on
 /// the first terminal status — the launch-phase slot release (see
 /// `start_gate`). `broken` fires on a Broken report (terminal, unrecoverable)
-/// — the supervision relaunch signal; the logger then returns.
+/// — the supervision relaunch signal; the logger then returns. Every line
+/// carries the time since `launched_at`, and the degraded ones arti's problem.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn log_status_events(
     mut events: tor_hsservice::status::OnionServiceStatusStream,
     nickname: String,
     address: String,
+    launched_at: tokio::time::Instant,
     started: tokio::sync::oneshot::Sender<()>,
     broken: Option<tokio::sync::oneshot::Sender<()>>,
     tracker: StatusTracker,
@@ -426,17 +446,20 @@ pub(crate) async fn log_status_events(
             last = Some(state);
             continue;
         }
+        let previous = last;
         last = Some(state);
+        let since_launch_s = secs_since(launched_at);
+        let problem = problem_summary(status.current_problem());
         match state {
             tor_hsservice::status::State::Running => {
                 release(&mut started);
                 set_status(&tracker, &nickname, ServiceStatus::Running);
-                info!(nickname = %nickname, %address, "onion service reachable");
+                info!(nickname = %nickname, %address, since_launch_s, ?previous, "onion service reachable");
             }
             tor_hsservice::status::State::Broken => {
                 release(&mut started);
                 set_status(&tracker, &nickname, ServiceStatus::Broken);
-                warn!(nickname = %nickname, %address, "onion service is broken");
+                warn!(nickname = %nickname, %address, since_launch_s, ?previous, %problem, "onion service is broken");
                 // Broken is terminal: fire the supervision signal and stop
                 // logging; the service is relaunched by `service_manager`.
                 if let Some(broken) = broken.take() {
@@ -447,7 +470,10 @@ pub(crate) async fn log_status_events(
             tor_hsservice::status::State::DegradedReachable => {
                 release(&mut started);
                 set_status(&tracker, &nickname, ServiceStatus::DegradedReachable);
-                warn!(nickname = %nickname, %address, "onion service reachable but degraded");
+                warn!(
+                    nickname = %nickname, %address, since_launch_s, ?previous, %problem,
+                    "onion service reachable but degraded"
+                );
             }
             tor_hsservice::status::State::DegradedUnreachable
             | tor_hsservice::status::State::Recovering => {
@@ -457,11 +483,14 @@ pub(crate) async fn log_status_events(
                     ServiceStatus::Recovering
                 };
                 set_status(&tracker, &nickname, status);
-                warn!(nickname = %nickname, %address, "onion service unreachable, attempting recovery");
+                warn!(
+                    nickname = %nickname, %address, since_launch_s, ?previous, %problem,
+                    "onion service unreachable, attempting recovery"
+                );
             }
             tor_hsservice::status::State::Bootstrapping => {
                 set_status(&tracker, &nickname, ServiceStatus::Bootstrapping);
-                info!(nickname = %nickname, "onion service bootstrapping");
+                info!(nickname = %nickname, since_launch_s, ?previous, "onion service bootstrapping");
             }
             tor_hsservice::status::State::Shutdown => {
                 info!(nickname = %nickname, "onion service shut down");
@@ -655,6 +684,7 @@ pub(crate) async fn service_manager(
         // Hold one of at most MAX_STARTING launch slots until terminal status,
         // the 90 s slot cap, or shutdown.
         {
+            let queued_at = tokio::time::Instant::now();
             let Some(slot) = gate.acquire(&token).await else {
                 debug!(nickname = %nick, "onion service launch aborted: shutting down while waiting for a launch slot");
                 mark_stopped(&tracker, &nick);
@@ -664,6 +694,13 @@ pub(crate) async fn service_manager(
                 mark_stopped(&tracker, &nick);
                 return;
             }
+            info!(
+                nickname = %nick,
+                waited_s = secs_since(queued_at),
+                slots_in_use = gate.in_use(),
+                "onion service got a launch slot"
+            );
+            let launched_at = tokio::time::Instant::now();
             match tunnel.raw().launch_onion_service(config.clone()) {
                 Ok(Some((service, rend_requests))) => {
                     #[cfg(test)]
@@ -673,7 +710,17 @@ pub(crate) async fn service_manager(
                     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
                     // The slot holder releases it at terminal status/90 s cap/shutdown.
                     let mut slot_holder = tokio::task::JoinSet::new();
-                    slot_holder.spawn(slot.hold_until_started(started_rx, token.clone()));
+                    let held_token = token.clone();
+                    let held_nick = nick.clone();
+                    slot_holder.spawn(async move {
+                        let (reason, held) = slot.hold_until_started(started_rx, held_token).await;
+                        info!(
+                            nickname = %held_nick,
+                            reason = reason.as_str(),
+                            held_s = secs(held),
+                            "onion service launch slot released"
+                        );
+                    });
                     match wait_for_address(&service, &token, &nick).await {
                         AddressWait::Available(address) => {
                             let actual = address.display_unredacted().to_string();
@@ -694,6 +741,7 @@ pub(crate) async fn service_manager(
                             info!(
                                 nickname = %nick,
                                 address = %address.display_unredacted(),
+                                address_after_s = secs_since(launched_at),
                                 "onion service address available: onion service starting"
                             );
                             #[cfg(test)]
@@ -702,18 +750,22 @@ pub(crate) async fn service_manager(
                             }
                             let (broken_tx, broken_rx) = tokio::sync::oneshot::channel();
                             let mut children = tokio::task::JoinSet::new();
-                            children.spawn(serve_service(
-                                service.clone(),
-                                rend_requests,
-                                ports.clone(),
-                                semaphore.clone(),
-                                global_streams.clone(),
-                                token.clone(),
-                            ));
+                            children.spawn(
+                                serve_service(
+                                    service.clone(),
+                                    rend_requests,
+                                    ports.clone(),
+                                    semaphore.clone(),
+                                    global_streams.clone(),
+                                    token.clone(),
+                                )
+                                .instrument(tracing::info_span!("onion_service", nickname = %nick)),
+                            );
                             children.spawn(log_status_events(
                                 service.status_events(),
                                 nick.clone(),
                                 address.display_unredacted().to_string(),
+                                launched_at,
                                 started_tx,
                                 Some(broken_tx),
                                 tracker.clone(),
