@@ -77,6 +77,8 @@ SANCTIONED_DEPENDENCY_REMOVALS = frozenset({
     ("apps/sdk/crates/server/Cargo.toml", "dependencies", "bridge-store"),
     ("apps/sdk/crates/server/Cargo.toml", "dependencies", "time"),
     ("apps/sdk/crates/server/Cargo.toml", "dependencies", "tracing-subscriber"),
+    # Bridge groups: bridge-line is a normal dependency of tor-socks5-server.
+    ("apps/sdk/crates/server/Cargo.toml", "dev-dependencies", "bridge-line"),
     # H21: the binary now links the SDK through the tor-socks5 facade
     # (features `pt` + `auth`; `onion-service` maps to facade
     # `onion-service`/`onion-keys`). persist-lock comes via the facade's

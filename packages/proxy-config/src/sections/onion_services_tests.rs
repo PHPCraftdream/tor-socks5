@@ -248,6 +248,8 @@ fn onion_services_roundtrip_through_write() {
             address: None,
             key: None,
             circuit_hops: 4,
+            bridge_group: None,
+            bridges: None,
             ports: vec![
                 OnionServicePort {
                     onion_port: 80,
@@ -278,6 +280,8 @@ fn circuit_hops_is_skipped_in_serialized_output_when_default() {
             address: None,
             key: None,
             circuit_hops: 4,
+            bridge_group: None,
+            bridges: None,
             ports: vec![OnionServicePort {
                 onion_port: 80,
                 target: "127.0.0.1:8080".into(),
@@ -304,6 +308,8 @@ fn non_default_circuit_hops_is_serialized_and_roundtrips() {
             address: None,
             key: None,
             circuit_hops: 2,
+            bridge_group: None,
+            bridges: None,
             ports: vec![OnionServicePort {
                 onion_port: 80,
                 target: "127.0.0.1:8080".into(),
@@ -493,6 +499,8 @@ fn address_and_key_roundtrip_and_key_is_redacted_in_debug() {
             address: Some(ADDRESS.into()),
             key: Some(IdentityKey::new("LS0tLS1CRUdJTg==").unwrap()),
             circuit_hops: 4,
+            bridge_group: None,
+            bridges: None,
             ports: vec![OnionServicePort {
                 onion_port: 80,
                 target: "127.0.0.1:8080".into(),
@@ -517,4 +525,134 @@ fn a_port_mapping_parses_from_its_file_spelling() {
     assert_eq!((port.onion_port, port.target.as_str()), (443, "[::1]:8443"));
     assert!("443".parse::<OnionServicePort>().is_err());
     assert!("0=127.0.0.1:80".parse::<OnionServicePort>().is_err());
+}
+
+fn grouped(nickname: &str, group: &str, bridges: Option<u8>, enabled: bool) -> String {
+    let bridges = bridges.map_or(String::new(), |n| format!("\t\tbridges: {n}\n"));
+    format!(
+        "\t{{\n\t\tnickname: {nickname}\n\t\tenabled: {enabled}\n\t\tbridge_group: {group}\n\
+         {bridges}\t\tports: [ 80=127.0.0.1:8080 ]\n\t}}\n"
+    )
+}
+
+#[test]
+fn a_service_without_a_bridge_group_uses_the_shared_client() {
+    let cfg = parse(&service_with("enabled: true")).expect("parses");
+    assert_eq!(cfg.services[0].bridge_group, None);
+    assert_eq!(cfg.services[0].bridges, None);
+    assert_eq!(cfg.services[0].bridge_group_spec(), None);
+}
+
+#[test]
+fn a_bridge_group_defaults_to_one_bridge() {
+    let cfg = parse(&config_with_services(&grouped("web", "edge", None, true))).expect("parses");
+    assert_eq!(cfg.services[0].bridge_group_spec(), Some(("edge", 1)));
+}
+
+#[test]
+fn a_bridge_group_keeps_its_stated_bridge_count() {
+    let cfg = parse(&config_with_services(&grouped(
+        "web",
+        "edge",
+        Some(3),
+        true,
+    )))
+    .expect("parses");
+    assert_eq!(cfg.services[0].bridge_group_spec(), Some(("edge", 3)));
+}
+
+#[test]
+fn bridges_without_a_group_are_rejected_with_the_entry_path() {
+    let err = parse(&service_with("bridges: 2")).expect_err("needs a group");
+    assert!(err.contains("services[0].bridges"), "{err}");
+    assert!(err.contains("bridge_group"), "{err}");
+}
+
+#[test]
+fn the_bridge_count_must_be_within_range() {
+    for count in [0u8, 9, 200] {
+        let err = parse(&config_with_services(&grouped(
+            "web",
+            "edge",
+            Some(count),
+            true,
+        )))
+        .expect_err("out of range");
+        assert!(err.contains("services[0].bridges"), "{count}: {err}");
+    }
+    let err =
+        parse(&service_with("bridge_group: edge\n\t\tbridges: two")).expect_err("not a number");
+    assert!(err.contains("bridges"), "{err}");
+    for count in [1u8, 8] {
+        parse(&config_with_services(&grouped(
+            "web",
+            "edge",
+            Some(count),
+            true,
+        )))
+        .unwrap_or_else(|err| panic!("{count} must be accepted: {err}"));
+    }
+}
+
+#[test]
+fn group_names_are_lower_case_directory_safe_and_short() {
+    for bad in ["Edge", "a b", "a/b", "a.b", "..", &"x".repeat(26)] {
+        let src = service_with(&format!("bridge_group: {bad}"));
+        let err = parse(&src).expect_err(&format!("{bad:?} must be rejected"));
+        assert!(err.contains("services[0].bridge_group"), "{bad:?}: {err}");
+    }
+    for good in ["a", "edge-1", "edge_1", "0", &"x".repeat(25)] {
+        parse(&service_with(&format!("bridge_group: {good}")))
+            .unwrap_or_else(|err| panic!("{good:?} must be accepted: {err}"));
+    }
+}
+
+#[test]
+fn enabled_services_of_a_group_must_agree_on_the_bridge_count() {
+    let src = config_with_services(&format!(
+        "{}{}",
+        grouped("a", "edge", Some(2), true),
+        grouped("b", "edge", Some(3), true)
+    ));
+    let err = parse(&src).expect_err("conflict");
+    assert!(err.contains("'edge'"), "{err}");
+    assert!(
+        err.contains("services[0]") && err.contains("services[1]"),
+        "{err}"
+    );
+    // An unstated count is the default of one, so it conflicts with two.
+    let src = config_with_services(&format!(
+        "{}{}",
+        grouped("a", "edge", Some(2), true),
+        grouped("b", "edge", None, true)
+    ));
+    assert!(parse(&src).is_err());
+}
+
+#[test]
+fn services_of_a_group_with_the_same_count_and_other_groups_are_accepted() {
+    let src = config_with_services(&format!(
+        "{}{}{}{}",
+        grouped("a", "edge", Some(2), true),
+        grouped("b", "edge", Some(2), true),
+        grouped("c", "core", Some(3), true),
+        grouped("d", "edge", Some(5), false)
+    ));
+    let cfg = parse(&src).expect("a disabled service may differ");
+    assert_eq!(cfg.services.len(), 4);
+}
+
+#[test]
+fn bridge_group_and_bridges_roundtrip_and_are_omitted_when_unset() {
+    let src = config_with_services(&format!(
+        "{}{}",
+        grouped("a", "edge", Some(2), true),
+        service("plain", "80=127.0.0.1:8081")
+    ));
+    let cfg = parse(&src).expect("parses");
+    let written = ktav::to_string(&cfg).expect("serializes");
+    assert!(written.contains("bridge_group: edge"), "{written}");
+    assert!(written.contains("bridges: 2"), "{written}");
+    assert_eq!(written.matches("bridge_group").count(), 1, "{written}");
+    assert_eq!(parse(&written).expect("reparses"), cfg);
 }

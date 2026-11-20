@@ -21,6 +21,15 @@ const DEFAULT_CIRCUIT_HOPS: u8 = 4;
 /// Length of the `<host>` part of a v3 onion address (base32 of the public key).
 const ADDRESS_HOST_LEN: usize = 56;
 
+/// Maximum bridge-group name length in bytes (the name becomes a directory name).
+const MAX_GROUP_NAME_LEN: usize = 25;
+
+/// Bridges of a group whose entries do not state `bridges`.
+pub const DEFAULT_GROUP_BRIDGES: u8 = 1;
+
+/// Largest `bridges` value: a group this wide gains nothing more.
+pub const MAX_GROUP_BRIDGES: u8 = 8;
+
 /// The secret identity key of a service: the bytes of the Arti keystore key
 /// file, as one line of base64. It is the whole identity of the service, so
 /// it is never shown by `Debug` and never part of an error message.
@@ -80,9 +89,27 @@ pub struct OnionServiceEntry {
     /// `2 | 3 | 4` are permitted. Omitted when `4` on serialization.
     #[serde(skip_serializing_if = "circuit_hops_is_default")]
     pub circuit_hops: u8,
+    /// Bridge group: services of one group are hosted by their own Tor client
+    /// that uses only the group's bridges, so a bridge failing elsewhere does
+    /// not touch them. `None` (default): the process-wide client with all
+    /// bridges. `[a-z0-9_-]+`, at most 25 bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bridge_group: Option<String>,
+    /// How many bridges the group uses (`1..=8`, default `1`). Only with
+    /// `bridge_group`; every enabled service of a group must state the same.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bridges: Option<u8>,
     /// Port mappings `onion_port=host:port`: at least one for an enabled
     /// service, none yet for a disabled one.
     pub ports: Vec<OnionServicePort>,
+}
+
+impl OnionServiceEntry {
+    /// The bridge group and its bridge count, when the service has a group.
+    pub fn bridge_group_spec(&self) -> Option<(&str, u8)> {
+        let group = self.bridge_group.as_deref()?;
+        Some((group, self.bridges.unwrap_or(DEFAULT_GROUP_BRIDGES)))
+    }
 }
 
 /// The document of the onion services file: `services: [ { .. } ]`.
@@ -156,6 +183,41 @@ where
             "services[i].circuit_hops must be an integer; permitted values are 2, 3, or 4",
         )
     })
+}
+
+/// Parse `bridges`: an integer; the range check happens in [`validate_entries`]
+/// so the error can carry the entry path.
+fn parse_bridges<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    u8::deserialize(deserializer).map(Some).map_err(|_| {
+        serde::de::Error::custom(format!(
+            "services[i].bridges must be an integer from 1 to {MAX_GROUP_BRIDGES}"
+        ))
+    })
+}
+
+/// Bridge-group name: it names a directory, so lower-case only (a
+/// case-insensitive file system must not merge two groups), non-empty, at
+/// most [`MAX_GROUP_NAME_LEN`] bytes, only `a-z 0-9 _ -`.
+fn validate_group_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("the group name must not be empty".to_owned());
+    }
+    if name.len() > MAX_GROUP_NAME_LEN {
+        return Err(format!(
+            "the group name is {} bytes long (max {MAX_GROUP_NAME_LEN})",
+            name.len()
+        ));
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+    {
+        return Err("the group name must only contain a-z 0-9 _ -".to_owned());
+    }
+    Ok(())
 }
 
 /// Lightweight nickname check (tor-hsservice re-validates at launch):
@@ -254,6 +316,10 @@ struct OnionServiceEntryRaw {
         deserialize_with = "parse_circuit_hops"
     )]
     circuit_hops: u8,
+    #[serde(default)]
+    bridge_group: Option<String>,
+    #[serde(default, deserialize_with = "parse_bridges")]
+    bridges: Option<u8>,
     ports: Vec<String>,
 }
 
@@ -299,6 +365,25 @@ fn validate_entries<E: serde::de::Error>(
                 entry.circuit_hops
             )));
         }
+        if let Some(group) = &entry.bridge_group {
+            validate_group_name(group).map_err(|reason| {
+                E::custom(format!(
+                    "{path}.bridge_group: invalid group '{group}' ({reason})"
+                ))
+            })?;
+        }
+        if let Some(bridges) = entry.bridges {
+            if entry.bridge_group.is_none() {
+                return Err(E::custom(format!(
+                    "{path}.bridges: `bridges` needs `bridge_group` (name the group the bridges belong to)"
+                )));
+            }
+            if !(1..=MAX_GROUP_BRIDGES).contains(&bridges) {
+                return Err(E::custom(format!(
+                    "{path}.bridges: bridges must be 1 to {MAX_GROUP_BRIDGES} (got {bridges})"
+                )));
+            }
+        }
         if entry.enabled && entry.ports.is_empty() {
             return Err(E::custom(format!(
                 "{path}.ports: at least one port mapping is required"
@@ -337,9 +422,12 @@ fn validate_entries<E: serde::de::Error>(
             address: entry.address,
             key,
             circuit_hops: entry.circuit_hops,
+            bridge_group: entry.bridge_group,
+            bridges: entry.bridges,
             ports,
         });
     }
+    check_group_bridge_counts::<E>(&entries)?;
     // One server circuit length per process (an Arti limitation): all
     // enabled services must use the same hop count.
     let mut reference: Option<(usize, u8)> = None;
@@ -362,6 +450,29 @@ fn validate_entries<E: serde::de::Error>(
         }
     }
     Ok(entries)
+}
+
+/// The enabled services of one group share one client, so they must agree on
+/// how many bridges it has (an unstated count means the default).
+fn check_group_bridge_counts<E: serde::de::Error>(entries: &[OnionServiceEntry]) -> Result<(), E> {
+    let mut seen: Vec<(&str, usize, u8)> = Vec::new();
+    for (idx, entry) in entries.iter().enumerate() {
+        let Some((group, bridges)) = entry.bridge_group_spec().filter(|_| entry.enabled) else {
+            continue;
+        };
+        match seen.iter().find(|(name, ..)| *name == group) {
+            None => seen.push((group, idx, bridges)),
+            Some(&(_, first, expected)) if expected != bridges => {
+                return Err(E::custom(format!(
+                    "services: the services of bridge group '{group}' must agree on `bridges` \
+                     (one client per group): services[{first}] uses {expected}, \
+                     services[{idx}] uses {bridges}"
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn onion_services<'de, D>(deserializer: D) -> Result<Vec<OnionServiceEntry>, D::Error>

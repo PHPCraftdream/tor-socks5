@@ -596,6 +596,8 @@ mod tests {
                 address: None,
                 key: None,
                 circuit_hops: DEFAULT_CIRCUIT_HOPS,
+                bridge_group: None,
+                bridges: None,
                 ports: Vec::new(),
             }],
         )

@@ -58,6 +58,8 @@ fn service(nickname: &str) -> OnionServiceEntry {
         address: None,
         key: None,
         circuit_hops: 4,
+        bridge_group: None,
+        bridges: None,
         ports: vec![proxy_config::OnionServicePort {
             onion_port: 80,
             target: "127.0.0.1:8080".to_owned(),
