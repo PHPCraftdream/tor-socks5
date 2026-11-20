@@ -680,10 +680,9 @@ mod tests {
                 address: None,
                 key: None,
                 circuit_hops,
-                ports: vec![crate::config::OnionServicePort {
-                    onion_port: 80,
-                    target: "127.0.0.1:8080".to_owned(),
-                }],
+                bridge_group: None,
+                bridges: None,
+                ports: vec!["80=127.0.0.1:8080".parse().expect("a port mapping")],
             }],
             ..Default::default()
         }

@@ -339,6 +339,8 @@ pub(super) async fn phase_bootstrap(
     init.complete_handoff()?;
     if super::global_init::launch_background(ctx.hooks.as_deref()) {
         let mut launch = super::producers::LaunchGuard::new(producer_owner.clone());
+        #[cfg(feature = "onion-service")]
+        let onion_settings = settings.clone();
         tor_socks5_runtime::bridge_producers::launch_producers(
             handle.clone(),
             ctx.config_path.clone(),
@@ -358,6 +360,7 @@ pub(super) async fn phase_bootstrap(
         #[cfg(feature = "onion-service")]
         crate::onion::service::spawn_services(
             handle.clone(),
+            onion_settings,
             &cfg.onion_services,
             &ctx.config_path,
             producer_token.clone(),

@@ -48,6 +48,8 @@ fn enabled_onion_services_with_upstream_emit_an_explicit_warning() {
         address: None,
         key: None,
         circuit_hops: 4,
+        bridge_group: None,
+        bridges: None,
         ports: vec![proxy_config::OnionServicePort {
             onion_port: 80,
             target: "127.0.0.1:8080".into(),

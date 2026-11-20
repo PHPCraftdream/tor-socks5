@@ -100,7 +100,8 @@ tor-socks5 onion remove <NICK> --yes           # delete the service and its key
 - **The Arti keystore is a copy.** At each start the key of the file is put
   into the keystore at
   `<config dir>/arti-data/state/keystore/hss/<nick>/ks_hs_id.ed25519_expanded_private`
-  (the file arti reads). A key that an older version left in the keystore
+  (the file arti reads; a service in a bridge group uses the keystore under
+  `arti-data/group-<name>/state/` instead). A key that an older version left in the keystore
   without a file entry is adopted at the first start and moves into the
   file, so the address stays.
 - **Lock:** while the server runs and any onion service is active, it holds
@@ -335,9 +336,72 @@ In practice: start with few services, watch the status lines, and raise the
 count gradually. Set `tor.guard_spread: 2` or `3` only for failure isolation
 — provided you have at least that many working bridges (see
 [bridges](../bridges.md)) and accept that more bridges see your traffic. For
-much more than ~10 services, consider splitting them across separate
-tor-socks5 processes, each with its own config directory and its own bridge
-set — an option you configure yourself, not a shipped feature.
+much more than ~10 services, put them in [bridge groups](#bridge-groups),
+or split them across separate tor-socks5 processes, each with its own config
+directory and its own bridge set.
+
+## Bridge groups
+
+By default every service uses the process-wide Tor client and so every bridge
+of the process: one failing bridge disturbs all services, and one bridge
+carries all their circuits. A **bridge group** gives some services a Tor client
+of their own, limited to a few bridges:
+
+```ktav
+services: [
+    {
+        nickname: web-a
+        bridge_group: edge-a
+        bridges: 2
+        ports: [ 80=127.0.0.1:8080 ]
+    }
+    {
+        nickname: web-b
+        bridge_group: edge-b
+        bridges: 2
+        ports: [ 80=127.0.0.1:8080 ]
+    }
+]
+```
+
+- `bridge_group` — the group's name: `a-z 0-9 _ -`, at most 25 bytes. Services
+  with the same name share one client. Without it the service stays on the
+  process-wide client, as before.
+- `bridges` — how many bridges the group uses, `1` to `8`, default `1`. It
+  needs `bridge_group`, and the enabled services of a group must state the
+  same number.
+- **Same backend, several addresses.** The two services above forward to the
+  same local port, each through its own bridges: one bridge failing takes down
+  one address, not both. Tor has no way to put two addresses under one name, so
+  the clients must know both addresses and try the second when the first does
+  not answer. One group with `bridges: 2` or more is the transparent
+  alternative: one address that survives the loss of a bridge.
+- **Which bridges.** Every group gets its own bridges from the working list of
+  the process, in group-name order over the list sorted by bridge line, so the
+  same list gives the same assignment at every start. When the list is smaller
+  than the groups need, the groups share bridges and a warning names them. A
+  group never starts without bridges: a client without bridges would reach Tor
+  directly.
+- **Failover inside a group.** Up to 3 of the group's bridges carry circuits at
+  once; the rest stand by. A group's circuits therefore do not all depend on
+  one bridge, whatever `tor.guard_spread` says (that setting is for the
+  process-wide client only).
+- **Cost.** Every group is a Tor client of its own: one more pluggable-transport
+  process, one more set of connections to its bridges, a bootstrap at start.
+  The group reads the directory cache of the process client, so it does not
+  download the consensus again, but the first start waits for the process
+  client to bootstrap. With many groups the bridges see more connections from
+  one address, and each bridge sees only the services of its group.
+- **Where the state lives.** `<config dir>/arti-data/group-<name>/` holds the
+  group's guard state and its keystore (the services file stays the source of
+  keys). The log lines of a group carry `group=<name>` next to the nickname.
+- **Not replaced while running.** The process-wide client replaces dead
+  bridges; a group's bridges are chosen at start and kept. If all of them fail,
+  the group's services stay down until the next start. Restart after changing
+  the bridge list.
+- **Not verified live yet.** The configuration, the assignment and the wiring
+  are covered by tests; starting a group's client against real bridges has not
+  been measured. Try one group before relying on many.
 
 ## Limitations
 

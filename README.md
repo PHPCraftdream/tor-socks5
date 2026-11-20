@@ -631,6 +631,12 @@ services: [
 ]
 ```
 
+`bridge_group` (a name, `a-z 0-9 _ -`) and `bridges` (`1..=8`, default `1`) put a service on a Tor
+client of its own that uses only that many of the bridges, so one failing bridge does not touch
+the other groups; services with the same group name share the client, and the enabled services of
+a group must state the same `bridges`. Without `bridge_group` a service uses the process-wide
+client. See [bridge groups](docs/guide/ops/onion-service.md#bridge-groups).
+
 
 ### The bridges file
 

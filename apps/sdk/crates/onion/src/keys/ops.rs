@@ -251,6 +251,8 @@ fn record_identity(
                     address: Some(address.clone()),
                     key: Some(key),
                     circuit_hops: DEFAULT_CIRCUIT_HOPS,
+                    bridge_group: None,
+                    bridges: None,
                     ports: ports.unwrap_or_default(),
                 };
                 let enabled = entry.enabled && !entry.ports.is_empty();

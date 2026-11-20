@@ -6,9 +6,11 @@
 
 use std::path::Path;
 
+use arti_wrapper::Settings;
 use proxy_config::{Config, OnionServiceEntry};
 use tokio_util::sync::CancellationToken;
 
+use super::groups;
 use tor_socks5_onion::host::OnionHostConfig;
 use tor_socks5_runtime::tor_watchdog::TorHandle;
 
@@ -21,6 +23,7 @@ use tor_socks5_runtime::tor_watchdog::TorHandle;
 /// warning) now live in the library's `start()`; this shell logs nothing.
 pub(crate) fn spawn_services(
     handle: TorHandle,
+    settings: Settings,
     entries: &[OnionServiceEntry],
     config_path: &Path,
     token: CancellationToken,
@@ -61,33 +64,79 @@ pub(crate) fn spawn_services(
             return;
         }
 
-        let host_config = OnionHostConfig::new(
-            handle,
-            tor_socks5_runtime::tor_setup::arti_keystore_dir(&config_path),
-            token,
-        )
-        .with_entries(entries)
-        .with_config_path(Some(config_path));
-        let mut host = AbortOnDropHandle::new(
-            tor_socks5_onion::host::OnionHost::new(host_config)
-                .start()
-                .detach(),
-        );
-        if let Err(error) = host.join().await {
-            tracing::warn!(%error, "onion service producer task ended with a join error");
+        // Services without a bridge group share the process client; each
+        // group is hosted by a client of its own on its own bridges.
+        let split = groups::split_entries(entries);
+        // The shared host holds the process keystore's lock. When every
+        // service is in a group, nothing else would, and `onion new`/`remove`
+        // must keep refusing while the server runs.
+        let _keystore_lock = if split.shared.is_empty() {
+            let keystore_dir = tor_socks5_runtime::tor_setup::arti_keystore_dir(&config_path);
+            match tor_socks5_runtime::workers::run_fallible_blocking(move || {
+                persist_lock::PathLock::acquire_bounded(&keystore_dir, persist_lock::CLI_LOCK_WAIT)
+            })
+            .await
+            {
+                Ok(Ok(lock)) => Some(lock),
+                Ok(Err(error)) | Err(error) => {
+                    tracing::error!(
+                        %error,
+                        "onion services not started: the onion keystore lock is unavailable \
+                         (held by a tor-socks5 onion command or another server instance?)"
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let mut hosts = Vec::new();
+        if !split.shared.is_empty() {
+            let host_config = OnionHostConfig::new(
+                handle,
+                tor_socks5_runtime::tor_setup::arti_keystore_dir(&config_path),
+                token.clone(),
+            )
+            .with_entries(split.shared)
+            .with_config_path(Some(config_path.clone()));
+            hosts.push(AbortOnDropHandle::new(
+                tor_socks5_onion::host::OnionHost::new(host_config)
+                    .start()
+                    .detach(),
+            ));
+        }
+        let mut assigned = groups::assign_bridges(&settings.bridges, &split.groups);
+        for (name, plan) in split.groups {
+            let Some(bridges) = assigned.remove(&name) else {
+                continue;
+            };
+            hosts.push(AbortOnDropHandle::new(tokio::spawn(groups::run_group(
+                name,
+                plan,
+                bridges,
+                settings.clone(),
+                config_path.clone(),
+                token.clone(),
+            ))));
+        }
+        for result in futures::future::join_all(hosts.iter_mut().map(AbortOnDropHandle::join)).await
+        {
+            if let Err(error) = result {
+                tracing::warn!(%error, "onion service producer task ended with a join error");
+            }
         }
     }));
 }
 
 /// Aborting the supervising producer must also abort the detached host task.
-struct AbortOnDropHandle<T>(tokio::task::JoinHandle<T>);
+pub(super) struct AbortOnDropHandle<T>(tokio::task::JoinHandle<T>);
 
 impl<T> AbortOnDropHandle<T> {
-    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+    pub(super) fn new(handle: tokio::task::JoinHandle<T>) -> Self {
         Self(handle)
     }
 
-    async fn join(&mut self) -> Result<T, tokio::task::JoinError> {
+    pub(super) async fn join(&mut self) -> Result<T, tokio::task::JoinError> {
         (&mut self.0).await
     }
 }
@@ -283,6 +332,8 @@ mod tests {
             address: None,
             key: None,
             circuit_hops: 4,
+            bridge_group: None,
+            bridges: None,
             ports: vec![OnionServicePort {
                 onion_port: 80,
                 target: "127.0.0.1:8080".to_owned(),

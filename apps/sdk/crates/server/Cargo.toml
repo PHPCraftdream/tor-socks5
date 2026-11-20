@@ -30,6 +30,7 @@ onion-service = ["dep:tor-socks5-onion"]
 anyhow.workspace = true
 arti-wrapper = { path = "../../../../packages/arti-wrapper", version = "0.2.0" }
 auth = { path = "../../../../packages/auth", version = "0.2.0", package = "tor-socks5-auth" }
+bridge-line.workspace = true
 dns-server = { path = "../../../../packages/dns-server", version = "0.2.0", package = "tor-socks5-dns" }
 futures.workspace = true
 persist-lock = { path = "../../../../packages/persist-lock", version = "0.2.0" }
@@ -45,7 +46,6 @@ tracing.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-bridge-line.workspace = true
 bridge-store = { path = "../../../../packages/bridge-store", version = "0.2.0" }
 ktav.workspace = true
 rustls.workspace = true
