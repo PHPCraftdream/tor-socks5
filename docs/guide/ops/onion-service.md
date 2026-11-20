@@ -336,9 +336,10 @@ In practice: start with few services, watch the status lines, and raise the
 count gradually. Set `tor.guard_spread: 2` or `3` only for failure isolation
 — provided you have at least that many working bridges (see
 [bridges](../bridges.md)) and accept that more bridges see your traffic. For
-much more than ~10 services, put them in [bridge groups](#bridge-groups),
-or split them across separate tor-socks5 processes, each with its own config
-directory and its own bridge set.
+much more than ~10 services, split them across separate tor-socks5 processes,
+each with its own config directory and its own bridge set.
+[Bridge groups](#bridge-groups) do the same inside one process, but are not
+verified live yet.
 
 ## Bridge groups
 
@@ -369,7 +370,8 @@ services: [
   process-wide client, as before.
 - `bridges` — how many bridges the group uses, `1` to `8`, default `1`. It
   needs `bridge_group`, and the enabled services of a group must state the
-  same number.
+  same number. Use `2` or more: a group with one bridge depends on that
+  bridge alone, which is less reliable than the process-wide client.
 - **Same backend, several addresses.** The two services above forward to the
   same local port, each through its own bridges: one bridge failing takes down
   one address, not both. Tor has no way to put two addresses under one name, so
