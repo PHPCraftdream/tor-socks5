@@ -225,4 +225,79 @@ mod tests {
         let cli = parse(&["tor-socks5"]);
         assert!(!cli.angel);
     }
+
+    #[cfg(feature = "onion-service")]
+    fn onion_action(cli: Cli) -> crate::onion::commands::OnionAction {
+        match cli.command {
+            Some(Command::Onion { action }) => action,
+            _ => panic!("not an onion command"),
+        }
+    }
+
+    #[cfg(feature = "onion-service")]
+    #[test]
+    fn onion_new_bridge_group_flags_parse() {
+        let cli = parse(&[
+            "tor-socks5",
+            "onion",
+            "new",
+            "svc",
+            "--bridge-group",
+            "edge-a",
+            "--bridges",
+            "2",
+        ]);
+        match onion_action(cli) {
+            crate::onion::commands::OnionAction::New {
+                bridge_group,
+                bridges,
+                ..
+            } => {
+                assert_eq!(bridge_group.as_deref(), Some("edge-a"));
+                assert_eq!(bridges, Some(2));
+            }
+            other => panic!("not `onion new`: {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "onion-service")]
+    #[test]
+    fn onion_import_bridge_group_flags_parse() {
+        let cli = parse(&[
+            "tor-socks5",
+            "onion",
+            "import",
+            "svc",
+            "key.id",
+            "--bridge-group",
+            "edge-b",
+            "--bridges",
+            "3",
+        ]);
+        match onion_action(cli) {
+            crate::onion::commands::OnionAction::Import {
+                bridge_group,
+                bridges,
+                ..
+            } => {
+                assert_eq!(bridge_group.as_deref(), Some("edge-b"));
+                assert_eq!(bridges, Some(3));
+            }
+            other => panic!("not `onion import`: {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "onion-service")]
+    #[test]
+    fn onion_new_help_documents_the_bridge_group_flags() {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let new = cmd
+            .find_subcommand_mut("onion")
+            .and_then(|onion| onion.find_subcommand_mut("new"))
+            .expect("onion new is a subcommand");
+        let help = new.render_long_help().to_string();
+        assert!(help.contains("--bridge-group"), "{help}");
+        assert!(help.contains("--bridges"), "{help}");
+    }
 }

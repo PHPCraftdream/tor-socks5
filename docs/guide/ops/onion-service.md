@@ -74,6 +74,7 @@ All operations are `tor-socks5 onion ...` subcommands working on the file:
 ```bash
 tor-socks5 onion new <NICK> [--port ...]...    # generate a key + address, record the service
 tor-socks5 onion new <NICK> --vanity prefix    # mine an address with a prefix
+tor-socks5 onion new <NICK> --bridge-group NAME [--bridges N]  # into a bridge group
 tor-socks5 onion list                          # nicknames, addresses, ports
 tor-socks5 onion show <NICK>                   # one service in detail
 tor-socks5 onion export <NICK> --out <FILE>    # write a keystore-format file
@@ -93,6 +94,15 @@ tor-socks5 onion remove <NICK> --yes           # delete the service and its key
   `--force` is given — overwriting changes the address. With `--port` they
   set the ports (and enable the service); without it a new service is
   created disabled and an existing one keeps its ports.
+- **`--bridge-group NAME [--bridges N]`** (on `new` and on `import`) writes the
+  group into the service's entry, so a service can be created in a bridge
+  group without editing the file: the name is `a-z 0-9 _ -`, at most 25 bytes,
+  and `bridges` is 1 to 8 (default 1). `--bridges` needs `--bridge-group`, and
+  a wrong value is refused before any key is made or the file is touched.
+  Without the flags the entry gets no group fields; `--force` replaces only
+  the identity, so an existing group (and its `bridges`) stays unless the
+  flags state a new one, and an unstated `--bridges` keeps the count the
+  entry already has.
 - **`remove`** requires `--yes`; there is no undo.
 - **The file holds secret keys.** Keep it private, back it up with the same
   care as a private key. On Unix it is written with mode `0600`; it is in
@@ -372,6 +382,11 @@ services: [
   needs `bridge_group`, and the enabled services of a group must state the
   same number. Use `2` or more: a group with one bridge depends on that
   bridge alone, which is less reliable than the process-wide client.
+- **From the CLI.** `onion new web --bridge-group edge-a --bridges 2` (the same
+  flags work on `onion import`) writes the fields into the entry; nothing has
+  to be typed into the file by hand. `onion show` prints the group of a
+  service, and `--force` keeps the group unless the flags name another one.
+  All enabled services of a group must still state the same `bridges`.
 - **Same backend, several addresses.** The two services above forward to the
   same local port, each through its own bridges: one bridge failing takes down
   one address, not both. Tor has no way to put two addresses under one name, so

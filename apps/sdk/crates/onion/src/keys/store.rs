@@ -56,6 +56,14 @@ pub enum KeysError {
     /// The export output file already exists.
     #[error("{0} already exists")]
     ExportExists(String),
+    /// The bridge group settings are refused by the services-file rule.
+    #[error("{field}: {reason}")]
+    InvalidBridgeGroup {
+        /// `bridge_group` or `bridges`.
+        field: &'static str,
+        /// Why the value is refused.
+        reason: String,
+    },
     /// The derived address does not match the address the key source claimed.
     #[error("address mismatch; key not saved")]
     AddressMismatch,

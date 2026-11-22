@@ -36,7 +36,9 @@ pub use log::{LogConfig, LogOutput};
 mod listen_addresses;
 #[path = "sections/onion_services.rs"]
 mod onion_services;
-pub use onion_services::{IdentityKey, OnionServiceEntry, OnionServicePort};
+pub use onion_services::{
+    check_group_args, GroupArgsError, IdentityKey, OnionServiceEntry, OnionServicePort,
+};
 #[path = "layout/migrate.rs"]
 mod migrate;
 #[path = "onion/file.rs"]

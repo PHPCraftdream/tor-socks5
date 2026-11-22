@@ -37,6 +37,14 @@ pub(crate) enum OnionAction {
         /// ports are added to the file by hand.
         #[arg(long = "port", value_name = "ONION_PORT=HOST:PORT")]
         ports: Vec<String>,
+        /// Bridge group to place the service in: services of one group are
+        /// hosted by their own Tor client on the group's bridges
+        /// (`a-z 0-9 _ -`, at most 25 bytes).
+        #[arg(long = "bridge-group", value_name = "NAME")]
+        bridge_group: Option<String>,
+        /// Bridges of the group, 1 to 8 (default 1). Needs `--bridge-group`.
+        #[arg(long, value_name = "N")]
+        bridges: Option<u8>,
         /// Replace an existing identity. WARNING: the old .onion address
         /// will be lost permanently.
         #[arg(long)]
@@ -80,6 +88,13 @@ pub(crate) enum OnionAction {
         /// ports of an existing service.
         #[arg(long = "port", value_name = "ONION_PORT=HOST:PORT")]
         ports: Vec<String>,
+        /// Bridge group to place the imported service in
+        /// (`a-z 0-9 _ -`, at most 25 bytes).
+        #[arg(long = "bridge-group", value_name = "NAME")]
+        bridge_group: Option<String>,
+        /// Bridges of the group, 1 to 8 (default 1). Needs `--bridge-group`.
+        #[arg(long, value_name = "N")]
+        bridges: Option<u8>,
         /// Replace an existing identity for this nickname. WARNING: the old
         /// .onion address will be lost permanently.
         #[arg(long)]
@@ -121,11 +136,27 @@ pub(crate) fn run(action: OnionAction, config_path: Option<&Path>) -> Result<()>
         OnionAction::New {
             nick,
             ports,
+            bridge_group,
+            bridges,
             force,
             vanity,
             threads,
             timeout,
-        } => cmd_new(&at, &nick, &ports, force, vanity, threads, timeout),
+        } => {
+            let group = parse_group(bridge_group.as_deref(), bridges)?;
+            cmd_new(
+                &at,
+                &nick,
+                NewOpts {
+                    ports,
+                    force,
+                    vanity,
+                    threads,
+                    timeout,
+                    group,
+                },
+            )
+        }
         OnionAction::List => cmd_list(&at),
         OnionAction::Show { nick } => cmd_show(&at, &nick),
         OnionAction::Export { nick, out, force } => cmd_export(&at, &nick, &out, force),
@@ -133,8 +164,13 @@ pub(crate) fn run(action: OnionAction, config_path: Option<&Path>) -> Result<()>
             nick,
             file,
             ports,
+            bridge_group,
+            bridges,
             force,
-        } => cmd_import(&at, &nick, &file, &ports, force),
+        } => {
+            let group = parse_group(bridge_group.as_deref(), bridges)?;
+            cmd_import_group(&at, &nick, &file, &ports, force, group.as_ref())
+        }
         OnionAction::Remove { nick, yes } => cmd_remove(&at, &nick, yes),
     }
 }
@@ -154,6 +190,16 @@ fn parse_ports(raw: &[String]) -> Result<Option<Vec<OnionServicePort>>> {
     Ok(Some(ports))
 }
 
+/// The `--bridge-group`/`--bridges` pair as a validated group.
+fn parse_group(bridge_group: Option<&str>, bridges: Option<u8>) -> Result<Option<keys::GroupSpec>> {
+    keys::GroupSpec::from_flags(bridge_group, bridges).map_err(|error| match error {
+        keys::KeysError::InvalidBridgeGroup { field, reason } => {
+            anyhow::anyhow!("--{}: {reason}", field.replace('_', "-"))
+        }
+        other => anyhow::Error::new(other),
+    })
+}
+
 fn print_recorded(at: &Target, nick: &HsNickname, address: &str, enabled_ports: bool) {
     println!("nickname: {nick}");
     println!("address:  {address}");
@@ -166,20 +212,37 @@ fn print_recorded(at: &Target, nick: &HsNickname, address: &str, enabled_ports: 
     }
 }
 
-fn cmd_new(
-    at: &Target,
-    nick: &str,
-    ports: &[String],
+fn print_group(group: &keys::GroupSpec) {
+    match group.bridges() {
+        Some(bridges) => println!("group:    {} ({bridges} bridges)", group.name()),
+        None => println!("group:    {}", group.name()),
+    }
+}
+
+/// The `onion new` options, already parsed from the flags.
+struct NewOpts {
+    ports: Vec<String>,
     force: bool,
     vanity: Option<String>,
     threads: Option<usize>,
     timeout: Option<String>,
-) -> Result<()> {
+    group: Option<keys::GroupSpec>,
+}
+
+fn cmd_new(at: &Target, nick: &str, opts: NewOpts) -> Result<()> {
+    let NewOpts {
+        ports,
+        force,
+        vanity,
+        threads,
+        timeout,
+        group,
+    } = opts;
     if vanity.is_none() && (threads.is_some() || timeout.is_some()) {
         bail!("--threads/--timeout require --vanity");
     }
     let nick_hs = store::nickname(nick)?;
-    let ports = parse_ports(ports)?;
+    let ports = parse_ports(&ports)?;
     // The replace warning must fire (as before) while the caller has decided
     // to force: the crate's `create_service` takes the lock and performs the
     // refuse-without-force check itself, returning the same typed error.
@@ -199,9 +262,20 @@ fn cmd_new(
         Some(_) => keys::NewIdentity::Supplied(&mut pick),
         None => keys::NewIdentity::Random,
     };
-    let recorded = keys::create_service(&at.config, &at.keystore, nick, ports, force, source)
-        .map_err(with_hint)?;
+    let recorded = keys::create_service_with_group(
+        &at.config,
+        &at.keystore,
+        nick,
+        ports,
+        force,
+        source,
+        group.as_ref(),
+    )
+    .map_err(with_hint)?;
     print_recorded(at, &nick_hs, &recorded.address, recorded.ports_enabled);
+    if let Some(group) = &group {
+        print_group(group);
+    }
     Ok(())
 }
 
@@ -245,6 +319,9 @@ fn cmd_show(at: &Target, nick: &str) -> Result<()> {
             .unwrap_or("none yet (created at the first start)")
     );
     println!("enabled:  {}", if service.enabled { "yes" } else { "no" });
+    if let Some((group, bridges)) = service.bridge_group_spec() {
+        println!("group:    {group} ({bridges} bridges)");
+    }
     for port in &service.ports {
         println!("port:     {}={}", port.onion_port, port.target);
     }
@@ -262,7 +339,20 @@ fn cmd_export(at: &Target, nick: &str, out: &Path, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// `onion import` without a bridge group; the tests keep this entry point.
+#[cfg(test)]
 fn cmd_import(at: &Target, nick: &str, file: &Path, ports: &[String], force: bool) -> Result<()> {
+    cmd_import_group(at, nick, file, ports, force, None)
+}
+
+fn cmd_import_group(
+    at: &Target,
+    nick: &str,
+    file: &Path,
+    ports: &[String],
+    force: bool,
+    group: Option<&keys::GroupSpec>,
+) -> Result<()> {
     let nick_hs = store::nickname(nick)?;
     let ports = parse_ports(ports)?;
     // The warning moved a little ahead of the file read (the crate reads and
@@ -275,10 +365,14 @@ fn cmd_import(at: &Target, nick: &str, file: &Path, ports: &[String], force: boo
             nick_hs.to_string()
         );
     }
-    let recorded = keys::import_identity(&at.config, &at.keystore, nick, file, ports, force)
-        .map_err(with_hint)?;
+    let recorded =
+        keys::import_identity_with_group(&at.config, &at.keystore, nick, file, ports, force, group)
+            .map_err(with_hint)?;
     println!("imported {} from {}", nick_hs, file.display());
     print_recorded(at, &nick_hs, &recorded.address, recorded.ports_enabled);
+    if let Some(group) = group {
+        print_group(group);
+    }
     Ok(())
 }
 
@@ -329,8 +423,40 @@ mod tests {
         (dir, config)
     }
 
+    /// The `onion new` flags as the CLI receives them, before validation.
+    #[derive(Default)]
+    struct NewFlags {
+        ports: Vec<String>,
+        force: bool,
+        vanity: Option<String>,
+        threads: Option<usize>,
+        timeout: Option<String>,
+        bridge_group: Option<String>,
+        bridges: Option<u8>,
+    }
+
+    fn run_new_flags(config: &Path, nick: &str, flags: NewFlags) -> Result<()> {
+        run(
+            OnionAction::New {
+                nick: nick.to_owned(),
+                ports: flags.ports,
+                bridge_group: flags.bridge_group,
+                bridges: flags.bridges,
+                force: flags.force,
+                vanity: flags.vanity,
+                threads: flags.threads,
+                timeout: flags.timeout,
+            },
+            Some(config),
+        )
+    }
+
     fn run_new(config: &Path, nick: &str, force: bool) -> Result<()> {
-        run_new_full(config, nick, &[], force, None, None, None)
+        let flags = NewFlags {
+            force,
+            ..NewFlags::default()
+        };
+        run_new_flags(config, nick, flags)
     }
 
     fn run_new_full(
@@ -342,17 +468,20 @@ mod tests {
         threads: Option<usize>,
         timeout: Option<&str>,
     ) -> Result<()> {
-        run(
-            OnionAction::New {
-                nick: nick.to_owned(),
-                ports: ports.iter().map(|port| (*port).to_owned()).collect(),
-                force,
-                vanity: vanity.map(str::to_owned),
-                threads,
-                timeout: timeout.map(str::to_owned),
-            },
-            Some(config),
-        )
+        let flags = NewFlags {
+            ports: ports.iter().map(|port| (*port).to_owned()).collect(),
+            force,
+            vanity: vanity.map(str::to_owned),
+            threads,
+            timeout: timeout.map(str::to_owned),
+            ..NewFlags::default()
+        };
+        run_new_flags(config, nick, flags)
+    }
+
+    fn group_of(config: &Path, nick: &str) -> (Option<String>, Option<u8>) {
+        let entry = service(config, nick);
+        (entry.bridge_group, entry.bridges)
     }
 
     fn service(config: &Path, nick: &str) -> OnionServiceEntry {
@@ -457,6 +586,114 @@ mod tests {
     }
 
     #[test]
+    fn onion_new_records_the_bridge_group_and_the_bridge_count() {
+        let (_tmp, config) = temp_setup();
+        let grouped = NewFlags {
+            bridges: Some(2),
+            bridge_group: Some("edge-a".to_owned()),
+            ..NewFlags::default()
+        };
+        run_new_flags(&config, "edge", grouped).expect("new in a group");
+        assert_eq!(
+            group_of(&config, "edge"),
+            (Some("edge-a".to_owned()), Some(2))
+        );
+
+        let named_only = NewFlags {
+            bridge_group: Some("edge-b".to_owned()),
+            ..NewFlags::default()
+        };
+        run_new_flags(&config, "named-only", named_only).expect("new with a name only");
+        assert_eq!(
+            group_of(&config, "named-only"),
+            (Some("edge-b".to_owned()), None),
+            "an unstated count stays out of the file"
+        );
+    }
+
+    #[test]
+    fn onion_new_without_group_flags_writes_no_group_fields() {
+        let (_tmp, config) = temp_setup();
+        let flags = NewFlags {
+            ports: vec!["80=127.0.0.1:8080".to_owned()],
+            ..NewFlags::default()
+        };
+        run_new_flags(&config, "plain", flags).expect("new");
+        assert_eq!(group_of(&config, "plain"), (None, None));
+        let text = std::fs::read_to_string(Config::onion_path(&config)).expect("file text");
+        assert!(!text.contains("bridge_group"), "{text}");
+        assert!(!text.contains("bridges"), "{text}");
+    }
+
+    #[test]
+    fn onion_new_refuses_invalid_group_flags_without_side_effects() {
+        let (_tmp, config) = temp_setup();
+        let long_name = "a".repeat(26);
+        let cases: [(Option<&str>, Option<u8>); 7] = [
+            (None, Some(2)),
+            (Some("Edge-A"), None),
+            (Some("with space"), None),
+            (Some("dot.ty"), None),
+            (Some(long_name.as_str()), None),
+            (Some("edge"), Some(0)),
+            (Some("edge"), Some(9)),
+        ];
+        for (name, bridges) in cases {
+            let flags = NewFlags {
+                bridge_group: name.map(str::to_owned),
+                bridges,
+                ..NewFlags::default()
+            };
+            let error = run_new_flags(&config, "svc", flags).expect_err("must refuse");
+            let text = error.to_string();
+            assert!(
+                text.contains("bridge-group")
+                    || text.contains("bridge group")
+                    || text.contains("bridges"),
+                "{name:?} with {bridges:?}: {text}"
+            );
+            assert!(
+                !Config::onion_path(&config).exists(),
+                "{name:?} with {bridges:?}: no services file"
+            );
+            assert!(
+                !tor_socks5::config::arti_keystore_dir(&config).exists(),
+                "{name:?} with {bridges:?}: no key"
+            );
+        }
+    }
+
+    #[test]
+    fn a_forced_new_keeps_the_group_unless_the_flags_replace_it() {
+        let (_tmp, config) = temp_setup();
+        let grouped = NewFlags {
+            bridges: Some(2),
+            bridge_group: Some("edge-a".to_owned()),
+            ..NewFlags::default()
+        };
+        run_new_flags(&config, "edge", grouped).expect("new in a group");
+
+        run_new(&config, "edge", true).expect("forced new without group flags");
+        assert_eq!(
+            group_of(&config, "edge"),
+            (Some("edge-a".to_owned()), Some(2)),
+            "a forced new keeps the group it cannot name"
+        );
+
+        let renamed = NewFlags {
+            force: true,
+            bridge_group: Some("edge-b".to_owned()),
+            ..NewFlags::default()
+        };
+        run_new_flags(&config, "edge", renamed).expect("forced new in another group");
+        assert_eq!(
+            group_of(&config, "edge"),
+            (Some("edge-b".to_owned()), Some(2)),
+            "the name is replaced, the unstated count stays"
+        );
+    }
+
+    #[test]
     fn a_key_left_in_the_keystore_counts_as_an_existing_identity() {
         let (_tmp, config) = temp_setup();
         let nick = store::nickname("old").expect("nickname");
@@ -503,6 +740,62 @@ mod tests {
         assert!(copy.enabled);
         assert_eq!(copy.ports[0].onion_port, 8080);
         assert_eq!(copy.address, service(&config, "src").address);
+    }
+
+    #[test]
+    fn onion_import_records_the_bridge_group() {
+        let (tmp, config) = temp_setup();
+        run_new(&config, "src", false).expect("new");
+        let export = tmp.path().join("src.id");
+        cmd_export(&at(&config), "src", &export, false).expect("export");
+
+        let (_other_tmp, other) = temp_setup();
+        let group = keys::GroupSpec::new("edge-a", Some(3)).unwrap();
+        cmd_import_group(&at(&other), "copy", &export, &[], false, Some(&group))
+            .expect("import into a group");
+        assert_eq!(
+            group_of(&other, "copy"),
+            (Some("edge-a".to_owned()), Some(3))
+        );
+    }
+
+    #[test]
+    fn onion_import_refuses_bad_group_flags_without_side_effects() {
+        let (tmp, config) = temp_setup();
+        run_new(&config, "src", false).expect("new");
+        let export = tmp.path().join("src.id");
+        cmd_export(&at(&config), "src", &export, false).expect("export");
+        let before = std::fs::read(Config::onion_path(&config)).expect("services file");
+
+        let error = run(
+            OnionAction::Import {
+                nick: "copy".to_owned(),
+                file: export,
+                ports: Vec::new(),
+                bridge_group: None,
+                bridges: Some(2),
+                force: false,
+            },
+            Some(&config),
+        )
+        .expect_err("--bridges alone");
+        let text = error.to_string();
+        assert!(
+            text.contains("--bridges") && text.contains("needs `bridge_group`"),
+            "{text}"
+        );
+        assert_eq!(
+            std::fs::read(Config::onion_path(&config)).expect("services file"),
+            before,
+            "the file is left as it was"
+        );
+        assert!(
+            Config::read_onion_services(&config)
+                .unwrap()
+                .iter()
+                .all(|entry| entry.nickname != "copy"),
+            "nothing was imported"
+        );
     }
 
     #[test]
