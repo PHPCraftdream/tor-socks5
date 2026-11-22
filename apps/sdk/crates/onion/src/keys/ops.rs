@@ -44,6 +44,53 @@ pub enum NewIdentity<'a> {
     Supplied(&'a mut dyn FnMut() -> anyhow::Result<crate::address::Keypair>),
 }
 
+/// The bridge group a service is created in: the `bridge_group` name of the
+/// onion services file and, when stated, its `bridges` count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupSpec {
+    name: String,
+    bridges: Option<u8>,
+}
+
+impl GroupSpec {
+    /// A group named `name` whose client uses `bridges` bridges (`None`: the
+    /// count the file states, `1` for a new service).
+    ///
+    /// Both values go through [`proxy_config::check_group_args`], the check
+    /// the onion services file itself is read with, so a CLI flag and a value
+    /// typed into the file cannot diverge.
+    pub fn new(name: &str, bridges: Option<u8>) -> Result<Self, KeysError> {
+        Self::from_flags(Some(name), bridges)
+            .map(|spec| spec.unwrap_or_else(|| unreachable!("a group name was given")))
+    }
+
+    /// The `bridge_group`/`bridges` pair as stated: `None` when no group is
+    /// named, an error when the pair is refused (`bridges` without a group
+    /// included).
+    pub fn from_flags(group: Option<&str>, bridges: Option<u8>) -> Result<Option<Self>, KeysError> {
+        proxy_config::check_group_args(group, bridges).map_err(|error| {
+            KeysError::InvalidBridgeGroup {
+                field: error.field,
+                reason: error.reason,
+            }
+        })?;
+        Ok(group.map(|name| Self {
+            name: name.to_owned(),
+            bridges,
+        }))
+    }
+
+    /// The group name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The bridge count, when the caller stated one.
+    pub fn bridges(&self) -> Option<u8> {
+        self.bridges
+    }
+}
+
 /// Whether `nick` already has an identity: a key in the onion services file,
 /// or a keypair left in the keystore by an older version.
 ///
@@ -86,6 +133,30 @@ pub fn create_service(
     force: bool,
     identity: NewIdentity,
 ) -> Result<Recorded, KeysError> {
+    create_service_with_group(
+        config_path,
+        keystore_dir,
+        nick,
+        ports,
+        force,
+        identity,
+        None,
+    )
+}
+
+/// [`create_service`] with a bridge group: `group`, when given, sets the
+/// entry's `bridge_group` (and `bridges`, when the caller stated a count).
+/// Without a group the entry's group fields are left untouched, so a forced
+/// replacement keeps the group the service was already in.
+pub fn create_service_with_group(
+    config_path: &Path,
+    keystore_dir: &Path,
+    nick: &str,
+    ports: Option<Vec<OnionServicePort>>,
+    force: bool,
+    identity: NewIdentity,
+    group: Option<&GroupSpec>,
+) -> Result<Recorded, KeysError> {
     let nick = store::nickname(nick)?;
     if identity_exists(config_path, keystore_dir, &nick)? && !force {
         return Err(KeysError::IdentityExists(nick.to_string()));
@@ -103,7 +174,15 @@ pub fn create_service(
     }
     let address = store::address_of(&key);
     let bytes = store::identity_file_bytes(key, &nick, keystore_dir)?;
-    let ports_enabled = record_identity(config_path, keystore_dir, &nick, &bytes, &address, ports)?;
+    let ports_enabled = record_identity(
+        config_path,
+        keystore_dir,
+        &nick,
+        &bytes,
+        &address,
+        ports,
+        group,
+    )?;
     Ok(Recorded {
         address,
         ports_enabled,
@@ -162,6 +241,20 @@ pub fn import_identity(
     ports: Option<Vec<OnionServicePort>>,
     force: bool,
 ) -> Result<Recorded, KeysError> {
+    import_identity_with_group(config_path, keystore_dir, nick, file, ports, force, None)
+}
+
+/// [`import_identity`] with a bridge group; `group` works as in
+/// [`create_service_with_group`].
+pub fn import_identity_with_group(
+    config_path: &Path,
+    keystore_dir: &Path,
+    nick: &str,
+    file: &Path,
+    ports: Option<Vec<OnionServicePort>>,
+    force: bool,
+    group: Option<&GroupSpec>,
+) -> Result<Recorded, KeysError> {
     let nick = store::nickname(nick)?;
     let bytes =
         Zeroizing::new(std::fs::read(file).with_context(|| format!("reading {}", file.display()))?);
@@ -171,7 +264,15 @@ pub fn import_identity(
         return Err(KeysError::IdentityExists(nick.to_string()));
     }
     let address = store::address_of(&key);
-    let ports_enabled = record_identity(config_path, keystore_dir, &nick, &bytes, &address, ports)?;
+    let ports_enabled = record_identity(
+        config_path,
+        keystore_dir,
+        &nick,
+        &bytes,
+        &address,
+        ports,
+        group,
+    )?;
     Ok(Recorded {
         address,
         ports_enabled,
@@ -220,7 +321,8 @@ fn hs_keypair(generated: &crate::address::Keypair) -> Result<HsIdKeypair, KeysEr
 
 /// Record `key_bytes` (a keystore key file) as the identity of `nick` and
 /// drop the keystore's copy. See [`create_service`] for the ports/enabled
-/// rule. Returns whether the entry ended up enabled (its state as written).
+/// rule and [`create_service_with_group`] for `group`. Returns whether the
+/// entry ended up enabled (its state as written).
 fn record_identity(
     config_path: &Path,
     keystore_dir: &Path,
@@ -228,6 +330,7 @@ fn record_identity(
     key_bytes: &[u8],
     address: &str,
     ports: Option<Vec<OnionServicePort>>,
+    group: Option<&GroupSpec>,
 ) -> Result<bool, KeysError> {
     let key = IdentityKey::new(store::encode_key(key_bytes)).map_err(anyhow::Error::msg)?;
     let name = nick.to_string();
@@ -242,17 +345,27 @@ fn record_identity(
                     entry.ports = ports;
                     entry.enabled = true;
                 }
+                if let Some(group) = group {
+                    entry.bridge_group = Some(group.name().to_owned());
+                    if group.bridges().is_some() {
+                        entry.bridges = group.bridges();
+                    }
+                }
                 Ok(entry.enabled && !entry.ports.is_empty())
             }
             None => {
+                let (bridge_group, bridges) = match group {
+                    Some(group) => (Some(group.name().to_owned()), group.bridges()),
+                    None => (None, None),
+                };
                 let entry = OnionServiceEntry {
                     nickname: name,
                     enabled: ports.is_some(),
                     address: Some(address.clone()),
                     key: Some(key),
                     circuit_hops: DEFAULT_CIRCUIT_HOPS,
-                    bridge_group: None,
-                    bridges: None,
+                    bridge_group,
+                    bridges,
                     ports: ports.unwrap_or_default(),
                 };
                 let enabled = entry.enabled && !entry.ports.is_empty();

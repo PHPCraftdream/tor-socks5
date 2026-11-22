@@ -842,3 +842,41 @@ fn keystore_lock_is_exclusive_and_names_the_hint() {
     drop(_server_guard);
     store::lock_with(&keystore, Duration::from_secs(1)).expect("acquire after release");
 }
+
+#[test]
+fn group_spec_uses_the_rules_of_the_services_file() {
+    let spec = ops::GroupSpec::new("edge-a", Some(2)).expect("valid group");
+    assert_eq!(spec.name(), "edge-a");
+    assert_eq!(spec.bridges(), Some(2));
+    assert_eq!(
+        ops::GroupSpec::new("edge-a", None)
+            .expect("no count")
+            .bridges(),
+        None
+    );
+
+    let long = "a".repeat(26);
+    for bad in ["Edge-A", "with space", "dot.ty", "", long.as_str()] {
+        let error = ops::GroupSpec::new(bad, None).expect_err("bad group name");
+        assert!(
+            error.to_string().contains("bridge_group: invalid group"),
+            "{error}"
+        );
+    }
+    for bad in [0, 9] {
+        let error = ops::GroupSpec::new("edge", Some(bad)).expect_err("bad bridge count");
+        assert!(
+            error.to_string().contains("bridges must be 1 to 8"),
+            "{error}"
+        );
+    }
+    let error = ops::GroupSpec::from_flags(None, Some(2)).expect_err("bridges alone");
+    assert!(
+        error.to_string().contains("needs `bridge_group`"),
+        "{error}"
+    );
+    assert_eq!(
+        ops::GroupSpec::from_flags(None, None).expect("no flags"),
+        None
+    );
+}

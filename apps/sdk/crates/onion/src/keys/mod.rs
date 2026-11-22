@@ -26,8 +26,9 @@ pub(crate) mod store;
 pub(crate) use identity::ensure;
 pub use identity::{prepare_all, PreparationFailure, PreparedService};
 pub use ops::{
-    create_service, export_identity, identity_exists, import_identity, list_services,
-    remove_service, show_service, NewIdentity, Recorded,
+    create_service, create_service_with_group, export_identity, identity_exists, import_identity,
+    import_identity_with_group, list_services, remove_service, show_service, GroupSpec,
+    NewIdentity, Recorded,
 };
 pub use store::{address, address_of, decode_key, encode_key, lock, nickname, KeysError};
 
