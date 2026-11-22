@@ -1,11 +1,18 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use arti_wrapper::Settings;
 use bridge_line::BridgeLine;
 use proxy_config::{OnionServiceEntry, OnionServicePort};
+use tokio_util::sync::CancellationToken;
 
-use super::{assign_bridges, group_settings, split_entries, GroupPlan};
+use super::{
+    assign_bridges, bootstrap_until_ready, group_settings, retry_delay, split_entries, GroupPlan,
+    BOOTSTRAP_ATTEMPT_LIMIT, BOOTSTRAP_FIRST_DELAY, BOOTSTRAP_MAX_DELAY,
+};
 
 fn entry(nickname: &str, group: Option<(&str, Option<u8>)>) -> OnionServiceEntry {
     OnionServiceEntry {
@@ -207,4 +214,213 @@ fn a_group_needs_the_state_directory() {
     let mut main = main_settings();
     main.state_dir = None;
     assert!(group_settings(&main, "edge", pool(1)).is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_group_bootstraps_on_its_first_attempt() {
+    let token = CancellationToken::new();
+    let calls = Arc::new(AtomicU32::new(0));
+    let seen = Arc::clone(&calls);
+    let started = tokio::time::Instant::now();
+    let client = bootstrap_until_ready(
+        || {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok::<&str, anyhow::Error>("client")
+            }
+        },
+        &token,
+    )
+    .await;
+    assert_eq!(client, Some("client"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "one attempt is enough");
+    assert_eq!(
+        started.elapsed(),
+        Duration::ZERO,
+        "no pause after a working attempt"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_group_retries_failures_until_a_client_bootstraps() {
+    let token = CancellationToken::new();
+    let calls = Arc::new(AtomicU32::new(0));
+    let seen = Arc::clone(&calls);
+    let started = tokio::time::Instant::now();
+    let client = bootstrap_until_ready(
+        || {
+            let seen = Arc::clone(&seen);
+            async move {
+                let call = seen.fetch_add(1, Ordering::SeqCst) + 1;
+                match call {
+                    1 => Err(anyhow::anyhow!("no directory consensus")),
+                    2 => Err(anyhow::anyhow!("every bridge failed")),
+                    _ => Ok(call),
+                }
+            }
+        },
+        &token,
+    )
+    .await;
+    assert_eq!(client, Some(3), "the third attempt produced the client");
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        started.elapsed(),
+        retry_delay(1) + retry_delay(2),
+        "a pause after each of the two failures"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stuck_attempt_is_cut_at_the_limit_and_retried() {
+    let token = CancellationToken::new();
+    let calls = Arc::new(AtomicU32::new(0));
+    let seen = Arc::clone(&calls);
+    let started = tokio::time::Instant::now();
+    let client = tokio::time::timeout(
+        BOOTSTRAP_ATTEMPT_LIMIT * 3,
+        bootstrap_until_ready(
+            || {
+                let seen = Arc::clone(&seen);
+                async move {
+                    let call = seen.fetch_add(1, Ordering::SeqCst) + 1;
+                    if call == 1 {
+                        // A dead bridge: the client makes no progress at all.
+                        std::future::pending::<()>().await;
+                    }
+                    Ok::<u32, anyhow::Error>(call)
+                }
+            },
+            &token,
+        ),
+    )
+    .await
+    .expect("a stuck attempt is cut at its deadline, not waited on");
+    assert_eq!(client, Some(2), "the stuck attempt gave way to a retry");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        started.elapsed(),
+        BOOTSTRAP_ATTEMPT_LIMIT + retry_delay(1),
+        "the stuck attempt ran to its deadline, then the first pause"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_cuts_a_running_attempt() {
+    let token = CancellationToken::new();
+    let calls = Arc::new(AtomicU32::new(0));
+    let seen = Arc::clone(&calls);
+    let started = tokio::time::Instant::now();
+    let canceller = token.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(BOOTSTRAP_FIRST_DELAY).await;
+        canceller.cancel();
+    });
+    let client = bootstrap_until_ready(
+        || {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+                Ok::<(), anyhow::Error>(())
+            }
+        },
+        &token,
+    )
+    .await;
+    assert_eq!(client, None);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "no attempt after the cancelled one"
+    );
+    assert_eq!(
+        started.elapsed(),
+        BOOTSTRAP_FIRST_DELAY,
+        "the attempt was cut on cancellation, not left until its deadline"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_cuts_the_pause_between_attempts() {
+    let token = CancellationToken::new();
+    let calls = Arc::new(AtomicU32::new(0));
+    let seen = Arc::clone(&calls);
+    let started = tokio::time::Instant::now();
+    let canceller = token.clone();
+    tokio::spawn(async move {
+        // Half of the first pause: the second attempt must never start.
+        tokio::time::sleep(BOOTSTRAP_FIRST_DELAY / 2).await;
+        canceller.cancel();
+    });
+    let client = bootstrap_until_ready(
+        || {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Err::<(), anyhow::Error>(anyhow::anyhow!("no bridge answers"))
+            }
+        },
+        &token,
+    )
+    .await;
+    assert_eq!(client, None);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "no attempt starts after cancellation"
+    );
+    assert_eq!(
+        started.elapsed(),
+        BOOTSTRAP_FIRST_DELAY / 2,
+        "the pause ended on cancellation, not after the full delay"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_pause_grows_and_stops_at_the_ceiling() {
+    let token = CancellationToken::new();
+    let times = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&times);
+    let client = bootstrap_until_ready(
+        || {
+            let seen = Arc::clone(&seen);
+            async move {
+                let call = {
+                    let mut times = seen.lock().expect("attempt times");
+                    times.push(tokio::time::Instant::now());
+                    times.len()
+                };
+                match call {
+                    12 => Ok(call),
+                    _ => Err(anyhow::anyhow!("no bridge answers yet")),
+                }
+            }
+        },
+        &token,
+    )
+    .await;
+    assert_eq!(client, Some(12));
+    let times = times.lock().expect("attempt times");
+    assert_eq!(times.len(), 12);
+    let gaps: Vec<Duration> = times.windows(2).map(|pair| pair[1] - pair[0]).collect();
+    let expected = vec![
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+        Duration::from_secs(20),
+        Duration::from_secs(40),
+        Duration::from_secs(80),
+        Duration::from_secs(160),
+        Duration::from_secs(300),
+        Duration::from_secs(300),
+        Duration::from_secs(300),
+        Duration::from_secs(300),
+        Duration::from_secs(300),
+    ];
+    assert_eq!(
+        gaps, expected,
+        "5 s doubling per failure, held at the 300 s ceiling, and no gap above it"
+    );
+    assert!(gaps.iter().all(|gap| *gap <= BOOTSTRAP_MAX_DELAY));
 }
