@@ -97,7 +97,7 @@ tor-socks5 onion remove <NICK> --yes           # delete the service and its key
 - **`--bridge-group NAME [--bridges N]`** (on `new` and on `import`) writes the
   group into the service's entry, so a service can be created in a bridge
   group without editing the file: the name is `a-z 0-9 _ -`, at most 25 bytes,
-  and `bridges` is 1 to 8 (default 1). `--bridges` needs `--bridge-group`, and
+  and `bridges` is 1 to 8 (default 2). `--bridges` needs `--bridge-group`, and
   a wrong value is refused before any key is made or the file is touched.
   Without the flags the entry gets no group fields; `--force` replaces only
   the identity, so an existing group (and its `bridges`) stays unless the
@@ -378,10 +378,10 @@ services: [
 - `bridge_group` — the group's name: `a-z 0-9 _ -`, at most 25 bytes. Services
   with the same name share one client. Without it the service stays on the
   process-wide client, as before.
-- `bridges` — how many bridges the group uses, `1` to `8`, default `1`. It
+- `bridges` — how many bridges the group uses, `1` to `8`, default `2`. It
   needs `bridge_group`, and the enabled services of a group must state the
-  same number. Use `2` or more: a group with one bridge depends on that
-  bridge alone, which is less reliable than the process-wide client.
+  same number. Keep `2` or more: a group with one bridge depends on that
+  bridge alone and is down from its failure until a replacement is claimed.
 - **From the CLI.** `onion new web --bridge-group edge-a --bridges 2` (the same
   flags work on `onion import`) writes the fields into the entry; nothing has
   to be typed into the file by hand. `onion show` prints the group of a
@@ -396,9 +396,9 @@ services: [
 - **Which bridges.** Every group gets its own bridges from the working list of
   the process, in group-name order over the list sorted by bridge line, so the
   same list gives the same assignment at every start. When the list is smaller
-  than the groups need, the groups share bridges and a warning names them. A
-  group never starts without bridges: a client without bridges would reach Tor
-  directly.
+  than the groups need (groups x `bridges` above the number of working
+  bridges), the groups share bridges and a warning names them. A group never
+  starts without bridges: a client without bridges would reach Tor directly.
 - **Failover inside a group.** Up to 3 of the group's bridges carry circuits at
   once; the rest stand by. A group's circuits therefore do not all depend on
   one bridge, whatever `tor.guard_spread` says (that setting is for the
@@ -412,13 +412,22 @@ services: [
 - **Where the state lives.** `<config dir>/arti-data/group-<name>/` holds the
   group's guard state and its keystore (the services file stays the source of
   keys). The log lines of a group carry `group=<name>` next to the nickname.
-- **Not replaced while running.** The process-wide client replaces dead
-  bridges; a group's bridges are chosen at start and kept. If all of them fail,
-  the group's services stay down until the next start. Restart after changing
-  the bridge list.
-- **Not verified live yet.** The configuration, the assignment and the wiring
-  are covered by tests; starting a group's client against real bridges has not
-  been measured. Try one group before relying on many.
+- **Maintenance.** A group's client is supervised. Its bridges are claimed
+  from the working list of the process before every bootstrap attempt and on
+  every `[watchdog]` tick: a bridge the process dropped is replaced by a free
+  one, never by one another group holds, and a bridge is kept until the client
+  accepted its replacement. A failed or stuck bootstrap is retried with a
+  growing pause; a client with no reachable service for the watchdog's stale
+  window is re-created; a group stops only when every service failed for a
+  reason a new client cannot fix (keys, configuration). `[watchdog]
+  enabled: false` turns this maintenance off for groups as well. A bridge counts
+  as dead when the process dropped it from its working list, not by a verdict
+  of its own, and a service's status is the last one published, so a client that
+  hangs while still reported as running is not noticed.
+- **Not verified live yet.** The configuration, the assignment, the claims
+  and the supervision are covered by tests; starting a group's client against
+  real bridges, replacing a bridge and re-creating a client have not been
+  measured. Try one group before relying on many.
 
 ## Limitations
 

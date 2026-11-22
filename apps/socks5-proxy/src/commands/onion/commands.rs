@@ -42,7 +42,7 @@ pub(crate) enum OnionAction {
         /// (`a-z 0-9 _ -`, at most 25 bytes).
         #[arg(long = "bridge-group", value_name = "NAME")]
         bridge_group: Option<String>,
-        /// Bridges of the group, 1 to 8 (default 1). Needs `--bridge-group`.
+        /// Bridges of the group, 1 to 8 (default 2). Needs `--bridge-group`.
         #[arg(long, value_name = "N")]
         bridges: Option<u8>,
         /// Replace an existing identity. WARNING: the old .onion address
@@ -92,7 +92,7 @@ pub(crate) enum OnionAction {
         /// (`a-z 0-9 _ -`, at most 25 bytes).
         #[arg(long = "bridge-group", value_name = "NAME")]
         bridge_group: Option<String>,
-        /// Bridges of the group, 1 to 8 (default 1). Needs `--bridge-group`.
+        /// Bridges of the group, 1 to 8 (default 2). Needs `--bridge-group`.
         #[arg(long, value_name = "N")]
         bridges: Option<u8>,
         /// Replace an existing identity for this nickname. WARNING: the old

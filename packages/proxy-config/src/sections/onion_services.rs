@@ -25,7 +25,7 @@ const ADDRESS_HOST_LEN: usize = 56;
 const MAX_GROUP_NAME_LEN: usize = 25;
 
 /// Bridges of a group whose entries do not state `bridges`.
-pub const DEFAULT_GROUP_BRIDGES: u8 = 1;
+pub const DEFAULT_GROUP_BRIDGES: u8 = 2;
 
 /// Largest `bridges` value: a group this wide gains nothing more.
 pub const MAX_GROUP_BRIDGES: u8 = 8;
@@ -95,7 +95,7 @@ pub struct OnionServiceEntry {
     /// bridges. `[a-z0-9_-]+`, at most 25 bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bridge_group: Option<String>,
-    /// How many bridges the group uses (`1..=8`, default `1`). Only with
+    /// How many bridges the group uses (`1..=8`, default `2`). Only with
     /// `bridge_group`; every enabled service of a group must state the same.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bridges: Option<u8>,
