@@ -80,7 +80,7 @@ fn services_of_one_group_share_a_plan_in_file_order() {
     assert_eq!(split.groups.keys().collect::<Vec<_>>(), ["core", "edge"]);
     assert_eq!(split.groups["edge"].bridges, 2);
     assert_eq!(names(&split.groups["edge"].entries), ["a", "c"]);
-    assert_eq!(split.groups["core"].bridges, 1, "an unstated count is one");
+    assert_eq!(split.groups["core"].bridges, 2, "an unstated count is two");
 }
 
 #[test]

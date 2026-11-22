@@ -613,7 +613,7 @@ starting with the given base32 prefix (a-z, 2-7, up to 8 chars); the full guide 
 vanity tables, security and diagnostics — is in
 [docs/guide/ops/onion-service.md](docs/guide/ops/onion-service.md).
 `--bridge-group NAME [--bridges N]` records the service in a bridge group: the name is
-`a-z 0-9 _ -` (at most 25 bytes) and `bridges` is 1 to 8 (default 1) and needs the group name; a
+`a-z 0-9 _ -` (at most 25 bytes) and `bridges` is 1 to 8 (default 2) and needs the group name; a
 wrong value is refused before any key is made or the file is touched.
 
 Setting `circuit_hops` (2..=4, default `4`) on a service shortens the server-side
@@ -634,7 +634,7 @@ services: [
 ]
 ```
 
-`bridge_group` (a name, `a-z 0-9 _ -`) and `bridges` (`1..=8`, default `1`) put a service on a Tor
+`bridge_group` (a name, `a-z 0-9 _ -`) and `bridges` (`1..=8`, default `2`) put a service on a Tor
 client of its own that uses only that many of the bridges, so one failing bridge does not touch
 the other groups; services with the same group name share the client, and the enabled services of
 a group must state the same `bridges`. Without `bridge_group` a service uses the process-wide

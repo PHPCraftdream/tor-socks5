@@ -544,9 +544,9 @@ fn a_service_without_a_bridge_group_uses_the_shared_client() {
 }
 
 #[test]
-fn a_bridge_group_defaults_to_one_bridge() {
+fn a_bridge_group_defaults_to_two_bridges() {
     let cfg = parse(&config_with_services(&grouped("web", "edge", None, true))).expect("parses");
-    assert_eq!(cfg.services[0].bridge_group_spec(), Some(("edge", 1)));
+    assert_eq!(cfg.services[0].bridge_group_spec(), Some(("edge", 2)));
 }
 
 #[test]
@@ -620,13 +620,20 @@ fn enabled_services_of_a_group_must_agree_on_the_bridge_count() {
         err.contains("services[0]") && err.contains("services[1]"),
         "{err}"
     );
-    // An unstated count is the default of one, so it conflicts with two.
+    // An unstated count is the default of two: it conflicts with three...
+    let src = config_with_services(&format!(
+        "{}{}",
+        grouped("a", "edge", Some(3), true),
+        grouped("b", "edge", None, true)
+    ));
+    assert!(parse(&src).is_err());
+    // ...and agrees with an explicit two.
     let src = config_with_services(&format!(
         "{}{}",
         grouped("a", "edge", Some(2), true),
         grouped("b", "edge", None, true)
     ));
-    assert!(parse(&src).is_err());
+    assert!(parse(&src).is_ok());
 }
 
 #[test]
