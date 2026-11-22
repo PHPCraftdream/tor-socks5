@@ -424,10 +424,14 @@ services: [
   as dead when the process dropped it from its working list, not by a verdict
   of its own, and a service's status is the last one published, so a client that
   hangs while still reported as running is not noticed.
-- **Not verified live yet.** The configuration, the assignment, the claims
-  and the supervision are covered by tests; starting a group's client against
-  real bridges, replacing a bridge and re-creating a client have not been
-  measured. Try one group before relying on many.
+- **Verified live once, in part.** The configuration, the assignment, the
+  claims and the supervision are covered by tests. Starting one group
+  (`bridges: 2`, one service) against real bridges was measured once: its client
+  was ready within seconds of the group starting, on the process client's
+  directory cache without downloading the consensus again, and the service
+  answered through the proxy. Failure of a group's bridge, replacing it and
+  re-creating a client have not been measured live, and neither have several
+  groups at once. Try one group before relying on many.
 
 ## Limitations
 
