@@ -10,8 +10,9 @@ use proxy_config::{OnionServiceEntry, OnionServicePort};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    assign_bridges, bootstrap_until_ready, group_settings, retry_delay, split_entries, GroupPlan,
-    BOOTSTRAP_ATTEMPT_LIMIT, BOOTSTRAP_FIRST_DELAY, BOOTSTRAP_MAX_DELAY,
+    assign_bridges, bootstrap_group, bootstrap_until_ready, group_settings, retry_delay,
+    split_entries, start_window, Assigned, GroupBridges, GroupPlan, BOOTSTRAP_ATTEMPT_LIMIT,
+    BOOTSTRAP_FIRST_DELAY, BOOTSTRAP_MAX_DELAY, GROUP_START_WINDOW, GROUP_START_WINDOW_MAX,
 };
 
 fn entry(nickname: &str, group: Option<(&str, Option<u8>)>) -> OnionServiceEntry {
@@ -117,7 +118,7 @@ fn a_used_up_pool_wraps_around_and_says_so() {
     assert!(!assigned["a"].overlaps);
     assert!(
         assigned["b"].overlaps,
-        "b needs the 4th bridge of a pool of 3"
+        "b needs a fourth bridge and the pool has three"
     );
     assert!(assigned["c"].overlaps);
     for got in assigned.values() {
@@ -333,7 +334,7 @@ async fn cancellation_cuts_a_running_attempt() {
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
-        "no attempt after the cancelled one"
+        "only the attempt that was cut by cancellation ran"
     );
     assert_eq!(
         started.elapsed(),
@@ -369,7 +370,7 @@ async fn cancellation_cuts_the_pause_between_attempts() {
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
-        "no attempt starts after cancellation"
+        "the second attempt never started"
     );
     assert_eq!(
         started.elapsed(),
@@ -423,4 +424,162 @@ async fn the_pause_grows_and_stops_at_the_ceiling() {
         "5 s doubling per failure, held at the 300 s ceiling, and no gap above it"
     );
     assert!(gaps.iter().all(|gap| *gap <= BOOTSTRAP_MAX_DELAY));
+}
+
+/// A registry entry for the group named by the caller.
+fn assigned(bridges: Vec<BridgeLine>) -> Assigned {
+    Assigned {
+        bridges,
+        overlaps: false,
+        short: false,
+    }
+}
+
+/// A registry seeded with the one group named by the caller.
+fn seeded(name: &str, bridges: Vec<BridgeLine>) -> Arc<GroupBridges> {
+    GroupBridges::new(&BTreeMap::from([(name.to_owned(), assigned(bridges))]))
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_first_attempt_uses_the_bridge_claimed_before_it() {
+    let token = CancellationToken::new();
+    let dead = pool(1);
+    let free = pool(2)[1].clone();
+    let registry = seeded("edge", dead.clone());
+    let mut bridges = dead.clone();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+    let (client, prepared) = bootstrap_group(
+        &registry,
+        "edge",
+        &main_settings(),
+        &mut bridges,
+        || Some(vec![free.clone()]),
+        |settings| {
+            let recorder = Arc::clone(&recorder);
+            async move {
+                recorder
+                    .lock()
+                    .expect("attempts")
+                    .push(settings.bridges.clone());
+                Ok::<u32, anyhow::Error>(7)
+            }
+        },
+        &token,
+    )
+    .await
+    .expect("no configuration error")
+    .expect("bootstrapped");
+    assert_eq!(client, 7);
+    assert_eq!(
+        seen.lock().expect("attempts").clone(),
+        vec![vec![free.clone()]],
+        "the very first attempt already runs on the claimed bridge"
+    );
+    assert_eq!(prepared.settings.bridges, vec![free.clone()]);
+    assert_eq!(bridges, [free], "the group keeps what it claimed");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_retry_claims_the_bridge_the_process_offers_in_the_meantime() {
+    let token = CancellationToken::new();
+    let dead = pool(1);
+    let free = pool(2)[1].clone();
+    let registry = seeded("edge", dead.clone());
+    let mut bridges = dead.clone();
+    let calls = Arc::new(AtomicU32::new(0));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let working_calls = Arc::clone(&calls);
+    let recorder = Arc::clone(&seen);
+    let offered = free.clone();
+    let (_, prepared) = bootstrap_group(
+        &registry,
+        "edge",
+        &main_settings(),
+        &mut bridges,
+        move || {
+            if working_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Some(Vec::new())
+            } else {
+                Some(vec![offered.clone()])
+            }
+        },
+        |settings| {
+            let recorder = Arc::clone(&recorder);
+            async move {
+                let first = recorder.lock().expect("attempts").is_empty();
+                recorder
+                    .lock()
+                    .expect("attempts")
+                    .push(settings.bridges.clone());
+                if first {
+                    return Err(anyhow::anyhow!("the dead bridge does not answer"));
+                }
+                Ok::<(), anyhow::Error>(())
+            }
+        },
+        &token,
+    )
+    .await
+    .expect("no configuration error")
+    .expect("bootstrapped");
+    assert_eq!(
+        seen.lock().expect("attempts").clone(),
+        vec![dead.clone(), vec![free.clone()]],
+        "the failed attempt kept the dead bridge, the retry claimed the free one"
+    );
+    assert_eq!(prepared.settings.bridges, [free]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_group_that_can_never_have_a_client_stops_instead_of_retrying() {
+    let token = CancellationToken::new();
+    let mut main = main_settings();
+    main.state_dir = None;
+    let dead = pool(1);
+    let registry = seeded("edge", dead.clone());
+    let mut bridges = dead.clone();
+    let attempts = Arc::new(AtomicU32::new(0));
+    let counter = Arc::clone(&attempts);
+    let result = tokio::time::timeout(
+        Duration::from_secs(600),
+        bootstrap_group(
+            &registry,
+            "edge",
+            &main,
+            &mut bridges,
+            || None,
+            |_| {
+                let counter = Arc::clone(&counter);
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok::<(), anyhow::Error>(())
+                }
+            },
+            &token,
+        ),
+    )
+    .await
+    .expect("a configuration error must stop the loop instead of retrying forever");
+    assert!(
+        result.is_err(),
+        "a group without a state directory cannot have a client"
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        0,
+        "no bootstrap attempt is made for a configuration error"
+    );
+}
+
+#[test]
+fn the_start_window_doubles_per_restart_and_stops_at_its_ceiling() {
+    assert_eq!(start_window(0), GROUP_START_WINDOW);
+    assert_eq!(start_window(1), GROUP_START_WINDOW * 2);
+    assert_eq!(
+        start_window(2),
+        (GROUP_START_WINDOW * 4).min(GROUP_START_WINDOW_MAX)
+    );
+    assert_eq!(start_window(9), GROUP_START_WINDOW_MAX);
+    assert_eq!(start_window(u32::MAX), GROUP_START_WINDOW_MAX);
 }
