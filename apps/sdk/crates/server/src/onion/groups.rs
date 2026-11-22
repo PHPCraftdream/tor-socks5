@@ -9,9 +9,11 @@
 //! not replaced while the process runs.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use anyhow::{bail, Context};
+use anyhow::{anyhow, bail, Context};
 use arti_wrapper::{Settings, TorTunnel};
 use bridge_line::BridgeLine;
 use proxy_config::OnionServiceEntry;
@@ -153,6 +155,72 @@ fn group_settings(
     Ok((settings, keystore_dir))
 }
 
+/// Deadline of one bootstrap attempt. A dead bridge can leave the group's
+/// client making no progress at all, so a stuck attempt is cut and retried
+/// instead of waited on until the process ends.
+const BOOTSTRAP_ATTEMPT_LIMIT: Duration = Duration::from_secs(120);
+
+/// Pause after the first failed attempt; it doubles for every next failure.
+const BOOTSTRAP_FIRST_DELAY: Duration = Duration::from_secs(5);
+
+/// Ceiling of that pause: a group whose bridges stay dead keeps retrying at
+/// this cadence instead of growing the gap further.
+const BOOTSTRAP_MAX_DELAY: Duration = Duration::from_secs(300);
+
+/// Pause after the `failures`-th failed attempt: [`BOOTSTRAP_FIRST_DELAY`]
+/// doubled once per failure, never above [`BOOTSTRAP_MAX_DELAY`].
+fn retry_delay(failures: u32) -> Duration {
+    // The shift is capped, so the doubling cannot overflow.
+    let factor = 1u32 << failures.saturating_sub(1).min(16);
+    BOOTSTRAP_FIRST_DELAY
+        .saturating_mul(factor)
+        .min(BOOTSTRAP_MAX_DELAY)
+}
+
+/// Run `attempt` until it succeeds or `token` is cancelled, and return what it
+/// produced (`None` on cancellation). A failed attempt, and one that misses
+/// [`BOOTSTRAP_ATTEMPT_LIMIT`], is logged and followed by a [`retry_delay`]
+/// pause, so the services of a group wait for a working client instead of
+/// staying unhosted until a restart. Both the attempt and the pause are cut by
+/// `token`. The attempt is injected, so the loop is testable without Tor.
+async fn bootstrap_until_ready<F, Fut, T, E>(mut attempt: F, token: &CancellationToken) -> Option<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+    E: Into<anyhow::Error>,
+{
+    let mut failures = 0u32;
+    loop {
+        let outcome = tokio::select! {
+            biased;
+            () = token.cancelled() => return None,
+            result = tokio::time::timeout(BOOTSTRAP_ATTEMPT_LIMIT, attempt()) => result,
+        };
+        let error = match outcome {
+            Ok(Ok(value)) => return Some(value),
+            Ok(Err(error)) => error.into(),
+            Err(_elapsed) => anyhow!(
+                "the attempt did not finish in {}s",
+                BOOTSTRAP_ATTEMPT_LIMIT.as_secs()
+            ),
+        };
+        failures += 1;
+        let delay = retry_delay(failures);
+        // `{error:#}` keeps the whole chain: the outer error says little.
+        warn!(
+            attempt = failures,
+            retry_in = ?delay,
+            error = %format!("{error:#}"),
+            "bridge group did not bootstrap; its services stay unhosted until a retry works"
+        );
+        tokio::select! {
+            biased;
+            () = token.cancelled() => return None,
+            () = tokio::time::sleep(delay) => {}
+        }
+    }
+}
+
 /// Host the services of one group on a Tor client of its own, until `token`
 /// is cancelled. Failures are logged and end only this group.
 pub(crate) async fn run_group(
@@ -190,18 +258,11 @@ pub(crate) async fn run_group(
             services = plan.entries.len(),
             "starting a bridge group: bootstrapping its own Tor client"
         );
-        let bootstrap = TorTunnel::bootstrap_with(settings.clone());
-        let tunnel = tokio::select! {
-            () = token.cancelled() => return,
-            result = bootstrap => result,
-        };
-        let tunnel = match tunnel {
-            Ok(tunnel) => tunnel,
-            Err(error) => {
-                error!(%error, "bridge group not started: its Tor client did not bootstrap; \
-                               its services are not hosted");
-                return;
-            }
+        let tunnel =
+            bootstrap_until_ready(|| TorTunnel::bootstrap_with(settings.clone()), &token).await;
+        let Some(tunnel) = tunnel else {
+            info!("bridge group cancelled before its Tor client bootstrapped");
+            return;
         };
         let handle = TorHandle::new_with_settings(tunnel, &settings);
         let host_config = OnionHostConfig::new(handle.clone(), keystore_dir, token)
