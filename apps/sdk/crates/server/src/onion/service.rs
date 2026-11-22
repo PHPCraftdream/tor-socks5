@@ -5,9 +5,10 @@
 //! lock and the status snapshot all live in the library crate.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use arti_wrapper::Settings;
-use proxy_config::{Config, OnionServiceEntry};
+use proxy_config::{Config, OnionServiceEntry, WatchdogConfig};
 use tokio_util::sync::CancellationToken;
 
 use super::groups;
@@ -26,6 +27,7 @@ pub(crate) fn spawn_services(
     settings: Settings,
     entries: &[OnionServiceEntry],
     config_path: &Path,
+    watchdog: WatchdogConfig,
     token: CancellationToken,
     producers: &mut Vec<tokio::task::JoinHandle<()>>,
 ) {
@@ -90,6 +92,7 @@ pub(crate) fn spawn_services(
         } else {
             None
         };
+        let pool = handle.clone();
         let mut hosts = Vec::new();
         if !split.shared.is_empty() {
             let host_config = OnionHostConfig::new(
@@ -106,17 +109,25 @@ pub(crate) fn spawn_services(
             ));
         }
         let mut assigned = groups::assign_bridges(&settings.bridges, &split.groups);
+        // Every group sees the bridges of the others, so a replacement never
+        // takes a bridge another group works with.
+        let group_bridges = groups::GroupBridges::new(&assigned);
         for (name, plan) in split.groups {
             let Some(bridges) = assigned.remove(&name) else {
                 continue;
             };
             hosts.push(AbortOnDropHandle::new(tokio::spawn(groups::run_group(
-                name,
-                plan,
-                bridges,
-                settings.clone(),
-                config_path.clone(),
-                token.clone(),
+                groups::GroupRun {
+                    name,
+                    plan,
+                    assigned: bridges,
+                    main: settings.clone(),
+                    pool: pool.clone(),
+                    groups: Arc::clone(&group_bridges),
+                    watchdog,
+                    config_path: config_path.clone(),
+                    token: token.clone(),
+                },
             ))));
         }
         for result in futures::future::join_all(hosts.iter_mut().map(AbortOnDropHandle::join)).await

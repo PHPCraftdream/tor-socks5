@@ -363,6 +363,7 @@ pub(super) async fn phase_bootstrap(
             onion_settings,
             &cfg.onion_services,
             &ctx.config_path,
+            cfg.watchdog,
             producer_token.clone(),
             &mut launch.handles,
         );
