@@ -37,6 +37,14 @@ TEST_AFFECTED_DRY=1 git push
 FULL=1 git push
 ```
 
+After changing any `Cargo.toml` or `Cargo.lock`, commit locally and run the planner before pushing (`origin/main` must be an ancestor of `HEAD`, so fetch first):
+
+```sh
+sh scripts/testing/test-affected.sh --base origin/main --mode list --kind all
+```
+
+It works from `cargo metadata` and git only; nothing is built or tested. It rejects uncommitted `.rs`, `Cargo.toml` and `Cargo.lock` files (`planner: незакоммиченные исходники или манифесты: <path>`), hence the commit first. It prints the Rust packages the plan selects; empty output means no Rust package is selected (other CI segments may still run), and the base and event handling are not identical to the hook's and CI's. `planner: missing mapping: удалена зависимость пакета` means a dependency left a changed manifest without a sanction: add the `(manifest, table, name)` triple to `SANCTIONED_DEPENDENCY_REMOVALS` in `scripts/testing/planner_lib/policy.py` with a comment naming the move that justifies it, as done for earlier moves, then amend the commit.
+
 `git push --no-verify` обходит хук; используйте его только в экстренном случае. `cargo nextest` не выполняет doctest, поэтому они запускаются отдельно. `saturating-time` исключён из doctest, поскольку его примеры могут зависнуть в Windows.
 
 Запускайте `--all-features` для vendored crate отдельным вызовом cargo, не вместе с пакетом приложения: объединение features иначе может привести к несовместимой комбинации upstream features.
