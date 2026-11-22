@@ -301,6 +301,8 @@ async fn a_client_that_loses_its_services_is_recreated_after_the_stale_window() 
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(30)).await;
         sender.send_replace(host_status(ServiceStatus::Bootstrapping));
+        // A dropped sender means the host is gone (a stop); keep it alive.
+        std::future::pending::<()>().await;
     });
     let stale = Duration::from_secs(180);
     let end = supervise(&mut status, &token, GROUP_START_WINDOW, stale, false).await;
