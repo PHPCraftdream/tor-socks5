@@ -220,6 +220,43 @@ fn validate_group_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A refused `bridge_group`/`bridges` pair: the field at fault and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupArgsError {
+    /// `bridge_group` or `bridges`.
+    pub field: &'static str,
+    /// Why the value is refused.
+    pub reason: String,
+}
+
+/// The one check of a service's `bridge_group` and `bridges`: the services
+/// file is read with it and so are the CLI flags that write the same fields,
+/// so the two cannot diverge.
+pub fn check_group_args(group: Option<&str>, bridges: Option<u8>) -> Result<(), GroupArgsError> {
+    if let Some(group) = group {
+        validate_group_name(group).map_err(|reason| GroupArgsError {
+            field: "bridge_group",
+            reason: format!("invalid group '{group}' ({reason})"),
+        })?;
+    }
+    if let Some(bridges) = bridges {
+        if group.is_none() {
+            return Err(GroupArgsError {
+                field: "bridges",
+                reason: "`bridges` needs `bridge_group` (name the group the bridges belong to)"
+                    .to_owned(),
+            });
+        }
+        if !(1..=MAX_GROUP_BRIDGES).contains(&bridges) {
+            return Err(GroupArgsError {
+                field: "bridges",
+                reason: format!("bridges must be 1 to {MAX_GROUP_BRIDGES} (got {bridges})"),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Lightweight nickname check (tor-hsservice re-validates at launch):
 /// non-empty, at most [`MAX_NICKNAME_LEN`] bytes, only `A-Z a-z 0-9 _ -`.
 pub(super) fn validate_nickname(nickname: &str) -> Result<(), String> {
@@ -365,25 +402,8 @@ fn validate_entries<E: serde::de::Error>(
                 entry.circuit_hops
             )));
         }
-        if let Some(group) = &entry.bridge_group {
-            validate_group_name(group).map_err(|reason| {
-                E::custom(format!(
-                    "{path}.bridge_group: invalid group '{group}' ({reason})"
-                ))
-            })?;
-        }
-        if let Some(bridges) = entry.bridges {
-            if entry.bridge_group.is_none() {
-                return Err(E::custom(format!(
-                    "{path}.bridges: `bridges` needs `bridge_group` (name the group the bridges belong to)"
-                )));
-            }
-            if !(1..=MAX_GROUP_BRIDGES).contains(&bridges) {
-                return Err(E::custom(format!(
-                    "{path}.bridges: bridges must be 1 to {MAX_GROUP_BRIDGES} (got {bridges})"
-                )));
-            }
-        }
+        check_group_args(entry.bridge_group.as_deref(), entry.bridges)
+            .map_err(|error| E::custom(format!("{path}.{}: {}", error.field, error.reason)))?;
         if entry.enabled && entry.ports.is_empty() {
             return Err(E::custom(format!(
                 "{path}.ports: at least one port mapping is required"

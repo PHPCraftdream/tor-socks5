@@ -599,11 +599,11 @@ The services are managed from the CLI (stop the server first: it writes the same
 the keystore lock while services run):
 
 ```bash
-tor-socks5 onion new <NICK> [--port 80=127.0.0.1:8080]... [--vanity PREFIX] [--threads N] [--timeout DURATION]
+tor-socks5 onion new <NICK> [--port 80=127.0.0.1:8080]... [--vanity PREFIX] [--threads N] [--timeout DURATION] [--bridge-group NAME [--bridges N]]
 tor-socks5 onion list
 tor-socks5 onion show <NICK>
 tor-socks5 onion export <NICK> --out <FILE>
-tor-socks5 onion import <NICK> <FILE> [--port 80=127.0.0.1:8080]...
+tor-socks5 onion import <NICK> <FILE> [--port 80=127.0.0.1:8080]... [--bridge-group NAME [--bridges N]]
 tor-socks5 onion remove <NICK> --yes
 ```
 
@@ -612,6 +612,9 @@ tor-socks5 onion remove <NICK> --yes
 starting with the given base32 prefix (a-z, 2-7, up to 8 chars); the full guide — quick start,
 vanity tables, security and diagnostics — is in
 [docs/guide/ops/onion-service.md](docs/guide/ops/onion-service.md).
+`--bridge-group NAME [--bridges N]` records the service in a bridge group: the name is
+`a-z 0-9 _ -` (at most 25 bytes) and `bridges` is 1 to 8 (default 1) and needs the group name; a
+wrong value is refused before any key is made or the file is touched.
 
 Setting `circuit_hops` (2..=4, default `4`) on a service shortens the server-side
 onion circuits — a latency-for-anonymity trade intended for censorship
